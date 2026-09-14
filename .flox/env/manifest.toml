@@ -1,41 +1,26 @@
-# The development environment. `flox activate` is the only setup step; every
-# tool the build needs comes from here and nothing is installed on the host.
-#
-# Contributors do not need flox. `rust-toolchain.toml` is the real toolchain
-# pin, so a plain rustup install produces the identical compiler, and CI uses
-# rustup directly. flox is how the maintainer avoids accumulating toolchains
-# and container runtimes on a laptop.
+# The development environment: `flox activate` and everything the build needs
+# is on PATH. `rust-toolchain.toml` is the toolchain contract, so a plain
+# rustup install works too and CI uses one.
 
 schema-version = "1.10.0"
 
 [install]
-# rustup, not rust: `rust-toolchain.toml` names the version, and rustup is what
-# reads it. Pinning a compiler here as well would give two sources of truth.
+# rustup rather than a compiler: rust-toolchain.toml names the version, and
+# pinning it here as well would give two sources of truth.
 rustup.pkg-path = "rustup"
-
-# The container runtime, needed only by the one container-gated test (the
-# Iceberg REST catalog fixture). `dev/runtime.sh` drives it.
+# Only the container-gated catalog test needs these; dev/runtime.sh drives them.
 colima.pkg-path = "colima"
 docker-client.pkg-path = "docker-client"
 docker-compose.pkg-path = "docker-compose"
 
 [options]
-# Apple Silicon and Linux. x86_64-darwin is omitted deliberately: listing a
-# system flox cannot resolve the closure for makes every activation probe for
-# it and fail slowly, for no benefit here.
 systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]
 
 [hook]
 on-activate = '''
-  # Toolchains live with the environment, not in $HOME, so several checkouts on
-  # one machine never share or fight over a rustup installation.
+  # Toolchains per checkout; the crates.io cache stays shared at CARGO_HOME's
+  # default, or every checkout re-downloads every dependency.
   export RUSTUP_HOME="${RUSTUP_HOME:-$FLOX_ENV_CACHE/rustup}"
-
-  # CARGO_HOME is left at its default on purpose. It holds the crates.io
-  # registry cache, which every project should share; isolating it would make
-  # each checkout re-download the whole dependency set.
-
-  # The container runtime writes its client config here, and `colima start`
-  # fails on a missing directory rather than creating one.
+  # colima start fails on a missing config directory rather than creating one.
   export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
 '''

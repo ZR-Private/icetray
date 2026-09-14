@@ -7,7 +7,7 @@
 #   dev/runtime.sh status  is a runtime reachable?
 #
 # macOS has no container runtime of its own, so this starts a small Linux VM
-# (colima, from the flox environment) and points the docker client at it. On
+# (colima) and points the docker client at it. On
 # Linux the daemon is already there and `up` is a no-op.
 set -euo pipefail
 

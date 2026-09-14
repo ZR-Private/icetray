@@ -13,15 +13,10 @@ tool can check it.
 - `rust-toolchain.toml` pins the exact stable version and the `rustfmt` and
   `clippy` components. rustup installs it on first use, locally and in CI.
   Bumping it is its own commit.
-- The development environment is a flox environment, declared in
-  `.flox/env/manifest.toml`. `flox activate` is the only setup step: it brings
-  rustup and the container runtime, and installs nothing on the host. Run the
-  gates inside it (`flox activate -- dev/ci-checks.sh`), or activate once and
-  work in the shell.
-- Contributors do not need flox. `rust-toolchain.toml` is the toolchain
-  contract, so a plain rustup install produces the identical compiler, and CI
-  uses rustup directly. Nothing in CI or the hooks requires an environment
-  manager.
+- `.flox/env/manifest.toml` declares the development environment: `flox
+  activate` puts rustup and the container runtime on PATH. It is a
+  convenience, not a requirement. Nothing in CI, the hooks, or the `dev/`
+  scripts assumes it.
 
 ## Formatting
 
