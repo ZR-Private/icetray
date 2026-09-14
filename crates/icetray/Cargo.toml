@@ -1,0 +1,16 @@
+[package]
+name = "icetray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "One binary: the serve daemon and the one-shot doctor, get, and info subcommands"
+
+[lints]
+workspace = true
+
+[dependencies]
+icetray-core = { workspace = true }
+icetray-proto = { workspace = true }
+
+[dev-dependencies]
+icetray-testkit = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "icetray-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The gRPC contract, generated at build time"
+
+[lints]
+workspace = true

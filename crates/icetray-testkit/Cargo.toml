@@ -1,0 +1,12 @@
+[package]
+name = "icetray-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process S3, fixture writer, simulation, shared assertions, and the golden-table locator"
+
+[lints]
+workspace = true
+
+[dependencies]
+icetray-core = { workspace = true }
