@@ -37,6 +37,7 @@ redefine.
 | `error` | the one `Error` enum and `Result` | |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`); the only `cast_precision_loss` allow | 015 |
 | `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string; CONTRIBUTING Constants | |
+| `metric` | the metric and label names of section 7 as constants, and the read-kind label enum; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, key length cap and advice, file size target); the one home for every constant another crate needs | 002, 008 |
@@ -141,7 +142,8 @@ pub struct HedgeConfig { pub enabled: bool, pub percentile: f64, pub window: usi
 pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, pub access_key_id: Option<String>, pub secret_access_key: Option<String>, pub allow_http: bool, pub path_style: bool }
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty }
+/// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
@@ -156,6 +158,8 @@ pub enum SourceConfig {
 // storage
 /// One counter for a lookup's whole cost, whatever residency the table runs
 /// (RFD 003): object-store GETs and local reads are counted in the same place.
+/// Every GET is counted whether or not it succeeds; a hedge is a GET and
+/// counts as one, and once more under `hedges` (RFD 013).
 pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64 */ }
 impl IoStats { pub fn gets(&self) -> u64; pub fn bytes(&self) -> u64; pub fn hedges(&self) -> u64; pub fn local_reads(&self) -> u64; pub fn local_bytes(&self) -> u64; }
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`;
@@ -190,6 +194,9 @@ impl Storage {
     pub async fn with_sdk_defaults(config: StorageConfig) -> Self;
     pub fn register(&self, prefix: impl Into<String>, store: Arc<dyn ObjectStore>);
     pub fn stats(&self) -> Arc<IoStats>;
+    /// Rewrite rules first, then the store for the `scheme://authority/` prefix;
+    /// no store is `ConfigViolation::NoStoreForLocation`, a relative path
+    /// `ConfigViolation::LocationNotAbsolute`.
     pub fn locate(&self, location: &str) -> Result<Located>;
     pub async fn read_all(&self, location: &str) -> Result<Bytes>;
     /// Load path: never hedged.
@@ -495,7 +502,7 @@ skip).
 | invariant | tier |
 |---|---|
 | Bucket routing equals the Iceberg library's transform for long, string, binary, uuid, and fixed keys | U (oracle test against the library, all five types) |
-| Key ordering equals Parquet's for each type; keys of different types never compare | U |
+| Key ordering equals Parquet's for each type; a key of another type than the table's is refused at the Table boundary with Error::KeyType | U, P |
 | A cold hit costs exactly one GET; a warm hit none; a miss none, including misses inside a file's range | P, S |
 | Load costs two GETs per file plus the metadata reads; a load with `previous` reuses every unchanged file by pointer | P |
 | An unchanged poll costs one read (hint file or catalog record) | P, C |
