@@ -17,7 +17,7 @@
       }
     },
     "hook": {
-      "on-activate": "  # Toolchains live with the environment, not in $HOME, so several checkouts on\n  # one machine never share or fight over a rustup installation.\n  export RUSTUP_HOME=\"${RUSTUP_HOME:-$FLOX_ENV_CACHE/rustup}\"\n\n  # CARGO_HOME is left at its default on purpose. It holds the crates.io\n  # registry cache, which every project should share; isolating it would make\n  # each checkout re-download the whole dependency set.\n\n  # The container runtime writes its client config here, and `colima start`\n  # fails on a missing directory rather than creating one.\n  export DOCKER_CONFIG=\"${DOCKER_CONFIG:-$HOME/.docker}\"\n"
+      "on-activate": "  # Toolchains per checkout; the crates.io cache stays shared at CARGO_HOME's\n  # default, or every checkout re-downloads every dependency.\n  export RUSTUP_HOME=\"${RUSTUP_HOME:-$FLOX_ENV_CACHE/rustup}\"\n  # colima start fails on a missing config directory rather than creating one.\n  export DOCKER_CONFIG=\"${DOCKER_CONFIG:-$HOME/.docker}\"\n"
     },
     "options": {
       "systems": [
