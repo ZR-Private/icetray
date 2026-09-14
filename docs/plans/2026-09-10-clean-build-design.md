@@ -36,6 +36,7 @@ redefine.
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`); the only `cast_precision_loss` allow | 015 |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string; CONTRIBUTING Constants | |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, key length cap and advice, file size target); the one home for every constant another crate needs | 002, 008 |
@@ -87,29 +88,38 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Named refusals (RFD 007). Display gives the snake_case name used in logs.
-pub enum RefusalReason { Unsorted, NullKeys, DuplicateKeys, KeyTypeMismatch, ValueTypeUnsupported, DeleteFiles, KeyTooLong, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { row_group: usize }, NoLocalDir }
+pub enum RefusalReason { Unsorted, NullKeys, DuplicateKeys, KeyTypeMismatch, KeyTypeUnsupported, ValueTypeUnsupported, DeleteFiles, KeyTooLong, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { row_group: usize }, NoLocalDir }
 /// A snapshot id is not an integer; it is never compared with one.
 pub struct SnapshotId(pub i64);
 /// Metric label values for lookups.
 pub enum LookupResult { ColdHit, WarmHit, Miss }
 
 // key
+/// The width of an Iceberg uuid and of the FIXED_LEN_BYTE_ARRAY Parquet stores it in.
+pub const UUID_BYTES: usize = 16;
 pub enum KeyType { Long, String, Binary, Uuid }
 impl KeyType {
-    /// long -> Long; string -> String; binary and fixed -> Binary; uuid -> Uuid (RFD 008).
-    pub fn from_iceberg(column: &str, ty: &iceberg::spec::Type) -> Result<Self>;
+    /// long -> Long; string -> String; binary and fixed -> Binary; uuid -> Uuid.
+    /// Every other type is `None`; the caller that owns the table name turns it
+    /// into `Error::Refused { reason: RefusalReason::KeyTypeUnsupported }` (RFD 008).
+    pub fn from_iceberg(ty: &iceberg::spec::Type) -> Option<Self>;
 }
 /// `Ord` is the served order per type: numeric, UTF-8 bytes, bytewise, and for
-/// `Uuid` the order the Iceberg specification defines, conformance-tested
-/// against the reference implementation rather than assumed (RFD 008).
-pub enum Key { Long(i64), Str(String), Bytes(Vec<u8>), Uuid([u8; 16]) }
+/// `Uuid` bytewise unsigned over its sixteen bytes, which is the order
+/// iceberg-rust's `Datum` and Parquet's UUID column statistics use,
+/// conformance-tested against both rather than assumed. It is not the order
+/// Iceberg Java's `Comparators` gives the type, `java.util.UUID`'s signed
+/// halves; a file sorted that way reads as unsorted (RFD 008).
+pub enum Key { Long(i64), Str(String), Bytes(Vec<u8>), Uuid([u8; UUID_BYTES]) }
 impl Key {
     pub fn key_type(&self) -> KeyType;
     pub fn from_datum(datum: &iceberg::spec::Datum) -> Option<Self>;
     /// The bytes the bucket transform and byte-wise comparisons see.
     pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]>;
+    /// A statistic that cannot be read never excludes.
     pub fn within_stats(&self, min: &[u8], max: &[u8]) -> bool;
 }
+impl std::fmt::Display for Key { /* the integer, a Debug-quoted string, 0x-prefixed hex, a hyphenated uuid */ }
 
 // bucket
 pub fn bucket(key: &Key, buckets: u32) -> u32;
@@ -131,9 +141,10 @@ pub struct HedgeConfig { pub enabled: bool, pub percentile: f64, pub window: usi
 pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, pub access_key_id: Option<String>, pub secret_access_key: Option<String>, pub allow_http: bool, pub path_style: bool }
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
+/// Display gives the file's lowercase name, for the doctor's output and metric labels.
 pub enum Residency { Full, Disk, Bloom }
 pub struct LocalConfig { pub dir: PathBuf, pub index_budget_bytes: Option<u64>, pub page_cache_disk_bytes: u64 }
 pub struct StorageConfig { pub s3: Option<S3Config>, pub rewrite: Vec<RewriteRule>, pub hedge: HedgeConfig, pub local: Option<LocalConfig> }
@@ -377,12 +388,13 @@ form of the `FindingCode` variant; code never compares these strings:
 | `bloom_undersized` | Advice | bloom bits per key below `BLOOM_BITS_PER_KEY_MIN` (the Bloom tier's miss cost rises) | | `write.parquet.bloom-filter-ndv.column.<key>` (Iceberg 1.11+) |
 
 Refusals (never findings; `Error::Refused` at load) are the `RefusalReason`
-variants: unsorted, null keys, duplicate keys, key type mismatch, value type
-unsupported (the value column must be Iceberg binary, fixed, or string,
-served as opaque bytes), delete files, key too long, and the three residency
-refusals of RFD 017: over budget, no local directory, no bloom filter. The
-prototype's per-table `key_chunk_cost` line becomes a `FileReport` field,
-not a finding.
+variants: unsorted, null keys, duplicate keys, key type mismatch, key type
+unsupported (the key column's Iceberg type is none of long, string, binary,
+fixed, or uuid), value type unsupported (the value column must be Iceberg
+binary, fixed, or string, served as opaque bytes), delete files, key too
+long, and the three residency refusals of RFD 017: over budget, no local
+directory, no bloom filter. The prototype's per-table `key_chunk_cost` line
+becomes a `FileReport` field, not a finding.
 
 ## 4. `icetray-proto`
 
