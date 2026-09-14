@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pre-push hook: the same lint gate CI runs, so a push never fails CI on
+# formatting or a lint. Install with: git config core.hooksPath dev/hooks
+#
+# No environment manager is assumed. Inside `flox activate` the pinned
+# toolchain is already on PATH; outside it, a plain rustup install reads the
+# same `rust-toolchain.toml`. The gate runs either way.
+set -euo pipefail
+
+dev/ci-checks.sh

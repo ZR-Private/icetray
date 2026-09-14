@@ -1,0 +1,39 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 9am on Monday"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on Monday"]
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "labels": ["dependencies", "security"]
+  },
+  "major": {
+    "enabled": false
+  },
+  "packageRules": [
+    {
+      "description": "One weekly PR for all Rust patch and minor bumps. Cargo's semver discipline plus the workspace tests are enough signal to review them as a batch. Majors stay manual.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "rust dependencies",
+      "groupSlug": "rust-deps"
+    },
+    {
+      "description": "Pin every GitHub Action to a commit SHA so a moved tag cannot re-point CI at different code. Renovate refreshes the SHA on tagged releases.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "description": "All GitHub Actions bumps in one weekly PR. With SHA pinning this is mostly digest refreshes.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "patch", "minor"],
+      "groupName": "github-actions",
+      "groupSlug": "github-actions"
+    }
+  ]
+}

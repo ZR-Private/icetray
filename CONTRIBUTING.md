@@ -1,0 +1,206 @@
+<!-- source: github.com/bfs/rust-template CONTRIBUTING.md @ v0.1.0 -->
+
+# Contributing
+
+These are the project's Rust conventions. Humans and coding agents read the
+same file; `AGENTS.md` adds only what agents need beyond it. Anything a lint
+can enforce is enforced by `Cargo.toml` and `clippy.toml`, and the sections
+below say so rather than restating the rule. The rest is here because no
+tool can check it.
+
+## Toolchain
+
+- `rust-toolchain.toml` pins the exact stable version and the `rustfmt` and
+  `clippy` components. rustup installs it on first use, locally and in CI.
+  Bumping it is its own commit.
+- The development environment is a flox environment, declared in
+  `.flox/env/manifest.toml`. `flox activate` is the only setup step: it brings
+  rustup and the container runtime, and installs nothing on the host. Run the
+  gates inside it (`flox activate -- dev/ci-checks.sh`), or activate once and
+  work in the shell.
+- Contributors do not need flox. `rust-toolchain.toml` is the toolchain
+  contract, so a plain rustup install produces the identical compiler, and CI
+  uses rustup directly. Nothing in CI or the hooks requires an environment
+  manager.
+
+## Formatting
+
+rustfmt defaults, no `.rustfmt.toml`, enforced by `cargo fmt --all --check`.
+This is a decision, not an omission. Every stable toolchain and editor
+produces the same output with no setup. The options worth having (import
+grouping, comment wrapping) are nightly-only and would pin a second
+toolchain for one tool. The stable options that remain either match the
+defaults or duplicate clippy lints. If import grouping ever becomes worth
+that cost, it arrives together with the nightly pin, a CI step, and a
+paragraph here, never halfway.
+
+## Lints
+
+`[workspace.lints]` in the root `Cargo.toml` is the whole policy: clippy
+pedantic denied, four pedantic lints allowed, `unwrap_used` and
+`wildcard_enum_match_arm` denied, `missing_docs` warned. Every crate opts in with `[lints] workspace = true`.
+CI runs clippy with `-D warnings` on all targets, so a warning is a failure.
+
+- Do not add `#[allow(...)]` to get past a lint. Fix the code. If a lint is
+  wrong for the whole project, change the workspace table in one commit that
+  says why.
+- The one exception is generated code: output a build script writes to
+  `OUT_DIR` and an inline module `include!`s. That module may carry inner
+  `#![allow(...)]` attributes, one lint per line, each added only after the
+  generator's output tripped it. Nothing hand-written goes inside that module,
+  the crate stays under the workspace lint table, and the attribute never
+  widens to the crate or the file.
+- The other exception is `clippy::cast_precision_loss`, allowed only inside
+  `icetray_core::approx`. Integers become floats through its named helpers
+  (`ratio`, `gauge`), so a call site says what the float is for, and the loss
+  above 2^53 is accepted there by design. Identifiers never become floats;
+  they go in metric labels and log fields.
+- `#[allow(dead_code)]` never. Unused code is deleted, not kept for later.
+- `unwrap()` in production code never. `expect("reason")` marks a case that
+  cannot happen and says why. `?` handles everything else. Tests may
+  `unwrap()`; `clippy.toml` exempts them.
+
+## Errors
+
+- Every error is a variant of a `thiserror` enum with typed fields: an enum
+  for the reason, a newtype for the id, a `Duration` for the timeout. A
+  caller that needs to know what went wrong matches on the variant, and the
+  compiler lists the cases it forgot. Nothing, tests included, decides
+  anything by looking at an error's message: no `to_string().contains(..)`,
+  no substring assertions. Messages exist for people reading a log.
+- `thiserror` in library crates. `anyhow` only in a binary's `main`, to turn
+  the typed error into an exit code or a gRPC status through one exhaustive
+  match; it never wraps an error a caller might still inspect.
+- Messages are lowercase, carry no trailing punctuation, and include the
+  context a reader needs to act: the value, the path, the id.
+- No swallowed errors. A `catch`-shaped block (a `let _ =`, an `if let Err`
+  that does nothing, a `.ok()` on a `Result`) either logs and handles, logs
+  and propagates, or carries an `// intentional: <reason>` comment.
+
+## Types over strings
+
+A closed set of values is an enum, never a string or a `&'static str` code:
+finding codes, refusal reasons, tiers, key types, table states, metric label
+values, writer property names. The string form is derived (`Display`, serde
+`rename_all`) for logs, JSON output, and metric labels, and the only place a
+string becomes the enum again is a boundary parser (configuration, the
+command line) through one `FromStr`. Identifiers that must not be confused
+with one another are newtypes: a snapshot id is not an `i64`, a byte offset
+is not a row index. `clippy::wildcard_enum_match_arm` is denied, so a match
+names every variant and a new variant fails to compile everywhere it matters
+instead of falling into a `_` arm nobody reads. The test is always the same:
+if something can or cannot happen, the compiler says so, not the presence or
+absence of a substring.
+
+## Protobuf
+
+The `.proto` files are the client contract and follow the same rule. Every
+closed set is an `enum` with a zero `_UNSPECIFIED` value; alternatives are a
+`oneof`; opaque payloads are `bytes`; counts and ids use the narrowest
+integer type that fits. No `map<string, string>`, no JSON or other
+serialized text inside a string field, no `google.protobuf.Struct`, `Value`,
+or `Any`. A field comment states what a caller may rely on, never how the
+server produces it. Field numbers are never reused.
+
+## Constants
+
+No magic numbers. Every numeric literal is a named `const` with a doc comment
+saying what it bounds and why that value. The exceptions are `0` and `1` used
+as booleans or initial values, and a `Vec::with_capacity` argument whose
+meaning is obvious from the line it is on. A constant has one home: when two
+crates need the same value, it is declared once in the lowest crate both
+depend on and imported from there, never redeclared. A test fixture that
+needs the page row limit imports the contract's constant; it does not write
+`1_000` again. Time is typed: elapsed time
+is a `Duration`, a point in monotonic time an `Instant`, a wall-clock
+timestamp a `jiff` type, and arithmetic on them uses their own methods. The
+only place a time value becomes a bare number (a histogram in seconds, an
+interval read from configuration, a log field) is one module of named
+conversion helpers, so no `* 1000`, no `/ 86400`, no `as_millis()` at a call
+site, and no hand-rolled epoch or DST math anywhere. The first occurrence is
+where the helper goes.
+
+## Dependencies
+
+- Never write a version from memory. `cargo add <crate>` resolves it from
+  the registry; the output it writes is the version to keep.
+- Commit `Cargo.lock`. CI passes `--locked`, so a stale lock fails fast.
+- Renovate batches Rust patch and minor bumps into one weekly PR and pins
+  GitHub Actions to commit SHAs. Majors are manual.
+
+## Layout and docs
+
+- `lib.rs` re-exports the public API. Internals are `pub(crate)`. One
+  significant type per file.
+- Every crate root starts with a `//!` header saying what the crate is.
+- Every public item has a `///` comment. `missing_docs` warns, and CI turns
+  the warning into a failure.
+
+## Comments
+
+A comment states a constraint the code has to satisfy, or it goes. Evergreen
+voice: what is true now, not what used to be true, when it changed, or who
+decided. If history matters, restate it as the live constraint ("hide, never
+delete: deleting releases the id") and put the story in the commit message.
+No comment sells the code's virtues. A constraint that takes a paragraph
+gets a paragraph; a sentence carrying no load gets deleted.
+
+## Testing
+
+- Unit tests live in `#[cfg(test)] mod tests` at the bottom of the file they
+  test. Integration tests in `crates/<name>/tests/` use the public API only.
+- Names are `test_<fn>_<scenario>`.
+- Assert on typed outcomes: a variant, a field, a count. Never on message
+  text or log output.
+- Put a test in the lowest tier that has what it needs. A property of one
+  function is a unit test. An interaction between components that can run
+  in-process is an in-process test. Only what genuinely needs sockets,
+  processes, or containers goes to an end-to-end tier, and those run per
+  batch, not per change.
+- A test proves what it claims. Run it and read the output. If the number
+  you assert on is zero when it should not be, the test passed without
+  proving anything.
+- A failing test is never "pre-existing, not my problem". Fix it now, or
+  write down the symptom, the file and line, and the suspected cause where
+  the fix will be scheduled. Ignoring it is not one of the choices.
+- A change checked on only the axis you were thinking about is unchecked.
+  Look at the other one before calling it done.
+
+## Gates
+
+- Per change: `cargo test` for the crate you touched.
+- Per batch, before a push: `dev/ci-checks.sh` and `cargo test --workspace`.
+  The pre-push hook runs the lint gate for you.
+- The container-gated tests are separate and need a runtime:
+  `dev/runtime.sh up`, `dev/rest-fixture.sh up`, then `dev/test-int.sh`.
+- CI runs the same script and the same test command. There is one gate,
+  called from three places.
+
+## Review checklist
+
+Check each of these against your own diff before asking for review.
+
+- **DRY.** No duplicated logic blocks. When extracting, take the whole unit
+  that repeats at the call sites, not the smallest shared fragment.
+- **Consolidation.** DRY catches duplicated text; this catches duplicated
+  mechanism. A change that adds a mechanism names what it supersedes and
+  deletes it. Watch for two ways to do one thing, two guards for one hazard
+  under different names, state derivable from other state, fallbacks nothing
+  reaches, helpers that differ from an existing one by a parameter, and
+  comments describing a mechanism that no longer exists. A diff that only
+  adds needs a stated reason.
+- **Small functions.** Over about 100 lines, split it.
+- **No over-engineering.** No abstraction for a one-time operation. No
+  hypothetical future requirement. Three similar lines beat a premature
+  abstraction.
+- **`f64` ordering** uses `f64::total_cmp`, never `partial_cmp().unwrap()`.
+- **Boundaries are validated.** User input, files, and external APIs are
+  checked where they enter. No injection paths.
+
+## Commits
+
+Conventional Commits: `<type>(<scope>): <description>`. Types are `feat`,
+`fix`, `refactor`, `test`, `docs`, `chore`, `ci`, `perf`. Scopes are crate
+names or the top-level area (`ci`, `docs`). The message says what changed and
+why, in enough detail that the reader does not need the diff for the why.
+No attribution trailers for tools or agents.

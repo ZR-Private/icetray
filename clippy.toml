@@ -1,0 +1,4 @@
+# `unwrap_used` is denied workspace-wide (see [workspace.lints] in Cargo.toml).
+# Tests are exempt mechanically rather than by convention, so nobody has to
+# remember the exception and nobody can forget it.
+allow-unwrap-in-tests = true

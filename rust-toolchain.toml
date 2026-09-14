@@ -1,0 +1,6 @@
+# One toolchain everywhere: rustup reads this on every machine and in CI, so
+# `cargo fmt`, `cargo clippy`, and `cargo test` mean the same thing in each
+# place. Bump deliberately; a bump is a commit of its own.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
