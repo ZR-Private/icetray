@@ -12,6 +12,8 @@ pub mod contract;
 pub mod error;
 pub mod index;
 pub mod key;
+pub mod metric;
+pub mod storage;
 pub mod time;
 
 pub use bucket::bucket;
@@ -24,3 +26,4 @@ pub use config::{
 pub use error::{Error, LookupResult, RefusalReason, Result, SnapshotId};
 pub use index::FileFault;
 pub use key::{Key, KeyType};
+pub use storage::{HedgeWindow, IoStats, Located, Storage};

@@ -2,6 +2,14 @@
 //! crate; this is the one module where a duration becomes text or a number
 //! and back, so no call site carries its own unit arithmetic.
 
+use std::time::Duration;
+
+/// A duration as a float of seconds, the unit a Prometheus histogram takes.
+/// The one place a `Duration` becomes a bare number for a metric.
+pub(crate) fn seconds(duration: Duration) -> f64 {
+    duration.as_secs_f64()
+}
+
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
 /// friendly form: `"10s"`, `"250ms"`, `"1m 30s"`. Only that grammar is
 /// accepted: a negative duration (`"-1s"`, `"1s ago"`) and text without a
@@ -53,9 +61,26 @@ mod tests {
     const QUARTER_SECOND: Duration = Duration::from_millis(250);
     /// A value that spans two units, `"1m 30s"`, for the round trip.
     const NINETY_SECONDS: Duration = Duration::from_secs(90);
+    /// A duration with a fractional second, so the float carries it.
+    const ONE_AND_A_HALF_SECONDS: Duration = Duration::from_millis(1500);
+    /// The float `ONE_AND_A_HALF_SECONDS` becomes; exactly representable.
+    const ONE_AND_A_HALF: f64 = 1.5;
 
     fn parse(text: &str) -> Result<Holder, serde_json::Error> {
         serde_json::from_str(&format!("{{\"elapsed\": \"{text}\"}}"))
+    }
+
+    #[test]
+    fn test_seconds_carries_the_fraction() {
+        assert_eq!(
+            super::seconds(ONE_AND_A_HALF_SECONDS).to_bits(),
+            ONE_AND_A_HALF.to_bits()
+        );
+    }
+
+    #[test]
+    fn test_seconds_zero_is_zero() {
+        assert_eq!(super::seconds(Duration::ZERO).to_bits(), 0.0f64.to_bits());
     }
 
     #[test]

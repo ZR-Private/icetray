@@ -89,7 +89,10 @@ pub enum ConfigError {
 }
 
 /// A rule a parsed configuration breaks. The set is closed; a rule not
-/// listed here is not checked.
+/// listed here is not checked. The two location rules are checked when a
+/// location is resolved rather than when the file is parsed, because
+/// locations arrive from table metadata; they are configuration faults all
+/// the same, since the remedy is a rewrite rule or a registered store.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ConfigViolation {
     /// A table has an empty name.
@@ -124,6 +127,23 @@ pub enum ConfigViolation {
     /// The hedge window holds no samples, so it has no percentile.
     #[error("hedge window must hold at least one sample")]
     HedgeWindowEmpty,
+    /// A location, after rewriting, whose `scheme://authority/` prefix names
+    /// no store the process has registered and none it can build (RFD 003:
+    /// it builds `s3://`, `s3a://`, and `file://`).
+    #[error(
+        "no object store for location {location}; add a rewrite rule or register a store for its prefix"
+    )]
+    NoStoreForLocation {
+        /// The location as the process tried to resolve it.
+        location: String,
+    },
+    /// A location, after rewriting, that is neither a URI nor an absolute
+    /// path, so it names no store at all.
+    #[error("location {location} is neither a uri nor an absolute path")]
+    LocationNotAbsolute {
+        /// The location as the process tried to resolve it.
+        location: String,
+    },
 }
 
 /// The whole configuration: the server, storage, and the tables it serves.
