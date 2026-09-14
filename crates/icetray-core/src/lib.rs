@@ -4,6 +4,7 @@
 //! and the testkit build on this crate; it depends on neither.
 
 pub mod approx;
+pub mod bucket;
 pub mod cache;
 pub mod check;
 pub mod config;
@@ -12,9 +13,10 @@ pub mod error;
 pub mod index;
 pub mod key;
 
+pub use bucket::bucket;
 pub use cache::CacheError;
 pub use check::FindingCode;
 pub use config::{ConfigError, ConfigViolation};
 pub use error::{Error, LookupResult, RefusalReason, Result, SnapshotId};
 pub use index::FileFault;
-pub use key::KeyType;
+pub use key::{Key, KeyType};

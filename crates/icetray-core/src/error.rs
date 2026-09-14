@@ -88,6 +88,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         | RefusalReason::NullKeys
         | RefusalReason::DuplicateKeys
         | RefusalReason::KeyTypeMismatch
+        | RefusalReason::KeyTypeUnsupported
         | RefusalReason::ValueTypeUnsupported
         | RefusalReason::DeleteFiles
         | RefusalReason::KeyTooLong
@@ -121,6 +122,8 @@ pub enum RefusalReason {
     DuplicateKeys,
     /// The key column's physical type is not the one its Iceberg type maps to.
     KeyTypeMismatch,
+    /// The key column's Iceberg type is not long, string, binary, fixed, or uuid.
+    KeyTypeUnsupported,
     /// The value column is not Iceberg binary, fixed, or string.
     ValueTypeUnsupported,
     /// The snapshot carries delete files.
@@ -150,6 +153,7 @@ impl fmt::Display for RefusalReason {
             Self::NullKeys => "null_keys",
             Self::DuplicateKeys => "duplicate_keys",
             Self::KeyTypeMismatch => "key_type_mismatch",
+            Self::KeyTypeUnsupported => "key_type_unsupported",
             Self::ValueTypeUnsupported => "value_type_unsupported",
             Self::DeleteFiles => "delete_files",
             Self::KeyTooLong => "key_too_long",
@@ -214,6 +218,7 @@ mod tests {
             (RefusalReason::NullKeys, "null_keys"),
             (RefusalReason::DuplicateKeys, "duplicate_keys"),
             (RefusalReason::KeyTypeMismatch, "key_type_mismatch"),
+            (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
             (
                 RefusalReason::ValueTypeUnsupported,
                 "value_type_unsupported",
