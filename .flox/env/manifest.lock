@@ -1,0 +1,380 @@
+{
+  "lockfile-version": 1,
+  "manifest": {
+    "schema-version": "1.10.0",
+    "install": {
+      "colima": {
+        "pkg-path": "colima"
+      },
+      "docker-client": {
+        "pkg-path": "docker-client"
+      },
+      "docker-compose": {
+        "pkg-path": "docker-compose"
+      },
+      "rustup": {
+        "pkg-path": "rustup"
+      }
+    },
+    "hook": {
+      "on-activate": "  # Toolchains live with the environment, not in $HOME, so several checkouts on\n  # one machine never share or fight over a rustup installation.\n  export RUSTUP_HOME=\"${RUSTUP_HOME:-$FLOX_ENV_CACHE/rustup}\"\n\n  # CARGO_HOME is left at its default on purpose. It holds the crates.io\n  # registry cache, which every project should share; isolating it would make\n  # each checkout re-download the whole dependency set.\n\n  # The container runtime writes its client config here, and `colima start`\n  # fails on a missing directory rather than creating one.\n  export DOCKER_CONFIG=\"${DOCKER_CONFIG:-$HOME/.docker}\"\n"
+    },
+    "options": {
+      "systems": [
+        "aarch64-darwin",
+        "aarch64-linux",
+        "x86_64-linux"
+      ]
+    }
+  },
+  "packages": [
+    {
+      "attr_path": "colima",
+      "broken": false,
+      "derivation": "/nix/store/vgq4v6b0i0dijmi20iz43midvmg2jnp8-colima-0.10.3.drv",
+      "description": "Container runtimes with minimal setup",
+      "install_id": "colima",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "colima-0.10.3",
+      "pname": "colima",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:02:13.264229Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/qlnfasnrcmkcgn5rk8npzaa26fp11cai-colima-0.10.3"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "colima",
+      "broken": false,
+      "derivation": "/nix/store/160ggljhpqrv9d3kfxj5xzszz9lmp7hx-colima-0.10.3.drv",
+      "description": "Container runtimes with minimal setup",
+      "install_id": "colima",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "colima-0.10.3",
+      "pname": "colima",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:37:23.310096Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/d6zw25swmafrrk4ga4z2qqyh2bbpw6sf-colima-0.10.3"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "colima",
+      "broken": false,
+      "derivation": "/nix/store/4fvvh69kv0j2hc1sam9h6sl4pp6isvaw-colima-0.10.3.drv",
+      "description": "Container runtimes with minimal setup",
+      "install_id": "colima",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "colima-0.10.3",
+      "pname": "colima",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T06:16:42.732727Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.10.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/yymam96zkvw64hvc1bmfjv4p5c9425c7-colima-0.10.3"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-client",
+      "broken": false,
+      "derivation": "/nix/store/cqglxa3zmjp7frwxg63apa47v8qw7nmc-docker-29.8.0.drv",
+      "description": "Open source project to pack, ship and run any application as a lightweight container",
+      "install_id": "docker-client",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-29.8.0",
+      "pname": "docker-client",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:02:13.520773Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "29.8.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/qqc1lqglm0331y9khnda76a8bmrxm3c5-docker-29.8.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-client",
+      "broken": false,
+      "derivation": "/nix/store/bdgh72hn0516adyi1ygskha0s108506f-docker-29.8.0.drv",
+      "description": "Open source project to pack, ship and run any application as a lightweight container",
+      "install_id": "docker-client",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-29.8.0",
+      "pname": "docker-client",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:37:23.716697Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "29.8.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/k20jkjy5har4pir80q38jamfnvjkqlda-docker-29.8.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-client",
+      "broken": false,
+      "derivation": "/nix/store/9krl9rvkqdz4i8lp4mrglhawjkjxwp63-docker-29.8.0.drv",
+      "description": "Open source project to pack, ship and run any application as a lightweight container",
+      "install_id": "docker-client",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-29.8.0",
+      "pname": "docker-client",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T06:16:43.154498Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "29.8.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/p16zpk2wylm1g5vgwk21crilj0rnpiya-docker-29.8.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-compose",
+      "broken": false,
+      "derivation": "/nix/store/hfn9hibrn6dpqn3pvzsjjp37wjk7pwqp-docker-compose-5.5.1.drv",
+      "description": "Docker CLI plugin to define and run multi-container applications with Docker",
+      "install_id": "docker-compose",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-compose-5.5.1",
+      "pname": "docker-compose",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:02:13.521309Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "5.5.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/4dvrpv63ggva8jn7mgbwkr7y156j502z-docker-compose-5.5.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-compose",
+      "broken": false,
+      "derivation": "/nix/store/9yw6fy71arz9a7yj1ld4ihsl3nx1jcdz-docker-compose-5.5.1.drv",
+      "description": "Docker CLI plugin to define and run multi-container applications with Docker",
+      "install_id": "docker-compose",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-compose-5.5.1",
+      "pname": "docker-compose",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:37:23.717224Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "5.5.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/q0h4vkxv0kl7cq6gi4lvyi9gj5c68s58-docker-compose-5.5.1"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "docker-compose",
+      "broken": false,
+      "derivation": "/nix/store/qh3q9j30p1v9f0f6sddna0f8ng8bybfn-docker-compose-5.5.1.drv",
+      "description": "Docker CLI plugin to define and run multi-container applications with Docker",
+      "install_id": "docker-compose",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "docker-compose-5.5.1",
+      "pname": "docker-compose",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T06:16:43.155050Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "5.5.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/iixpw2q471iiwbgzl6h3h9q2gc307nmn-docker-compose-5.5.1"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "rustup",
+      "broken": false,
+      "derivation": "/nix/store/giys4s2xxxknf28ki87gh560m834yg6p-rustup-1.29.0.drv",
+      "description": "Rust toolchain installer",
+      "install_id": "rustup",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "rustup-1.29.0",
+      "pname": "rustup",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:03:53.482429Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.29.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/sc6j867802r27yni5r9bk251wlwfbwf3-rustup-1.29.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "rustup",
+      "broken": false,
+      "derivation": "/nix/store/zqah3xgcf2pfpkqp4j1yvhk0aaspc2p3-rustup-1.29.0.drv",
+      "description": "Rust toolchain installer",
+      "install_id": "rustup",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "rustup-1.29.0",
+      "pname": "rustup",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T05:39:33.752983Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.29.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/z6r60fwh700r3r1vdsvmjmypyxv4qi3g-rustup-1.29.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "rustup",
+      "broken": false,
+      "derivation": "/nix/store/14ajgdrhzm1kknb5c1kdbpqijbmix5rf-rustup-1.29.0.drv",
+      "description": "Rust toolchain installer",
+      "install_id": "rustup",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "name": "rustup-1.29.0",
+      "pname": "rustup",
+      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "rev_count": 1072397,
+      "rev_date": "2026-09-11T18:00:29Z",
+      "scrape_date": "2026-09-13T06:19:00.819380Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.29.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/yfb4m0ppkap16a2isbfaxqn4kgy0xz4r-rustup-1.29.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    }
+  ]
+}
