@@ -35,7 +35,7 @@ redefine.
 | module | owns | RFD |
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
-| `approx` | integer-to-float conversion (`ratio`, `gauge`, `count`, `len`); the only `cast_precision_loss` allow | 015 |
+| `approx` | integer-to-float conversion (`ratio`, `gauge`); the only `cast_precision_loss` allow | 015 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, key length cap and advice, file size target); the one home for every constant another crate needs | 002, 008 |
@@ -147,7 +147,6 @@ pub enum SourceConfig {
 /// (RFD 003): object-store GETs and local reads are counted in the same place.
 pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64 */ }
 impl IoStats { pub fn gets(&self) -> u64; pub fn bytes(&self) -> u64; pub fn hedges(&self) -> u64; pub fn local_reads(&self) -> u64; pub fn local_bytes(&self) -> u64; }
-pub enum CacheError { Fetch(Arc<Error>), Backend(String) }
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`;
 /// the hedge delay is its configured percentile, capped by the hedge rate.
 pub struct HedgeWindow;
@@ -267,6 +266,7 @@ impl FileIndex {
 pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_offset: u64 }
 
 // cache
+pub enum CacheError { Fetch(Arc<Error>), Backend(String) }
 pub struct PageCache;
 impl PageCache {
     /// `disk` is the local level of RFD 017: a page evicted from memory is
