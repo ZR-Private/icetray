@@ -1,0 +1,114 @@
+# Clean build: sequence
+
+How the blueprint in `2026-09-10-clean-build-design.md` gets built, in an
+order that lets independent parts proceed in parallel once the seams they
+share are frozen. Each step ends with the gate green (`fmt`, `clippy`
+pedantic at deny, all tests) and one conventional commit.
+
+## Before the first commit
+
+- The repository history starts fresh at the first commit below; the
+  prototype branch is not merged and not pushed. The published repository
+  carries the analysis documents, the RFDs, these plans, the template files
+  (`CONTRIBUTING.md`, `AGENTS.md`, `clippy.toml`, the toolchain pin, CI), and
+  the code built here. The workspace manifest and its lint table arrive with
+  stage 1's first commit, because a workspace with no members does not
+  build.
+- Commit author for every commit: the maintainer's public identity with a
+  no-reply address. A local pre-commit hook (not committed) rejects a fixed
+  denylist of internal identifiers. The denylist itself is never committed,
+  so CI cannot run it; the hook and the checks run before every commit are
+  the gate.
+- Nothing from the prototype is copied without being read; the salvage note
+  in the maintainer's scratch directory lists what is carried and what is
+  rewritten, module by module.
+
+## Stage 1: foundations, single-threaded
+
+One worker, in this order, because every later step builds on these
+signatures.
+
+1. Workspace: four crates, `[workspace.dependencies]`, lint table, `approx`,
+   `error`. Commit: `chore: workspace and lint policy`.
+2. `key` and `bucket` with the oracle tests for all three key types.
+3. `config` with TOML and JSON parsing and the equivalence test.
+4. `storage`: prefix stores, rewriting, request counting, credential bridge
+   with coalesced refresh, hedging behind `HedgeConfig` (adaptive delay from
+   a sliding window of lookup GET latencies, rate ceiling), load-path reads
+   never hedged. Unit tests with a counting credential provider and an
+   in-memory store.
+5. `parquet_io` and `index`: footer load, `Segments`, `FileIndex::build`
+   with the refusals and both residency tiers (carry the prototype's bloom
+   path and its tests), `find` over exact fences, `read_value`, `page_of`,
+   `predicted_resident_bytes`; the value column's column index dropped after
+   its offset index is taken. Unit tests write Parquet with `arrow`: contract layout,
+   misaligned pages, dictionary-encoded value column, dictionary-encoded key
+   column, several row groups with statistics disabled, keys at and over the
+   cap.
+6. `cache` with hits and fetches counted after coalescing.
+
+## Stage 2: fan-out on frozen seams
+
+Five workers in parallel, each against the signatures in the blueprint. None
+changes a signature without updating the blueprint first.
+
+- **A. Tables.** `catalog` (static, hint, REST construction; one-read change
+  detection), `manifest` (snapshot schema, per-manifest spec, delete-file
+  refusal, deterministic ordering), `generation` (load with reuse, overlap
+  groups, duplicate refusal, `plan`, `Table` lifecycle with serialized
+  refresh, the residency budget check at the footer stage), `open`.
+- **B. Doctor.** `check` with the finding table and thresholds module,
+  `TableSummary`, `diagnose`. Depends on A's `Generation` shape only, which is
+  frozen.
+- **C. Contract and binary.** `icetray-proto` (proto, build script, scoped
+  allows, round-trip tests), the `icetray` binary's `serve` subcommand
+  (service, health, readiness, per-table refresh tasks, twelve-factor main,
+  graceful shutdown).
+- **E. Local disk.** `local`: the directory layout, chunk-file identity
+  and reuse, deletion with the generation, the disk budget, local-read
+  counting, `DiskChunks` with positioned reads on a blocking pool, and the
+  page cache's disk tier through the cache library's hybrid mode. Depends on
+  the `FileIndex::build` seam and `IoStats`, both frozen.
+- **D. Testkit.** Carry the fixture writer, in-process S3, simulation
+  transport, and acceptance tests; rewrite `verify` on `Generation::plan`;
+  add the new fixtures (delete file, evolved spec, permuted-key overlap,
+  dictionary value column, statistics-free multi-row-group file); golden
+  locator by environment variable with visible skip; dependency split.
+
+Order of merges: D's fixtures and A's tables first (they test each other),
+then E, then B, then C.
+
+## Stage 3: integration
+
+One worker.
+
+1. The one-shot subcommands (`doctor`, `get`, `info`) on `core::open` and
+   `TableSummary`; binary test covering `--config`, `--location`, string and
+   binary keys, exit code 2, the broken-pipe path.
+2. Acceptance suite green over in-process S3 and simulation; the gRPC tests
+   behind the server including health and readiness; the REST container test
+   with a visible skip.
+3. Golden tables: regenerate the Spark tables (contract, default writer,
+   truncated column index, truncated manifest metrics, several row groups)
+   with a checked-in script; run the golden tests.
+4. Conformance run: start the server the way a pod would (config path from
+   the environment, JSON config, no flags) and check logs, metrics, health.
+5. `README.md` rewritten for the working system: what it is, the contract in
+   words with a pointer to the doctor, how to run against a table, how to
+   deploy. Then the humanizer pass on the README and the RFD problem
+   statements.
+
+## Stage 4: against real S3
+
+From a laptop with profile credentials against tables written by the
+notebook recipe in the prototype findings: doctor, lookups with value
+verification, load time after the credential fix (the number the analysis
+lacks), snapshot advance, adaptive hedging behavior. Record results in a new
+analysis document; update the findings document's "not verified" list.
+
+## Done when
+
+Every invariant in the blueprint's section 6 has its test; the gate is
+green; the doctor reports the contract fixture as efficient with no
+findings; the conformance run passes; the README describes the system as
+built; the denylist grep over the tree and the history is empty.
