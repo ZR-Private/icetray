@@ -128,6 +128,16 @@ impl IoStats {
         metrics::counter!(metric::HEDGES_TOTAL).increment(1);
         self.record_get(ReadKind::Lookup, len);
     }
+
+    /// One read of `len` bytes from the local directory (RFD 017), counted
+    /// beside GETs so a lookup's whole cost is one structure whatever tier
+    /// the table runs (RFD 003). A local read is never a GET.
+    pub(crate) fn record_local_read(&self, len: u64) {
+        self.local_reads.fetch_add(1, Ordering::Relaxed);
+        self.local_bytes.fetch_add(len, Ordering::Relaxed);
+        metrics::counter!(metric::LOCAL_READS_TOTAL).increment(1);
+        metrics::counter!(metric::LOCAL_BYTES_TOTAL).increment(len);
+    }
 }
 
 /// A location resolved to the store that holds the object and the object's
@@ -1341,6 +1351,17 @@ mod tests {
         assert_eq!(stats.hedges(), 1);
         assert_eq!(stats.gets(), 1);
         assert_eq!(stats.bytes(), payload_len());
+    }
+
+    #[test]
+    fn test_record_local_read_counts_one_read_and_its_bytes_and_no_get() {
+        let stats = IoStats::default();
+        stats.record_local_read(payload_len());
+        assert_eq!(stats.local_reads(), 1);
+        assert_eq!(stats.local_bytes(), payload_len());
+        assert_eq!(stats.gets(), 0);
+        assert_eq!(stats.bytes(), 0);
+        assert_eq!(stats.hedges(), 0);
     }
 
     #[tokio::test]

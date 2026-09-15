@@ -2,12 +2,14 @@
 //! logs and metric labels: refusal reasons, snapshot ids, lookup results.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::cache::CacheError;
 use crate::check::FindingCode;
 use crate::config::ConfigError;
 use crate::index::FileFault;
 use crate::key::KeyType;
+use crate::local::LocalFault;
 
 /// Every failure a caller of this crate can observe. A caller decides what
 /// to do by matching the variant; the message is for a person reading a log.
@@ -73,6 +75,14 @@ pub enum Error {
     NotReady {
         /// The table's configured name.
         table: String,
+    },
+    /// The local directory failed (RFD 017); the fault set is closed.
+    #[error("local {}: {fault}", path.display())]
+    Local {
+        /// The file or directory the operation was on.
+        path: PathBuf,
+        /// What went wrong with it.
+        fault: LocalFault,
     },
 }
 
