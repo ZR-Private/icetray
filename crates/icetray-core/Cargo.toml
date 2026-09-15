@@ -16,6 +16,7 @@ bytes = { workspace = true }
 foyer = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
 jiff = { workspace = true }
 metrics = { workspace = true }
 murmur3 = { workspace = true }

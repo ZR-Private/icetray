@@ -43,12 +43,14 @@ bytes = "1.12.1"
 foyer = "0.22.6"
 futures = "0.3.34"
 iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
 jiff = { version = "0.2.37", features = ["serde"] }
 metrics = "0.24.6"
 murmur3 = "0.5.2"
 object_store = { version = "0.14.1", features = ["aws"] }
 parquet = { version = "58", features = ["async"] }
 prost = "0.14.4"
+protoc-bin-vendored = "3.2.0"
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -57,6 +59,9 @@ tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 toml = "1.1.6"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
 tracing = "0.1.44"
 url = "2.5.8"
 uuid = "1.26.1"

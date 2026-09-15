@@ -7,3 +7,12 @@ description = "The gRPC contract, generated at build time"
 
 [lints]
 workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
