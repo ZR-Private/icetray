@@ -145,11 +145,14 @@ pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, 
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
 pub enum Residency { Full, Disk, Bloom }
+/// `page_cache_disk_bytes`: zero means no disk level, anything else at least
+/// `contract::PAGE_CACHE_DISK_BLOCK_BYTES`, the level's one block, or the
+/// level would hold nothing; `Config::parse` refuses less as `PageCacheDiskTooSmall`.
 pub struct LocalConfig { pub dir: PathBuf, pub index_budget_bytes: Option<u64>, pub page_cache_disk_bytes: u64 }
 pub struct StorageConfig { pub s3: Option<S3Config>, pub rewrite: Vec<RewriteRule>, pub hedge: HedgeConfig, pub local: Option<LocalConfig> }
 pub enum SourceConfig {
@@ -194,7 +197,8 @@ impl LocalDir {
     /// footer stage (RFD 017).
     pub fn index_bytes_in_use(&self) -> Result<u64>;
     pub fn index_budget(&self) -> Option<u64>;
-    /// `None` when `page_cache_disk_bytes` is zero.
+    /// `None` when `page_cache_disk_bytes` is zero; otherwise a level of at
+    /// least one block, which `Config::parse` has checked.
     pub fn page_tier(&self) -> Option<DiskTier>;
 }
 /// A key page read from local disk on demand. Not a `ChunkReader`: the index
@@ -214,7 +218,9 @@ pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest
 // message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; }
 // message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
 /// The page cache's disk level, handed to `PageCache` by `local` (RFD 017):
-/// the `cache/` directory and its size bound.
+/// the `cache/` directory, its size bound, and the `IoStats` a page served
+/// from it is charged to as one local read, the same counter `LocalDir`
+/// charges chunk reads to (RFD 003).
 pub struct DiskTier;
 impl DiskTier { pub fn dir(&self) -> &Path; pub fn capacity_bytes(&self) -> u64; }
 pub struct Located { pub store: Arc<dyn ObjectStore>, pub path: object_store::path::Path }
@@ -266,13 +272,33 @@ pub async fn list_data_files(table: &str, md: &TableMetadata, snapshot: &Snapsho
 // parquet_io
 pub struct FileHandle { pub location: String }
 impl FileHandle {
-    pub fn open(storage: Arc<Storage>, location: &str, size: u64) -> Result<Self>;
+    /// `size` is the manifest's, so opening issues no request. `hedge` is the
+    /// owning table's window (RFD 013): lookup reads are hedged against it and
+    /// recorded into it, load reads never touch it.
+    pub fn open(storage: Arc<Storage>, location: &str, size: u64, hedge: Arc<HedgeWindow>) -> Result<Self>;
+    pub fn size(&self) -> u64;
+    pub fn storage(&self) -> &Arc<Storage>;
+    /// Load path, never hedged: one load GET per range.
+    pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes>;
+    pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
+    /// Lookup path: one lookup GET, hedged against the table's window.
+    pub async fn read_range_hedged(&self, range: Range<u64>) -> Result<Bytes>;
+    /// The footer and both page indexes behind a tail prefetch: one load GET
+    /// when the tail fits it, one more when the indexes start before the
+    /// prefetched tail, two more when the thrift metadata itself does not fit.
+    /// A failed fetch comes back as the storage error it was, not as a parquet error.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
     pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<Bytes>;
 }
+/// Why a `Segments` refused a read; carried inside `ParquetError::External`.
+pub enum SegmentsFault { NotResident { offset: u64 }, CrossesResidentRange { start: u64, end: u64, held_start: u64, held_end: u64 } }
 pub struct Segments;
-impl Segments { pub fn new(parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self; pub fn resident_len(&self) -> usize; }
-impl parquet::file::reader::ChunkReader for Segments { /* errors on non-resident bytes */ }
+impl Segments {
+    pub fn new(parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self; pub fn resident_len(&self) -> usize;
+    /// The `SegmentsFault` a parquet error carries, when it is one, so a caller matches the variant.
+    pub fn fault(error: &ParquetError) -> Option<&SegmentsFault>;
+}
+impl parquet::file::reader::ChunkReader for Segments { /* errors, typed as SegmentsFault, on non-resident bytes */ }
 
 // index (MAX_KEY_BYTES comes from `contract`)
 pub struct RowRef { pub row_group: usize, pub row: i64 }
@@ -314,15 +340,27 @@ impl FileIndex {
 pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_offset: u64 }
 
 // cache
-pub enum CacheError { Fetch(Arc<Error>), Backend(String) }
+/// `Backend` keeps foyer's error whole: it is `std::error::Error + Send + Sync`
+/// and carries its kind, so a caller matches on it rather than on text.
+pub enum CacheError { Fetch(Arc<Error>), Backend(#[from] foyer::Error) }
+/// Clone: clones share one cache and one pair of counters, so every table
+/// holds a clone of the process's one cache.
 pub struct PageCache;
 impl PageCache {
     /// `disk` is the local level of RFD 017: a page evicted from memory is
     /// served from it with a local read and no GET, and it survives a restart.
-    pub fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Self;
+    /// Async and fallible because opening the level opens its files and
+    /// recovers what they hold; a failure is `CacheError::Backend`. A disk
+    /// level that fails to read a page falls through to the fetch.
+    pub async fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Result<Self>;
     pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<Bytes>
     where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
-    /// Hits and fetches after coalescing.
+    /// `fetches` counts fetch futures run, after coalescing: concurrent misses
+    /// on one key run one and count one. `hits` counts lookups served without
+    /// a fetch, from memory or the disk level, per lookup served: several
+    /// lookups coalesced onto one disk read each count a hit and a local read,
+    /// as each would under `DiskChunks::page`, since foyer names no leader
+    /// among them; a lookup coalesced onto another's fetch counts under neither.
     pub fn hits(&self) -> u64; pub fn fetches(&self) -> u64; pub fn usage(&self) -> usize;
 }
 
@@ -336,7 +374,8 @@ pub struct Generation {
 impl Generation {
     /// `config` carries the residency and the resident-bytes budget; the
     /// budget is checked at the footer stage, before any key chunk is fetched.
-    pub async fn load(table: &str, config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
+    /// `hedge` is the table's hedge window, handed to every FileHandle it opens.
+    pub async fn load(table: &str, config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
     pub fn candidates(&self, key: &Key) -> impl Iterator<Item = &Arc<LoadedFile>>;
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize>;
     pub fn overlap_groups_verified(&self) -> usize;
@@ -353,6 +392,9 @@ pub struct MultiLookup { pub values: Vec<Value>, pub snapshot_id: SnapshotId }
 // table (after `check`, because the strict gate runs `check::diagnose` on a
 // built generation before it is swapped in)
 pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant }, Degraded { serving: Option<SnapshotId>, error: Arc<Error>, since: Instant } }
+/// Owns the table's `HedgeWindow`, created from `config.storage.hedge` and
+/// handed to every `Generation::load`, so one table's delay is set from its
+/// own reads and never another's (RFD 013).
 pub struct Table;
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`.
@@ -397,6 +439,8 @@ pub const TARGET_FILE_BYTES_MIN: u64 = 32 * 1024 * 1024;
 pub const TARGET_FILE_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const MAX_KEY_BYTES: usize = 4_096;
 pub const KEY_BYTES_ADVICE: usize = 128;
+/// The page cache disk level's block: its unit of eviction and the smallest level that holds a page.
+pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
 
 // open
 pub struct Opened { pub storage: Arc<Storage>, pub cache: PageCache, pub local: Option<Arc<LocalDir>>, pub tables: Vec<Arc<Table>> }
@@ -476,7 +520,8 @@ Health is `grpc.health.v1` from the tonic health crate, not our proto.
 `index/`, named by a digest of the data file's path, each carrying a
 `ChunkFileHeader` inside the RFD 011 envelope; the page cache's disk level
 under `cache/`, handed to `PageCache` as a `DiskTier`, or none when
-`page_cache_disk_bytes` is zero.
+`page_cache_disk_bytes` is zero; any other size is at least one block,
+`contract::PAGE_CACHE_DISK_BLOCK_BYTES`, which `Config::parse` checks.
 Disk residency reads pages with positioned reads on a blocking pool, never
 mmap, so every local read is counted and no page fault stalls a worker.
 Startup reuses chunk files whose identity matches; a generation swap
