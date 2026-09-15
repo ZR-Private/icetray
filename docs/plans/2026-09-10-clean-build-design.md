@@ -362,6 +362,10 @@ impl PageCache {
     /// as each would under `DiskChunks::page`, since foyer names no leader
     /// among them; a lookup coalesced onto another's fetch counts under neither.
     pub fn hits(&self) -> u64; pub fn fetches(&self) -> u64; pub fn usage(&self) -> usize;
+    /// Flushes the disk level and closes it; `serve` calls it while draining
+    /// (RFD 012), so what memory still held reaches disk before the process
+    /// exits. A memory-only cache returns `Ok` and does nothing.
+    pub async fn close(&self) -> Result<()>;
 }
 
 // generation
