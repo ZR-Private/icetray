@@ -253,6 +253,17 @@ impl PageCache {
         }
     }
 
+    /// Flushes the disk level and closes it, so what memory still held
+    /// reaches disk before the process exits; `serve` calls it while
+    /// draining (RFD 012). A memory-only cache has nothing to flush and
+    /// returns `Ok`. A failure of the level is `CacheError::Backend`.
+    pub async fn close(&self) -> Result<()> {
+        match self.tier.as_ref() {
+            Tier::Memory(_) => Ok(()),
+            Tier::Hybrid { cache, .. } => cache.close().await.map_err(backend),
+        }
+    }
+
     /// The memory tier's path, one call to foyer: the page from memory,
     /// else one coalesced fetch.
     async fn via_memory<F, Fut>(
@@ -681,6 +692,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_close_memory_tier_is_ok_and_keeps_serving() {
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        cache
+            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .await
+            .unwrap();
+        cache.close().await.unwrap();
+        let again = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        assert_eq!(&again[..], PAGE);
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(cache.hits(), 1);
+    }
+
+    #[tokio::test]
     async fn test_get_or_fetch_coalesces_concurrent_misses() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
@@ -827,7 +853,7 @@ mod tests {
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&first, &runs).await;
         assert_eq!(first_stats.local_reads(), 0);
-        hybrid(&first).close().await.unwrap();
+        first.close().await.unwrap();
         drop(first);
 
         let (tier, stats) = disk_tier(dir.path());
@@ -859,7 +885,7 @@ mod tests {
         let first = PageCache::new(TINY_BYTES, Some(tier)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&first, &runs).await;
-        hybrid(&first).close().await.unwrap();
+        first.close().await.unwrap();
         drop(first);
         assert!(corrupt_on_disk(&cache_dir, PAGE) >= 1);
 

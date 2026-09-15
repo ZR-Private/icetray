@@ -26,7 +26,7 @@ pub use config::{
     RewriteRule, S3Config, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
 pub use error::{Error, LookupResult, RefusalReason, Result, SnapshotId};
-pub use index::FileFault;
+pub use index::{FileFault, FileIndex, PageRef, ResidentBytes, RowRef};
 pub use key::{Key, KeyType};
 pub use local::{DataFileIdentity, DiskChunks, DiskTier, LocalDir, LocalFault};
 pub use parquet_io::{FileHandle, Segments, SegmentsFault};

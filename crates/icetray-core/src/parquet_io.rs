@@ -5,17 +5,21 @@
 //! any byte outside them rather than fetching it.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
 use parquet::arrow::async_reader::MetadataFetch;
 use parquet::errors::ParquetError;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::FOOTER_SIZE;
+use parquet::file::metadata::{
+    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader,
+};
 use parquet::file::reader::{ChunkReader, Length};
 
 use crate::cache::PageCache;
 use crate::error::{Error, Result};
+use crate::local::{self, DIGEST_BYTES};
 use crate::storage::{HedgeWindow, Located, Storage};
 
 /// Bytes read from the tail of a file in the first metadata request: the
@@ -43,6 +47,10 @@ pub struct FileHandle {
     storage: Arc<Storage>,
     file_id: Arc<str>,
     hedge: Arc<HedgeWindow>,
+    /// `local::digest` of the footer, set by the first `load_metadata`. A
+    /// data file never changes, so every load computes the same value and
+    /// the first one stands.
+    footer_digest: OnceLock<[u8; DIGEST_BYTES]>,
 }
 
 impl FileHandle {
@@ -65,6 +73,7 @@ impl FileHandle {
             storage,
             file_id: Arc::from(location),
             hedge,
+            footer_digest: OnceLock::new(),
         })
     }
 
@@ -76,6 +85,14 @@ impl FileHandle {
     /// The storage this handle reads through, whose counters price its reads.
     pub fn storage(&self) -> &Arc<Storage> {
         &self.storage
+    }
+
+    /// `local::digest` of the file's footer, the thrift metadata and the
+    /// eight trailing bytes: the `footer_digest` of a `DataFileIdentity`
+    /// (RFD 017). `Some` once `load_metadata` has returned, computed from the
+    /// tail the metadata reader fetched, so it costs no request of its own.
+    pub fn footer_digest(&self) -> Option<[u8; DIGEST_BYTES]> {
+        self.footer_digest.get().copied()
     }
 
     /// One byte range on the load path: one load GET, never hedged.
@@ -128,9 +145,11 @@ impl FileHandle {
     /// two more when the thrift metadata itself does not fit, since the
     /// reader then fetches the metadata and the indexes separately. Every
     /// one is a load read: never hedged, and counted as a load GET. The
-    /// page index is required, so a file written without one is
-    /// `Error::Parquet`; a fetch that failed comes back as the storage
-    /// error it was.
+    /// page indexes are read when the file has them; a file whose columns
+    /// lack an offset index comes back with neither index, and `index`
+    /// refuses it as `FileFault::MissingPageIndex`. A fetch that failed
+    /// comes back as the storage error it was. On return `footer_digest`
+    /// is set.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>> {
         self.load_metadata_prefetching(FOOTER_PREFETCH_BYTES).await
     }
@@ -141,24 +160,109 @@ impl FileHandle {
         self: &Arc<Self>,
         prefetch: usize,
     ) -> Result<Arc<ParquetMetaData>> {
+        let fetched = Arc::new(Mutex::new(Vec::new()));
         let metadata = ParquetMetaDataReader::new()
-            .with_page_index_policy(PageIndexPolicy::Required)
+            .with_page_index_policy(PageIndexPolicy::Optional)
             .with_prefetch_hint(Some(prefetch))
-            .load_and_finish(LoadFetch(Arc::clone(self)), self.size)
+            .load_and_finish(
+                LoadFetch {
+                    handle: Arc::clone(self),
+                    fetched: Arc::clone(&fetched),
+                },
+                self.size,
+            )
             .await
             .map_err(reclaim)?;
+        let fetched = fetched.lock().unwrap_or_else(PoisonError::into_inner);
+        self.footer_digest
+            .get_or_init(|| footer_digest(self.size, &fetched));
         Ok(Arc::new(metadata))
     }
 }
 
+/// The byte ranges one metadata load fetched, with their bytes.
+type Fetched = Vec<(Range<u64>, Bytes)>;
+
 /// `MetadataFetch` over a handle: every range the metadata reader asks for
 /// is a load read, since a footer is bulk work nobody waits on (RFD 013).
-struct LoadFetch(Arc<FileHandle>);
+/// Every range fetched is recorded, so the footer's bytes can be digested
+/// after the load without a request of their own.
+struct LoadFetch {
+    handle: Arc<FileHandle>,
+    fetched: Arc<Mutex<Fetched>>,
+}
 
 impl MetadataFetch for LoadFetch {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        Box::pin(async move { self.0.read_range(range).await.map_err(external) })
+        Box::pin(async move {
+            let bytes = self
+                .handle
+                .read_range(range.clone())
+                .await
+                .map_err(external)?;
+            self.fetched
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((range, bytes.clone()));
+            Ok(bytes)
+        })
     }
+}
+
+/// The digest of a file's footer, the thrift metadata and the eight bytes
+/// after it, from the ranges the metadata reader fetched to decode it. The
+/// reader decoded the footer from those ranges, so every byte of it is in
+/// them: in the one tail read when it fit the prefetch, otherwise the eight
+/// bytes in the tail read and the metadata in the read that followed.
+fn footer_digest(size: u64, fetched: &Fetched) -> [u8; DIGEST_BYTES] {
+    let footer_size =
+        u64::try_from(FOOTER_SIZE).expect("the footer's eight bytes fit u64 on every target");
+    let tail = assemble(fetched, size - footer_size..size);
+    let tail: [u8; FOOTER_SIZE] = tail
+        .as_slice()
+        .try_into()
+        .expect("assemble returns exactly the range's length");
+    let metadata_len = FooterTail::try_new(&tail)
+        .expect("the metadata reader decoded this footer tail")
+        .metadata_length();
+    let metadata_len =
+        u64::try_from(metadata_len).expect("a footer's metadata length fits u64 on every target");
+    local::digest(&assemble(fetched, size - footer_size - metadata_len..size))
+}
+
+/// The bytes of `range` copied out of `fetched`, whose parts may overlap
+/// one another. Every byte of the range is in some part; the metadata
+/// reader decoded it from them.
+fn assemble(fetched: &Fetched, range: Range<u64>) -> Vec<u8> {
+    let len = usize::try_from(range.end - range.start)
+        .expect("a footer's length fits usize on the 64-bit targets the crate supports");
+    let mut out = vec![0u8; len];
+    let mut covered: Vec<Range<u64>> = Vec::with_capacity(fetched.len());
+    for (held, bytes) in fetched {
+        let overlap = held.start.max(range.start)..held.end.min(range.end);
+        if overlap.start >= overlap.end {
+            continue;
+        }
+        let from = offset_within(held, overlap.start);
+        let to = offset_within(&range, overlap.start);
+        let n = offset_within(&overlap, overlap.end);
+        out[to..to + n].copy_from_slice(&bytes[from..from + n]);
+        covered.push(overlap);
+    }
+    covered.sort_by_key(|part| part.start);
+    let mut reached = range.start;
+    for part in &covered {
+        assert!(
+            part.start <= reached,
+            "the metadata reader fetched every byte of the footer it decoded"
+        );
+        reached = reached.max(part.end);
+    }
+    assert!(
+        reached >= range.end,
+        "the metadata reader fetched every byte of the footer it decoded"
+    );
+    out
 }
 
 /// The crate's error inside parquet's, for a fetch the parquet reader drove.
@@ -315,7 +419,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use parquet::file::FOOTER_SIZE;
     use parquet::file::metadata::FooterTail;
-    use parquet::file::properties::WriterProperties;
+    use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 
     use super::*;
     use crate::config::{HedgeConfig, StorageConfig};
@@ -370,21 +474,29 @@ mod tests {
         page_rows() * PAGES_PER_ROW_GROUP
     }
 
-    /// A Parquet file of `ROW_GROUPS` row groups of `PAGES_PER_ROW_GROUP`
-    /// pages each, with a key and a value column, page indexes on, and no
-    /// dictionary so every value page is a data page at its offset-index
-    /// position.
-    fn write_fixture() -> Vec<u8> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(KEY_COLUMN, DataType::Int64, false),
-            Field::new(VALUE_COLUMN, DataType::Binary, false),
-        ]));
-        let properties = WriterProperties::builder()
+    /// The writer properties every fixture shares: `PAGES_PER_ROW_GROUP`
+    /// pages of `PAGE_ROWS` per row group and no dictionary, so every value
+    /// page is a data page at its offset-index position.
+    fn fixture_properties() -> WriterPropertiesBuilder {
+        WriterProperties::builder()
             .set_data_page_row_count_limit(page_rows())
             .set_write_batch_size(page_rows())
             .set_max_row_group_row_count(Some(rows_per_group()))
             .set_dictionary_enabled(false)
-            .build();
+    }
+
+    /// A Parquet file of `ROW_GROUPS` row groups with a key and a value
+    /// column and page indexes on.
+    fn write_fixture() -> Vec<u8> {
+        write_fixture_with(fixture_properties().build())
+    }
+
+    /// `write_fixture` under `properties`.
+    fn write_fixture_with(properties: WriterProperties) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(KEY_COLUMN, DataType::Int64, false),
+            Field::new(VALUE_COLUMN, DataType::Binary, false),
+        ]));
         let rows = rows_per_group() * ROW_GROUPS;
         let keys = Int64Array::from_iter_values((0..rows).map(|row| i64::try_from(row).unwrap()));
         let values =
@@ -414,7 +526,15 @@ mod tests {
     /// with a window built from `config`; returns the file's bytes too, so
     /// a page read is checked against the file itself.
     async fn open_fixture(config: &HedgeConfig) -> (Arc<FileHandle>, Arc<HedgeWindow>, Bytes) {
-        let file = Bytes::from(write_fixture());
+        open_file(Bytes::from(write_fixture()), config).await
+    }
+
+    /// `file` in an in-memory store behind a fresh storage, opened with a
+    /// window built from `config`.
+    async fn open_file(
+        file: Bytes,
+        config: &HedgeConfig,
+    ) -> (Arc<FileHandle>, Arc<HedgeWindow>, Bytes) {
         let size = u64::try_from(file.len()).unwrap();
         let store = Arc::new(InMemory::new());
         store
@@ -532,6 +652,69 @@ mod tests {
         assert_eq!(stats.gets(), 3);
         assert_eq!(stats.hedges(), 0);
         assert_both_indexes(&metadata);
+    }
+
+    /// The digest of the file's footer computed from the file itself: the
+    /// thrift metadata and the eight trailing bytes.
+    fn expected_footer_digest(file: &Bytes) -> [u8; DIGEST_BYTES] {
+        let footer_len = FOOTER_SIZE + metadata_len(file);
+        local::digest(&file[file.len() - footer_len..])
+    }
+
+    #[tokio::test]
+    async fn test_footer_digest_is_none_before_a_load_and_the_footer_digest_after() {
+        let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
+        assert_eq!(handle.footer_digest(), None);
+        handle.load_metadata().await.unwrap();
+        assert_eq!(handle.footer_digest(), Some(expected_footer_digest(&file)));
+    }
+
+    #[tokio::test]
+    async fn test_footer_digest_is_stable_across_loads_and_fetch_paths() {
+        let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
+        handle.load_metadata().await.unwrap();
+        let first = handle.footer_digest().unwrap();
+        handle.load_metadata().await.unwrap();
+        assert_eq!(handle.footer_digest(), Some(first));
+
+        // The same file read with the eight-byte prefetch, where the footer
+        // arrives in two fetches, digests the same.
+        let (split, _, _) = open_fixture(&HedgeConfig::default()).await;
+        split.load_metadata_prefetching(FOOTER_SIZE).await.unwrap();
+        assert_eq!(split.footer_digest(), Some(first));
+        assert_eq!(first, expected_footer_digest(&file));
+    }
+
+    #[tokio::test]
+    async fn test_footer_digest_differs_between_files() {
+        let (handle, _, _) = open_fixture(&HedgeConfig::default()).await;
+        handle.load_metadata().await.unwrap();
+        let other_file = Bytes::from(write_fixture_with(
+            fixture_properties()
+                .set_max_row_group_row_count(Some(page_rows()))
+                .build(),
+        ));
+        let (other, _, other_file) = open_file(other_file, &HedgeConfig::default()).await;
+        other.load_metadata().await.unwrap();
+        assert_ne!(handle.footer_digest(), other.footer_digest());
+        assert_eq!(
+            other.footer_digest(),
+            Some(expected_footer_digest(&other_file))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_without_offset_index_carries_no_page_index() {
+        let file = Bytes::from(write_fixture_with(
+            fixture_properties().set_offset_index_disabled(true).build(),
+        ));
+        let (handle, _, _) = open_file(file, &HedgeConfig::default()).await;
+        let metadata = handle.load_metadata().await.unwrap();
+        assert_eq!(metadata.num_row_groups(), ROW_GROUPS);
+        assert!(metadata.offset_index().is_none());
+        assert!(metadata.column_index().is_none());
+        assert_eq!(handle.storage().stats().gets(), 1);
+        assert!(handle.footer_digest().is_some());
     }
 
     #[tokio::test]

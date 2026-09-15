@@ -8,7 +8,7 @@ use crate::cache::CacheError;
 use crate::check::FindingCode;
 use crate::config::ConfigError;
 use crate::index::FileFault;
-use crate::key::KeyType;
+use crate::key::{Key, KeyType};
 use crate::local::LocalFault;
 
 /// Every failure a caller of this crate can observe. A caller decides what
@@ -86,22 +86,35 @@ pub enum Error {
     },
 }
 
-/// A refusal for a log line: the name, and for the two reasons that carry
-/// numbers, the numbers a reader needs to act on (RFD 017).
+/// A refusal for a log line: the name, then the fields a reader needs to
+/// act on: the file and row group, the types found and expected, the length
+/// over the cap, the bytes needed and the budget (RFD 007, RFD 017).
 fn refusal_detail(reason: &RefusalReason) -> String {
     match reason {
+        RefusalReason::Unsorted { path, row_group }
+        | RefusalReason::NullKeys { path, row_group }
+        | RefusalReason::NoBloomFilter { path, row_group } => {
+            format!("{reason} (file {path}, row group {row_group})")
+        }
+        RefusalReason::KeyTypeMismatch {
+            path,
+            expected,
+            got,
+        } => format!("{reason} (file {path}, expected {expected}, got {got})"),
+        RefusalReason::ValueTypeUnsupported { path, got } => {
+            format!("{reason} (file {path}, got {got})")
+        }
+        RefusalReason::KeyTooLong { path, bytes } => {
+            format!("{reason} (file {path}, {bytes} bytes)")
+        }
+        RefusalReason::DuplicateKeys { path, key } => {
+            format!("{reason} (file {path}, key {key})")
+        }
         RefusalReason::OverBudget { needed, budget } => {
             format!("{reason} (needed {needed} bytes, budget {budget} bytes)")
         }
-        RefusalReason::NoBloomFilter { row_group } => format!("{reason} (row group {row_group})"),
-        RefusalReason::Unsorted
-        | RefusalReason::NullKeys
-        | RefusalReason::DuplicateKeys
-        | RefusalReason::KeyTypeMismatch
-        | RefusalReason::KeyTypeUnsupported
-        | RefusalReason::ValueTypeUnsupported
+        RefusalReason::KeyTypeUnsupported
         | RefusalReason::DeleteFiles
-        | RefusalReason::KeyTooLong
         | RefusalReason::NoLocalDir => reason.to_string(),
     }
 }
@@ -120,26 +133,63 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Why a table cannot be served correctly (RFD 007). Display gives the
 /// `snake_case` name that appears in logs, the doctor's output, and the
-/// `reason` metric label; the two variants that carry fields render their
-/// name alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// `reason` metric label; the variants that carry fields render their name
+/// alone, and `Error::Refused`'s message adds the fields.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RefusalReason {
-    /// A data file's key column is not sorted.
-    Unsorted,
+    /// A data file's key column is not sorted: a key of a row group is below
+    /// the one before it, or a row group's first key is below the previous
+    /// row group's last.
+    Unsorted {
+        /// The data file's location.
+        path: String,
+        /// The row group where the order breaks.
+        row_group: usize,
+    },
     /// A data file has a null key.
-    NullKeys,
-    /// One key appears in more than one row.
-    DuplicateKeys,
+    NullKeys {
+        /// The data file's location.
+        path: String,
+        /// The row group holding the null.
+        row_group: usize,
+    },
+    /// One key appears in more than one row: twice within `path`, or in
+    /// `path` and in an earlier file of the same bucket.
+    DuplicateKeys {
+        /// The data file the key appears in again.
+        path: String,
+        /// The repeated key.
+        key: Key,
+    },
     /// The key column's physical type is not the one its Iceberg type maps to.
-    KeyTypeMismatch,
+    KeyTypeMismatch {
+        /// The data file's location.
+        path: String,
+        /// The key type the snapshot's schema declares.
+        expected: KeyType,
+        /// The physical type the file stores the column as.
+        got: parquet::basic::Type,
+    },
     /// The key column's Iceberg type is not long, string, binary, fixed, or uuid.
     KeyTypeUnsupported,
-    /// The value column is not Iceberg binary, fixed, or string.
-    ValueTypeUnsupported,
+    /// The value column's physical type is neither `BYTE_ARRAY` nor
+    /// `FIXED_LEN_BYTE_ARRAY`, so its bytes have no defined encoding on the
+    /// wire (RFD 010).
+    ValueTypeUnsupported {
+        /// The data file's location.
+        path: String,
+        /// The physical type the file stores the column as.
+        got: parquet::basic::Type,
+    },
     /// The snapshot carries delete files.
     DeleteFiles,
     /// A key is longer than `contract::MAX_KEY_BYTES`.
-    KeyTooLong,
+    KeyTooLong {
+        /// The data file's location.
+        path: String,
+        /// The length of the file's longest key.
+        bytes: usize,
+    },
     /// A full-residency load would exceed its resident-bytes budget (RFD 017).
     OverBudget {
         /// The resident bytes the load would need.
@@ -149,6 +199,8 @@ pub enum RefusalReason {
     },
     /// Bloom residency on a file whose row group has no key bloom filter (RFD 017).
     NoBloomFilter {
+        /// The data file's location.
+        path: String,
         /// The row group without a filter.
         row_group: usize,
     },
@@ -159,14 +211,14 @@ pub enum RefusalReason {
 impl fmt::Display for RefusalReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Self::Unsorted => "unsorted",
-            Self::NullKeys => "null_keys",
-            Self::DuplicateKeys => "duplicate_keys",
-            Self::KeyTypeMismatch => "key_type_mismatch",
+            Self::Unsorted { .. } => "unsorted",
+            Self::NullKeys { .. } => "null_keys",
+            Self::DuplicateKeys { .. } => "duplicate_keys",
+            Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
-            Self::ValueTypeUnsupported => "value_type_unsupported",
+            Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
             Self::DeleteFiles => "delete_files",
-            Self::KeyTooLong => "key_too_long",
+            Self::KeyTooLong { .. } => "key_too_long",
             Self::OverBudget { .. } => "over_budget",
             Self::NoBloomFilter { .. } => "no_bloom_filter",
             Self::NoLocalDir => "no_local_dir",
@@ -221,20 +273,57 @@ mod tests {
     /// An id wider than 32 bits, so the round trip exercises the whole `i64`.
     const SAMPLE_SNAPSHOT_ID: i64 = 5_123_456_789_012;
 
+    /// A synthetic data file location for the reasons that name one.
+    const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
+
     #[test]
     fn test_fmt_refusal_reason_snake_case_names() {
         let cases = [
-            (RefusalReason::Unsorted, "unsorted"),
-            (RefusalReason::NullKeys, "null_keys"),
-            (RefusalReason::DuplicateKeys, "duplicate_keys"),
-            (RefusalReason::KeyTypeMismatch, "key_type_mismatch"),
+            (
+                RefusalReason::Unsorted {
+                    path: FILE_PATH.to_string(),
+                    row_group: 1,
+                },
+                "unsorted",
+            ),
+            (
+                RefusalReason::NullKeys {
+                    path: FILE_PATH.to_string(),
+                    row_group: 0,
+                },
+                "null_keys",
+            ),
+            (
+                RefusalReason::DuplicateKeys {
+                    path: FILE_PATH.to_string(),
+                    key: Key::Long(1),
+                },
+                "duplicate_keys",
+            ),
+            (
+                RefusalReason::KeyTypeMismatch {
+                    path: FILE_PATH.to_string(),
+                    expected: KeyType::Long,
+                    got: parquet::basic::Type::BYTE_ARRAY,
+                },
+                "key_type_mismatch",
+            ),
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
             (
-                RefusalReason::ValueTypeUnsupported,
+                RefusalReason::ValueTypeUnsupported {
+                    path: FILE_PATH.to_string(),
+                    got: parquet::basic::Type::INT64,
+                },
                 "value_type_unsupported",
             ),
             (RefusalReason::DeleteFiles, "delete_files"),
-            (RefusalReason::KeyTooLong, "key_too_long"),
+            (
+                RefusalReason::KeyTooLong {
+                    path: FILE_PATH.to_string(),
+                    bytes: 1,
+                },
+                "key_too_long",
+            ),
             (
                 RefusalReason::OverBudget {
                     needed: 1,
@@ -243,7 +332,10 @@ mod tests {
                 "over_budget",
             ),
             (
-                RefusalReason::NoBloomFilter { row_group: 0 },
+                RefusalReason::NoBloomFilter {
+                    path: FILE_PATH.to_string(),
+                    row_group: 0,
+                },
                 "no_bloom_filter",
             ),
             (RefusalReason::NoLocalDir, "no_local_dir"),
