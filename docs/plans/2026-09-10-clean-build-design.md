@@ -85,6 +85,8 @@ pub enum Error {
     File { path: String, fault: FileFault },
     /// The table has no serving generation yet.
     NotReady { table: String },
+    /// The local directory failed (RFD 017); the fault set is closed.
+    Local { path: PathBuf, fault: LocalFault },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -168,25 +170,53 @@ pub struct HedgeWindow;
 impl HedgeWindow { pub fn new(config: &HedgeConfig) -> Self; pub fn delay(&self) -> Option<Duration>; pub fn record(&self, elapsed: Duration, hedged: bool); }
 
 // local
+/// The width of the digest a chunk file is named by and a footer is
+/// identified by: SHA-256, which `digest` computes; the one home of the algorithm.
+pub const DIGEST_BYTES: usize = 32;
+pub fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES];
+/// Why the local directory failed; closed. `Io` is the operation's error, the
+/// rest are the format's boundaries and the blocking pool's.
+pub enum LocalFault { Io(std::io::Error), RangeNotResident { start: u64, end: u64 }, ChunkLengthMismatch { start: u64, end: u64, len: u64 }, ChunkOverlap { start: u64, end: u64 }, HeaderTooLarge { len: usize }, Join(tokio::task::JoinError) }
 pub struct LocalDir;
 impl LocalDir {
     pub fn open(config: &LocalConfig, stats: Arc<IoStats>) -> Result<Self>;
     /// The chunk file for a data file, identified by path, size, and footer digest; `None` if absent or stale.
     pub fn chunks_for(&self, identity: &DataFileIdentity) -> Result<Option<DiskChunks>>;
-    /// Writes verified key chunks as they stream; returns the handle the index keeps.
+    /// Writes verified key chunks, collected and sorted by data offset because the
+    /// header names every span before the first payload byte; returns the handle
+    /// the index keeps.
     pub fn write_chunks(&self, identity: &DataFileIdentity, chunks: impl Iterator<Item = (Range<u64>, Bytes)>) -> Result<DiskChunks>;
-    /// Deletes chunk files no current generation references.
+    /// Deletes chunk files no current generation references. `live` is the union
+    /// over every table sharing the directory.
     pub fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64>;
+    /// The bytes every file under `index/` occupies, and the bound from
+    /// `LocalConfig::index_budget_bytes`; `generation` compares them at the
+    /// footer stage (RFD 017).
+    pub fn index_bytes_in_use(&self) -> Result<u64>;
+    pub fn index_budget(&self) -> Option<u64>;
+    /// `None` when `page_cache_disk_bytes` is zero.
+    pub fn page_tier(&self) -> Option<DiskTier>;
 }
-/// A key page read from local disk on demand; implements the same `ChunkReader` surface as `Segments`.
+/// A key page read from local disk on demand. Not a `ChunkReader`: the index
+/// wraps the bytes a page read returns in a `Segments`.
 pub struct DiskChunks;
-impl DiskChunks { pub async fn page(&self, range: Range<u64>) -> Result<Bytes>; pub fn bytes_on_disk(&self) -> u64; }
+impl DiskChunks {
+    pub async fn page(&self, range: Range<u64>) -> Result<Bytes>;
+    /// Whether one stored chunk holds the whole range; checked before a reused file skips the chunk fetch.
+    pub fn holds(&self, range: &Range<u64>) -> bool;
+    pub fn bytes_on_disk(&self) -> u64;
+}
 /// What a chunk file is named by and validated against; written into its
 /// header inside the RFD 011 envelope as a `ChunkFileHeader` message.
-pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest: [u8; 32] }
-/// The page cache's disk level, handed to `PageCache` by `local` (RFD 017).
+pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest: [u8; DIGEST_BYTES] }
+/// The header, a `pub(crate)` prost message declared in `local` (section 4);
+/// its spans are what lets a restart serve pages without the footer.
+// message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; }
+// message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
+/// The page cache's disk level, handed to `PageCache` by `local` (RFD 017):
+/// the `cache/` directory and its size bound.
 pub struct DiskTier;
-impl LocalDir { pub fn page_tier(&self) -> Option<DiskTier>; }
+impl DiskTier { pub fn dir(&self) -> &Path; pub fn capacity_bytes(&self) -> u64; }
 pub struct Located { pub store: Arc<dyn ObjectStore>, pub path: object_store::path::Path }
 pub struct Storage;
 impl Storage {
@@ -421,12 +451,16 @@ enum KeyType { KEY_TYPE_UNSPECIFIED = 0; KEY_TYPE_LONG = 1; KEY_TYPE_STRING = 2;
 message TableInfoResponse { string table = 1; int64 snapshot_id = 2; uint32 buckets = 3; uint64 data_files = 4; uint64 records = 5; KeyType key_type = 6; uint64 index_bytes = 7; }
 ```
 
-A second file carries the one message icetray persists for itself, the
-header of a chunk file (RFD 011's envelope: a magic byte, a version, then
-this message length-prefixed):
+The one message icetray persists for itself, the header of a chunk file, is
+not in this crate. It is a prost message declared in `icetray-core::local`
+beside its reader, inside RFD 011's envelope (a magic byte, a version, then
+the message length-prefixed), with no `.proto` file: nothing outside icetray
+reads a chunk file, and `icetray-core` depends on no workspace crate. As
+built:
 
 ```proto
-message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; }
+message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; }
+message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
 ```
 
 Comments describe the contract, not internals. Generated code is included
@@ -441,7 +475,8 @@ Health is `grpc.health.v1` from the tonic health crate, not our proto.
 **Local directory.** Optional (`storage.local`). Chunk files under
 `index/`, named by a digest of the data file's path, each carrying a
 `ChunkFileHeader` inside the RFD 011 envelope; the page cache's disk level
-under `cache/`, handed to `PageCache` as a `DiskTier`.
+under `cache/`, handed to `PageCache` as a `DiskTier`, or none when
+`page_cache_disk_bytes` is zero.
 Disk residency reads pages with positioned reads on a blocking pool, never
 mmap, so every local read is counted and no page fault stalls a worker.
 Startup reuses chunk files whose identity matches; a generation swap

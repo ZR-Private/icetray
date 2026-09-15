@@ -29,8 +29,8 @@ RFDs your brief cites, and the blueprint's sections 2, 3, and 6.
 ## Stage 1: foundations (one worker, in order)
 
 Owns: the workspace, `error`, `approx`, `key`, `bucket`, `contract`,
-`config`, `storage`, `parquet_io`, `index`, `cache`. Nothing else may start
-until these signatures exist and compile.
+`config`, `storage`, `local`, `parquet_io`, `index`, `cache`. Nothing else
+may start until these signatures exist and compile.
 
 1. Workspace: four crates per blueprint section 1, `[workspace.dependencies]`
    with versions from `cargo add` and never from memory, the lint table of
@@ -112,8 +112,8 @@ bytes.
 Owns `icetray-proto` and the `icetray` crate. RFD 010, RFD 012, RFD 016's
 exit codes.
 
-The proto is blueprint section 4 verbatim, including the chunk-file header
-message and a vendored protobuf compiler so a source build needs none.
+The proto is blueprint section 4 verbatim, with a vendored protobuf compiler
+so a source build needs none.
 `serve` binds the gRPC and metrics listeners and registers health before
 loading, flips readiness when every table serves, refreshes per table, and
 drains on SIGTERM. The one-shot subcommands share one flag vocabulary with
@@ -142,21 +142,9 @@ passed; every `RefusalReason` variant has exactly one fixture.
 
 ## Stage 2E: local disk
 
-Owns `local`, and the disk level inside `cache`. RFD 017, RFD 012.
-
-Chunk files under `index/`, named by a digest of the data file's path, each
-carrying a `ChunkFileHeader` inside the envelope of RFD 011. Identity is
-path, size, and footer digest; a matching file is reused on restart and the
-chunk fetch is skipped. A generation that drops a file deletes its chunk
-file. Pages are read with positioned reads on a blocking pool, never mapped,
-and every read is counted. The page cache's disk level takes a `DiskTier`
-from here.
-
-Invariants: a disk-tier cold hit is one GET and one local read, a miss one
-local read and no GET; a restart with matching chunk files fetches footers
-only; a dropped file's chunk file is deleted; no local directory is a typed
-refusal; a page evicted from memory is served from disk with no GET and
-survives a restart.
+Built in stage 1, after `storage`, because `index` and `cache` call into it.
+Its invariants are proved by the disk-tier acceptance tests, which stage 2D
+owns.
 
 ## Stage 3: integration (one worker)
 

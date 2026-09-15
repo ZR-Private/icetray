@@ -37,7 +37,13 @@ signatures.
    a sliding window of lookup GET latencies, rate ceiling), load-path reads
    never hedged. Unit tests with a counting credential provider and an
    in-memory store.
-5. `parquet_io` and `index`: footer load, `Segments`, `FileIndex::build`
+5. `local`: the directory layout, chunk-file identity and reuse, deletion
+   with the generation, disk budget accounting, local-read counting,
+   `DiskChunks` with positioned reads on a blocking pool, and the `DiskTier`
+   handle the page cache's disk level is built from. Built here rather than
+   in stage 2 because `FileIndex::build` and `PageCache::new` call into it
+   and nothing is stubbed.
+6. `parquet_io` and `index`: footer load, `Segments`, `FileIndex::build`
    with the refusals and both residency tiers (carry the prototype's bloom
    path and its tests), `find` over exact fences, `read_value`, `page_of`,
    `predicted_resident_bytes`; the value column's column index dropped after
@@ -45,11 +51,11 @@ signatures.
    misaligned pages, dictionary-encoded value column, dictionary-encoded key
    column, several row groups with statistics disabled, keys at and over the
    cap.
-6. `cache` with hits and fetches counted after coalescing.
+7. `cache` with hits and fetches counted after coalescing.
 
 ## Stage 2: fan-out on frozen seams
 
-Five workers in parallel, each against the signatures in the blueprint. None
+Four workers in parallel, each against the signatures in the blueprint. None
 changes a signature without updating the blueprint first.
 
 - **A. Tables.** `catalog` (static, hint, REST construction; one-read change
@@ -64,11 +70,6 @@ changes a signature without updating the blueprint first.
   allows, round-trip tests), the `icetray` binary's `serve` subcommand
   (service, health, readiness, per-table refresh tasks, twelve-factor main,
   graceful shutdown).
-- **E. Local disk.** `local`: the directory layout, chunk-file identity
-  and reuse, deletion with the generation, the disk budget, local-read
-  counting, `DiskChunks` with positioned reads on a blocking pool, and the
-  page cache's disk tier through the cache library's hybrid mode. Depends on
-  the `FileIndex::build` seam and `IoStats`, both frozen.
 - **D. Testkit.** Carry the fixture writer, in-process S3, simulation
   transport, and acceptance tests; rewrite `verify` on `Generation::plan`;
   add the new fixtures (delete file, evolved spec, permuted-key overlap,
@@ -76,7 +77,7 @@ changes a signature without updating the blueprint first.
   locator by environment variable with visible skip; dependency split.
 
 Order of merges: D's fixtures and A's tables first (they test each other),
-then E, then B, then C.
+then B, then C.
 
 ## Stage 3: integration
 
