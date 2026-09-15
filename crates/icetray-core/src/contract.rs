@@ -14,6 +14,14 @@ pub const PAGE_ROWS: i64 = 1_000;
 /// layout was measured at (RFD 002).
 pub const VALUE_PAGE_BYTES: u64 = 64 * 1024;
 
+/// The block of the page cache's disk level (RFD 017): the level's unit of
+/// eviction and the largest page it can hold. Sixty-four value pages of
+/// `VALUE_PAGE_BYTES`, four mebibytes, so eviction keeps the level within a
+/// few dozen pages of its bound. Below one block the level has no block to
+/// write into and holds nothing, so `page_cache_disk_bytes` is zero or at
+/// least this; `config` checks the bound and `cache` sizes its blocks by it.
+pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
+
 /// The lower end of the data file size target, 32 mebibytes. Smaller files
 /// mean more files for the same bytes: more footer GETs at load and more
 /// index bytes per key (RFD 002).

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::Result;
 use crate::time;
 
@@ -110,6 +111,17 @@ pub enum ConfigViolation {
     /// Disk residency with no local directory to write chunk files to.
     #[error("disk residency needs a local directory under storage.local")]
     DiskResidencyWithoutLocalDir,
+    /// A page cache disk level smaller than its one block, which would hold
+    /// nothing (RFD 017); zero turns the level off instead.
+    #[error(
+        "page_cache_disk_bytes {bytes} is below one block of {minimum} bytes; zero means no disk level"
+    )]
+    PageCacheDiskTooSmall {
+        /// The configured size.
+        bytes: u64,
+        /// The smallest level that holds a page: one block.
+        minimum: u64,
+    },
     /// The hedge percentile is outside `(0, 1]`; the delay is that percentile
     /// of the latency window (RFD 013).
     #[error("hedge percentile {percentile} is not in (0, 1]")]
@@ -192,6 +204,15 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         && s3.access_key_id.is_some() != s3.secret_access_key.is_some()
     {
         return Err(ConfigViolation::IncompleteStaticKeys);
+    }
+    if let Some(local) = &config.storage.local
+        && local.page_cache_disk_bytes > 0
+        && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
+    {
+        return Err(ConfigViolation::PageCacheDiskTooSmall {
+            bytes: local.page_cache_disk_bytes,
+            minimum: PAGE_CACHE_DISK_BLOCK_BYTES,
+        });
     }
     let mut names = HashSet::new();
     for table in &config.tables {
@@ -366,7 +387,9 @@ pub struct LocalConfig {
     pub dir: PathBuf,
     /// The bytes chunk files may occupy across every table; unbounded when absent.
     pub index_budget_bytes: Option<u64>,
-    /// The size bound of the page cache's disk level.
+    /// The size bound of the page cache's disk level: zero means no disk
+    /// level, anything else at least `contract::PAGE_CACHE_DISK_BLOCK_BYTES`,
+    /// the level's one block.
     pub page_cache_disk_bytes: u64,
 }
 
@@ -876,10 +899,42 @@ locaton = "typo"
         assert_eq!(violation(&bloom), ConfigViolation::BudgetWithoutResidency);
         // Disk has its local directory, so the budget is the only fault.
         let disk = format!(
-            "{}\nresidency = \"disk\"\nresident_budget_bytes = 1\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = 1\n",
+            "{}\nresidency = \"disk\"\nresident_budget_bytes = 1\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {PAGE_CACHE_DISK_BLOCK_BYTES}\n",
             TOML_MINIMAL.trim_end()
         );
         assert_eq!(violation(&disk), ConfigViolation::BudgetWithoutResidency);
+    }
+
+    #[test]
+    fn test_parse_refuses_page_cache_disk_below_one_block() {
+        let with_disk_level = |bytes: u64| {
+            format!(
+                "{}\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {bytes}\n",
+                TOML_MINIMAL.trim_end()
+            )
+        };
+        let just_below = PAGE_CACHE_DISK_BLOCK_BYTES - 1;
+        assert_eq!(
+            violation(&with_disk_level(just_below)),
+            ConfigViolation::PageCacheDiskTooSmall {
+                bytes: just_below,
+                minimum: PAGE_CACHE_DISK_BLOCK_BYTES,
+            }
+        );
+        assert_eq!(
+            violation(&with_disk_level(1)),
+            ConfigViolation::PageCacheDiskTooSmall {
+                bytes: 1,
+                minimum: PAGE_CACHE_DISK_BLOCK_BYTES,
+            }
+        );
+        let one_block = Config::parse(&with_disk_level(PAGE_CACHE_DISK_BLOCK_BYTES)).unwrap();
+        assert_eq!(
+            one_block.storage.local.unwrap().page_cache_disk_bytes,
+            PAGE_CACHE_DISK_BLOCK_BYTES
+        );
+        let no_level = Config::parse(&with_disk_level(0)).unwrap();
+        assert_eq!(no_level.storage.local.unwrap().page_cache_disk_bytes, 0);
     }
 
     #[test]

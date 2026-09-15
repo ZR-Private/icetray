@@ -18,7 +18,7 @@ pub mod storage;
 pub mod time;
 
 pub use bucket::bucket;
-pub use cache::CacheError;
+pub use cache::{CacheError, PageCache};
 pub use check::FindingCode;
 pub use config::{
     Config, ConfigError, ConfigViolation, HedgeConfig, LocalConfig, LogConfig, Residency,

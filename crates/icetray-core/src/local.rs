@@ -468,10 +468,14 @@ impl LocalDir {
 
     /// The page cache's disk level, or `None` when
     /// `LocalConfig::page_cache_disk_bytes` is zero and there is no level.
+    /// A level is at least one block, `contract::PAGE_CACHE_DISK_BLOCK_BYTES`,
+    /// which `Config::parse` checks: below that the level has no block to
+    /// write into and would hold nothing.
     pub fn page_tier(&self) -> Option<DiskTier> {
         (self.page_cache_disk_bytes > 0).then(|| DiskTier {
             dir: self.cache_dir.clone(),
             capacity_bytes: self.page_cache_disk_bytes,
+            stats: Arc::clone(&self.stats),
         })
     }
 
@@ -686,14 +690,16 @@ impl ChunkFile {
     }
 }
 
-/// The page cache's disk level (RFD 017): the `cache/` directory and its
-/// size bound, handed to `PageCache` by `LocalDir::page_tier`. Pages there
-/// are keyed by file and offset and evicted by size alone, never for
-/// staleness, since a data file never changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The page cache's disk level (RFD 017): the `cache/` directory, its size
+/// bound, and the counter a page served from it is charged to, handed to
+/// `PageCache` by `LocalDir::page_tier`. Pages there are keyed by file and
+/// offset and evicted by size alone, never for staleness, since a data
+/// file never changes.
+#[derive(Clone, Debug)]
 pub struct DiskTier {
     dir: PathBuf,
     capacity_bytes: u64,
+    stats: Arc<IoStats>,
 }
 
 impl DiskTier {
@@ -706,6 +712,12 @@ impl DiskTier {
     /// The bytes the level may occupy; above zero, or there is no level.
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
+    }
+
+    /// The counter every page served from the level is charged to as one
+    /// local read (RFD 003): the same one `LocalDir` charges chunk reads to.
+    pub(crate) fn stats(&self) -> &Arc<IoStats> {
+        &self.stats
     }
 }
 
@@ -1671,7 +1683,7 @@ mod tests {
     fn test_page_tier_none_at_zero_budget() {
         let dir = tempfile::tempdir().unwrap();
         let local = LocalDir::open(&config(dir.path(), 0), Arc::new(IoStats::default())).unwrap();
-        assert_eq!(local.page_tier(), None);
+        assert!(local.page_tier().is_none());
     }
 
     #[test]
