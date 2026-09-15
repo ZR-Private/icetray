@@ -90,8 +90,12 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Named refusals (RFD 007). Display gives the snake_case name used in logs.
-pub enum RefusalReason { Unsorted, NullKeys, DuplicateKeys, KeyTypeMismatch, KeyTypeUnsupported, ValueTypeUnsupported, DeleteFiles, KeyTooLong, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { row_group: usize }, NoLocalDir }
+/// Named refusals (RFD 007). Display gives the snake_case name used in logs;
+/// the fields name the file, row group, type, key, or bytes a reader has to
+/// act on, and `Error::Refused`'s message carries them. Clone, not Copy.
+/// `DuplicateKeys` names the file the key appears in again: the same file
+/// for a duplicate within one file, the later file of a bucket otherwise.
+pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { path: String, got: parquet::basic::Type }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize }, NoLocalDir }
 /// A snapshot id is not an integer; it is never compared with one.
 pub struct SnapshotId(pub i64);
 /// Metric label values for lookups.
@@ -278,6 +282,11 @@ impl FileHandle {
     pub fn open(storage: Arc<Storage>, location: &str, size: u64, hedge: Arc<HedgeWindow>) -> Result<Self>;
     pub fn size(&self) -> u64;
     pub fn storage(&self) -> &Arc<Storage>;
+    /// `local::digest` of the footer (the thrift metadata and the eight
+    /// trailing bytes), the `footer_digest` of a `DataFileIdentity`; `Some`
+    /// once `load_metadata` has returned, computed from the bytes that load
+    /// fetched, so it costs no request of its own.
+    pub fn footer_digest(&self) -> Option<[u8; local::DIGEST_BYTES]>;
     /// Load path, never hedged: one load GET per range.
     pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes>;
     pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
@@ -286,6 +295,8 @@ impl FileHandle {
     /// The footer and both page indexes behind a tail prefetch: one load GET
     /// when the tail fits it, one more when the indexes start before the
     /// prefetched tail, two more when the thrift metadata itself does not fit.
+    /// The page indexes are read when the file has them; a file without them
+    /// loads with neither and `index` refuses it as `FileFault::MissingPageIndex`.
     /// A failed fetch comes back as the storage error it was, not as a parquet error.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
     pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<Bytes>;
@@ -303,24 +314,35 @@ impl parquet::file::reader::ChunkReader for Segments { /* errors, typed as Segme
 // index (MAX_KEY_BYTES comes from `contract`)
 pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// What makes a data file unservable beyond the contract refusals; closed set.
-pub enum FileFault { MissingColumn(String), UnexpectedPhysicalType { expected: &'static str, got: String }, MissingPageIndex, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize } }
+/// A physical type that does not match is a refusal (`KeyTypeMismatch`,
+/// `ValueTypeUnsupported`), never a fault. `InconsistentRowCounts`,
+/// `InconsistentOffsetIndex`, and `PageRowsMismatch` are a footer that the
+/// file contradicts: a negative count or row groups that do not sum to the
+/// file's, an offset index whose pages are not where or what it says, a key
+/// or value page holding other rows than its offset index gives it.
+pub enum FileFault { MissingColumn(String), MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnsizedBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64> }
 pub struct FileIndex;
 impl FileIndex {
-    /// Refuses (typed) an unsorted or null key column, a key physical type
-    /// that does not match `key_type` (Binary accepts BYTE_ARRAY and
-    /// FIXED_LEN_BYTE_ARRAY), a value column whose physical type is neither
-    /// BYTE_ARRAY nor FIXED_LEN_BYTE_ARRAY, keys over the cap, in the
-    /// Bloom tier a row group without a key bloom filter, and in the Disk
-    /// tier the absence of a local directory. Every tier streams the key
-    /// chunks once for verification; Full keeps them in memory, Disk writes
-    /// them through `LocalDir` (or reuses a chunk file with matching
-    /// identity and skips the chunk fetch), Bloom keeps filters. The value
-    /// column's column index is dropped after the offset index is taken; it
-    /// is never part of the resident set.
-    pub async fn build(handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
-    /// Every tier's resident bytes for this file, from the footer alone.
+    /// Refuses (typed, under `table`) an unsorted key column, a null key, a
+    /// key repeated within the file, a key physical type that does not match
+    /// `key_type` (Binary accepts BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY), a
+    /// value column whose physical type is neither BYTE_ARRAY nor
+    /// FIXED_LEN_BYTE_ARRAY, keys over the cap, in the Bloom tier a row group
+    /// without a key bloom filter, and in the Disk tier the absence of a
+    /// local directory. Every tier streams the key chunks once for
+    /// verification, checking every key page against its offset index; Full
+    /// keeps the chunks in memory, Disk writes them through `LocalDir` (or
+    /// reuses a chunk file with matching identity and skips the chunk fetch),
+    /// Bloom keeps filters. The column index of every column but the key is
+    /// dropped after the offset indexes are taken; it is never part of the
+    /// resident set.
+    pub async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
+    /// Every tier's resident bytes for this file, from the footer alone, the
+    /// same from the footer as loaded and as kept: no other column's column
+    /// index is counted either way, so the budget check at the footer stage
+    /// predicts what `resident_bytes` reports.
     pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> ResidentBytes;
     pub fn key_range(&self) -> (&Key, &Key);
     pub fn may_contain(&self, key: &Key) -> bool;
@@ -334,10 +356,33 @@ impl FileIndex {
     pub fn resident_bytes(&self) -> usize;
     pub fn max_key_bytes(&self) -> usize;
     pub fn metadata(&self) -> &Arc<ParquetMetaData>;
-    /// The page a key would decode and the value page it would fetch, for tests and the doctor.
+    /// The page a key would decode and the value page it would fetch, for
+    /// tests and the doctor; `None` when `find` would decode nothing (a key
+    /// outside the range, between two row groups, or ruled out by the Bloom
+    /// tier's filter), so `Generation::plan` predicts the key-page GET from it.
     pub fn page_of(&self, key: &Key) -> Option<PageRef>;
+    /// For `generation` and `check`, in-crate: the tier built, the file, its
+    /// row count, the key and value leaves, the fences per row group, the key
+    /// pages of a row group and the rows one of them holds.
+    pub fn residency(&self) -> Residency; pub fn handle(&self) -> &Arc<FileHandle>; pub fn rows(&self) -> i64; pub fn key_leaf(&self) -> usize; pub fn value_leaf(&self) -> usize; pub fn fences(&self) -> &[Vec<Key>]; pub fn page_count(&self, row_group: usize) -> usize; pub fn page_rows(&self, row_group: usize, page: usize) -> Range<i64>;
+    /// The key column of a row group, or one page of it, decoded from `chunks` with no I/O; for the overlap check.
+    pub fn decode_keys(&self, row_group: usize, page: Option<usize>, chunks: &Segments) -> Result<Keys>;
+    /// The key chunks for the overlap check: Full hands out the resident
+    /// chunks at no cost, Disk reads them back as one counted local read per
+    /// row group and no GET, Bloom fetches them again as one counted load GET
+    /// per row group.
+    pub async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>>;
 }
-pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_offset: u64 }
+/// A decoded run of keys in file order, one arm per key type over the values
+/// parquet decoded, searched and compared in the served order; an in-crate
+/// helper, not re-exported from `lib.rs`.
+pub enum Keys { Long(Vec<i64>), Str(Vec<ByteArray>), Bin(Vec<ByteArray>), Uuid(Vec<[u8; UUID_BYTES]>) }
+impl Keys { pub fn key_type(&self) -> KeyType; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; pub fn get(&self, at: usize) -> Key; pub fn binary_search(&self, key: &Key) -> Result<usize, usize>; pub fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering; pub fn max_len(&self) -> usize; pub fn is_strictly_increasing(&self) -> bool; pub fn first_not_increasing(&self) -> Option<(usize, Ordering)>; }
+/// `value_page_offset` is `Some` in the Full tier for a present key, where
+/// the key page is resident and decodes without I/O; `None` for an absent
+/// key and in the Disk and Bloom tiers, where naming the value page would
+/// take a read.
+pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_offset: Option<u64> }
 
 // cache
 /// `Backend` keeps foyer's error whole: it is `std::error::Error + Send + Sync`
@@ -473,13 +518,17 @@ form of the `FindingCode` variant; code never compares these strings:
 | `bloom_undersized` | Advice | bloom bits per key below `BLOOM_BITS_PER_KEY_MIN` (the Bloom tier's miss cost rises) | | `write.parquet.bloom-filter-ndv.column.<key>` (Iceberg 1.11+) |
 
 Refusals (never findings; `Error::Refused` at load) are the `RefusalReason`
-variants: unsorted, null keys, duplicate keys, key type mismatch, key type
-unsupported (the key column's Iceberg type is none of long, string, binary,
-fixed, or uuid), value type unsupported (the value column must be Iceberg
-binary, fixed, or string, served as opaque bytes), delete files, key too
-long, and the three residency refusals of RFD 017: over budget, no local
-directory, no bloom filter. The prototype's per-table `key_chunk_cost` line
-becomes a `FileReport` field, not a finding.
+variants: unsorted (a key below the one before it, within a row group or
+across two), null keys, duplicate keys (a key equal to the one before it
+within a file, or shared by two files of a bucket; never reported as
+unsorted), key type mismatch, key type unsupported (the key column's Iceberg
+type is none of long, string, binary, fixed, or uuid), value type
+unsupported (the value column must be Iceberg binary, fixed, or string,
+served as opaque bytes), delete files, key too long, and the three residency
+refusals of RFD 017: over budget, no local directory, no bloom filter. The
+reasons raised for one file carry its path, so a log line names the file.
+The prototype's per-table `key_chunk_cost` line becomes a `FileReport`
+field, not a finding.
 
 ## 4. `icetray-proto`
 
@@ -597,7 +646,7 @@ skip).
 | Layout follows the snapshot's schema and each manifest's spec; an evolved bucket count routes correctly | P (or U on hand-built metadata if the writer cannot evolve a spec) |
 | Overlapping files without duplicates serve correctly and are priced as files probed | P |
 | Unpartitioned tables serve correctly and are priced | P |
-| A dictionary-encoded value column costs one extra GET; a dictionary-encoded key column costs none | U |
+| A dictionary-encoded value column costs one extra GET; a dictionary-encoded key column costs none in the Full tier, one more local read per find in the Disk tier, and in the Bloom tier one more GET on the first positive in a row group and none after | U |
 | Keys over `MAX_KEY_BYTES` are refused; keys over the advice length serve with advice | P |
 | `Generation::plan` predicts exactly the GETs a `multi_get` issues | P |
 | Concurrent lookups for one page coalesce to one fetch | P |
