@@ -1,0 +1,171 @@
+// The client contract of icetray: read-only get-by-key lookups over Apache
+// Iceberg tables, spoken over gRPC. Clients in any language are generated
+// from this file; icetray ships no hand-written client. JSON exists only as
+// the output of the operator subcommands (`doctor`, `get`, `info`) and is
+// never a transport.
+//
+// Every comment states what a caller may rely on, never how the server
+// produces it. Field numbers are never reused.
+syntax = "proto3";
+
+package icetray.v1;
+
+// Lookups over the tables the server is configured to serve. Naming a table
+// the server does not serve is a NOT_FOUND error. Sending a key whose
+// variant does not match the table's key type, or a key with no variant
+// set, is an INVALID_ARGUMENT error. A key that is not in the table is a
+// normal answer, never an error.
+service Icetray {
+  // Look up one key in one table. The answer carries the snapshot id it was
+  // read from.
+  rpc Get(GetRequest) returns (GetResponse);
+  // Look up many keys in one table. The results are in request order and
+  // all come from one snapshot. When any key cannot be answered the whole
+  // call fails and the caller retries the batch it built; a response never
+  // answers only some of the keys.
+  rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
+  // Describe the snapshot the server currently serves for a table.
+  rpc TableInfo(TableInfoRequest) returns (TableInfoResponse);
+}
+
+// A lookup key. The variant must match the table's key type, which
+// TableInfoResponse.key_type reports; sending another variant is an
+// INVALID_ARGUMENT error.
+message Key {
+  // Exactly one variant is set.
+  oneof key {
+    // The key of a table whose key type is KEY_TYPE_LONG: a signed 64-bit
+    // integer.
+    int64 long = 1;
+    // The key of a table whose key type is KEY_TYPE_STRING: UTF-8 text,
+    // matched as its bytes.
+    string str = 2;
+    // The key of a table whose key type is KEY_TYPE_BINARY or KEY_TYPE_UUID.
+    // `bin` carries binary, fixed, and uuid keys, and the table's key type
+    // says how its bytes are read: a binary or fixed key is the column's
+    // bytes, matched bytewise; a uuid key is the sixteen bytes of the UUID.
+    // The bytes pass through unchanged, so a composite key is the caller's
+    // encoding into them.
+    bytes bin = 3;
+  }
+}
+
+// One lookup in one table.
+message GetRequest {
+  // The name the server is configured to serve the table under. A name the
+  // server does not serve is a NOT_FOUND error.
+  string table = 1;
+  // The key to look up. Its variant must match the table's key type; a
+  // request that omits it is an INVALID_ARGUMENT error.
+  Key key = 2;
+}
+
+// The outcome of one lookup. The three answered outcomes are distinct on
+// the wire: a key whose value is null is not an absent key.
+enum Presence {
+  // Never sent by the server. It is the proto3 default, so a message that
+  // reads as unspecified was not answered.
+  PRESENCE_UNSPECIFIED = 0;
+  // The key is in the snapshot and its value is not null; `value` carries
+  // the value's bytes.
+  PRESENCE_PRESENT = 1;
+  // The key is in the snapshot and its value is null; `value` is empty.
+  // What a null value means is the table owner's rule.
+  PRESENCE_NULL = 2;
+  // The key is not in the snapshot; `value` is empty. A miss is a normal
+  // answer, not an error.
+  PRESENCE_ABSENT = 3;
+}
+
+// The answer to one lookup.
+message GetResponse {
+  // Whether the key is in the snapshot and, when it is, whether its value
+  // is null.
+  Presence presence = 1;
+  // The value's bytes, unchanged from the table, when presence is
+  // PRESENCE_PRESENT; empty otherwise. An empty value under
+  // PRESENCE_PRESENT is a present value of zero length.
+  bytes value = 2;
+  // The Iceberg snapshot id the answer was read from. Two answers carrying
+  // different ids came from different snapshots of the table.
+  int64 snapshot_id = 3;
+}
+
+// Several lookups in one table, all answered from one snapshot.
+message MultiGetRequest {
+  // The name the server is configured to serve the table under. A name the
+  // server does not serve is a NOT_FOUND error.
+  string table = 1;
+  // The keys to look up. Every variant must match the table's key type.
+  // The response carries one result per key, in this order.
+  repeated Key keys = 2;
+}
+
+// The answer to one key of a MultiGet. It carries no snapshot id of its
+// own: every result of a batch came from the one snapshot named on the
+// MultiGetResponse.
+message Hit {
+  // Whether the key is in the snapshot and, when it is, whether its value
+  // is null.
+  Presence presence = 1;
+  // The value's bytes, unchanged from the table, when presence is
+  // PRESENCE_PRESENT; empty otherwise.
+  bytes value = 2;
+}
+
+// The answers to a MultiGet. The call fails as a whole when any key cannot
+// be answered, so a response answers every key of the request.
+message MultiGetResponse {
+  // One result per requested key, in request order: results[i] answers
+  // keys[i].
+  repeated Hit results = 1;
+  // The Iceberg snapshot id every result was read from. A batch is
+  // consistent with itself: no two of its results come from different
+  // snapshots.
+  int64 snapshot_id = 2;
+}
+
+// A request to describe the snapshot the server serves for one table.
+message TableInfoRequest {
+  // The name the server is configured to serve the table under. A name the
+  // server does not serve is a NOT_FOUND error.
+  string table = 1;
+}
+
+// The Iceberg type of a table's key column. It decides which Key variant a
+// lookup sends and how a `bin` key's bytes are read; clients switch on it.
+enum KeyType {
+  // Never sent by the server. It is the proto3 default, so a message that
+  // reads as unspecified was not answered.
+  KEY_TYPE_UNSPECIFIED = 0;
+  // Iceberg `long`. Lookups send Key.long.
+  KEY_TYPE_LONG = 1;
+  // Iceberg `string`. Lookups send Key.str.
+  KEY_TYPE_STRING = 2;
+  // Iceberg `binary` or `fixed`. Lookups send Key.bin with the key's bytes.
+  KEY_TYPE_BINARY = 3;
+  // Iceberg `uuid`. Lookups send Key.bin with the sixteen bytes of the UUID.
+  KEY_TYPE_UUID = 4;
+}
+
+// The snapshot the server currently serves for a table.
+message TableInfoResponse {
+  // The name the table was requested under.
+  string table = 1;
+  // The Iceberg snapshot id being served. Get and MultiGet answers for the
+  // table carry this id until the table advances to another snapshot.
+  int64 snapshot_id = 2;
+  // The bucket count of the key column's bucket partition; 0 when the
+  // table is not bucket-partitioned.
+  uint32 buckets = 3;
+  // The number of data files in the served snapshot.
+  uint64 data_files = 4;
+  // The number of rows in the served snapshot.
+  uint64 records = 5;
+  // The key column's type. It says which Key variant a lookup must send
+  // and how a `bin` key's bytes are read.
+  KeyType key_type = 6;
+  // The bytes resident in memory for this table's lookup index, as one
+  // total with no breakdown.
+  uint64 index_bytes = 7;
+}
