@@ -143,6 +143,31 @@ Iceberg's own uuid type, which the golden script cannot write.
 Invariants: a gated test that cannot run reports as skipped and never as
 passed; every `RefusalReason` variant has exactly one fixture.
 
+Invariants the tables stage proved at unit tier only, or not at all, and
+defers here:
+
+- A `TableSource::Catalog` built by `from_config` resolving through a real
+  REST catalog (`load_table` over HTTP, metadata and location taken from the
+  loaded table): `from_config` construction is unit-tested and the catalog
+  path is proved with iceberg's in-process `MemoryCatalog` (zero
+  object-storage GETs), but the REST client itself needs the container-gated
+  catalog fixture (RFD 014).
+- `TableFault::BucketValueMissing` for a non-null, non-integer bucket
+  literal: iceberg-rust's manifest writer serializes the partition tuple by
+  the spec's type and cannot write one; only the null-bucket case is proved
+  at unit tier.
+- `Generation::load` in the Bloom tier (overlap verification re-fetching
+  chunks as load GETs, filters kept): the index tier proves the per-file
+  costs; the generation tests run Full and Disk. The Bloom acceptance suite
+  (RFD 017) should count a Bloom generation load.
+- The retain live set as the union over every table sharing a local
+  directory: `Generation::identities()` is proved to equal the chunk files on
+  disk for one table; the union is `table`/`open`'s to build and the
+  disk-tier acceptance tests to count.
+- Load GET count for files with several row groups through
+  `Generation::load` (one chunk GET per row group): proved at the index tier;
+  the generation end-to-end fixture writes single-row-group files.
+
 ## Stage 2E: local disk
 
 Built in stage 1, after `storage`, because `index` and `cache` call into it.

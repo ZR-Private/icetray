@@ -81,6 +81,12 @@ pub enum Error {
     /// The table serves at a cost and `strict` is on.
     Inefficient { table: String, findings: Vec<FindingCode> },
     KeyType { table: String, expected: KeyType, got: KeyType },
+    /// The table's metadata makes it unusable before any data file is read;
+    /// the fault set is closed (`TableFault`, under `catalog`). `table` is the
+    /// configured name, or, for a fault raised while a `TableSource` resolves
+    /// and no table has been named yet, the source itself: the static
+    /// location or the catalog identifier.
+    Table { table: String, fault: TableFault },
     /// A data file is malformed for serving; the fault set is closed.
     File { path: String, fault: FileFault },
     /// The table has no serving generation yet.
@@ -95,7 +101,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// act on, and `Error::Refused`'s message carries them. Clone, not Copy.
 /// `DuplicateKeys` names the file the key appears in again: the same file
 /// for a duplicate within one file, the later file of a bucket otherwise.
-pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { path: String, got: parquet::basic::Type }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize }, NoLocalDir }
+/// `ValueTypeUnsupported` is raised from the snapshot's schema by
+/// `TableLayout::derive`, so it names no file and carries the Iceberg type's
+/// `Display` (the type does not implement `Hash`); a data file whose physical
+/// type contradicts an admitted schema type is `FileFault::ValuePhysicalType`.
+pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize }, NoLocalDir }
 /// A snapshot id is not an integer; it is never compared with one.
 pub struct SnapshotId(pub i64);
 /// Metric label values for lookups.
@@ -248,29 +258,75 @@ impl Storage {
 }
 
 // catalog
+/// What makes a table unusable before any data file is read (`Error::Table`);
+/// closed. `RefNotFound` is the one ref fault: iceberg-rust validates every
+/// ref against the snapshot list when metadata is parsed or built, so a ref
+/// that is present names a snapshot the metadata holds, and metadata whose
+/// ref names a missing snapshot is refused at the parse boundary as
+/// `Error::Json`. `BucketValueMissing` covers a null, another type, or a
+/// negative value where the spec puts the key's bucket.
+pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown }
 pub struct Resolved { pub metadata: Arc<TableMetadata>, pub location: String }
-impl Resolved { pub fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>>; }
+impl Resolved {
+    /// A ref the metadata lacks is `TableFault::RefNotFound` under `table`.
+    pub fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>>;
+}
 pub enum TableSource { Static { location: String }, Catalog { catalog: Arc<dyn Catalog>, ident: TableIdent } }
 impl TableSource {
     /// Builds REST clients too; the only place a catalog client is constructed.
+    /// Async because the REST builder is; constructing a client sends nothing.
     pub async fn from_config(cfg: &SourceConfig) -> Result<Self>;
+    /// A static location ending in `.metadata.json` names the file itself and
+    /// never advances; any other is a table root followed through
+    /// `metadata/version-hint.text`, whose content is a bare version, a file
+    /// name under `metadata/`, or a full location (nothing but whitespace is
+    /// `VersionHintEmpty`, more than one token or not UTF-8 is
+    /// `VersionHintMalformed`). A catalog record without a metadata location
+    /// is `MetadataLocationUnknown`.
     pub async fn resolve(&self, storage: &Storage) -> Result<Resolved>;
-    /// One small read when nothing moved.
+    /// One small read when nothing moved: the version hint of a static root,
+    /// parsing no metadata, or one table load from the catalog, whose metadata
+    /// the client parses either way; a pinned metadata file reads nothing.
     pub async fn resolve_if_changed(&self, storage: &Storage, known: &str) -> Result<Option<Resolved>>;
 }
 
 // manifest
+/// The bucket transform on the key, `bucket[count]` over `source_field_id`.
+/// Files of one snapshot carry different bucketings after a spec evolution,
+/// and a key's bucket differs under each. Ord, so it keys routes and orders files.
 pub struct Bucketing { pub count: u32, pub source_field_id: i32 }
+impl Bucketing { pub fn bucket_of(&self, key: &Key) -> u32; }
+/// `bucketing` is the default spec's, the one new files are written under,
+/// which `TableInfo` and the doctor report; each data file routes by its own
+/// manifest's spec (`DataFileEntry::bucketing`).
 pub struct TableLayout { pub bucketing: Option<Bucketing>, pub key_column: String, pub key_field_id: i32, pub key_type: KeyType, pub value_column: String, pub value_field_id: i32 }
 impl TableLayout {
-    /// From the snapshot's own schema, never the table's current one.
+    /// From the snapshot's own schema, never the table's current one, except
+    /// for a snapshot recording no schema id (written before Iceberg recorded
+    /// them), which is read under the current schema as Iceberg readers read
+    /// it. A schema id the metadata lacks or a configured column absent from
+    /// the schema is a `TableFault`; a key type `KeyType::from_iceberg` does
+    /// not admit is `KeyTypeUnsupported`; a value type other than binary,
+    /// fixed, or string is `ValueTypeUnsupported`. The bucketing is the first
+    /// field of the default spec, in spec order, that buckets the key; a
+    /// count of zero there is `TableFault::ZeroBuckets`.
     pub fn derive(table: &str, md: &TableMetadata, snapshot: &Snapshot, key_column: &str, value_column: &str) -> Result<Self>;
+    /// Under the default spec's transform; `0` for a table without one.
     pub fn bucket_of(&self, key: &Key) -> u32;
 }
-pub struct DataFileEntry { pub path: String, pub bucket: u32, pub records: u64, pub size: u64, pub key_min: Option<Key>, pub key_max: Option<Key> }
-/// Reads every manifest of the snapshot, delete manifests included; a delete
-/// file is `Error::Refused { reason: RefusalReason::DeleteFiles }`. Bucket
-/// position comes from each manifest's spec.
+/// `bucketing` is the transform of the file's own manifest's spec, `None`
+/// when that spec has no bucket on the key, and `bucket` is then `0`, the one
+/// bucket every unbucketed file is in.
+pub struct DataFileEntry { pub path: String, pub bucket: u32, pub bucketing: Option<Bucketing>, pub records: u64, pub size: u64, pub key_min: Option<Key>, pub key_max: Option<Key> }
+/// Reads every manifest of the snapshot, delete manifests included, and skips
+/// entries of status `Deleted`; a live entry whose content is not data is
+/// `Error::Refused { reason: RefusalReason::DeleteFiles }`, so a delete
+/// manifest whose entries are all deleted serves. Bucket position comes from
+/// each manifest's spec, looked up in the metadata by the id the manifest list
+/// records: missing is `TableFault::SpecMissing`, a partition tuple without a
+/// non-negative integer at the bucket field is `TableFault::BucketValueMissing`.
+/// Ordered by (bucketing, bucket, `key_min` with `None` first, path), the same
+/// for the same manifests in any order.
 pub async fn list_data_files(table: &str, md: &TableMetadata, snapshot: &Snapshot, layout: &TableLayout, storage: &Storage) -> Result<Vec<DataFileEntry>>;
 
 // parquet_io
@@ -314,31 +370,41 @@ impl parquet::file::reader::ChunkReader for Segments { /* errors, typed as Segme
 // index (MAX_KEY_BYTES comes from `contract`)
 pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// What makes a data file unservable beyond the contract refusals; closed set.
-/// A physical type that does not match is a refusal (`KeyTypeMismatch`,
-/// `ValueTypeUnsupported`), never a fault. `InconsistentRowCounts`,
-/// `InconsistentOffsetIndex`, and `PageRowsMismatch` are a footer that the
-/// file contradicts: a negative count or row groups that do not sum to the
-/// file's, an offset index whose pages are not where or what it says, a key
-/// or value page holding other rows than its offset index gives it.
-pub enum FileFault { MissingColumn(String), MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnsizedBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
+/// A key physical type that does not match is a refusal (`KeyTypeMismatch`),
+/// never a fault. A value column stored as anything but a byte array is
+/// `ValuePhysicalType`, a fault: `TableLayout::derive` admitted the column's
+/// Iceberg type from the schema, and a conformant writer stores binary, fixed,
+/// and string as byte arrays, so the file contradicts its schema.
+/// `InconsistentRowCounts`, `InconsistentOffsetIndex`, and `PageRowsMismatch`
+/// are a footer that the file contradicts: a negative count or row groups
+/// that do not sum to the file's, an offset index whose pages are not where
+/// or what it says, a key or value page holding other rows than its offset
+/// index gives it.
+pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnsizedBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64> }
 pub struct FileIndex;
 impl FileIndex {
     /// Refuses (typed, under `table`) an unsorted key column, a null key, a
     /// key repeated within the file, a key physical type that does not match
-    /// `key_type` (Binary accepts BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY), a
-    /// value column whose physical type is neither BYTE_ARRAY nor
-    /// FIXED_LEN_BYTE_ARRAY, keys over the cap, in the Bloom tier a row group
-    /// without a key bloom filter, and in the Disk tier the absence of a
-    /// local directory. Every tier streams the key chunks once for
-    /// verification, checking every key page against its offset index; Full
-    /// keeps the chunks in memory, Disk writes them through `LocalDir` (or
-    /// reuses a chunk file with matching identity and skips the chunk fetch),
-    /// Bloom keeps filters. The column index of every column but the key is
-    /// dropped after the offset indexes are taken; it is never part of the
-    /// resident set.
+    /// `key_type` (Binary accepts BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY), keys
+    /// over the cap, in the Bloom tier a row group without a key bloom
+    /// filter, and in the Disk tier the absence of a local directory; a value
+    /// column whose physical type is neither BYTE_ARRAY nor
+    /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`. Every tier
+    /// streams the key chunks once for verification, checking every key page
+    /// against its offset index; Full keeps the chunks in memory, Disk writes
+    /// them through `LocalDir` (or reuses a chunk file with matching identity
+    /// and skips the chunk fetch), Bloom keeps filters. The column index of
+    /// every column but the key is dropped after the offset indexes are
+    /// taken; it is never part of the resident set. `build` is `inspect`
+    /// followed by `Inspected::build`.
     pub async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
+    /// The footer stage of `build` on its own: one GET, every footer check,
+    /// the footer trimmed to what the index keeps, and the prediction, so
+    /// `generation` checks every file against a budget before any key chunk
+    /// is fetched (RFD 017).
+    pub async fn inspect(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType) -> Result<Inspected>;
     /// Every tier's resident bytes for this file, from the footer alone, the
     /// same from the footer as loaded and as kept: no other column's column
     /// index is counted either way, so the budget check at the footer stage
@@ -372,6 +438,20 @@ impl FileIndex {
     /// row group and no GET, Bloom fetches them again as one counted load GET
     /// per row group.
     pub async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>>;
+}
+/// A data file past the footer stage: its footer checked and trimmed, its
+/// resident bytes predicted, and no key chunk fetched yet.
+pub struct Inspected;
+impl Inspected {
+    pub fn predicted(&self) -> &ResidentBytes;
+    pub fn handle(&self) -> &Arc<FileHandle>;
+    /// What a Disk-tier `build` would add to `local`'s `index/`: zero when a
+    /// chunk file with the file's identity already holds every key chunk, so
+    /// a restart is not charged for what is on disk, else
+    /// `predicted().disk_bytes`. Reads the chunk file's header and no chunk.
+    pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
+    /// The chunk stage of `FileIndex::build`.
+    pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex>;
 }
 /// A decoded run of keys in file order, one arm per key type over the values
 /// parquet decoded, searched and compared in the served order; an in-crate
@@ -417,20 +497,46 @@ impl PageCache {
 pub struct LoadedFile { pub entry: DataFileEntry, pub index: FileIndex }
 pub struct Generation {
     pub table: String, pub snapshot_id: SnapshotId, pub sequence_number: i64, pub metadata_location: String,
-    pub layout: TableLayout, pub residency: Residency, pub files: Vec<Arc<LoadedFile>> /* sorted by (bucket, first key, path) */,
+    pub layout: TableLayout, pub residency: Residency, pub files: Vec<Arc<LoadedFile>> /* sorted by (bucketing, bucket, exact first key, path) */,
     pub records: u64, pub index_bytes: usize, pub loaded_at: Instant,
 }
 impl Generation {
     /// `config` carries the residency and the resident-bytes budget; the
-    /// budget is checked at the footer stage, before any key chunk is fetched.
+    /// budget is checked at the footer stage, before any key chunk is fetched:
+    /// Full compares `config.resident_budget_bytes` with the reused files'
+    /// resident bytes plus every new file's predicted full bytes; Disk
+    /// compares `local.index_budget()` with the bytes `index/` holds plus every
+    /// new file's `Inspected::disk_bytes_needed`; Bloom takes none; over is
+    /// `RefusalReason::OverBudget`. A file is reused from `previous` when its
+    /// path and size are unchanged. Overlap groups that gained a file are
+    /// verified one at a time, so the load holds one group's key chunks at
+    /// once and not the table's (RFD 017).
     /// `hedge` is the table's hedge window, handed to every FileHandle it opens.
-    pub async fn load(table: &str, config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
+    /// The table's name is `config.name`; `load` takes no second copy of it.
+    pub async fn load(config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
+    /// The files that may hold `key`, in file order: under every bucketing
+    /// the files carry, the files of the bucket the key falls in under it,
+    /// and every file without a bucketing, narrowed to those whose exact key
+    /// range covers the key.
     pub fn candidates(&self, key: &Key) -> impl Iterator<Item = &Arc<LoadedFile>>;
+    /// Per bucket number an overlap group touches, the widest such group. Two
+    /// files may share a key when their exact ranges intersect and one key can
+    /// fall in both their buckets: the same bucketing and bucket, two
+    /// bucketings with buckets congruent modulo the gcd of their counts, or no
+    /// bucketing on either; groups are the connected components. Buckets of
+    /// different bucketings that share a number share one entry.
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize>;
     pub fn overlap_groups_verified(&self) -> usize;
     pub async fn get(&self, key: &Key, cache: &PageCache) -> Result<Value>;
-    /// Which (file, value page) each key would fetch; the oracle for cost tests.
+    /// Which (file, value page) each key would fetch; the oracle for cost
+    /// tests. The first candidate whose `page_of` names a value page, which in
+    /// the Full tier is the file holding the key wherever in an overlap group
+    /// it sits; when none does, the first candidate that would decode a key
+    /// page, the first probe; `None` when none would.
     pub fn plan(&self, keys: &[Key]) -> Vec<Option<(Arc<LoadedFile>, PageRef)>>;
+    /// The chunk-file identity of every file, for `LocalDir::retain`, whose
+    /// live set is the union over every table sharing the directory.
+    pub fn identities(&self) -> HashSet<DataFileIdentity>;
 }
 /// The three outcomes of a lookup; the wire carries the same three.
 pub enum Value { Present(Bytes), Null, Absent }
