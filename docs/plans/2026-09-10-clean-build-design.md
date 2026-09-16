@@ -644,7 +644,7 @@ service Icetray { rpc Get(GetRequest) returns (GetResponse); rpc MultiGet(MultiG
 // its bytes are read (RFD 008).
 message Key { oneof key { int64 long = 1; string str = 2; bytes bin = 3; } }
 message GetRequest { string table = 1; Key key = 2; }
-enum Presence { PRESENCE_UNSPECIFIED = 0; PRESENT = 1; NULL = 2; ABSENT = 3; }
+enum Presence { PRESENCE_UNSPECIFIED = 0; PRESENCE_PRESENT = 1; PRESENCE_NULL = 2; PRESENCE_ABSENT = 3; }
 message GetResponse { Presence presence = 1; bytes value = 2; int64 snapshot_id = 3; }
 message MultiGetRequest { string table = 1; repeated Key keys = 2; }
 message Hit { Presence presence = 1; bytes value = 2; }
@@ -666,11 +666,15 @@ message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; 
 message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
 ```
 
-Comments describe the contract, not internals. Generated code is included
-in one inline module carrying the scoped allows (RFD 015). The build script
-uses a vendored protobuf compiler, so building from source needs none on the
-build host (RFD 012). The crate gets round-trip tests per message and a wire
-test for the bytes key variant.
+Comments describe the contract, not internals. Enum values carry their
+enum's name as a prefix (`PRESENCE_NULL`, never `NULL`): value names share
+one scope per package, and a bare `NULL` is a macro in C and C++ clients. A
+request that omits its key, or sends a `Key` with no variant set, is an
+INVALID_ARGUMENT error. Generated code is included in one inline module
+carrying the scoped allows (RFD 015). The build script uses a vendored
+protobuf compiler, so building from source needs none on the build host
+(RFD 012). The crate gets round-trip tests per message, a wire test for the
+bytes key variant, and an integer test per enum value.
 Health is `grpc.health.v1` from the tonic health crate, not our proto.
 
 ## 5. The binary and the testkit
