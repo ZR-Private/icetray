@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::cache::CacheError;
+use crate::catalog::TableFault;
 use crate::check::FindingCode;
 use crate::config::ConfigError;
 use crate::index::FileFault;
@@ -62,6 +63,17 @@ pub enum Error {
         /// The key type the caller sent.
         got: KeyType,
     },
+    /// The table's metadata makes it unusable before any data file is read;
+    /// the fault set is closed.
+    #[error("table {table}: {fault}")]
+    Table {
+        /// The table's configured name, or, for a fault raised while a
+        /// `TableSource` is resolved and no table has been named yet, the
+        /// source itself: the static location or the catalog identifier.
+        table: String,
+        /// What is wrong with its metadata.
+        fault: TableFault,
+    },
     /// A data file is malformed for serving; the fault set is closed.
     #[error("file {path}: {fault}")]
     File {
@@ -86,6 +98,24 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// `Error::Refused` for `table`.
+    pub(crate) fn refused(table: &str, reason: RefusalReason) -> Self {
+        Self::Refused {
+            table: table.to_string(),
+            reason,
+        }
+    }
+
+    /// `Error::Table` for `table`.
+    pub(crate) fn table_fault(table: &str, fault: TableFault) -> Self {
+        Self::Table {
+            table: table.to_string(),
+            fault,
+        }
+    }
+}
+
 /// A refusal for a log line: the name, then the fields a reader needs to
 /// act on: the file and row group, the types found and expected, the length
 /// over the cap, the bytes needed and the budget (RFD 007, RFD 017).
@@ -101,9 +131,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             expected,
             got,
         } => format!("{reason} (file {path}, expected {expected}, got {got})"),
-        RefusalReason::ValueTypeUnsupported { path, got } => {
-            format!("{reason} (file {path}, got {got})")
-        }
+        RefusalReason::ValueTypeUnsupported { got } => format!("{reason} (got {got})"),
         RefusalReason::KeyTooLong { path, bytes } => {
             format!("{reason} (file {path}, {bytes} bytes)")
         }
@@ -172,14 +200,15 @@ pub enum RefusalReason {
     },
     /// The key column's Iceberg type is not long, string, binary, fixed, or uuid.
     KeyTypeUnsupported,
-    /// The value column's physical type is neither `BYTE_ARRAY` nor
-    /// `FIXED_LEN_BYTE_ARRAY`, so its bytes have no defined encoding on the
-    /// wire (RFD 010).
+    /// The value column's Iceberg type in the snapshot's schema is none of
+    /// binary, fixed, or string, so its bytes have no defined encoding on the
+    /// wire (RFD 002, RFD 010). Raised by `TableLayout::derive`; a data file
+    /// whose physical type contradicts an admitted schema type is
+    /// `FileFault::ValuePhysicalType`, a malformed file rather than a refusal.
     ValueTypeUnsupported {
-        /// The data file's location.
-        path: String,
-        /// The physical type the file stores the column as.
-        got: parquet::basic::Type,
+        /// The Iceberg type's `Display`, held as text because
+        /// `iceberg::spec::Type` does not implement `Hash`.
+        got: String,
     },
     /// The snapshot carries delete files.
     DeleteFiles,
@@ -311,8 +340,8 @@ mod tests {
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
             (
                 RefusalReason::ValueTypeUnsupported {
-                    path: FILE_PATH.to_string(),
-                    got: parquet::basic::Type::INT64,
+                    got: iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long)
+                        .to_string(),
                 },
                 "value_type_unsupported",
             ),

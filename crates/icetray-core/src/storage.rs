@@ -35,10 +35,10 @@ use crate::time;
 const FILE_PREFIX: &str = "file://";
 
 /// What separates a URI's scheme from its authority.
-const SCHEME_SEPARATOR: &str = "://";
+pub(crate) const SCHEME_SEPARATOR: &str = "://";
 
 /// What separates an authority from the key, and the segments of a key.
-const PATH_SEPARATOR: char = '/';
+pub(crate) const PATH_SEPARATOR: char = '/';
 
 /// The schemes that name an S3 bucket by authority. `s3a://` is what
 /// Hadoop-based writers record and reads the same as `s3://`.

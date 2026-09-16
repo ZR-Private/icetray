@@ -116,6 +116,17 @@ pub enum FileFault {
         /// The row group holding the value.
         row_group: usize,
     },
+    /// The value column's physical type is neither `BYTE_ARRAY` nor
+    /// `FIXED_LEN_BYTE_ARRAY`. The snapshot's schema admitted the column as
+    /// binary, fixed, or string (`TableLayout::derive` refuses anything else
+    /// as `RefusalReason::ValueTypeUnsupported`), and a spec-conformant
+    /// writer stores those three as byte arrays, so a file that does not is
+    /// malformed.
+    #[error("value column is stored as {got}, not a byte array")]
+    ValuePhysicalType {
+        /// The physical type the file stores the column as.
+        got: PhysicalType,
+    },
 }
 
 /// Every tier's resident bytes for one file, from the footer alone (RFD
@@ -377,18 +388,20 @@ impl FileIndex {
     /// Refuses, typed under `Error::Refused` for `table`: a key column
     /// whose physical type does not match `key_type` (`Binary` accepts
     /// `BYTE_ARRAY` and `FIXED_LEN_BYTE_ARRAY`, `Uuid` a
-    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), a value column that is
-    /// neither `BYTE_ARRAY` nor `FIXED_LEN_BYTE_ARRAY`, in the Disk tier
-    /// the absence of a local directory, in the Bloom tier a row group
-    /// without a key bloom filter, then, once the chunks are decoded, a
-    /// null key, a key below the one before it or a row group starting
-    /// below the previous one's last key, a key repeated, and a key over
+    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), in the Disk tier the
+    /// absence of a local directory, in the Bloom tier a row group without
+    /// a key bloom filter, then, once the chunks are decoded, a null key, a
+    /// key below the one before it or a row group starting below the
+    /// previous one's last key, a key repeated, and a key over
     /// `contract::MAX_KEY_BYTES`. A file that is malformed for serving is
-    /// `Error::File`: a missing column, no rows, row counts that disagree,
-    /// no offset index on either column or one that does not describe its
-    /// pages, an unbounded or undecodable bloom filter, a string key that
-    /// is not UTF-8, a key page holding other rows than its offset index
-    /// says. Footer checks run before any chunk is fetched.
+    /// `Error::File`: a missing column, a value column that is neither
+    /// `BYTE_ARRAY` nor `FIXED_LEN_BYTE_ARRAY` (the schema admitted its
+    /// Iceberg type, so the file contradicts it), no rows, row counts that
+    /// disagree, no offset index on either column or one that does not
+    /// describe its pages, an unbounded or undecodable bloom filter, a
+    /// string key that is not UTF-8, a key page holding other rows than
+    /// its offset index says. Footer checks run before any chunk is
+    /// fetched; `inspect` is that stage on its own.
     ///
     /// Full keeps the chunks in memory. Disk reuses a chunk file in `local`
     /// whose identity matches and holds every chunk (reading the chunks
@@ -408,6 +421,24 @@ impl FileIndex {
         residency: Residency,
         local: Option<&LocalDir>,
     ) -> Result<Self> {
+        Self::inspect(table, handle, key_column, value_column, key_type)
+            .await?
+            .build(residency, local)
+            .await
+    }
+
+    /// The footer stage of `build`, on its own so that a caller can check
+    /// every file's predicted resident bytes against a budget before any key
+    /// chunk is fetched (RFD 017): loads the footer (one GET), makes every
+    /// footer check `build` documents, trims the footer to what the index
+    /// keeps, and computes the prediction. Nothing past the footer is read.
+    pub async fn inspect(
+        table: &str,
+        handle: Arc<FileHandle>,
+        key_column: &str,
+        value_column: &str,
+        key_type: KeyType,
+    ) -> Result<Inspected> {
         let loaded = handle.load_metadata().await?;
         let layout = Layout::inspect(table, &handle, &loaded, key_column, value_column, key_type)?;
         let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf));
@@ -415,57 +446,18 @@ impl FileIndex {
         let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf);
         tracing::debug!(
             path = %handle.location,
-            %residency,
             full = predicted.full,
             disk_memory = predicted.disk_memory,
             disk_bytes = predicted.disk_bytes,
             bloom = ?predicted.bloom,
             "predicted resident bytes"
         );
-        let column = Column {
-            metadata: &metadata,
-            leaf: layout.key_leaf,
-            path: &handle.location,
-        };
-        let ranges = key_chunk_ranges(&metadata, layout.key_leaf);
-        let (keys, verified) = match residency {
-            Residency::Full => {
-                let parts = fetch_chunk_parts(&handle, &ranges).await?;
-                let chunks = Arc::new(Segments::new(parts, handle.size()));
-                let verified = verify(table, &column, layout.key_shape, &chunks)?;
-                (KeyResidency::Chunks(chunks), verified)
-            }
-            Residency::Disk => {
-                let local = local.ok_or_else(|| refused(table, RefusalReason::NoLocalDir))?;
-                let (disk, verified) =
-                    disk_chunks(table, &handle, local, &column, layout.key_shape, &ranges).await?;
-                (KeyResidency::Disk(disk), verified)
-            }
-            Residency::Bloom => {
-                let filter_ranges = bloom_ranges(table, &handle, &metadata, layout.key_leaf)?;
-                let parts = fetch_chunk_parts(&handle, &ranges).await?;
-                let chunks = Arc::new(Segments::new(parts, handle.size()));
-                let verified = verify(table, &column, layout.key_shape, &chunks)?;
-                drop(chunks);
-                let filters =
-                    read_bloom_filters(&handle, &metadata, layout.key_leaf, filter_ranges).await?;
-                (KeyResidency::Filters(filters), verified)
-            }
-        };
-        let rows = metadata.file_metadata().num_rows();
-        Ok(Self {
+        Ok(Inspected {
+            table: table.to_string(),
             handle,
             metadata,
-            key_leaf: layout.key_leaf,
-            value_leaf: layout.value_leaf,
-            key_shape: layout.key_shape,
-            value_shape: layout.value_shape,
-            keys,
-            fences: verified.fences,
-            groups: verified.groups,
-            key_range: verified.key_range,
-            max_key_bytes: verified.max_key_bytes,
-            rows,
+            layout,
+            predicted,
         })
     }
 
@@ -841,6 +833,108 @@ impl FileIndex {
     }
 }
 
+/// A data file past the footer stage of `FileIndex::build`: its footer
+/// checked and trimmed, its resident bytes predicted, and no key chunk
+/// fetched yet. `build` is the chunk stage; between the two a caller holds
+/// the budget check of RFD 017.
+#[derive(Debug)]
+pub struct Inspected {
+    table: String,
+    handle: Arc<FileHandle>,
+    metadata: Arc<ParquetMetaData>,
+    layout: Layout,
+    predicted: ResidentBytes,
+}
+
+impl Inspected {
+    /// Every tier's resident bytes for the file, from its footer alone.
+    pub fn predicted(&self) -> &ResidentBytes {
+        &self.predicted
+    }
+
+    /// The file the footer belongs to.
+    pub fn handle(&self) -> &Arc<FileHandle> {
+        &self.handle
+    }
+
+    /// The bytes a Disk-tier `build` would add to `local`'s `index/`: zero
+    /// when a chunk file with this file's identity already holds every key
+    /// chunk, since `build` reuses it and writes nothing, otherwise the key
+    /// chunks' bytes (`predicted().disk_bytes`). The disk budget is checked
+    /// against this rather than against the prediction alone, so a restart
+    /// over a directory that already holds the table's chunk files is not
+    /// charged for them twice (RFD 017). Reads the chunk file's header and
+    /// no key chunk; a chunk file that fails a check counts as absent, as
+    /// `LocalDir::chunks_for` treats it.
+    pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
+        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf);
+        Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
+            Some(_) => 0,
+            None => self.predicted.disk_bytes,
+        })
+    }
+
+    /// The chunk stage of `FileIndex::build`: streams the key chunks once
+    /// for verification and keeps what `residency` keeps, as `build`
+    /// documents. The Disk tier without a local directory is refused here,
+    /// before any chunk is fetched.
+    pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex> {
+        let Self {
+            table,
+            handle,
+            metadata,
+            layout,
+            predicted: _,
+        } = self;
+        let column = Column {
+            metadata: &metadata,
+            leaf: layout.key_leaf,
+            path: &handle.location,
+        };
+        let ranges = key_chunk_ranges(&metadata, layout.key_leaf);
+        let (keys, verified) = match residency {
+            Residency::Full => {
+                let parts = fetch_chunk_parts(&handle, &ranges).await?;
+                let chunks = Arc::new(Segments::new(parts, handle.size()));
+                let verified = verify(&table, &column, layout.key_shape, &chunks)?;
+                (KeyResidency::Chunks(chunks), verified)
+            }
+            Residency::Disk => {
+                let local =
+                    local.ok_or_else(|| Error::refused(&table, RefusalReason::NoLocalDir))?;
+                let (disk, verified) =
+                    disk_chunks(&table, &handle, local, &column, layout.key_shape, &ranges).await?;
+                (KeyResidency::Disk(disk), verified)
+            }
+            Residency::Bloom => {
+                let filter_ranges = bloom_ranges(&table, &handle, &metadata, layout.key_leaf)?;
+                let parts = fetch_chunk_parts(&handle, &ranges).await?;
+                let chunks = Arc::new(Segments::new(parts, handle.size()));
+                let verified = verify(&table, &column, layout.key_shape, &chunks)?;
+                drop(chunks);
+                let filters =
+                    read_bloom_filters(&handle, &metadata, layout.key_leaf, filter_ranges).await?;
+                (KeyResidency::Filters(filters), verified)
+            }
+        };
+        let rows = metadata.file_metadata().num_rows();
+        Ok(FileIndex {
+            handle,
+            metadata,
+            key_leaf: layout.key_leaf,
+            value_leaf: layout.value_leaf,
+            key_shape: layout.key_shape,
+            value_shape: layout.value_shape,
+            keys,
+            fences: verified.fences,
+            groups: verified.groups,
+            key_range: verified.key_range,
+            max_key_bytes: verified.max_key_bytes,
+            rows,
+        })
+    }
+}
+
 /// One column of the file as the decoders see it: the footer, the leaf,
 /// and the path errors name.
 #[derive(Clone, Copy)]
@@ -1015,6 +1109,7 @@ impl PageReader for CountedPages {
 }
 
 /// The key and value leaves of a file and how each decodes, from the footer.
+#[derive(Debug)]
 struct Layout {
     key_leaf: usize,
     value_leaf: usize,
@@ -1023,10 +1118,10 @@ struct Layout {
 }
 
 impl Layout {
-    /// The checks `build` makes on the footer, in order: both columns
-    /// exist, the key's physical type matches the key type, the value's is
-    /// a byte array, the file has rows and its row counts agree, both
-    /// columns have an offset index that describes their pages.
+    /// The checks `FileIndex::inspect` makes on the footer, in order: both
+    /// columns exist, the key's physical type matches the key type, the
+    /// value's is a byte array, the file has rows and its row counts agree,
+    /// both columns have an offset index that describes their pages.
     fn inspect(
         table: &str,
         handle: &FileHandle,
@@ -1040,7 +1135,7 @@ impl Layout {
         let key_leaf = leaf(path, schema, key_column)?;
         let value_leaf = leaf(path, schema, value_column)?;
         let key_shape = key_shape(table, path, key_type, &schema.column(key_leaf))?;
-        let value_shape = value_shape(table, path, &schema.column(value_leaf))?;
+        let value_shape = value_shape(path, &schema.column(value_leaf))?;
         if metadata.file_metadata().num_rows() == 0 {
             return Err(file_fault(path, FileFault::NoRows));
         }
@@ -1095,7 +1190,7 @@ fn key_shape(
         ) => None,
     };
     shape.ok_or_else(|| {
-        refused(
+        Error::refused(
             table,
             RefusalReason::KeyTypeMismatch {
                 path: path.to_string(),
@@ -1106,9 +1201,9 @@ fn key_shape(
     })
 }
 
-/// How the value column decodes, or `RefusalReason::ValueTypeUnsupported`
-/// when it is not a byte array of either width.
-fn value_shape(table: &str, path: &str, descr: &ColumnDescriptor) -> Result<ValueShape> {
+/// How the value column decodes, or `FileFault::ValuePhysicalType` when it
+/// is not a byte array of either width.
+fn value_shape(path: &str, descr: &ColumnDescriptor) -> Result<ValueShape> {
     let physical = descr.physical_type();
     match physical {
         PhysicalType::BYTE_ARRAY => Ok(ValueShape::Variable),
@@ -1118,12 +1213,9 @@ fn value_shape(table: &str, path: &str, descr: &ColumnDescriptor) -> Result<Valu
         | PhysicalType::INT64
         | PhysicalType::INT96
         | PhysicalType::FLOAT
-        | PhysicalType::DOUBLE => Err(refused(
-            table,
-            RefusalReason::ValueTypeUnsupported {
-                path: path.to_string(),
-                got: physical,
-            },
+        | PhysicalType::DOUBLE => Err(file_fault(
+            path,
+            FileFault::ValuePhysicalType { got: physical },
         )),
     }
 }
@@ -1271,16 +1363,7 @@ async fn disk_chunks(
     shape: KeyShape,
     ranges: &[Range<u64>],
 ) -> Result<(DiskChunks, Verified)> {
-    let identity = DataFileIdentity {
-        path: handle.location.clone(),
-        size: handle.size(),
-        footer_digest: handle
-            .footer_digest()
-            .expect("load_metadata set the footer digest before build read the footer"),
-    };
-    if let Some(disk) = local.chunks_for(&identity)?
-        && ranges.iter().all(|range| disk.holds(range))
-    {
+    if let Some(disk) = reusable_disk_chunks(handle, local, ranges)? {
         let chunks = chunks_from_disk(&disk, ranges, handle.size()).await?;
         let verified = verify(table, column, shape, &chunks)?;
         return Ok((disk, verified));
@@ -1289,25 +1372,46 @@ async fn disk_chunks(
     let chunks = Arc::new(Segments::new(parts.clone(), handle.size()));
     let verified = verify(table, column, shape, &chunks)?;
     drop(chunks);
-    let disk = write_chunks_blocking(local, &identity, parts)?;
+    let disk = off_worker(|| local.write_chunks(&identity_of(handle), parts.into_iter()))?;
     Ok((disk, verified))
 }
 
-/// Writes a chunk file off the async worker. `LocalDir` arrives borrowed,
-/// which rules out `spawn_blocking` and its `'static` bound, so on the
-/// multi-thread runtime the worker steps aside with `block_in_place`; the
-/// current-thread runtime has no other worker to hand the write to and runs
-/// it inline.
-fn write_chunks_blocking(
+/// The chunk file in `local` a Disk-tier build reuses for `handle`'s file:
+/// one whose identity (path, size, footer digest) matches and which holds
+/// every one of `ranges`, the key column chunks. `None` when there is none,
+/// and the chunks are fetched and written instead.
+fn reusable_disk_chunks(
+    handle: &FileHandle,
     local: &LocalDir,
-    identity: &DataFileIdentity,
-    parts: Vec<(Range<u64>, Bytes)>,
-) -> Result<DiskChunks> {
-    let write = || local.write_chunks(identity, parts.into_iter());
+    ranges: &[Range<u64>],
+) -> Result<Option<DiskChunks>> {
+    Ok(local
+        .chunks_for(&identity_of(handle))?
+        .filter(|disk| ranges.iter().all(|range| disk.holds(range))))
+}
+
+/// The identity a chunk file is named by and checked against, for a handle
+/// whose footer has been loaded.
+pub(crate) fn identity_of(handle: &FileHandle) -> DataFileIdentity {
+    DataFileIdentity {
+        path: handle.location.clone(),
+        size: handle.size(),
+        footer_digest: handle
+            .footer_digest()
+            .expect("load_metadata set the footer digest before the footer was inspected"),
+    }
+}
+
+/// Runs `work`, blocking I/O or CPU work over borrowed state (a chunk file
+/// write, an overlap group's merge), off the async worker. The borrows rule
+/// out `spawn_blocking` and its `'static` bound, so on the multi-thread
+/// runtime the worker steps aside with `block_in_place`; the current-thread
+/// runtime has no other worker to hand the work to and runs it inline.
+pub(crate) fn off_worker<T>(work: impl FnOnce() -> T) -> T {
     if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-        tokio::task::block_in_place(write)
+        tokio::task::block_in_place(work)
     } else {
-        write()
+        work()
     }
 }
 
@@ -1332,7 +1436,7 @@ fn bloom_ranges(
                 .bloom_filter_offset()
                 .and_then(|offset| u64::try_from(offset).ok())
                 .ok_or_else(|| {
-                    refused(
+                    Error::refused(
                         table,
                         RefusalReason::NoBloomFilter {
                             path: path.to_string(),
@@ -1420,7 +1524,7 @@ fn verify(
                 path: path.to_string(),
                 row_group,
             };
-            return Err(refused(table, reason));
+            return Err(Error::refused(table, reason));
         }
         check_utf8(column, row_group, &keys)?;
         longest = longest.max(keys.max_len());
@@ -1430,14 +1534,14 @@ fn verify(
         }
         if let Some((at, order)) = keys.first_not_increasing() {
             let reason = not_above_previous(path, row_group, order, keys.get(at));
-            return Err(refused(table, reason));
+            return Err(Error::refused(table, reason));
         }
         let first = keys.get(0);
         let last = keys.get(keys.len() - 1);
         if let Some(previous) = groups.last() {
             let order = first.cmp(&previous.last);
             if order != Ordering::Greater {
-                return Err(refused(
+                return Err(Error::refused(
                     table,
                     not_above_previous(path, row_group, order, first),
                 ));
@@ -1461,7 +1565,7 @@ fn verify(
             path: path.to_string(),
             bytes: longest,
         };
-        return Err(refused(table, reason));
+        return Err(Error::refused(table, reason));
     }
     let has_keys = "inspect checked that the row groups sum to the file's rows, which are above zero, so a row group holds keys";
     let head = groups.first().expect(has_keys);
@@ -1782,14 +1886,6 @@ fn byte_array_fence_heap(
             let mean = encoded.checked_div(values).unwrap_or(0);
             bytes(pages) * mean
         }
-    }
-}
-
-/// `Error::Refused` for `table`.
-fn refused(table: &str, reason: RefusalReason) -> Error {
-    Error::Refused {
-        table: table.to_string(),
-        reason,
     }
 }
 
@@ -3155,18 +3251,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_refuses_an_int64_value_column() {
+    async fn test_build_an_int64_value_column_is_a_file_fault() {
         let mut fixture = Fixture::contract(KeyType::Long, FEW_ROWS);
         fixture.value_column = ValueColumn::Int64;
         let opened = store(&fixture).await;
         assert_eq!(
-            refusal_of(opened.build(KeyType::Long, Residency::Full, None).await),
-            RefusalReason::ValueTypeUnsupported {
-                path: location(),
+            fault_of(opened.build(KeyType::Long, Residency::Full, None).await),
+            FileFault::ValuePhysicalType {
                 got: PhysicalType::INT64,
             }
         );
-        assert_eq!(opened.stats().gets(), 1, "refused at the footer");
+        assert_eq!(opened.stats().gets(), 1, "faulted at the footer");
     }
 
     #[tokio::test]
@@ -3970,6 +4065,75 @@ mod tests {
             }
             assert_eq!(decoded, rows);
         }
+    }
+
+    /// The footer stage over the fixture: `FileIndex::inspect` for `opened`.
+    async fn inspect(opened: &Opened, key_type: KeyType) -> Inspected {
+        FileIndex::inspect(
+            TABLE,
+            Arc::clone(&opened.handle),
+            KEY_COLUMN,
+            VALUE_COLUMN,
+            key_type,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inspect_costs_the_footer_alone_and_predicts_what_build_keeps() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let inspected = inspect(&opened, KeyType::Long).await;
+        assert_eq!(opened.stats().gets(), 1, "the footer alone");
+        assert!(Arc::ptr_eq(inspected.handle(), &opened.handle));
+        let predicted = *inspected.predicted();
+        let index = inspected.build(Residency::Full, None).await.unwrap();
+        assert_eq!(
+            opened.stats().gets(),
+            1 + count(ROW_GROUPS),
+            "then the chunks"
+        );
+        assert_eq!(predicted, predicted_of(&index));
+        assert_eq!(count(index.resident_bytes()), predicted.full);
+    }
+
+    #[tokio::test]
+    async fn test_disk_bytes_needed_is_zero_with_a_matching_chunk_file_and_the_prediction_without()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let local = local_dir(dir.path(), opened.stats());
+        let fresh = inspect(&opened, KeyType::Long).await;
+        let disk_bytes = fresh.predicted().disk_bytes;
+        assert!(disk_bytes > 0);
+        assert_eq!(
+            fresh.disk_bytes_needed(&local).unwrap(),
+            disk_bytes,
+            "an empty directory takes every chunk"
+        );
+        fresh.build(Residency::Disk, Some(&local)).await.unwrap();
+        assert_eq!(
+            inspect(&opened, KeyType::Long)
+                .await
+                .disk_bytes_needed(&local)
+                .unwrap(),
+            0,
+            "the chunk file written is reused"
+        );
+
+        // Another file at the same location: the chunk file on disk has
+        // another identity and counts as absent.
+        let other = store(&Fixture::contract(
+            KeyType::Long,
+            contract_rows() + page_rows(),
+        ))
+        .await;
+        let stale = inspect(&other, KeyType::Long).await;
+        assert_eq!(
+            stale.disk_bytes_needed(&local).unwrap(),
+            stale.predicted().disk_bytes
+        );
+        assert_eq!(other.stats().gets(), 1, "no chunk is read for the check");
     }
 
     #[tokio::test]
