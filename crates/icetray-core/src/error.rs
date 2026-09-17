@@ -114,6 +114,86 @@ impl Error {
             fault,
         }
     }
+
+    /// Which variant this is, with the reason for a refusal: the `reason`
+    /// label of `refresh_errors_total`.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Iceberg(_) => ErrorKind::Iceberg,
+            Self::Parquet(_) => ErrorKind::Parquet,
+            Self::ObjectStore(_) => ErrorKind::ObjectStore,
+            Self::ObjectStorePath(_) => ErrorKind::ObjectStorePath,
+            Self::Json(_) => ErrorKind::Json,
+            Self::Config(_) => ErrorKind::Config,
+            Self::Cache(_) => ErrorKind::Cache,
+            Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
+            Self::Inefficient { .. } => ErrorKind::Inefficient,
+            Self::KeyType { .. } => ErrorKind::KeyType,
+            Self::Table { .. } => ErrorKind::Table,
+            Self::File { .. } => ErrorKind::File,
+            Self::NotReady { .. } => ErrorKind::NotReady,
+            Self::Local { .. } => ErrorKind::Local,
+        }
+    }
+}
+
+/// Which variant an `Error` is, for the `reason` label of
+/// `refresh_errors_total`; a refusal carries its `RefusalReason`, so the
+/// label names the refusal. Display gives the label value: the refusal's own
+/// name for `Refused`, `inefficient` for the strict gate, and the variant's
+/// `snake_case` name for the rest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorKind {
+    /// `Error::Iceberg`.
+    Iceberg,
+    /// `Error::Parquet`.
+    Parquet,
+    /// `Error::ObjectStore`.
+    ObjectStore,
+    /// `Error::ObjectStorePath`.
+    ObjectStorePath,
+    /// `Error::Json`.
+    Json,
+    /// `Error::Config`.
+    Config,
+    /// `Error::Cache`.
+    Cache,
+    /// `Error::Refused`, with its reason.
+    Refused(RefusalReason),
+    /// `Error::Inefficient`.
+    Inefficient,
+    /// `Error::KeyType`.
+    KeyType,
+    /// `Error::Table`.
+    Table,
+    /// `Error::File`.
+    File,
+    /// `Error::NotReady`.
+    NotReady,
+    /// `Error::Local`.
+    Local,
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Refused(reason) => return reason.fmt(f),
+            Self::Iceberg => "iceberg",
+            Self::Parquet => "parquet",
+            Self::ObjectStore => "object_store",
+            Self::ObjectStorePath => "object_store_path",
+            Self::Json => "json",
+            Self::Config => "config",
+            Self::Cache => "cache",
+            Self::Inefficient => "inefficient",
+            Self::KeyType => "key_type",
+            Self::Table => "table",
+            Self::File => "file",
+            Self::NotReady => "not_ready",
+            Self::Local => "local",
+        };
+        f.write_str(name)
+    }
 }
 
 /// A refusal for a log line: the name, then the fields a reader needs to
@@ -298,6 +378,7 @@ impl fmt::Display for LookupResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigViolation;
 
     /// An id wider than 32 bits, so the round trip exercises the whole `i64`.
     const SAMPLE_SNAPSHOT_ID: i64 = 5_123_456_789_012;
@@ -404,5 +485,131 @@ mod tests {
     fn test_deserialize_snapshot_id_transparent() {
         let id: SnapshotId = serde_json::from_str(&SAMPLE_SNAPSHOT_ID.to_string()).unwrap();
         assert_eq!(id, SnapshotId(SAMPLE_SNAPSHOT_ID));
+    }
+
+    /// The table the crate-raised sample errors name.
+    const TABLE: &str = "kv";
+
+    /// One error of every variant that wraps a library's or the local
+    /// directory's failure, each beside its `reason` label.
+    fn wrapped_cases() -> Vec<(Error, &'static str)> {
+        vec![
+            (
+                Error::Iceberg(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "sample",
+                )),
+                "iceberg",
+            ),
+            (
+                Error::Parquet(parquet::errors::ParquetError::General("sample".to_string())),
+                "parquet",
+            ),
+            (
+                Error::ObjectStore(object_store::Error::Generic {
+                    store: "sample",
+                    source: Box::new(std::io::Error::other("sample")),
+                }),
+                "object_store",
+            ),
+            (
+                Error::ObjectStorePath(object_store::path::Error::EmptySegment {
+                    path: "a//b".to_string(),
+                }),
+                "object_store_path",
+            ),
+            (
+                Error::Json(serde_json::from_str::<u8>("sample").unwrap_err()),
+                "json",
+            ),
+            (
+                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName)),
+                "config",
+            ),
+            (
+                Error::Cache(CacheError::Fetch(std::sync::Arc::new(Error::NotReady {
+                    table: TABLE.to_string(),
+                }))),
+                "cache",
+            ),
+            (
+                Error::Local {
+                    path: PathBuf::from("/var/lib/icetray"),
+                    fault: LocalFault::Io(std::io::Error::other("sample")),
+                },
+                "local",
+            ),
+        ]
+    }
+
+    /// One error of every variant the crate raises itself, each beside its
+    /// `reason` label; their fields are all `Clone`.
+    fn raised_cases() -> Vec<(Error, &'static str)> {
+        vec![
+            (
+                Error::Refused {
+                    table: TABLE.to_string(),
+                    reason: RefusalReason::NoLocalDir,
+                },
+                "no_local_dir",
+            ),
+            (
+                Error::Inefficient {
+                    table: TABLE.to_string(),
+                    findings: vec![FindingCode::DictionaryEncodedValue],
+                },
+                "inefficient",
+            ),
+            (
+                Error::KeyType {
+                    table: TABLE.to_string(),
+                    expected: KeyType::Long,
+                    got: KeyType::String,
+                },
+                "key_type",
+            ),
+            (
+                Error::Table {
+                    table: TABLE.to_string(),
+                    fault: TableFault::MetadataLocationUnknown,
+                },
+                "table",
+            ),
+            (
+                Error::File {
+                    path: FILE_PATH.to_string(),
+                    fault: FileFault::NoRows,
+                },
+                "file",
+            ),
+            (
+                Error::NotReady {
+                    table: TABLE.to_string(),
+                },
+                "not_ready",
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_kind_display_label_values() {
+        for (error, name) in wrapped_cases().into_iter().chain(raised_cases()) {
+            assert_eq!(error.kind().to_string(), name);
+        }
+        let duplicate = Error::Refused {
+            table: TABLE.to_string(),
+            reason: RefusalReason::DuplicateKeys {
+                path: FILE_PATH.to_string(),
+                key: Key::Long(1),
+            },
+        };
+        assert_eq!(duplicate.kind().to_string(), "duplicate_keys");
+        assert_eq!(
+            duplicate.kind(),
+            ErrorKind::Refused(RefusalReason::DuplicateKeys {
+                path: FILE_PATH.to_string(),
+                key: Key::Long(1),
+            })
+        );
     }
 }

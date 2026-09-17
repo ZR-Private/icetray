@@ -61,7 +61,8 @@ pub const LABEL_KIND: &str = "kind";
 pub const LABEL_TABLE: &str = "table";
 /// The `result` label: the lookup outcome, from `LookupResult`.
 pub const LABEL_RESULT: &str = "result";
-/// The `reason` label: the refusal, from `RefusalReason`.
+/// The `reason` label: why a refresh failed, from `ErrorKind`, which gives
+/// the refusal's own name for a refusal.
 pub const LABEL_REASON: &str = "reason";
 /// The `code` label: the finding, from `FindingCode`.
 pub const LABEL_CODE: &str = "code";

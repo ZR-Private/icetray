@@ -29,7 +29,7 @@ use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor, SchemaDescriptor};
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::approx;
-use crate::cache::PageCache;
+use crate::cache::{PageCache, PageOrigin};
 use crate::config::Residency;
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::{Error, RefusalReason, Result};
@@ -588,23 +588,29 @@ impl FileIndex {
         let Some((row_group, page)) = self.locate(key) else {
             return Ok(None);
         };
+        // Only the value page decides a lookup's label; a key page's origin
+        // is not kept.
         let segments = match &self.keys {
             KeyResidency::Chunks(chunks) => Arc::clone(chunks),
             KeyResidency::Disk(disk) => {
-                self.fetch_pages(&self.key_column(), row_group, page, PageSource::Disk(disk))
-                    .await?
+                let (segments, _origin) = self
+                    .fetch_pages(&self.key_column(), row_group, page, PageSource::Disk(disk))
+                    .await?;
+                segments
             }
             KeyResidency::Filters(filters) => {
                 if !filters[row_group].check(&*key.as_bytes()) {
                     return Ok(None);
                 }
-                self.fetch_pages(
-                    &self.key_column(),
-                    row_group,
-                    page,
-                    PageSource::Store(cache),
-                )
-                .await?
+                let (segments, _origin) = self
+                    .fetch_pages(
+                        &self.key_column(),
+                        row_group,
+                        page,
+                        PageSource::Store(cache),
+                    )
+                    .await?;
+                segments
             }
         };
         self.search(key, row_group, page, segments)
@@ -621,9 +627,22 @@ impl FileIndex {
         row: RowRef,
         cache: Option<&PageCache>,
     ) -> Result<Option<Bytes>> {
+        self.read_value_with_origin(row, cache)
+            .await
+            .map(|(value, _origin)| value)
+    }
+
+    /// `read_value`, with where the value page came from: `Fetched` for the
+    /// GET of a cold hit, `Cached` for a warm one. The dictionary page, when
+    /// there is one, does not decide it.
+    pub(crate) async fn read_value_with_origin(
+        &self,
+        row: RowRef,
+        cache: Option<&PageCache>,
+    ) -> Result<(Option<Bytes>, PageOrigin)> {
         let page = self.value_page(row)?;
         let column = self.value_column();
-        let segments = self
+        let (segments, origin) = self
             .fetch_pages(&column, row.row_group, page, PageSource::Store(cache))
             .await?;
         let value = match self.value_shape {
@@ -632,7 +651,7 @@ impl FileIndex {
             ValueShape::Fixed => read_one::<FixedLenByteArrayType>(&column, row, segments)?
                 .map(|value| Bytes::copy_from_slice(value.data())),
         };
-        Ok(value)
+        Ok((value, origin))
     }
 
     /// The key page `find` would decode for `key` and, in the Full tier for
@@ -798,38 +817,50 @@ impl FileIndex {
     /// chunk's start and its first data page, so the reader asks for exactly
     /// what is held. Both ranges are known before either read starts, so
     /// the two reads run together: the dictionary costs its GET or local
-    /// read, never a second round trip's wait.
+    /// read, never a second round trip's wait. The origin returned is the
+    /// page's own; the dictionary page's is not kept.
     async fn fetch_pages(
         &self,
         column: &Column<'_>,
         row_group: usize,
         page: usize,
         source: PageSource<'_>,
-    ) -> Result<Arc<Segments>> {
+    ) -> Result<(Arc<Segments>, PageOrigin)> {
         let range = column.page_range(row_group, page);
         let dictionary = column.dictionary_range(row_group);
         let read_dictionary = async {
             match dictionary.clone() {
-                Some(dictionary) => self.read_from(source, dictionary).await.map(Some),
+                Some(dictionary) => self
+                    .read_from(source, dictionary)
+                    .await
+                    .map(|(bytes, _origin)| Some(bytes)),
                 None => Ok(None),
             }
         };
-        let (page_bytes, dictionary_bytes) =
+        let ((page_bytes, origin), dictionary_bytes) =
             futures::try_join!(self.read_from(source, range.clone()), read_dictionary)?;
         let mut parts = Vec::with_capacity(2);
         parts.push((range, page_bytes));
         if let (Some(dictionary), Some(bytes)) = (dictionary, dictionary_bytes) {
             parts.push((dictionary, bytes));
         }
-        Ok(Arc::new(Segments::new(parts, self.handle.size())))
+        Ok((Arc::new(Segments::new(parts, self.handle.size())), origin))
     }
 
     /// One byte range of the file from `source`: a hedged lookup GET through
-    /// the cache, or one counted local read.
-    async fn read_from(&self, source: PageSource<'_>, range: Range<u64>) -> Result<Bytes> {
+    /// the cache, or one counted local read. A chunk-file read is `Cached`:
+    /// it cost no GET, which is what the origin distinguishes.
+    async fn read_from(
+        &self,
+        source: PageSource<'_>,
+        range: Range<u64>,
+    ) -> Result<(Bytes, PageOrigin)> {
         match source {
-            PageSource::Store(cache) => self.handle.read_page(range, cache).await,
-            PageSource::Disk(disk) => disk.page(range).await,
+            PageSource::Store(cache) => self.handle.read_page_with_origin(range, cache).await,
+            PageSource::Disk(disk) => disk
+                .page(range)
+                .await
+                .map(|bytes| (bytes, PageOrigin::Cached)),
         }
     }
 }

@@ -16,7 +16,7 @@ use iceberg_catalog_rest::{
 };
 
 use crate::config::SourceConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, SnapshotId};
 use crate::storage::{PATH_SEPARATOR, SCHEME_SEPARATOR, Storage};
 
 /// The file under a static table root that names the current metadata
@@ -111,6 +111,13 @@ pub enum TableFault {
     /// there is nothing to compare a poll against.
     #[error("the catalog holds no metadata location for the table")]
     MetadataLocationUnknown,
+    /// The snapshot's timestamp is outside the range a `jiff::Timestamp`
+    /// represents, so its age cannot be measured.
+    #[error("snapshot {snapshot_id} has a timestamp outside the representable range")]
+    SnapshotTimestampOutOfRange {
+        /// The snapshot whose timestamp it is.
+        snapshot_id: SnapshotId,
+    },
 }
 
 /// The current metadata and the location it was read from; the location is

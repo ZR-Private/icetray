@@ -21,6 +21,12 @@ pub fn gauge(value: u64) -> f64 {
     value as f64
 }
 
+/// A length or byte total held in memory as a gauge value. A `usize` above
+/// `u64::MAX` cannot arise and saturates rather than wraps.
+pub fn gauge_len(value: usize) -> f64 {
+    gauge(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +44,10 @@ mod tests {
     #[test]
     fn test_gauge_is_the_value() {
         assert_eq!(gauge(7).to_bits(), 7.0f64.to_bits());
+    }
+
+    #[test]
+    fn test_gauge_len_is_the_value() {
+        assert_eq!(gauge_len(7).to_bits(), 7.0f64.to_bits());
     }
 }

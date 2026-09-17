@@ -17,7 +17,7 @@ use parquet::file::metadata::{
 };
 use parquet::file::reader::{ChunkReader, Length};
 
-use crate::cache::PageCache;
+use crate::cache::{PageCache, PageOrigin};
 use crate::error::{Error, Result};
 use crate::local::{self, DIGEST_BYTES};
 use crate::storage::{HedgeWindow, Located, Storage};
@@ -124,19 +124,30 @@ impl FileHandle {
         range: Range<u64>,
         cache: Option<&PageCache>,
     ) -> Result<Bytes> {
-        match cache {
-            Some(cache) => {
-                let handle = Arc::clone(self);
-                let key = (Arc::clone(&self.file_id), range.start);
-                cache
-                    .get_or_fetch(
-                        key,
-                        move || async move { handle.read_range_hedged(range).await },
-                    )
-                    .await
-            }
-            None => self.read_range_hedged(range).await,
-        }
+        self.read_page_with_origin(range, cache)
+            .await
+            .map(|(page, _origin)| page)
+    }
+
+    /// `read_page`, with where the page came from; a read without a cache
+    /// is always a GET and so always `Fetched`.
+    pub(crate) async fn read_page_with_origin(
+        self: &Arc<Self>,
+        range: Range<u64>,
+        cache: Option<&PageCache>,
+    ) -> Result<(Bytes, PageOrigin)> {
+        let Some(cache) = cache else {
+            let page = self.read_range_hedged(range).await?;
+            return Ok((page, PageOrigin::Fetched));
+        };
+        let handle = Arc::clone(self);
+        let key = (Arc::clone(&self.file_id), range.start);
+        cache
+            .fetch_with_origin(
+                key,
+                move || async move { handle.read_range_hedged(range).await },
+            )
+            .await
     }
 
     /// The footer with both page indexes, kept for the life of a

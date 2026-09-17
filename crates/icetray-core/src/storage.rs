@@ -244,6 +244,13 @@ impl Storage {
         Arc::clone(&self.stats)
     }
 
+    /// The hedge settings this storage runs under, so a `Table` builds its
+    /// `HedgeWindow` from the same configuration its reads are hedged by
+    /// (RFD 013).
+    pub fn hedge_config(&self) -> &HedgeConfig {
+        &self.config.hedge
+    }
+
     /// Resolves a location to a store and a path: the configured rewrite
     /// rules are applied in order and the first match wins, then the
     /// location is split into its `scheme://authority/` prefix and the rest

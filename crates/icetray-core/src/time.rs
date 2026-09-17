@@ -1,6 +1,7 @@
-//! Time conversions. Elapsed time is a `Duration` everywhere else in the
-//! crate; this is the one module where a duration becomes text or a number
-//! and back, so no call site carries its own unit arithmetic.
+//! Time conversions. Elapsed time is a `Duration` and a wall-clock instant
+//! a `jiff::Timestamp` everywhere else in the crate; this is the one module
+//! where either becomes text or a number and back, so no call site carries
+//! its own unit arithmetic.
 
 use std::time::Duration;
 
@@ -8,6 +9,14 @@ use std::time::Duration;
 /// The one place a `Duration` becomes a bare number for a metric.
 pub(crate) fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
+}
+
+/// A count of milliseconds since the Unix epoch, as Iceberg records a
+/// snapshot's timestamp, as a `jiff::Timestamp`. The one place an epoch
+/// millisecond becomes a timestamp. `Err` for a value outside the range jiff
+/// represents, which spans years -9999 to 9999.
+pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error> {
+    jiff::Timestamp::from_millisecond(millis)
 }
 
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
@@ -81,6 +90,34 @@ mod tests {
     #[test]
     fn test_seconds_zero_is_zero() {
         assert_eq!(super::seconds(Duration::ZERO).to_bits(), 0.0f64.to_bits());
+    }
+
+    /// Milliseconds since the epoch with a fraction of a second, so the
+    /// round trip carries the milliseconds.
+    const EPOCH_MILLIS: i64 = 1_700_000_000_123;
+
+    #[test]
+    fn test_timestamp_from_millis_zero_is_the_epoch() {
+        assert_eq!(
+            super::timestamp_from_millis(0).unwrap(),
+            jiff::Timestamp::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn test_timestamp_from_millis_round_trips() {
+        assert_eq!(
+            super::timestamp_from_millis(EPOCH_MILLIS)
+                .unwrap()
+                .as_millisecond(),
+            EPOCH_MILLIS
+        );
+    }
+
+    #[test]
+    fn test_timestamp_from_millis_rejects_out_of_range() {
+        assert!(super::timestamp_from_millis(i64::MAX).is_err());
+        assert!(super::timestamp_from_millis(i64::MIN).is_err());
     }
 
     #[test]

@@ -14,16 +14,17 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::Snapshot;
 
-use crate::cache::PageCache;
-use crate::catalog::Resolved;
+use crate::cache::{PageCache, PageOrigin};
+use crate::catalog::{Resolved, TableFault};
 use crate::config::{Residency, TableConfig};
-use crate::error::{Error, RefusalReason, Result, SnapshotId};
+use crate::error::{Error, LookupResult, RefusalReason, Result, SnapshotId};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
 use crate::parquet_io::{FileHandle, Segments};
 use crate::storage::{HedgeWindow, Storage};
+use crate::time;
 
 /// Files worked on at once while a generation loads: footers loaded at the
 /// footer stage, then chunks fetched and verified at the chunk stage, then
@@ -69,6 +70,9 @@ pub struct Generation {
     pub index_bytes: usize,
     /// When the load finished.
     pub loaded_at: Instant,
+    /// The snapshot's own timestamp, when the writer committed it; what
+    /// `generation_age_seconds` measures against now.
+    pub snapshot_timestamp: jiff::Timestamp,
     /// Positions in `files`, in file order, per bucketing the files carry
     /// and per bucket under it; how a key finds its candidates.
     routes: Routes,
@@ -103,7 +107,8 @@ impl Generation {
     /// same concurrency and assembles the generation: files sorted, overlap
     /// groups found, and every group that gained a file merged to refuse a
     /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
-    /// `previous`.
+    /// `previous`. A snapshot timestamp jiff cannot represent is
+    /// `TableFault::SnapshotTimestampOutOfRange`, raised before any read.
     pub async fn load(
         config: &TableConfig,
         resolved: &Resolved,
@@ -114,6 +119,15 @@ impl Generation {
         previous: Option<&Generation>,
     ) -> Result<Self> {
         let table = config.name.as_str();
+        let snapshot_timestamp =
+            time::timestamp_from_millis(snapshot.timestamp_ms()).map_err(|_out_of_range| {
+                Error::table_fault(
+                    table,
+                    TableFault::SnapshotTimestampOutOfRange {
+                        snapshot_id: SnapshotId(snapshot.snapshot_id()),
+                    },
+                )
+            })?;
         let layout = TableLayout::derive(
             table,
             &resolved.metadata,
@@ -189,6 +203,7 @@ impl Generation {
         Self::assemble(
             table,
             snapshot,
+            snapshot_timestamp,
             &resolved.location,
             layout,
             config.residency,
@@ -207,6 +222,7 @@ impl Generation {
     async fn assemble(
         table: &str,
         snapshot: &Snapshot,
+        snapshot_timestamp: jiff::Timestamp,
         metadata_location: &str,
         layout: TableLayout,
         residency: Residency,
@@ -249,6 +265,7 @@ impl Generation {
             records,
             index_bytes,
             loaded_at: Instant::now(),
+            snapshot_timestamp,
             routes,
             overlapping,
             verified_groups: to_verify.len(),
@@ -298,15 +315,34 @@ impl Generation {
     /// index's: in the Full tier one GET for a cold hit, none for a warm hit
     /// or a miss.
     pub async fn get(&self, key: &Key, cache: &PageCache) -> Result<Value> {
+        self.lookup(key, cache).await.map(|(value, _result)| value)
+    }
+
+    /// `get`, with the `result` label the lookup earns: `Miss` for an absent
+    /// key; for a present one, `ColdHit` when its value page came from
+    /// outside the cache (a fetch this lookup ran or joined) and `WarmHit`
+    /// when the cache served it from memory or its disk level. Only the
+    /// value page decides it; a key-page GET in the Bloom tier does not.
+    pub(crate) async fn lookup(
+        &self,
+        key: &Key,
+        cache: &PageCache,
+    ) -> Result<(Value, LookupResult)> {
         for file in self.candidates(key) {
             if let Some(row) = file.index.find(key, Some(cache)).await? {
-                return Ok(match file.index.read_value(row, Some(cache)).await? {
+                let (value, origin) = file.index.read_value_with_origin(row, Some(cache)).await?;
+                let value = match value {
                     Some(bytes) => Value::Present(bytes),
                     None => Value::Null,
-                });
+                };
+                let result = match origin {
+                    PageOrigin::Fetched => LookupResult::ColdHit,
+                    PageOrigin::Cached => LookupResult::WarmHit,
+                };
+                return Ok((value, result));
             }
         }
-        Ok(Value::Absent)
+        Ok((Value::Absent, LookupResult::Miss))
     }
 
     /// Which file and page each key would reach; the oracle for cost tests.
@@ -784,7 +820,7 @@ pub(crate) mod testing {
     use parquet::schema::types::ColumnPath;
 
     use super::Generation;
-    use crate::catalog::TableSource;
+    use crate::catalog::{TableSource, VERSION_HINT, under};
     use crate::config::{
         HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
     };
@@ -814,6 +850,21 @@ pub(crate) mod testing {
     /// The false-positive rate a `Bloom::Sized` filter is written at, the
     /// writer recipe's (RFD 002).
     pub(crate) const BLOOM_FPP: f64 = 0.01;
+    /// Buckets of the two-bucket fixture.
+    pub(crate) const TWO: u32 = 2;
+    /// Keys in each end-to-end data file.
+    pub(crate) const E2E_KEYS: i64 = 24;
+    /// The snapshot ids and sequence numbers of the end-to-end snapshots.
+    pub(crate) const FIRST_SNAPSHOT: i64 = 1_001;
+    pub(crate) const SECOND_SNAPSHOT: i64 = 1_002;
+    pub(crate) const THIRD_SNAPSHOT: i64 = 1_003;
+    pub(crate) const FIRST_SEQUENCE: i64 = 1;
+    pub(crate) const SECOND_SEQUENCE: i64 = 2;
+    pub(crate) const THIRD_SEQUENCE: i64 = 3;
+    /// The metadata versions of the end-to-end snapshots.
+    pub(crate) const FIRST_VERSION: u64 = 1;
+    pub(crate) const SECOND_VERSION: u64 = 2;
+    pub(crate) const THIRD_VERSION: u64 = 3;
 
     /// The contract's page row limit as the writer takes it.
     pub(crate) fn page_rows() -> usize {
@@ -1211,6 +1262,23 @@ pub(crate) mod testing {
             self.files.retain(|(file, _)| file.file_path() != path);
         }
 
+        /// Deletes the version hint, so the next resolve of the root fails
+        /// on the store's own error, as a poll does while the root is
+        /// unreachable; `restore_hint` or `commit` writes it again.
+        pub(crate) fn remove_hint(&self) {
+            std::fs::remove_file(self.dir.path().join(VERSION_HINT)).unwrap();
+        }
+
+        /// Writes the version hint pointing at metadata `version` again.
+        pub(crate) async fn restore_hint(&self, version: u64) {
+            manifest_testing::write_file(
+                &FileIO::new_with_fs(),
+                &under(&self.root(), VERSION_HINT),
+                Bytes::from(version.to_string()),
+            )
+            .await;
+        }
+
         /// Evolves the partition spec to `buckets` buckets; files added
         /// from here on are written under the new spec.
         pub(crate) fn evolve(&mut self, buckets: u32) {
@@ -1296,6 +1364,23 @@ pub(crate) mod testing {
         }
     }
 
+    /// Two contract files in two buckets, committed as `FIRST_SNAPSHOT`,
+    /// and every key they hold.
+    pub(crate) async fn two_bucket_table() -> (Table, Vec<i64>) {
+        let mut table = Table::bucketed(TWO);
+        let all = keys_from(0, E2E_KEYS);
+        for bucket in 0..TWO {
+            let keys = keys_in_bucket(&all, bucketing(TWO), bucket);
+            table
+                .add_long_file(&format!("f{bucket}"), &keys, bucket)
+                .await;
+        }
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        (table, all)
+    }
+
     /// A local directory under `dir` charging its reads to `stats`, with
     /// `budget` on its `index/` and no page cache disk level.
     pub(crate) fn local_dir(
@@ -1325,14 +1410,17 @@ mod tests {
     use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 
     use super::testing::{
-        self, KEY_STEP, TABLE, Table, WriterLayout, bucketing, keys_from, keys_in_bucket,
-        local_dir, value_for, values_of,
+        self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
+        KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, THIRD_SEQUENCE,
+        THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table, WriterLayout, bucketing, keys_from,
+        keys_in_bucket, local_dir, long_keys, two_bucket_table, value_for, values_of,
     };
     use super::*;
+    use crate::catalog::TableSource;
     use crate::config::{HedgeConfig, StorageConfig};
     use crate::key::KeyType;
     use crate::manifest::testing::{
-        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID,
+        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID,
     };
 
     /// The synthetic prefix the in-memory store is registered under.
@@ -1344,27 +1432,24 @@ mod tests {
     const SEQUENCE: i64 = 1;
     /// The memory budget of a test page cache: every page a test touches fits.
     const CACHE_BYTES: usize = 64 * 1024 * 1024;
-    /// Bucket counts the routing and end-to-end tests use.
-    const TWO: u32 = 2;
+    /// Bucket counts the routing tests use beside the fixture's `TWO`.
     const FOUR: u32 = 4;
     const EIGHT: u32 = 8;
     /// Keys per bucket file in the routing tests.
     const KEYS_PER_FILE: i64 = 16;
-    /// Keys in each end-to-end data file.
-    const E2E_KEYS: i64 = 24;
     /// A budget below any file's resident bytes.
     const TINY_BUDGET: u64 = 1;
-    /// The snapshot ids and sequence numbers of the end-to-end snapshots.
-    const FIRST_SNAPSHOT: i64 = 1_001;
-    const SECOND_SNAPSHOT: i64 = 1_002;
-    const THIRD_SNAPSHOT: i64 = 1_003;
-    const FIRST_SEQUENCE: i64 = 1;
-    const SECOND_SEQUENCE: i64 = 2;
-    const THIRD_SEQUENCE: i64 = 3;
-    /// The metadata versions of the end-to-end snapshots.
-    const FIRST_VERSION: u64 = 1;
-    const SECOND_VERSION: u64 = 2;
-    const THIRD_VERSION: u64 = 3;
+    /// A false-positive rate far above the contract's: the writer folds the
+    /// filter to its one-block minimum, so with `BLOOM_KEYS` keys the
+    /// filter passes about a third of the absent keys in range and rules
+    /// out the rest, and both kinds of miss are reachable.
+    const LOOSE_FPP: f64 = 0.5;
+    /// Keys in the Bloom-tier fixture's one file: enough to fill a
+    /// one-block filter to that rate, few enough that it rules keys out.
+    const BLOOM_KEYS: i64 = 64;
+    /// The GETs a Bloom-tier cold hit costs: the key page, then the value
+    /// page (RFD 017).
+    const BLOOM_HIT_GETS: u64 = 2;
 
     fn layout(bucketing: Option<Bucketing>) -> TableLayout {
         TableLayout {
@@ -1513,6 +1598,7 @@ mod tests {
         Generation::assemble(
             TABLE,
             &placeholder_snapshot(),
+            jiff::Timestamp::UNIX_EPOCH,
             MEM_METADATA,
             layout,
             Residency::Full,
@@ -1722,6 +1808,146 @@ mod tests {
             );
         }
         assert_eq!(mem.gets(), before + 1, "a miss is none");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_labels_cold_hit_then_warm_hit_then_miss() {
+        let (table, all) = two_bucket_table().await;
+        let config = table.config(Residency::Full, None);
+        let generation = table.load(&config, None, None).await.unwrap();
+        let cache = cache().await;
+        let key = Key::Long(all[0]);
+        let present = Value::Present(Bytes::from(value_for(all[0])));
+        let before = table.gets();
+        assert_eq!(
+            generation.lookup(&key, &cache).await.unwrap(),
+            (present.clone(), LookupResult::ColdHit)
+        );
+        assert_eq!(table.gets(), before + 1, "a cold hit is one GET");
+        assert_eq!(
+            generation.lookup(&key, &cache).await.unwrap(),
+            (present, LookupResult::WarmHit)
+        );
+        assert_eq!(
+            generation
+                .lookup(&Key::Long(all[0] + 1), &cache)
+                .await
+                .unwrap(),
+            (Value::Absent, LookupResult::Miss)
+        );
+        assert_eq!(table.gets(), before + 1, "a warm hit and a miss cost none");
+    }
+
+    /// Two lookups of `key` through `cache`: the first `ColdHit` at
+    /// `hit_gets` GETs, the second `WarmHit` at none.
+    async fn assert_cold_then_warm(
+        table: &Table,
+        generation: &Generation,
+        cache: &PageCache,
+        key: i64,
+        hit_gets: u64,
+    ) {
+        let present = Value::Present(Bytes::from(value_for(key)));
+        let before = table.gets();
+        assert_eq!(
+            generation.lookup(&Key::Long(key), cache).await.unwrap(),
+            (present.clone(), LookupResult::ColdHit)
+        );
+        assert_eq!(table.gets(), before + hit_gets, "a cold hit");
+        assert_eq!(
+            generation.lookup(&Key::Long(key), cache).await.unwrap(),
+            (present, LookupResult::WarmHit)
+        );
+        assert_eq!(table.gets(), before + hit_gets, "a warm hit costs none");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_labels_follow_the_value_page_in_disk_and_bloom_residency() {
+        let (table, all) = two_bucket_table().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        let disk = table
+            .load(&table.config(Residency::Disk, None), Some(&local), None)
+            .await
+            .unwrap();
+        let disk_cache = cache().await;
+        assert_cold_then_warm(&table, &disk, &disk_cache, all[0], 1).await;
+        let before = table.gets();
+        assert_eq!(
+            disk.lookup(&Key::Long(all[0] + 1), &disk_cache)
+                .await
+                .unwrap(),
+            (Value::Absent, LookupResult::Miss)
+        );
+        assert_eq!(
+            table.gets(),
+            before,
+            "a Disk miss reads the chunk file, no GET"
+        );
+
+        let mut table = Table::bucketed(1);
+        let all = keys_from(0, BLOOM_KEYS);
+        let keys = long_keys(&all);
+        table
+            .add_file(FileSpec {
+                name: "f",
+                keys: &keys,
+                values: values_of(&all),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout {
+                    bloom: Bloom::Fpp(LOOSE_FPP),
+                    ..WriterLayout::contract()
+                },
+            })
+            .await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let bloom = table
+            .load(&table.config(Residency::Bloom, None), None, None)
+            .await
+            .unwrap();
+        let bloom_cache = cache().await;
+        assert_cold_then_warm(&table, &bloom, &bloom_cache, all[0], BLOOM_HIT_GETS).await;
+        let absent: Vec<Key> = all[..all.len() - 1]
+            .iter()
+            .map(|key| Key::Long(key + 1))
+            .collect();
+        let plans = bloom.plan(&absent);
+        let passing = absent
+            .iter()
+            .zip(&plans)
+            .find(|(_, plan)| plan.is_some())
+            .map(|(key, _)| key.clone())
+            .expect("an undersized filter passes some absent key in range");
+        let ruled_out = absent
+            .iter()
+            .zip(&plans)
+            .find(|(_, plan)| plan.is_none())
+            .map(|(key, _)| key.clone())
+            .expect("a filter rules out some absent key in range");
+        // A fresh cache, so the key page the hit above fetched is not held.
+        let miss_cache = cache().await;
+        let before = table.gets();
+        assert_eq!(
+            bloom.lookup(&passing, &miss_cache).await.unwrap(),
+            (Value::Absent, LookupResult::Miss)
+        );
+        assert_eq!(
+            table.gets(),
+            before + 1,
+            "a filter-positive miss costs the key page and is still a miss"
+        );
+        assert_eq!(
+            bloom.lookup(&ruled_out, &miss_cache).await.unwrap(),
+            (Value::Absent, LookupResult::Miss)
+        );
+        assert_eq!(
+            table.gets(),
+            before + 1,
+            "a filter-negative miss costs none"
+        );
     }
 
     #[tokio::test]
@@ -2046,22 +2272,6 @@ mod tests {
         assert_eq!(joined.overlapping_buckets(), &BTreeMap::from([(0, 4)]));
     }
 
-    /// Two files in two buckets, one snapshot.
-    async fn two_bucket_table() -> (Table, Vec<i64>) {
-        let mut table = Table::bucketed(TWO);
-        let all = keys_from(0, E2E_KEYS);
-        for bucket in 0..TWO {
-            let keys = keys_in_bucket(&all, bucketing(TWO), bucket);
-            table
-                .add_long_file(&format!("f{bucket}"), &keys, bucket)
-                .await;
-        }
-        table
-            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
-            .await;
-        (table, all)
-    }
-
     /// The GETs a load makes before any data file: the hint, the metadata,
     /// the manifest list, and one manifest.
     const METADATA_GETS: u64 = 4;
@@ -2130,6 +2340,18 @@ mod tests {
         );
         assert_eq!(first.layout.bucketing, Some(bucketing(TWO)));
         assert_eq!(first.residency, Residency::Full);
+        let committed = TableSource::Static {
+            location: table.root(),
+        }
+        .resolve(&table.storage)
+        .await
+        .unwrap()
+        .snapshot_for_ref(TABLE, testing::MAIN)
+        .unwrap();
+        assert_eq!(
+            first.snapshot_timestamp,
+            time::timestamp_from_millis(committed.timestamp_ms()).unwrap()
+        );
         assert_eq!(first.files.len(), 2);
         assert_eq!(first.records, u64::try_from(all.len()).unwrap());
         assert_eq!(

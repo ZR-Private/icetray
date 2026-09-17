@@ -171,6 +171,26 @@ enum Tier {
     },
 }
 
+/// Where one call's page came from, as the `result` label of a lookup
+/// distinguishes it: fetched from outside, or served by the cache. A caller
+/// that joined another caller's fetch counts as `Fetched`, since it waited
+/// on the GET; a page from the disk level is `Cached`, since it cost no GET.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageOrigin {
+    /// The page came from the caller's fetch, run or joined.
+    Fetched,
+    /// The page was in memory or on the disk level.
+    Cached,
+}
+
+/// The origin of a page from where foyer says the entry came.
+fn origin_of(source: Source) -> PageOrigin {
+    match source {
+        Source::Outer => PageOrigin::Fetched,
+        Source::Memory | Source::Disk => PageOrigin::Cached,
+    }
+}
+
 /// The shared value-page cache. Clones share one cache and one set of
 /// counters: every table of a process holds a clone of the same cache.
 #[derive(Clone, Debug)]
@@ -223,6 +243,23 @@ impl PageCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
+        self.fetch_with_origin(key, fetch)
+            .await
+            .map(|(page, _origin)| page)
+    }
+
+    /// `get_or_fetch`, with where the page came from: what the `result`
+    /// label of a lookup is decided by, per call rather than by differencing
+    /// the process-wide counters, which concurrent lookups would confuse.
+    pub(crate) async fn fetch_with_origin<F, Fut>(
+        &self,
+        key: (Arc<str>, u64),
+        fetch: F,
+    ) -> Result<(Bytes, PageOrigin)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Bytes>> + Send + 'static,
+    {
         let key = PageKey(key.0, key.1);
         match self.tier.as_ref() {
             Tier::Memory(cache) => self.via_memory(cache, &key, fetch).await,
@@ -271,7 +308,7 @@ impl PageCache {
         cache: &Cache<PageKey, PageValue>,
         key: &PageKey,
         fetch: F,
-    ) -> Result<Bytes>
+    ) -> Result<(Bytes, PageOrigin)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
@@ -287,7 +324,7 @@ impl PageCache {
             Source::Outer => self.record_insert(),
             Source::Memory | Source::Disk => self.record_hit(),
         }
-        Ok(entry.value().0.clone())
+        Ok((entry.value().0.clone(), origin_of(entry.source())))
     }
 
     /// The hybrid tier's path, one call to foyer: memory, then the disk
@@ -301,7 +338,7 @@ impl PageCache {
         stats: &IoStats,
         key: &PageKey,
         fetch: F,
-    ) -> Result<Bytes>
+    ) -> Result<(Bytes, PageOrigin)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
@@ -312,7 +349,7 @@ impl PageCache {
             .await
             .map_err(cache_error)?;
         self.record_hybrid(entry.source(), stats, entry.value());
-        Ok(entry.value().0.clone())
+        Ok((entry.value().0.clone(), origin_of(entry.source())))
     }
 
     /// Counts how the hybrid tier served a page. From memory: a hit. From
@@ -344,7 +381,7 @@ impl PageCache {
     /// One page fetched and inserted: the one event that raises the memory
     /// budget's usage, so the gauge is set here and not on every lookup.
     fn record_insert(&self) {
-        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(bytes_gauge(self.usage()));
+        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
     }
 }
 
@@ -421,11 +458,6 @@ fn backend(error: foyer::Error) -> Error {
 /// `u64::MAX` bytes cannot be in memory and would saturate rather than wrap.
 fn page_len(value: &PageValue) -> u64 {
     u64::try_from(value.0.len()).unwrap_or(u64::MAX)
-}
-
-/// The memory budget's usage as the gauge takes it.
-fn bytes_gauge(usage: usize) -> f64 {
-    approx::gauge(u64::try_from(usage).unwrap_or(u64::MAX))
 }
 
 /// A byte bound as the device builder takes it. A bound wider than the

@@ -189,6 +189,29 @@ pub enum FindingCode {
     BloomUndersized,
 }
 
+impl FindingCode {
+    /// Every code, in finding-table order, for a caller that keeps a series
+    /// per code: the `findings` gauge is set for each of these on every
+    /// admitted generation, so a code the generation does not raise reads
+    /// zero. Complete: a successor match over every variant, which a new
+    /// variant fails to compile, is compared to this list in tests.
+    pub const ALL: [Self; 13] = [
+        Self::DictionaryEncodedValue,
+        Self::LargeKeyPages,
+        Self::NoBucketPartition,
+        Self::OverlappingFiles,
+        Self::BoundsMissing,
+        Self::ColumnIndexTruncated,
+        Self::LargeValuePages,
+        Self::LongKeys,
+        Self::LargeFile,
+        Self::ManyFilesPerBucket,
+        Self::NoBloomFilter,
+        Self::BloomOversized,
+        Self::BloomUndersized,
+    ];
+}
+
 impl fmt::Display for FindingCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code = match self {
@@ -1377,6 +1400,42 @@ mod tests {
     #[test]
     fn test_finding_code_order_is_the_finding_table() {
         assert!(CODES.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// The code after `code` in the finding table, `None` after the last.
+    /// The match names every variant, so a variant added to the enum fails
+    /// to compile here until it is placed in the chain, and the chain is
+    /// what `ALL` is checked against.
+    fn after(code: FindingCode) -> Option<FindingCode> {
+        match code {
+            FindingCode::DictionaryEncodedValue => Some(FindingCode::LargeKeyPages),
+            FindingCode::LargeKeyPages => Some(FindingCode::NoBucketPartition),
+            FindingCode::NoBucketPartition => Some(FindingCode::OverlappingFiles),
+            FindingCode::OverlappingFiles => Some(FindingCode::BoundsMissing),
+            FindingCode::BoundsMissing => Some(FindingCode::ColumnIndexTruncated),
+            FindingCode::ColumnIndexTruncated => Some(FindingCode::LargeValuePages),
+            FindingCode::LargeValuePages => Some(FindingCode::LongKeys),
+            FindingCode::LongKeys => Some(FindingCode::LargeFile),
+            FindingCode::LargeFile => Some(FindingCode::ManyFilesPerBucket),
+            FindingCode::ManyFilesPerBucket => Some(FindingCode::NoBloomFilter),
+            FindingCode::NoBloomFilter => Some(FindingCode::BloomOversized),
+            FindingCode::BloomOversized => Some(FindingCode::BloomUndersized),
+            FindingCode::BloomUndersized => None,
+        }
+    }
+
+    #[test]
+    fn test_all_lists_every_code_once_in_table_order() {
+        let mut chain = vec![FindingCode::ALL[0]];
+        while let Some(next) = after(*chain.last().unwrap()) {
+            chain.push(next);
+        }
+        assert_eq!(chain, FindingCode::ALL);
+        assert!(FindingCode::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            FindingCode::ALL.to_vec(),
+            CODES.iter().map(|(code, _)| *code).collect::<Vec<_>>()
+        );
     }
 
     #[test]
