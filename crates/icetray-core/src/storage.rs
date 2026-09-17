@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use aws_config::SdkConfig;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -22,6 +22,10 @@ use object_store::aws::{AmazonS3Builder, AwsCredential};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{CredentialProvider, ObjectStore, ObjectStoreExt};
+// Reads are timed on tokio's clock: a paused runtime (the simulation) advances
+// it virtually, so the hedge window and the timer that consults it agree; the
+// wall clock would feed the window real durations under a virtual timer.
+use tokio::time::Instant;
 
 use crate::approx;
 use crate::config::{ConfigError, ConfigViolation, HedgeConfig, S3Config, StorageConfig};
