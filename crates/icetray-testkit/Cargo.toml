@@ -9,4 +9,32 @@ description = "In-process S3, fixture writer, simulation, shared assertions, and
 workspace = true
 
 [dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+iceberg = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 icetray-core = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true }
+pin-project-lite = { workspace = true }
+s3s = { workspace = true }
+s3s-fs = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+# `net` for the in-process S3 server's loopback listener; nothing in the
+# serving crates listens.
+tokio = { workspace = true, features = ["net"] }
+tower = { workspace = true }
+tracing = { workspace = true }
+turmoil = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The container-gated catalog test writes its fixture through a REST catalog.
+iceberg-catalog-rest = { workspace = true }
