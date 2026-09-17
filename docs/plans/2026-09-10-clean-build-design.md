@@ -268,6 +268,11 @@ impl Storage {
     pub async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes>;
     /// Lookup path: hedged per `HedgeConfig` against the table's own latency
     /// window, since file size sets first-byte latency per table (RFD 013).
+    /// Reads are timed on tokio's clock (`tokio::time::Instant`), which a paused
+    /// runtime such as the simulation advances virtually, so the hedge window and
+    /// the timer that consults it agree; the wall clock would feed the window real
+    /// durations under a virtual timer and make the hedge count in simulation an
+    /// artifact of machine load. Outside a paused runtime it is the same monotonic clock.
     pub async fn read_range_hedged(&self, l: &Located, range: Range<u64>, window: &HedgeWindow) -> Result<Bytes>;
     pub async fn read_ranges(&self, l: &Located, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
 }
@@ -305,6 +310,15 @@ impl TableSource {
     /// the client parses either way; a pinned metadata file reads nothing.
     pub async fn resolve_if_changed(&self, storage: &Storage, known: &str) -> Result<Option<Resolved>>;
 }
+/// The metadata file a bare `version` names under `root`: `metadata/v<version>.metadata.json`,
+/// the Hadoop catalog's layout. A writer publishing a snapshot by hand (the testkit's
+/// `Fixture::commit_by_hand`) names its metadata file through it.
+pub fn version_file(root: &str, version: u64) -> String;
+/// The location of the version hint under `root`: `metadata/version-hint.text`. Core's own
+/// resolver reads the hint through it and the testkit's hint writer names the file through it,
+/// so this module stays the one home of the layout under a table root; `VERSION_HINT`,
+/// `METADATA_DIR`, and `under` stay `pub(crate)`.
+pub fn hint_location(root: &str) -> String;
 
 // manifest
 /// The bucket transform on the key, `bucket[count]` over `source_field_id`.
@@ -706,10 +720,12 @@ impl Opened {
 /// `tables`, whose message and exit code are the caller's. Issues no GET. Loading is the
 /// caller's step. `lib.rs` re-exports `Opened`, `open`, `Table`, `TableState`, `ErrorKind`.
 pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened>;
-/// The body of `open` over a storage the caller built, so tests use `Storage::new` and
-/// never the SDK chain: `LocalDir::open` when configured, one `PageCache` with the
-/// directory's `page_tier`, one `Table` per configured name matching `only`.
-pub(crate) async fn open_with(config: &Config, only: Option<&str>, storage: Arc<Storage>) -> Result<Opened>;
+/// The body of `open` over a storage the caller built, for the testkit and embedders: a test
+/// constructs one with `Storage::new`, registers its own stores on it, and never touches the
+/// SDK chain. `LocalDir::open` when configured, one `PageCache` with the directory's
+/// `page_tier`, one `Table` per configured name matching `only`. The binary uses `open`; the
+/// disk-tier acceptance tests count `Opened::retain` over two tables through this.
+pub async fn open_with(config: &Config, only: Option<&str>, storage: Arc<Storage>) -> Result<Opened>;
 ```
 
 Finding codes and tiers (RFD 007, RFD 016). The code column is the Display
@@ -825,23 +841,120 @@ so a new measurement in core reaches the CLI without a CLI change. Flags
 that only apply to `--location` are rejected under `--config`. Returns
 `ExitCode`.
 
-**Testkit.** Carried: the key/value derivation (`3 * i`, values a function
-of the key), `FixtureSpec`, the Iceberg writer plumbing, the in-process S3
-server, the simulation transport (verbatim), the acceptance tests. Changed:
-the fixture writer imports the layout constants from `contract` instead of
-declaring its own;
-`verify` uses `Generation::plan` as the cost oracle instead of re-deriving
-probe order; a fresh `PageCache` per measured batch; the fixture keeps one
-source of truth for written ids; `key_array` takes the `KeyType`; golden
-tables are located by `ICETRAY_GOLDEN_WAREHOUSE` and a missing warehouse
-marks the test skipped in output; new fixtures, one per refusal
-and per finding that no contract fixture triggers: a delete file, an
-unsorted file, a null key, a mismatched key physical type, an unsupported
-value column type, a multi-row-group file without column statistics, an
-evolved partition spec, a permuted-key overlapping table, a
-dictionary-encoded value column, a uuid-keyed table, and a table whose
-files carry no key bloom filter; everything test-only under
-`[dev-dependencies]`.
+**Testkit.** `icetray-testkit` is `error` (`TestkitError`, one variant per
+failure source; `SpecFault { PadOnFixedWidthKey, CatalogBehind }` for a
+specification the writer refuses; `Precondition { OracleNotFull,
+CacheNotCold, GoldenUnset, RestUriUnset }` for a helper called in a state
+it cannot measure; `required_var`, the one place a gate's variable is
+read), `keys` (`key_at`, `key_at_padded`, `absent_key_from`,
+`absent_key_near`, `far_key`, `value_for`, `value_for_len`; `KEY_STEP`,
+`VALUE_BYTES`, `STRING_KEY_FIXED_BYTES`; keys of all four types, uuid as
+sixteen bytes with the big-endian value in the tail, and values a function
+of the key), `layout` (`Layout` with `page_rows`, `page_bytes`,
+`Dictionary`, `column_index_truncate`, `Statistics`, `Bloom`,
+`row_group_rows`, `target_file_bytes`, and `Layout::contract()` built from
+`contract`'s constants; `KEY_BLOOM_FPP`, `KEY_COLUMN`, `VALUE_COLUMN`),
+`fixture` (`FixtureSpec` with `small` and `interleaved`, `Order`, `Nulls`,
+`Fixture` with its accessors, `files`, `keys_at`, and the sources
+`catalog_source`, `root_source`, `pinned_source`; `RawFile::from_batch`;
+`HandSnapshot`; `write_fixture`, `write_table_of_types`,
+`position_delete_file`, `memory_catalog_local`, `memory_catalog_s3`,
+`local_catalog`, `residue_class`; the constants `SMALL_IDS`,
+`SMALL_BUCKETS`, `SAMPLE`, `INTERLEAVED_IDS`, `INTERLEAVE_STRIDE`,
+`INTERLEAVED_BUCKETS`, `DATA_DIR`), `s3` (`S3Fixture`, whose
+`storage_config` is hedge-disabled and whose `file_io_props` is a
+`HashMap`), `sim` (`serve_s3`, `serve_s3_with`, `SlowEvery`,
+`sim_s3_store`, `SIM_S3_PORT`), `verify` (`Served` with `load` and
+`current`; `build`, `serve_over`, `serve`, `serve_catalog`,
+`serve_catalog_with`; `expected_cold_gets`, `expected_key_pages`,
+`predicted_probe`; `verify_hits`, `verify_hit_cost`, `verify_misses`;
+`storage_config_for_tests`, `count`, `TEST_PAGE_CACHE_BYTES`), and
+`golden` (`WAREHOUSE_VAR`, `warehouse`, `GoldenTable`, `table_config`,
+`config`, `long_key`, `string_key`, `permuted_key`, `value`,
+`wide_value`). The constants `PAGE_ROWS`, `VALUE_PAGE_BYTES`,
+`TARGET_FILE_BYTES_MAX`, `KEY_BYTES_ADVICE`, `MAX_KEY_BYTES`, and
+`PAGE_CACHE_DISK_BLOCK_BYTES` are imported from `contract` and never
+redeclared; the golden key derivations delegate to `keys`; `count` is the
+crate's one `usize` to `u64` conversion. Everything is test-only, under
+`[dev-dependencies]` of the crates that use it.
+
+The fixture writer commits through the Iceberg library's `ClusteredWriter`
+over the rolling data-file writer under `Layout::properties`, grouping ids
+by the library's own bucket transform. Raw files (`RawFile`, committed
+through `fast_append`, which admits any data file) produce what the writer
+cannot: a key column whose Parquet type contradicts the schema, a null
+key, and the two unsupported-type tables. By-hand snapshots
+(`Fixture::commit_by_hand`) write a data manifest, a delete manifest when
+there are delete files, the manifest list, and the metadata at
+`catalog::version_file(root, n)` under `Operation::Overwrite`, then the
+hint at `catalog::hint_location(root)`: a snapshot carrying a delete file
+and a snapshot dropping a data file, neither of which a fast append can
+commit. A table that has committed by hand is followed through its root
+and refuses further catalog commits as `SpecFault::CatalogBehind`.
+`Fixture::write_hint` writes the current metadata location as the hint's
+whole content; the testkit owns hint writing, core owns the hint's
+location. `Statistics::Truncated(n)` cuts the key column's row-group
+statistics, and because iceberg-rust 0.10.1 records a manifest bound only
+from an exact Parquet statistic, the manifest then carries no key bounds
+at all rather than shortened ones; the shortened bounds Iceberg's Java
+writer records under its default metrics mode are covered only by the
+golden `default_layout_1m` table. The evolved partition spec is proved at
+unit tier on core's hand-built metadata (`generation::testing::Table::
+evolve`), since iceberg-rust's transaction API cannot evolve a spec; the
+testkit writes no such fixture.
+
+`Served` is one table over its own storage and cache: `build` leaves it
+unloaded, for a test that asserts on a refused table's state or needs a
+cache of another size; `serve_over` and `serve` load it; `serve_catalog`
+opens a fixture through its catalog over hedge-free storage. The cost
+oracle is `Generation::plan` through `verify::expected_cold_gets` (the
+distinct value pages a cold Full-tier batch fetches; a key the plan names
+no value page for costs nothing in the Full tier and is
+`Precondition::OracleNotFull` in any other), `expected_key_pages` (the
+distinct key pages a Bloom-tier cold batch adds), and `predicted_probe`
+(whether a miss pays a key-page GET in the Bloom tier or a local read in
+the Disk tier). `verify_hit_cost` requires a cold cache and enforces it
+(`Precondition::CacheNotCold`), asserts the cold batch costs exactly the
+oracle's count and the repeat nothing. `Generation::plan` names a
+Bloom-tier key's first probe alone, so it cannot price a cold Bloom hit
+across an overlap group; the Bloom acceptance tests walk `candidates` and
+`page_of` up to the holder the Full plan names. In the Bloom tier a refresh
+that widens an overlap group costs, beyond the Full tier's GETs, one filter
+per row group of every new file and one chunk per row group of every member
+of the widened group, new files included: the tier keeps no chunks, and
+`Generation::assemble` gathers `key_chunks_for_verification` for every
+member of a group with a non-reused file. Every P-tier test serves under
+`storage_config_for_tests` or `S3Fixture::storage_config`, both
+hedge-disabled; only `tests/sim.rs` enables hedging.
+
+The acceptance suite is `tests/lookup.rs`, `lookup_s3.rs`, `refresh.rs`,
+`refusals.rs`, `findings.rs`, `residency_bloom.rs`, `residency_disk.rs`
+(P), `sim.rs` (S), `golden.rs` (G), `rest_catalog.rs` (C), and the
+`scale.rs` probe. One fixture per `RefusalReason` variant: descending
+order for `Unsorted`; a raw nullable key column for `NullKeys`; an
+overlapping append for `DuplicateKeys`; a raw `Utf8` key column on a
+long-keyed table for `KeyTypeMismatch`; `write_table_of_types` with an
+`Int` key for `KeyTypeUnsupported` and a `Long` value for
+`ValueTypeUnsupported`; a by-hand snapshot listing a position-delete file
+for `DeleteFiles`; a `key_pad` over `MAX_KEY_BYTES` for `KeyTooLong`; a
+one-byte budget for `OverBudget`; `Bloom::Off` under `Residency::Bloom`
+for `NoBloomFilter`; `Residency::Disk` without a local directory for
+`NoLocalDir`. One fixture per `FindingCode`: `Dictionary::Value`;
+`page_rows` at twice `KEY_PAGE_ROWS_COST` with 24-byte values; `buckets:
+0` rolled into twenty 64 KiB files; the interleaved fixture;
+`Statistics::Truncated`; `column_index_truncate` under a shared 64-byte
+prefix; 16 KiB values under the row bound; a padded string key; 9,000 rows
+of 16 KiB in one file; 48,000 ids at a 40 KiB target; `Bloom::Off`;
+`Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. Each set is bound to its enum by
+an exhaustive match, and the advice a layout cannot avoid is asserted
+beside the designed code. The gated tests carry `#[ignore = "<reason>"]`
+naming their variable and script, so a plain `cargo test` reports them as
+ignored, never as passed; forced without the variable they fail on
+`Precondition::GoldenUnset` or `Precondition::RestUriUnset`.
+`dev/test-int.sh` runs `rest_catalog` with `-- --ignored` once the catalog
+answers; `dev/test-golden.sh` refuses without `ICETRAY_GOLDEN_WAREHOUSE`,
+or without a `file://` warehouse's `db/` directory, then runs `golden`
+with `-- --ignored`.
 
 ## 6. Invariants and the tier that proves each
 
@@ -860,11 +973,11 @@ skip).
 | A refresh verifies only overlap groups that gained a file; a disjoint append verifies zero groups | P (counting) |
 | A duplicate key across files is refused and the previous generation keeps serving | P |
 | A delete file in the followed snapshot is refused with reason `delete_files` | P (fixture with a delete file) |
-| A file without column statistics and several row groups never yields a false miss | U (writer with statistics disabled) |
+| A file without column statistics and several row groups never yields a false miss | U (writer with statistics disabled), P (`findings.rs`: a footer per file and a chunk per row group on load, an absent key inside the range costs no GET) |
 | Layout follows the snapshot's schema and each manifest's spec; an evolved bucket count routes correctly | P (or U on hand-built metadata if the writer cannot evolve a spec) |
 | Overlapping files without duplicates serve correctly and are priced as files probed | P |
 | Unpartitioned tables serve correctly and are priced | P |
-| A dictionary-encoded value column costs one extra GET; a dictionary-encoded key column costs none in the Full tier, one more local read per find in the Disk tier, and in the Bloom tier one more GET on the first positive in a row group and none after | U |
+| A dictionary-encoded value column costs one extra GET; a dictionary-encoded key column costs none in the Full tier, one more local read per find in the Disk tier, and in the Bloom tier one more GET on the first positive in a row group and none after | U, P for the value column (`findings.rs`: one dictionary page per file touched on a cold batch, none warm) |
 | Keys over `MAX_KEY_BYTES` are refused; keys over the advice length serve with advice | P |
 | `Generation::plan` predicts exactly the GETs a `multi_get` issues | P |
 | Concurrent lookups for one page coalesce to one fetch | P |

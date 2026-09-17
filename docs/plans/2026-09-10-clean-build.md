@@ -88,10 +88,13 @@ One worker.
    binary keys, exit code 2, the broken-pipe path.
 2. Acceptance suite green over in-process S3 and simulation; the gRPC tests
    behind the server including health and readiness; the REST container test
-   with a visible skip.
+   (`icetray-testkit/tests/rest_catalog.rs`, an ignored test that a plain
+   `cargo test` reports as ignored) run through `dev/test-int.sh`.
 3. Golden tables: regenerate the Spark tables (contract, default writer,
    truncated column index, truncated manifest metrics, several row groups)
-   with a checked-in script; run the golden tests.
+   with a checked-in script; run the golden tests
+   (`icetray-testkit/tests/golden.rs`, ignored tests) through
+   `dev/test-golden.sh`.
 4. Conformance run: start the server the way a pod would (config path from
    the environment, JSON config, no flags) and check logs, metrics, health.
 5. `README.md` rewritten for the working system: what it is, the contract in

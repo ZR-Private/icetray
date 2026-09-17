@@ -144,29 +144,38 @@ Invariants: a gated test that cannot run reports as skipped and never as
 passed; every `RefusalReason` variant has exactly one fixture.
 
 Invariants the tables stage proved at unit tier only, or not at all, and
-defers here:
+deferred here; where the testkit proves each:
 
 - A `TableSource::Catalog` built by `from_config` resolving through a real
   REST catalog (`load_table` over HTTP, metadata and location taken from the
-  loaded table): `from_config` construction is unit-tested and the catalog
-  path is proved with iceberg's in-process `MemoryCatalog` (zero
-  object-storage GETs), but the REST client itself needs the container-gated
-  catalog fixture (RFD 014).
+  loaded table): the catalog path is proved through iceberg's in-process
+  `MemoryCatalog` at zero object-storage GETs (every P-tier load over
+  `Fixture::catalog_source`, and `tests/lookup_s3.rs::
+  test_refresh_on_a_catalog_source_reads_no_object` for the unchanged
+  poll); the REST client itself is proved by `tests/rest_catalog.rs::
+  test_rest_catalog_source_loads_polls_and_advances`, container-gated, run
+  by `dev/test-int.sh` with `-- --ignored` and reported as ignored
+  otherwise (RFD 014).
 - `TableFault::BucketValueMissing` for a non-null, non-integer bucket
-  literal: iceberg-rust's manifest writer serializes the partition tuple by
-  the spec's type and cannot write one; only the null-bucket case is proved
-  at unit tier.
-- `Generation::load` in the Bloom tier (overlap verification re-fetching
-  chunks as load GETs, filters kept): the index tier proves the per-file
-  costs; the generation tests run Full and Disk. The Bloom acceptance suite
-  (RFD 017) should count a Bloom generation load.
+  literal stays unproved beyond the null case: iceberg-rust's manifest
+  writer serializes the partition tuple by the spec's type and cannot write
+  one.
+- `Generation::load` in the Bloom tier: `tests/residency_bloom.rs` counts a
+  load as the Full tier's GETs plus one filter per row group
+  (`test_bloom_load_reads_filters_and_keeps_less_resident`), and a refresh
+  as one filter per row group of each new file plus one chunk per row group
+  of every member of each overlap group a new file joined, new files
+  included (`test_bloom_reverifies_grown_groups_by_refetching_chunks`).
 - The retain live set as the union over every table sharing a local
-  directory: built as `Opened::retain`, which holds every table's load lock
-  and unions `Generation::identities()`, and proved at unit tier over two
-  tables sharing one directory; the disk-tier acceptance tests count it.
+  directory: `tests/residency_disk.rs::
+  test_retain_frees_only_what_no_table_serves` opens two tables over one
+  root-followed fixture through `open_with`, drops a file by hand, and
+  counts `Opened::retain` freeing nothing while either table serves the
+  file and its chunk file once neither does.
 - Load GET count for files with several row groups through
-  `Generation::load` (one chunk GET per row group): proved at the index tier;
-  the generation end-to-end fixture writes single-row-group files.
+  `Generation::load`: `tests/findings.rs::
+  test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group`
+  counts a footer per file and a chunk per row group.
 
 ## Stage 2E: local disk
 
