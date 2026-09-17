@@ -760,32 +760,581 @@ pub struct MultiLookup {
     pub snapshot_id: SnapshotId,
 }
 
+/// Iceberg tables in a temporary directory whose data files arrow writes
+/// under typed layout knobs, followed through `Storage`'s `file://` store
+/// and loaded through `Generation::load`, with the key and value
+/// derivations every fixture shares; for the tests of this module and of
+/// `check`. Nothing here is compiled outside tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use bytes::Bytes;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        DataContentType, DataFile, ManifestContentType, ManifestStatus, PrimitiveType, Schema,
+        TableMetadata, TableMetadataBuilder, Type, UnboundPartitionSpec,
+    };
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use parquet::schema::types::ColumnPath;
+
+    use super::Generation;
+    use crate::catalog::TableSource;
+    use crate::config::{
+        HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
+    };
+    use crate::contract::PAGE_ROWS;
+    use crate::error::Result;
+    use crate::key::{Key, KeyType};
+    use crate::local::LocalDir;
+    use crate::manifest::Bucketing;
+    use crate::manifest::testing::{
+        self as manifest_testing, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN,
+    };
+    use crate::storage::{HedgeWindow, IoStats, Storage};
+
+    /// The table every fixture is named.
+    pub(crate) const TABLE: &str = "kv";
+    /// The branch the fixture tables are followed on.
+    pub(crate) const MAIN: &str = iceberg::spec::MAIN_BRANCH;
+    /// The step between written long keys, so the key after any written key
+    /// is absent and inside the file's range.
+    pub(crate) const KEY_STEP: i64 = 3;
+    /// Bytes per value where a fixture does not say.
+    pub(crate) const VALUE_BYTES: usize = 32;
+    /// The mixers that make a value a function of its key.
+    const VALUE_KEY_MIX: i64 = 31;
+    const VALUE_BYTE_MIX: i64 = 7;
+    const VALUE_MODULUS: i64 = 251;
+    /// The false-positive rate a `Bloom::Sized` filter is written at, the
+    /// writer recipe's (RFD 002).
+    pub(crate) const BLOOM_FPP: f64 = 0.01;
+
+    /// The contract's page row limit as the writer takes it.
+    pub(crate) fn page_rows() -> usize {
+        usize::try_from(PAGE_ROWS).unwrap()
+    }
+
+    /// A count as the byte and row totals take it.
+    pub(crate) fn count(n: usize) -> u64 {
+        u64::try_from(n).unwrap()
+    }
+
+    /// `VALUE_BYTES` bytes that are a function of `key`.
+    pub(crate) fn value_for(key: i64) -> Vec<u8> {
+        value_of_len(key, VALUE_BYTES)
+    }
+
+    /// `len` bytes that are a function of `mix`, distinct for neighbouring
+    /// mixes.
+    pub(crate) fn value_of_len(mix: i64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|at| {
+                let at = i64::try_from(at).unwrap();
+                u8::try_from((mix * VALUE_KEY_MIX + at * VALUE_BYTE_MIX).rem_euclid(VALUE_MODULUS))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Each key's value, none null.
+    pub(crate) fn values_of(keys: &[i64]) -> Vec<Option<Vec<u8>>> {
+        keys.iter().map(|key| Some(value_for(*key))).collect()
+    }
+
+    /// Keys `from`, `from + KEY_STEP`, ... `count` of them.
+    pub(crate) fn keys_from(from: i64, count: i64) -> Vec<i64> {
+        (0..count).map(|at| from + at * KEY_STEP).collect()
+    }
+
+    /// The keys among `keys` that `bucketing` routes to `bucket`.
+    pub(crate) fn keys_in_bucket(keys: &[i64], bucketing: Bucketing, bucket: u32) -> Vec<i64> {
+        keys.iter()
+            .copied()
+            .filter(|key| bucketing.bucket_of(&Key::Long(*key)) == bucket)
+            .collect()
+    }
+
+    /// `bucket[count]` over the fixture key column.
+    pub(crate) fn bucketing(count: u32) -> Bucketing {
+        Bucketing {
+            count,
+            source_field_id: KEY_FIELD_ID,
+        }
+    }
+
+    /// `keys` as long keys.
+    pub(crate) fn long_keys(keys: &[i64]) -> Vec<Key> {
+        keys.iter().map(|key| Key::Long(*key)).collect()
+    }
+
+    /// Which fixture column is dictionary-encoded; the other never is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Dictionary {
+        /// Neither: the contract's shape.
+        Off,
+        /// The key column, whose dictionary page costs nothing extra.
+        Key,
+        /// The value column, whose dictionary page is one more GET per hit.
+        Value,
+    }
+
+    /// Whether and how the key column gets a bloom filter. The writer sizes
+    /// a filter for the file's keys and folds it down to the smallest size
+    /// that meets the false-positive rate, so the rate is the one knob that
+    /// sets its bytes per key.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(crate) enum Bloom {
+        /// None.
+        Off,
+        /// Sized to the file's keys at `BLOOM_FPP`: the contract's filter.
+        Sized,
+        /// Sized to the file's keys at this false-positive rate: far below
+        /// `BLOOM_FPP` an oversized filter, far above it an undersized one.
+        Fpp(f64),
+    }
+
+    /// The writer's layout knobs; `contract()` is RFD 002's shape.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(crate) struct WriterLayout {
+        /// Rows per page, key and value alike; the write batch is the same,
+        /// so the row limit binds exactly.
+        pub(crate) page_rows: usize,
+        /// Which column is dictionary-encoded.
+        pub(crate) dictionary: Dictionary,
+        /// The column index's truncation length; `None` keeps whole values.
+        pub(crate) column_index_truncate: Option<usize>,
+        /// The key column's bloom filter.
+        pub(crate) bloom: Bloom,
+        /// Rows per row group; `None` leaves the writer's default, one row
+        /// group for every fixture this size.
+        pub(crate) row_group_rows: Option<usize>,
+    }
+
+    impl WriterLayout {
+        /// RFD 002's shape: contract pages, no dictionary, a whole column
+        /// index, a sized filter.
+        pub(crate) fn contract() -> Self {
+            Self {
+                page_rows: page_rows(),
+                dictionary: Dictionary::Off,
+                column_index_truncate: None,
+                bloom: Bloom::Sized,
+                row_group_rows: None,
+            }
+        }
+
+        /// The writer properties for a file of `rows` rows. The filter
+        /// setters enable a filter on the column they name, so the value
+        /// column never gets one.
+        fn properties(&self, rows: usize) -> WriterProperties {
+            let mut builder = WriterProperties::builder()
+                .set_data_page_row_count_limit(self.page_rows)
+                .set_write_batch_size(self.page_rows)
+                .set_dictionary_enabled(false)
+                .set_column_index_truncate_length(self.column_index_truncate)
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_bloom_filter_enabled(false);
+            let dictionary_column = match self.dictionary {
+                Dictionary::Off => None,
+                Dictionary::Key => Some(KEY_COLUMN),
+                Dictionary::Value => Some(VALUE_COLUMN),
+            };
+            if let Some(column) = dictionary_column {
+                builder = builder.set_column_dictionary_enabled(ColumnPath::from(column), true);
+            }
+            builder = builder.set_max_row_group_row_count(self.row_group_rows);
+            let fpp = match self.bloom {
+                Bloom::Off => None,
+                Bloom::Sized => Some(BLOOM_FPP),
+                Bloom::Fpp(fpp) => Some(fpp),
+            };
+            if let Some(fpp) = fpp {
+                let key = ColumnPath::from(KEY_COLUMN);
+                builder = builder
+                    .set_column_bloom_filter_enabled(key.clone(), true)
+                    .set_column_bloom_filter_fpp(key.clone(), fpp)
+                    .set_column_bloom_filter_ndv(key, count(rows));
+            }
+            builder.build()
+        }
+    }
+
+    /// The arrow type of a key column of `key_type`; fixtures write long
+    /// and string keys.
+    fn key_data_type(key_type: KeyType) -> DataType {
+        match key_type {
+            KeyType::Long => DataType::Int64,
+            KeyType::String => DataType::Utf8,
+            KeyType::Binary | KeyType::Uuid => panic!("fixtures write long and string keys"),
+        }
+    }
+
+    /// `keys`, all of `key_type`, as the key column's array.
+    fn key_array(key_type: KeyType, keys: &[Key]) -> ArrayRef {
+        match key_type {
+            KeyType::Long => Arc::new(Int64Array::from(
+                keys.iter()
+                    .map(|key| {
+                        let Key::Long(value) = key else {
+                            panic!("a long fixture holds long keys");
+                        };
+                        *value
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            KeyType::String => Arc::new(StringArray::from(
+                keys.iter()
+                    .map(|key| {
+                        let Key::Str(text) = key else {
+                            panic!("a string fixture holds string keys");
+                        };
+                        text.as_str()
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            KeyType::Binary | KeyType::Uuid => panic!("fixtures write long and string keys"),
+        }
+    }
+
+    /// A Parquet file of `keys` with `values` (a `None` is a null) laid out
+    /// as `layout` says, one row group.
+    pub(crate) fn parquet(
+        key_type: KeyType,
+        keys: &[Key],
+        values: &[Option<Vec<u8>>],
+        layout: &WriterLayout,
+    ) -> Bytes {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(KEY_COLUMN, key_data_type(key_type), false),
+            Field::new(VALUE_COLUMN, DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                key_array(key_type, keys),
+                Arc::new(values.iter().cloned().collect::<BinaryArray>()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut out, schema, Some(layout.properties(keys.len()))).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(out)
+    }
+
+    /// The Iceberg schema of a table keyed by `key_type` with binary values.
+    pub(crate) fn schema_for(key_type: KeyType) -> Schema {
+        let key = match key_type {
+            KeyType::Long => PrimitiveType::Long,
+            KeyType::String => PrimitiveType::String,
+            KeyType::Binary => PrimitiveType::Binary,
+            KeyType::Uuid => PrimitiveType::Uuid,
+        };
+        manifest_testing::schema(Type::Primitive(key), Type::Primitive(PrimitiveType::Binary))
+    }
+
+    /// What a fixture file's manifest entry records as its key bounds.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Bounds {
+        /// The exact least and greatest key, as
+        /// `write.metadata.metrics.column.<key>=full` records them.
+        Exact,
+        /// No bounds.
+        Missing,
+        /// String bounds cut to this many bytes, as Iceberg's default
+        /// metrics cut them (prototype findings, finding 8): the lower
+        /// bound is the cut prefix, the upper the cut prefix with its last
+        /// byte incremented, so both still bound the keys.
+        Truncated(usize),
+    }
+
+    /// `bounds` as the manifest records them for a file whose least and
+    /// greatest keys are `min` and `max`.
+    fn recorded_bounds(bounds: Bounds, min: &Key, max: &Key) -> Option<(Key, Key)> {
+        match bounds {
+            Bounds::Exact => Some((min.clone(), max.clone())),
+            Bounds::Missing => None,
+            Bounds::Truncated(len) => Some((
+                truncated_bound(min, len, false),
+                truncated_bound(max, len, true),
+            )),
+        }
+    }
+
+    /// A string key cut to `len` bytes, the last byte incremented for an
+    /// upper bound; fixture keys are ASCII, so the cut is text.
+    fn truncated_bound(key: &Key, len: usize, upper: bool) -> Key {
+        let Key::Str(text) = key else {
+            panic!("truncated bounds are a string-key fixture");
+        };
+        let mut cut = text.as_bytes()[..len].to_vec();
+        if upper {
+            *cut.last_mut().unwrap() += 1;
+        }
+        Key::Str(String::from_utf8(cut).unwrap())
+    }
+
+    /// One data file to write and record for the next snapshot.
+    pub(crate) struct FileSpec<'a> {
+        /// The file's name under the table's data directory.
+        pub(crate) name: &'a str,
+        /// Its keys, ascending, all of the table's key type.
+        pub(crate) keys: &'a [Key],
+        /// Its values, one per key; a `None` is a null.
+        pub(crate) values: Vec<Option<Vec<u8>>>,
+        /// Its partition tuple under the table's default spec.
+        pub(crate) partition: Partition,
+        /// What its manifest entry records as key bounds.
+        pub(crate) bounds: Bounds,
+        /// How its Parquet is laid out.
+        pub(crate) layout: WriterLayout,
+    }
+
+    /// An Iceberg table in a temporary directory: metadata from
+    /// `TableMetadataBuilder`, data files arrow writes, manifests and
+    /// snapshots iceberg-rust writes, all followed through `Storage`'s
+    /// `file://` store.
+    pub(crate) struct Table {
+        dir: tempfile::TempDir,
+        /// The one storage every read goes through; its counter is the oracle.
+        pub(crate) storage: Arc<Storage>,
+        /// The table's hedge window, handed to every load.
+        pub(crate) hedge: Arc<HedgeWindow>,
+        key_type: KeyType,
+        md: TableMetadata,
+        /// The default spec, which `add_file` writes under.
+        spec_id: i32,
+        /// Every data file written so far with the spec it was written
+        /// under: its entry for the next manifest.
+        pub(crate) files: Vec<(DataFile, i32)>,
+    }
+
+    impl Table {
+        /// A table keyed by `key_type` under `spec`, with no snapshot yet.
+        pub(crate) fn new(key_type: KeyType, spec: UnboundPartitionSpec) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = manifest_testing::file_root(dir.path());
+            let md = manifest_testing::metadata(&root, schema_for(key_type), spec);
+            Self {
+                dir,
+                storage: Arc::new(Storage::new(StorageConfig::default())),
+                hedge: Arc::new(HedgeWindow::new(&HedgeConfig::default())),
+                key_type,
+                spec_id: md.default_partition_spec_id(),
+                md,
+                files: Vec::new(),
+            }
+        }
+
+        /// A long-keyed table bucketed `buckets` ways.
+        pub(crate) fn bucketed(buckets: u32) -> Self {
+            Self::new(KeyType::Long, manifest_testing::bucket_spec(buckets))
+        }
+
+        /// The table root as a `file://` location.
+        pub(crate) fn root(&self) -> String {
+            manifest_testing::file_root(self.dir.path())
+        }
+
+        /// The location data file `name` is written at.
+        pub(crate) fn path_of(&self, name: &str) -> String {
+            format!("{}/{DATA_DIR}/{name}.parquet", self.root())
+        }
+
+        /// A configuration following this table's main branch in `residency`
+        /// with `budget` as its resident-bytes budget.
+        pub(crate) fn config(&self, residency: Residency, budget: Option<u64>) -> TableConfig {
+            TableConfig {
+                name: TABLE.to_string(),
+                source: SourceConfig::Static {
+                    location: self.root(),
+                },
+                r#ref: MAIN.to_string(),
+                key_column: KEY_COLUMN.to_string(),
+                value_column: VALUE_COLUMN.to_string(),
+                strict: true,
+                residency,
+                resident_budget_bytes: budget,
+            }
+        }
+
+        /// Writes `spec`'s file and records it for the next snapshot.
+        pub(crate) async fn add_file(&mut self, spec: FileSpec<'_>) {
+            let path = self.path_of(spec.name);
+            let bytes = parquet(self.key_type, spec.keys, &spec.values, &spec.layout);
+            let size = count(bytes.len());
+            manifest_testing::write_file(&FileIO::new_with_fs(), &path, bytes).await;
+            let min = spec.keys.iter().min().unwrap();
+            let max = spec.keys.iter().max().unwrap();
+            let bounds = recorded_bounds(spec.bounds, min, max);
+            self.files.push((
+                manifest_testing::data_file(
+                    &path,
+                    self.spec_id,
+                    manifest_testing::partition(spec.partition),
+                    count(spec.keys.len()),
+                    size,
+                    bounds.as_ref().map(|(min, max)| (min, max)),
+                    DataContentType::Data,
+                ),
+                self.spec_id,
+            ));
+        }
+
+        /// `add_file` of a contract-layout file of long `keys` with their
+        /// values and exact bounds, in `bucket`.
+        pub(crate) async fn add_long_file(&mut self, name: &str, keys: &[i64], bucket: u32) {
+            let typed = long_keys(keys);
+            self.add_file(FileSpec {
+                name,
+                keys: &typed,
+                values: values_of(keys),
+                partition: Partition::Bucket(bucket),
+                bounds: Bounds::Exact,
+                layout: WriterLayout::contract(),
+            })
+            .await;
+        }
+
+        /// Drops the recorded file `name`, so the next snapshot no longer
+        /// lists it or lists another file added under the same name.
+        pub(crate) fn remove_file(&mut self, name: &str) {
+            let path = self.path_of(name);
+            self.files.retain(|(file, _)| file.file_path() != path);
+        }
+
+        /// Evolves the partition spec to `buckets` buckets; files added
+        /// from here on are written under the new spec.
+        pub(crate) fn evolve(&mut self, buckets: u32) {
+            self.md = self
+                .md
+                .clone()
+                .into_builder(None)
+                .add_partition_spec(manifest_testing::bucket_spec(buckets))
+                .unwrap()
+                .set_default_partition_spec(TableMetadataBuilder::LAST_ADDED)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            self.spec_id = self.md.default_partition_spec_id();
+        }
+
+        /// Commits every file added so far as snapshot `id`, one manifest
+        /// per spec the files were written under, and writes the metadata
+        /// as `version`, pointing the hint at it.
+        pub(crate) async fn commit(
+            &mut self,
+            id: i64,
+            parent: Option<i64>,
+            sequence: i64,
+            version: u64,
+        ) {
+            let mut by_spec: BTreeMap<i32, Vec<(DataFile, ManifestStatus)>> = BTreeMap::new();
+            for (file, spec_id) in &self.files {
+                by_spec
+                    .entry(*spec_id)
+                    .or_default()
+                    .push((file.clone(), ManifestStatus::Added));
+            }
+            let manifests = by_spec
+                .into_iter()
+                .map(|(spec_id, entries)| manifest_testing::ManifestSpec {
+                    spec_id,
+                    content: ManifestContentType::Data,
+                    entries,
+                })
+                .collect();
+            let snapshot = manifest_testing::write_snapshot(
+                &self.md,
+                id,
+                parent,
+                sequence,
+                self.md.current_schema_id(),
+                manifests,
+            )
+            .await;
+            self.md = manifest_testing::with_snapshot(self.md.clone(), snapshot);
+            manifest_testing::write_metadata(&self.md, version).await;
+        }
+
+        /// Resolves the root and loads the main branch's snapshot.
+        pub(crate) async fn load(
+            &self,
+            config: &TableConfig,
+            local: Option<&LocalDir>,
+            previous: Option<&Generation>,
+        ) -> Result<Generation> {
+            let source = TableSource::Static {
+                location: self.root(),
+            };
+            let resolved = source.resolve(&self.storage).await?;
+            let snapshot = resolved.snapshot_for_ref(TABLE, MAIN)?;
+            Generation::load(
+                config,
+                &resolved,
+                &snapshot,
+                &self.storage,
+                Arc::clone(&self.hedge),
+                local,
+                previous,
+            )
+            .await
+        }
+
+        /// GETs the table's storage has issued so far.
+        pub(crate) fn gets(&self) -> u64 {
+            self.storage.stats().gets()
+        }
+    }
+
+    /// A local directory under `dir` charging its reads to `stats`, with
+    /// `budget` on its `index/` and no page cache disk level.
+    pub(crate) fn local_dir(
+        dir: &std::path::Path,
+        stats: Arc<IoStats>,
+        budget: Option<u64>,
+    ) -> LocalDir {
+        LocalDir::open(
+            &LocalConfig {
+                dir: dir.to_path_buf(),
+                index_budget_bytes: budget,
+                page_cache_disk_bytes: 0,
+            },
+            stats,
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use iceberg::io::FileIO;
-    use iceberg::spec::{
-        DataContentType, ManifestContentType, ManifestStatus, Operation, Summary,
-        TableMetadataBuilder,
-    };
+    use iceberg::spec::{Operation, Summary};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
 
+    use super::testing::{
+        self, KEY_STEP, TABLE, Table, WriterLayout, bucketing, keys_from, keys_in_bucket,
+        local_dir, value_for, values_of,
+    };
     use super::*;
-    use crate::catalog::TableSource;
-    use crate::config::{HedgeConfig, LocalConfig, SourceConfig, StorageConfig};
-    use crate::contract::PAGE_ROWS;
+    use crate::config::{HedgeConfig, StorageConfig};
     use crate::key::KeyType;
-    use crate::manifest::testing::{self, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN};
+    use crate::manifest::testing::{
+        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID,
+    };
 
-    /// The table every test names.
-    const TABLE: &str = "kv";
     /// The synthetic prefix the in-memory store is registered under.
     const MEM_PREFIX: &str = "mem://w/";
     /// The metadata location the assembled generations claim.
@@ -793,17 +1342,6 @@ mod tests {
     /// The snapshot id and sequence number of the assembled generations.
     const SNAPSHOT: i64 = 77;
     const SEQUENCE: i64 = 1;
-    /// The branch the end-to-end tables are followed on.
-    const MAIN: &str = iceberg::spec::MAIN_BRANCH;
-    /// The step between written keys, so the key after any written key is
-    /// absent and inside the file's range.
-    const KEY_STEP: i64 = 3;
-    /// Bytes per value.
-    const VALUE_BYTES: usize = 32;
-    /// The mixers that make a value a function of its key.
-    const VALUE_KEY_MIX: i64 = 31;
-    const VALUE_BYTE_MIX: i64 = 7;
-    const VALUE_MODULUS: i64 = 251;
     /// The memory budget of a test page cache: every page a test touches fits.
     const CACHE_BYTES: usize = 64 * 1024 * 1024;
     /// Bucket counts the routing and end-to-end tests use.
@@ -828,68 +1366,6 @@ mod tests {
     const SECOND_VERSION: u64 = 2;
     const THIRD_VERSION: u64 = 3;
 
-    fn value_for(key: i64) -> Vec<u8> {
-        (0..VALUE_BYTES)
-            .map(|at| {
-                let at = i64::try_from(at).unwrap();
-                u8::try_from((key * VALUE_KEY_MIX + at * VALUE_BYTE_MIX).rem_euclid(VALUE_MODULUS))
-                    .unwrap()
-            })
-            .collect()
-    }
-
-    /// Keys `from`, `from + KEY_STEP`, ... `count` of them.
-    fn keys_from(from: i64, count: i64) -> Vec<i64> {
-        (0..count).map(|at| from + at * KEY_STEP).collect()
-    }
-
-    /// The keys among `keys` that `bucketing` routes to `bucket`.
-    fn keys_in_bucket(keys: &[i64], bucketing: Bucketing, bucket: u32) -> Vec<i64> {
-        keys.iter()
-            .copied()
-            .filter(|key| bucketing.bucket_of(&Key::Long(*key)) == bucket)
-            .collect()
-    }
-
-    fn bucketing(count: u32) -> Bucketing {
-        Bucketing {
-            count,
-            source_field_id: KEY_FIELD_ID,
-        }
-    }
-
-    /// A Parquet file of `keys` with `values` (a `None` is a null) in the
-    /// contract's page shape, one row group.
-    fn parquet(keys: &[i64], values: &[Option<Vec<u8>>]) -> Bytes {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(KEY_COLUMN, DataType::Int64, false),
-            Field::new(VALUE_COLUMN, DataType::Binary, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef,
-                Arc::new(values.iter().cloned().collect::<BinaryArray>()) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        let page_rows = usize::try_from(PAGE_ROWS).unwrap();
-        let properties = WriterProperties::builder()
-            .set_data_page_row_count_limit(page_rows)
-            .set_write_batch_size(page_rows)
-            .set_dictionary_enabled(false)
-            .build();
-        let mut out = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        Bytes::from(out)
-    }
-
-    fn values_of(keys: &[i64]) -> Vec<Option<Vec<u8>>> {
-        keys.iter().map(|key| Some(value_for(*key))).collect()
-    }
-
     fn layout(bucketing: Option<Bucketing>) -> TableLayout {
         TableLayout {
             bucketing,
@@ -897,7 +1373,7 @@ mod tests {
             key_field_id: KEY_FIELD_ID,
             key_type: KeyType::Long,
             value_column: VALUE_COLUMN.to_string(),
-            value_field_id: testing::VALUE_FIELD_ID,
+            value_field_id: VALUE_FIELD_ID,
         }
     }
 
@@ -958,7 +1434,12 @@ mod tests {
             bucketing: Option<Bucketing>,
             bucket: u32,
         ) -> Arc<LoadedFile> {
-            let bytes = parquet(keys, values);
+            let bytes = testing::parquet(
+                KeyType::Long,
+                &testing::long_keys(keys),
+                values,
+                &WriterLayout::contract(),
+            );
             let size = u64::try_from(bytes.len()).unwrap();
             let key = Self::location(name)
                 .strip_prefix(MEM_PREFIX)
@@ -1565,173 +2046,15 @@ mod tests {
         assert_eq!(joined.overlapping_buckets(), &BTreeMap::from([(0, 4)]));
     }
 
-    /// An Iceberg table in a temporary directory, its data files written
-    /// with arrow, followed through `Storage`'s `file://` store.
-    struct Table {
-        dir: tempfile::TempDir,
-        storage: Arc<Storage>,
-        hedge: Arc<HedgeWindow>,
-        md: iceberg::spec::TableMetadata,
-        /// The default spec, which `add_file` writes under.
-        spec_id: i32,
-        /// Every data file written so far with the spec it was written
-        /// under: its entry for the next manifest.
-        files: Vec<(iceberg::spec::DataFile, i32)>,
-    }
-
-    impl Table {
-        fn new(buckets: u32) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let root = testing::file_root(dir.path());
-            let md =
-                testing::metadata(&root, testing::long_schema(), testing::bucket_spec(buckets));
-            Self {
-                dir,
-                storage: Arc::new(Storage::new(StorageConfig::default())),
-                hedge: Arc::new(HedgeWindow::new(&HedgeConfig::default())),
-                spec_id: md.default_partition_spec_id(),
-                md,
-                files: Vec::new(),
-            }
-        }
-
-        fn root(&self) -> String {
-            testing::file_root(self.dir.path())
-        }
-
-        fn config(&self, residency: Residency, budget: Option<u64>) -> TableConfig {
-            TableConfig {
-                name: TABLE.to_string(),
-                source: SourceConfig::Static {
-                    location: self.root(),
-                },
-                r#ref: MAIN.to_string(),
-                key_column: KEY_COLUMN.to_string(),
-                value_column: VALUE_COLUMN.to_string(),
-                strict: true,
-                residency,
-                resident_budget_bytes: budget,
-            }
-        }
-
-        /// Writes `keys` as data file `name` in `bucket` and records it for
-        /// the next snapshot.
-        async fn add_file(&mut self, name: &str, keys: &[i64], bucket: u32) {
-            let path = format!("{}/{DATA_DIR}/{name}.parquet", self.root());
-            let bytes = parquet(keys, &values_of(keys));
-            let size = u64::try_from(bytes.len()).unwrap();
-            testing::write_file(&FileIO::new_with_fs(), &path, bytes).await;
-            let (min, max) = (
-                Key::Long(*keys.iter().min().unwrap()),
-                Key::Long(*keys.iter().max().unwrap()),
-            );
-            self.files.push((
-                testing::data_file(
-                    &path,
-                    self.spec_id,
-                    testing::partition(testing::Partition::Bucket(bucket)),
-                    u64::try_from(keys.len()).unwrap(),
-                    size,
-                    Some((&min, &max)),
-                    DataContentType::Data,
-                ),
-                self.spec_id,
-            ));
-        }
-
-        /// Drops the recorded file `name`, so the next snapshot no longer
-        /// lists it or lists another file added under the same name.
-        fn remove_file(&mut self, name: &str) {
-            let path = format!("{}/{DATA_DIR}/{name}.parquet", self.root());
-            self.files.retain(|(file, _)| file.file_path() != path);
-        }
-
-        /// Evolves the partition spec to `buckets` buckets; files added
-        /// from here on are written under the new spec.
-        fn evolve(&mut self, buckets: u32) {
-            self.md = self
-                .md
-                .clone()
-                .into_builder(None)
-                .add_partition_spec(testing::bucket_spec(buckets))
-                .unwrap()
-                .set_default_partition_spec(TableMetadataBuilder::LAST_ADDED)
-                .unwrap()
-                .build()
-                .unwrap()
-                .metadata;
-            self.spec_id = self.md.default_partition_spec_id();
-        }
-
-        /// Commits every file added so far as snapshot `id`, one manifest
-        /// per spec the files were written under, and writes the metadata
-        /// as `version`, pointing the hint at it.
-        async fn commit(&mut self, id: i64, parent: Option<i64>, sequence: i64, version: u64) {
-            let mut by_spec: BTreeMap<i32, Vec<(iceberg::spec::DataFile, ManifestStatus)>> =
-                BTreeMap::new();
-            for (file, spec_id) in &self.files {
-                by_spec
-                    .entry(*spec_id)
-                    .or_default()
-                    .push((file.clone(), ManifestStatus::Added));
-            }
-            let manifests = by_spec
-                .into_iter()
-                .map(|(spec_id, entries)| testing::ManifestSpec {
-                    spec_id,
-                    content: ManifestContentType::Data,
-                    entries,
-                })
-                .collect();
-            let snapshot = testing::write_snapshot(
-                &self.md,
-                id,
-                parent,
-                sequence,
-                self.md.current_schema_id(),
-                manifests,
-            )
-            .await;
-            self.md = testing::with_snapshot(self.md.clone(), snapshot);
-            testing::write_metadata(&self.md, version).await;
-        }
-
-        /// Resolves the root and loads the main branch's snapshot.
-        async fn load(
-            &self,
-            config: &TableConfig,
-            local: Option<&LocalDir>,
-            previous: Option<&Generation>,
-        ) -> Result<Generation> {
-            let source = TableSource::Static {
-                location: self.root(),
-            };
-            let resolved = source.resolve(&self.storage).await?;
-            let snapshot = resolved.snapshot_for_ref(TABLE, MAIN)?;
-            Generation::load(
-                config,
-                &resolved,
-                &snapshot,
-                &self.storage,
-                Arc::clone(&self.hedge),
-                local,
-                previous,
-            )
-            .await
-        }
-
-        fn gets(&self) -> u64 {
-            self.storage.stats().gets()
-        }
-    }
-
     /// Two files in two buckets, one snapshot.
     async fn two_bucket_table() -> (Table, Vec<i64>) {
-        let mut table = Table::new(TWO);
+        let mut table = Table::bucketed(TWO);
         let all = keys_from(0, E2E_KEYS);
         for bucket in 0..TWO {
             let keys = keys_in_bucket(&all, bucketing(TWO), bucket);
-            table.add_file(&format!("f{bucket}"), &keys, bucket).await;
+            table
+                .add_long_file(&format!("f{bucket}"), &keys, bucket)
+                .await;
         }
         table
             .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
@@ -1781,7 +2104,7 @@ mod tests {
             bucketing(TWO),
             0,
         );
-        table.add_file("f2", &appended, 0).await;
+        table.add_long_file("f2", &appended, 0).await;
         table
             .commit(
                 SECOND_SNAPSHOT,
@@ -1875,7 +2198,7 @@ mod tests {
         );
         let replaced: Vec<i64> = in_bucket_zero.iter().chain(&more).copied().collect();
         table.remove_file("f0");
-        table.add_file("f0", &replaced, 0).await;
+        table.add_long_file("f0", &replaced, 0).await;
         table
             .commit(
                 SECOND_SNAPSHOT,
@@ -1892,7 +2215,7 @@ mod tests {
             "the replaced file is loaded anew, the other reused"
         );
         let by_name = |generation: &Generation, name: &str| {
-            let path = format!("{}/{DATA_DIR}/{name}.parquet", table.root());
+            let path = table.path_of(name);
             generation
                 .files
                 .iter()
@@ -1923,7 +2246,9 @@ mod tests {
         for bucket in 0..FOUR {
             let keys = keys_in_bucket(&more, bucketing(FOUR), bucket);
             assert!(!keys.is_empty(), "bucket {bucket} holds keys");
-            table.add_file(&format!("g{bucket}"), &keys, bucket).await;
+            table
+                .add_long_file(&format!("g{bucket}"), &keys, bucket)
+                .await;
         }
         table
             .commit(
@@ -1989,7 +2314,7 @@ mod tests {
             .filter(|key| bucketing(TWO).bucket_of(&Key::Long(*key)) == 0)
             .collect();
         assert!(interleaved.len() > 1);
-        table.add_file("f3", &interleaved, 0).await;
+        table.add_long_file("f3", &interleaved, 0).await;
         table
             .commit(
                 THIRD_SNAPSHOT,
@@ -2015,7 +2340,7 @@ mod tests {
         // The duplicate file starts above f0's first key, so it is the
         // later file in file order and the one the refusal names.
         let in_bucket_zero = keys_in_bucket(&all, bucketing(TWO), 0);
-        table.add_file("dup", &in_bucket_zero[1..3], 0).await;
+        table.add_long_file("dup", &in_bucket_zero[1..3], 0).await;
         table
             .commit(
                 SECOND_SNAPSHOT,
@@ -2027,7 +2352,7 @@ mod tests {
         assert_eq!(
             refusal_of(table.load(&config, None, Some(&first)).await),
             RefusalReason::DuplicateKeys {
-                path: format!("{}/{DATA_DIR}/dup.parquet", table.root()),
+                path: table.path_of("dup"),
                 key: Key::Long(in_bucket_zero[1]),
             }
         );
@@ -2072,22 +2397,6 @@ mod tests {
         let generous = table.config(Residency::Full, Some(predicted));
         let loaded = table.load(&generous, None, None).await.unwrap();
         assert_eq!(u64::try_from(loaded.index_bytes).unwrap(), predicted);
-    }
-
-    fn local_dir(
-        dir: &std::path::Path,
-        stats: Arc<crate::storage::IoStats>,
-        budget: Option<u64>,
-    ) -> LocalDir {
-        LocalDir::open(
-            &LocalConfig {
-                dir: dir.to_path_buf(),
-                index_budget_bytes: budget,
-                page_cache_disk_bytes: 0,
-            },
-            stats,
-        )
-        .unwrap()
     }
 
     #[tokio::test]

@@ -133,7 +133,8 @@ pub enum FileFault {
 /// 017), so the budget check and the table owner see the numbers before any
 /// key chunk is fetched. `bloom` and `bloom_bits_per_key` are `None` when a
 /// row group lacks a key bloom filter or the footer does not bound one.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Serializes with these field names: the doctor's summary carries it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct ResidentBytes {
     /// Footer, page indexes, key chunks, and fences.
     pub full: u64,
