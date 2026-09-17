@@ -75,9 +75,10 @@ pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened> {
     open_with(config, only, storage).await
 }
 
-/// `open` over a storage the caller built, so a test constructs one with
-/// `Storage::new` and never touches the SDK chain.
-pub(crate) async fn open_with(
+/// `open` over a storage the caller built, for the testkit and embedders:
+/// a test constructs one with `Storage::new` and never touches the SDK
+/// chain, and registers its own stores on it. The binary uses `open`.
+pub async fn open_with(
     config: &Config,
     only: Option<&str>,
     storage: Arc<Storage>,

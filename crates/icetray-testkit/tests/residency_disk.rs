@@ -1,0 +1,366 @@
+//! The Disk residency tier (RFD 017) in a temporary directory per test,
+//! counting GETs and local reads on one `IoStats`: a cold hit is one GET and
+//! one local read, a miss one local read; a restart reuses the chunk files
+//! and fetches footers only; an over-budget load is refused before a chunk
+//! is written; `retain` frees a dropped file's chunk file once no table
+//! serves it; the page cache's disk level serves evicted pages and survives
+//! a restart.
+
+use std::collections::HashSet;
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
+
+use iceberg::Catalog;
+use icetray_core::config::{
+    Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
+};
+use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
+use icetray_core::open::open_with;
+use icetray_core::{DataFileIdentity, Error, KeyType, LocalDir, RefusalReason, Storage, Value};
+use icetray_testkit::fixture::{SAMPLE, local_catalog};
+use icetray_testkit::verify::{self, Served, count};
+use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
+
+/// The namespace every fixture is written in.
+const NAMESPACE: &str = "ns";
+
+/// Ids and buckets of the smaller fixtures.
+const IDS_4K: Range<u64> = 0..4_000;
+const FOUR_BUCKETS: u32 = 4;
+
+/// Load GETs beyond the per-file ones over a catalog source: the manifest
+/// list and the manifest.
+const LOAD_METADATA_GETS: u64 = 2;
+
+/// A chunk-file budget no file fits in.
+const TINY_BUDGET: u64 = 1;
+
+/// The two tables sharing one local directory in the retain test.
+const TABLE_A: &str = "a";
+const TABLE_B: &str = "b";
+
+/// The page cache's memory capacity in the disk-level test: a few contract
+/// pages of hundred-byte values, so the dozen distinct pages `SAMPLE`
+/// fetches overflow it and spill to the disk level.
+const SMALL_CACHE_BYTES: usize = 384 * 1024;
+
+/// A local directory under `dir` over `storage`'s counters, with `budget`
+/// on its chunk files and `page_cache_disk_bytes` as its page cache level.
+fn local_dir(
+    dir: &Path,
+    storage: &Storage,
+    budget: Option<u64>,
+    page_cache_disk_bytes: u64,
+) -> Result<Arc<LocalDir>> {
+    Ok(Arc::new(LocalDir::open(
+        &LocalConfig {
+            dir: dir.to_path_buf(),
+            index_budget_bytes: budget,
+            page_cache_disk_bytes,
+        },
+        storage.stats(),
+    )?))
+}
+
+/// `fixture` served in the Disk tier through its catalog over a fresh
+/// storage and a local directory under `dir`.
+async fn serve_disk(
+    fixture: &Fixture,
+    catalog: &Arc<dyn Catalog>,
+    dir: &Path,
+    budget: Option<u64>,
+) -> Result<(Arc<Storage>, Arc<LocalDir>, Result<Served>)> {
+    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+    let local = local_dir(dir, &storage, budget, 0)?;
+    let served = verify::serve_over(
+        Arc::clone(&storage),
+        fixture.config(Residency::Disk, false),
+        fixture.catalog_source(Arc::clone(catalog)),
+        Some(Arc::clone(&local)),
+    )
+    .await;
+    Ok((storage, local, served))
+}
+
+#[tokio::test]
+async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_disk", KeyType::Long),
+    )
+    .await?;
+    let oracle = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
+    let expected = verify::expected_cold_gets(&oracle.current(), &fixture.keys_at(&SAMPLE))?;
+    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let served = served?;
+    assert_eq!(served.current().residency, Residency::Disk);
+    let stats = storage.stats();
+    let counters = || (stats.gets(), stats.local_reads());
+    let sample = count(SAMPLE.len());
+
+    let (gets, reads) = counters();
+    let cold = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
+    assert_eq!(cold, expected, "one value page GET per cold hit");
+    assert_eq!(
+        counters(),
+        (gets + expected, reads + sample),
+        "one key page read per find"
+    );
+
+    let (gets, reads) = counters();
+    let warm = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
+    assert_eq!(warm, 0);
+    assert_eq!(
+        counters(),
+        (gets, reads + sample),
+        "a warm hit still finds its row on disk"
+    );
+
+    // An absent key hashes to its own bucket, whose file may not cover it:
+    // only a probe the plan routes to a key page reads that page.
+    let generation = served.current();
+    let (gets, reads) = counters();
+    let mut routed = 0;
+    for id in SAMPLE {
+        let key = fixture.absent_near(id);
+        if verify::predicted_probe(&generation, &key) {
+            routed += 1;
+        }
+        assert_eq!(
+            served.table.get(&key).await?.value,
+            Value::Absent,
+            "key {key}"
+        );
+    }
+    assert!(routed > 0, "some absent key falls inside a file's range");
+    assert_eq!(
+        counters(),
+        (gets, reads + routed),
+        "a miss inside a file's range costs one local read and no GET, one outside every range nothing"
+    );
+
+    let (gets, reads) = counters();
+    let far = icetray_testkit::far_key(KeyType::Long);
+    assert_eq!(served.table.get(&far).await?.value, Value::Absent);
+    assert_eq!(counters(), (gets, reads), "a far miss touches nothing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_disk_restart", KeyType::Long),
+    )
+    .await?;
+    let files = count(fixture.file_count());
+    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let served = served?;
+    let identities = served.current().identities();
+    assert_eq!(count(identities.len()), files);
+    for identity in &identities {
+        assert!(local.chunks_for(identity)?.is_some(), "{}", identity.path);
+    }
+    assert!(local.index_bytes_in_use()? > 0);
+    drop(served);
+    drop(local);
+
+    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let served = served?;
+    assert_eq!(
+        storage.stats().gets(),
+        LOAD_METADATA_GETS + files,
+        "footers only: every chunk file is reused"
+    );
+    let stats = storage.stats();
+    for id in SAMPLE {
+        let key = fixture.key(id);
+        let (gets, reads) = (stats.gets(), stats.local_reads());
+        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            (stats.gets() - gets, stats.local_reads() - reads),
+            (1, 1),
+            "key {key}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_disk_over_budget_is_refused_before_any_chunk_is_written() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_disk_budget", KeyType::Long),
+    )
+    .await?;
+    let (storage, local, served) =
+        serve_disk(&fixture, &catalog, scratch.path(), Some(TINY_BUDGET)).await?;
+    let error = served.err().unwrap();
+    assert!(
+        matches!(
+            error,
+            TestkitError::Core(Error::Refused {
+                reason: RefusalReason::OverBudget { .. },
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(local.index_bytes_in_use()?, 0, "no chunk file was written");
+    assert_eq!(
+        storage.stats().gets(),
+        LOAD_METADATA_GETS + count(fixture.file_count()),
+        "every footer and no chunk"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retain_frees_only_what_no_table_serves() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let spec = FixtureSpec {
+        ids: IDS_4K,
+        buckets: FOUR_BUCKETS,
+        ..FixtureSpec::small("kv_retain", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture.write_hint().await?;
+    let table = |name: &str| TableConfig {
+        name: name.to_string(),
+        source: fixture.root_source(),
+        ..fixture.config(Residency::Disk, false)
+    };
+    let config = Config {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            local: Some(LocalConfig {
+                dir: scratch.path().to_path_buf(),
+                index_budget_bytes: None,
+                page_cache_disk_bytes: 0,
+            }),
+            ..verify::storage_config_for_tests()
+        },
+        tables: vec![table(TABLE_A), table(TABLE_B)],
+    };
+    let storage = Arc::new(Storage::new(config.storage.clone()));
+    let opened = open_with(&config, None, storage).await?;
+    let local = opened.local.clone().unwrap();
+    let (a, b) = (&opened.tables[0], &opened.tables[1]);
+    a.load().await?;
+    b.load().await?;
+    assert_eq!(opened.retain().await?, 0);
+    let identities: HashSet<DataFileIdentity> =
+        a.current().expect("the table was loaded").identities();
+    assert_eq!(identities.len(), fixture.file_count());
+
+    let dropped_file = fixture.files().last().unwrap().clone();
+    let dropped = identities
+        .iter()
+        .find(|identity| identity.path == dropped_file.file_path())
+        .unwrap()
+        .clone();
+    let kept = identities
+        .iter()
+        .find(|identity| identity.path != dropped_file.file_path())
+        .unwrap()
+        .clone();
+    let data: Vec<_> = fixture
+        .files()
+        .iter()
+        .filter(|file| file.file_path() != dropped_file.file_path())
+        .cloned()
+        .collect();
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data,
+            deletes: Vec::new(),
+        })
+        .await?;
+    assert!(a.refresh().await?);
+    assert_eq!(opened.retain().await?, 0, "b still serves the dropped file");
+    assert!(local.chunks_for(&dropped)?.is_some());
+    assert!(b.refresh().await?);
+    assert!(
+        opened.retain().await? > 0,
+        "nothing serves the dropped file"
+    );
+    assert!(local.chunks_for(&dropped)?.is_none());
+    assert!(local.chunks_for(&kept)?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_disk_pages", KeyType::Long),
+    )
+    .await?;
+    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+    let local = local_dir(scratch.path(), &storage, None, PAGE_CACHE_DISK_BLOCK_BYTES)?;
+    let config = fixture.config(Residency::Full, false);
+    let source = || fixture.catalog_source(Arc::clone(&catalog));
+
+    let served = verify::build(
+        Arc::clone(&storage),
+        config.clone(),
+        source(),
+        Some(Arc::clone(&local)),
+        SMALL_CACHE_BYTES,
+    )
+    .await?
+    .load()
+    .await?;
+    let fetched_page_bytes =
+        SAMPLE.len() * usize::try_from(PAGE_ROWS).unwrap() * fixture.spec().value_bytes;
+    assert!(
+        fetched_page_bytes > SMALL_CACHE_BYTES,
+        "the sample's pages overflow memory, so the surplus reaches the disk level"
+    );
+    for id in SAMPLE {
+        let key = fixture.key(id);
+        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+    }
+    assert_eq!(
+        served.cache.fetches(),
+        count(SAMPLE.len()),
+        "one distinct page per sample id"
+    );
+    served.cache.close().await?;
+    drop(served);
+
+    let served = verify::build(
+        Arc::clone(&storage),
+        config,
+        source(),
+        Some(local),
+        SMALL_CACHE_BYTES,
+    )
+    .await?
+    .load()
+    .await?;
+    let stats = storage.stats();
+    let key = fixture.key(SAMPLE[0]);
+    let (gets, reads) = (stats.gets(), stats.local_reads());
+    assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+    assert_eq!(
+        (stats.gets() - gets, stats.local_reads() - reads),
+        (0, 1),
+        "the page comes back from the disk level"
+    );
+    Ok(())
+}

@@ -246,7 +246,7 @@ async fn current_metadata_file(storage: &Storage, location: &str) -> Result<Stri
         return Ok(location.to_string());
     }
     let root = location.trim_end_matches(PATH_SEPARATOR);
-    let bytes = storage.read_all(&under(root, VERSION_HINT)).await?;
+    let bytes = storage.read_all(&hint_location(root)).await?;
     Ok(parse_hint(root, &bytes)?.metadata_file(root))
 }
 
@@ -279,9 +279,19 @@ pub(crate) fn under(root: &str, rest: &str) -> String {
     format!("{root}{PATH_SEPARATOR}{rest}")
 }
 
+/// The location of the version hint under `root`, which carries no trailing
+/// separator: `metadata/version-hint.text`. A writer that publishes a
+/// snapshot to a static root writes the current metadata location there;
+/// this module owns the layout under a table root, so the testkit's hint
+/// writer names the file through it.
+pub fn hint_location(root: &str) -> String {
+    under(root, VERSION_HINT)
+}
+
 /// The metadata file a bare `version` names under `root`:
-/// `metadata/v<version>.metadata.json`, the Hadoop catalog's layout.
-pub(crate) fn version_file(root: &str, version: u64) -> String {
+/// `metadata/v<version>.metadata.json`, the Hadoop catalog's layout. A
+/// writer publishing a snapshot by hand names its metadata file through it.
+pub fn version_file(root: &str, version: u64) -> String {
     under(
         root,
         &format!("{METADATA_DIR}{PATH_SEPARATOR}{VERSION_FILE_PREFIX}{version}{METADATA_SUFFIX}"),

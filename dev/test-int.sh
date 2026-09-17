@@ -14,4 +14,4 @@ if ! curl -fsS --max-time 5 "$ICETRAY_REST_URI/v1/config" >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo test --workspace --locked --test rest_catalog
+cargo test --workspace --locked --test rest_catalog -- --ignored
