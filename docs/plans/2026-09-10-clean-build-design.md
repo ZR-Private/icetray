@@ -35,8 +35,8 @@ redefine.
 | module | owns | RFD |
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
-| `approx` | integer-to-float conversion (`ratio`, `gauge`); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string; CONTRIBUTING Constants | |
+| `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`); the only `cast_precision_loss` allow | 015 |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string, and an epoch millisecond a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the read-kind label enum; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -95,6 +95,18 @@ pub enum Error {
     Local { path: PathBuf, fault: LocalFault },
 }
 pub type Result<T> = std::result::Result<T, Error>;
+impl Error {
+    /// The variant, with the reason for a refusal: the `reason` label of `refresh_errors_total`.
+    pub fn kind(&self) -> ErrorKind;
+}
+/// One variant per `Error` variant, `Refused` carrying its reason. Display gives the `reason`
+/// label of `refresh_errors_total`: the refusal's own name for `Refused`, `inefficient` for
+/// the strict gate, and the variant's snake_case name for the rest (`iceberg`, `parquet`,
+/// `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
+/// `file`, `not_ready`, `local`). Also what `TableState::Degraded` carries as its reason:
+/// `Error` is not `Clone`, so the failure goes to the caller and its kind to the state.
+/// Re-exported from `lib.rs`.
+pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local }
 
 /// Named refusals (RFD 007). Display gives the snake_case name used in logs;
 /// the fields name the file, row group, type, key, or bytes a reader has to
@@ -244,6 +256,9 @@ impl Storage {
     pub async fn with_sdk_defaults(config: StorageConfig) -> Self;
     pub fn register(&self, prefix: impl Into<String>, store: Arc<dyn ObjectStore>);
     pub fn stats(&self) -> Arc<IoStats>;
+    /// The hedge settings this storage runs under; `Table::new` builds the table's
+    /// `HedgeWindow` from it, so the frozen `Table::new` takes no `HedgeConfig`.
+    pub fn hedge_config(&self) -> &HedgeConfig;
     /// Rewrite rules first, then the store for the `scheme://authority/` prefix;
     /// no store is `ConfigViolation::NoStoreForLocation`, a relative path
     /// `ConfigViolation::LocationNotAbsolute`.
@@ -264,8 +279,9 @@ impl Storage {
 /// that is present names a snapshot the metadata holds, and metadata whose
 /// ref names a missing snapshot is refused at the parse boundary as
 /// `Error::Json`. `BucketValueMissing` covers a null, another type, or a
-/// negative value where the spec puts the key's bucket.
-pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown }
+/// negative value where the spec puts the key's bucket. `SnapshotTimestampOutOfRange` is a
+/// snapshot timestamp jiff cannot represent, raised by `Generation::load` before any read.
+pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown, SnapshotTimestampOutOfRange { snapshot_id: SnapshotId } }
 pub struct Resolved { pub metadata: Arc<TableMetadata>, pub location: String }
 impl Resolved {
     /// A ref the metadata lacks is `TableFault::RefNotFound` under `table`.
@@ -356,6 +372,9 @@ impl FileHandle {
     /// A failed fetch comes back as the storage error it was, not as a parquet error.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
     pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<Bytes>;
+    /// `read_page` with where the page came from; a read without a cache is always
+    /// `Fetched`. The frozen `read_page` wraps it.
+    pub(crate) async fn read_page_with_origin(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<(Bytes, PageOrigin)>;
 }
 /// Why a `Segments` refused a read; carried inside `ParquetError::External`.
 pub enum SegmentsFault { NotResident { offset: u64 }, CrossesResidentRange { start: u64, end: u64, held_start: u64, held_end: u64 } }
@@ -419,6 +438,10 @@ impl FileIndex {
     pub async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>>;
     /// `None` is a null value, distinct from an absent key.
     pub async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<Option<Bytes>>;
+    /// `read_value` with the value page's origin, through `fetch_pages`, which returns the
+    /// page's own origin and not the dictionary page's; the frozen `read_value` wraps it, and
+    /// `find` discards the key page's origin.
+    pub(crate) async fn read_value_with_origin(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
     pub fn resident_bytes(&self) -> usize;
     pub fn max_key_bytes(&self) -> usize;
     pub fn metadata(&self) -> &Arc<ParquetMetaData>;
@@ -468,6 +491,9 @@ pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_o
 /// `Backend` keeps foyer's error whole: it is `std::error::Error + Send + Sync`
 /// and carries its kind, so a caller matches on it rather than on text.
 pub enum CacheError { Fetch(Arc<Error>), Backend(#[from] foyer::Error) }
+/// Where one call's page came from, in-crate. `Fetched` for a fetch the caller ran or
+/// joined, since it waited on the GET; `Cached` for memory or the disk level, which cost none.
+pub(crate) enum PageOrigin { Fetched, Cached }
 /// Clone: clones share one cache and one pair of counters, so every table
 /// holds a clone of the process's one cache.
 pub struct PageCache;
@@ -479,6 +505,10 @@ impl PageCache {
     /// level that fails to read a page falls through to the fetch.
     pub async fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Result<Self>;
     pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<Bytes>
+    where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
+    /// `get_or_fetch` with where the page came from, per call and never by differencing the
+    /// process-wide counters; the frozen `get_or_fetch` wraps it and drops the origin.
+    pub(crate) async fn fetch_with_origin<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
     where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
     /// `fetches` counts fetch futures run, after coalescing: concurrent misses
     /// on one key run one and count one. `hits` counts lookups served without
@@ -499,6 +529,10 @@ pub struct Generation {
     pub table: String, pub snapshot_id: SnapshotId, pub sequence_number: i64, pub metadata_location: String,
     pub layout: TableLayout, pub residency: Residency, pub files: Vec<Arc<LoadedFile>> /* sorted by (bucketing, bucket, exact first key, path) */,
     pub records: u64, pub index_bytes: usize, pub loaded_at: Instant,
+    /// The snapshot's own timestamp, from `snapshot.timestamp_ms()` through
+    /// `time::timestamp_from_millis`, set in `load` before any read; the binary samples
+    /// `generation_age_seconds` from it against now.
+    pub snapshot_timestamp: jiff::Timestamp,
 }
 impl Generation {
     /// `config` carries the residency and the resident-bytes budget; the
@@ -528,6 +562,11 @@ impl Generation {
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize>;
     pub fn overlap_groups_verified(&self) -> usize;
     pub async fn get(&self, key: &Key, cache: &PageCache) -> Result<Value>;
+    /// `get` with the `result` label: `Miss` for `Absent`; for a present key `ColdHit` when
+    /// its value page was `Fetched` and `WarmHit` when `Cached`. Only the value page decides
+    /// it, never a key-page GET in the Bloom tier or a chunk-file read in the Disk tier. The
+    /// frozen `get` wraps it and drops the label.
+    pub(crate) async fn lookup(&self, key: &Key, cache: &PageCache) -> Result<(Value, LookupResult)>;
     /// Which (file, value page) each key would fetch; the oracle for cost
     /// tests. The first candidate whose `page_of` names a value page, which in
     /// the Full tier is the file holding the key wherever in an overlap group
@@ -546,31 +585,79 @@ pub struct MultiLookup { pub values: Vec<Value>, pub snapshot_id: SnapshotId }
 
 // table (after `check`, because the strict gate runs `check::diagnose` on a
 // built generation before it is swapped in)
-pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant }, Degraded { serving: Option<SnapshotId>, error: Arc<Error>, since: Instant } }
-/// Owns the table's `HedgeWindow`, created from `config.storage.hedge` and
-/// handed to every `Generation::load`, so one table's delay is set from its
-/// own reads and never another's (RFD 013).
+/// Clone and Debug; Display gives the `state` label (`loading`, `serving`, `degraded`).
+/// `Serving` means a generation answers and the last load or refresh succeeded; `since` is
+/// when the state began (the swap, or the poll that ended a `Degraded` state). `Degraded`
+/// means the last load or refresh failed while the generation before it, if any, keeps
+/// answering (RFD 005); it ends at the next swap or at the next poll that finds the table in
+/// step with its ref (`Ok(false)`). `Degraded.reason` is the failure's `ErrorKind` (a
+/// refusal with its reason, the strict gate, a table or file fault, or the library or
+/// local-directory failure's variant); the failure itself went to the caller of `load` or
+/// `refresh`, which logs it, since `Error` is not `Clone`.
+pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant }, Degraded { serving: Option<SnapshotId>, reason: ErrorKind, since: Instant } }
+/// Owns the table's `HedgeWindow`, built once in `new` from `Storage::hedge_config` and
+/// handed to every `Generation::load`, so one table's delay is set from its own reads and
+/// never another's (RFD 013). Send + Sync; Debug names the table and its state. Holds the
+/// serving generation in an `ArcSwapOption`, the state in a std mutex never held across an
+/// await, the metadata location it last admitted or found unchanged in snapshot (`known`),
+/// and one tokio mutex that serializes `load` and `refresh`. `known` is what `refresh`
+/// polls against; a failed build does not advance it, so every later poll reads the metadata
+/// again and retries, a transient failure recovers on the next poll, and a persistent refusal
+/// is counted under `refresh_errors_total` once per poll.
 pub struct Table;
 impl Table {
-    /// Constructs in `Loading`; nothing is read until `load`.
+    /// Constructs in `Loading`; nothing is read until `load`. Sets `table_state` for the state.
     pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>) -> Self;
-    /// First load. `Err` leaves the table `Degraded` with no generation.
+    /// First load. `Err` leaves the table `Degraded` with no generation and is not counted
+    /// under `refresh_errors_total`: a first-load failure is the caller's to report (RFD 005).
+    /// On a serving table, a full re-resolve and reload reusing every unchanged file.
     pub async fn load(&self) -> Result<()>;
-    /// Serialized per table. `Ok(true)` when a new generation was swapped in.
+    /// Serialized per table. `Ok(true)` when a new generation was swapped in, counting
+    /// `generation_swaps_total`. With no current generation it does what `load` does (a table
+    /// left `Degraded` with no generation recovers on the next poll). Otherwise
+    /// `resolve_if_changed(&storage, &known)`: `None` is `Ok(false)`; a snapshot whose id equals
+    /// the current generation's records the new location and is `Ok(false)`; else the build,
+    /// the gate, and the swap. `Err` leaves the current generation serving, sets `Degraded`,
+    /// and counts `refresh_errors_total{table, reason}` with `reason` the `ErrorKind`'s Display.
     pub async fn refresh(&self) -> Result<bool>;
     pub fn name(&self) -> &str;
     pub fn config(&self) -> &TableConfig;
     pub fn state(&self) -> TableState;
     pub fn current(&self) -> Option<Arc<Generation>>;
+    /// `Error::NotReady` with no generation; `Error::KeyType` before any read. One
+    /// `load_full`, one lookup through `Generation::lookup`, timed and counted under
+    /// `lookups_total{table, result}` and `lookup_seconds{table, result}`.
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
+    /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
+    /// the whole call and issues nothing); the lookups run concurrently against that one
+    /// generation, each counted as `get` counts; any `Err` fails the whole call (RFD 010).
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup>;
+    /// Holds the table's load and refresh lock, for `Opened::retain`, which takes every
+    /// table's in `tables` order; nothing else ever holds two.
+    pub(crate) async fn serialized(&self) -> tokio::sync::MutexGuard<'_, ()>;
 }
+// The gate: `check::diagnose` on the built generation; every finding logged (cost at warn,
+// advice at info, with `table`, `%code`, `?tier`, `file`, and the message); under `strict`
+// an `Inefficient` verdict drops the generation as `Error::Inefficient` with the distinct
+// cost codes in report order; advice never affects admission. The swap: `current.store`,
+// then `Serving`; `index_bytes{table}` through `approx::gauge_len`; `findings{table, code}`
+// set for every `FindingCode::ALL` entry from the admitted generation's counts, zero for
+// the absent ones, so the gauge always describes the serving generation and a refused
+// generation's findings reach only the logs and the error; `generation_info` 0 for the
+// replaced snapshot and 1 for the new; `table_state{table, state}` 1 for the current state
+// and 0 for the other two on every state change; one info event with `files`, `reused`
+// (by `Arc::ptr_eq`), `records`, `residency`, `index_bytes`.
 
 // check
 pub enum Tier { Advice, Cost }
 pub enum Serviceability { Efficient, Inefficient }
 pub struct Penalty { pub extra_gets_per_hit: Option<u32>, pub keys_decoded_per_lookup: Option<i64>, pub files_probed_per_lookup: Option<usize> }
 pub enum FindingCode { DictionaryEncodedValue, LargeKeyPages, NoBucketPartition, OverlappingFiles, BoundsMissing, ColumnIndexTruncated, LargeValuePages, LongKeys, LargeFile, ManyFilesPerBucket, NoBloomFilter, BloomOversized, BloomUndersized }
+impl FindingCode {
+    /// Every code in finding-table order, for the `findings` gauge, which `table` sets for every
+    /// code on every admitted generation, zero for the absent ones; a test proves it complete.
+    pub const ALL: [FindingCode; 13];
+}
 /// Writer properties the doctor names; Display gives the property string.
 /// The per-column ones (`MetricsColumn`, `BloomFilterEnabled`,
 /// `BloomFilterNdvColumn`) render the property up to its trailing dot and
@@ -601,10 +688,28 @@ pub const KEY_BYTES_ADVICE: usize = 128;
 pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
 
 // open
+/// A private `complete` field records whether `tables` is every configured table.
 pub struct Opened { pub storage: Arc<Storage>, pub cache: PageCache, pub local: Option<Arc<LocalDir>>, pub tables: Vec<Arc<Table>> }
+impl Opened {
+    /// Deletes the chunk files no table's serving generation references and returns the
+    /// bytes freed; `Ok(0)` with no local directory, and `Ok(0)` for an `Opened` that `only`
+    /// narrowed, since the tables left out share the directory and their chunk files are
+    /// live to them. Holds every table's load lock in `tables` order while the live set (the
+    /// union of every table's `Generation::identities`) is computed and applied. The one
+    /// place chunk files are deleted: the serve loop calls it after every table's first
+    /// `load` and after any `refresh` that returned `Ok(true)`; a one-shot subcommand may
+    /// call it before exit.
+    pub async fn retain(&self) -> Result<u64>;
+}
 /// Builds storage from the SDK chain, one cache, and every configured table
-/// in `Loading`; `only` narrows by name. Loading is the caller's step.
+/// in `Loading`; `only` narrows by name, and a name matching no table is `Ok` with empty
+/// `tables`, whose message and exit code are the caller's. Issues no GET. Loading is the
+/// caller's step. `lib.rs` re-exports `Opened`, `open`, `Table`, `TableState`, `ErrorKind`.
 pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened>;
+/// The body of `open` over a storage the caller built, so tests use `Storage::new` and
+/// never the SDK chain: `LocalDir::open` when configured, one `PageCache` with the
+/// directory's `page_tier`, one `Table` per configured name matching `only`.
+pub(crate) async fn open_with(config: &Config, only: Option<&str>, storage: Arc<Storage>) -> Result<Opened>;
 ```
 
 Finding codes and tiers (RFD 007, RFD 016). The code column is the Display
@@ -806,8 +911,22 @@ swap), `icetray_table_state{table,state}`.
 
 Every label value is the `Display` of an enum, never a literal string at the
 call site: `kind` from a read-kind enum, `result` from `LookupResult`, `call`
-from the RPC enum, `reason` from `RefusalReason`, `code` from `FindingCode`,
+from the RPC enum, `reason` from `ErrorKind`, whose `Display` is the
+`RefusalReason`'s name for `Error::Refused`, `inefficient` for the strict
+gate, and the variant's snake_case name otherwise, `code` from `FindingCode`,
 `state` from `TableState`.
+
+Ownership: `table` emits `lookups_total`, `lookup_seconds`,
+`refresh_errors_total`, `generation_swaps_total`, `index_bytes`, `findings`,
+`generation_info`, and `table_state`; `cache` the two page-cache counters and
+the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
+series; the binary samples `generation_age_seconds` (from
+`Generation::snapshot_timestamp` against now) and `process_rss_bytes` and
+counts `requests_total`. `icetray_findings{table,code}` describes the serving
+generation: it is set for every `FindingCode` on every admitted generation,
+zero for the absent codes, and never from a generation the strict gate
+refused. `refresh_errors_total` is counted only from `refresh`, once per
+failed poll; a first-load failure is the caller's to report.
 
 ## 8. Open questions carried from the RFDs
 

@@ -78,8 +78,8 @@ RFD 007's refusal list, RFD 017's budget check.
   keys, checks the resident-bytes budget at the footer stage before any chunk
   is fetched, and exposes `plan` as the cost oracle. `Generation::load` passes
   the table's name and hedge window to `FileIndex::build` and
-  `FileHandle::open`, and builds `retain`'s live set as the union over every
-  table sharing the local directory.
+  `FileHandle::open`, and exposes `identities` for `retain`'s live set, which
+  `Opened::retain` unions over every table sharing the local directory.
 - `table` owns the lifecycle, the serialized refresh, the atomic swap, and
   the `strict` gate, which calls `check::diagnose` on a built generation
   before swapping it in. It is a separate module so that gate does not invert
@@ -161,9 +161,9 @@ defers here:
   costs; the generation tests run Full and Disk. The Bloom acceptance suite
   (RFD 017) should count a Bloom generation load.
 - The retain live set as the union over every table sharing a local
-  directory: `Generation::identities()` is proved to equal the chunk files on
-  disk for one table; the union is `table`/`open`'s to build and the
-  disk-tier acceptance tests to count.
+  directory: built as `Opened::retain`, which holds every table's load lock
+  and unions `Generation::identities()`, and proved at unit tier over two
+  tables sharing one directory; the disk-tier acceptance tests count it.
 - Load GET count for files with several row groups through
   `Generation::load` (one chunk GET per row group): proved at the index tier;
   the generation end-to-end fixture writes single-row-group files.
