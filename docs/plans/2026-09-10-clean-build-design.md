@@ -572,7 +572,10 @@ pub enum Serviceability { Efficient, Inefficient }
 pub struct Penalty { pub extra_gets_per_hit: Option<u32>, pub keys_decoded_per_lookup: Option<i64>, pub files_probed_per_lookup: Option<usize> }
 pub enum FindingCode { DictionaryEncodedValue, LargeKeyPages, NoBucketPartition, OverlappingFiles, BoundsMissing, ColumnIndexTruncated, LargeValuePages, LongKeys, LargeFile, ManyFilesPerBucket, NoBloomFilter, BloomOversized, BloomUndersized }
 /// Writer properties the doctor names; Display gives the property string.
-pub enum WriterProperty { EnableDictionary, ColumnIndexTruncateLength, PageRowLimit, PageSizeBytes, RowGroupCheckRecordCount, TargetFileSizeBytes, MetricsColumn, BloomFilterEnabled, BloomFilterMaxBytes, SkewSplitting }
+/// The per-column ones (`MetricsColumn`, `BloomFilterEnabled`,
+/// `BloomFilterNdvColumn`) render the property up to its trailing dot and
+/// the finding's message appends the column.
+pub enum WriterProperty { EnableDictionary, ColumnIndexTruncateLength, PageRowLimit, PageSizeBytes, RowGroupCheckRecordCount, TargetFileSizeBytes, MetricsColumn, BloomFilterEnabled, BloomFilterMaxBytes, BloomFilterNdvColumn, SkewSplitting }
 pub struct Finding { pub tier: Tier, pub code: FindingCode, pub message: String, pub file: Option<String>, pub penalty: Option<Penalty>, pub property: Option<WriterProperty> }
 pub struct FileReport {
     pub path: String, pub bucket: u32, pub key_type: KeyType, pub rows: i64, pub row_groups: usize,
@@ -585,7 +588,7 @@ pub struct TableSummary { pub table: String, pub snapshot_id: SnapshotId, pub se
 pub struct TableReport { pub summary: TableSummary, pub findings: Vec<Finding>, pub files: Vec<FileReport> }
 pub fn diagnose(g: &Generation) -> TableReport;
 /// The thresholds, in one place, each with the analysis section that set it.
-pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_BYTES_ADVICE: u64 = 128 * 1024; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; }
+pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_BYTES_ADVICE: u64 = 2 * contract::VALUE_PAGE_BYTES; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; }
 
 // contract (the layout's numbers; every other crate imports these, none redeclares them)
 pub const PAGE_ROWS: i64 = 1_000;
@@ -611,7 +614,7 @@ form of the `FindingCode` variant; code never compares these strings:
 |---|---|---|---|---|
 | `dictionary_encoded_value` | Cost | value column dictionary-encoded | one extra GET per hit | `parquet.enable.dictionary` |
 | `large_key_pages` | Cost | key page rows above `KEY_PAGE_ROWS_COST` | rows decoded per lookup | `write.parquet.page-row-limit` |
-| `no_bucket_partition` | Cost | no bucket transform on the key and more than one file | files probed per lookup | partition spec |
+| `no_bucket_partition` | Cost | a file written under a spec with no bucket transform on the key, and more than one file (each file's own spec, so an evolved table is priced by the files every lookup probes) | files probed per lookup: the unbucketed files plus one when bucketed files exist | partition spec |
 | `overlapping_files` | Cost | intersecting exact ranges within a bucket | files probed per lookup | `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled` |
 | `bounds_missing` | Advice | manifest lacks key bounds, or its bounds are shorter than the file's exact first or last key | | `write.metadata.metrics.column.<key>` |
 | `column_index_truncated` | Advice | distinct page minimums ratio below threshold | | `parquet.columnindex.truncate.length` |
@@ -620,8 +623,8 @@ form of the `FindingCode` variant; code never compares these strings:
 | `large_file` | Advice | data file above `FILE_BYTES_ADVICE` | | `write.target-file-size-bytes` |
 | `many_files_per_bucket` | Advice | files in a bucket above twice what the bucket's bytes divided by `TARGET_FILE_BYTES_MAX` explain (a rolled sorted task is not many files) | | compaction |
 | `no_bloom_filter` | Advice | no bloom filter on the key | | `write.parquet.bloom-filter-enabled.column.<key>` |
-| `bloom_oversized` | Advice | bloom bytes per key above threshold | | `write.parquet.bloom-filter-max-bytes` (Iceberg 1.11+) |
-| `bloom_undersized` | Advice | bloom bits per key below `BLOOM_BITS_PER_KEY_MIN` (the Bloom tier's miss cost rises) | | `write.parquet.bloom-filter-ndv.column.<key>` (Iceberg 1.11+) |
+| `bloom_oversized` | Advice | bloom bytes per key above threshold in any row group (filters are per row group; the report keeps the file's figure) | | `write.parquet.bloom-filter-max-bytes` (Iceberg 1.11+) |
+| `bloom_undersized` | Advice | bloom bits per key below `BLOOM_BITS_PER_KEY_MIN` in any row group (a miss consults one row group's filter, so its rate is what rises) | | `write.parquet.bloom-filter-ndv.column.<key>` (Iceberg 1.11+) |
 
 Refusals (never findings; `Error::Refused` at load) are the `RefusalReason`
 variants: unsorted (a key below the one before it, within a row group or
