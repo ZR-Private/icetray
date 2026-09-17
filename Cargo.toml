@@ -46,6 +46,7 @@ iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 jiff = { version = "0.2.37", features = ["serde"] }
 metrics = "0.24.6"
+metrics-util = "0.20.4"
 murmur3 = "0.5.2"
 object_store = { version = "0.14.1", features = ["aws"] }
 parquet = { version = "58", features = ["async"] }
