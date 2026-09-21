@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{Snapshot, TableMetadata};
 use iceberg::{Catalog, CatalogBuilder as _, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{
@@ -186,7 +187,15 @@ impl TableSource {
                 if let Some(warehouse) = warehouse {
                     props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
                 }
+                // The client refuses to load a table without a storage
+                // factory and builds file I/O from it lazily, on the first
+                // read through the library. icetray reads every byte through
+                // `Storage` (RFD 003) and never through the library, so the
+                // factory is never asked to build; the in-memory one is the
+                // placeholder that, should it ever be, reaches an empty store
+                // and never the host.
                 let catalog = RestCatalogBuilder::default()
+                    .with_storage_factory(Arc::new(MemoryStorageFactory))
                     .load(REST_CATALOG_NAME, props)
                     .await?;
                 let namespace = NamespaceIdent::from_strs(namespace.split(NAMESPACE_SEPARATOR))?;
