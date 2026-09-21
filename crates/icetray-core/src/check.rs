@@ -38,14 +38,24 @@ pub mod thresholds {
     pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS;
 
     /// Mean uncompressed value page bytes above which `large_value_pages`
-    /// is advice: 128 KiB, twice `contract::VALUE_PAGE_BYTES`. The one
-    /// value page a cold hit fetches is the bytes it transfers and
-    /// decompresses (prototype findings, finding 4: 85 µs of a 100 µs
-    /// cached hit went to decompressing a 216 KB page), and both writers
-    /// check the byte bound lazily (finding 6), so a writer set to the
-    /// bound overshoots it by up to a batch; twice the bound leaves that
-    /// overshoot unremarked.
-    pub const VALUE_PAGE_BYTES_ADVICE: u64 = 2 * contract::VALUE_PAGE_BYTES;
+    /// is advice: 1 MiB, `VALUE_PAGE_ADVICE_FACTOR` times
+    /// `contract::VALUE_PAGE_BYTES`. The one value page a cold hit fetches
+    /// is the bytes it transfers and decompresses, and that cost is linear
+    /// in the page's bytes with no step anywhere (the clean build against
+    /// real S3, results: 192 KB pages served at the same cold latency as 64
+    /// KiB ones), so the line is drawn where the transfer itself reaches
+    /// the order of a round trip: at object-store bandwidth a megabyte
+    /// takes tens of milliseconds, which shows in a cold hit, while a few
+    /// hundred kilobytes do not. A row limit alone leaves pages of many
+    /// megabytes for large values (prototype findings, finding 6); the
+    /// contract's byte bound of RFD 002 is the recipe for those, and
+    /// `FileReport::avg_value_bytes` beside `avg_value_page_bytes` shows an
+    /// owner how many values a hit fetches for the one it wanted.
+    pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES;
+
+    /// How many contract value pages the advice threshold spans: sixteen,
+    /// which makes it 1 MiB.
+    pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16;
 
     /// Data file bytes above which `large_file` is advice: twice
     /// `contract::TARGET_FILE_BYTES_MAX`. First-byte latency of a range GET
@@ -357,6 +367,12 @@ pub struct FileReport {
     /// Mean uncompressed bytes of a value page, the value column's
     /// uncompressed chunk bytes over its pages: what a hit decompresses.
     pub avg_value_page_bytes: u64,
+    /// Mean uncompressed bytes of one value, the value column's
+    /// uncompressed chunk bytes over the file's rows. Against
+    /// `avg_value_page_bytes` it says how many values a hit fetches for the
+    /// one it wanted; reported, never thresholded, since a membership set
+    /// with empty values fetches a page for nothing and is not wrong.
+    pub avg_value_bytes: u64,
     /// Whether every value page starts on the same row as a key page in
     /// every row group.
     pub pages_aligned: bool,
@@ -574,6 +590,10 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             avg_value_page_bytes: chunks
                 .value_uncompressed_bytes
                 .checked_div(count(pages.value_pages))
+                .unwrap_or(0),
+            avg_value_bytes: chunks
+                .value_uncompressed_bytes
+                .checked_div(rows_of(index))
                 .unwrap_or(0),
             pages_aligned: pages.aligned,
             dictionary_columns,
@@ -1067,7 +1087,8 @@ mod tests {
 
     use super::thresholds::{
         BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, VALUE_PAGE_BYTES_ADVICE,
+        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, VALUE_PAGE_ADVICE_FACTOR,
+        VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
     use crate::generation::testing::{
@@ -1099,7 +1120,7 @@ mod tests {
     const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_COST + 1;
     /// Bytes per value of the large-value-page fixture: `FILE_KEYS` of them
     /// make one page of twice the advice threshold.
-    const LARGE_VALUE_BYTES: usize = 8 * 1024;
+    const LARGE_VALUE_BYTES: usize = 64 * 1024;
     /// The length of the long-key fixture's keys, just above the advice
     /// length.
     const LONG_KEY_BYTES: usize = contract::KEY_BYTES_ADVICE + 1;
@@ -1369,7 +1390,10 @@ mod tests {
     #[test]
     fn test_thresholds_derive_from_contract() {
         assert_eq!(KEY_PAGE_ROWS_COST, 2 * contract::PAGE_ROWS);
-        assert_eq!(VALUE_PAGE_BYTES_ADVICE, 2 * contract::VALUE_PAGE_BYTES);
+        assert_eq!(
+            VALUE_PAGE_BYTES_ADVICE,
+            VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES
+        );
         assert_eq!(FILE_BYTES_ADVICE, 2 * contract::TARGET_FILE_BYTES_MAX);
         const { assert!(FILES_PER_BUCKET_FACTOR > MIN_EXPLAINED_FILES) };
         // A filter cannot be oversized in bytes and undersized in bits at once.
@@ -2277,6 +2301,7 @@ mod tests {
                 "max_key_page_rows",
                 "max_key_bytes",
                 "avg_value_page_bytes",
+                "avg_value_bytes",
                 "pages_aligned",
                 "dictionary_columns",
                 "bloom_bytes",

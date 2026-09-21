@@ -330,6 +330,7 @@ mod tests {
             max_key_page_rows: 1,
             max_key_bytes: 1,
             avg_value_page_bytes: 1,
+            avg_value_bytes: 1,
             pages_aligned: true,
             dictionary_columns: Vec::new(),
             bloom_bytes: None,
