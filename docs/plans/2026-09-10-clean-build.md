@@ -93,14 +93,28 @@ One worker.
 2. Acceptance suite green over in-process S3 and simulation; the gRPC tests
    behind the server including health and readiness; the REST container test
    (`icetray-testkit/tests/rest_catalog.rs`, an ignored test that a plain
-   `cargo test` reports as ignored) run through `dev/test-int.sh`.
-3. Golden tables: regenerate the Spark tables (contract, default writer,
-   truncated column index, truncated manifest metrics, several row groups)
-   with a checked-in script; run the golden tests
-   (`icetray-testkit/tests/golden.rs`, ignored tests) through
-   `dev/test-golden.sh`.
-4. Conformance run: start the server the way a pod would (config path from
-   the environment, JSON config, no flags) and check logs, metrics, health.
+   `cargo test` reports as ignored) run through `dev/test-int.sh`. The first
+   run found that core built the REST client without a storage factory,
+   which the library requires before it loads a table; the client is now
+   built with the library's in-memory factory, a placeholder that is never
+   asked to build because every byte goes through `Storage`.
+3. Golden tables: `dev/golden-tables.sh` runs the recipe with Spark in a
+   container against `target/golden-warehouse`, and `dev/test-golden.sh`
+   runs the golden tests (`icetray-testkit/tests/golden.rs`, ignored tests)
+   against it. The first run found that a Hadoop catalog records locations
+   as `file:/path`, with no authority, which `Storage::locate` refused as
+   relative; the form is accepted now. The recipe's contract tables draw
+   `large_value_pages` advice: 192-byte values in 1,000-row pages decompress
+   to about 192 KB, above the 128 KiB threshold, so the recipe's `CONTRACT`
+   properties do not by themselves meet RFD 002's value-page bound. Whether
+   the recipe lowers `write.parquet.page-size-bytes` for every table or the
+   threshold moves is a stage 4 question, recorded in its analysis.
+4. Conformance run: `dev/conformance.sh`, a CI job of its own, runs the
+   binary's `test_serve_conformance_from_the_environment` by name: the
+   server started the way a pod starts it (the path from `ICETRAY_CONFIG`, a
+   JSON file, no flags), the JSON logs under the configured field names, the
+   health service answering while the table loads, readiness after it
+   serves, the metrics scrape, and the drain on SIGTERM to exit 0.
 5. `README.md` rewritten for the working system: what it is, the contract in
    words with a pointer to the doctor, how to run against a table, how to
    deploy. Then the humanizer pass on the README and the RFD problem

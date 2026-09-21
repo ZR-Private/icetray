@@ -271,7 +271,9 @@ impl Storage {
     pub fn hedge_config(&self) -> &HedgeConfig;
     /// Rewrite rules first, then the store for the `scheme://authority/` prefix;
     /// no store is `ConfigViolation::NoStoreForLocation`, a relative path
-    /// `ConfigViolation::LocationNotAbsolute`.
+    /// `ConfigViolation::LocationNotAbsolute`. `file:///path`, the authority-less
+    /// `file:/path` a Hadoop catalog records, and a bare absolute path all name the
+    /// local filesystem store.
     pub fn locate(&self, location: &str) -> Result<Located>;
     pub async fn read_all(&self, location: &str) -> Result<Bytes>;
     /// Load path: never hedged.
@@ -305,7 +307,12 @@ impl Resolved {
 pub enum TableSource { Static { location: String }, Catalog { catalog: Arc<dyn Catalog>, ident: TableIdent } }
 impl TableSource {
     /// Builds REST clients too; the only place a catalog client is constructed.
-    /// Async because the REST builder is; constructing a client sends nothing.
+    /// Async because the REST builder is; constructing a client sends nothing. The
+    /// REST client is built with the library's in-memory storage factory: the
+    /// library refuses to load a table without one and builds file I/O from it
+    /// lazily, and icetray never reads through the library, so the factory is a
+    /// placeholder that reaches an empty store, never the host, should it ever be
+    /// asked to build.
     pub async fn from_config(cfg: &SourceConfig) -> Result<Self>;
     /// A static location ending in `.metadata.json` names the file itself and
     /// never advances; any other is a table root followed through
