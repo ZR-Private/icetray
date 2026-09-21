@@ -340,6 +340,27 @@ mod tests {
         }
     }
 
+    /// The daemon runs retention on a spawned task after every load and
+    /// swap, so `retain`'s future is `Send`; `tokio::spawn` refuses one
+    /// that is not at compile time.
+    #[tokio::test]
+    async fn test_retain_is_spawnable() {
+        let fixture = two_file_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local(
+            dir.path(),
+            vec![named(FIRST_TABLE, &fixture, Residency::Disk)],
+        );
+        let opened = Arc::new(
+            open_with(&config, None, storage_for(&config))
+                .await
+                .unwrap(),
+        );
+        opened.tables[0].load().await.unwrap();
+        let retained = tokio::spawn(async move { opened.retain().await });
+        assert_eq!(retained.await.unwrap().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn test_retain_without_local_directory_is_zero() {
         let fixture = two_file_fixture().await;

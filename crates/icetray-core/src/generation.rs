@@ -632,13 +632,15 @@ fn widest_per_bucket(files: &[Arc<LoadedFile>], groups: &[Vec<usize>]) -> BTreeM
 /// The key chunks of every member of one `group`, by position: what its
 /// merge decodes from, gathered `LOAD_CONCURRENCY` members at a time. Full
 /// hands out its resident chunks; Disk reads them back as local reads;
-/// Bloom fetches them again (RFD 017).
+/// Bloom fetches them again (RFD 017). The positions are streamed by value:
+/// a closure taking a reference and returning an `async` block makes every
+/// future up the call chain unprovably `Send`, and a load must be spawnable.
 async fn gather_chunks(
     files: &[Arc<LoadedFile>],
     group: &[usize],
 ) -> Result<HashMap<usize, Arc<Segments>>> {
-    stream::iter(group)
-        .map(|&at| async move {
+    stream::iter(group.iter().copied())
+        .map(|at| async move {
             let chunks = files[at].index.key_chunks_for_verification().await?;
             Ok::<_, Error>((at, chunks))
         })

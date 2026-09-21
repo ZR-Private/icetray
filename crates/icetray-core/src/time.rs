@@ -5,10 +5,39 @@
 
 use std::time::Duration;
 
-/// A duration as a float of seconds, the unit a Prometheus histogram takes.
-/// The one place a `Duration` becomes a bare number for a metric.
-pub(crate) fn seconds(duration: Duration) -> f64 {
+/// A duration as a float of seconds, the unit a Prometheus histogram takes
+/// and the unit its bucket bounds are declared in. The one place a
+/// `Duration` becomes a bare number for a metric.
+pub fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
+}
+
+/// An elapsed time as whole microseconds, for a one-shot subcommand's
+/// output. Saturates at `u64::MAX`, which is over five hundred thousand
+/// years; no one-shot reaches it.
+pub fn micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// The wall clock now. The one place it is read, so a caller that needs
+/// "now" as a timestamp never names the clock itself.
+pub fn now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+}
+
+/// Seconds from `since` to now: the `generation_age_seconds` gauge, from a
+/// served snapshot's own timestamp. A `since` in the future gives a negative
+/// age, kept as measured rather than clamped, so a writer's clock running
+/// ahead shows as such.
+pub fn age_seconds(since: jiff::Timestamp) -> f64 {
+    now().duration_since(since).as_secs_f64()
+}
+
+/// A wall-clock timestamp as log text: RFC 3339 in UTC with a `Z` offset,
+/// through jiff's own printer, with the fraction of a second only when it
+/// is non-zero. The one place a timestamp becomes text.
+pub fn log_timestamp(at: jiff::Timestamp) -> String {
+    at.to_string()
 }
 
 /// A count of milliseconds since the Unix epoch, as Iceberg records a
@@ -90,6 +119,80 @@ mod tests {
     #[test]
     fn test_seconds_zero_is_zero() {
         assert_eq!(super::seconds(Duration::ZERO).to_bits(), 0.0f64.to_bits());
+    }
+
+    /// The microseconds `ONE_AND_A_HALF_SECONDS` holds.
+    const ONE_AND_A_HALF_SECONDS_MICROS: u64 = 1_500_000;
+
+    #[test]
+    fn test_micros_is_the_whole_microseconds() {
+        assert_eq!(
+            super::micros(ONE_AND_A_HALF_SECONDS),
+            ONE_AND_A_HALF_SECONDS_MICROS
+        );
+        assert_eq!(super::micros(Duration::ZERO), 0);
+    }
+
+    /// One nanosecond short of a microsecond; truncates to 0.
+    const JUST_UNDER_A_MICRO: Duration = Duration::from_nanos(999);
+    /// One nanosecond short of two microseconds; truncates to 1.
+    const JUST_UNDER_TWO_MICROS: Duration = Duration::from_nanos(1_999);
+
+    #[test]
+    fn test_micros_truncates_below_a_microsecond() {
+        assert_eq!(super::micros(JUST_UNDER_A_MICRO), 0);
+        assert_eq!(super::micros(JUST_UNDER_TWO_MICROS), 1);
+    }
+
+    #[test]
+    fn test_micros_saturates_at_u64_max() {
+        assert_eq!(super::micros(Duration::MAX), u64::MAX);
+    }
+
+    /// An age far enough in the past that clock skew between two reads of
+    /// `now` cannot bring it below `AGE_LOWER_BOUND`.
+    const AGE_OFFSET: Duration = Duration::from_secs(3_600);
+    /// Half of `AGE_OFFSET`; the measured age is at least this.
+    const AGE_LOWER_BOUND: f64 = 1_800.0;
+    /// Twice `AGE_OFFSET`; the measured age is at most this.
+    const AGE_UPPER_BOUND: f64 = 7_200.0;
+
+    #[test]
+    fn test_age_seconds_of_the_past_is_positive() {
+        let since = super::now()
+            .checked_sub(AGE_OFFSET)
+            .expect("an hour ago is representable");
+        let age = super::age_seconds(since);
+        assert!(age > AGE_LOWER_BOUND && age < AGE_UPPER_BOUND, "{age}");
+    }
+
+    #[test]
+    fn test_age_seconds_of_the_future_is_negative() {
+        let since = super::now()
+            .checked_add(AGE_OFFSET)
+            .expect("an hour ahead is representable");
+        let age = super::age_seconds(since);
+        assert!(age < -AGE_LOWER_BOUND && age > -AGE_UPPER_BOUND, "{age}");
+    }
+
+    #[test]
+    fn test_log_timestamp_is_rfc3339_in_utc() {
+        assert_eq!(
+            super::log_timestamp(jiff::Timestamp::UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
+        );
+        let with_millis = super::timestamp_from_millis(EPOCH_MILLIS).unwrap();
+        assert_eq!(
+            super::log_timestamp(with_millis),
+            "2023-11-14T22:13:20.123Z"
+        );
+    }
+
+    #[test]
+    fn test_log_timestamp_round_trips_through_jiff() {
+        let at = super::timestamp_from_millis(EPOCH_MILLIS).unwrap();
+        let back: jiff::Timestamp = super::log_timestamp(at).parse().unwrap();
+        assert_eq!(back, at);
     }
 
     /// Milliseconds since the epoch with a fraction of a second, so the

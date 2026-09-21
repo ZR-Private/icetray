@@ -746,6 +746,28 @@ mod tests {
         );
     }
 
+    /// The daemon spawns every load, poll, and lookup onto a multi-thread
+    /// runtime, so their futures are `Send`; `tokio::spawn` refuses one that
+    /// is not at compile time.
+    #[tokio::test]
+    async fn test_load_refresh_and_get_are_spawnable() {
+        let (fixture, all) = two_bucket_table().await;
+        let table = Arc::new(table_over(&fixture, fixture.config(Residency::Full, None)).await);
+        let loaded = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move { table.load().await }
+        });
+        loaded.await.unwrap().unwrap();
+        let polled = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move { table.refresh().await }
+        });
+        assert!(!polled.await.unwrap().unwrap(), "nothing moved");
+        let key = Key::Long(all[0]);
+        let looked_up = tokio::spawn(async move { table.get(&key).await });
+        assert_eq!(looked_up.await.unwrap().unwrap().value, present(all[0]));
+    }
+
     #[tokio::test]
     async fn test_get_refuses_a_key_of_another_type_before_any_read() {
         let (fixture, _) = two_bucket_table().await;

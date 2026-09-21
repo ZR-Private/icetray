@@ -156,6 +156,13 @@ pub enum ConfigViolation {
         /// The location as the process tried to resolve it.
         location: String,
     },
+    /// Text that names no residency tier; raised by `Residency`'s `FromStr`,
+    /// the command line's parser for the setting.
+    #[error("unknown residency {text}; expected full, disk, or bloom")]
+    UnknownResidency {
+        /// The text as given.
+        text: String,
+    },
 }
 
 /// The whole configuration: the server, storage, and the tables it serves.
@@ -459,6 +466,11 @@ pub enum Residency {
     Bloom,
 }
 
+impl Residency {
+    /// Every tier, for the parser and the tests that hold the names together.
+    const ALL: [Self; 3] = [Self::Full, Self::Disk, Self::Bloom];
+}
+
 impl fmt::Display for Residency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -467,6 +479,22 @@ impl fmt::Display for Residency {
             Self::Bloom => "bloom",
         };
         f.write_str(name)
+    }
+}
+
+impl std::str::FromStr for Residency {
+    type Err = ConfigViolation;
+
+    /// Exactly the lowercase names `Display` prints; the one boundary parser
+    /// for the setting when it arrives from the command line rather than
+    /// the file, where serde reads the same names.
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|residency| residency.to_string() == text)
+            .ok_or_else(|| ConfigViolation::UnknownResidency {
+                text: text.to_string(),
+            })
     }
 }
 
@@ -1049,11 +1077,32 @@ locaton = "typo"
 
     #[test]
     fn test_serialize_residency_matches_display() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let json = serde_json::to_string(&residency).unwrap();
             assert_eq!(json, format!("\"{residency}\""));
             let back: Residency = serde_json::from_str(&json).unwrap();
             assert_eq!(back, residency);
+        }
+    }
+
+    #[test]
+    fn test_from_str_residency_round_trips_display() {
+        for residency in Residency::ALL {
+            let parsed: Residency = residency.to_string().parse().unwrap();
+            assert_eq!(parsed, residency);
+        }
+    }
+
+    #[test]
+    fn test_from_str_residency_refuses_another_word() {
+        for text in ["memory", "Full", "FULL", "", " full"] {
+            assert_eq!(
+                text.parse::<Residency>(),
+                Err(ConfigViolation::UnknownResidency {
+                    text: text.to_string(),
+                }),
+                "{text:?}"
+            );
         }
     }
 }

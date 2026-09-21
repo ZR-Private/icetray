@@ -271,7 +271,11 @@ pub async fn list_data_files(
 ) -> Result<Vec<DataFileEntry>> {
     let list_bytes = storage.read_all(snapshot.manifest_list()).await?;
     let list = ManifestList::parse_with_version(&list_bytes, md.format_version())?;
-    let manifests: Vec<(ManifestFile, Manifest)> = stream::iter(list.consume_entries())
+    // Collected before streaming: the library returns an opaque
+    // `impl IntoIterator`, whose iterator the compiler cannot prove `Send`,
+    // and a load must be spawnable onto a multi-thread runtime.
+    let files: Vec<ManifestFile> = list.consume_entries().into_iter().collect();
+    let manifests: Vec<(ManifestFile, Manifest)> = stream::iter(files)
         .map(|file| async move {
             let bytes = storage.read_all(&file.manifest_path).await?;
             let manifest = Manifest::parse_avro(&bytes)?;

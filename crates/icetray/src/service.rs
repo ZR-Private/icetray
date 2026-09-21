@@ -1,0 +1,461 @@
+//! The gRPC service over the generated contract (RFD 010): `Get`,
+//! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
+//! read under the table's key type, and core's errors mapped to status codes
+//! by variant. Every call is counted under `requests_total`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use icetray_core::key::UUID_BYTES;
+use icetray_core::{Error, Generation, Key, KeyType, Opened, Table, Value};
+use icetray_proto::v1;
+use icetray_proto::v1::icetray_server::Icetray;
+use icetray_proto::v1::{
+    GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, TableInfoRequest,
+    TableInfoResponse,
+};
+use tonic::{Request, Response, Status};
+
+use crate::telemetry::{self, Call};
+
+/// The served tables by name. Clone: tonic hands one clone to every
+/// connection, and they share the tables.
+#[derive(Clone)]
+pub struct Service {
+    tables: Arc<HashMap<String, Arc<Table>>>,
+}
+
+impl Service {
+    /// The service over every table `opened` holds, by configured name.
+    pub fn new(opened: &Opened) -> Self {
+        let tables = opened
+            .tables
+            .iter()
+            .map(|table| (table.name().to_string(), Arc::clone(table)))
+            .collect();
+        Self {
+            tables: Arc::new(tables),
+        }
+    }
+
+    /// The table served under `name`; a name not served is `NOT_FOUND`.
+    pub fn table(&self, name: &str) -> Result<&Arc<Table>, Status> {
+        self.tables
+            .get(name)
+            .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
+    }
+
+    /// The generation `table` serves; none is `UNAVAILABLE`, through
+    /// `Error::NotReady`, so the message is core's.
+    fn serving(table: &Table) -> Result<Arc<Generation>, Status> {
+        table.current().ok_or_else(|| {
+            status_from(&Error::NotReady {
+                table: table.name().to_string(),
+            })
+        })
+    }
+}
+
+/// The wire variant's name, for a mismatch message.
+fn variant_name(key: &v1::key::Key) -> &'static str {
+    match key {
+        v1::key::Key::Long(_) => "long",
+        v1::key::Key::Str(_) => "str",
+        v1::key::Key::Bin(_) => "bin",
+    }
+}
+
+/// A key from the wire under the table's key type (RFD 010): the variant
+/// must match the type, and `bin` on a uuid table must be `UUID_BYTES` long.
+/// A missing key, a `Key` with no variant, and every other pairing are
+/// `INVALID_ARGUMENT`.
+pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Status> {
+    let Some(variant) = key.and_then(|key| key.key) else {
+        return Err(Status::invalid_argument("key is required"));
+    };
+    match (variant, key_type) {
+        (v1::key::Key::Long(value), KeyType::Long) => Ok(Key::Long(value)),
+        (v1::key::Key::Str(text), KeyType::String) => Ok(Key::Str(text)),
+        (v1::key::Key::Bin(bytes), KeyType::Binary) => Ok(Key::Bytes(bytes)),
+        (v1::key::Key::Bin(bytes), KeyType::Uuid) => <[u8; UUID_BYTES]>::try_from(bytes.as_slice())
+            .map(Key::Uuid)
+            .map_err(|_| {
+                Status::invalid_argument(format!(
+                    "a uuid key is {UUID_BYTES} bytes, got {}",
+                    bytes.len()
+                ))
+            }),
+        (variant @ v1::key::Key::Long(_), KeyType::String | KeyType::Binary | KeyType::Uuid)
+        | (variant @ v1::key::Key::Str(_), KeyType::Long | KeyType::Binary | KeyType::Uuid)
+        | (variant @ v1::key::Key::Bin(_), KeyType::Long | KeyType::String) => {
+            Err(Status::invalid_argument(format!(
+                "table keys are {key_type}, got a {} key",
+                variant_name(&variant)
+            )))
+        }
+    }
+}
+
+/// Core's error as a status (RFD 010): a key of the wrong type is
+/// `INVALID_ARGUMENT`; a read the caller can retry (no generation yet, an
+/// object-store, cache, or local-directory failure) is `UNAVAILABLE`; every
+/// other failure is `INTERNAL`. The message is the error's `Display`.
+pub fn status_from(error: &Error) -> Status {
+    let message = error.to_string();
+    match error {
+        Error::KeyType { .. } => Status::invalid_argument(message),
+        Error::NotReady { .. } | Error::ObjectStore(_) | Error::Cache(_) | Error::Local { .. } => {
+            Status::unavailable(message)
+        }
+        Error::Iceberg(_)
+        | Error::Parquet(_)
+        | Error::ObjectStorePath(_)
+        | Error::Json(_)
+        | Error::Config(_)
+        | Error::Refused { .. }
+        | Error::Inefficient { .. }
+        | Error::Table { .. }
+        | Error::File { .. } => Status::internal(message),
+    }
+}
+
+/// A lookup's outcome on the wire: the presence and the value bytes, empty
+/// for a null or absent key.
+pub fn presence(value: Value) -> (v1::Presence, Vec<u8>) {
+    match value {
+        Value::Present(bytes) => (v1::Presence::Present, bytes.to_vec()),
+        Value::Null => (v1::Presence::Null, Vec::new()),
+        Value::Absent => (v1::Presence::Absent, Vec::new()),
+    }
+}
+
+/// The table's key type on the wire.
+fn key_type_wire(key_type: KeyType) -> v1::KeyType {
+    match key_type {
+        KeyType::Long => v1::KeyType::Long,
+        KeyType::String => v1::KeyType::String,
+        KeyType::Binary => v1::KeyType::Binary,
+        KeyType::Uuid => v1::KeyType::Uuid,
+    }
+}
+
+/// A count held in memory as the wire's `uint64`.
+fn wire_count(count: usize) -> u64 {
+    u64::try_from(count).expect("a usize is at most 64 bits on the supported targets")
+}
+
+#[tonic::async_trait]
+impl Icetray for Service {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        telemetry::count(Call::Get);
+        let request = request.into_inner();
+        let table = self.table(&request.table)?;
+        let generation = Self::serving(table)?;
+        let key = key_from_wire(request.key, generation.layout.key_type)?;
+        let lookup = table.get(&key).await.map_err(|error| status_from(&error))?;
+        let (presence, value) = presence(lookup.value);
+        Ok(Response::new(GetResponse {
+            presence: i32::from(presence),
+            value,
+            snapshot_id: lookup.snapshot_id.0,
+        }))
+    }
+
+    async fn multi_get(
+        &self,
+        request: Request<MultiGetRequest>,
+    ) -> Result<Response<MultiGetResponse>, Status> {
+        telemetry::count(Call::MultiGet);
+        let request = request.into_inner();
+        let table = self.table(&request.table)?;
+        let generation = Self::serving(table)?;
+        let keys = request
+            .keys
+            .into_iter()
+            .map(|key| key_from_wire(Some(key), generation.layout.key_type))
+            .collect::<Result<Vec<Key>, Status>>()?;
+        let lookup = table
+            .multi_get(&keys)
+            .await
+            .map_err(|error| status_from(&error))?;
+        let results = lookup
+            .values
+            .into_iter()
+            .map(|value| {
+                let (presence, value) = presence(value);
+                Hit {
+                    presence: i32::from(presence),
+                    value,
+                }
+            })
+            .collect();
+        Ok(Response::new(MultiGetResponse {
+            results,
+            snapshot_id: lookup.snapshot_id.0,
+        }))
+    }
+
+    async fn table_info(
+        &self,
+        request: Request<TableInfoRequest>,
+    ) -> Result<Response<TableInfoResponse>, Status> {
+        telemetry::count(Call::TableInfo);
+        let request = request.into_inner();
+        let table = self.table(&request.table)?;
+        let generation = Self::serving(table)?;
+        Ok(Response::new(TableInfoResponse {
+            table: request.table,
+            snapshot_id: generation.snapshot_id.0,
+            buckets: generation
+                .layout
+                .bucketing
+                .map_or(0, |bucketing| bucketing.count),
+            data_files: wire_count(generation.files.len()),
+            records: generation.records,
+            key_type: i32::from(key_type_wire(generation.layout.key_type)),
+            index_bytes: wire_count(generation.index_bytes),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use bytes::Bytes;
+    use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
+    use icetray_core::{
+        CacheError, FileFault, FindingCode, LocalFault, RefusalReason, Storage, TableFault,
+    };
+    use tonic::Code;
+
+    use super::*;
+
+    /// The table the sample errors name.
+    const TABLE: &str = "kv";
+
+    /// A `bin` key one byte short of a uuid.
+    const SHORT_BIN_LEN: usize = UUID_BYTES - 1;
+
+    /// The value of the sample long and string keys.
+    const LONG_VALUE: i64 = 42;
+    const STR_VALUE: &str = "user:42";
+
+    const TYPES: [KeyType; 4] = [
+        KeyType::Long,
+        KeyType::String,
+        KeyType::Binary,
+        KeyType::Uuid,
+    ];
+
+    fn wire(variant: v1::key::Key) -> v1::Key {
+        v1::Key { key: Some(variant) }
+    }
+
+    fn code_of(result: Result<Key, Status>) -> Code {
+        result.expect_err("an invalid key").code()
+    }
+
+    #[test]
+    fn test_key_from_wire_missing_key_or_variant_is_invalid_argument_for_every_type() {
+        for key_type in TYPES {
+            assert_eq!(
+                code_of(key_from_wire(None, key_type)),
+                Code::InvalidArgument
+            );
+            assert_eq!(
+                code_of(key_from_wire(Some(v1::Key { key: None }), key_type)),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_from_wire_matching_variant_per_type() {
+        assert_eq!(
+            key_from_wire(Some(wire(v1::key::Key::Long(LONG_VALUE))), KeyType::Long).unwrap(),
+            Key::Long(LONG_VALUE)
+        );
+        assert_eq!(
+            key_from_wire(
+                Some(wire(v1::key::Key::Str(STR_VALUE.to_string()))),
+                KeyType::String
+            )
+            .unwrap(),
+            Key::Str(STR_VALUE.to_string())
+        );
+        let bytes = vec![0u8; SHORT_BIN_LEN];
+        assert_eq!(
+            key_from_wire(
+                Some(wire(v1::key::Key::Bin(bytes.clone()))),
+                KeyType::Binary
+            )
+            .unwrap(),
+            Key::Bytes(bytes)
+        );
+        let uuid = [7u8; UUID_BYTES];
+        assert_eq!(
+            key_from_wire(Some(wire(v1::key::Key::Bin(uuid.to_vec()))), KeyType::Uuid).unwrap(),
+            Key::Uuid(uuid)
+        );
+    }
+
+    #[test]
+    fn test_key_from_wire_mismatched_variant_is_invalid_argument() {
+        let variants = [
+            v1::key::Key::Long(LONG_VALUE),
+            v1::key::Key::Str(STR_VALUE.to_string()),
+            v1::key::Key::Bin(vec![0u8; UUID_BYTES]),
+        ];
+        for key_type in TYPES {
+            for variant in &variants {
+                let matches = matches!(
+                    (variant, key_type),
+                    (v1::key::Key::Long(_), KeyType::Long)
+                        | (v1::key::Key::Str(_), KeyType::String)
+                        | (v1::key::Key::Bin(_), KeyType::Binary | KeyType::Uuid)
+                );
+                let result = key_from_wire(Some(wire(variant.clone())), key_type);
+                if matches {
+                    assert!(result.is_ok(), "{variant:?} on {key_type}");
+                } else {
+                    assert_eq!(
+                        code_of(result),
+                        Code::InvalidArgument,
+                        "{variant:?} on {key_type}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_key_from_wire_uuid_needs_exactly_sixteen_bytes() {
+        for len in [0, SHORT_BIN_LEN, UUID_BYTES + 1] {
+            assert_eq!(
+                code_of(key_from_wire(
+                    Some(wire(v1::key::Key::Bin(vec![0u8; len]))),
+                    KeyType::Uuid
+                )),
+                Code::InvalidArgument,
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// One error of every variant the binary can build without the Iceberg,
+    /// Parquet, or object-store crates, beside its code.
+    fn status_cases() -> Vec<(Error, Code)> {
+        vec![
+            (
+                Error::KeyType {
+                    table: TABLE.to_string(),
+                    expected: KeyType::Long,
+                    got: KeyType::String,
+                },
+                Code::InvalidArgument,
+            ),
+            (
+                Error::NotReady {
+                    table: TABLE.to_string(),
+                },
+                Code::Unavailable,
+            ),
+            (
+                Error::Cache(CacheError::Fetch(Arc::new(Error::NotReady {
+                    table: TABLE.to_string(),
+                }))),
+                Code::Unavailable,
+            ),
+            (
+                Error::Local {
+                    path: PathBuf::from("/var/lib/icetray"),
+                    fault: LocalFault::Io(std::io::Error::other("sample")),
+                },
+                Code::Unavailable,
+            ),
+            (
+                Error::Json(serde_json::from_str::<u8>("sample").unwrap_err()),
+                Code::Internal,
+            ),
+            (
+                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName)),
+                Code::Internal,
+            ),
+            (
+                Error::Refused {
+                    table: TABLE.to_string(),
+                    reason: RefusalReason::NoLocalDir,
+                },
+                Code::Internal,
+            ),
+            (
+                Error::Inefficient {
+                    table: TABLE.to_string(),
+                    findings: vec![FindingCode::DictionaryEncodedValue],
+                },
+                Code::Internal,
+            ),
+            (
+                Error::Table {
+                    table: TABLE.to_string(),
+                    fault: TableFault::MetadataLocationUnknown,
+                },
+                Code::Internal,
+            ),
+            (
+                Error::File {
+                    path: "mem://f0.parquet".to_string(),
+                    fault: FileFault::NoRows,
+                },
+                Code::Internal,
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_status_from_code_per_variant() {
+        for (error, code) in status_cases() {
+            let message = error.to_string();
+            let status = status_from(&error);
+            assert_eq!(status.code(), code, "{message}");
+            assert_eq!(status.message(), message);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status_from_object_store_failure_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("file://{}/missing", dir.path().display());
+        let error = Storage::new(StorageConfig::default())
+            .read_all(&missing)
+            .await
+            .expect_err("a missing file");
+        assert!(matches!(error, Error::ObjectStore(_)), "{error:?}");
+        assert_eq!(status_from(&error).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn test_presence_per_value() {
+        let bytes = Bytes::from_static(STR_VALUE.as_bytes());
+        assert_eq!(
+            presence(Value::Present(bytes.clone())),
+            (v1::Presence::Present, bytes.to_vec())
+        );
+        assert_eq!(presence(Value::Null), (v1::Presence::Null, Vec::new()));
+        assert_eq!(presence(Value::Absent), (v1::Presence::Absent, Vec::new()));
+    }
+
+    #[test]
+    fn test_key_type_wire_per_type() {
+        let cases = [
+            (KeyType::Long, v1::KeyType::Long),
+            (KeyType::String, v1::KeyType::String),
+            (KeyType::Binary, v1::KeyType::Binary),
+            (KeyType::Uuid, v1::KeyType::Uuid),
+        ];
+        for (key_type, wire) in cases {
+            assert_eq!(key_type_wire(key_type), wire);
+        }
+    }
+}
