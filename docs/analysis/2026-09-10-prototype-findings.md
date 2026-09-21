@@ -448,11 +448,18 @@ tests it.
 - Latency over hours or days, from a pod in the serving cluster, or in
   another region; every S3 number is from one laptop and one in-region
   notebook pod on two days.
-- Load time on S3 after the credential fix, and load time at thousands of
-  files on S3 (1,500 files was measured from local disk only).
+- Load time at thousands of files on S3 (1,500 files was measured from
+  local disk only). Load time on S3 after the credential fix was measured
+  with the rebuilt binary: under four seconds for `long_50m` and `long_2m`
+  loading together
+  ([the clean build against real S3](2026-09-21-real-s3-verification.md#load-time-after-the-credential-fix)).
 - Throughput per core and behavior under concurrent load; the page cache's
   hit-rate curve under a skewed key distribution.
-- Adaptive hedging; only fixed delays were run.
+- Adaptive hedging under a real stall episode. The mechanism was verified
+  against S3 with the rebuilt binary (the window fills, the percentile is
+  taken, the ceiling binds) on an afternoon whose latency had one mode, so
+  it trimmed nothing
+  ([the clean build against real S3](2026-09-21-real-s3-verification.md#adaptive-hedging)).
 - The bloom-filter fallback was measured after this document was first
   written; see [the bloom residency tier](2026-09-10-bloom-residency-tier.md).
 - The overlap merge's cost after the review changes, on the 25-file fixtures.
