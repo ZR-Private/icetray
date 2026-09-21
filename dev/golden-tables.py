@@ -10,6 +10,9 @@ ICETRAY_GOLDEN_WAREHOUSE.
     python3 dev/golden-tables.py --warehouse s3a://bucket/prefix/warehouse
     python3 dev/golden-tables.py --warehouse file:///tmp/icetray-golden
 
+Without Spark on the host, dev/golden-tables.sh runs this script with Spark in
+a container against a warehouse under target/.
+
 Needs Spark 3.5 with the Iceberg runtime on its classpath; --packages adds it
 from Maven when it is absent. A Hadoop catalog is used so that a table root
 and its version hint are the only handles a reader needs, with no catalog
