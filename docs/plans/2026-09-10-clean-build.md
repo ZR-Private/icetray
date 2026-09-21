@@ -103,12 +103,12 @@ One worker.
    runs the golden tests (`icetray-testkit/tests/golden.rs`, ignored tests)
    against it. The first run found that a Hadoop catalog records locations
    as `file:/path`, with no authority, which `Storage::locate` refused as
-   relative; the form is accepted now. The recipe's contract tables draw
-   `large_value_pages` advice: 192-byte values in 1,000-row pages decompress
-   to about 192 KB, above the 128 KiB threshold, so the recipe's `CONTRACT`
-   properties do not by themselves meet RFD 002's value-page bound. Whether
-   the recipe lowers `write.parquet.page-size-bytes` for every table or the
-   threshold moves is a stage 4 question, recorded in its analysis.
+   relative; the form is accepted now. The recipe's contract tables drew
+   `large_value_pages` advice at the doctor's first threshold of 128 KiB:
+   192-byte values in 1,000-row pages decompress to about 192 KB. The
+   threshold moved to 1 MiB after stage 4 measured the cost as linear with
+   no step (RFD 016): the recipe is unchanged, and the doctor reports the
+   mean value size beside the mean page size instead.
 4. Conformance run: `dev/conformance.sh`, a CI job of its own, runs the
    binary's `test_serve_conformance_from_the_environment` by name: the
    server started the way a pod starts it (the path from `ICETRAY_CONFIG`, a

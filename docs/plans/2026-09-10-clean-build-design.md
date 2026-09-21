@@ -713,7 +713,7 @@ pub struct TableSummary { pub table: String, pub snapshot_id: SnapshotId, pub se
 pub struct TableReport { pub summary: TableSummary, pub findings: Vec<Finding>, pub files: Vec<FileReport> }
 pub fn diagnose(g: &Generation) -> TableReport;
 /// The thresholds, in one place, each with the analysis section that set it.
-pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_BYTES_ADVICE: u64 = 2 * contract::VALUE_PAGE_BYTES; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; }
+pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16; pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES /* 1 MiB: where a page's transfer reaches the order of a round trip; the cost below it is linear and small */; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; }
 
 // contract (the layout's numbers; every other crate imports these, none redeclares them)
 pub const PAGE_ROWS: i64 = 1_000;
@@ -780,7 +780,7 @@ form of the `FindingCode` variant; code never compares these strings:
 | `overlapping_files` | Cost | intersecting exact ranges within a bucket | files probed per lookup | `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled` |
 | `bounds_missing` | Advice | manifest lacks key bounds, or its bounds are shorter than the file's exact first or last key | | `write.metadata.metrics.column.<key>` |
 | `column_index_truncated` | Advice | distinct page minimums ratio below threshold | | `parquet.columnindex.truncate.length` |
-| `large_value_pages` | Advice | mean uncompressed value page above threshold | | `write.parquet.page-size-bytes` and the row-group-check properties |
+| `large_value_pages` | Advice | mean uncompressed value page above 1 MiB (`FileReport::avg_value_bytes` beside it says how many values a hit fetches for one; reported, not thresholded) | | `write.parquet.page-size-bytes` and the row-group-check properties |
 | `long_keys` | Advice | key bytes above `KEY_BYTES_ADVICE` | | |
 | `large_file` | Advice | data file above `FILE_BYTES_ADVICE` | | `write.target-file-size-bytes` |
 | `many_files_per_bucket` | Advice | files in a bucket above twice what the bucket's bytes divided by `TARGET_FILE_BYTES_MAX` explain (a rolled sorted task is not many files) | | compaction |

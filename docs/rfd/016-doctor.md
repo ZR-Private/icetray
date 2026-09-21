@@ -28,10 +28,17 @@ measured defaults kept in one documented table.
 The refusal reasons and cost findings are RFD 007's lists, grouped by its
 tiers, and the doctor reports each cost finding with the penalty RFD 007
 assigns it. The advice: missing or truncated manifest bounds, value pages
-over 128 KiB, keys over 128 bytes, data files over 128 MiB, a truncated
+over 1 MiB, keys over 128 bytes, data files over 128 MiB, a truncated
 column index, more files per bucket than the table's size and file-size
 target explain, and a key bloom filter absent, oversized, or undersized for
-its row group's key count, reported as the filter's bits per key. Each
+its row group's key count, reported as the filter's bits per key. The
+value-page line is about bytes fetched per hit, a cost that is linear in
+the page's size with no step anywhere, so it is drawn where the transfer
+itself reaches the order of a round trip rather than at the contract's
+64 KiB bound; the bound stays the recipe for large values, where a row limit
+alone leaves pages of megabytes, and the doctor reports the mean value size
+beside the mean page size so an owner sees how many values a hit fetches for
+the one it wanted. Each
 advice names the Iceberg or Parquet writer property that fixes it. The
 summary also carries each residency tier's resident bytes computed from
 footers alone, so an owner chooses a tier (RFD 017 (Residency tiers)) from
