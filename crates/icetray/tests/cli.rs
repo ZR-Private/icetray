@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hyper::StatusCode;
 use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
-use icetray::listen::READY_PATH;
+use icetray::listen::{METRICS_PATH, READY_PATH};
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
+use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
 use icetray_core::{Key, KeyType};
 use icetray_testkit::fixture::{SAMPLE, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::layout::Layout;
@@ -532,8 +533,17 @@ fn check_log_line(line: &Json) {
     }
 }
 
+/// The `state` label value of a table that serves, as `TableState` renders it.
+const SERVING_STATE: &str = "serving";
+
+/// The conformance run of RFD 012, which `dev/conformance.sh` runs by name:
+/// the binary started as an orchestrator starts it (the configuration path
+/// from the environment, a JSON file, no flags), its logs under the
+/// configured field names, the health service answering while the table
+/// loads, readiness turning on once it serves, the metrics scrape carrying
+/// the table's state and the process's memory, and the drain on SIGTERM.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_serve_reads_its_config_from_the_environment_and_drains_on_sigterm() -> TestResult {
+async fn test_serve_conformance_from_the_environment() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_serve", KeyType::Long)).await?;
     let config = write_file(dir.path(), "serve.json", &json_config(TABLE_A, &fixture))?;
@@ -570,6 +580,25 @@ async fn test_serve_reads_its_config_from_the_environment_and_drains_on_sigterm(
         .expect("the metrics address")
         .parse()?;
 
+    // The health service answers as soon as the listener is up, while the
+    // table may still be loading: the answer is one of the two states,
+    // never a transport failure.
+    let channel = Channel::from_shared(format!("http://{grpc}"))?
+        .connect()
+        .await?;
+    let mut health = HealthClient::new(channel);
+    let during_load = health
+        .check(HealthCheckRequest {
+            service: OVERALL_SERVICE.to_string(),
+        })
+        .await?
+        .into_inner()
+        .status;
+    assert!(matches!(
+        ServingStatus::try_from(during_load)?,
+        ServingStatus::NotServing | ServingStatus::Serving
+    ));
+
     let deadline = Instant::now() + READY_WAIT;
     loop {
         let (status, body) = http_get(metrics, READY_PATH).await?;
@@ -581,10 +610,6 @@ async fn test_serve_reads_its_config_from_the_environment_and_drains_on_sigterm(
         assert!(Instant::now() < deadline, "not ready within {READY_WAIT:?}");
         tokio::time::sleep(POLL_STEP).await;
     }
-    let channel = Channel::from_shared(format!("http://{grpc}"))?
-        .connect()
-        .await?;
-    let mut health = HealthClient::new(channel);
     let status = health
         .check(HealthCheckRequest {
             service: OVERALL_SERVICE.to_string(),
@@ -593,6 +618,24 @@ async fn test_serve_reads_its_config_from_the_environment_and_drains_on_sigterm(
         .into_inner()
         .status;
     assert_eq!(ServingStatus::try_from(status)?, ServingStatus::Serving);
+
+    let (status, exposition) = http_get(metrics, METRICS_PATH).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        exposition
+            .lines()
+            .any(|line| line.starts_with(PROCESS_RSS_BYTES)),
+        "the scrape carries the process's memory"
+    );
+    let state_line = exposition
+        .lines()
+        .find(|line| {
+            line.starts_with(TABLE_STATE)
+                && line.contains(&format!("{LABEL_TABLE}=\"{TABLE_A}\""))
+                && line.contains(&format!("{LABEL_STATE}=\"{SERVING_STATE}\""))
+        })
+        .expect("the scrape carries the table's state");
+    assert!(state_line.ends_with(" 1"), "{state_line}");
 
     let killed = Command::new("kill")
         .arg("-TERM")
