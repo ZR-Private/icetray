@@ -21,6 +21,12 @@ RFDs your brief cites, and the blueprint's sections 2, 3, and 6.
   constant two crates need lives in `contract`.
 - Every invariant in your brief has a test at the tier named, written with
   the code it pins, asserting on typed outcomes and exact counts.
+- Every `pub async fn` the daemon spawns (`Table::load`, `refresh`, `get`,
+  `Opened::retain`) returns a `Send` future. A closure that takes a reference
+  and returns an `async` block, or an opaque `impl IntoIterator` fed to
+  `stream::iter`, makes every future up the call chain unprovably `Send`
+  without failing core's own tests; collect into a `Vec` and stream by value,
+  and keep the spawnability tests in `table` and `open` green.
 - Gate before reporting: `dev/ci-checks.sh` and `cargo test --workspace`, run
   to completion, output read, never piped through `head`. Report the exact
   result lines.
@@ -117,16 +123,48 @@ exit codes.
 
 The proto is blueprint section 4 verbatim, with a vendored protobuf compiler
 so a source build needs none.
-`serve` binds the gRPC and metrics listeners and registers health before
-loading, flips readiness when every table serves, refreshes per table, and
-drains on SIGTERM. The one-shot subcommands share one flag vocabulary with
-it and go through `open`. Logs are JSON with the configured field names; the
-metric and label names in blueprint section 7 are the public surface.
+The binary is blueprint section 5 as built: `serve` binds both listeners and
+registers health `NOT_SERVING` before opening any table, loads every table
+concurrently, flips `SERVING` and `/ready` together when every table
+serves, runs one refresh task per table and one sampler on the poll
+interval, calls `Opened::retain` after the first loads and after every swap,
+drains on SIGTERM or SIGINT, and refuses to start after the grace on a
+first-load failure. `doctor`, `get`, and `info` share the `Target`
+vocabulary and go through `open`; RFD 010's mapping is
+`service::status_from`, exhaustive over `Error`, and `key_from_wire` reads
+the wire key under the table's key type. Logs are JSON with the configured
+field names; the metric and label names in blueprint section 7 are the
+public surface.
 
-Invariants: the gRPC error mapping per RFD 010, `MultiGet` from one snapshot
-failing as a whole when one read fails, a null value distinct from an absent
-key, health `NOT_SERVING` until every table serves with the listener already
-accepting, and the subcommands' JSON shape and exit codes.
+What the binary proves and where. `tests/serve.rs` drives `Serving`
+in-process over the in-process S3 server: health `NOT_SERVING` and `/ready`
+503 with the listeners already accepting, then `SERVING` on both health
+names and 200 once the table serves; `TableInfo` describing the served
+snapshot; three cold `Get`s at exactly the oracle's GETs, warm and absent
+at none, a null at one GET cold and distinct from absent; `MultiGet` in
+order from one snapshot; a missing, unset, mismatched, or fifteen-byte uuid
+key as `INVALID_ARGUMENT` with no GET; an unserved table as `NOT_FOUND`; a
+deleted object as `UNAVAILABLE` for one `Get` and for a whole batch, the
+other keys still answering; exact `requests_total` deltas per call and the
+sampled gauges in the exposition; a refresh within the poll interval; a
+`Get` before `shutdown` answered and `join` `Ok`; a first-load refusal
+visible as `NOT_SERVING` through the grace, then `FirstLoad` naming the
+table and `ErrorKind::Refused(NoLocalDir)`; and a shutdown during the grace
+ending the run at once. `tests/cli.rs` runs the built binary over local
+fixtures: `info`'s summary with `kind` and `table` first; the doctor at
+exit 0 with 16 `file` lines, at exit 2 with `no_bucket_partition` at tier
+`cost`, and at exit 1 with a `refused` line whose reason is `unsorted`;
+`get` answering present, null, and absent with base64 values and GET
+counts; every key type as `Display` prints it; a bad key at exit 64 with
+nothing on stdout; a table name required under two tables; TOML and JSON
+configurations printing identical lines; location-only flags under
+`--config`, no target, and an unknown `--table` at exit 64; a reader
+closing stdout ending the run at exit 0; and `serve` started from the
+environment alone, logging under the renamed fields, ready, `SERVING`, and
+draining on SIGTERM to exit 0. Unit tests cover the key parser, the output
+lines' key order, the log formatter's order and uniqueness, the recorder,
+the wire key and status mapping per variant, the command line, and the exit
+code per `CliError` variant.
 
 ## Stage 2D: testkit
 

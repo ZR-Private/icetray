@@ -19,13 +19,18 @@ below carries a string code, and no test matches on message text.
 |---|---|---|---|
 | `icetray-core` | library | none | everything from bytes to lookups: keys, storage, catalog, manifests, index, cache, generations, doctor, config |
 | `icetray-proto` | library | none | the gRPC contract, generated at build time |
-| `icetray` | binary + thin library | core, proto | one binary: `serve` (the daemon: service, table lifecycle, poll loop, twelve-factor surface) and the one-shot `doctor`, `get`, `info` as JSON lines |
+| `icetray` | binary + thin library | core, proto | one binary: `serve` (the daemon: service, table lifecycle, poll loop, twelve-factor surface) and the one-shot `doctor`, `get`, `info` as JSON lines; the library's modules are `cli`, `error`, `key_text`, `output`, `oneshot`, `logging`, `telemetry`, `service`, `listen`, and `serve` |
 | `icetray-testkit` | library | core (dev: the `icetray` crate depends on testkit) | in-process S3, fixture writer, simulation, shared assertions, golden-table locator |
 
 `icetray-core` never depends on the testkit (its unit tests write Parquet
 with `arrow` as a dev-dependency). Every subcommand of the binary opens
-tables through one core function and shares one flag vocabulary. Pinned
-dependency versions live once, in `[workspace.dependencies]`.
+tables through one core function and shares one flag vocabulary. The
+binary's `main` parses the command line, builds the runtime, and maps the
+library's typed outcomes to exit codes; everything else is in the library,
+so the integration tests drive `Serving` in-process over the in-process S3
+server (`tests/serve.rs`) and the built binary over local fixtures
+(`tests/cli.rs`). Pinned dependency versions live once, in
+`[workspace.dependencies]`.
 
 ## 2. `icetray-core` module map and owners
 
@@ -36,7 +41,7 @@ redefine.
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string, and an epoch millisecond a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`); CONTRIBUTING Constants | |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the read-kind label enum; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -171,11 +176,16 @@ pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, 
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String } }
+/// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
 pub enum Residency { Full, Disk, Bloom }
+/// Exactly the lowercase names `Display` prints (`full`, `disk`, `bloom`); any other word is
+/// `ConfigViolation::UnknownResidency`. The one boundary parser for the setting when it arrives
+/// from the command line; the file reads the same names through serde.
+impl std::str::FromStr for Residency { type Err = ConfigViolation; }
 /// `page_cache_disk_bytes`: zero means no disk level, anything else at least
 /// `contract::PAGE_CACHE_DISK_BLOCK_BYTES`, the level's one block, or the
 /// level would hold nothing; `Config::parse` refuses less as `PageCacheDiskTooSmall`.
@@ -617,7 +627,14 @@ pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant
 /// and one tokio mutex that serializes `load` and `refresh`. `known` is what `refresh`
 /// polls against; a failed build does not advance it, so every later poll reads the metadata
 /// again and retries, a transient failure recovers on the next poll, and a persistent refusal
-/// is counted under `refresh_errors_total` once per poll.
+/// is counted under `refresh_errors_total` once per poll. `load`, `refresh`, `get`, and
+/// `Opened::retain` return `Send` futures: the daemon spawns them onto a multi-thread
+/// runtime, so `manifest::list_data_files` collects the manifest files into a `Vec` before
+/// streaming them and `generation::gather_chunks` streams group positions by value, since an
+/// opaque `impl IntoIterator` fed to `stream::iter` and a closure taking a reference and
+/// returning an `async` block each make every future up the call chain unprovably `Send`;
+/// `table::tests::test_load_refresh_and_get_are_spawnable` and
+/// `open::tests::test_retain_is_spawnable` pin the property.
 pub struct Table;
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Sets `table_state` for the state.
@@ -700,6 +717,23 @@ pub const MAX_KEY_BYTES: usize = 4_096;
 pub const KEY_BYTES_ADVICE: usize = 128;
 /// The page cache disk level's block: its unit of eviction and the smallest level that holds a page.
 pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
+
+// time (the one place a Duration or a timestamp becomes a number or text, and the wall clock is read)
+/// A duration in seconds: the histogram unit, and the unit the latency buckets are declared in.
+pub fn seconds(duration: Duration) -> f64;
+/// Whole microseconds, the `get` line's `elapsed_micros`; saturates at `u64::MAX`.
+pub fn micros(elapsed: Duration) -> u64;
+/// The wall clock now; a caller that needs a timestamp never names the clock (the binary has no `jiff`).
+pub fn now() -> jiff::Timestamp;
+/// Seconds from `since` to now, the `generation_age_seconds` gauge; a `since` in the future gives a
+/// negative age, kept as measured.
+pub fn age_seconds(since: jiff::Timestamp) -> f64;
+/// RFC 3339 in UTC with a `Z` offset through jiff's printer, the fraction of a second only when it is
+/// non-zero; the one place a timestamp becomes log text.
+pub fn log_timestamp(at: jiff::Timestamp) -> String;
+/// In-crate: an Iceberg snapshot's epoch millisecond as a timestamp; out of jiff's range is `Err`,
+/// which `Generation::load` reports as `TableFault::SnapshotTimestampOutOfRange`.
+pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error>;
 
 // open
 /// A private `complete` field records whether `tables` is every configured table.
@@ -815,31 +849,88 @@ Startup reuses chunk files whose identity matches; a generation swap
 deletes chunk files nothing references; a disk budget refuses loads that
 would exceed it, at the footer stage.
 
-**`icetray serve`.** The binary uses jemalloc with background purging so
-that memory freed after a load (shed key chunks, dropped generations)
-returns to the operating system; memory metrics report the index's live
-bytes beside process RSS. The daemon subcommand binds the gRPC listener and the
-metrics listener first (the metrics listener serves `/metrics` and
-`/ready`), registers the health service (all tables `NOT_SERVING`), then calls
-`core::open` and loads every table concurrently. A table's first-load failure
-is fatal to the process (RFD 005: refuse to start), after the reason is
-logged and the health status reflects it for the shutdown grace period. Once
-every table is `Serving`, health flips to `SERVING` and the readiness
-endpoint answers 200. Refresh runs as one task per table with the configured
-interval; a refresh failure keeps the last generation, sets `Degraded`, and
-counts `icetray_refresh_errors_total{table}`. Configuration path from
-`--config` or `ICETRAY_CONFIG`; TOML or JSON. Logs through `tracing` with the
-JSON formatter, field names remapped through `LogConfig.fields` and
-`static_fields` appended. Prometheus histograms use the prototype's buckets
-(100 µs to 2 s). SIGTERM drains in-flight requests and exits 0.
+**`icetray serve`.** `serve` takes only the configuration path, from
+`--config` or `ICETRAY_CONFIG` (RFD 012); TOML or JSON. The binary uses
+jemalloc, and `serve` turns on background purging at start so that memory
+freed after a load (shed key chunks, dropped generations) returns to the
+operating system, with a `warn` log where the platform refuses (purging is
+jemalloc's Linux feature); memory metrics report the index's live bytes
+beside process RSS. `Serving::start` binds the gRPC listener and the metrics
+listener first (the metrics listener serves `/metrics` and `/ready` from
+one HTTP/1 accept loop, which only the shutdown ends: a failed `accept` is
+logged and retried), registers the gRPC health service with the overall
+server (`""`) and the `Icetray` service both `NOT_SERVING`, opens every
+table through `core::open` (nothing read yet), starts the gRPC and HTTP
+servers, logs `listening`, and returns; the loads run behind it, every table
+concurrently, so the listeners accept while tables load. There is no
+per-table health entry: readiness is a fact about the first loads. Once
+every table serves a generation, the daemon calls `Opened::retain` once,
+samples its gauges, flips both health names to `SERVING` together, and
+`/ready` answers 200; both stay so, since a later refresh failure keeps the
+last generation serving (RFD 005), sets `Degraded`, and counts
+`icetray_refresh_errors_total{table}`. A table's first-load failure is fatal
+to the process (RFD 005: refuse to start): the reason is logged, health
+stays `NOT_SERVING` for `START_FAILURE_GRACE` (10 seconds, long enough for
+an orchestrator's probe to see the refusal beside its logged reason; tests
+pass a shorter grace through `ServeOptions`), then the run ends and the
+process exits 1. Refresh runs as one task per table on
+`server.poll_interval`, the one period for everything periodic, with the
+sampler for `generation_age_seconds` and `process_rss_bytes` as one more
+task on the same period; the tickers start one interval after the first
+loads rather than at once, so a load is not followed by an immediate,
+redundant poll and sample, and a missed tick delays rather than bursts. A
+refresh that swapped a generation in is followed by `Opened::retain`.
+`serve` logs JSON to stdout at `info` (the twelve-factor log stream)
+through the binary's own `tracing` event formatter: keys in the order
+time, level, target, message, the event's other fields, the static fields;
+the standard fields under the names `LogConfig.fields` maps them to, every
+line carrying the message key (empty for an event without one), and unique
+keys, an event's own field winning over a standard one and never displaced
+by a static field; a `log.fields` key naming no standard field, or two
+standard fields mapped to one emitted name, is refused at startup with exit
+64. Prometheus histograms use the prototype's buckets (100 µs to 2 s); the
+recorder installs once per process and every later caller gets the same
+handle. SIGTERM or SIGINT drains in-flight requests, flushes the page
+cache's disk level (RFD 017), and exits 0; a shutdown asked for while the
+first loads run is honoured as soon as they end, cutting the grace short
+and never flipping to `SERVING`.
 
-**One-shot subcommands.** `doctor [table] [--files]` (exit 0 efficient, 2
-inefficient, 1 refused or error), `get [table] <key>...` (table optional when
-exactly one is open; binary keys as hex), `info [table]`. JSON lines with
-`kind` and `table` first; `doctor` and `info` lines serialize `TableSummary`
-so a new measurement in core reaches the CLI without a CLI change. Flags
-that only apply to `--location` are rejected under `--config`. Returns
-`ExitCode`.
+**One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
+the target vocabulary after the subcommand: `--config <file>` (also
+`ICETRAY_CONFIG`) or `--location <root or metadata file>` (exactly one, a
+clap group), `--rewrite FROM=TO` under either, and four location-only flags
+(`--key-column`, `--value-column`, `--ref`, `--residency`) that conflict
+with `--config`, since clap waives a `requires` whose argument conflicts
+with a present one. A `--location` table is opened under the name `table`,
+never strict (the one-shots exist to report what `strict` would refuse),
+with defaults `key`, `value`, `main`, `full`. The table filter is a
+`--table` flag on all three (a positional before `get`'s keys would make a
+key and a table name indistinguishable); `get` needs it when more than one
+table is configured. Keys are typed in the form `Key`'s `Display` prints
+them (a long's digits, negative ones included; a string's text without
+`Display`'s quotes; hex with or without `0x`, either case, even length; a
+uuid hyphenated or simple), parsed under the served generation's key type
+before any lookup. Every one-shot opens through `core::open` and loads
+concurrently; none calls `Opened::retain`, which is the daemon's. JSON
+lines with `kind` and `table` first: `table` (`info`) and `doctor` lines
+flatten `TableSummary`, so a new measurement in core reaches the CLI
+without a CLI change; `finding` and `file` lines flatten core's `Finding`
+and `FileReport`; a `get` line carries the key, `presence`
+(`present`/`null`/`absent`), the value as standard base64 and, when UTF-8,
+as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
+`elapsed_micros`; a table the doctor could not load is one `refused` line
+(`table`, `reason` as the `ErrorKind`'s name, `message`). The doctor opens
+every table with `strict` off. Exit codes: 0 for a run that did what was
+asked; 1 for a load or read error, a table the doctor could not load (which
+dominates 2), a configuration file that cannot be read or parsed, a
+first-load failure, or a bind failure; 2 when the doctor found a cost
+finding (RFD 016); 64 (`sysexits.h`'s `EX_USAGE`) when the command line or
+the target could not be used, including clap's own errors, no table
+matched, a table name required, a key that does not parse, and a bad log
+field mapping, so clap's default exit code 2 is never used and 2 means one
+thing. A reader that closes stdout ends the run with exit 0 and nothing
+more printed. The one-shots log to stderr at `warn`, since their stdout is
+data.
 
 **Testkit.** `icetray-testkit` is `error` (`TestkitError`, one variant per
 failure source; `SpecFault { PadOnFixedWidthKey, CatalogBehind }` for a
@@ -1019,8 +1110,10 @@ Histograms: `icetray_lookup_seconds{table,result}`,
 `icetray_findings{table,code}`, `icetray_generation_age_seconds{table}`
 (the served snapshot's timestamp to now, through the time-conversion
 helpers), `icetray_generation_info{table,snapshot_id}` (1 for the serving
-snapshot, 0 for the previous; series of older snapshots are removed on
-swap), `icetray_table_state{table,state}`.
+snapshot, 0 for the previous; a replaced snapshot's series reads 0 until the
+process restarts, since the exporter's only series removal is an idle
+timeout, which would also drop the live gauges `table` sets only on change,
+so the recorder installs none), `icetray_table_state{table,state}`.
 
 Every label value is the `Display` of an enum, never a literal string at the
 call site: `kind` from a read-kind enum, `result` from `LookupResult`, `call`
@@ -1034,8 +1127,9 @@ Ownership: `table` emits `lookups_total`, `lookup_seconds`,
 `generation_info`, and `table_state`; `cache` the two page-cache counters and
 the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
 series; the binary samples `generation_age_seconds` (from
-`Generation::snapshot_timestamp` against now) and `process_rss_bytes` and
-counts `requests_total`. `icetray_findings{table,code}` describes the serving
+`Generation::snapshot_timestamp` against now) and `process_rss_bytes` once
+after the first loads and then every `poll_interval`, running the
+recorder's upkeep with each sample, and counts `requests_total`. `icetray_findings{table,code}` describes the serving
 generation: it is set for every `FindingCode` on every admitted generation,
 zero for the absent codes, and never from a generation the strict gate
 refused. `refresh_errors_total` is counted only from `refresh`, once per

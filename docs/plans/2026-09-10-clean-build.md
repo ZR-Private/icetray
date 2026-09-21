@@ -83,9 +83,13 @@ then B, then C.
 
 One worker.
 
-1. The one-shot subcommands (`doctor`, `get`, `info`) on `core::open` and
-   `TableSummary`; binary test covering `--config`, `--location`, string and
-   binary keys, exit code 2, the broken-pipe path.
+1. The one-shot subcommands (`doctor`, `get`, `info`) exist from stage 2C
+   on `core::open` and `TableSummary`, with the binary test
+   (`icetray/tests/cli.rs`) covering `--config` in TOML and JSON,
+   `--location`, string, binary, and uuid keys, exit codes 0, 1, 2, and 64,
+   the broken-pipe path, and `serve` started from the environment with a
+   SIGTERM drain; stage 3 reruns it as part of the workspace gate and adds
+   nothing here.
 2. Acceptance suite green over in-process S3 and simulation; the gRPC tests
    behind the server including health and readiness; the REST container test
    (`icetray-testkit/tests/rest_catalog.rs`, an ignored test that a plain
