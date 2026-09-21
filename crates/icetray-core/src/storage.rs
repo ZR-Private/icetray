@@ -38,6 +38,11 @@ use crate::time;
 /// one whose metadata records URIs read the same way.
 const FILE_PREFIX: &str = "file://";
 
+/// The local filesystem scheme with no authority, `file:/path`, the form
+/// Hadoop's `Path` records in the metadata of a table written to a local
+/// warehouse; it names the same absolute path as `file:///path`.
+const FILE_SCHEME: &str = "file:";
+
 /// What separates a URI's scheme from its authority.
 pub(crate) const SCHEME_SEPARATOR: &str = "://";
 
@@ -477,11 +482,17 @@ impl Storage {
     }
 }
 
-/// A location's `scheme://authority/` prefix and the rest. `file://` and a
-/// bare absolute path both give the `file://` prefix with the absolute path
-/// as the rest; a relative path is a configuration fault.
+/// A location's `scheme://authority/` prefix and the rest. `file://`, the
+/// authority-less `file:/path`, and a bare absolute path all give the
+/// `file://` prefix with the absolute path as the rest; a relative path is a
+/// configuration fault.
 fn split_location(location: &str) -> Result<(String, String)> {
     if let Some(path) = location.strip_prefix(FILE_PREFIX) {
+        return Ok((FILE_PREFIX.to_string(), path.to_string()));
+    }
+    if let Some(path) = location.strip_prefix(FILE_SCHEME)
+        && path.starts_with(PATH_SEPARATOR)
+    {
         return Ok((FILE_PREFIX.to_string(), path.to_string()));
     }
     if location.starts_with(PATH_SEPARATOR) {
@@ -1204,6 +1215,14 @@ mod tests {
     fn test_split_location_file_uri() {
         assert_eq!(
             split_location("file:///tmp/w/t").unwrap(),
+            (FILE_PREFIX.to_string(), "/tmp/w/t".to_string())
+        );
+    }
+
+    #[test]
+    fn test_split_location_hadoop_file_uri_without_authority() {
+        assert_eq!(
+            split_location("file:/tmp/w/t").unwrap(),
             (FILE_PREFIX.to_string(), "/tmp/w/t".to_string())
         );
     }
