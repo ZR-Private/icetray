@@ -40,7 +40,9 @@ arrow = "58"
 async-trait = "0.1.92"
 aws-config = "1.12.0"
 aws-credential-types = "1.3.0"
+base64 = "0.23.1"
 bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
 foyer = "0.22.6"
 futures = "0.3.34"
 http-body-util = "0.1.5"
@@ -57,7 +59,12 @@ iceberg-catalog-rest = "0.10.1"
 # filesystem storage, and icetray itself reads every byte through object_store.
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3"] }
 jiff = { version = "0.2.37", features = ["serde"] }
+# The binary reads the process's resident set size for its memory gauge.
+memory-stats = "1.2.0"
 metrics = "0.24.6"
+# The binary serves `/metrics` and `/ready` from one hyper listener of its
+# own, so the exporter's own HTTP listener and push gateway stay out.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-util = "0.20.4"
 murmur3 = "0.5.2"
 object_store = { version = "0.14.1", features = ["aws"] }
@@ -73,13 +80,23 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
+# jemalloc for the binary alone: memory freed after a load (shed key chunks,
+# dropped generations) returns to the operating system through its
+# background purging, which the binary turns on at start.
+tikv-jemalloc-ctl = "0.7.0"
+tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 toml = "1.1.6"
 tonic = "0.14.6"
+tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = "0.5.3"
 tracing = "0.1.44"
+# Logs are JSON events with a deployer's field names (RFD 012); the binary
+# writes them through its own event formatter, so the subscriber's own
+# formats and colors stay out.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "env-filter", "std"] }
 turmoil = "0.7.2"
 url = "2.5.8"
 uuid = "1.26.1"

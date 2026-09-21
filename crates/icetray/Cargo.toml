@@ -9,8 +9,31 @@ description = "One binary: the serve daemon and the one-shot doctor, get, and in
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 icetray-core = { workspace = true }
 icetray-proto = { workspace = true }
+memory-stats = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemallocator = { workspace = true }
+# `net` for the two listeners, `signal` for the SIGTERM drain (RFD 012).
+tokio = { workspace = true, features = ["net", "signal"] }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 icetray-testkit = { workspace = true }
+tempfile = { workspace = true }
