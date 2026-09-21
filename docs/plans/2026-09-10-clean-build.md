@@ -125,8 +125,12 @@ One worker.
 From a laptop with profile credentials against tables written by the
 notebook recipe in the prototype findings: doctor, lookups with value
 verification, load time after the credential fix (the number the analysis
-lacks), snapshot advance, adaptive hedging behavior. Record results in a new
-analysis document; update the findings document's "not verified" list.
+lacks), snapshot advance, adaptive hedging behavior. Recorded in
+[the clean build against real S3](../analysis/2026-09-21-real-s3-verification.md);
+the findings document's "not verified" list points at it for the two items
+it settles. The snapshot was appended by a Spark job run the way
+`dev/golden-tables.sh` runs the recipe, in a container against the S3
+warehouse with temporary credentials from the profile.
 
 ## Done when
 
