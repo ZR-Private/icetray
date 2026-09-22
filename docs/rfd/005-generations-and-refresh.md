@@ -34,8 +34,9 @@ schema or spec change between snapshots cannot misroute a key; the table's
 current schema and default spec play no part
 ([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
 
-A data file the new snapshot still references by the same path keeps its
-resident index from the previous generation; only new files are loaded.
+A data file the new snapshot still references by the same path at the
+same size keeps its resident index from the previous generation; only new
+files are loaded.
 Load work is per file and unchanged files are reused, so a refresh costs
 its delta
 ([prototype findings, finding 3](../analysis/2026-09-10-prototype-findings.md#3-load-time));

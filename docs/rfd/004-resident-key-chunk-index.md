@@ -35,9 +35,10 @@ The fence array picks the one key page to decode, and the key's position in
 it names the one value page to fetch on a cold hit. RFD 006 (Lookup hot
 path) covers the decode.
 
-Load issues two GETs per file: the footer with a tail prefetch that carries
-the page indexes, then the key chunks. Memory per key is a small multiple of
-the compressed key bytes
+Load issues one GET per file for the footer, with a tail prefetch that
+carries the page indexes, then one per row group for its key chunk; a
+contract-shaped file has one row group, so two GETs a file. Memory per key
+is a small multiple of the compressed key bytes
 ([prototype findings, finding 2](../analysis/2026-09-10-prototype-findings.md#2-resident-index-size)).
 
 The resident set excludes the value column's column index; only its offset

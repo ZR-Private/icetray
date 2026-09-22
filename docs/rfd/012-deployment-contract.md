@@ -59,7 +59,7 @@ load with a named reason, and the start-or-fail rule of RFD 005
 (Generations and refresh) applies.
 
 Logs are JSON events; a field-name map in configuration renames the
-standard fields (time, level, message) to the deployer's schema, and
+standard fields (time, level, message, target) to the deployer's schema, and
 static fields from configuration are added to every event.
 
 Metrics are Prometheus: request counts by call; GET counts, local read

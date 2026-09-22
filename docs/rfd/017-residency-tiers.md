@@ -101,11 +101,12 @@ them.
 A replica wanting the disk tier runs on hardware with local solid-state
 storage or a local volume; the state on it is disposable.
 
-Load peaks differ by tier. The disk tier holds one file's chunks at a time,
-since overlap groups are verified by reading pages back from the chunk
-files. The bloom tier has no local copy to read back, so its load still
-peaks at the full tier's size while a group is verified in memory, once per
-load ([bloom residency tier, observations](../analysis/2026-09-10-bloom-residency-tier.md#observations)).
+Load peaks differ by tier. The disk tier holds one overlap group's chunks
+at a time, since a group is verified by reading pages back from the chunk
+files and its chunks are dropped before the next group's are read. The
+bloom tier has no local copy to read back, so its load still peaks at the
+full tier's size while a group is verified in memory, once per load
+([bloom residency tier, observations](../analysis/2026-09-10-bloom-residency-tier.md#observations)).
 
 The bloom tier's miss cost is set by the writer's filter sizing, which one
 Iceberg release could not control; the doctor reports the filter's size per

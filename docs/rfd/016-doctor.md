@@ -38,11 +38,12 @@ itself reaches the order of a round trip rather than at the contract's
 64 KiB bound; the bound stays the recipe for large values, where a row limit
 alone leaves pages of megabytes, and the doctor reports the mean value size
 beside the mean page size so an owner sees how many values a hit fetches for
-the one it wanted. Each
-advice names the Iceberg or Parquet writer property that fixes it. The
-summary also carries each residency tier's resident bytes computed from
-footers alone, so an owner chooses a tier (RFD 017 (Residency tiers)) from
-one run
+the one it wanted. An advice names the Iceberg or Parquet writer property
+that fixes it when one does; long keys and many files per bucket are the
+owner's data and its compaction, which no writer property sets, so those
+two name none. The summary also carries each residency tier's resident
+bytes computed from footers alone, so an owner chooses a tier (RFD 017
+(Residency tiers)) from one run
 ([bloom residency tier, results](../analysis/2026-09-10-bloom-residency-tier.md#results)).
 
 The command exits 0 for a table with no cost finding (advice does not change
