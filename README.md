@@ -162,7 +162,9 @@ refused over, at the footer stage, before any key chunk is fetched.
 Every section defaults when absent, and a key the schema does not know is
 an error. The server defaults are `listen = "127.0.0.1:7433"`,
 `metrics_listen = "127.0.0.1:9433"`, `poll_interval = "10s"`, and
-`page_cache_bytes = 268435456` (256 MiB). Under `storage`, `s3` holds
+`page_cache_bytes = 268435456` (256 MiB; a budget below one 64 KiB value
+page is refused, since the cache could hold nothing). Under `storage`, `s3`
+holds
 explicit client settings (`endpoint`, `region`, `access_key_id` and
 `secret_access_key` as a pair, `allow_http`, `path_style`) and is omitted to
 use the AWS default credential chain; `rewrite` is a list of `{from, to}`

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
+use crate::approx;
+use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::error::Result;
 use crate::time;
 
@@ -113,6 +114,15 @@ pub enum ConfigViolation {
     /// Disk residency with no local directory to write chunk files to.
     #[error("disk residency needs a local directory under storage.local")]
     DiskResidencyWithoutLocalDir,
+    /// The memory budget of the page cache cannot hold one value page, so
+    /// the cache would keep a page per shard and nothing an operator chose.
+    #[error("page_cache_bytes {bytes} is below one value page of {minimum} bytes")]
+    PageCacheTooSmall {
+        /// The configured budget.
+        bytes: u64,
+        /// The smallest budget that holds a page: one contract value page.
+        minimum: u64,
+    },
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
     #[error(
@@ -233,6 +243,12 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     {
         return Err(ConfigViolation::IncompleteStaticKeys);
     }
+    if approx::count(config.server.page_cache_bytes) < VALUE_PAGE_BYTES {
+        return Err(ConfigViolation::PageCacheTooSmall {
+            bytes: approx::count(config.server.page_cache_bytes),
+            minimum: VALUE_PAGE_BYTES,
+        });
+    }
     if let Some(local) = &config.storage.local
         && local.page_cache_disk_bytes > 0
         && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
@@ -299,7 +315,8 @@ pub struct ServerConfig {
     /// friendly duration such as `"10s"`.
     #[serde(with = "time::friendly_duration")]
     pub poll_interval: Duration,
-    /// The value-page cache budget in bytes.
+    /// The value-page cache budget in bytes; at least one contract value
+    /// page (`contract::VALUE_PAGE_BYTES`), or the cache could hold nothing.
     pub page_cache_bytes: usize,
     /// Log field renames and additions.
     pub log: LogConfig,
@@ -963,6 +980,36 @@ locaton = "typo"
             TOML_MINIMAL.trim_end()
         );
         assert_eq!(violation(&disk), ConfigViolation::BudgetWithoutResidency);
+    }
+
+    #[test]
+    fn test_parse_refuses_page_cache_below_one_value_page() {
+        let with_budget = |bytes: u64| {
+            format!(
+                "[server]\npage_cache_bytes = {bytes}\n{}",
+                TOML_MINIMAL.trim_start()
+            )
+        };
+        let just_below = VALUE_PAGE_BYTES - 1;
+        assert_eq!(
+            violation(&with_budget(just_below)),
+            ConfigViolation::PageCacheTooSmall {
+                bytes: just_below,
+                minimum: VALUE_PAGE_BYTES,
+            }
+        );
+        assert_eq!(
+            violation(&with_budget(0)),
+            ConfigViolation::PageCacheTooSmall {
+                bytes: 0,
+                minimum: VALUE_PAGE_BYTES,
+            }
+        );
+        let one_page = Config::parse(&with_budget(VALUE_PAGE_BYTES)).unwrap();
+        assert_eq!(
+            approx::count(one_page.server.page_cache_bytes),
+            VALUE_PAGE_BYTES
+        );
     }
 
     #[test]

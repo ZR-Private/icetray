@@ -181,6 +181,8 @@ impl Config {
 }
 /// `metrics_listen` is required (default 127.0.0.1:9433) and serves `/metrics`
 /// and `/ready`; RFD 012 makes both part of the surface.
+/// `page_cache_bytes`: at least `contract::VALUE_PAGE_BYTES`, or the cache could hold no page;
+/// `Config::parse` refuses less as `PageCacheTooSmall`, as it refuses a disk level below one block.
 pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
 /// standard fields and `static_fields` are added to every event.
@@ -191,7 +193,7 @@ pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
 /// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
