@@ -98,5 +98,4 @@ tracing = "0.1.44"
 # formats and colors stay out.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "env-filter", "std"] }
 turmoil = "0.7.2"
-url = "2.5.8"
 uuid = "1.26.1"
