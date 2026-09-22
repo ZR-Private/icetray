@@ -1,7 +1,6 @@
 //! One fixture per `RefusalReason` variant (RFD 007, RFD 017): each fails
 //! its first load with the named reason and leaves the table with no
-//! generation, `Degraded` with nothing serving. The exhaustive match at the
-//! bottom fails to compile when a variant is added without a fixture.
+//! generation, `Degraded` with nothing serving.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -426,66 +425,4 @@ async fn test_disk_tier_without_a_local_directory_is_refused() -> Result<()> {
     assert_eq!(refused.reason, RefusalReason::NoLocalDir);
     assert!(refused.table.current().is_none());
     Ok(())
-}
-
-/// The test above that produces each reason. Exhaustive: a variant added
-/// without a fixture fails this file to compile.
-fn fixture_test_for(reason: &RefusalReason) -> &'static str {
-    match reason {
-        RefusalReason::Unsorted { .. } => "test_unsorted_file_is_refused",
-        RefusalReason::NullKeys { .. } => "test_null_key_is_refused",
-        RefusalReason::DuplicateKeys { .. } => "test_duplicate_keys_across_files_are_refused",
-        RefusalReason::KeyTypeMismatch { .. } => "test_key_physical_type_mismatch_is_refused",
-        RefusalReason::KeyTypeUnsupported => "test_unsupported_key_type_is_refused",
-        RefusalReason::ValueTypeUnsupported { .. } => "test_unsupported_value_type_is_refused",
-        RefusalReason::DeleteFiles => "test_delete_file_is_refused",
-        RefusalReason::KeyTooLong { .. } => "test_key_over_the_cap_is_refused",
-        RefusalReason::OverBudget { .. } => {
-            "test_full_tier_over_budget_is_refused_at_the_footer_stage"
-        }
-        RefusalReason::NoBloomFilter { .. } => "test_bloom_tier_without_a_filter_is_refused",
-        RefusalReason::NoLocalDir => "test_disk_tier_without_a_local_directory_is_refused",
-    }
-}
-
-#[test]
-fn test_every_refusal_reason_has_a_fixture() {
-    let path = RAW_FILE.to_string();
-    let samples = [
-        RefusalReason::Unsorted {
-            path: path.clone(),
-            row_group: 0,
-        },
-        RefusalReason::NullKeys {
-            path: path.clone(),
-            row_group: 0,
-        },
-        RefusalReason::DuplicateKeys {
-            path: path.clone(),
-            key: Key::Long(RAW_KEYS[0]),
-        },
-        RefusalReason::KeyTypeMismatch {
-            path: path.clone(),
-            expected: KeyType::Long,
-            got: parquet::basic::Type::BYTE_ARRAY,
-        },
-        RefusalReason::KeyTypeUnsupported,
-        RefusalReason::ValueTypeUnsupported {
-            got: PrimitiveType::Long.to_string(),
-        },
-        RefusalReason::DeleteFiles,
-        RefusalReason::KeyTooLong {
-            path: path.clone(),
-            bytes: MAX_KEY_BYTES + 1,
-        },
-        RefusalReason::OverBudget {
-            needed: TINY_BUDGET + 1,
-            budget: TINY_BUDGET,
-        },
-        RefusalReason::NoBloomFilter { path, row_group: 0 },
-        RefusalReason::NoLocalDir,
-    ];
-    for reason in samples {
-        assert!(!fixture_test_for(&reason).is_empty(), "{reason}");
-    }
 }

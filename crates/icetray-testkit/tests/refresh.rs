@@ -1,4 +1,5 @@
-//! The ref moves and the table follows (RFD 005): a second snapshot appends
+//! The ref moves and the table follows (RFD 005): an unchanged poll reads
+//! the catalog record or the hint and no object, a second snapshot appends
 //! files, the table advances on refresh reusing every unchanged file, a
 //! duplicate key is refused while the last generation keeps serving, and
 //! overlapping files are verified once per group that gained a file.
@@ -7,12 +8,8 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use icetray_core::check::Tier;
 use icetray_core::config::Residency;
-use icetray_core::{
-    Error, ErrorKind, FindingCode, KeyType, RefusalReason, Serviceability, TableSource, TableState,
-    Value, diagnose,
-};
+use icetray_core::{Error, ErrorKind, KeyType, RefusalReason, TableSource, TableState, Value};
 use icetray_testkit::fixture::{
     APPENDED_4K_6K, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
@@ -64,12 +61,18 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
     let v1 = served.current();
     let new_key = fixture.key(FUTURE_ID);
     assert_eq!(served.table.get(&new_key).await?.value, Value::Absent);
+    let stats = served.storage.stats();
+    let before = stats.gets();
     assert!(!served.table.refresh().await?, "nothing moved yet");
+    assert_eq!(
+        stats.gets(),
+        before,
+        "an unchanged poll reads the catalog record and no object"
+    );
 
     fixture
         .append(catalog.as_ref(), APPENDED_8K_12K, "build2")
         .await?;
-    let stats = served.storage.stats();
     let before = stats.gets();
     assert!(served.table.refresh().await?, "the ref moved");
     let v2 = served.current();
@@ -245,9 +248,9 @@ async fn test_refresh_recovers_when_the_offending_file_is_dropped() -> Result<()
 }
 
 /// Files in one bucket whose key ranges interleave but share no key are
-/// served at the cost of probing each; the doctor prices it and `strict`
-/// refuses it. Uniqueness is proved once per group: a range-disjoint append
-/// verifies nothing again, an interleaving one verifies its groups.
+/// served at the cost of probing each. Uniqueness is proved once per
+/// group: a range-disjoint append verifies nothing again, an interleaving
+/// one verifies its groups.
 #[tokio::test]
 async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -285,21 +288,6 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     verify::verify_misses(&served, &fixture, &INTERLEAVED_SAMPLE).await?;
     assert_eq!(fixture.ids().count(), INTERLEAVED_WRITTEN);
 
-    let report = diagnose(&generation);
-    assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
-    let overlap = report
-        .findings
-        .iter()
-        .find(|finding| finding.code == FindingCode::OverlappingFiles)
-        .expect("priced as a cost");
-    assert_eq!(overlap.tier, Tier::Cost);
-    assert_eq!(
-        overlap
-            .penalty
-            .and_then(|penalty| penalty.files_probed_per_lookup),
-        Some(TWO_FILES)
-    );
-
     fixture.append(catalog.as_ref(), TAIL, "tail").await?;
     assert!(served.table.refresh().await?);
     let generation = served.current();
@@ -336,14 +324,5 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
         generation.records,
         u64::try_from(fixture.ids().count()).unwrap()
     );
-
-    let error = verify::serve_catalog(&fixture, &catalog, Residency::Full, true)
-        .await
-        .err()
-        .unwrap();
-    let TestkitError::Core(Error::Inefficient { findings, .. }) = error else {
-        panic!("strict refuses overlapping files: {error:?}");
-    };
-    assert_eq!(findings, vec![FindingCode::OverlappingFiles]);
     Ok(())
 }

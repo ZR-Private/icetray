@@ -3,7 +3,9 @@
 //! load. Every test asserts the designed code at its tier and the exact set
 //! of codes the report raises: the cost set is the designed one (empty for
 //! an advice fixture), and advice a layout cannot avoid is named in the
-//! test's doc comment and asserted with it.
+//! test's doc comment and asserted with it. `strict` refuses a cost fixture
+//! naming its codes and loads an advice fixture: the doctor's verdicts live
+//! here, the GET costs of the same layouts in `lookup.rs` and `refresh.rs`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
@@ -17,16 +19,17 @@ use icetray_core::check::thresholds::{
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST,
 };
 use icetray_core::config::Residency;
-use icetray_core::{FindingCode, KeyType, Serviceability, TableReport, Value, diagnose};
+use icetray_core::{Error, FindingCode, KeyType, Serviceability, TableReport, Value, diagnose};
 use icetray_testkit::fixture::{
-    FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE, SECOND_CLASS,
-    SMALL_FILE_BYTES, TWO_BUCKETS, TWO_FILES, UNPARTITIONED_FILE_BYTES, WIDE_VALUE_BYTES,
-    local_catalog, residue_class,
+    FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
+    SECOND_CLASS, SMALL_FILE_BYTES, TWO_BUCKETS, TWO_FILES, UNPARTITIONED_FILE_BYTES,
+    WIDE_VALUE_BYTES, local_catalog, residue_class,
 };
 use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served};
 use icetray_testkit::{
-    Bloom, Dictionary, Fixture, FixtureSpec, Layout, Result, Statistics, write_fixture,
+    Bloom, Dictionary, Fixture, FixtureSpec, Layout, Result, Statistics, TestkitError,
+    write_fixture,
 };
 
 /// Rows per key page of the large-key-page fixture: twice the cost
@@ -124,6 +127,18 @@ fn assert_codes(report: &TableReport, costs: &[FindingCode], advice: &[FindingCo
     );
 }
 
+/// Serves `fixture` under `strict`: the cost codes the refusal names, or
+/// none when it loads, which advice alone must allow.
+async fn strict_refusal(fixture: &Fixture, catalog: &Arc<dyn Catalog>) -> Result<Vec<FindingCode>> {
+    let Err(error) = verify::serve_catalog(fixture, catalog, Residency::Full, true).await else {
+        return Ok(Vec::new());
+    };
+    let TestkitError::Core(Error::Inefficient { findings, .. }) = error else {
+        return Err(error);
+    };
+    Ok(findings)
+}
+
 /// The one finding of `code` in `report`.
 fn finding(report: &TableReport, code: FindingCode) -> &icetray_core::Finding {
     report
@@ -213,7 +228,7 @@ async fn test_large_key_pages_cost_is_the_rows_decoded() -> Result<()> {
 }
 
 /// Twenty unbucketed files of a few hundred kibibytes in one bucket also
-/// draw `ManyFilesPerBucket`.
+/// draw `ManyFilesPerBucket`; `strict` refuses the cost and names only it.
 #[tokio::test]
 async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -225,7 +240,7 @@ async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
         },
         ..FixtureSpec::small("kv_flat", KeyType::Long)
     };
-    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
     assert!(generation.files.len() >= TWO_FILES);
     let report = diagnose(&generation);
@@ -239,6 +254,10 @@ async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
             .penalty
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(generation.files.len())
+    );
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::NoBucketPartition]
     );
     Ok(())
 }
@@ -263,6 +282,10 @@ async fn test_overlapping_files_is_a_cost() -> Result<()> {
             .penalty
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(TWO_FILES)
+    );
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::OverlappingFiles]
     );
     Ok(())
 }
@@ -337,6 +360,7 @@ async fn test_large_value_pages_is_advice() -> Result<()> {
     Ok(())
 }
 
+/// Advice alone never refuses: the same fixture loads under `strict`.
 #[tokio::test]
 async fn test_long_keys_is_advice() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -345,9 +369,19 @@ async fn test_long_keys_is_advice() -> Result<()> {
         key_pad: LONG_KEY_PAD,
         ..FixtureSpec::small("kv_longkeys", KeyType::String)
     };
-    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let report = diagnose(&served.current());
     assert_codes(&report, &[], &[FindingCode::LongKeys]);
+    assert!(
+        report
+            .files
+            .iter()
+            .all(|file| file.max_key_bytes == LONG_KEY_BYTES)
+    );
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "an advice-only table loads under strict"
+    );
     Ok(())
 }
 

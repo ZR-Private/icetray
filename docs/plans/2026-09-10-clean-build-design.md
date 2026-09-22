@@ -1072,8 +1072,10 @@ for `NoBloomFilter`; `Residency::Disk` without a local directory for
 `Statistics::Truncated`; `column_index_truncate` under a shared 64-byte
 prefix; 16 KiB values under the row bound; a padded string key; 9,000 rows
 of 16 KiB in one file; 48,000 ids at a 40 KiB target; `Bloom::Off`;
-`Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. Each set is bound to its enum by
-an exhaustive match, and the advice a layout cannot avoid is asserted
+`Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. The finding set is bound to
+`FindingCode::ALL` by an exhaustive match asserting one distinct test per
+code; the refusal set, whose variants carry fields and have no `ALL`, is
+bound by review alone. The advice a layout cannot avoid is asserted
 beside the designed code. The gated tests carry `#[ignore = "<reason>"]`
 naming their variable and script, so a plain `cargo test` reports them as
 ignored, never as passed; forced without the variable they fail on
@@ -1124,7 +1126,7 @@ skip).
 | The page cache's disk tier serves a page evicted from memory with a local read and no GET, and survives a restart | P (temporary directory) |
 | Row-group choice never consults column statistics: long string keys sharing a prefix beyond 64 bytes across several row groups all resolve | U (carried from the prototype) |
 | Over-budget Full load is refused at the footer stage with no chunk fetched | P (counting) |
-| The value column's column index is not resident; index bytes for a byte-bounded large-value table are within a small factor of its key bytes | P |
+| The value column's column index is not resident; index bytes for a byte-bounded large-value table are within a small factor of its key bytes | P (`lookup.rs`: no loaded footer keeps a value column index), U for the factor (`RESIDENT_TO_KEY_CHUNK_FACTOR` on core's fixture; on the testkit's 16 KiB-value fixture the offset index of the value pages alone is tens of times its zstd-compressed key chunks) |
 | Health is `NOT_SERVING` until every table serves; the listener accepts before load completes | P (server test) |
 | A skipped gated test is reported as skipped, never as passed | C, G (harness) |
 | CLI JSON lines: `kind` and `table` first, `gets` per lookup exact, exit codes as specified | P (binary test) |

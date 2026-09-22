@@ -143,13 +143,12 @@ fn advice_codes(golden: &Golden) -> Vec<FindingCode> {
 async fn test_golden_long_contract_serves_one_get_per_hit() -> Result<()> {
     let golden = open_golden(GoldenTable::Long2m, false).await?;
     let report = diagnose(&golden.current());
-    assert_eq!(
-        report.summary.serviceability,
-        Serviceability::Efficient,
-        "{:?}",
+    assert!(
+        report.findings.is_empty(),
+        "the contract table draws no finding: {:?}",
         report.findings
     );
-    assert!(cost_codes(&golden).is_empty());
+    assert_eq!(report.summary.serviceability, Serviceability::Efficient);
     let keys: Vec<Key> = IDS_2M.iter().map(|&id| golden::long_key(id)).collect();
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }

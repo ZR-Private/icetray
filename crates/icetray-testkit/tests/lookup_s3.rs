@@ -48,31 +48,3 @@ async fn test_get_over_s3() -> Result<()> {
     let served = verify::verify_hit_cost(served, &fixture, &SAMPLE).await?;
     verify::verify_misses(&served, &fixture, &SAMPLE).await
 }
-
-#[tokio::test]
-async fn test_refresh_on_a_catalog_source_reads_no_object() -> Result<()> {
-    let s3 = S3Fixture::start(BUCKET).await?;
-    let catalog: Arc<dyn Catalog> = memory_catalog_s3(&s3, WAREHOUSE).await?;
-    let fixture = write_fixture(
-        catalog.as_ref(),
-        NAMESPACE,
-        FixtureSpec::small("kv_s3_poll", KeyType::Long),
-    )
-    .await?;
-    let served = verify::serve_catalog_with(
-        &fixture,
-        &catalog,
-        Residency::Full,
-        false,
-        s3.storage_config(),
-    )
-    .await?;
-    let before = served.storage.stats().gets();
-    assert!(!served.table.refresh().await?, "nothing moved");
-    assert_eq!(
-        served.storage.stats().gets(),
-        before,
-        "the one read is the catalog record"
-    );
-    Ok(())
-}

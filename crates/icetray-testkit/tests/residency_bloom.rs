@@ -1,8 +1,9 @@
 //! The Bloom residency tier (RFD 017) against the Full tier on the same
 //! fixtures, each over its own storage: a cold hit is a key page and a value
 //! page, a warm hit nothing, a miss what the filter predicts; the load reads
-//! the filters and keeps less resident; a refresh refetches the chunks of
-//! the groups it verifies; a duplicate key is refused as in the Full tier.
+//! the filters and keeps exactly the predicted bytes resident, no chunk
+//! among them; a refresh refetches the chunks of the groups it verifies; a
+//! duplicate key is refused as in the Full tier.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -209,7 +210,16 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         full.index_bytes
     );
     let predicted = diagnose(&full).summary.predicted;
-    assert!(predicted.bloom.is_some_and(|bloom| bloom < predicted.full));
+    assert_eq!(
+        predicted.in_tier(Residency::Full),
+        Some(count(full.index_bytes)),
+        "the footer stage predicts the Full tier's resident bytes"
+    );
+    assert_eq!(
+        predicted.in_tier(Residency::Bloom),
+        Some(count(bloom.index_bytes)),
+        "and the Bloom tier's: footers, indexes, filters, and fences, no chunk"
+    );
     assert_eq!(diagnose(&bloom).summary.residency, Residency::Bloom);
     verify_bloom_hit_cost(&tiers, &fixture, &SAMPLE).await
 }

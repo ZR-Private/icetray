@@ -1,13 +1,13 @@
 //! Serving fixture tables from a memory catalog on local disk in the Full
 //! tier (the P tier of RFD 014): routing over every key type, one GET per
 //! cold hit and none per warm hit or miss, `Generation::plan` as the oracle
-//! for `multi_get`, and the layouts the doctor prices or advises on.
+//! for `multi_get`, and the GET costs of the layouts the doctor prices or
+//! advises on; `findings.rs` holds the doctor's verdicts on them.
 
 use icetray_core::approx::count;
-use icetray_core::check::Tier;
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
-use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Serviceability, Value, diagnose};
+use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Value, diagnose};
 use icetray_testkit::error::Precondition;
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, SAMPLE, SAMPLE_4K,
@@ -16,6 +16,7 @@ use icetray_testkit::fixture::{
 };
 use icetray_testkit::verify;
 use icetray_testkit::{Fixture, FixtureSpec, Layout, Nulls, Result, TestkitError, write_fixture};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 
 /// Every this-many-th id is looked up once: routing over every bucket and
 /// page of the small fixture.
@@ -264,9 +265,9 @@ async fn test_verify_hit_cost_refuses_a_warm_cache() -> Result<()> {
 }
 
 /// A sorted table without a bucket partition serves by exact key ranges
-/// alone; the doctor prices it as a cost and `strict` refuses it.
+/// alone, at the Full tier's GET costs.
 #[tokio::test]
-async fn test_unpartitioned_table_serves_and_is_priced() -> Result<()> {
+async fn test_unpartitioned_table_serves() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         buckets: 0,
@@ -290,28 +291,12 @@ async fn test_unpartitioned_table_serves_and_is_priced() -> Result<()> {
     }
     assert_sample_pages_distinct(&fixture, &generation)?;
     let served = verify::verify_hit_cost(served, &fixture, &SAMPLE).await?;
-    verify::verify_misses(&served, &fixture, &SAMPLE).await?;
-
-    let report = diagnose(&generation);
-    assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
-    assert!(report.findings.iter().any(
-        |finding| finding.tier == Tier::Cost && finding.code == FindingCode::NoBucketPartition
-    ));
-
-    let error = verify::serve_catalog(&fixture, &catalog, Residency::Full, true)
-        .await
-        .err()
-        .unwrap();
-    let TestkitError::Core(Error::Inefficient { findings, .. }) = error else {
-        panic!("strict refuses an unpartitioned table: {error:?}");
-    };
-    assert_eq!(findings, vec![FindingCode::NoBucketPartition]);
-    Ok(())
+    verify::verify_misses(&served, &fixture, &SAMPLE).await
 }
 
-/// Keys over the advice length serve at one GET per hit and draw advice.
+/// Keys over the advice length serve at one GET per hit.
 #[tokio::test]
-async fn test_long_keys_serve_with_advice() -> Result<()> {
+async fn test_long_keys_serve_at_one_get_per_hit() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         key_pad: LONG_KEY_PAD,
@@ -322,20 +307,7 @@ async fn test_long_keys_serve_with_advice() -> Result<()> {
     assert_eq!(fixture.key(0).as_bytes().len(), LONG_KEY_BYTES);
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let served = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K).await?;
-    let report = diagnose(&served.current());
-    let advice = report
-        .findings
-        .iter()
-        .find(|finding| finding.code == FindingCode::LongKeys)
-        .expect("keys over the advice length draw advice");
-    assert_eq!(advice.tier, Tier::Advice);
-    assert!(
-        report
-            .files
-            .iter()
-            .all(|file| file.max_key_bytes == LONG_KEY_BYTES)
-    );
-    Ok(())
+    verify::verify_misses(&served, &fixture, &SAMPLE_4K).await
 }
 
 /// A null value is served as present with null, distinct from absent, at
@@ -381,7 +353,10 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
 
 /// Large values: with the row limit alone a hit fetches a page of about a
 /// thousand values; with a byte bound as well, a few. Every cold hit is at
-/// most one GET either way, and the doctor points at the first layout.
+/// most one GET either way, and the doctor points at the first layout. In
+/// both layouts every loaded footer keeps the key column's column index
+/// and none of the value column's, whose many byte-bounded pages would
+/// otherwise carry a truncated minimum and maximum each into memory.
 #[tokio::test]
 async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -411,10 +386,33 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         let gets = stats.gets() - gets_before;
         assert!(gets >= 1);
         let bytes_per_get = (stats.bytes() - bytes_before) / gets;
-        let flagged = diagnose(&served.current())
+        let generation = served.current();
+        let report = diagnose(&generation);
+        let flagged = report
             .findings
             .iter()
             .any(|finding| finding.code == FindingCode::LargeValuePages);
+        for file in &generation.files {
+            let column_index = file
+                .index
+                .metadata()
+                .column_index()
+                .expect("the contract layout writes a column index");
+            for row_group in column_index {
+                assert_eq!(
+                    row_group[file.index.value_leaf()],
+                    ColumnIndexMetaData::NONE,
+                    "{}: the value column's column index is dropped on load",
+                    file.entry.path
+                );
+                assert_ne!(
+                    row_group[file.index.key_leaf()],
+                    ColumnIndexMetaData::NONE,
+                    "{}: the key column's is kept",
+                    file.entry.path
+                );
+            }
+        }
         per_layout.push((bytes_per_get, flagged));
     }
     let (row_bounded, row_bounded_flagged) = per_layout[0];
