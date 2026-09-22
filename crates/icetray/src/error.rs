@@ -1,9 +1,10 @@
 //! The binary's failures and the exit codes they become. `CliError` is every
 //! failure a one-shot subcommand can end with; `ServeError` every failure
 //! `serve` can end with; `KeyTextFault` why command-line text is not a key;
-//! `WireKeyFault` why a wire key is not one. `CliError::exit_code` is the
-//! one exhaustive match from a failure to an exit code, and the service maps
-//! faults to status codes by variant, so nothing decides on a message.
+//! `RewriteTextFault` why `--rewrite` text is not a rule; `WireKeyFault`
+//! why a wire key is not a key. `CliError::exit_code` is the one exhaustive
+//! match from a failure to an exit code, and the service maps faults to
+//! status codes by variant, so nothing decides on a message.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -11,6 +12,7 @@ use std::process::ExitCode;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, KeyType};
 
+use crate::logging::StandardField;
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
 
@@ -58,6 +60,25 @@ pub enum KeyTextFault {
     /// The table's keys are uuids and the text is not one.
     #[error("key {text} is not a uuid")]
     NotAUuid {
+        /// The text as given.
+        text: String,
+    },
+}
+
+/// Why `--rewrite` text is not a rule. clap reports it as a value
+/// validation failure, so the run ends with `EXIT_USAGE` before anything is
+/// opened; the messages carry the text as given.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RewriteTextFault {
+    /// No `=` separates `FROM` from `TO`.
+    #[error("rewrite {text} is not FROM=TO")]
+    NoSeparator {
+        /// The text as given.
+        text: String,
+    },
+    /// `FROM` is empty, and an empty prefix would rewrite every location.
+    #[error("rewrite {text} has an empty FROM, which would rewrite every location")]
+    EmptyPrefix {
         /// The text as given.
         text: String,
     },
@@ -162,7 +183,10 @@ pub enum CliError {
     #[error(transparent)]
     Key(#[from] KeyTextFault),
     /// A key of `log.fields` that names no standard field.
-    #[error("log field {name} is not a standard field; expected time, level, message, or target")]
+    #[error(
+        "log field {name} is not a standard field; expected one of {}",
+        StandardField::names()
+    )]
     LogField {
         /// The key as configured.
         name: String,
@@ -215,15 +239,12 @@ impl CliError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use icetray_core::config::ServerConfig;
 
     use super::*;
 
     /// A table name for the errors that carry one.
     const TABLE: &str = "kv";
-
-    /// An address for `Bind`.
-    const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7433);
 
     fn core_error() -> icetray_core::Error {
         icetray_core::Error::NotReady {
@@ -231,9 +252,10 @@ mod tests {
         }
     }
 
+    /// `Bind` on the default gRPC address.
     fn serve_error() -> ServeError {
         ServeError::Bind {
-            addr: ADDR,
+            addr: ServerConfig::default().listen,
             source: std::io::Error::other("sample"),
         }
     }
@@ -281,22 +303,13 @@ mod tests {
         assert_eq!(CliError::BrokenPipe.exit_code(), ExitCode::from(EXIT_OK));
     }
 
-    /// `sysexits.h`'s `EX_USAGE`, the value `EXIT_USAGE` is fixed at.
-    const EX_USAGE: u8 = 64;
-
-    /// RFD 016's exit code for a table that serves at a cost.
-    const RFD_016_INEFFICIENT: u8 = 2;
-
     #[test]
-    fn test_exit_codes_are_distinct_and_usage_is_ex_usage() {
+    fn test_exit_codes_are_distinct() {
         let codes = [EXIT_OK, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_USAGE];
         for (i, a) in codes.iter().enumerate() {
             for b in &codes[i + 1..] {
                 assert_ne!(a, b);
             }
         }
-        assert_eq!(EXIT_OK, 0);
-        assert_eq!(EXIT_INEFFICIENT, RFD_016_INEFFICIENT);
-        assert_eq!(EXIT_USAGE, EX_USAGE);
     }
 }

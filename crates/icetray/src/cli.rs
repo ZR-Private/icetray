@@ -7,10 +7,11 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use icetray_core::config::{
-    Config, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    Config, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
+    TableConfig,
 };
 
-use crate::error::CliError;
+use crate::error::{CliError, RewriteTextFault};
 
 /// The environment variable that names the configuration file when the
 /// flag does not (RFD 012), so a pod passes no flags at all.
@@ -29,10 +30,6 @@ pub const DEFAULT_VALUE_COLUMN: &str = "value";
 /// branch, the value of `iceberg::spec::MAIN_BRANCH`, which this crate does
 /// not depend on.
 pub const DEFAULT_REF: &str = "main";
-
-/// The residency of a `--location` table when `--residency` says nothing:
-/// the tier a configuration file defaults to as well.
-const DEFAULT_RESIDENCY: Residency = Residency::Full;
 
 /// What separates the two halves of a `--rewrite FROM=TO` rule; the first
 /// occurrence, since a location may itself carry one.
@@ -135,11 +132,21 @@ pub struct Target {
     pub residency: Option<Residency>,
 }
 
-/// A `--rewrite` rule from `FROM=TO`, split at the first `=`.
-fn parse_rewrite(text: &str) -> Result<RewriteRule, String> {
-    let (from, to) = text
-        .split_once(REWRITE_SEPARATOR)
-        .ok_or_else(|| format!("expected FROM=TO, got {text}"))?;
+/// A `--rewrite` rule from `FROM=TO`, split at the first `=`. An empty
+/// `FROM` is refused here, the one guard for a rule typed on the command
+/// line: `Config::parse` refuses the same in a file, and the rules a target
+/// appends never pass through it.
+fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
+    let (from, to) =
+        text.split_once(REWRITE_SEPARATOR)
+            .ok_or_else(|| RewriteTextFault::NoSeparator {
+                text: text.to_string(),
+            })?;
+    if from.is_empty() {
+        return Err(RewriteTextFault::EmptyPrefix {
+            text: text.to_string(),
+        });
+    }
     Ok(RewriteRule {
         from: from.to_string(),
         to: to.to_string(),
@@ -168,10 +175,7 @@ impl Target {
     fn location_config(&self, location: String) -> Config {
         Config {
             server: ServerConfig::default(),
-            storage: StorageConfig {
-                rewrite: Vec::new(),
-                ..StorageConfig::default()
-            },
+            storage: StorageConfig::default(),
             tables: vec![TableConfig {
                 name: LOCATION_TABLE_NAME.to_string(),
                 source: SourceConfig::Static { location },
@@ -364,12 +368,28 @@ mod tests {
     #[test]
     fn test_parse_rewrite_splits_at_the_first_separator() {
         assert_eq!(
-            parse_rewrite("s3://a/=s3://b/?x=1").unwrap(),
-            RewriteRule {
+            parse_rewrite("s3://a/=s3://b/?x=1"),
+            Ok(RewriteRule {
                 from: "s3://a/".to_string(),
                 to: "s3://b/?x=1".to_string(),
-            }
+            })
         );
-        assert!(parse_rewrite("no-separator").is_err());
+        assert_eq!(
+            parse_rewrite("no-separator"),
+            Err(RewriteTextFault::NoSeparator {
+                text: "no-separator".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_rewrite_refuses_an_empty_prefix() {
+        let text = format!("={REWRITE_TO}");
+        assert_eq!(
+            parse_rewrite(&text),
+            Err(RewriteTextFault::EmptyPrefix { text: text.clone() })
+        );
+        let error = parse(&["info", "--location", LOCATION, "--rewrite", &text]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{error}");
     }
 }

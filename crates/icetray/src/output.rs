@@ -168,6 +168,8 @@ impl<'a> GetLine<'a> {
             presence: Presence::of(&lookup.value),
             value_base64: bytes
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            // intentional: a value that is not UTF-8 has no text form, and
+            // the base64 field already carries its bytes.
             value_utf8: bytes.and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_string)),
             value_bytes: bytes.map_or(0, <[u8]>::len),
             snapshot_id: lookup.snapshot_id,
@@ -253,8 +255,10 @@ mod tests {
     /// Standard base64 with padding of `TEXT_VALUE`.
     const TEXT_VALUE_BASE64: &str = "aGVsbG8=";
 
-    /// The GETs and microseconds the sample `get` line carries.
+    /// The GETs the sample `get` line carries: one cold hit.
     const GETS: u64 = 1;
+
+    /// The microseconds the sample `get` line carries.
     const ELAPSED_MICROS: u64 = 250;
 
     /// The first `LEADING_KEYS` keys of `line`'s JSON.

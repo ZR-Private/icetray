@@ -46,6 +46,16 @@ pub enum StandardField {
 impl StandardField {
     /// Every standard field, for the parser.
     const ALL: [Self; 4] = [Self::Time, Self::Level, Self::Message, Self::Target];
+
+    /// Every field's name, comma-separated, for the message that refuses a
+    /// key; rendered from `ALL` so the list cannot lag the enum.
+    pub(crate) fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl fmt::Display for StandardField {
@@ -406,8 +416,11 @@ mod tests {
         }
     }
 
-    /// The structured field values the sample event carries.
+    /// An integer field of the sample event, so a number is emitted as a
+    /// JSON number, not quoted.
     const COUNT: u64 = 3;
+
+    /// A float field of the sample event, so a fraction keeps its point.
     const RATIO: f64 = 0.5;
 
     #[test]

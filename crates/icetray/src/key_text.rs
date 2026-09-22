@@ -3,6 +3,7 @@
 //! served generation; the text alone does not say whether `1` is a long or
 //! a string.
 
+use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType};
 
 use crate::error::KeyTextFault;
@@ -13,9 +14,6 @@ const HEX_PREFIXES: [&str; 2] = ["0x", "0X"];
 
 /// The base of a hex digit.
 const HEX_RADIX: u32 = 16;
-
-/// Hex digits per byte.
-const HEX_DIGITS_PER_BYTE: usize = 2;
 
 /// Parses `text` as a key of `key_type`. A long is `i64::from_str`. A string
 /// is the text as given: the shell already removed its quoting, and `Key`'s

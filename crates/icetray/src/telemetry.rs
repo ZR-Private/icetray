@@ -102,10 +102,14 @@ pub fn sample(opened: &Opened, handle: &PrometheusHandle) {
 
 #[cfg(test)]
 mod tests {
+    use icetray_testkit::verify::series_value;
+
     use super::*;
 
-    /// The first and last bucket bounds the contract fixes.
+    /// The lowest bucket bound the contract fixes: 100 microseconds.
     const FIRST_BUCKET: f64 = 1e-4;
+
+    /// The highest bucket bound the contract fixes: 2 seconds.
     const LAST_BUCKET: f64 = 2.0;
 
     #[test]
@@ -142,19 +146,15 @@ mod tests {
         // global recorder; the whole expositions are not compared, since
         // another test in this process may count between two renders.
         count(Call::TableInfo);
-        let series = format!(
-            "{}{{{}=\"{}\"}}",
-            metric::REQUESTS_TOTAL,
-            metric::LABEL_CALL,
-            Call::TableInfo
-        );
+        let call = Call::TableInfo.to_string();
         for handle in [&first, &second] {
             let exposition = handle.render();
-            let value: u64 = exposition
-                .lines()
-                .find_map(|line| line.strip_prefix(&series))
-                .and_then(|rest| rest.trim().parse().ok())
-                .unwrap_or_else(|| panic!("{series} in {exposition}"));
+            let value = series_value(
+                &exposition,
+                metric::REQUESTS_TOTAL,
+                &[(metric::LABEL_CALL, &call)],
+            )
+            .unwrap_or_else(|| panic!("{call} in {exposition}"));
             assert!(value >= 1, "{value}");
         }
     }
