@@ -40,13 +40,16 @@ use iceberg::{Catalog, CatalogBuilder as _, ErrorKind, NamespaceIdent, TableCrea
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use icetray_core::catalog::{TableSource, hint_location, version_file};
 use icetray_core::config::{Residency, SourceConfig, TableConfig};
+use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{Key, KeyType, Value};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use crate::error::{Result, SpecFault};
-use crate::keys::{VALUE_BYTES, absent_key_from, id_of, key_at_padded, value_for_len};
+use crate::keys::{
+    STRING_KEY_FIXED_BYTES, VALUE_BYTES, absent_key_from, id_of, key_at_padded, value_for_len,
+};
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::s3::S3Fixture;
 use crate::verify::count;
@@ -68,6 +71,75 @@ pub const SAMPLE: [u64; 12] = [
     0, 1_500, 2_134, 3_783, 5_000, 6_402, 7_372, 8_191, 9_894, 10_000, 12_416, 17_000,
 ];
 
+/// The namespace every in-process fixture is written in. Each test opens a
+/// catalog of its own, so one name serves every fixture.
+pub const NAMESPACE: &str = "ns";
+
+/// Ids of the fixtures whose files hold no more than one contract page:
+/// 4,000 ids over `FOUR_BUCKETS` or more is at most a thousand rows per
+/// file.
+pub const IDS_4K: Range<u64> = 0..4_000;
+
+/// Ids of the two-bucket fixtures: a thousand rows, one contract page, per
+/// file, the smallest fixture with more than one file.
+pub const IDS_2K: Range<u64> = 0..2_000;
+
+/// Ids sampled on an `IDS_4K` fixture: both ends and the middle, so the
+/// sample reaches every bucket's file.
+pub const SAMPLE_4K: [u64; 5] = [0, 1, 1_234, 2_999, 3_999];
+
+/// An append to an `IDS_4K` fixture repeating the upper half of its ids:
+/// every bucket gains a file whose keys the first build already holds.
+pub const OVERLAPPING_APPEND: Range<u64> = 2_000..6_000;
+
+/// An append to an `IDS_4K` fixture above every id it holds: new files
+/// that overlap nothing.
+pub const APPENDED_4K_6K: Range<u64> = 4_000..6_000;
+
+/// An id `APPENDED_4K_6K` adds, absent before the append.
+pub const NEW_ID: u64 = 5_000;
+
+/// An id every first build holds, far from any bucket's edge.
+pub const OLD_ID: u64 = 10;
+
+/// One bucket: every id in one file, for a fixture whose one file is the
+/// subject.
+pub const ONE_BUCKET: u32 = 1;
+
+/// Two buckets: an `IDS_2K` fixture at a thousand rows per file.
+pub const TWO_BUCKETS: u32 = 2;
+
+/// Four buckets: an `IDS_4K` fixture at a thousand rows per file.
+pub const FOUR_BUCKETS: u32 = 4;
+
+/// A resident-bytes or chunk-file budget no file fits in.
+pub const TINY_BUDGET: u64 = 1;
+
+/// A file size target below one write batch of contract pages, so the
+/// rolling writer starts a new file at every batch and an unpartitioned
+/// fixture holds one file per thousand ids.
+pub const UNPARTITIONED_FILE_BYTES: usize = 64 * 1024;
+
+/// A file size target below one write batch of the small fixture, so the
+/// rolling writer starts a second file in every bucket.
+pub const SMALL_FILE_BYTES: usize = 40 * 1024;
+
+/// Bytes per value in the wide-value fixtures: sixteen kibibytes, so a
+/// row-bounded page of a thousand values is sixteen mebibytes, far over
+/// the value page advice, while a byte-bounded page holds a few.
+pub const WIDE_VALUE_BYTES: usize = 16 * 1024;
+
+/// Bytes past `KEY_BYTES_ADVICE` every key of the long-key fixture carries:
+/// well over the advice length and far under `MAX_KEY_BYTES`, so the keys
+/// draw advice and no refusal.
+pub const LONG_KEY_EXTRA: usize = 93;
+
+/// The length of every key of the long-key fixture.
+pub const LONG_KEY_BYTES: usize = KEY_BYTES_ADVICE + LONG_KEY_EXTRA;
+
+/// The `key_pad` that makes a string key `LONG_KEY_BYTES` long.
+pub const LONG_KEY_PAD: usize = LONG_KEY_BYTES - STRING_KEY_FIXED_BYTES;
+
 /// Ids of the interleaved fixture, written at `INTERLEAVE_STRIDE` so the
 /// other residue classes (`residue_class`) can be appended between them.
 pub const INTERLEAVED_IDS: Range<u64> = 0..8_000;
@@ -79,6 +151,32 @@ pub const INTERLEAVE_STRIDE: u64 = 4;
 /// Buckets of the interleaved fixture: one file per bucket per build, so an
 /// appended class widens every bucket's overlap group by one file.
 pub const INTERLEAVED_BUCKETS: u32 = 4;
+
+/// The residue class appended to the interleaved fixture after its first
+/// build: the `2 mod 4` ids, which widen every bucket's group to two files.
+pub const SECOND_CLASS: u64 = 2;
+
+/// The residue class appended after `SECOND_CLASS`: the `1 mod 4` ids,
+/// which widen every bucket's group to three files.
+pub const THIRD_CLASS: u64 = 1;
+
+/// Files per bucket of the interleaved fixture after `SECOND_CLASS`.
+pub const TWO_FILES: usize = 2;
+
+/// Files per bucket of the interleaved fixture after `THIRD_CLASS`.
+pub const THREE_FILES: usize = 3;
+
+/// A range-disjoint append to the interleaved fixture: above every id of
+/// `INTERLEAVED_IDS`, so its files join no overlap group.
+pub const TAIL: Range<u64> = 8_000..9_000;
+
+/// Ids sampled on the interleaved fixture after `SECOND_CLASS`: both
+/// classes, both ends.
+pub const INTERLEAVED_SAMPLE: [u64; 6] = [0, 2, 1_234, 2_998, 4_002, 7_998];
+
+/// Ids only the newest files of the interleaved fixture hold after
+/// `THIRD_CLASS` and `TAIL`: three of the third class and one of the tail.
+pub const NEWEST_SAMPLE: [u64; 4] = [1, 4_001, 7_997, 8_500];
 
 /// The field id of the key column in every fixture schema.
 const KEY_FIELD_ID: i32 = 1;

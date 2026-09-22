@@ -7,25 +7,13 @@ use std::sync::Arc;
 use iceberg::Catalog;
 use icetray_core::KeyType;
 use icetray_core::config::Residency;
-use icetray_testkit::verify::{self, count};
+use icetray_testkit::fixture::{NAMESPACE, SAMPLE};
+use icetray_testkit::verify::{self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, count};
 use icetray_testkit::{FixtureSpec, Result, S3Fixture, memory_catalog_s3, write_fixture};
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
 
 /// The fixture server's bucket and the warehouse prefix inside it.
 const BUCKET: &str = "icetray-test";
 const WAREHOUSE: &str = "warehouse";
-
-/// Ids sampled on the small fixture, spread over its buckets.
-const SAMPLE: [u64; 8] = [0, 999, 1_000, 4_242, 9_999, 12_345, 16_000, 19_999];
-
-/// Load GETs beyond the per-file ones over a catalog source: the manifest
-/// list and the one manifest; the metadata came from the catalog.
-const LOAD_METADATA_GETS: u64 = 2;
-
-/// Load GETs per single-row-group file: a footer and a key chunk.
-const LOAD_GETS_PER_FILE: u64 = 2;
 
 #[tokio::test]
 async fn test_get_over_s3() -> Result<()> {

@@ -3,44 +3,28 @@
 //! cold hit and none per warm hit or miss, `Generation::plan` as the oracle
 //! for `multi_get`, and the layouts the doctor prices or advises on.
 
-use std::ops::Range;
-
 use icetray_core::check::Tier;
 use icetray_core::config::Residency;
-use icetray_core::contract::{KEY_BYTES_ADVICE, PAGE_ROWS, VALUE_PAGE_BYTES};
+use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
 use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Serviceability, Value, diagnose};
 use icetray_testkit::error::Precondition;
-use icetray_testkit::fixture::{SAMPLE, SMALL_BUCKETS, SMALL_IDS, local_catalog};
-use icetray_testkit::keys::STRING_KEY_FIXED_BYTES;
+use icetray_testkit::fixture::{
+    FOUR_BUCKETS, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, SAMPLE, SAMPLE_4K,
+    SMALL_BUCKETS, SMALL_FILE_BYTES, SMALL_IDS, UNPARTITIONED_FILE_BYTES, WIDE_VALUE_BYTES,
+    local_catalog,
+};
 use icetray_testkit::verify::{self, count};
 use icetray_testkit::{Fixture, FixtureSpec, Layout, Nulls, Result, TestkitError, write_fixture};
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
 
 /// Every this-many-th id is looked up once: routing over every bucket and
 /// page of the small fixture.
 const SWEEP_STRIDE: usize = 97;
-
-/// A file size target below one write batch of the small fixture, so the
-/// rolling writer starts a second file in every bucket.
-const SMALL_FILE_BYTES: usize = 40 * 1024;
-
-/// A file size target below one write batch of the unpartitioned fixture,
-/// so every batch of contract pages is its own file.
-const UNPARTITIONED_FILE_BYTES: usize = 64 * 1024;
 
 /// Keys sharing one value page in the coalescing test.
 const SHARED_PAGE_KEYS: usize = 10;
 
 /// A key of another type than the long fixtures'.
 const OTHER_TYPE_KEY: &str = "nope";
-
-/// Bytes above the advice length every key of the long-key fixture carries.
-const LONG_KEY_EXTRA: usize = 93;
-
-/// The length of every key of the long-key fixture.
-const LONG_KEY_BYTES: usize = KEY_BYTES_ADVICE + LONG_KEY_EXTRA;
 
 /// The nulls fixture's period: every seventh id has a null value, so the
 /// sample mixes null and present ids.
@@ -49,18 +33,6 @@ const NULL_EVERY: u64 = 7;
 /// A null id outside `SAMPLE`, and the present id after it.
 const NULL_ID: u64 = 14;
 const PRESENT_ID: u64 = 15;
-
-/// Ids of the smaller fixtures, whose files hold one contract page each.
-const IDS_4K: Range<u64> = 0..4_000;
-
-/// Buckets of the wide-value fixtures: a thousand rows per file.
-const FOUR_BUCKETS: u32 = 4;
-
-/// Ids sampled on the 4,000-id fixtures.
-const SMALL_SAMPLE: [u64; 5] = [0, 1, 1_234, 2_999, 3_999];
-
-/// Bytes per value in the wide-value fixtures.
-const WIDE_VALUE_BYTES: usize = 16 * 1024;
 
 /// A row-limited page carries about a thousand values, so the bytes one
 /// cold hit transfers are at least this share of a full page.
@@ -272,8 +244,8 @@ async fn test_verify_hit_cost_refuses_a_warm_cache() -> Result<()> {
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    served.table.get(&fixture.key(SMALL_SAMPLE[0])).await?;
-    let error = verify::verify_hit_cost(served, &fixture, &SMALL_SAMPLE)
+    served.table.get(&fixture.key(SAMPLE_4K[0])).await?;
+    let error = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K)
         .await
         .err()
         .unwrap();
@@ -341,14 +313,14 @@ async fn test_unpartitioned_table_serves_and_is_priced() -> Result<()> {
 async fn test_long_keys_serve_with_advice() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
-        key_pad: LONG_KEY_BYTES - STRING_KEY_FIXED_BYTES,
+        key_pad: LONG_KEY_PAD,
         ids: IDS_4K,
         ..FixtureSpec::small("kv_longkeys", KeyType::String)
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     assert_eq!(fixture.key(0).as_bytes().len(), LONG_KEY_BYTES);
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    let served = verify::verify_hit_cost(served, &fixture, &SMALL_SAMPLE).await?;
+    let served = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K).await?;
     let report = diagnose(&served.current());
     let advice = report
         .findings
@@ -429,7 +401,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
         let stats = served.storage.stats();
         let (gets_before, bytes_before) = (stats.gets(), stats.bytes());
-        for id in SMALL_SAMPLE {
+        for id in SAMPLE_4K {
             let key = fixture.key(id);
             let before = stats.gets();
             assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));

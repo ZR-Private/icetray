@@ -21,7 +21,7 @@ use icetray_proto::v1::{
     self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
 };
-use icetray_testkit::fixture::{SAMPLE, SMALL_BUCKETS, SMALL_IDS};
+use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::verify::expected_cold_gets;
 use icetray_testkit::{Fixture, FixtureSpec, Nulls, S3Fixture, memory_catalog_s3, write_fixture};
 use tonic::transport::Channel;
@@ -32,9 +32,7 @@ use tonic_health::pb::health_client::HealthClient;
 
 mod common;
 
-use common::{
-    BoxError, NAMESPACE, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get,
-};
+use common::{BoxError, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get};
 
 /// What every test returns.
 type TestResult = Result<(), BoxError>;

@@ -9,12 +9,9 @@ use std::time::Instant;
 use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::{KeyType, Value};
-use icetray_testkit::fixture::local_catalog;
+use icetray_testkit::fixture::{NAMESPACE, local_catalog};
 use icetray_testkit::verify;
 use icetray_testkit::{FixtureSpec, Result, write_fixture};
-
-/// The namespace the probe's fixture is written in.
-const NAMESPACE: &str = "ns";
 
 /// Files per generation, one per bucket: the file count a three-billion-row
 /// table would have at two million rows per file.

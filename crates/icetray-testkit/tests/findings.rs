@@ -18,25 +18,16 @@ use icetray_core::check::thresholds::{
 };
 use icetray_core::config::Residency;
 use icetray_core::{FindingCode, KeyType, Serviceability, TableReport, Value, diagnose};
-use icetray_testkit::fixture::{SAMPLE, local_catalog, residue_class};
-use icetray_testkit::verify::{self, Served};
+use icetray_testkit::fixture::{
+    FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE, SECOND_CLASS,
+    SMALL_FILE_BYTES, TWO_BUCKETS, TWO_FILES, UNPARTITIONED_FILE_BYTES, WIDE_VALUE_BYTES,
+    local_catalog, residue_class,
+};
+use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served};
 use icetray_testkit::{
     Bloom, Dictionary, Fixture, FixtureSpec, Layout, Result, Statistics, write_fixture,
 };
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
-
-/// Ids of the fixtures whose files hold one contract page each.
-const IDS_4K: Range<u64> = 0..4_000;
-
-/// Ids and buckets of the two-bucket fixtures.
-const IDS_2K: Range<u64> = 0..2_000;
-const TWO_BUCKETS: u32 = 2;
-const ONE_BUCKET: u32 = 1;
-
-/// Buckets of the wide-value fixture: a thousand rows per file.
-const FOUR_BUCKETS: u32 = 4;
 
 /// Rows per key page of the large-key-page fixture: twice the cost
 /// threshold, so the finding is a cost and not the chosen margin.
@@ -49,15 +40,6 @@ const LARGE_PAGE_IDS: Range<u64> = 0..8_000;
 /// 4,000-row value page stays under the large-value-page advice, so the
 /// fixture raises the one code it is designed for.
 const SMALL_VALUE_BYTES: usize = 24;
-
-/// A file size target below one write batch of the unpartitioned fixture,
-/// so every batch is its own file.
-const UNPARTITIONED_FILE_BYTES: usize = 64 * 1024;
-
-/// The residue class appended to the interleaved fixture, so each bucket
-/// holds two files whose ranges interleave.
-const SECOND_CLASS: u64 = 2;
-const TWO_FILES: usize = 2;
 
 /// The bounds fixture cuts its statistics to this many bytes, shorter than
 /// any string key.
@@ -76,12 +58,6 @@ const SHARED_PREFIX_PAD: usize = 64;
 /// advice ratio.
 const SMALL_PAGE_ROWS: usize = 100;
 
-/// Bytes per value in the wide-value fixtures.
-const WIDE_VALUE_BYTES: usize = 16 * 1024;
-
-/// Bytes above the advice length every key of the long-key fixture carries.
-const LONG_KEY_EXTRA: usize = 93;
-
 /// Rows of the large-file fixture, at `WIDE_VALUE_BYTES` of incompressible
 /// value each: 9,000 rows is 140.6 MiB, ten percent over `FILE_BYTES_ADVICE`
 /// (128 MiB), the fewest thousands of rows that clear it.
@@ -90,18 +66,9 @@ const LARGE_FILE_ROWS: u64 = 9_000;
 /// A file size target above the large-file fixture's one file.
 const LARGE_FILE_TARGET_BYTES: usize = 256 * 1024 * 1024;
 
-/// A file size target below one write batch of the small fixture, so the
-/// rolling writer starts a new file at every batch.
-const SMALL_FILE_BYTES: usize = 40 * 1024;
-
 /// Ids of the many-files fixture: 3,000 per bucket, three batches, so
 /// every bucket holds more files than `FILES_PER_BUCKET_FACTOR` explains.
 const MANY_FILES_IDS: Range<u64> = 0..48_000;
-
-/// The false-positive rates far outside the recipe's: one in a trillion
-/// takes tens of bytes per key, one in two a few bits.
-const OVERSIZED_FPP: f64 = 1e-12;
-const UNDERSIZED_FPP: f64 = 0.5;
 
 /// Keys looked up per row group of the statistics-free file: one in each
 /// half, so every row group is routed to.
@@ -109,10 +76,6 @@ const PROBES_PER_ROW_GROUP: usize = 2;
 
 /// An id inside the statistics-free file's range.
 const INSIDE_ID: u64 = 1_234;
-
-/// Load GETs beyond the per-file ones over a catalog source: the manifest
-/// list and the manifest.
-const LOAD_METADATA_GETS: u64 = 2;
 
 /// Writes `spec` and serves it in the Full tier through its catalog.
 async fn write_and_serve(
@@ -379,8 +342,7 @@ async fn test_long_keys_is_advice() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         ids: IDS_4K,
-        key_pad: LONG_KEY_EXTRA + icetray_core::contract::KEY_BYTES_ADVICE
-            - icetray_testkit::keys::STRING_KEY_FIXED_BYTES,
+        key_pad: LONG_KEY_PAD,
         ..FixtureSpec::small("kv_longkeys", KeyType::String)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;

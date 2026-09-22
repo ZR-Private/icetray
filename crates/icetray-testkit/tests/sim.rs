@@ -14,13 +14,13 @@ use iceberg::memory::MemoryCatalog;
 use icetray_core::approx;
 use icetray_core::config::{HedgeConfig, Residency, RewriteRule, StorageConfig, TableConfig};
 use icetray_core::{Key, KeyType, Storage, TableSource, Value};
+use icetray_testkit::fixture::{APPENDED_4K_6K, IDS_4K, NAMESPACE, NEW_ID};
 use icetray_testkit::sim::{SlowEvery, serve_s3_with, sim_s3_store};
-use icetray_testkit::verify::{self, Served};
+use icetray_testkit::verify::{
+    self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served,
+};
 use icetray_testkit::{Fixture, FixtureSpec, Result, memory_catalog_local, write_fixture};
 use tempfile::TempDir;
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
 
 /// The simulated hosts, the bucket the S3 host serves from its root, and the
 /// warehouse under it the fixture is written into.
@@ -53,16 +53,7 @@ const HIT_MAX_ROUND_TRIPS: u32 = 3;
 /// the manifest list, the manifest, then footers and chunks.
 const LOAD_MIN_ROUND_TRIPS: u32 = 4;
 
-/// Load GETs beyond the per-file ones over a pinned metadata file: the
-/// file, the manifest list, and the manifest.
-const LOAD_METADATA_GETS: u64 = 3;
-
-/// Load GETs per single-row-group file: a footer and a key chunk.
-const LOAD_GETS_PER_FILE: u64 = 2;
-
-/// Ids of the small fixtures, and an id in the middle of them the cold
-/// lookup asks for.
-const IDS_4K: Range<u64> = 0..4_000;
+/// An id in the middle of an `IDS_4K` fixture the cold lookup asks for.
 const SAMPLE_ID: u64 = 1_414;
 
 /// Ids of the tail fixtures: enough distinct pages for hundreds of cold
@@ -100,10 +91,6 @@ const EAGER_PERCENTILE: f64 = 1.0;
 const EAGER_WINDOW: usize = 1;
 const EAGER_MAX_RATE: f64 = 1.0;
 const STALL_EVERY_SECOND: u32 = 2;
-
-/// The append the never-hedge test follows through the hint.
-const APPENDED_4K_6K: Range<u64> = 4_000..6_000;
-const NEW_ID: u64 = 5_000;
 
 /// The fixture as written for real: the temporary root the S3 host serves,
 /// the fixture under `<root>/bucket/warehouse`, and the memory catalog and
@@ -283,7 +270,7 @@ fn test_cold_hit_is_one_round_trip_and_load_is_fixed_dependent_round_trips() -> 
     );
     assert_eq!(
         first.load_gets,
-        LOAD_METADATA_GETS + LOAD_GETS_PER_FILE * first.files,
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + LOAD_GETS_PER_FILE * first.files,
         "metadata file, manifest list, manifest, then a footer and a chunk per file"
     );
     assert!(

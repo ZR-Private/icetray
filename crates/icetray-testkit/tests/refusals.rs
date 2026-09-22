@@ -16,27 +16,15 @@ use icetray_core::{
     Error, ErrorKind, Key, KeyType, RefusalReason, Storage, Table, TableSource, TableState,
 };
 use icetray_testkit::fixture::{
-    DATA_DIR, local_catalog, position_delete_file, write_table_of_types,
+    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, TINY_BUDGET, TWO_BUCKETS,
+    local_catalog, position_delete_file, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
-use icetray_testkit::verify::{self, count};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, count};
 use icetray_testkit::{
     Bloom, Fixture, FixtureSpec, HandSnapshot, Layout, Order, RawFile, Result, value_for,
     write_fixture,
 };
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
-
-/// Ids of the fixtures that need no more than a page per file.
-const IDS_4K: Range<u64> = 0..4_000;
-
-/// Ids of the two-bucket fixtures.
-const IDS_2K: Range<u64> = 0..2_000;
-const TWO_BUCKETS: u32 = 2;
-
-/// An append overlapping the first build's files in every bucket.
-const OVERLAPPING_APPEND: Range<u64> = 2_000..6_000;
 
 /// The long keys of a raw file, ascending, and the same values as their
 /// arrow arrays for a raw file whose key column is of another type.
@@ -60,16 +48,8 @@ const DELETE_BYTES: u64 = 1;
 /// A key pad that alone exceeds the cap, so every key is over it.
 const OVER_CAP_PAD: usize = MAX_KEY_BYTES;
 
-/// Rows and buckets of the over-cap fixture: few rows, each a few kibibytes.
+/// Rows of the over-cap fixture: few, each a few kibibytes, in one bucket.
 const OVER_CAP_IDS: Range<u64> = 0..300;
-const ONE_BUCKET: u32 = 1;
-
-/// A resident-bytes budget no file fits in.
-const TINY_BUDGET: u64 = 1;
-
-/// Load GETs beyond the per-file footers over a catalog source: the
-/// manifest list and the manifest.
-const LOAD_METADATA_GETS: u64 = 2;
 
 /// A table whose first load was refused: the reason, and the table and
 /// storage left behind for the state and GET assertions.

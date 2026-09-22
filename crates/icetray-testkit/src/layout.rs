@@ -21,6 +21,14 @@ pub const VALUE_COLUMN: &str = "value";
 /// which `Bloom::Sized` writes at.
 pub const KEY_BLOOM_FPP: f64 = 0.01;
 
+/// A false-positive rate far below `KEY_BLOOM_FPP`: one in a trillion takes
+/// tens of bytes per key, the oversized filter the doctor advises on.
+pub const OVERSIZED_FPP: f64 = 1e-12;
+
+/// A false-positive rate far above `KEY_BLOOM_FPP`: one in two takes a few
+/// bits per key, the undersized filter the doctor advises on.
+pub const UNDERSIZED_FPP: f64 = 0.5;
+
 /// The write batch under a page byte bound. The byte limit is checked
 /// between batches, so a batch larger than the bound would overshoot it by
 /// a batch; two rows keeps the overshoot to one value.

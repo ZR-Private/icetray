@@ -15,9 +15,6 @@ use hyper_util::rt::TokioIo;
 /// `?` for the plumbing.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The namespace every fixture is written in.
-pub const NAMESPACE: &str = "ns";
-
 /// How often a test polls while waiting for readiness, a refresh, or an exit.
 pub const POLL_STEP: Duration = Duration::from_millis(50);
 

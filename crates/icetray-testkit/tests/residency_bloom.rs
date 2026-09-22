@@ -5,7 +5,6 @@
 //! the groups it verifies; a duplicate key is refused as in the Full tier.
 
 use std::collections::HashSet;
-use std::ops::Range;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -13,14 +12,14 @@ use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::{Error, Generation, Key, KeyType, LoadedFile, RefusalReason, diagnose};
 use icetray_testkit::error::Precondition;
-use icetray_testkit::fixture::{INTERLEAVED_BUCKETS, SAMPLE, local_catalog, residue_class};
-use icetray_testkit::keys::STRING_KEY_FIXED_BYTES;
+use icetray_testkit::fixture::{
+    IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, LONG_KEY_PAD, NAMESPACE, NEWEST_SAMPLE,
+    OLD_ID, OVERLAPPING_APPEND, SAMPLE, SECOND_CLASS, TAIL, THIRD_CLASS, THREE_FILES,
+    local_catalog, residue_class,
+};
 use icetray_testkit::layout::KEY_BLOOM_FPP;
 use icetray_testkit::verify::{self, Served, count};
 use icetray_testkit::{Fixture, FixtureSpec, Result, TestkitError, write_fixture};
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
 
 /// Absent keys probed per miss batch, spread evenly over the id range.
 const MISS_PROBES: u64 = 200;
@@ -30,30 +29,6 @@ const MISS_PROBES: u64 = 200;
 /// run reaches.
 const MISS_ALLOWANCE_FACTOR: f64 = 10.0;
 const MISS_FALSE_POSITIVE_ALLOWANCE: f64 = MISS_ALLOWANCE_FACTOR * KEY_BLOOM_FPP;
-
-/// The padding of the long-string fixture: 221-byte keys.
-const LONG_KEY_BYTES: usize = 221;
-const LONG_KEY_PAD: usize = LONG_KEY_BYTES - STRING_KEY_FIXED_BYTES;
-
-/// Ids of the duplicate fixture and the append that duplicates them.
-const IDS_4K: Range<u64> = 0..4_000;
-const OVERLAPPING_APPEND: Range<u64> = 2_000..6_000;
-
-/// An id of the first build.
-const OLD_ID: u64 = 10;
-
-/// The residue classes appended to the interleaved fixture: the `2 mod 4`
-/// ids widen every group to two files, the `1 mod 4` ids to three.
-const SECOND_CLASS: u64 = 2;
-const THIRD_CLASS: u64 = 1;
-const THREE_FILES: usize = 3;
-
-/// A range-disjoint append: files above every earlier key.
-const TAIL: Range<u64> = 8_000..9_000;
-
-/// Ids sampled on the interleaved fixture, and ids only its newest files hold.
-const INTERLEAVED_SAMPLE: [u64; 6] = [0, 2, 1_234, 2_998, 4_002, 7_998];
-const NEWEST_SAMPLE: [u64; 4] = [1, 4_001, 7_997, 8_500];
 
 /// The same fixture served in both tiers, each over its own storage.
 struct Tiers {

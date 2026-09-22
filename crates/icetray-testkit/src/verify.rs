@@ -21,6 +21,23 @@ use crate::keys::far_key;
 /// cold count is exactly the distinct pages a batch fetches.
 pub const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Load GETs past the per-file ones over a catalog source: the manifest
+/// list and the one manifest a fixture's first snapshot has. The metadata
+/// itself came from the catalog record.
+pub const LOAD_METADATA_GETS: u64 = 2;
+
+/// The GET a static source spends on the metadata file before
+/// `LOAD_METADATA_GETS`, which a catalog source takes from its record.
+pub const METADATA_FILE_GETS: u64 = 1;
+
+/// Load GETs per single-row-group file in every tier: the footer and the
+/// key chunk. The Bloom tier reads one filter per row group besides.
+pub const LOAD_GETS_PER_FILE: u64 = 2;
+
+/// An unchanged poll of a static root reads its version hint and nothing
+/// else.
+pub const HINT_POLL_GETS: u64 = 1;
+
 /// One table over its own storage, so its counters are its own, and its own
 /// cache. `build` hands it back unloaded; `serve_over` and `serve` loaded.
 pub struct Served {

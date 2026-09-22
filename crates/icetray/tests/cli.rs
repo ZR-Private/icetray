@@ -4,7 +4,6 @@
 
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
-use std::ops::Range;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -17,7 +16,9 @@ use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
 use icetray_core::{Key, KeyType};
-use icetray_testkit::fixture::{SAMPLE, SMALL_BUCKETS, SMALL_IDS};
+use icetray_testkit::fixture::{
+    IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, UNPARTITIONED_FILE_BYTES,
+};
 use icetray_testkit::layout::Layout;
 use icetray_testkit::{Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture};
 use serde_json::Value as Json;
@@ -28,22 +29,13 @@ use tonic_health::pb::health_client::HealthClient;
 
 mod common;
 
-use common::{
-    BoxError, NAMESPACE, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get,
-};
+use common::{BoxError, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get};
 
 /// What every test returns.
 type TestResult = Result<(), BoxError>;
 
 /// The built binary under test.
 const BIN: &str = env!("CARGO_BIN_EXE_icetray");
-
-/// Ids of the fixtures that need no more than a page per file.
-const IDS_4K: Range<u64> = 0..4_000;
-
-/// A file size target below one write batch of the unpartitioned fixture,
-/// so every batch is its own file and the table is priced as files probed.
-const UNPARTITIONED_FILE_BYTES: usize = 64 * 1024;
 
 /// Present keys the broken-pipe test asks for: at a few hundred bytes a
 /// line, well over the 64 KiB a pipe buffers, so the binary blocks on a

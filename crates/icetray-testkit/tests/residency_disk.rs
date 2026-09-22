@@ -7,7 +7,6 @@
 //! a restart.
 
 use std::collections::HashSet;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,23 +17,11 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{DataFileIdentity, Error, KeyType, LocalDir, RefusalReason, Storage, Value};
-use icetray_testkit::fixture::{SAMPLE, local_catalog};
-use icetray_testkit::verify::{self, Served, count};
+use icetray_testkit::fixture::{
+    FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
+};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served, count};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
-
-/// The namespace every fixture is written in.
-const NAMESPACE: &str = "ns";
-
-/// Ids and buckets of the smaller fixtures.
-const IDS_4K: Range<u64> = 0..4_000;
-const FOUR_BUCKETS: u32 = 4;
-
-/// Load GETs beyond the per-file ones over a catalog source: the manifest
-/// list and the manifest.
-const LOAD_METADATA_GETS: u64 = 2;
-
-/// A chunk-file budget no file fits in.
-const TINY_BUDGET: u64 = 1;
 
 /// The two tables sharing one local directory in the retain test.
 const TABLE_A: &str = "a";

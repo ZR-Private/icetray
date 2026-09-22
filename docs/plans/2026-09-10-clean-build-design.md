@@ -970,22 +970,31 @@ sixteen bytes with the big-endian value in the tail, and values a function
 of the key), `layout` (`Layout` with `page_rows`, `page_bytes`,
 `Dictionary`, `column_index_truncate`, `Statistics`, `Bloom`,
 `row_group_rows`, `target_file_bytes`, and `Layout::contract()` built from
-`contract`'s constants; `KEY_BLOOM_FPP`, `KEY_COLUMN`, `VALUE_COLUMN`),
-`fixture` (`FixtureSpec` with `small` and `interleaved`, `Order`, `Nulls`,
-`Fixture` with its accessors, `files`, `keys_at`, and the sources
-`catalog_source`, `root_source`, `pinned_source`; `RawFile::from_batch`;
-`HandSnapshot`; `write_fixture`, `write_table_of_types`,
-`position_delete_file`, `memory_catalog_local`, `memory_catalog_s3`,
-`local_catalog`, `residue_class`; the constants `SMALL_IDS`,
-`SMALL_BUCKETS`, `SAMPLE`, `INTERLEAVED_IDS`, `INTERLEAVE_STRIDE`,
-`INTERLEAVED_BUCKETS`, `DATA_DIR`), `s3` (`S3Fixture`, whose
-`storage_config` is hedge-disabled and whose `file_io_props` is a
-`HashMap`), `sim` (`serve_s3`, `serve_s3_with`, `SlowEvery`,
-`sim_s3_store`, `SIM_S3_PORT`), `verify` (`Served` with `load` and
-`current`; `build`, `serve_over`, `serve`, `serve_catalog`,
-`serve_catalog_with`; `expected_cold_gets`, `expected_key_pages`,
-`predicted_probe`; `verify_hits`, `verify_hit_cost`, `verify_misses`;
-`storage_config_for_tests`, `count`, `TEST_PAGE_CACHE_BYTES`), and
+`contract`'s constants; `KEY_BLOOM_FPP`, `OVERSIZED_FPP`, `UNDERSIZED_FPP`,
+`KEY_COLUMN`, `VALUE_COLUMN`), `fixture` (`FixtureSpec` with `small` and
+`interleaved`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
+`keys_at`, and the sources `catalog_source`, `root_source`,
+`pinned_source`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
+`write_table_of_types`, `position_delete_file`, `memory_catalog_local`,
+`memory_catalog_s3`, `local_catalog`, `residue_class`; the constants
+`SMALL_IDS`, `SMALL_BUCKETS`, `SAMPLE`, `INTERLEAVED_IDS`,
+`INTERLEAVE_STRIDE`, `INTERLEAVED_BUCKETS`, `DATA_DIR`, and the shapes the
+acceptance tests share, each declared once: `NAMESPACE`, `IDS_4K`, `IDS_2K`,
+`SAMPLE_4K`, `OVERLAPPING_APPEND`, `APPENDED_4K_6K`, `NEW_ID`, `OLD_ID`,
+`ONE_BUCKET`, `TWO_BUCKETS`, `FOUR_BUCKETS`, `TINY_BUDGET`,
+`UNPARTITIONED_FILE_BYTES`, `SMALL_FILE_BYTES`, `WIDE_VALUE_BYTES`,
+`LONG_KEY_EXTRA`, `LONG_KEY_BYTES`, `LONG_KEY_PAD`, `SECOND_CLASS`,
+`THIRD_CLASS`, `TWO_FILES`, `THREE_FILES`, `TAIL`, `INTERLEAVED_SAMPLE`,
+`NEWEST_SAMPLE`), `s3` (`S3Fixture`, whose `storage_config` is
+hedge-disabled and whose `file_io_props` is a `HashMap`), `sim`
+(`serve_s3`, `serve_s3_with`, `SlowEvery`, `sim_s3_store`, `SIM_S3_PORT`),
+`verify` (`Served` with `load` and `current`; `build`, `serve_over`,
+`serve`, `serve_catalog`, `serve_catalog_with`; `expected_cold_gets`,
+`expected_key_pages`, `predicted_probe`; `verify_hits`, `verify_hit_cost`,
+`verify_misses`; `storage_config_for_tests`, `count`,
+`TEST_PAGE_CACHE_BYTES`, and the GET oracle's fixed counts
+`LOAD_METADATA_GETS`, `METADATA_FILE_GETS`, `LOAD_GETS_PER_FILE`,
+`HINT_POLL_GETS`), and
 `golden` (`WAREHOUSE_VAR`, `warehouse`, `GoldenTable`, `table_config`,
 `config`, `long_key`, `string_key`, `permuted_key`, `value`,
 `wide_value`). The constants `PAGE_ROWS`, `VALUE_PAGE_BYTES`,

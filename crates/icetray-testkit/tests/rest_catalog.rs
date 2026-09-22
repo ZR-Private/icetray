@@ -5,7 +5,6 @@
 //! passing.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 
 use iceberg::CatalogBuilder as _;
@@ -15,22 +14,16 @@ use icetray_core::KeyType;
 use icetray_core::config::{Residency, SourceConfig, TableConfig};
 use icetray_core::{TableSource, Value};
 use icetray_testkit::error::{Precondition, REST_URI_VAR, required_var};
+use icetray_testkit::fixture::{APPENDED_4K_6K, IDS_4K, NEW_ID, OLD_ID};
 use icetray_testkit::verify;
 use icetray_testkit::{FixtureSpec, Result, write_fixture};
 
-/// The namespace the integration fixtures are written in.
+/// The namespace the integration fixtures are written in: one shared REST
+/// catalog serves every run, so the name says whose tables they are.
 const NAMESPACE: &str = "icetray_it";
 
 /// The name the REST client is registered under; nothing reads it back.
 const CATALOG_NAME: &str = "rest";
-
-/// Ids of the fixture and the range appended to it.
-const IDS_4K: Range<u64> = 0..4_000;
-const APPENDED_4K_6K: Range<u64> = 4_000..6_000;
-
-/// An id of the first build, and one the append adds.
-const OLD_ID: u64 = 10;
-const NEW_ID: u64 = 5_000;
 
 #[tokio::test]
 #[ignore = "needs a REST catalog at ICETRAY_REST_URI; run dev/test-int.sh"]
