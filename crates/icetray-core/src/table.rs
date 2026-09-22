@@ -586,13 +586,12 @@ mod tests {
         Bloom, Bounds, Dictionary, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
         FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
         THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table as Fixture, WriterLayout,
-        bucketing, keys_from, keys_in_bucket, long_keys, two_bucket_table, value_for, values_of,
+        bucketing, cache, keys_from, keys_in_bucket, long_keys, two_bucket_table, value_for,
+        values_of,
     };
     use crate::key::KeyType;
     use crate::manifest::testing::Partition;
 
-    /// The memory budget of a test page cache: every page a test touches fits.
-    const CACHE_BYTES: usize = 64 * 1024 * 1024;
     /// Keys in a one-file fixture: enough that its bloom filter, sized to
     /// them, draws no finding of its own.
     const FILE_KEYS: i64 = 32;
@@ -604,10 +603,6 @@ mod tests {
     /// The name of a second, strict table in the metrics tests, beside the
     /// fixture's `TABLE`.
     const STRICT_TABLE: &str = "strict";
-
-    async fn cache() -> PageCache {
-        PageCache::new(CACHE_BYTES, None).await.unwrap()
-    }
 
     /// A one-bucket fixture with one file of `FILE_KEYS` keys laid out as
     /// `layout` says, committed as `FIRST_SNAPSHOT`.

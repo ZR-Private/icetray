@@ -2158,7 +2158,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_diagnose_predicted_bytes_per_tier_equal_the_loaded_index_bytes() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let scratch = tempfile::tempdir().unwrap();
             let mut table = contract_table().await;
             let local = testing::local_dir(scratch.path(), table.storage.stats(), None);

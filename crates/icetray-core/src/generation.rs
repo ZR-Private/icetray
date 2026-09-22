@@ -844,7 +844,9 @@ pub(crate) mod testing {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
+    use arrow::array::{
+        ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use bytes::Bytes;
     use iceberg::io::FileIO;
@@ -854,18 +856,19 @@ pub(crate) mod testing {
     };
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
-    use parquet::file::properties::WriterProperties;
+    use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
     use parquet::schema::types::ColumnPath;
 
     use super::Generation;
     use crate::approx::count;
-    use crate::catalog::{TableSource, VERSION_HINT, hint_location};
+    use crate::cache::PageCache;
+    use crate::catalog::{TableFault, TableSource, VERSION_HINT, hint_location};
     use crate::config::{
         HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
     };
     use crate::contract::PAGE_ROWS;
-    use crate::error::Result;
-    use crate::key::{Key, KeyType};
+    use crate::error::{Error, RefusalReason, Result};
+    use crate::key::{Key, KeyType, UUID_BYTES};
     use crate::local::LocalDir;
     use crate::manifest::Bucketing;
     use crate::manifest::testing::{
@@ -875,6 +878,12 @@ pub(crate) mod testing {
 
     /// The table every fixture is named.
     pub(crate) const TABLE: &str = "kv";
+    /// The synthetic prefix an in-memory store is registered under, in the
+    /// tests that read through one.
+    pub(crate) const MEM_PREFIX: &str = "mem://w/";
+    /// The memory budget of a test page cache: every page a test touches
+    /// fits, so no test sees an eviction it did not ask for.
+    pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
     /// The branch the fixture tables are followed on.
     pub(crate) const MAIN: &str = iceberg::spec::MAIN_BRANCH;
     /// The step between written long keys, so the key after any written key
@@ -882,7 +891,9 @@ pub(crate) mod testing {
     pub(crate) const KEY_STEP: i64 = 3;
     /// Bytes per value where a fixture does not say.
     pub(crate) const VALUE_BYTES: usize = 32;
-    /// The mixers that make a value a function of its key.
+    /// The mixers that make a value a function of its key or row and of the
+    /// byte's position, distinct for neighbouring keys: two small primes and
+    /// a prime modulus under 256, so every byte is in range.
     const VALUE_KEY_MIX: i64 = 31;
     const VALUE_BYTE_MIX: i64 = 7;
     const VALUE_MODULUS: i64 = 251;
@@ -958,15 +969,63 @@ pub(crate) mod testing {
         keys.iter().map(|key| Key::Long(*key)).collect()
     }
 
-    /// Which fixture column is dictionary-encoded; the other never is.
+    /// A memory-only page cache of `CACHE_BYTES`.
+    pub(crate) async fn cache() -> PageCache {
+        PageCache::new(CACHE_BYTES, None).await.unwrap()
+    }
+
+    /// The refusal `result` ended in, for `TABLE`.
+    pub(crate) fn refusal_of<T: std::fmt::Debug>(result: Result<T>) -> RefusalReason {
+        let Err(Error::Refused { table, reason }) = result else {
+            panic!("expected a refusal, got {result:?}");
+        };
+        assert_eq!(table, TABLE);
+        reason
+    }
+
+    /// The table fault `result` ended in, under `table`.
+    pub(crate) fn table_fault_of<T: std::fmt::Debug>(result: Result<T>, table: &str) -> TableFault {
+        let Err(Error::Table {
+            table: named,
+            fault,
+        }) = result
+        else {
+            panic!("expected a table fault, got {result:?}");
+        };
+        assert_eq!(named, table);
+        fault
+    }
+
+    /// Which fixture columns are dictionary-encoded.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Dictionary {
         /// Neither: the contract's shape.
         Off,
-        /// The key column, whose dictionary page costs nothing extra.
+        /// The key column alone, whose dictionary page costs nothing extra.
         Key,
-        /// The value column, whose dictionary page is one more GET per hit.
+        /// The value column alone, whose dictionary page is one more GET per
+        /// hit.
         Value,
+        /// Every column.
+        All,
+    }
+
+    /// `builder` with dictionary encoding on the columns `dictionary` names
+    /// and off elsewhere.
+    pub(crate) fn with_dictionary(
+        builder: WriterPropertiesBuilder,
+        dictionary: Dictionary,
+    ) -> WriterPropertiesBuilder {
+        let builder = builder.set_dictionary_enabled(dictionary == Dictionary::All);
+        let column = match dictionary {
+            Dictionary::Off | Dictionary::All => None,
+            Dictionary::Key => Some(KEY_COLUMN),
+            Dictionary::Value => Some(VALUE_COLUMN),
+        };
+        match column {
+            Some(column) => builder.set_column_dictionary_enabled(ColumnPath::from(column), true),
+            None => builder,
+        }
     }
 
     /// Whether and how the key column gets a bloom filter. The writer sizes
@@ -982,6 +1041,37 @@ pub(crate) mod testing {
         /// Sized to the file's keys at this false-positive rate: far below
         /// `BLOOM_FPP` an oversized filter, far above it an undersized one.
         Fpp(f64),
+    }
+
+    impl Bloom {
+        /// The false-positive rate the filter is written at; `None` for no
+        /// filter.
+        pub(crate) fn fpp(self) -> Option<f64> {
+            match self {
+                Self::Off => None,
+                Self::Sized => Some(BLOOM_FPP),
+                Self::Fpp(fpp) => Some(fpp),
+            }
+        }
+    }
+
+    /// `builder` with a filter on the key column written at `bloom`'s rate
+    /// for `ndv` distinct keys, or unchanged for no filter. The filter
+    /// setters enable a filter on the column they name, so the value column
+    /// never gets one.
+    pub(crate) fn with_key_bloom(
+        builder: WriterPropertiesBuilder,
+        bloom: Bloom,
+        ndv: u64,
+    ) -> WriterPropertiesBuilder {
+        let Some(fpp) = bloom.fpp() else {
+            return builder;
+        };
+        let key = ColumnPath::from(KEY_COLUMN);
+        builder
+            .set_column_bloom_filter_enabled(key.clone(), true)
+            .set_column_bloom_filter_fpp(key.clone(), fpp)
+            .set_column_bloom_filter_ndv(key, ndv)
     }
 
     /// The writer's layout knobs; `contract()` is RFD 002's shape.
@@ -1014,76 +1104,86 @@ pub(crate) mod testing {
             }
         }
 
-        /// The writer properties for a file of `rows` rows. The filter
-        /// setters enable a filter on the column they name, so the value
-        /// column never gets one.
+        /// The writer properties for a file of `rows` rows, the filter
+        /// sized to all of them.
         fn properties(&self, rows: usize) -> WriterProperties {
-            let mut builder = WriterProperties::builder()
+            let builder = WriterProperties::builder()
                 .set_data_page_row_count_limit(self.page_rows)
                 .set_write_batch_size(self.page_rows)
-                .set_dictionary_enabled(false)
                 .set_column_index_truncate_length(self.column_index_truncate)
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                .set_bloom_filter_enabled(false);
-            let dictionary_column = match self.dictionary {
-                Dictionary::Off => None,
-                Dictionary::Key => Some(KEY_COLUMN),
-                Dictionary::Value => Some(VALUE_COLUMN),
-            };
-            if let Some(column) = dictionary_column {
-                builder = builder.set_column_dictionary_enabled(ColumnPath::from(column), true);
-            }
-            builder = builder.set_max_row_group_row_count(self.row_group_rows);
-            let fpp = match self.bloom {
-                Bloom::Off => None,
-                Bloom::Sized => Some(BLOOM_FPP),
-                Bloom::Fpp(fpp) => Some(fpp),
-            };
-            if let Some(fpp) = fpp {
-                let key = ColumnPath::from(KEY_COLUMN);
-                builder = builder
-                    .set_column_bloom_filter_enabled(key.clone(), true)
-                    .set_column_bloom_filter_fpp(key.clone(), fpp)
-                    .set_column_bloom_filter_ndv(key, count(rows));
-            }
-            builder.build()
+                .set_bloom_filter_enabled(false)
+                .set_max_row_group_row_count(self.row_group_rows);
+            let builder = with_dictionary(builder, self.dictionary);
+            with_key_bloom(builder, self.bloom, count(rows)).build()
         }
     }
 
-    /// The arrow type of a key column of `key_type`; fixtures write long
-    /// and string keys.
-    fn key_data_type(key_type: KeyType) -> DataType {
+    /// How a fixture's key column is typed in arrow.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum KeyColumn {
+        Int64,
+        Utf8,
+        Binary,
+        FixedBinary(i32),
+    }
+
+    /// The arrow column a key type is written as: a uuid as a fixed binary
+    /// of `UUID_BYTES`, as Parquet stores the type.
+    pub(crate) fn column_of(key_type: KeyType) -> KeyColumn {
         match key_type {
-            KeyType::Long => DataType::Int64,
-            KeyType::String => DataType::Utf8,
-            KeyType::Binary | KeyType::Uuid => panic!("fixtures write long and string keys"),
+            KeyType::Long => KeyColumn::Int64,
+            KeyType::String => KeyColumn::Utf8,
+            KeyType::Binary => KeyColumn::Binary,
+            KeyType::Uuid => KeyColumn::FixedBinary(i32::try_from(UUID_BYTES).unwrap()),
         }
     }
 
-    /// `keys`, all of `key_type`, as the key column's array.
-    fn key_array(key_type: KeyType, keys: &[Key]) -> ArrayRef {
-        match key_type {
-            KeyType::Long => Arc::new(Int64Array::from(
+    /// The arrow type of a key column.
+    pub(crate) fn key_data_type(column: KeyColumn) -> DataType {
+        match column {
+            KeyColumn::Int64 => DataType::Int64,
+            KeyColumn::Utf8 => DataType::Utf8,
+            KeyColumn::Binary => DataType::Binary,
+            KeyColumn::FixedBinary(width) => DataType::FixedSizeBinary(width),
+        }
+    }
+
+    /// `keys` as the key column's array; a `None` is a null.
+    pub(crate) fn key_array(column: KeyColumn, keys: &[Option<Key>]) -> ArrayRef {
+        let raw = || {
+            keys.iter()
+                .map(|key| key.as_ref().map(|key| key.as_bytes().into_owned()))
+        };
+        match column {
+            KeyColumn::Int64 => Arc::new(Int64Array::from(
                 keys.iter()
                     .map(|key| {
-                        let Key::Long(value) = key else {
-                            panic!("a long fixture holds long keys");
-                        };
-                        *value
+                        key.as_ref().map(|key| {
+                            let Key::Long(value) = key else {
+                                panic!("a long fixture holds long keys");
+                            };
+                            *value
+                        })
                     })
                     .collect::<Vec<_>>(),
             )),
-            KeyType::String => Arc::new(StringArray::from(
+            KeyColumn::Utf8 => Arc::new(
                 keys.iter()
                     .map(|key| {
-                        let Key::Str(text) = key else {
-                            panic!("a string fixture holds string keys");
-                        };
-                        text.as_str()
+                        key.as_ref().map(|key| {
+                            let Key::Str(text) = key else {
+                                panic!("a string fixture holds string keys");
+                            };
+                            text.clone()
+                        })
                     })
-                    .collect::<Vec<_>>(),
-            )),
-            KeyType::Binary | KeyType::Uuid => panic!("fixtures write long and string keys"),
+                    .collect::<StringArray>(),
+            ),
+            KeyColumn::Binary => Arc::new(raw().collect::<BinaryArray>()),
+            KeyColumn::FixedBinary(width) => Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(raw(), width).unwrap(),
+            ),
         }
     }
 
@@ -1095,14 +1195,16 @@ pub(crate) mod testing {
         values: &[Option<Vec<u8>>],
         layout: &WriterLayout,
     ) -> Bytes {
+        let column = column_of(key_type);
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(KEY_COLUMN, key_data_type(key_type), false),
+            Field::new(KEY_COLUMN, key_data_type(column), false),
             Field::new(VALUE_COLUMN, DataType::Binary, true),
         ]));
+        let keys: Vec<Option<Key>> = keys.iter().cloned().map(Some).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                key_array(key_type, keys),
+                key_array(column, &keys),
                 Arc::new(values.iter().cloned().collect::<BinaryArray>()) as ArrayRef,
             ],
         )
@@ -1445,9 +1547,10 @@ mod tests {
 
     use super::testing::{
         self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
-        KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, THIRD_SEQUENCE,
-        THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table, WriterLayout, bucketing, keys_from,
-        keys_in_bucket, local_dir, long_keys, two_bucket_table, value_for, values_of,
+        KEY_STEP, MEM_PREFIX, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
+        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table, WriterLayout, bucketing, cache,
+        keys_from, keys_in_bucket, local_dir, long_keys, refusal_of, two_bucket_table, value_for,
+        values_of,
     };
     use super::*;
     use crate::catalog::TableSource;
@@ -1457,15 +1560,11 @@ mod tests {
         DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID,
     };
 
-    /// The synthetic prefix the in-memory store is registered under.
-    const MEM_PREFIX: &str = "mem://w/";
     /// The metadata location the assembled generations claim.
     const MEM_METADATA: &str = "mem://w/db/kv/metadata/v1.metadata.json";
     /// The snapshot id and sequence number of the assembled generations.
     const SNAPSHOT: i64 = 77;
     const SEQUENCE: i64 = 1;
-    /// The memory budget of a test page cache: every page a test touches fits.
-    const CACHE_BYTES: usize = 64 * 1024 * 1024;
     /// Bucket counts the routing tests use beside the fixture's `TWO`.
     const FOUR: u32 = 4;
     const EIGHT: u32 = 8;
@@ -1509,10 +1608,6 @@ mod tests {
                 additional_properties: HashMap::new(),
             })
             .build()
-    }
-
-    async fn cache() -> PageCache {
-        PageCache::new(CACHE_BYTES, None).await.unwrap()
     }
 
     /// An in-memory store behind a storage, and the files built over it.
@@ -1646,14 +1741,6 @@ mod tests {
 
     fn paths<'a>(files: impl Iterator<Item = &'a Arc<LoadedFile>>) -> Vec<String> {
         files.map(|file| file.entry.path.clone()).collect()
-    }
-
-    fn refusal_of<T: std::fmt::Debug>(result: Result<T>) -> RefusalReason {
-        let Err(Error::Refused { table, reason }) = result else {
-            panic!("expected a refusal, got {result:?}");
-        };
-        assert_eq!(table, TABLE);
-        reason
     }
 
     /// Every key of `keys` is `Present` with its value, through a fresh

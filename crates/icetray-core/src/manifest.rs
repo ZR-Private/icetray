@@ -702,11 +702,9 @@ mod tests {
     use super::*;
     use crate::bucket;
     use crate::config::StorageConfig;
-    use crate::error::Error;
+    use crate::generation::testing::{TABLE, refusal_of, table_fault_of};
     use crate::key::UUID_BYTES;
 
-    /// The table every test names.
-    const TABLE: &str = "kv";
     /// A column name no fixture schema has.
     const ABSENT_COLUMN: &str = "absent";
     /// The second value column name of the evolved schema.
@@ -772,20 +770,9 @@ mod tests {
         TableLayout::derive(TABLE, md, snapshot, KEY_COLUMN, VALUE_COLUMN)
     }
 
-    fn refusal_of<T: std::fmt::Debug>(result: Result<T>) -> RefusalReason {
-        let Err(Error::Refused { table, reason }) = result else {
-            panic!("expected a refusal, got {result:?}");
-        };
-        assert_eq!(table, TABLE);
-        reason
-    }
-
+    /// The table fault `result` ended in, under `TABLE`.
     fn fault_of<T: std::fmt::Debug>(result: Result<T>) -> TableFault {
-        let Err(Error::Table { table, fault }) = result else {
-            panic!("expected a table fault, got {result:?}");
-        };
-        assert_eq!(table, TABLE);
-        fault
+        table_fault_of(result, TABLE)
     }
 
     fn data_path(root: &str, name: &str) -> String {

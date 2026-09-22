@@ -1967,9 +1967,7 @@ fn file_fault(path: &str, fault: FileFault) -> Error {
 mod tests {
     use std::path::Path;
 
-    use arrow::array::{
-        ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
-    };
+    use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
@@ -1983,25 +1981,21 @@ mod tests {
     use parquet::file::properties::{
         DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties,
     };
-    use parquet::schema::types::ColumnPath;
 
     use super::*;
     use crate::approx::count;
-    use crate::config::{HedgeConfig, LocalConfig, StorageConfig};
+    use crate::config::{HedgeConfig, StorageConfig};
     use crate::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
+    use crate::generation::testing::{
+        self, Bloom, Dictionary, KEY_STEP, KeyColumn, MEM_PREFIX, TABLE, cache, column_of,
+        key_array, key_data_type, refusal_of, with_dictionary, with_key_bloom,
+    };
     use crate::key::testing::UUID_HALF_BYTES;
+    use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
     use crate::storage::{HedgeWindow, IoStats, Storage};
 
-    /// The table every fixture is built for.
-    const TABLE: &str = "kv";
-    /// The synthetic prefix the in-memory store is registered under.
-    const MEM_PREFIX: &str = "mem://w/";
     /// The fixture file's key under the prefix.
     const FILE_KEY: &str = "db/kv/data/f0.parquet";
-    /// The fixture's key column.
-    const KEY_COLUMN: &str = "key";
-    /// The fixture's value column.
-    const VALUE_COLUMN: &str = "value";
     /// A column name no fixture has.
     const ABSENT_COLUMN: &str = "absent";
     /// Key pages per row group in the contract fixture.
@@ -2018,9 +2012,6 @@ mod tests {
     /// Bytes per value in the misaligned fixture: enough that the page byte
     /// bound splits value pages far more often than the row limit.
     const MISALIGNED_VALUE_BYTES: usize = 512;
-    /// The step between consecutive keys, so the key after any written key
-    /// is absent and inside the file's range.
-    const KEY_STEP: usize = 2;
     /// The byte every binary key starts with, above zero so a below-range
     /// binary key exists.
     const BINARY_KEY_TAG: u8 = 0xff;
@@ -2029,15 +2020,6 @@ mod tests {
     const UUID_KEY_FILL: u8 = 0x0a;
     /// The width of the fixed-width binary keys: a `u64`.
     const FIXED_KEY_BYTES: i32 = 8;
-    /// The multipliers and modulus that make a value a function of its row,
-    /// distinct for neighbouring rows.
-    const VALUE_ROW_MIX: usize = 31;
-    const VALUE_BYTE_MIX: usize = 7;
-    const VALUE_MODULUS: usize = 251;
-    /// The memory budget of a test page cache: every page a test touches fits.
-    const CACHE_BYTES: usize = 64 * 1024 * 1024;
-    /// The false-positive rate the fixtures' filters are sized at.
-    const BLOOM_FPP: f64 = 0.01;
     /// Rows in the small fixtures whose keys are written by hand.
     const FEW_ROWS: usize = 8;
     /// Rows per row group in the hand-written fixtures with two row groups.
@@ -2072,8 +2054,6 @@ mod tests {
     /// this factor of its key chunk bytes once the value column's column
     /// index is dropped; with the index kept they run to tens of times.
     const RESIDENT_TO_KEY_CHUNK_FACTOR: u64 = 6;
-    /// The residency tiers.
-    const TIERS: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
     /// The key types.
     const KEY_TYPES: [KeyType; 4] = [
         KeyType::Long,
@@ -2098,10 +2078,16 @@ mod tests {
         format!("{MEM_PREFIX}{FILE_KEY}")
     }
 
-    /// The `i`th key of a fixture of `key_type`: `KEY_STEP * i` rendered in
+    /// The number of the `i`th written key: `KEY_STEP * i`, so the key after
+    /// any written key is absent and inside the file's range.
+    fn stepped(i: usize) -> usize {
+        usize::try_from(KEY_STEP).unwrap() * i
+    }
+
+    /// The `i`th key of a fixture of `key_type`: `stepped(i)` rendered in
     /// the type, ascending in the served order.
     fn key_for(i: usize, key_type: KeyType) -> Key {
-        let n = KEY_STEP * i;
+        let n = stepped(i);
         match key_type {
             KeyType::Long => Key::Long(i64::try_from(n).unwrap()),
             KeyType::String => Key::Str(format!("user:{n:012}")),
@@ -2162,26 +2148,13 @@ mod tests {
         key_for(0, key_type).as_bytes().len()
     }
 
-    /// `len` bytes that are a function of the row.
+    /// `len` bytes that are a function of row `i`.
     fn value_of_len(i: usize, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|j| {
-                u8::try_from((i * VALUE_ROW_MIX + j * VALUE_BYTE_MIX) % VALUE_MODULUS).unwrap()
-            })
-            .collect()
+        testing::value_of_len(i64::try_from(i).unwrap(), len)
     }
 
     fn value_for(i: usize) -> Vec<u8> {
         value_of_len(i, VALUE_BYTES)
-    }
-
-    /// How a fixture's key column is typed in arrow.
-    #[derive(Clone, Copy)]
-    enum KeyColumn {
-        Int64,
-        Utf8,
-        Binary,
-        FixedBinary(i32),
     }
 
     /// How a fixture's value column is typed in arrow; `Int64` is the type
@@ -2191,25 +2164,6 @@ mod tests {
         Binary,
         FixedBinary(i32),
         Int64,
-    }
-
-    fn column_of(key_type: KeyType) -> KeyColumn {
-        match key_type {
-            KeyType::Long => KeyColumn::Int64,
-            KeyType::String => KeyColumn::Utf8,
-            KeyType::Binary => KeyColumn::Binary,
-            KeyType::Uuid => KeyColumn::FixedBinary(i32::try_from(UUID_BYTES).unwrap()),
-        }
-    }
-
-    /// Which columns a fixture dictionary-encodes.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Dictionary {
-        Off,
-        /// The key column alone.
-        Key,
-        /// Every column.
-        All,
     }
 
     /// The writer's layout knobs; `contract` is RFD 002's shape.
@@ -2222,7 +2176,7 @@ mod tests {
         dictionary: Dictionary,
         statistics: EnabledStatistics,
         truncate: Option<usize>,
-        bloom: bool,
+        bloom: Bloom,
         offset_index: bool,
     }
 
@@ -2236,40 +2190,28 @@ mod tests {
                 dictionary: Dictionary::Off,
                 statistics: EnabledStatistics::Page,
                 truncate: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
-                bloom: true,
+                bloom: Bloom::Sized,
                 offset_index: true,
             }
         }
 
-        /// The filter setters enable a filter on the column they name, so
-        /// the key column gets one only when `bloom` asks and the value
-        /// column never does. Page statistics keep the offset index on
-        /// whatever `offset_index` says, so a fixture without one also
-        /// writes no statistics.
+        /// The key column's filter is sized to one row group's keys. Page
+        /// statistics keep the offset index on whatever `offset_index`
+        /// says, so a fixture without one also writes no statistics.
         fn properties(&self) -> WriterProperties {
-            let mut builder = WriterProperties::builder()
+            let builder = WriterProperties::builder()
                 .set_max_row_group_row_count(Some(self.row_group_rows))
                 .set_write_batch_size(self.write_batch)
                 .set_data_page_row_count_limit(self.page_rows)
                 .set_data_page_size_limit(self.page_bytes)
-                .set_dictionary_enabled(self.dictionary == Dictionary::All)
                 .set_statistics_enabled(self.statistics)
                 .set_column_index_truncate_length(self.truncate)
                 .set_statistics_truncate_length(self.truncate)
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .set_bloom_filter_enabled(false)
                 .set_offset_index_disabled(!self.offset_index);
-            if self.dictionary == Dictionary::Key {
-                builder = builder.set_column_dictionary_enabled(ColumnPath::from(KEY_COLUMN), true);
-            }
-            if self.bloom {
-                let key = ColumnPath::from(KEY_COLUMN);
-                builder = builder
-                    .set_column_bloom_filter_enabled(key.clone(), true)
-                    .set_column_bloom_filter_fpp(key.clone(), BLOOM_FPP)
-                    .set_column_bloom_filter_ndv(key, count(self.row_group_rows));
-            }
-            builder.build()
+            let builder = with_dictionary(builder, self.dictionary);
+            with_key_bloom(builder, self.bloom, count(self.row_group_rows)).build()
         }
     }
 
@@ -2335,57 +2277,11 @@ mod tests {
         }
     }
 
-    fn key_data_type(column: KeyColumn) -> DataType {
-        match column {
-            KeyColumn::Int64 => DataType::Int64,
-            KeyColumn::Utf8 => DataType::Utf8,
-            KeyColumn::Binary => DataType::Binary,
-            KeyColumn::FixedBinary(width) => DataType::FixedSizeBinary(width),
-        }
-    }
-
     fn value_data_type(column: ValueColumn) -> DataType {
         match column {
             ValueColumn::Binary => DataType::Binary,
             ValueColumn::FixedBinary(width) => DataType::FixedSizeBinary(width),
             ValueColumn::Int64 => DataType::Int64,
-        }
-    }
-
-    fn key_array(column: KeyColumn, keys: &[Option<Key>]) -> ArrayRef {
-        let raw = || {
-            keys.iter()
-                .map(|key| key.as_ref().map(|key| key.as_bytes().into_owned()))
-        };
-        match column {
-            KeyColumn::Int64 => Arc::new(Int64Array::from(
-                keys.iter()
-                    .map(|key| {
-                        key.as_ref().map(|key| {
-                            let Key::Long(value) = key else {
-                                panic!("a long fixture holds long keys");
-                            };
-                            *value
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            KeyColumn::Utf8 => Arc::new(
-                keys.iter()
-                    .map(|key| {
-                        key.as_ref().map(|key| {
-                            let Key::Str(text) = key else {
-                                panic!("a string fixture holds string keys");
-                            };
-                            text.clone()
-                        })
-                    })
-                    .collect::<StringArray>(),
-            ),
-            KeyColumn::Binary => Arc::new(raw().collect::<BinaryArray>()),
-            KeyColumn::FixedBinary(width) => Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(raw(), width).unwrap(),
-            ),
         }
     }
 
@@ -2467,7 +2363,7 @@ mod tests {
             residency: Residency,
             dir: &Path,
         ) -> Result<FileIndex> {
-            let local = local_dir(dir, self.stats());
+            let local = testing::local_dir(dir, self.stats(), None);
             let local = (residency == Residency::Disk).then_some(&local);
             self.build(key_type, residency, local).await
         }
@@ -2490,33 +2386,6 @@ mod tests {
                 })
                 .collect()
         }
-    }
-
-    /// A local directory under `dir` charging its reads to `stats`, with no
-    /// page cache disk level.
-    fn local_dir(dir: &Path, stats: Arc<IoStats>) -> LocalDir {
-        LocalDir::open(
-            &LocalConfig {
-                dir: dir.to_path_buf(),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            stats,
-        )
-        .unwrap()
-    }
-
-    async fn cache() -> PageCache {
-        PageCache::new(CACHE_BYTES, None).await.unwrap()
-    }
-
-    /// The refusal a build ended in, for `TABLE`.
-    fn refusal_of(result: Result<FileIndex>) -> RefusalReason {
-        let Err(Error::Refused { table, reason }) = result else {
-            panic!("expected a refusal, got {result:?}");
-        };
-        assert_eq!(table, TABLE);
-        reason
     }
 
     /// The file fault a build or a check ended in, for the fixture file.
@@ -2800,14 +2669,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_long_prefix_string_keys_across_truncated_row_group_statistics() {
-        for residency in TIERS {
+        for residency in Residency::ALL {
             check_long_prefix_lookups(KeyType::String, residency).await;
         }
     }
 
     #[tokio::test]
     async fn test_find_long_prefix_binary_keys_across_truncated_row_group_statistics() {
-        for residency in TIERS {
+        for residency in Residency::ALL {
             check_long_prefix_lookups(KeyType::Binary, residency).await;
         }
     }
@@ -3043,7 +2912,7 @@ mod tests {
         fixture.layout.dictionary = Dictionary::Key;
         let opened = store(&fixture).await;
         let stats = opened.stats();
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let index = opened
                 .build_in(KeyType::Long, residency, dir.path())
                 .await
@@ -3108,7 +2977,7 @@ mod tests {
     /// `FEW_ROWS` string keys of exactly `len` bytes: zero-padded decimals.
     fn keys_of_len(len: usize) -> Vec<Option<Key>> {
         (0..FEW_ROWS)
-            .map(|i| Some(Key::Str(format!("{:0>len$}", KEY_STEP * i))))
+            .map(|i| Some(Key::Str(format!("{:0>len$}", stepped(i)))))
             .collect()
     }
 
@@ -3122,7 +2991,7 @@ mod tests {
         let index = opened.index(KeyType::String).await;
         assert_eq!(index.max_key_bytes(), MAX_KEY_BYTES);
         for i in 0..FEW_ROWS {
-            let key = Key::Str(format!("{:0>MAX_KEY_BYTES$}", KEY_STEP * i));
+            let key = Key::Str(format!("{:0>MAX_KEY_BYTES$}", stepped(i)));
             let row = index.find(&key, None).await.unwrap().unwrap();
             assert_eq!(
                 row,
@@ -3138,7 +3007,7 @@ mod tests {
             keys_of_len(MAX_KEY_BYTES + 1),
         ))
         .await;
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             assert_eq!(
                 refusal_of(over.build_in(KeyType::String, residency, dir.path()).await),
@@ -3157,7 +3026,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_refuses_an_unsorted_row_group_in_every_tier() {
         let opened = store(&Fixture::with_keys(KeyColumn::Int64, longs(&[5, 3, 9]))).await;
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             assert_eq!(
                 refusal_of(opened.build_in(KeyType::Long, residency, dir.path()).await),
@@ -3175,7 +3044,7 @@ mod tests {
         let mut fixture = Fixture::with_keys(KeyColumn::Int64, longs(&[10, 20, 5, 30]));
         fixture.layout.row_group_rows = TINY_GROUP_ROWS;
         let opened = store(&fixture).await;
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             let index = opened.build_in(KeyType::Long, residency, dir.path()).await;
             assert_eq!(
@@ -3206,7 +3075,7 @@ mod tests {
         let mut across = Fixture::with_keys(KeyColumn::Int64, longs(&[10, 20, 20, 30]));
         across.layout.row_group_rows = TINY_GROUP_ROWS;
         let across = store(&across).await;
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             assert_eq!(
                 refusal_of(within.build_in(KeyType::Long, residency, dir.path()).await),
@@ -3241,7 +3110,7 @@ mod tests {
             vec![Some(Key::Long(1)), None, Some(Key::Long(3))],
         ))
         .await;
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             assert_eq!(
                 refusal_of(opened.build_in(KeyType::Long, residency, dir.path()).await),
@@ -3281,7 +3150,7 @@ mod tests {
                     .map(|i| Some(key_for(i, KeyType::Binary)))
                     .collect(),
                 KeyColumn::FixedBinary(_) => (0..FEW_ROWS)
-                    .map(|i| Some(Key::Bytes(count(KEY_STEP * i).to_be_bytes().to_vec())))
+                    .map(|i| Some(Key::Bytes(count(stepped(i)).to_be_bytes().to_vec())))
                     .collect(),
             };
             let opened = store(&Fixture::with_keys(column, keys)).await;
@@ -3300,7 +3169,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_fixed_width_binary_keys_as_binary() {
         let keys: Vec<Option<Key>> = (0..FEW_ROWS)
-            .map(|i| Some(Key::Bytes(count(KEY_STEP * i).to_be_bytes().to_vec())))
+            .map(|i| Some(Key::Bytes(count(stepped(i)).to_be_bytes().to_vec())))
             .collect();
         let opened = store(&Fixture::with_keys(
             KeyColumn::FixedBinary(FIXED_KEY_BYTES),
@@ -3806,7 +3675,7 @@ mod tests {
     #[tokio::test]
     async fn test_bloom_tier_refuses_a_file_without_a_filter_that_full_serves() {
         let mut fixture = Fixture::contract(KeyType::Long, FEW_ROWS);
-        fixture.layout.bloom = false;
+        fixture.layout.bloom = Bloom::Off;
         let opened = store(&fixture).await;
         assert_eq!(
             refusal_of(opened.build(KeyType::Long, Residency::Bloom, None).await),
@@ -3995,7 +3864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opened = store(&Fixture::contract(KeyType::Long, rows)).await;
         let stats = opened.stats();
-        let local = local_dir(dir.path(), opened.stats());
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
         let index = opened
             .build(KeyType::Long, Residency::Disk, Some(&local))
             .await
@@ -4077,7 +3946,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opened = store(&Fixture::contract(KeyType::Long, rows)).await;
         let stats = opened.stats();
-        let local = local_dir(dir.path(), opened.stats());
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
         let index = opened
             .build(KeyType::Long, Residency::Disk, Some(&local))
             .await
@@ -4220,7 +4089,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opened = store(&Fixture::contract(KeyType::Uuid, rows)).await;
         let stats = opened.stats();
-        for residency in TIERS {
+        for residency in Residency::ALL {
             let index = opened
                 .build_in(KeyType::Uuid, residency, dir.path())
                 .await
@@ -4289,7 +4158,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
-        let local = local_dir(dir.path(), opened.stats());
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
         let fresh = inspect(&opened, KeyType::Long).await;
         let disk_bytes = fresh.predicted().disk_bytes;
         assert!(disk_bytes > 0);
@@ -4331,7 +4200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for key_type in KEY_TYPES {
             let opened = store(&Fixture::contract(key_type, rows)).await;
-            for residency in TIERS {
+            for residency in Residency::ALL {
                 let index = opened
                     .build_in(key_type, residency, dir.path())
                     .await
@@ -4352,7 +4221,7 @@ mod tests {
                 assert!(predicted.bloom_bits_per_key.unwrap() > 0.0);
             }
             let stats = opened.stats();
-            let local = local_dir(dir.path(), opened.stats());
+            let local = testing::local_dir(dir.path(), opened.stats(), None);
             let disk = opened
                 .build(key_type, Residency::Disk, Some(&local))
                 .await

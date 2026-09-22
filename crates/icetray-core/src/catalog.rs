@@ -401,14 +401,11 @@ mod tests {
 
     use super::*;
     use crate::config::StorageConfig;
+    use crate::generation::testing::{MEM_PREFIX, TABLE, table_fault_of};
     use crate::manifest::testing;
 
-    /// The synthetic prefix the in-memory store is registered under.
-    const MEM_PREFIX: &str = "mem://w/";
     /// The table root under the prefix.
     const ROOT_KEY: &str = "db/kv";
-    /// The table the tests name.
-    const TABLE: &str = "kv";
     /// The tag the first snapshot carries.
     const TAG: &str = "serving";
     /// A ref no metadata has.
@@ -536,18 +533,6 @@ mod tests {
         TableSource::Static { location: root() }
     }
 
-    fn fault_of<T: std::fmt::Debug>(result: Result<T>, table: &str) -> TableFault {
-        let Err(Error::Table {
-            table: named,
-            fault,
-        }) = result
-        else {
-            panic!("expected a table fault, got {result:?}");
-        };
-        assert_eq!(named, table);
-        fault
-    }
-
     #[tokio::test]
     async fn test_resolve_follows_every_version_hint_form() {
         let store = Store::new();
@@ -586,7 +571,7 @@ mod tests {
         for content in ["", "  \n\t"] {
             store.put_hint(content).await;
             assert_eq!(
-                fault_of(static_root().resolve(&store.storage).await, &root()),
+                table_fault_of(static_root().resolve(&store.storage).await, &root()),
                 TableFault::VersionHintEmpty { root: root() }
             );
         }
@@ -607,7 +592,7 @@ mod tests {
         for (content, hint) in cases {
             store.put_hint(content).await;
             assert_eq!(
-                fault_of(static_root().resolve(&store.storage).await, &root()),
+                table_fault_of(static_root().resolve(&store.storage).await, &root()),
                 TableFault::VersionHintMalformed { root: root(), hint }
             );
         }
@@ -688,7 +673,7 @@ mod tests {
             FIRST_SNAPSHOT
         );
         assert_eq!(
-            fault_of(resolved.snapshot_for_ref(TABLE, MISSING_REF), TABLE),
+            table_fault_of(resolved.snapshot_for_ref(TABLE, MISSING_REF), TABLE),
             TableFault::RefNotFound {
                 ref_name: MISSING_REF.to_string(),
             }

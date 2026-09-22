@@ -488,8 +488,9 @@ pub enum Residency {
 }
 
 impl Residency {
-    /// Every tier, for the parser and the tests that hold the names together.
-    const ALL: [Self; 3] = [Self::Full, Self::Disk, Self::Bloom];
+    /// Every tier, for the parser, the refusal message, and the tests that
+    /// run a case per tier.
+    pub(crate) const ALL: [Self; 3] = [Self::Full, Self::Disk, Self::Bloom];
 
     /// Every tier's name, comma-separated, for the message that refuses a
     /// name; rendered from `ALL` so the list cannot lag the enum.
