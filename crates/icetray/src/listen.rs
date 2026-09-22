@@ -30,10 +30,10 @@ pub const READY_PATH: &str = "/ready";
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// The body of a 200 on `READY_PATH`.
-const READY_BODY: &str = "ready";
+pub const READY_BODY: &str = "ready";
 
 /// The body of a 503 on `READY_PATH`.
-const NOT_READY_BODY: &str = "not ready";
+pub const NOT_READY_BODY: &str = "not ready";
 
 /// How long the accept loop pauses after `accept` fails before trying again:
 /// long enough that a descriptor shortage does not spin a worker, short

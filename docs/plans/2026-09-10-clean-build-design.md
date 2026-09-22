@@ -976,7 +976,8 @@ of the key), `layout` (`Layout` with `page_rows`, `page_bytes`,
 `keys_at`, and the sources `catalog_source`, `root_source`,
 `pinned_source`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
 `write_table_of_types`, `position_delete_file`, `memory_catalog_local`,
-`memory_catalog_s3`, `local_catalog`, `residue_class`; the constants
+`memory_catalog_s3` (their `MemoryCatalog` re-exported at the crate root, so a
+caller without `iceberg` can hold it), `local_catalog`, `residue_class`; the constants
 `SMALL_IDS`, `SMALL_BUCKETS`, `SAMPLE`, `INTERLEAVED_IDS`,
 `INTERLEAVE_STRIDE`, `INTERLEAVED_BUCKETS`, `DATA_DIR`, and the shapes the
 acceptance tests share, each declared once: `NAMESPACE`, `IDS_4K`, `IDS_2K`,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::StatusCode;
-use icetray::listen::{METRICS_PATH, READY_PATH};
+use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
@@ -23,16 +23,19 @@ use icetray_proto::v1::{
 };
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::verify::{expected_cold_gets, series_value};
-use icetray_testkit::{Fixture, FixtureSpec, Nulls, S3Fixture, memory_catalog_s3, write_fixture};
+use icetray_testkit::{
+    Fixture, FixtureSpec, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3, write_fixture,
+};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
-use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 
 mod common;
 
-use common::{BoxError, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get};
+use common::{
+    BoxError, NULL_EVERY, NULL_ID, PRESENT_ID, SHUTDOWN_WAIT, health_status, http_get, poll_until,
+};
 
 /// What every test returns.
 type TestResult = Result<(), BoxError>;
@@ -110,14 +113,27 @@ const DISPATCH_DELAY: Duration = Duration::from_millis(20);
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A running daemon over fixtures in the in-process S3 server, with the
-/// clients to drive it and the storage counters to price it.
+/// clients to drive it, the catalog the fixtures were written through, and
+/// the storage counters to price it.
 struct Stack {
     s3: S3Fixture,
+    catalog: Arc<MemoryCatalog>,
     fixtures: Vec<Fixture>,
     serving: Serving,
     client: IcetrayClient<Channel>,
     health: HealthClient<Channel>,
     stats: Arc<IoStats>,
+}
+
+/// What `Stack::start_with` hands a test before the daemon starts: the
+/// written fixtures, the configuration serving each from its pinned
+/// metadata file at `Residency::Full` and not strict, and the default
+/// options. The configuration is built directly, so nothing validates it
+/// before the load does, and a test reaches what `Config::parse` refuses.
+struct Setup {
+    fixtures: Vec<Fixture>,
+    config: Config,
+    options: ServeOptions,
 }
 
 /// A configuration over `s3` serving `tables` with both listeners on
@@ -139,6 +155,16 @@ impl Stack {
     /// Writes one fixture per spec and serves each from its pinned metadata
     /// file, not yet loaded.
     async fn start(specs: Vec<FixtureSpec>) -> Result<Self, BoxError> {
+        Self::start_with(specs, async |_| Ok(())).await
+    }
+
+    /// `start`, with `configure` run over the `Setup` between the fixture
+    /// writes and the daemon's start; the loads run behind the returned
+    /// stack.
+    async fn start_with(
+        specs: Vec<FixtureSpec>,
+        configure: impl AsyncFnOnce(&mut Setup) -> Result<(), BoxError>,
+    ) -> Result<Self, BoxError> {
         let s3 = S3Fixture::start(BUCKET).await?;
         let catalog = memory_catalog_s3(&s3, WAREHOUSE).await?;
         let mut fixtures = Vec::with_capacity(specs.len());
@@ -149,18 +175,17 @@ impl Stack {
             .iter()
             .map(|fixture| fixture.config(Residency::Full, false))
             .collect();
-        Self::serve(s3, fixtures, tables, ServeOptions::default()).await
-    }
-
-    /// Serves `tables` over `s3`, whose objects `fixtures` wrote, and
-    /// connects the clients; the loads run behind the returned stack.
-    async fn serve(
-        s3: S3Fixture,
-        fixtures: Vec<Fixture>,
-        tables: Vec<TableConfig>,
-        options: ServeOptions,
-    ) -> Result<Self, BoxError> {
-        let config = config_over(&s3, tables);
+        let mut setup = Setup {
+            fixtures,
+            config: config_over(&s3, tables),
+            options: ServeOptions::default(),
+        };
+        configure(&mut setup).await?;
+        let Setup {
+            fixtures,
+            config,
+            options,
+        } = setup;
         let storage = Arc::new(Storage::new(s3.storage_config()));
         let stats = storage.stats();
         let serving = Serving::start_over(config, storage, telemetry::install()?, options).await?;
@@ -169,6 +194,7 @@ impl Stack {
             .await?;
         Ok(Self {
             s3,
+            catalog,
             fixtures,
             serving,
             client: IcetrayClient::new(channel.clone()),
@@ -186,14 +212,7 @@ impl Stack {
 
     /// The health status of `service`.
     async fn health_status(&mut self, service: &str) -> Result<ServingStatus, BoxError> {
-        let response = self
-            .health
-            .check(HealthCheckRequest {
-                service: service.to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(ServingStatus::try_from(response.status)?)
+        health_status(&mut self.health, service).await
     }
 
     /// One `Get` of `key` on `table`.
@@ -291,7 +310,7 @@ async fn test_health_is_not_serving_until_every_table_serves() -> TestResult {
     );
     let (status, body) = stack.http_get(READY_PATH).await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body, "not ready");
+    assert_eq!(body, NOT_READY_BODY);
 
     stack.serving.ready().await;
     assert_eq!(
@@ -304,7 +323,7 @@ async fn test_health_is_not_serving_until_every_table_serves() -> TestResult {
     );
     let (status, body) = stack.http_get(READY_PATH).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "ready");
+    assert_eq!(body, READY_BODY);
     let (status, _) = stack.http_get("/elsewhere").await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
@@ -580,40 +599,29 @@ async fn test_requests_total_counts_every_call() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let s3 = S3Fixture::start(BUCKET).await?;
-    let catalog = memory_catalog_s3(&s3, WAREHOUSE).await?;
-    let fixture = write_fixture(
-        catalog.as_ref(),
-        NAMESPACE,
-        FixtureSpec::small(TABLE, KeyType::Long),
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            // Followed from the table root through its version hint, so an
+            // append after the start is what the poll finds.
+            setup.fixtures[0].write_hint().await?;
+            setup.config.tables[0].source = setup.fixtures[0].root_source();
+            Ok(())
+        },
     )
     .await?;
-    fixture.write_hint().await?;
-    let followed = TableConfig {
-        source: fixture.root_source(),
-        ..fixture.config(Residency::Full, false)
-    };
-    let mut stack =
-        Stack::serve(s3, vec![fixture], vec![followed], ServeOptions::default()).await?;
     stack.serving.ready().await;
     let first = stack.table_info(TABLE).await?.snapshot_id;
 
     stack.fixtures[0]
-        .append(catalog.as_ref(), NEW_IDS, APPEND_PREFIX)
+        .append(stack.catalog.as_ref(), NEW_IDS, APPEND_PREFIX)
         .await?;
     stack.fixtures[0].write_hint().await?;
-    let deadline = tokio::time::Instant::now() + REFRESH_WAIT;
-    let advanced = loop {
+    let advanced = poll_until(REFRESH_WAIT, "the table advancing", async || {
         let info = stack.table_info(TABLE).await?;
-        if info.snapshot_id != first {
-            break info;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the table did not advance within {REFRESH_WAIT:?}"
-        );
-        tokio::time::sleep(POLL_STEP).await;
-    };
+        Ok((info.snapshot_id != first).then_some(info))
+    })
+    .await?;
     assert_eq!(
         advanced.snapshot_id,
         stack.fixtures[0]
@@ -660,22 +668,17 @@ async fn test_shutdown_drains_and_returns_ok() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let s3 = S3Fixture::start(BUCKET).await?;
-    let catalog = memory_catalog_s3(&s3, WAREHOUSE).await?;
-    let fixture = write_fixture(
-        catalog.as_ref(),
-        NAMESPACE,
-        FixtureSpec::small(TABLE, KeyType::Long),
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            // Disk residency with no `storage.local`: refused as `NoLocalDir`
+            // at load.
+            setup.config.tables[0].residency = Residency::Disk;
+            setup.options.start_failure_grace = FAILURE_GRACE;
+            Ok(())
+        },
     )
     .await?;
-    // Disk residency with no `storage.local`: refused as `NoLocalDir` at
-    // load. The configuration is built directly, so nothing validates it
-    // before the load does.
-    let disk = fixture.config(Residency::Disk, false);
-    let options = ServeOptions {
-        start_failure_grace: FAILURE_GRACE,
-    };
-    let mut stack = Stack::serve(s3, vec![fixture], vec![disk], options).await?;
 
     assert_eq!(
         stack.health_status(OVERALL_SERVICE).await?,
@@ -712,19 +715,15 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let s3 = S3Fixture::start(BUCKET).await?;
-    let catalog = memory_catalog_s3(&s3, WAREHOUSE).await?;
-    let fixture = write_fixture(
-        catalog.as_ref(),
-        NAMESPACE,
-        FixtureSpec::small(TABLE, KeyType::Long),
+    let stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.tables[0].residency = Residency::Disk;
+            setup.options.start_failure_grace = SHUTDOWN_WAIT;
+            Ok(())
+        },
     )
     .await?;
-    let disk = fixture.config(Residency::Disk, false);
-    let options = ServeOptions {
-        start_failure_grace: SHUTDOWN_WAIT,
-    };
-    let stack = Stack::serve(s3, vec![fixture], vec![disk], options).await?;
     stack.serving.shutdown();
     let outcome = tokio::time::timeout(REFRESH_WAIT, stack.serving.join()).await?;
     let Err(ServeError::FirstLoad { failures }) = outcome else {

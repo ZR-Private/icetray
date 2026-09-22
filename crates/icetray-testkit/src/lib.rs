@@ -16,6 +16,9 @@ pub use fixture::{
     Fixture, FixtureSpec, HandSnapshot, Nulls, Order, RawFile, memory_catalog_local,
     memory_catalog_s3, write_fixture,
 };
+/// The catalog `memory_catalog_local` and `memory_catalog_s3` return, so a
+/// caller without an `iceberg` dependency can hold it.
+pub use iceberg::memory::MemoryCatalog;
 pub use keys::{
     absent_key_from, absent_key_near, far_key, key_at, key_at_padded, value_for, value_for_len,
 };

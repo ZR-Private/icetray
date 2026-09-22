@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hyper::StatusCode;
 use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
-use icetray::listen::{METRICS_PATH, READY_PATH};
+use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
-use icetray_core::{Key, KeyType};
+use icetray_core::{Key, KeyType, SnapshotId, TableState};
 use icetray_testkit::fixture::{
     IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, UNPARTITIONED_FILE_BYTES,
 };
@@ -24,13 +24,14 @@ use icetray_testkit::verify::series_value;
 use icetray_testkit::{Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture};
 use serde_json::Value as Json;
 use tonic::transport::Channel;
-use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 
 mod common;
 
-use common::{BoxError, NULL_EVERY, NULL_ID, POLL_STEP, PRESENT_ID, SHUTDOWN_WAIT, http_get};
+use common::{
+    BoxError, NULL_EVERY, NULL_ID, PRESENT_ID, SHUTDOWN_WAIT, health_status, http_get, poll_until,
+};
 
 /// What every test returns.
 type TestResult = Result<(), BoxError>;
@@ -71,6 +72,11 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
 /// The exit code of a finished run.
 fn code(output: &Output) -> i32 {
     output.status.code().expect("the binary exited")
+}
+
+/// Asserts the run exited with `expected`, showing its stderr when it did not.
+fn assert_exit(output: &Output, expected: u8) {
+    assert_eq!(code(output), i32::from(expected), "{}", stderr(output));
 }
 
 /// `stdout` parsed line by line.
@@ -158,18 +164,8 @@ fn write_file(dir: &Path, name: &str, text: &str) -> Result<String, BoxError> {
 }
 
 /// Waits for `child` to exit, up to `wait`.
-fn wait_within(child: &mut Child, wait: Duration) -> Result<ExitStatus, BoxError> {
-    let deadline = Instant::now() + wait;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the child did not exit within {wait:?}"
-        );
-        std::thread::sleep(POLL_STEP);
-    }
+async fn wait_within(child: &mut Child, wait: Duration) -> Result<ExitStatus, BoxError> {
+    poll_until(wait, "the child exiting", async || Ok(child.try_wait()?)).await
 }
 
 #[tokio::test]
@@ -177,7 +173,7 @@ async fn test_info_serializes_the_summary() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_info", KeyType::Long)).await?;
     let output = run(&[&["info"][..], &location(&fixture)].concat(), &[]);
-    assert_eq!(code(&output), i32::from(EXIT_OK), "{}", stderr(&output));
+    assert_exit(&output, EXIT_OK);
     let raw = String::from_utf8(output.stdout.clone())?;
     assert!(
         raw.starts_with(&format!(
@@ -207,7 +203,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
         &[&["doctor"][..], &location(&fixture), &["--files"]].concat(),
         &[],
     );
-    assert_eq!(code(&output), i32::from(EXIT_OK), "{}", stderr(&output));
+    assert_exit(&output, EXIT_OK);
     let report = lines(&output.stdout);
     assert_eq!(report[0]["kind"], "doctor");
     assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
@@ -235,12 +231,7 @@ async fn test_doctor_prices_an_unpartitioned_table_and_exits_2() -> TestResult {
     };
     let fixture = local_fixture(dir.path(), spec).await?;
     let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
-    assert_eq!(
-        code(&output),
-        i32::from(EXIT_INEFFICIENT),
-        "{}",
-        stderr(&output)
-    );
+    assert_exit(&output, EXIT_INEFFICIENT);
     let report = lines(&output.stdout);
     assert_eq!(report[0]["kind"], "doctor");
     assert_eq!(report[0]["serviceability"], "inefficient");
@@ -263,12 +254,7 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     };
     let fixture = local_fixture(dir.path(), spec).await?;
     let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
-    assert_eq!(
-        code(&output),
-        i32::from(EXIT_FAILURE),
-        "{}",
-        stderr(&output)
-    );
+    assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
     assert_eq!(report.len(), 1);
     assert_eq!(report[0]["kind"], "refused");
@@ -301,7 +287,7 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
         .concat(),
         &[],
     );
-    assert_eq!(code(&output), i32::from(EXIT_OK), "{}", stderr(&output));
+    assert_exit(&output, EXIT_OK);
     let got = lines(&output.stdout);
     assert_eq!(got.len(), keys.len());
     for (line, key) in got.iter().zip(&keys) {
@@ -346,12 +332,7 @@ async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
             Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => key.to_string(),
         };
         let output = run(&[&["get"][..], &location(&fixture), &[&text]].concat(), &[]);
-        assert_eq!(
-            code(&output),
-            i32::from(EXIT_OK),
-            "{name}: {}",
-            stderr(&output)
-        );
+        assert_exit(&output, EXIT_OK);
         let got = lines(&output.stdout);
         assert_eq!(got.len(), 1, "{name}");
         assert_eq!(got[0]["presence"], "present", "{name}");
@@ -364,7 +345,7 @@ async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
                 &[&["get"][..], &location(&fixture), &[&uppercase]].concat(),
                 &[],
             );
-            assert_eq!(code(&output), i32::from(EXIT_OK), "{}", stderr(&output));
+            assert_exit(&output, EXIT_OK);
             let got = lines(&output.stdout);
             assert_eq!(got[0]["presence"], "present");
             assert_eq!(got[0]["key"], Json::String(key.to_string()));
@@ -378,7 +359,7 @@ async fn test_get_rejects_a_key_that_does_not_parse() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_badkey", KeyType::Long)).await?;
     let output = run(&[&["get"][..], &location(&fixture), &["abc"]].concat(), &[]);
-    assert_eq!(code(&output), i32::from(EXIT_USAGE), "{}", stderr(&output));
+    assert_exit(&output, EXIT_USAGE);
     assert!(output.stdout.is_empty());
     Ok(())
 }
@@ -404,16 +385,11 @@ async fn test_get_needs_a_table_name_when_several_are_configured() -> TestResult
     let key = a.key(SAMPLE[0]).to_string();
 
     let unnamed = run(&["get", "--config", &config, &key], &[]);
-    assert_eq!(
-        code(&unnamed),
-        i32::from(EXIT_USAGE),
-        "{}",
-        stderr(&unnamed)
-    );
+    assert_exit(&unnamed, EXIT_USAGE);
     assert!(unnamed.stdout.is_empty());
 
     let named = run(&["get", "--config", &config, "--table", TABLE_A, &key], &[]);
-    assert_eq!(code(&named), i32::from(EXIT_OK), "{}", stderr(&named));
+    assert_exit(&named, EXIT_OK);
     let got = lines(&named.stdout);
     assert_eq!(got.len(), 1);
     assert_eq!(got[0]["table"], TABLE_A);
@@ -430,18 +406,8 @@ async fn test_config_toml_and_json_open_the_same_table() -> TestResult {
     let json = write_file(dir.path(), "one.json", &json)?;
     let from_toml = run(&["info", "--config", &toml], &[]);
     let from_json = run(&["info", "--config", &json], &[]);
-    assert_eq!(
-        code(&from_toml),
-        i32::from(EXIT_OK),
-        "{}",
-        stderr(&from_toml)
-    );
-    assert_eq!(
-        code(&from_json),
-        i32::from(EXIT_OK),
-        "{}",
-        stderr(&from_json)
-    );
+    assert_exit(&from_toml, EXIT_OK);
+    assert_exit(&from_json, EXIT_OK);
     assert_eq!(from_toml.stdout, from_json.stdout);
     let info = lines(&from_toml.stdout);
     assert_eq!(info.len(), 1);
@@ -456,33 +422,18 @@ async fn test_location_only_flags_are_rejected_under_config() -> TestResult {
     let config = write_file(dir.path(), "one.toml", &toml_table(TABLE_A, &fixture))?;
 
     let flagged = run(&["info", "--config", &config, "--key-column", "key"], &[]);
-    assert_eq!(
-        code(&flagged),
-        i32::from(EXIT_USAGE),
-        "{}",
-        stderr(&flagged)
-    );
+    assert_exit(&flagged, EXIT_USAGE);
     assert!(flagged.stdout.is_empty());
 
     let targetless = run(&["info"], &[]);
-    assert_eq!(
-        code(&targetless),
-        i32::from(EXIT_USAGE),
-        "{}",
-        stderr(&targetless)
-    );
+    assert_exit(&targetless, EXIT_USAGE);
     assert!(targetless.stdout.is_empty());
 
     let unknown = run(
         &[&["info"][..], &location(&fixture), &["--table", "nobody"]].concat(),
         &[],
     );
-    assert_eq!(
-        code(&unknown),
-        i32::from(EXIT_USAGE),
-        "{}",
-        stderr(&unknown)
-    );
+    assert_exit(&unknown, EXIT_USAGE);
     assert!(unknown.stdout.is_empty());
     Ok(())
 }
@@ -510,7 +461,7 @@ async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     assert_eq!(line["kind"], "get");
     drop(reader);
     let output = child.wait_with_output()?;
-    assert_eq!(code(&output), i32::from(EXIT_OK), "{}", stderr(&output));
+    assert_exit(&output, EXIT_OK);
     Ok(())
 }
 
@@ -526,8 +477,16 @@ fn check_log_line(line: &Json) {
     }
 }
 
-/// The `state` label value of a table that serves, as `TableState` renders it.
-const SERVING_STATE: &str = "serving";
+/// The `state` label value of a table that serves, as core renders the
+/// state; the state's fields do not reach the label, so any snapshot and
+/// instant give it.
+fn serving_state() -> String {
+    TableState::Serving {
+        snapshot_id: SnapshotId(0),
+        since: Instant::now(),
+    }
+    .to_string()
+}
 
 /// The conformance run of RFD 012, which `dev/conformance.sh` runs by name:
 /// the binary started as an orchestrator starts it (the configuration path
@@ -580,37 +539,26 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
         .connect()
         .await?;
     let mut health = HealthClient::new(channel);
-    let during_load = health
-        .check(HealthCheckRequest {
-            service: OVERALL_SERVICE.to_string(),
-        })
-        .await?
-        .into_inner()
-        .status;
     assert!(matches!(
-        ServingStatus::try_from(during_load)?,
+        health_status(&mut health, OVERALL_SERVICE).await?,
         ServingStatus::NotServing | ServingStatus::Serving
     ));
 
-    let deadline = Instant::now() + READY_WAIT;
-    loop {
+    poll_until(READY_WAIT, "readiness", async || {
         let (status, body) = http_get(metrics, READY_PATH).await?;
         if status == StatusCode::OK {
-            assert_eq!(body, "ready");
-            break;
+            assert_eq!(body, READY_BODY);
+            return Ok(Some(()));
         }
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(Instant::now() < deadline, "not ready within {READY_WAIT:?}");
-        tokio::time::sleep(POLL_STEP).await;
-    }
-    let status = health
-        .check(HealthCheckRequest {
-            service: OVERALL_SERVICE.to_string(),
-        })
-        .await?
-        .into_inner()
-        .status;
-    assert_eq!(ServingStatus::try_from(status)?, ServingStatus::Serving);
+        assert_eq!(body, NOT_READY_BODY);
+        Ok(None)
+    })
+    .await?;
+    assert_eq!(
+        health_status(&mut health, OVERALL_SERVICE).await?,
+        ServingStatus::Serving
+    );
 
     let (status, exposition) = http_get(metrics, METRICS_PATH).await?;
     assert_eq!(status, StatusCode::OK);
@@ -624,7 +572,7 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
         series_value(
             &exposition,
             TABLE_STATE,
-            &[(LABEL_TABLE, TABLE_A), (LABEL_STATE, SERVING_STATE)]
+            &[(LABEL_TABLE, TABLE_A), (LABEL_STATE, &serving_state())]
         ),
         Some(1),
         "the scrape carries the table's state"
@@ -635,7 +583,7 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
         .arg(daemon.0.id().to_string())
         .status()?;
     assert!(killed.success());
-    let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT)?;
+    let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT).await?;
     assert_eq!(status.code(), Some(i32::from(EXIT_OK)));
     let mut drained = String::new();
     std::io::Read::read_to_string(&mut reader, &mut drained)?;
