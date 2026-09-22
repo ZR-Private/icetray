@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The container runtime, needed only by the container-gated catalog test.
-# Everything else in the build runs without one.
+# The container runtime, needed by the container-gated catalog test and by
+# the golden-table writer. Everything else in the build runs without one.
 #
 #   dev/runtime.sh up      start it and print what answered
 #   dev/runtime.sh down    stop it, leaving the VM on disk
@@ -11,6 +11,9 @@
 # Linux the daemon is already there and `up` is a no-op.
 set -euo pipefail
 
+# Sized so that dev/golden-tables.sh fits: its Spark driver takes 4 GiB
+# (DRIVER_MEMORY there) beside the runtime itself, and Spark's local mode
+# runs one task per CPU the VM has. The REST fixture alone needs far less.
 CPUS=4
 MEMORY_GIB=8
 

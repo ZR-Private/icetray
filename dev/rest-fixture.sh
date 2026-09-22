@@ -11,9 +11,10 @@
 # both sides.
 set -euo pipefail
 
+. "$(dirname "$0")/lib.sh"
+
 NAME=icetray-rest
 IMAGE=apache/iceberg-rest-fixture:latest
-PORT=8181
 
 case "${1:-}" in
 up)
@@ -24,12 +25,12 @@ up)
   # --user root because the image's own user cannot write into a bind mount
   # from a macOS host.
   docker run -d --name "$NAME" --user root \
-    -p "127.0.0.1:$PORT:$PORT" \
+    -p "127.0.0.1:$REST_CATALOG_PORT:$REST_CATALOG_PORT" \
     -v "$warehouse:$warehouse" \
     -e "CATALOG_WAREHOUSE=file://$warehouse" \
     "$IMAGE" >/dev/null
-  echo "REST catalog at http://127.0.0.1:$PORT (warehouse $warehouse)"
-  echo "run the test with: ICETRAY_REST_URI=http://127.0.0.1:$PORT dev/test-int.sh"
+  echo "REST catalog at $REST_CATALOG_URI (warehouse $warehouse)"
+  echo "run the test with: ICETRAY_REST_URI=$REST_CATALOG_URI dev/test-int.sh"
   ;;
 down)
   docker rm -f "$NAME" >/dev/null 2>&1 && echo "removed $NAME" || echo "$NAME was not running"

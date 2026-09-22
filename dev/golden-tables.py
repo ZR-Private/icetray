@@ -34,6 +34,42 @@ import time
 ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.1"
 CATALOG = "golden"
 
+# Decimal gigabytes, the unit the per-table line prints file bytes in.
+GIGABYTE = 1_000_000_000
+
+# The shapes below mirror the testkit's golden.rs and keys.rs constants of
+# the same names; a test derives keys and values from those, so a change
+# here without one there breaks the golden tests.
+
+# Keys are spaced by this, so key + 1 is always absent inside the range.
+KEY_STEP = 3
+# Padding before a string key, so a table has long keys sharing a prefix.
+STRING_PREFIX_LEN = 70
+# Digits a string key's number is zero-padded to, so string order is
+# numeric order.
+STRING_DIGITS = 16
+# A bijection for id below the modulus (keys unique and uncorrelated with
+# input order): the multiplier is the 32-bit golden-ratio constant, the
+# modulus a prime above every id the recipe writes.
+PERMUTATION_MULTIPLIER = 2_654_435_761
+PERMUTATION_MODULUS = 1_000_000_007
+# 64-byte digests per value: a contract value is small, a wide one 16 KiB,
+# the size a row limit alone leaves in pages of megabytes.
+CONTRACT_REPEATS = 3
+WIDE_REPEATS = 256
+
+# Rows per table; the wide tables take fewer, since each of their rows
+# carries 16 KiB.
+ROWS_2M = 2_000_000
+ROWS_1M = 1_000_000
+ROWS_500K = 500_000
+ROWS_250K = 250_000
+# Bucket counts: four for the contract tables, two for the wide and overlap
+# tables, none for the unpartitioned table.
+FOUR_BUCKETS = 4
+TWO_BUCKETS = 2
+UNPARTITIONED = 0
+
 # RFD 002. Every entry is a standard Iceberg property or a parquet-mr key that
 # Iceberg passes through unchanged.
 CONTRACT = {
@@ -58,11 +94,13 @@ WIDE = {
     "write.parquet.row-group-check-max-record-count": "16",
 }
 
-LONG_KEY = "id * 3"
-STRING_KEY = "concat(repeat('p', 70), 'user:', lpad(CAST(id * 3 AS STRING), 16, '0'))"
-# A bijection for id below the modulus, so keys are unique and uncorrelated
-# with input order: the shape that makes a writer emit overlapping files.
-PERMUTED_KEY = "pmod(id * 2654435761, 1000000007)"
+LONG_KEY = f"id * {KEY_STEP}"
+STRING_KEY = (
+    f"concat(repeat('p', {STRING_PREFIX_LEN}), 'user:', "
+    f"lpad(CAST(id * {KEY_STEP} AS STRING), {STRING_DIGITS}, '0'))"
+)
+# The shape that makes a writer emit overlapping files.
+PERMUTED_KEY = f"pmod(id * {PERMUTATION_MULTIPLIER}, {PERMUTATION_MODULUS})"
 # Sixteen bytes that do not compress, the shape a UUID key has on the wire.
 # Deterministic in id, unlike Spark's uuid(), so a value derived from the key
 # agrees with it. A column of Iceberg's own `uuid` type is written by the
@@ -105,7 +143,7 @@ def create(spark, table, key_type, buckets, extra=None, sorted_by_key=True):
 
 
 def fill(spark, name, rows, key_expr, repeats, incompressible=False):
-    started = time.time()
+    started = time.monotonic()
     spark.sql(
         f"INSERT INTO {name} SELECT {key_expr} AS key, "
         f"{value_expr(key_expr, repeats, incompressible)} AS value FROM range({rows})"
@@ -114,7 +152,7 @@ def fill(spark, name, rows, key_expr, repeats, incompressible=False):
     files = spark.sql(f"SELECT count(*) AS f, sum(file_size_in_bytes) AS b FROM {name}.files").first()
     print(
         f"{name}: {counts.n:,} rows ({counts.d:,} distinct), {files.f} files, "
-        f"{(files.b or 0) / 1e9:.2f} GB, {time.time() - started:.0f}s",
+        f"{(files.b or 0) / GIGABYTE:.2f} GB, {time.monotonic() - started:.0f}s",
         flush=True,
     )
 
@@ -133,15 +171,21 @@ def skew_splitting(spark, enabled):
 
 def contract_tables(spark):
     skew_splitting(spark, False)
-    fill(spark, create(spark, "long_2m", "BIGINT", 4), 2_000_000, LONG_KEY, 3)
-    fill(spark, create(spark, "str_2m", "STRING", 4), 2_000_000, STRING_KEY, 3)
-    fill(spark, create(spark, "bin16_500k", "BINARY", 4), 500_000, BIN16_KEY, 3)
+    fill(spark, create(spark, "long_2m", "BIGINT", FOUR_BUCKETS), ROWS_2M, LONG_KEY, CONTRACT_REPEATS)
+    fill(spark, create(spark, "str_2m", "STRING", FOUR_BUCKETS), ROWS_2M, STRING_KEY, CONTRACT_REPEATS)
     fill(
         spark,
-        create(spark, "long_wide_250k", "BIGINT", 2, extra=WIDE),
-        250_000,
+        create(spark, "bin16_500k", "BINARY", FOUR_BUCKETS),
+        ROWS_500K,
+        BIN16_KEY,
+        CONTRACT_REPEATS,
+    )
+    fill(
+        spark,
+        create(spark, "long_wide_250k", "BIGINT", TWO_BUCKETS, extra=WIDE),
+        ROWS_250K,
         LONG_KEY,
-        256,
+        WIDE_REPEATS,
         incompressible=True,
     )
 
@@ -150,24 +194,30 @@ def off_contract_tables(spark):
     skew_splitting(spark, False)
     # The writer's defaults: large key pages misaligned with the value pages,
     # no bloom filter, dictionary-encoded columns where the data allows.
-    fill(spark, create(spark, "default_layout_1m", "BIGINT", 4, extra={
+    fill(spark, create(spark, "default_layout_1m", "BIGINT", FOUR_BUCKETS, extra={
         "parquet.enable.dictionary": "true",
         "write.parquet.page-row-limit": "20000",
         "write.parquet.bloom-filter-enabled.column.key": "false",
         "write.metadata.metrics.column.key": "truncate(16)",
         "parquet.columnindex.truncate.length": "16",
-    }), 1_000_000, LONG_KEY, 3)
+    }), ROWS_1M, LONG_KEY, CONTRACT_REPEATS)
     # No bucket partition: every file is a candidate, narrowed by key range.
-    fill(spark, create(spark, "unpartitioned_500k", "BIGINT", 0), 500_000, LONG_KEY, 3)
+    fill(
+        spark,
+        create(spark, "unpartitioned_500k", "BIGINT", UNPARTITIONED),
+        ROWS_500K,
+        LONG_KEY,
+        CONTRACT_REPEATS,
+    )
     # Overlapping files without duplicate keys: several sorted tasks per
     # bucket over keys uncorrelated with input order.
     skew_splitting(spark, True)
     fill(
         spark,
-        create(spark, "overlap_250k", "BIGINT", 2, extra=WIDE),
-        250_000,
+        create(spark, "overlap_250k", "BIGINT", TWO_BUCKETS, extra=WIDE),
+        ROWS_250K,
         PERMUTED_KEY,
-        256,
+        WIDE_REPEATS,
         incompressible=True,
     )
 

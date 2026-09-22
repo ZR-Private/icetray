@@ -9,5 +9,5 @@ log() { echo "==> $*"; }
 log "cargo fmt --check"
 cargo fmt --all --check
 
-log "cargo clippy --workspace --all-targets -- -D warnings"
+log "cargo clippy --workspace --all-targets --locked -- -D warnings"
 cargo clippy --workspace --all-targets --locked -- -D warnings

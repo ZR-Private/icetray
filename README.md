@@ -378,9 +378,9 @@ dev/ci-checks.sh
 ```
 
 `dev/ci-checks.sh` is the lint gate: `cargo fmt --all --check` and `cargo
-clippy --workspace --all-targets -- -D warnings`. CI runs that script and
-`cargo test --workspace --locked`, the same two commands a contributor runs
-before a push.
+clippy --workspace --all-targets --locked -- -D warnings`. CI runs that
+script and `cargo test --workspace --locked`, the same two commands a
+contributor runs before a push.
 
 Two suites are gated behind fixtures and refuse to run rather than report a
 pass they did not earn; under a plain `cargo test` they show as ignored.
