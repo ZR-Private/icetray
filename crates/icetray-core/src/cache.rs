@@ -436,7 +436,8 @@ fn saturating_usize(bytes: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::FileExt;
     use std::path::Path;
 
     use futures::future::{join, join_all};
@@ -614,25 +615,28 @@ mod tests {
     /// Overwrites every copy of `page` in the level's files under
     /// `cache_dir` with its bitwise complement, so the entry's checksum no
     /// longer matches what its block holds; returns how many were
-    /// overwritten.
+    /// overwritten. Each copy is written in place: foyer sizes a partition
+    /// file to the level's capacity as a sparse file, and rewriting the
+    /// whole file would make every hole real and fill the temp volume when
+    /// tests run side by side.
     fn corrupt_on_disk(cache_dir: &Path, page: &[u8]) -> usize {
         let mut copies = 0;
         for entry in fs::read_dir(cache_dir).unwrap() {
             let path = entry.unwrap().path();
-            let mut bytes = fs::read(&path).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            let flipped: Vec<u8> = page.iter().map(|byte| !byte).collect();
             let mut from = 0;
             while let Some(found) = bytes[from..]
                 .windows(page.len())
                 .position(|window| window == page)
             {
                 let at = from + found;
-                for byte in &mut bytes[at..at + page.len()] {
-                    *byte = !*byte;
-                }
+                file.write_all_at(&flipped, u64::try_from(at).unwrap())
+                    .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
                 copies += 1;
                 from = at + page.len();
             }
-            fs::write(&path, &bytes).unwrap();
         }
         copies
     }
