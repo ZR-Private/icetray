@@ -177,7 +177,7 @@ pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
 /// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.

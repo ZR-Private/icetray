@@ -139,6 +139,14 @@ pub enum ConfigViolation {
     /// The hedge window holds no samples, so it has no percentile.
     #[error("hedge window must hold at least one sample")]
     HedgeWindowEmpty,
+    /// A poll interval of zero: the poller would re-resolve without pause,
+    /// and the runtime's interval refuses a zero period.
+    #[error("poll_interval must be above zero")]
+    PollIntervalZero,
+    /// A rewrite rule whose `from` is empty: every location starts with the
+    /// empty prefix, so the rule would rewrite all of them.
+    #[error("a rewrite rule has an empty from prefix")]
+    EmptyRewritePrefix,
     /// A location, after rewriting, whose `scheme://authority/` prefix names
     /// no store the process has registered and none it can build (RFD 003:
     /// it builds `s3://`, `s3a://`, and `file://`).
@@ -206,7 +214,18 @@ impl Config {
 
 /// The first rule the configuration breaks, or `Ok` when it breaks none.
 fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
+    if config.server.poll_interval.is_zero() {
+        return Err(ConfigViolation::PollIntervalZero);
+    }
     validate_hedge(&config.storage.hedge)?;
+    if config
+        .storage
+        .rewrite
+        .iter()
+        .any(|rule| rule.from.is_empty())
+    {
+        return Err(ConfigViolation::EmptyRewritePrefix);
+    }
     if let Some(s3) = &config.storage.s3
         && s3.access_key_id.is_some() != s3.secret_access_key.is_some()
     {
@@ -972,6 +991,20 @@ locaton = "typo"
             violation(&text),
             ConfigViolation::DiskResidencyWithoutLocalDir
         );
+    }
+
+    #[test]
+    fn test_parse_refuses_poll_interval_zero() {
+        let text = format!("{TOML_MINIMAL}\n[server]\npoll_interval = \"0s\"\n");
+        assert_eq!(violation(&text), ConfigViolation::PollIntervalZero);
+    }
+
+    #[test]
+    fn test_parse_refuses_an_empty_rewrite_prefix() {
+        let text = format!(
+            "{TOML_MINIMAL}\n[[storage.rewrite]]\nfrom = \"\"\nto = \"s3://example-warehouse/\"\n"
+        );
+        assert_eq!(violation(&text), ConfigViolation::EmptyRewritePrefix);
     }
 
     #[test]
