@@ -49,7 +49,7 @@ files carry no key bloom filter.
 After reading footers, and before fetching any key chunk, the loader knows
 every tier's resident bytes, and the doctor reports them (RFD 016 (Doctor)),
 so the owner chooses with the numbers in front of them.
-The budget, per table or per replica, turns a `full` load that would exceed
+The budget, set per table, turns a `full` load that would exceed
 it into a refusal carrying the bytes needed and the budget, before anything
 expensive is fetched; `disk` without a configured local directory is
 refused the same way.
@@ -135,3 +135,14 @@ The index's live bytes are exported beside process memory (RFD 012
 process memory on every platform: on one, the allocator kept the shed
 chunks' pages
 ([bloom residency tier, observations](../analysis/2026-09-10-bloom-residency-tier.md#observations)).
+
+The `full` budget is per table and not per replica. A replica-wide bound
+would refuse whichever table happened to load last, so what a replica
+serves after a restart would depend on load order and two replicas with one
+configuration could refuse different tables; per-table budgets refuse the
+same table every time, and an operator bounds the process by dividing its
+memory among them. The disk tier's `index_budget_bytes` is replica-wide
+because it bounds one shared directory whose files outlive the process,
+which no per-table bound can keep from filling. A replica-wide `full`
+budget can be added later as one more server field and one more sum in the
+same check.

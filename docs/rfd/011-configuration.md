@@ -39,8 +39,7 @@ static keys RFD 003 (One storage stack) lets configuration supply, and the
 optional local directory of RFD 012 (Deployment contract)), and tables (a
 list, each with a name, a source, a ref, a key column, a value column,
 `strict`, whose meaning is RFD 007 (Serving tiers), and the `residency` and
-resident-bytes budget of RFD 017 (Residency tiers), the budget also settable
-for the replica). The
+resident-bytes budget of RFD 017 (Residency tiers)). The
 prototype ran on this shape in TOML
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).
 
