@@ -16,11 +16,11 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use crate::approx;
 use crate::config::Residency;
 use crate::contract;
-use crate::error::SnapshotId;
 use crate::generation::{Generation, LoadedFile};
 use crate::index::{FileIndex, ResidentBytes};
 use crate::key::{Key, KeyType};
 use crate::manifest::{DataFileEntry, TableLayout};
+use crate::snapshot::SnapshotId;
 
 /// The thresholds, in one place (RFD 016): each derives from `contract`
 /// where a contract number exists, and each names the analysis section that

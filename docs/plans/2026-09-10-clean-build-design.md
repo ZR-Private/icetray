@@ -40,9 +40,10 @@ redefine.
 | module | owns | RFD |
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
+| `snapshot` | `SnapshotId`, the newtype for an Iceberg snapshot id; it has no order and is a metric label, never a gauge value | 015 |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`) and the one widening of an in-memory count to `u64` (`count`); the only `cast_precision_loss` allow | 015 |
 | `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and epoch-millisecond arithmetic happens (`millis_after`, for a writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
-| `metric` | the metric and label names of section 7 as constants, and the read-kind label enum; the one home for those names | 012 |
+| `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, key length cap and advice, file size target); the one home for every constant another crate needs | 002, 008 |
@@ -123,8 +124,12 @@ pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Confi
 /// `Display` (the type does not implement `Hash`); a data file whose physical
 /// type contradicts an admitted schema type is `FileFault::ValuePhysicalType`.
 pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize }, NoLocalDir }
+
+// snapshot
 /// A snapshot id is not an integer; it is never compared with one.
 pub struct SnapshotId(pub i64);
+
+// metric
 /// Metric label values for lookups.
 pub enum LookupResult { ColdHit, WarmHit, Miss }
 

@@ -17,7 +17,8 @@ use iceberg_catalog_rest::{
 };
 
 use crate::config::SourceConfig;
-use crate::error::{Error, Result, SnapshotId};
+use crate::error::{Error, Result};
+use crate::snapshot::SnapshotId;
 use crate::storage::{PATH_SEPARATOR, SCHEME_SEPARATOR, Storage};
 
 /// The file under a static table root that names the current metadata

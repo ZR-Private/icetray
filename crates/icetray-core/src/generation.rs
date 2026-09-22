@@ -18,12 +18,14 @@ use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::config::{Residency, TableConfig};
-use crate::error::{Error, LookupResult, RefusalReason, Result, SnapshotId};
+use crate::error::{Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
+use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
+use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 

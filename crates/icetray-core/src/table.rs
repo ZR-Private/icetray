@@ -21,11 +21,12 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode, Serviceability, Tier};
 use crate::config::TableConfig;
-use crate::error::{Error, ErrorKind, Result, SnapshotId};
+use crate::error::{Error, ErrorKind, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::Key;
 use crate::local::LocalDir;
 use crate::metric;
+use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
@@ -583,7 +584,7 @@ mod tests {
 
     use super::*;
     use crate::config::Residency;
-    use crate::error::{ErrorKind, LookupResult, RefusalReason};
+    use crate::error::{ErrorKind, RefusalReason};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
         FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
@@ -593,6 +594,7 @@ mod tests {
     };
     use crate::key::KeyType;
     use crate::manifest::testing::Partition;
+    use crate::metric::LookupResult;
 
     /// Keys in a one-file fixture: enough that its bloom filter, sized to
     /// them, draws no finding of its own.

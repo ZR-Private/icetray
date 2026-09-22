@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod metric;
 pub mod open;
 pub mod parquet_io;
+pub mod snapshot;
 pub mod storage;
 pub mod table;
 pub mod time;
@@ -34,13 +35,15 @@ pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
     Residency, RewriteRule, S3Config, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
-pub use error::{Error, ErrorKind, LookupResult, RefusalReason, Result, SnapshotId};
+pub use error::{Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
 pub use index::{FileFault, FileIndex, Inspected, PageRef, ResidentBytes, RowRef};
 pub use key::{Key, KeyType};
 pub use local::{DataFileIdentity, DiskChunks, DiskTier, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout, list_data_files};
+pub use metric::LookupResult;
 pub use open::{Opened, open};
 pub use parquet_io::{FileHandle, Segments, SegmentsFault};
+pub use snapshot::SnapshotId;
 pub use storage::{HedgeWindow, IoStats, Located, Storage};
 pub use table::{Table, TableState};

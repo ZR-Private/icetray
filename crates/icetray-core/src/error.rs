@@ -1,5 +1,5 @@
-//! The one error type of the crate, and the names that travel with it into
-//! logs and metric labels: refusal reasons, snapshot ids, lookup results.
+//! The one error type of the crate, and the refusal reasons that travel with
+//! it into logs and metric labels.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -336,52 +336,10 @@ impl fmt::Display for RefusalReason {
     }
 }
 
-/// A snapshot id. It is a newtype so that it is never compared with or
-/// added to a bare integer, and it has no order: Iceberg ids are random, and
-/// snapshots order by sequence number. It is exported as a metric label
-/// rather than a gauge value, where an `f64` would lose its low digits
-/// (RFD 015). Serde is transparent: the id is the integer on the wire and in
-/// JSON.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct SnapshotId(pub i64);
-
-impl fmt::Display for SnapshotId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// The three outcomes of a lookup as the `result` metric label sees them.
-/// Display gives the `snake_case` label value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LookupResult {
-    /// The key was present and its value page was fetched.
-    ColdHit,
-    /// The key was present and its value page was already cached.
-    WarmHit,
-    /// The key was absent.
-    Miss,
-}
-
-impl fmt::Display for LookupResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::ColdHit => "cold_hit",
-            Self::WarmHit => "warm_hit",
-            Self::Miss => "miss",
-        };
-        f.write_str(name)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ConfigViolation;
-
-    /// An id wider than 32 bits, so the round trip exercises the whole `i64`.
-    const SAMPLE_SNAPSHOT_ID: i64 = 5_123_456_789_012;
 
     /// A synthetic data file location for the reasons that name one.
     const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
@@ -453,38 +411,6 @@ mod tests {
         for (reason, name) in cases {
             assert_eq!(reason.to_string(), name);
         }
-    }
-
-    #[test]
-    fn test_fmt_lookup_result_snake_case_names() {
-        let cases = [
-            (LookupResult::ColdHit, "cold_hit"),
-            (LookupResult::WarmHit, "warm_hit"),
-            (LookupResult::Miss, "miss"),
-        ];
-        for (result, name) in cases {
-            assert_eq!(result.to_string(), name);
-        }
-    }
-
-    #[test]
-    fn test_fmt_snapshot_id_is_the_integer() {
-        assert_eq!(
-            SnapshotId(SAMPLE_SNAPSHOT_ID).to_string(),
-            SAMPLE_SNAPSHOT_ID.to_string()
-        );
-    }
-
-    #[test]
-    fn test_serialize_snapshot_id_transparent() {
-        let json = serde_json::to_string(&SnapshotId(SAMPLE_SNAPSHOT_ID)).unwrap();
-        assert_eq!(json, SAMPLE_SNAPSHOT_ID.to_string());
-    }
-
-    #[test]
-    fn test_deserialize_snapshot_id_transparent() {
-        let id: SnapshotId = serde_json::from_str(&SAMPLE_SNAPSHOT_ID.to_string()).unwrap();
-        assert_eq!(id, SnapshotId(SAMPLE_SNAPSHOT_ID));
     }
 
     /// The table the crate-raised sample errors name.

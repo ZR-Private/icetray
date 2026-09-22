@@ -96,9 +96,44 @@ impl fmt::Display for ReadKind {
     }
 }
 
+/// The three outcomes of a lookup as the `result` metric label sees them.
+/// Display gives the `snake_case` label value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LookupResult {
+    /// The key was present and its value page was fetched.
+    ColdHit,
+    /// The key was present and its value page was already cached.
+    WarmHit,
+    /// The key was absent.
+    Miss,
+}
+
+impl fmt::Display for LookupResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::ColdHit => "cold_hit",
+            Self::WarmHit => "warm_hit",
+            Self::Miss => "miss",
+        };
+        f.write_str(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fmt_lookup_result_snake_case_names() {
+        let cases = [
+            (LookupResult::ColdHit, "cold_hit"),
+            (LookupResult::WarmHit, "warm_hit"),
+            (LookupResult::Miss, "miss"),
+        ];
+        for (result, name) in cases {
+            assert_eq!(result.to_string(), name);
+        }
+    }
 
     #[test]
     fn test_fmt_read_kind_label_values() {
