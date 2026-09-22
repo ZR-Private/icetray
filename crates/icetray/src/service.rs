@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{Error, Generation, Key, KeyType, Opened, Table, Value};
+use icetray_core::{Error, Key, KeyType, Opened, Table, Value};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
@@ -45,16 +45,6 @@ impl Service {
         self.tables
             .get(name)
             .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
-    }
-
-    /// The generation `table` serves; none is `UNAVAILABLE`, through
-    /// `Error::NotReady`, so the message is core's.
-    fn serving(table: &Table) -> Result<Arc<Generation>, Status> {
-        table.current().ok_or_else(|| {
-            status_from(&Error::NotReady {
-                table: table.name().to_string(),
-            })
-        })
     }
 }
 
@@ -181,7 +171,7 @@ impl Icetray for Service {
         telemetry::count(Call::Get);
         let request = request.into_inner();
         let table = self.table(&request.table)?;
-        let generation = Self::serving(table)?;
+        let generation = table.serving().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, generation.layout.key_type)?;
         let lookup = table.get(&key).await.map_err(|error| status_from(&error))?;
         let (presence, value) = presence(lookup.value);
@@ -199,7 +189,7 @@ impl Icetray for Service {
         telemetry::count(Call::MultiGet);
         let request = request.into_inner();
         let table = self.table(&request.table)?;
-        let generation = Self::serving(table)?;
+        let generation = table.serving().map_err(|error| status_from(&error))?;
         let keys = request
             .keys
             .into_iter()
@@ -233,7 +223,7 @@ impl Icetray for Service {
         telemetry::count(Call::TableInfo);
         let request = request.into_inner();
         let table = self.table(&request.table)?;
-        let generation = Self::serving(table)?;
+        let generation = table.serving().map_err(|error| status_from(&error))?;
         Ok(Response::new(TableInfoResponse {
             table: request.table,
             snapshot_id: generation.snapshot_id.0,

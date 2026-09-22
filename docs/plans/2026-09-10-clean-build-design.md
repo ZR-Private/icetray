@@ -681,6 +681,9 @@ impl Table {
     pub fn config(&self) -> &TableConfig;
     pub fn state(&self) -> TableState;
     pub fn current(&self) -> Option<Arc<Generation>>;
+    /// `current`, or `Error::NotReady`: the one refusal for a table with no generation to
+    /// answer from, which `get`, the gRPC service, and the one-shot subcommands all raise.
+    pub fn serving(&self) -> Result<Arc<Generation>>;
     /// `Error::NotReady` with no generation; `Error::KeyType` before any read. One
     /// `load_full`, one lookup through `Generation::lookup`, timed and counted under
     /// `lookups_total{table, result}` and `lookup_seconds{table, result}`.

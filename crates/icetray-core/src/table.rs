@@ -234,6 +234,15 @@ impl Table {
         self.current.load_full()
     }
 
+    /// `current`, or `Error::NotReady`: the one refusal for a table with no
+    /// generation to answer from, which `get`, the gRPC service, and the
+    /// one-shot subcommands all raise.
+    pub fn serving(&self) -> Result<Arc<Generation>> {
+        self.current().ok_or_else(|| Error::NotReady {
+            table: self.config.name.clone(),
+        })
+    }
+
     /// One lookup against the serving generation. `Error::NotReady` with no
     /// generation; `Error::KeyType` for a key of another type than the
     /// table's, before any read.
@@ -478,13 +487,6 @@ impl Table {
             metric::LABEL_SNAPSHOT_ID => snapshot_id.to_string()
         )
         .set(approx::gauge(u64::from(serving)));
-    }
-
-    /// The serving generation, or `Error::NotReady`.
-    fn serving(&self) -> Result<Arc<Generation>> {
-        self.current().ok_or_else(|| Error::NotReady {
-            table: self.config.name.clone(),
-        })
     }
 
     /// `Error::KeyType` for a key of another type than the generation's.

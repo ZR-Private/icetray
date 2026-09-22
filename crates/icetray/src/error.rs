@@ -61,12 +61,6 @@ pub enum KeyTextFault {
         /// The text as given.
         text: String,
     },
-    /// The key type is the served generation's, and the table serves none.
-    #[error("table {table} serves no generation, so its key type is unknown")]
-    NoGeneration {
-        /// The table's configured name.
-        table: String,
-    },
 }
 
 /// Why a key from the wire is not a key of the table's type (RFD 010).

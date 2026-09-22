@@ -9,9 +9,9 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use icetray_core::config::Config;
-use icetray_core::{Error, Generation, Opened, Serviceability, Table, diagnose, open, time};
+use icetray_core::{Opened, Serviceability, Table, diagnose, open, time};
 
-use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, KeyTextFault};
+use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
 use crate::output::{DoctorLine, FileLine, FindingLine, GetLine, InfoLine, RefusedLine, emit};
 
@@ -31,17 +31,6 @@ pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, 
 async fn load_all(opened: &Opened) -> Vec<(&Arc<Table>, icetray_core::Result<()>)> {
     let outcomes = join_all(opened.tables.iter().map(|table| table.load())).await;
     opened.tables.iter().zip(outcomes).collect()
-}
-
-/// The generation a loaded table serves; a table whose load returned `Ok`
-/// always has one, and the typed failure keeps that a fact the compiler
-/// sees rather than a panic.
-fn served(table: &Table) -> Result<Arc<Generation>, CliError> {
-    table.current().ok_or_else(|| {
-        CliError::Core(Error::NotReady {
-            table: table.name().to_string(),
-        })
-    })
 }
 
 /// `doctor`: one `doctor` line per table with its findings and, with
@@ -65,7 +54,7 @@ pub async fn doctor(
     for (table, outcome) in load_all(&opened).await {
         match outcome {
             Ok(()) => {
-                let generation = served(table)?;
+                let generation = table.serving()?;
                 let report = diagnose(&generation);
                 emit(&DoctorLine::new(&report.summary))?;
                 for finding in &report.findings {
@@ -106,7 +95,7 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
         loaded.push(table);
     }
     for table in loaded {
-        let generation = served(table)?;
+        let generation = table.serving()?;
         emit(&InfoLine::new(&diagnose(&generation).summary))?;
     }
     Ok(())
@@ -132,13 +121,7 @@ pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result
         }
     };
     table.load().await?;
-    let key_type = table
-        .current()
-        .ok_or_else(|| KeyTextFault::NoGeneration {
-            table: table.name().to_string(),
-        })?
-        .layout
-        .key_type;
+    let key_type = table.serving()?.layout.key_type;
     let parsed = keys
         .iter()
         .map(|text| key_text::parse(text, key_type))
