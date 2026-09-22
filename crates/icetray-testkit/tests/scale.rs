@@ -17,10 +17,11 @@ use icetray_testkit::{FixtureSpec, Result, write_fixture};
 /// table would have at two million rows per file.
 const FILES: u64 = 1_500;
 
-/// Rows per file.
+/// Rows per file: one contract page, so the write finishes in seconds and
+/// the file count alone sets the scale.
 const ROWS_PER_FILE: u64 = 1_000;
 
-/// Rows of the probe's first build.
+/// Rows of the probe's first build: one page in every file.
 const ROWS: u64 = FILES * ROWS_PER_FILE;
 
 /// Lookups per timed batch, and the stride that spreads them over the table.
@@ -57,7 +58,7 @@ async fn test_many_files_load_and_lookup() -> Result<()> {
     let started = Instant::now();
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let load = started.elapsed();
-    let generation = served.table.current().expect("the table was loaded");
+    let generation = served.current();
     let stats = served.storage.stats();
     eprintln!(
         "load: {load:.1?}; files {}, index {:.1} MiB, GETs {}, bytes {:.1} MiB",
@@ -102,7 +103,7 @@ async fn test_many_files_load_and_lookup() -> Result<()> {
     );
     let started = Instant::now();
     assert!(served.table.refresh().await?);
-    let generation = served.table.current().expect("the table was loaded");
+    let generation = served.current();
     eprintln!(
         "refresh: {:.1?}; files {}, index {:.1} MiB",
         started.elapsed(),

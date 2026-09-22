@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use iceberg::Catalog;
 use icetray_core::KeyType;
+use icetray_core::approx::count;
 use icetray_core::config::Residency;
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE};
-use icetray_testkit::verify::{self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, count};
+use icetray_testkit::verify::{self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS};
 use icetray_testkit::{FixtureSpec, Result, S3Fixture, memory_catalog_s3, write_fixture};
 
 /// The fixture server's bucket and the warehouse prefix inside it.

@@ -10,7 +10,10 @@ use icetray_core::{Key, KeyType};
 /// (`dev/golden-tables.py`): `key + 1` is absent and inside the range.
 pub const KEY_STEP: u64 = 3;
 
-/// Bytes in a fixture value where a specification does not say.
+/// Bytes in a fixture value where a specification does not say: a
+/// hundred, so a contract page of a thousand values is about a hundred
+/// kibibytes, under the doctor's value-page advice, and the small fixture
+/// draws no finding.
 pub const VALUE_BYTES: usize = 100;
 
 /// The text between a string key's padding and its digits.
@@ -63,9 +66,14 @@ const FNV_PRIME: u64 = 0x0100_0000_01b3;
 /// far apart.
 const SEED_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// The xorshift64 shifts, in order.
+/// The first shift of Marsaglia's xorshift64 triple (13, 7, 17), whose
+/// stream has full period, so no fixture's values repeat.
 const XORSHIFT_FIRST_LEFT: u32 = 13;
+
+/// The second shift of the triple, to the right.
 const XORSHIFT_RIGHT: u32 = 7;
+
+/// The third shift of the triple, to the left.
 const XORSHIFT_SECOND_LEFT: u32 = 17;
 
 /// The `i`-th fixture key of `key_type`, with no padding.
@@ -234,6 +242,7 @@ mod tests {
     /// The length the sized value test asks for.
     const OTHER_LEN: usize = 17;
 
+    /// Every key type, so each derivation is checked under all four.
     const TYPES: [KeyType; 4] = [
         KeyType::Long,
         KeyType::String,

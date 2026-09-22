@@ -20,6 +20,7 @@ use icetray_testkit::fixture::{
     IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, UNPARTITIONED_FILE_BYTES,
 };
 use icetray_testkit::layout::Layout;
+use icetray_testkit::verify::series_value;
 use icetray_testkit::{Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture};
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -619,15 +620,15 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
             .any(|line| line.starts_with(PROCESS_RSS_BYTES)),
         "the scrape carries the process's memory"
     );
-    let state_line = exposition
-        .lines()
-        .find(|line| {
-            line.starts_with(TABLE_STATE)
-                && line.contains(&format!("{LABEL_TABLE}=\"{TABLE_A}\""))
-                && line.contains(&format!("{LABEL_STATE}=\"{SERVING_STATE}\""))
-        })
-        .expect("the scrape carries the table's state");
-    assert!(state_line.ends_with(" 1"), "{state_line}");
+    assert_eq!(
+        series_value(
+            &exposition,
+            TABLE_STATE,
+            &[(LABEL_TABLE, TABLE_A), (LABEL_STATE, SERVING_STATE)]
+        ),
+        Some(1),
+        "the scrape carries the table's state"
+    );
 
     let killed = Command::new("kill")
         .arg("-TERM")

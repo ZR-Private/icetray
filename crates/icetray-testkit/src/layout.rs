@@ -2,13 +2,12 @@
 //! `Layout::contract()` is RFD 002's shape; every other fixture is a struct
 //! update on it, so a test names only the clause it departs from.
 
+use icetray_core::approx::count;
 use icetray_core::contract;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
-
-use crate::verify::count;
 
 /// The key column of every fixture table.
 pub const KEY_COLUMN: &str = "key";

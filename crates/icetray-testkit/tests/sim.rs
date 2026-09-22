@@ -32,8 +32,11 @@ const WAREHOUSE: &str = "warehouse";
 /// Virtual time a simulation may run before it is declared stuck.
 const SIM_DURATION: Duration = Duration::from_secs(600);
 
-/// The seeds; two runs of the first agree, the second keeps the GET counts.
+/// The seed two cold runs share, whose virtual timings must then agree;
+/// any value serves.
 const SEED_FIRST: u64 = 7;
+
+/// A seed other than `SEED_FIRST`: the GET counts must not depend on it.
 const SEED_SECOND: u64 = 11;
 
 /// One-way link latency when it is fixed; a round trip is twice it.
@@ -210,14 +213,7 @@ fn run_cold(seed: u64, written: &Written) -> Outcome {
         let served = serve_in_sim(storage, config, TableSource::Static { location }).await?;
         let load = turmoil::elapsed().saturating_sub(started);
         let load_gets = stats.gets();
-        let files = u64::try_from(
-            served
-                .table
-                .current()
-                .expect("the table was loaded")
-                .files
-                .len(),
-        )?;
+        let files = u64::try_from(served.current().files.len())?;
 
         let before = stats.gets();
         let started = turmoil::elapsed();
@@ -319,7 +315,7 @@ fn run_tail(
         let storage = client_storage(&root, hedge)?;
         let stats = storage.stats();
         let served = serve_in_sim(storage, config, TableSource::Static { location }).await?;
-        let generation = served.table.current().expect("the table was loaded");
+        let generation = served.current();
         let expected_gets = verify::expected_cold_gets(&generation, &keys)?;
         let (gets_before, hedges_before) = (stats.gets(), stats.hedges());
         let mut max = Duration::ZERO;
@@ -492,14 +488,7 @@ fn test_load_reads_never_hedge() -> Result<()> {
         let stats = storage.stats();
         let served =
             serve_in_sim(storage, config, TableSource::from_config(&source).await?).await?;
-        assert_eq!(
-            served
-                .table
-                .current()
-                .expect("the table was loaded")
-                .metadata_location,
-            v1_location
-        );
+        assert_eq!(served.current().metadata_location, v1_location);
         assert_eq!(stats.hedges(), 0, "a load never hedges");
         assert_eq!(
             served.table.get(&old_key).await?.value,

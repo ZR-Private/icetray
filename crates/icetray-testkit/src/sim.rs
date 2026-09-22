@@ -39,7 +39,9 @@ use turmoil::net::{TcpListener, TcpStream};
 use crate::error::{Result, TestkitError};
 use crate::s3::{ACCESS_KEY, REGION, SECRET_KEY};
 
-/// The port the simulated S3 host listens on.
+/// The port the simulated S3 host listens on: the one `MinIO` serves on,
+/// so a logged endpoint reads as an S3 one; nothing else binds a port in
+/// the simulation.
 pub const SIM_S3_PORT: u16 = 9000;
 
 /// The address the simulated host binds: every interface, `SIM_S3_PORT`.

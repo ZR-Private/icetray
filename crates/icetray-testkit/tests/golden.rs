@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use icetray_core::check::Tier;
 use icetray_core::{
-    Error, FindingCode, Key, Serviceability, Storage, Table, Value, diagnose, open,
+    Error, FindingCode, Generation, Key, Serviceability, Storage, Table, Value, diagnose, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, WIDE_REPEATS,
@@ -36,6 +36,15 @@ const FLIP: u8 = 0xff;
 struct Golden {
     storage: Arc<Storage>,
     table: Arc<Table>,
+}
+
+impl Golden {
+    /// The generation the golden table serves; `open_golden` loaded it.
+    fn current(&self) -> Arc<Generation> {
+        self.table
+            .current()
+            .expect("open_golden loaded the table before handing it out")
+    }
 }
 
 async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
@@ -87,7 +96,7 @@ async fn verify_contract_hits(
     keys: &[Key],
     expected: impl Fn(&Key) -> Vec<u8>,
 ) -> Result<()> {
-    let generation = golden.table.current().expect("the table was loaded");
+    let generation = golden.current();
     let cold = verify::expected_cold_gets(&generation, keys)?;
     assert!(cold > 0);
     assert_eq!(hits(golden, keys, expected).await?, cold);
@@ -112,7 +121,7 @@ fn string_text(key: &Key) -> String {
 }
 
 fn cost_codes(golden: &Golden) -> Vec<FindingCode> {
-    diagnose(&golden.table.current().expect("the table was loaded"))
+    diagnose(&golden.current())
         .findings
         .iter()
         .filter(|finding| finding.tier == Tier::Cost)
@@ -121,7 +130,7 @@ fn cost_codes(golden: &Golden) -> Vec<FindingCode> {
 }
 
 fn advice_codes(golden: &Golden) -> Vec<FindingCode> {
-    diagnose(&golden.table.current().expect("the table was loaded"))
+    diagnose(&golden.current())
         .findings
         .iter()
         .filter(|finding| finding.tier == Tier::Advice)
@@ -133,7 +142,7 @@ fn advice_codes(golden: &Golden) -> Vec<FindingCode> {
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_long_contract_serves_one_get_per_hit() -> Result<()> {
     let golden = open_golden(GoldenTable::Long2m, false).await?;
-    let report = diagnose(&golden.table.current().expect("the table was loaded"));
+    let report = diagnose(&golden.current());
     assert_eq!(
         report.summary.serviceability,
         Serviceability::Efficient,
@@ -162,7 +171,7 @@ async fn test_golden_string_contract_serves() -> Result<()> {
 async fn test_golden_bin16_contract_serves() -> Result<()> {
     let golden = open_golden(GoldenTable::Bin16_500k, false).await?;
     assert!(cost_codes(&golden).is_empty());
-    let generation = golden.table.current().expect("the table was loaded");
+    let generation = golden.current();
     let keys: Vec<Key> = generation
         .files
         .iter()
@@ -224,7 +233,7 @@ async fn test_golden_wide_values_are_byte_bounded() -> Result<()> {
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_default_layout_is_priced() -> Result<()> {
     let golden = open_golden(GoldenTable::DefaultLayout1m, false).await?;
-    let report = diagnose(&golden.table.current().expect("the table was loaded"));
+    let report = diagnose(&golden.current());
     assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
     assert!(cost_codes(&golden).contains(&FindingCode::LargeKeyPages));
     let advice = advice_codes(&golden);
@@ -271,7 +280,7 @@ async fn test_golden_overlap_serves_and_prices_overlap_when_present() -> Result<
         .iter()
         .map(|&id| golden::permuted_key(id))
         .collect();
-    let generation = golden.table.current().expect("the table was loaded");
+    let generation = golden.current();
     let cold = verify::expected_cold_gets(&generation, &keys)?;
     assert_eq!(
         hits(&golden, &keys, |key| golden::wide_value(&long_text(key))).await?,

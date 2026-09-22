@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use icetray_core::approx;
+use icetray_core::approx::{self, count};
 use icetray_core::config::Residency;
 use icetray_core::{Error, Generation, Key, KeyType, LoadedFile, RefusalReason, diagnose};
 use icetray_testkit::error::Precondition;
@@ -18,7 +18,7 @@ use icetray_testkit::fixture::{
     local_catalog, residue_class,
 };
 use icetray_testkit::layout::KEY_BLOOM_FPP;
-use icetray_testkit::verify::{self, Served, count};
+use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{Fixture, FixtureSpec, Result, TestkitError, write_fixture};
 
 /// Absent keys probed per miss batch, spread evenly over the id range.

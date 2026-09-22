@@ -59,7 +59,7 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
         verify::storage_config_for_tests(),
     )
     .await?;
-    let generation = served.table.current().expect("the table was loaded");
+    let generation = served.current();
     assert_eq!(
         generation.records,
         u64::try_from(fixture.ids().count()).unwrap()

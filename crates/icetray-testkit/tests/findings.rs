@@ -179,7 +179,7 @@ async fn test_dictionary_encoded_value_is_a_cost_of_one_extra_get() -> Result<()
     let cold = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
     assert_eq!(
         cold,
-        value_pages + verify::count(files_touched.len()),
+        value_pages + approx::count(files_touched.len()),
         "one value page per key and one dictionary page per file"
     );
     let warm = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
@@ -529,11 +529,11 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let files = verify::count(generation.files.len());
+    let files = approx::count(generation.files.len());
     let row_groups: u64 = generation
         .files
         .iter()
-        .map(|file| verify::count(file.index.metadata().num_row_groups()))
+        .map(|file| approx::count(file.index.metadata().num_row_groups()))
         .sum();
     assert!(row_groups > files, "several row groups per file");
     assert_eq!(

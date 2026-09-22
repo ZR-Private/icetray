@@ -22,7 +22,7 @@ use icetray_proto::v1::{
     TableInfoResponse,
 };
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
-use icetray_testkit::verify::expected_cold_gets;
+use icetray_testkit::verify::{expected_cold_gets, series_value};
 use icetray_testkit::{Fixture, FixtureSpec, Nulls, S3Fixture, memory_catalog_s3, write_fixture};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
@@ -252,23 +252,15 @@ fn wire_key(key: &Key) -> v1::Key {
     v1::Key { key: Some(variant) }
 }
 
-/// The `requests_total` series of `call`, as the exposition prints it.
-fn series(call: telemetry::Call) -> String {
-    format!(
-        "{}{{{}=\"{call}\"}}",
+/// The `requests_total` count of `call` in `exposition`: zero before the
+/// first call, when the series is not yet exposed.
+fn calls(exposition: &str, call: telemetry::Call) -> u64 {
+    series_value(
+        exposition,
         metric::REQUESTS_TOTAL,
-        metric::LABEL_CALL
+        &[(metric::LABEL_CALL, &call.to_string())],
     )
-}
-
-/// The value of `series` in `exposition` (`name{labels} value`), or zero
-/// when the series is absent.
-fn series_value(exposition: &str, series: &str) -> u64 {
-    exposition
-        .lines()
-        .find_map(|line| line.strip_prefix(series))
-        .and_then(|rest| rest.trim().parse().ok())
-        .unwrap_or(0)
+    .unwrap_or(0)
 }
 
 /// The code of a failed call.
@@ -543,9 +535,6 @@ async fn test_storage_failure_is_unavailable_and_fails_a_batch_whole() -> TestRe
 async fn test_requests_total_counts_every_call() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::ready_small().await?;
-    let get_series = series(telemetry::Call::Get);
-    let multi_get_series = series(telemetry::Call::MultiGet);
-    let table_info_series = series(telemetry::Call::TableInfo);
     let (status, before) = stack.http_get(METRICS_PATH).await?;
     assert_eq!(status, StatusCode::OK);
 
@@ -559,16 +548,16 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     let (status, after) = stack.http_get(METRICS_PATH).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        series_value(&after, &get_series),
-        series_value(&before, &get_series) + COUNTED_GETS
+        calls(&after, telemetry::Call::Get),
+        calls(&before, telemetry::Call::Get) + COUNTED_GETS
     );
     assert_eq!(
-        series_value(&after, &multi_get_series),
-        series_value(&before, &multi_get_series) + 1
+        calls(&after, telemetry::Call::MultiGet),
+        calls(&before, telemetry::Call::MultiGet) + 1
     );
     assert_eq!(
-        series_value(&after, &table_info_series),
-        series_value(&before, &table_info_series) + 1
+        calls(&after, telemetry::Call::TableInfo),
+        calls(&before, telemetry::Call::TableInfo) + 1
     );
     assert!(
         after

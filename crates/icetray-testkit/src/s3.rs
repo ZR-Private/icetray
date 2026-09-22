@@ -13,7 +13,7 @@ use hyper_util::rt::TokioIo;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
-use icetray_core::config::{HedgeConfig, S3Config, StorageConfig};
+use icetray_core::config::{S3Config, StorageConfig};
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s_fs::FileSystem;
@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::Result;
+use crate::verify::storage_config_for_tests;
 
 /// The static access key the fixture server accepts; callers outside the
 /// crate reach it through `storage_config` and `file_io_props`.
@@ -111,10 +112,10 @@ impl S3Fixture {
         )
     }
 
-    /// A storage configuration pointing icetray's `object_store` at this
-    /// server with the static keys, path-style addressing over plain HTTP,
-    /// no rewrites, no local directory, and hedging disabled, so a cost test
-    /// counts exactly the GETs the oracle predicts.
+    /// `storage_config_for_tests` (no rewrites, no local directory, hedging
+    /// disabled, so a cost test counts exactly the GETs the oracle
+    /// predicts) pointing icetray's `object_store` at this server with the
+    /// static keys and path-style addressing over plain HTTP.
     pub fn storage_config(&self) -> StorageConfig {
         StorageConfig {
             s3: Some(S3Config {
@@ -125,12 +126,7 @@ impl S3Fixture {
                 allow_http: true,
                 path_style: true,
             }),
-            rewrite: Vec::new(),
-            hedge: HedgeConfig {
-                enabled: false,
-                ..HedgeConfig::default()
-            },
-            local: None,
+            ..storage_config_for_tests()
         }
     }
 
@@ -182,6 +178,8 @@ async fn accept(listener: TcpListener, service: S3Service) {
 mod tests {
     use super::*;
 
+    /// The bucket the server is started with; any name the filesystem
+    /// admits as a directory works.
     const BUCKET: &str = "icetray-test";
 
     #[tokio::test]

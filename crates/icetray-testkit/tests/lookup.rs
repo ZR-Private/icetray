@@ -3,6 +3,7 @@
 //! cold hit and none per warm hit or miss, `Generation::plan` as the oracle
 //! for `multi_get`, and the layouts the doctor prices or advises on.
 
+use icetray_core::approx::count;
 use icetray_core::check::Tier;
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
@@ -13,7 +14,7 @@ use icetray_testkit::fixture::{
     SMALL_BUCKETS, SMALL_FILE_BYTES, SMALL_IDS, UNPARTITIONED_FILE_BYTES, WIDE_VALUE_BYTES,
     local_catalog,
 };
-use icetray_testkit::verify::{self, count};
+use icetray_testkit::verify;
 use icetray_testkit::{Fixture, FixtureSpec, Layout, Nulls, Result, TestkitError, write_fixture};
 
 /// Every this-many-th id is looked up once: routing over every bucket and

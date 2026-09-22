@@ -1,12 +1,14 @@
 //! Assertions shared by the acceptance tests (RFD 014): one table served
 //! over its own storage and cache, the cost oracle on `Generation::plan`,
-//! and the hit and miss checks that compare a lookup's answer with the
-//! fixture's derivation and its GETs with the oracle's count.
+//! the hit and miss checks that compare a lookup's answer with the
+//! fixture's derivation and its GETs with the oracle's count, and the
+//! reader of one series out of a metrics scrape.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, StorageConfig, TableConfig};
 use icetray_core::{
     Generation, Key, LocalDir, PageCache, Residency, Storage, Table, TableSource, Value,
@@ -277,8 +279,94 @@ pub async fn verify_misses(served: &Served, fixture: &Fixture, ids: &[u64]) -> R
     Ok(())
 }
 
-/// A length or count as the GET totals, row counts, and byte sizes take it:
-/// the one `usize` to `u64` conversion in the crate.
-pub fn count(n: usize) -> u64 {
-    u64::try_from(n).expect("a count fits u64 on the supported systems")
+/// The value of the series `name` whose labels include every pair in
+/// `labels`, read from a Prometheus text exposition (`name{label="value",
+/// ..} value`), or `None` when no such series is exposed: a counter appears
+/// only after its first count, so a reading before it is zero to the
+/// caller. The whole name must match, so `requests_total` never reads a
+/// `requests_total_bucket` line.
+pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
+    exposition.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?;
+        let (label_text, value) = match rest.strip_prefix('{') {
+            Some(labelled) => labelled.split_once('}')?,
+            None => ("", rest.strip_prefix(' ')?),
+        };
+        let present: Vec<(&str, &str)> = label_text
+            .split(',')
+            .filter_map(|pair| {
+                let (label, quoted) = pair.split_once('=')?;
+                Some((label, quoted.trim_matches('"')))
+            })
+            .collect();
+        labels
+            .iter()
+            .all(|pair| present.contains(pair))
+            .then(|| value.trim().parse().ok())?
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The counts the sample exposition carries, one per series.
+    const GETS: u64 = 3;
+    const MULTI_GETS: u64 = 1;
+    const RSS: u64 = 12_345;
+
+    /// A scrape as the exporter renders it: a comment line, labelled
+    /// counters, a two-label gauge, and an unlabelled gauge.
+    fn exposition() -> String {
+        format!(
+            "# TYPE requests_total counter
+requests_total{{call=\"get\"}} {GETS}
+requests_total{{call=\"multi_get\"}} {MULTI_GETS}
+table_state{{table=\"a\",state=\"serving\"}} 1
+process_rss_bytes {RSS}
+"
+        )
+    }
+
+    #[test]
+    fn test_series_value_reads_by_name_and_labels_in_any_order() {
+        let scrape = exposition();
+        assert_eq!(
+            series_value(&scrape, "requests_total", &[("call", "get")]),
+            Some(GETS)
+        );
+        assert_eq!(
+            series_value(&scrape, "requests_total", &[("call", "multi_get")]),
+            Some(MULTI_GETS)
+        );
+        assert_eq!(
+            series_value(&scrape, "requests_total", &[]),
+            Some(GETS),
+            "no label constraint reads the first series of the name"
+        );
+        assert_eq!(
+            series_value(
+                &scrape,
+                "table_state",
+                &[("state", "serving"), ("table", "a")]
+            ),
+            Some(1)
+        );
+        assert_eq!(series_value(&scrape, "process_rss_bytes", &[]), Some(RSS));
+    }
+
+    #[test]
+    fn test_series_value_is_none_for_an_absent_series_or_a_name_prefix() {
+        let scrape = exposition();
+        assert_eq!(
+            series_value(&scrape, "requests_total", &[("call", "table_info")]),
+            None
+        );
+        assert_eq!(
+            series_value(&scrape, "table_state", &[("table", "b")]),
+            None
+        );
+        assert_eq!(series_value(&scrape, "requests", &[]), None);
+        assert_eq!(series_value(&scrape, "process_rss", &[]), None);
+    }
 }

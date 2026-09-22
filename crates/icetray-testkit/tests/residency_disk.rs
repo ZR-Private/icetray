@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use icetray_core::approx::count;
 use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
 };
@@ -20,7 +21,7 @@ use icetray_core::{DataFileIdentity, Error, KeyType, LocalDir, RefusalReason, St
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
 };
-use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served, count};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
 
 /// The two tables sharing one local directory in the retain test.

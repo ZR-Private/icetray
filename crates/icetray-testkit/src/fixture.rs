@@ -38,10 +38,12 @@ use iceberg::writer::partitioning::PartitioningWriter as _;
 use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
 use iceberg::{Catalog, CatalogBuilder as _, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
+use icetray_core::approx::count;
 use icetray_core::catalog::{TableSource, hint_location, version_file};
 use icetray_core::config::{Residency, SourceConfig, TableConfig};
 use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
+use icetray_core::time::millis_after;
 use icetray_core::{Key, KeyType, Value};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
@@ -52,7 +54,6 @@ use crate::keys::{
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::s3::S3Fixture;
-use crate::verify::count;
 
 /// Ids of the small fixture: twenty thousand rows, about 1,250 per bucket
 /// of `SMALL_BUCKETS`, so every bucket's file holds two contract pages.
@@ -216,6 +217,11 @@ const MANIFEST_SUFFIX: &str = ".avro";
 
 /// The id of a by-hand snapshot on a table with none.
 const FIRST_SNAPSHOT_ID: i64 = 1;
+
+/// The milliseconds a by-hand snapshot is stamped past the metadata's last
+/// update: the least step that keeps snapshot timestamps increasing, which
+/// Iceberg requires of a commit.
+const HAND_COMMIT_STEP_MILLIS: i64 = 1;
 
 /// The name the memory catalog is registered under; nothing reads it back.
 const MEMORY_CATALOG_NAME: &str = "memory";
@@ -677,7 +683,10 @@ impl Fixture {
             .with_snapshot_id(snapshot_id)
             .with_parent_snapshot_id(parent)
             .with_sequence_number(sequence)
-            .with_timestamp_ms(self.metadata.last_updated_ms() + 1)
+            .with_timestamp_ms(millis_after(
+                self.metadata.last_updated_ms(),
+                HAND_COMMIT_STEP_MILLIS,
+            ))
             .with_manifest_list(list_path)
             .with_summary(Summary {
                 operation: Operation::Overwrite,
@@ -777,7 +786,7 @@ pub async fn write_fixture(
     namespace: &str,
     spec: FixtureSpec,
 ) -> Result<Fixture> {
-    if spec.key_pad > 0 && matches!(spec.key_type, KeyType::Long | KeyType::Uuid) {
+    if spec.key_pad > 0 && spec.key_type.is_fixed_width() {
         return Err(SpecFault::PadOnFixedWidthKey {
             key_type: spec.key_type,
         }

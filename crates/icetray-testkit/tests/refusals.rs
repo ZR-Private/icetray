@@ -10,6 +10,7 @@ use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, S
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
 use iceberg::spec::{PrimitiveType, Struct};
+use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
@@ -20,7 +21,7 @@ use icetray_testkit::fixture::{
     local_catalog, position_delete_file, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
-use icetray_testkit::verify::{self, LOAD_METADATA_GETS, count};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
 use icetray_testkit::{
     Bloom, Fixture, FixtureSpec, HandSnapshot, Layout, Order, RawFile, Result, value_for,
     write_fixture,

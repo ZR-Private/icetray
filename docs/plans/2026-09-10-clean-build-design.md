@@ -991,7 +991,8 @@ hedge-disabled and whose `file_io_props` is a `HashMap`), `sim`
 `verify` (`Served` with `load` and `current`; `build`, `serve_over`,
 `serve`, `serve_catalog`, `serve_catalog_with`; `expected_cold_gets`,
 `expected_key_pages`, `predicted_probe`; `verify_hits`, `verify_hit_cost`,
-`verify_misses`; `storage_config_for_tests`, `count`,
+`verify_misses`; `storage_config_for_tests`, `series_value` (one series
+of a Prometheus text exposition by name and labels),
 `TEST_PAGE_CACHE_BYTES`, and the GET oracle's fixed counts
 `LOAD_METADATA_GETS`, `METADATA_FILE_GETS`, `LOAD_GETS_PER_FILE`,
 `HINT_POLL_GETS`), and
@@ -1000,9 +1001,9 @@ hedge-disabled and whose `file_io_props` is a `HashMap`), `sim`
 `wide_value`). The constants `PAGE_ROWS`, `VALUE_PAGE_BYTES`,
 `TARGET_FILE_BYTES_MAX`, `KEY_BYTES_ADVICE`, `MAX_KEY_BYTES`, and
 `PAGE_CACHE_DISK_BLOCK_BYTES` are imported from `contract` and never
-redeclared; the golden key derivations delegate to `keys`; `count` is the
-crate's one `usize` to `u64` conversion. Everything is test-only, under
-`[dev-dependencies]` of the crates that use it.
+redeclared; the golden key derivations delegate to `keys`; a `usize`
+widens to `u64` through core's `approx::count` alone. Everything is
+test-only, under `[dev-dependencies]` of the crates that use it.
 
 The fixture writer commits through the Iceberg library's `ClusteredWriter`
 over the rolling data-file writer under `Layout::properties`, grouping ids
