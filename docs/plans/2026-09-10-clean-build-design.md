@@ -583,7 +583,7 @@ impl PageCache {
 // generation
 pub struct LoadedFile { pub entry: DataFileEntry, pub index: FileIndex }
 pub struct Generation {
-    pub table: String, pub snapshot_id: SnapshotId, pub sequence_number: i64, pub metadata_location: String,
+    pub table: String, pub snapshot_id: SnapshotId, pub metadata_location: String,
     pub layout: TableLayout, pub residency: Residency, pub files: Vec<Arc<LoadedFile>> /* sorted by (bucketing, bucket, exact first key, path) */,
     pub records: u64, pub index_bytes: usize, pub loaded_at: Instant,
     /// The snapshot's own timestamp, from `snapshot.timestamp_ms()` through

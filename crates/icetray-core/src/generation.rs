@@ -55,8 +55,6 @@ pub struct Generation {
     pub table: String,
     /// The snapshot served.
     pub snapshot_id: SnapshotId,
-    /// The snapshot's sequence number.
-    pub sequence_number: i64,
     /// The metadata file the snapshot was read from; what the next poll
     /// compares against.
     pub metadata_location: String,
@@ -202,7 +200,6 @@ impl Generation {
         Ok(Self {
             table: table.to_string(),
             snapshot_id: SnapshotId(snapshot.snapshot_id()),
-            sequence_number: snapshot.sequence_number(),
             metadata_location: metadata_location.to_string(),
             layout,
             residency,
@@ -2456,7 +2453,6 @@ mod tests {
         let first = table.load(&config, None, None).await.unwrap();
         assert_eq!(table.gets(), METADATA_GETS + 2 * FILE_GETS);
         assert_eq!(first.snapshot_id, SnapshotId(FIRST_SNAPSHOT));
-        assert_eq!(first.sequence_number, FIRST_SEQUENCE);
         assert_eq!(
             first.metadata_location,
             crate::catalog::version_file(&table.root(), FIRST_VERSION)
