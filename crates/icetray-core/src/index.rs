@@ -66,7 +66,8 @@ pub enum FileFault {
     #[error("the footer's row counts disagree with one another")]
     InconsistentRowCounts,
     /// A column's offset index does not describe its pages in a row group:
-    /// a row group with rows has no page, a page has a negative offset or
+    /// the column chunk the pages lie in has a negative offset or size, a
+    /// row group with rows has no page, a page has a negative offset or
     /// size or lies outside its column chunk, the first page does not start
     /// at row zero, or the pages' first rows are not strictly increasing
     /// within the row group.
@@ -95,7 +96,8 @@ pub enum FileFault {
         /// The row group it was looked for in.
         row_group: usize,
     },
-    /// A bloom filter that does not decode from the bytes the footer bounds.
+    /// A bloom filter that does not decode from exactly the bytes the
+    /// footer bounds, or decodes to a bitset of no block.
     #[error("bloom filter of row group {row_group} does not decode")]
     CorruptBloomFilter {
         /// The row group whose filter is unreadable.
@@ -944,8 +946,7 @@ impl Inspected {
                 let chunks = Arc::new(Segments::new(parts, handle.size()));
                 let verified = verify(&table, &column, layout.key_shape, &chunks)?;
                 drop(chunks);
-                let filters =
-                    read_bloom_filters(&handle, &metadata, layout.key_leaf, filter_ranges).await?;
+                let filters = read_bloom_filters(&handle, &filter_ranges).await?;
                 (KeyResidency::Filters(filters), verified)
             }
         };
@@ -1271,11 +1272,12 @@ fn check_row_counts(path: &str, metadata: &ParquetMetaData) -> Result<()> {
 
 /// The offset index of `leaf` in every row group, checked once so that the
 /// lookup path converts its numbers with no fallible step: an index is
-/// present, every page has a non-negative offset and size and lies inside
-/// its column chunk, the first page is at row zero, first rows are strictly
-/// increasing and inside the row group, and a row group with rows has a
-/// page. A footer without the index is `FileFault::MissingPageIndex`; one
-/// whose index fails a check is `FileFault::InconsistentOffsetIndex`.
+/// present, the column chunk has a non-negative offset and size, every
+/// page has a non-negative offset and size and lies inside the chunk, the
+/// first page is at row zero, first rows are strictly increasing and inside
+/// the row group, and a row group with rows has a page. A footer without
+/// the index is `FileFault::MissingPageIndex`; one whose index fails a
+/// check is `FileFault::InconsistentOffsetIndex`.
 fn check_offset_index(path: &str, metadata: &ParquetMetaData, leaf: usize) -> Result<()> {
     let offset_index = metadata
         .offset_index()
@@ -1291,13 +1293,12 @@ fn check_offset_index(path: &str, metadata: &ParquetMetaData, leaf: usize) -> Re
         if rows > 0 && locations.is_empty() {
             return Err(inconsistent());
         }
-        let (chunk_start, chunk_len) = group.column(leaf).byte_range();
-        let chunk_end = chunk_start.saturating_add(chunk_len);
+        let chunk = chunk_range(group.column(leaf)).ok_or_else(inconsistent)?;
         let mut previous: Option<i64> = None;
         for location in locations {
             let in_chunk = u64::try_from(location.offset).is_ok_and(|start| {
                 u64::try_from(location.compressed_page_size)
-                    .is_ok_and(|len| start >= chunk_start && start.saturating_add(len) <= chunk_end)
+                    .is_ok_and(|len| start >= chunk.start && start.saturating_add(len) <= chunk.end)
             });
             let in_group = location.first_row_index >= 0 && location.first_row_index < rows;
             let in_order = previous.map_or(location.first_row_index == 0, |first| {
@@ -1337,15 +1338,34 @@ fn kept_footer(metadata: &ParquetMetaData, key_leaf: usize) -> ParquetMetaData {
     builder.build()
 }
 
+/// The byte range of a column chunk from its footer fields: from the
+/// dictionary page when the chunk has one, else the first data page, for
+/// the chunk's compressed size. `None` when a field is negative or the end
+/// does not fit `u64`. Parquet's `byte_range` asserts on a negative field,
+/// so every chunk the index reads goes through this check at build, before
+/// anything asks parquet for its range.
+fn chunk_range(chunk: &ColumnChunkMetaData) -> Option<Range<u64>> {
+    let negative = chunk.data_page_offset() < 0
+        || chunk.compressed_size() < 0
+        || chunk
+            .dictionary_page_offset()
+            .is_some_and(|offset| offset < 0);
+    if negative {
+        return None;
+    }
+    let (start, len) = chunk.byte_range();
+    Some(start..start.checked_add(len)?)
+}
+
 /// The byte range of the key column chunk of every row group, in row group
-/// order.
+/// order; build checked every chunk's offset and size.
 fn key_chunk_ranges(metadata: &ParquetMetaData, key_leaf: usize) -> Vec<Range<u64>> {
     metadata
         .row_groups()
         .iter()
         .map(|group| {
-            let (start, len) = group.column(key_leaf).byte_range();
-            start..start + len
+            chunk_range(group.column(key_leaf))
+                .expect("column chunk offsets and sizes were checked at build")
         })
         .collect()
 }
@@ -1450,7 +1470,8 @@ pub(crate) fn off_worker<T>(work: impl FnOnce() -> T) -> T {
 /// The byte range of the key column's bloom filter in every row group. The
 /// Bloom tier stands the filter in for the key chunk, so a row group without
 /// one is `RefusalReason::NoBloomFilter`, and one whose filter the footer
-/// does not bound is `FileFault::UnsizedBloomFilter`.
+/// does not bound, by a missing or negative length or an end past `u64`,
+/// is `FileFault::UnsizedBloomFilter`.
 fn bloom_ranges(
     table: &str,
     handle: &FileHandle,
@@ -1476,47 +1497,43 @@ fn bloom_ranges(
                         },
                     )
                 })?;
+            let unsized_filter = || file_fault(path, FileFault::UnsizedBloomFilter { row_group });
             let len = column
                 .bloom_filter_length()
                 .and_then(|len| u64::try_from(len).ok())
-                .ok_or_else(|| file_fault(path, FileFault::UnsizedBloomFilter { row_group }))?;
-            Ok(offset..offset + len)
+                .ok_or_else(unsized_filter)?;
+            let end = offset.checked_add(len).ok_or_else(unsized_filter)?;
+            Ok(offset..end)
         })
         .collect()
 }
 
 /// The key column's bloom filter of every row group, one `read_ranges` call
 /// (one load GET per row group), each parsed from exactly the bytes the
-/// footer bounds; a filter that does not decode from them is
-/// `FileFault::CorruptBloomFilter`.
-async fn read_bloom_filters(
-    handle: &FileHandle,
-    metadata: &ParquetMetaData,
-    key_leaf: usize,
-    ranges: Vec<Range<u64>>,
-) -> Result<Vec<Sbbf>> {
-    let bytes = handle.read_ranges(&ranges).await?;
-    ranges
-        .into_iter()
-        .zip(bytes)
+/// footer bounds: a header, then a bitset of exactly the header's length,
+/// holding at least one block. A filter that does not decode so, or whose
+/// bitset holds no block (fewer than `parquet::bloom_filter::BITSET_MIN_LENGTH`
+/// bytes; a check indexes the first block), is `FileFault::CorruptBloomFilter`.
+async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Result<Vec<Sbbf>> {
+    let bytes = handle.read_ranges(ranges).await?;
+    bytes
+        .iter()
         .enumerate()
-        .map(|(row_group, (range, bytes))| {
-            let segments = Segments::new(vec![(range, bytes)], handle.size());
-            let column = metadata.row_group(row_group).column(key_leaf);
-            match Sbbf::read_from_column_chunk(column, &segments) {
-                Ok(Some(filter)) => Ok(filter),
-                Ok(None) => Err(file_fault(
+        .map(|(row_group, bytes)| {
+            let corrupt = || {
+                file_fault(
                     &handle.location,
                     FileFault::CorruptBloomFilter { row_group },
-                )),
-                Err(error) => {
-                    tracing::debug!(%error, path = %handle.location, row_group, "bloom filter does not decode");
-                    Err(file_fault(
-                        &handle.location,
-                        FileFault::CorruptBloomFilter { row_group },
-                    ))
-                }
+                )
+            };
+            let filter = Sbbf::from_bytes(bytes).map_err(|error| {
+                tracing::debug!(%error, path = %handle.location, row_group, "bloom filter does not decode");
+                corrupt()
+            })?;
+            if filter.num_blocks() == 0 {
+                return Err(corrupt());
             }
+            Ok(filter)
         })
         .collect()
 }
@@ -1691,7 +1708,10 @@ fn check_utf8(column: &Column<'_>, row_group: usize, keys: &Keys) -> Result<()> 
 /// were decoded, from exactly the pages the offset index names for them,
 /// each page holding the rows the index gives it; a page that does not is
 /// `FileFault::PageRowsMismatch`, so no row position rests on an offset
-/// index the pages contradict.
+/// index the pages contradict. `take` is the footer's number and sizes no
+/// buffer: the values grow with what the pages hold, so a footer claiming
+/// more rows than any file holds costs no reservation before the check
+/// refuses it.
 fn read_column<T: ParquetDataType>(
     column: &Column<'_>,
     row_group: usize,
@@ -1712,7 +1732,7 @@ fn read_column<T: ParquetDataType>(
     } else {
         0
     };
-    let mut values = Vec::with_capacity(take);
+    let mut values = Vec::new();
     let mut def_levels = Vec::new();
     let mut records = 0;
     while skipped == skip && records < take {
@@ -1942,7 +1962,9 @@ mod tests {
     use object_store::{ObjectStoreExt as _, PutPayload};
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
-    use parquet::file::metadata::{FileMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader};
+    use parquet::file::metadata::{
+        ColumnChunkMetaDataBuilder, FileMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader,
+    };
     use parquet::file::page_index::offset_index::OffsetIndexMetaData;
     use parquet::file::properties::{
         DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties,
@@ -2021,6 +2043,11 @@ mod tests {
     const SMALL_BATCH: usize = 8;
     /// Every `NULL_EVERY`th value of the nullable fixture is null.
     const NULL_EVERY: usize = 7;
+    /// A row count a footer may claim for one row group that no file holds:
+    /// two to the fiftieth, eight pebibytes of long keys, beyond the address
+    /// space of the supported targets, so a buffer reserved for that many
+    /// keys aborts the process before any check runs.
+    const UNALLOCATABLE_ROWS: i64 = 1 << 50;
     /// The bytes overwritten at the start of a bloom filter to corrupt it,
     /// and the byte they are overwritten with: no thrift field header.
     const GARBAGE_BYTES: usize = 32;
@@ -2515,6 +2542,30 @@ mod tests {
         groups.insert(
             row_group,
             group.into_builder().set_num_rows(rows).build().unwrap(),
+        );
+        builder.set_row_groups(groups).build()
+    }
+
+    /// `metadata` with column `leaf`'s chunk metadata in `row_group`
+    /// rebuilt through `edit`.
+    fn with_column_chunk(
+        metadata: &ParquetMetaData,
+        row_group: usize,
+        leaf: usize,
+        edit: impl FnOnce(ColumnChunkMetaDataBuilder) -> ColumnChunkMetaDataBuilder,
+    ) -> ParquetMetaData {
+        let mut builder = metadata.clone().into_builder();
+        let mut groups = builder.take_row_groups();
+        let group = groups.remove(row_group);
+        let mut columns = group.columns().to_vec();
+        columns[leaf] = edit(columns[leaf].clone().into_builder()).build().unwrap();
+        groups.insert(
+            row_group,
+            group
+                .into_builder()
+                .set_column_metadata(columns)
+                .build()
+                .unwrap(),
         );
         builder.set_row_groups(groups).build()
     }
@@ -3424,6 +3475,60 @@ mod tests {
         }
     }
 
+    /// A column chunk whose footer fields are negative is refused where the
+    /// offset index is checked against it, before anything asks parquet for
+    /// the chunk's byte range, which asserts on a negative field.
+    #[tokio::test]
+    async fn test_check_offset_index_refuses_a_column_chunk_with_a_negative_offset_or_size() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let path = location();
+        for leaf in [0, 1] {
+            let negative = [
+                with_column_chunk(&loaded, 0, leaf, |chunk| chunk.set_data_page_offset(-1)),
+                with_column_chunk(&loaded, 0, leaf, |chunk| {
+                    chunk.set_dictionary_page_offset(Some(-1))
+                }),
+                with_column_chunk(&loaded, 0, leaf, |chunk| {
+                    chunk.set_total_compressed_size(-1)
+                }),
+            ];
+            for patched in &negative {
+                assert_eq!(
+                    fault_of(check_offset_index(&path, patched, leaf)),
+                    FileFault::InconsistentOffsetIndex { row_group: 0 }
+                );
+            }
+        }
+    }
+
+    /// A footer that claims more rows for a row group than any page could
+    /// hold is refused by the pages read, and nothing is reserved for the
+    /// claimed rows on the way: the buffer grows with what the pages hold.
+    #[tokio::test]
+    async fn test_verify_refuses_an_unallocatable_row_count_without_reserving_for_it() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let chunks = key_chunks(&opened, &loaded, key_leaf).await;
+        let path = location();
+        let inflated = with_group_rows(&loaded, 0, UNALLOCATABLE_ROWS);
+        let column = Column {
+            metadata: &inflated,
+            leaf: key_leaf,
+            path: &path,
+        };
+        assert_eq!(
+            fault_of(
+                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups)
+            ),
+            FileFault::PageRowsMismatch {
+                row_group: 0,
+                page: PAGES_PER_GROUP - 1,
+            }
+        );
+    }
+
     /// The bytes of the fixture's key column chunks, as `build` fetches
     /// them for verification.
     async fn key_chunks(
@@ -3797,30 +3902,68 @@ mod tests {
         assert_eq!(index.residency(), Residency::Full);
     }
 
+    /// The key column's filters of the fixture behind `opened`, read as
+    /// `build` reads them, from the ranges `metadata` bounds.
+    async fn filters_of(opened: &Opened, metadata: &ParquetMetaData) -> Result<Vec<Sbbf>> {
+        let key_leaf = 0;
+        let ranges = bloom_ranges(TABLE, &opened.handle, metadata, key_leaf)?;
+        read_bloom_filters(&opened.handle, &ranges).await
+    }
+
+    /// A filter whose bitset holds no block, or whose footer length cuts
+    /// the bitset short, is refused at build: a filter of no block has no
+    /// first block to index on a check, and a cut bitset answers for keys
+    /// it never saw.
+    #[tokio::test]
+    async fn test_read_bloom_filters_refuses_a_filter_of_no_block_or_one_cut_short() {
+        let fixture = Fixture::contract(KeyType::Long, FEW_ROWS);
+        let file = fixture.write();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&file)
+            .unwrap();
+        let key_leaf = 0;
+        let column = metadata.row_group(0).column(key_leaf);
+        let offset = usize::try_from(column.bloom_filter_offset().unwrap()).unwrap();
+        let length = column.bloom_filter_length().unwrap();
+        let intact = store_file(file.clone()).await;
+        let filters = filters_of(&intact, &metadata).await.unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].num_blocks() > 0);
+
+        // A filter of no block as parquet serializes one: a header saying
+        // zero bitset bytes and nothing after it, in place of the written
+        // filter, with the footer bounding exactly those bytes.
+        let mut no_block = Vec::new();
+        Sbbf::new(&[]).write(&mut no_block).unwrap();
+        let mut overwritten = file.to_vec();
+        overwritten[offset..offset + no_block.len()].copy_from_slice(&no_block);
+        let opened = store_file(Bytes::from(overwritten)).await;
+        let no_block_footer = with_column_chunk(&metadata, 0, key_leaf, |chunk| {
+            chunk.set_bloom_filter_length(Some(i32::try_from(no_block.len()).unwrap()))
+        });
+        assert_eq!(
+            fault_of(filters_of(&opened, &no_block_footer).await),
+            FileFault::CorruptBloomFilter { row_group: 0 }
+        );
+
+        // The footer bounds one byte less than the header and bitset take.
+        let cut_short = with_column_chunk(&metadata, 0, key_leaf, |chunk| {
+            chunk.set_bloom_filter_length(Some(length - 1))
+        });
+        assert_eq!(
+            fault_of(filters_of(&intact, &cut_short).await),
+            FileFault::CorruptBloomFilter { row_group: 0 }
+        );
+    }
+
     #[tokio::test]
     async fn test_bloom_ranges_without_a_filter_length_is_a_file_fault() {
         let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
         let index = opened.index(KeyType::Long).await;
         let key_leaf = index.key_leaf();
-        let mut builder = (**index.metadata()).clone().into_builder();
-        let mut groups = builder.take_row_groups();
-        let group = groups.remove(0);
-        let mut columns = group.columns().to_vec();
-        columns[key_leaf] = columns[key_leaf]
-            .clone()
-            .into_builder()
-            .set_bloom_filter_length(None)
-            .build()
-            .unwrap();
-        groups.insert(
-            0,
-            group
-                .into_builder()
-                .set_column_metadata(columns)
-                .build()
-                .unwrap(),
-        );
-        let patched = builder.set_row_groups(groups).build();
+        let patched = with_column_chunk(index.metadata(), 0, key_leaf, |chunk| {
+            chunk.set_bloom_filter_length(None)
+        });
         let result = bloom_ranges(TABLE, &opened.handle, &patched, key_leaf);
         let Err(Error::File { path, fault }) = result else {
             panic!("expected a file fault, got {result:?}");
