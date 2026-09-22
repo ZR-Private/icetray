@@ -53,7 +53,7 @@ redefine.
 | `catalog` | where the current metadata comes from (static root with version hint, metadata file, any catalog incl. REST); one-read change detection | 005 |
 | `manifest` | snapshot to live data files; table layout (key and value columns, bucket transform) derived from the snapshot's schema and each manifest's partition spec; delete-file refusal | 005, 009 |
 | `parquet_io` | Parquet byte access: one-GET footer load, `Segments` (in-memory `ChunkReader` that never fetches) | 004, 006 |
-| `index` | the per-file resident index: key chunks, fences, exact per-row-group ranges, `find` (no I/O), `read_value` (one page through the cache) | 004, 006 |
+| `index` | the per-file resident index: key chunks, fences, exact per-row-group ranges, `find` (no I/O), `read_value` (one page through the cache). A directory module by pipeline stage: `index/mod.rs` holds the public surface and the lookup path, `index/inspect.rs` the footer stage, `index/build.rs` the chunk stage, and `index/testing.rs` the fixtures the three stages' tests share | 004, 006 |
 | `cache` | the shared value-page cache keyed by (file, page offset) with fetch coalescing | 004 |
 | `generation` | `Generation` (one snapshot, fully indexed, deterministic file order), overlap grouping and duplicate refusal, the residency budget check at the footer stage | 005, 017 |
 | `check` | the doctor: tiers, finding codes, penalties, thresholds table | 007, 016 |
