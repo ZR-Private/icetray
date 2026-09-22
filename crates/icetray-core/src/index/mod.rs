@@ -104,11 +104,13 @@ pub enum FileFault {
         /// The row group whose filter is unreadable.
         row_group: usize,
     },
-    /// The footer records where a row group's bloom filter starts but not
-    /// how long it is, so the filter cannot be read as one bounded range.
-    #[error("bloom filter of row group {row_group} has no length in the footer")]
-    UnsizedBloomFilter {
-        /// The row group whose filter has no length.
+    /// The footer names a row group's bloom filter but places it nowhere a
+    /// file can hold: a negative offset, no length, or a length negative or
+    /// past the end of `u64`, so the filter cannot be read as one bounded
+    /// range. A footer with no filter at all is a refusal, not a fault.
+    #[error("bloom filter of row group {row_group} has no place the footer can hold")]
+    UnplaceableBloomFilter {
+        /// The row group whose filter the footer cannot place.
         row_group: usize,
     },
     /// A string key column holds a value that is not UTF-8. A `Key::Str` is

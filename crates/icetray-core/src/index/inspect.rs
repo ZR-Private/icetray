@@ -296,8 +296,8 @@ pub(super) fn key_chunk_ranges(metadata: &ParquetMetaData, key_leaf: usize) -> V
 /// The byte range of the key column's bloom filter in every row group. The
 /// Bloom tier stands the filter in for the key chunk, so a row group without
 /// one is `RefusalReason::NoBloomFilter`, and one whose filter the footer
-/// does not bound, by a missing or negative length or an end past `u64`,
-/// is `FileFault::UnsizedBloomFilter`.
+/// places nowhere a file can hold, with a negative offset, no length, or a
+/// negative or overflowing length, is `FileFault::UnplaceableBloomFilter`.
 pub(super) fn bloom_ranges(
     table: &str,
     handle: &FileHandle,
@@ -311,24 +311,22 @@ pub(super) fn bloom_ranges(
         .enumerate()
         .map(|(row_group, group)| {
             let column = group.column(key_leaf);
-            let offset = column
-                .bloom_filter_offset()
-                .and_then(|offset| u64::try_from(offset).ok())
-                .ok_or_else(|| {
-                    Error::refused(
-                        table,
-                        RefusalReason::NoBloomFilter {
-                            path: path.to_string(),
-                            row_group,
-                        },
-                    )
-                })?;
-            let unsized_filter = || file_fault(path, FileFault::UnsizedBloomFilter { row_group });
+            let Some(offset) = column.bloom_filter_offset() else {
+                return Err(Error::refused(
+                    table,
+                    RefusalReason::NoBloomFilter {
+                        path: path.to_string(),
+                        row_group,
+                    },
+                ));
+            };
+            let unplaceable = || file_fault(path, FileFault::UnplaceableBloomFilter { row_group });
+            let offset = u64::try_from(offset).map_err(|_| unplaceable())?;
             let len = column
                 .bloom_filter_length()
                 .and_then(|len| u64::try_from(len).ok())
-                .ok_or_else(unsized_filter)?;
-            let end = offset.checked_add(len).ok_or_else(unsized_filter)?;
+                .ok_or_else(unplaceable)?;
+            let end = offset.checked_add(len).ok_or_else(unplaceable)?;
             Ok(offset..end)
         })
         .collect()
@@ -501,6 +499,8 @@ mod tests {
 
     /// A column name no fixture has.
     const ABSENT_COLUMN: &str = "absent";
+    /// A bloom filter offset no footer can mean: before the file's first byte.
+    const NEGATIVE_OFFSET: i64 = -1;
     /// Bytes per value where value pages must be bounded by bytes.
     const LARGE_VALUE_BYTES: usize = 4096;
     /// The resident bytes of a byte-bounded large-value file stay within
@@ -810,6 +810,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bloom_ranges_with_a_negative_filter_offset_is_a_file_fault() {
+        let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
+        let index = opened.index(KeyType::Long).await;
+        let key_leaf = index.key_leaf();
+        let patched = with_column_chunk(index.metadata(), 0, key_leaf, |chunk| {
+            chunk.set_bloom_filter_offset(Some(NEGATIVE_OFFSET))
+        });
+        let result = bloom_ranges(TABLE, &opened.handle, &patched, key_leaf);
+        let Err(Error::File { path, fault }) = result else {
+            panic!("expected a file fault, got {result:?}");
+        };
+        assert_eq!(path, location());
+        assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
+    }
+
+    #[tokio::test]
     async fn test_bloom_ranges_without_a_filter_length_is_a_file_fault() {
         let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
         let index = opened.index(KeyType::Long).await;
@@ -822,7 +838,7 @@ mod tests {
             panic!("expected a file fault, got {result:?}");
         };
         assert_eq!(path, location());
-        assert_eq!(fault, FileFault::UnsizedBloomFilter { row_group: 0 });
+        assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
         assert_eq!(
             FileIndex::predicted_resident_bytes(&patched, key_leaf).bloom,
             None
