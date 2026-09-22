@@ -109,12 +109,14 @@ One worker.
    threshold moved to 1 MiB after stage 4 measured the cost as linear with
    no step (RFD 016): the recipe is unchanged, and the doctor reports the
    mean value size beside the mean page size instead.
-4. Conformance run: `dev/conformance.sh`, a CI job of its own, runs the
-   binary's `test_serve_conformance_from_the_environment` by name: the
-   server started the way a pod starts it (the path from `ICETRAY_CONFIG`, a
-   JSON file, no flags), the JSON logs under the configured field names, the
-   health service answering while the table loads, readiness after it
-   serves, the metrics scrape, and the drain on SIGTERM to exit 0.
+4. Conformance run: the binary's `test_serve_conformance_from_the_environment`
+   starts the server the way a pod starts it (the path from `ICETRAY_CONFIG`,
+   a JSON file, no flags) and checks the JSON logs under the configured
+   field names, the health service answering while the table loads,
+   readiness after it serves, the metrics scrape, and the drain on SIGTERM
+   to exit 0. It runs with the workspace tests, so CI's one test job is the
+   conformance run RFD 012 asks for; a job of its own that reran the test by
+   name was dropped after review as a second call of the same gate.
 5. `README.md` rewritten for the working system: what it is, the contract in
    words with a pointer to the doctor, how to run against a table, how to
    deploy. Then the humanizer pass on the README and the RFD problem
@@ -136,5 +138,5 @@ warehouse with temporary credentials from the profile.
 
 Every invariant in the blueprint's section 6 has its test; the gate is
 green; the doctor reports the contract fixture as efficient with no
-findings; the conformance run passes; the README describes the system as
+findings; the conformance test passes; the README describes the system as
 built; the denylist grep over the tree and the history is empty.
