@@ -4,6 +4,7 @@
 //! by variant. Every call is counted under `requests_total`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use icetray_core::key::UUID_BYTES;
@@ -16,6 +17,7 @@ use icetray_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
+use crate::error::WireKeyFault;
 use crate::telemetry::{self, Call};
 
 /// The served tables by name. Clone: tonic hands one clone to every
@@ -56,22 +58,48 @@ impl Service {
     }
 }
 
-/// The wire variant's name, for a mismatch message.
-fn variant_name(key: &v1::key::Key) -> &'static str {
-    match key {
-        v1::key::Key::Long(_) => "long",
-        v1::key::Key::Str(_) => "str",
-        v1::key::Key::Bin(_) => "bin",
+/// The variant a wire `Key` carries (RFD 010), the closed set the `oneof`
+/// declares, for the fault naming one the table's key type does not take.
+/// Display gives the field's name in the contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireVariant {
+    /// `Key.long`.
+    Long,
+    /// `Key.str`.
+    Str,
+    /// `Key.bin`.
+    Bin,
+}
+
+impl WireVariant {
+    /// The variant `key` carries.
+    pub fn of(key: &v1::key::Key) -> Self {
+        match key {
+            v1::key::Key::Long(_) => Self::Long,
+            v1::key::Key::Str(_) => Self::Str,
+            v1::key::Key::Bin(_) => Self::Bin,
+        }
+    }
+}
+
+impl fmt::Display for WireVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Long => "long",
+            Self::Str => "str",
+            Self::Bin => "bin",
+        };
+        f.write_str(name)
     }
 }
 
 /// A key from the wire under the table's key type (RFD 010): the variant
 /// must match the type, and `bin` on a uuid table must be `UUID_BYTES` long.
-/// A missing key, a `Key` with no variant, and every other pairing are
-/// `INVALID_ARGUMENT`.
-pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Status> {
+/// A missing key or a `Key` with no variant is `Missing`; every other
+/// pairing is `VariantMismatch`.
+pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, WireKeyFault> {
     let Some(variant) = key.and_then(|key| key.key) else {
-        return Err(Status::invalid_argument("key is required"));
+        return Err(WireKeyFault::Missing);
     };
     match (variant, key_type) {
         (v1::key::Key::Long(value), KeyType::Long) => Ok(Key::Long(value)),
@@ -79,20 +107,23 @@ pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Sta
         (v1::key::Key::Bin(bytes), KeyType::Binary) => Ok(Key::Bytes(bytes)),
         (v1::key::Key::Bin(bytes), KeyType::Uuid) => <[u8; UUID_BYTES]>::try_from(bytes.as_slice())
             .map(Key::Uuid)
-            .map_err(|_| {
-                Status::invalid_argument(format!(
-                    "a uuid key is {UUID_BYTES} bytes, got {}",
-                    bytes.len()
-                ))
-            }),
+            .map_err(|_| WireKeyFault::UuidLength { bytes: bytes.len() }),
         (variant @ v1::key::Key::Long(_), KeyType::String | KeyType::Binary | KeyType::Uuid)
         | (variant @ v1::key::Key::Str(_), KeyType::Long | KeyType::Binary | KeyType::Uuid)
         | (variant @ v1::key::Key::Bin(_), KeyType::Long | KeyType::String) => {
-            Err(Status::invalid_argument(format!(
-                "table keys are {key_type}, got a {} key",
-                variant_name(&variant)
-            )))
+            Err(WireKeyFault::VariantMismatch {
+                expected: key_type,
+                got: WireVariant::of(&variant),
+            })
         }
+    }
+}
+
+/// A wire key's fault as a status: every fault is the caller's, so
+/// `INVALID_ARGUMENT`, with the fault's `Display` as the message.
+impl From<WireKeyFault> for Status {
+    fn from(fault: WireKeyFault) -> Self {
+        Self::invalid_argument(fault.to_string())
     }
 }
 
@@ -173,7 +204,7 @@ impl Icetray for Service {
             .keys
             .into_iter()
             .map(|key| key_from_wire(Some(key), generation.layout.key_type))
-            .collect::<Result<Vec<Key>, Status>>()?;
+            .collect::<Result<Vec<Key>, WireKeyFault>>()?;
         let lookup = table
             .multi_get(&keys)
             .await
@@ -237,10 +268,13 @@ mod tests {
     /// A `bin` key one byte short of a uuid.
     const SHORT_BIN_LEN: usize = UUID_BYTES - 1;
 
-    /// The value of the sample long and string keys.
+    /// The value of the sample long key.
     const LONG_VALUE: i64 = 42;
+
+    /// The value of the sample string key.
     const STR_VALUE: &str = "user:42";
 
+    /// Every key type, so each pairing with a wire variant is tried.
     const TYPES: [KeyType; 4] = [
         KeyType::Long,
         KeyType::String,
@@ -252,20 +286,13 @@ mod tests {
         v1::Key { key: Some(variant) }
     }
 
-    fn code_of(result: Result<Key, Status>) -> Code {
-        result.expect_err("an invalid key").code()
-    }
-
     #[test]
-    fn test_key_from_wire_missing_key_or_variant_is_invalid_argument_for_every_type() {
+    fn test_key_from_wire_missing_key_or_variant_is_missing_for_every_type() {
         for key_type in TYPES {
+            assert_eq!(key_from_wire(None, key_type), Err(WireKeyFault::Missing));
             assert_eq!(
-                code_of(key_from_wire(None, key_type)),
-                Code::InvalidArgument
-            );
-            assert_eq!(
-                code_of(key_from_wire(Some(v1::Key { key: None }), key_type)),
-                Code::InvalidArgument
+                key_from_wire(Some(v1::Key { key: None }), key_type),
+                Err(WireKeyFault::Missing)
             );
         }
     }
@@ -301,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_key_from_wire_mismatched_variant_is_invalid_argument() {
+    fn test_key_from_wire_mismatched_variant_names_both_sides() {
         let variants = [
             v1::key::Key::Long(LONG_VALUE),
             v1::key::Key::Str(STR_VALUE.to_string()),
@@ -320,8 +347,11 @@ mod tests {
                     assert!(result.is_ok(), "{variant:?} on {key_type}");
                 } else {
                     assert_eq!(
-                        code_of(result),
-                        Code::InvalidArgument,
+                        result,
+                        Err(WireKeyFault::VariantMismatch {
+                            expected: key_type,
+                            got: WireVariant::of(variant),
+                        }),
                         "{variant:?} on {key_type}"
                     );
                 }
@@ -333,13 +363,39 @@ mod tests {
     fn test_key_from_wire_uuid_needs_exactly_sixteen_bytes() {
         for len in [0, SHORT_BIN_LEN, UUID_BYTES + 1] {
             assert_eq!(
-                code_of(key_from_wire(
-                    Some(wire(v1::key::Key::Bin(vec![0u8; len]))),
-                    KeyType::Uuid
-                )),
-                Code::InvalidArgument,
+                key_from_wire(Some(wire(v1::key::Key::Bin(vec![0u8; len]))), KeyType::Uuid),
+                Err(WireKeyFault::UuidLength { bytes: len }),
                 "{len} bytes"
             );
+        }
+    }
+
+    #[test]
+    fn test_from_wire_key_fault_is_invalid_argument_per_variant() {
+        let faults = [
+            WireKeyFault::Missing,
+            WireKeyFault::VariantMismatch {
+                expected: KeyType::Long,
+                got: WireVariant::Str,
+            },
+            WireKeyFault::UuidLength {
+                bytes: SHORT_BIN_LEN,
+            },
+        ];
+        for fault in faults {
+            assert_eq!(Status::from(fault).code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn test_of_names_every_wire_variant() {
+        let cases = [
+            (v1::key::Key::Long(LONG_VALUE), WireVariant::Long),
+            (v1::key::Key::Str(STR_VALUE.to_string()), WireVariant::Str),
+            (v1::key::Key::Bin(Vec::new()), WireVariant::Bin),
+        ];
+        for (key, variant) in cases {
+            assert_eq!(WireVariant::of(&key), variant);
         }
     }
 
@@ -416,10 +472,7 @@ mod tests {
     #[test]
     fn test_status_from_code_per_variant() {
         for (error, code) in status_cases() {
-            let message = error.to_string();
-            let status = status_from(&error);
-            assert_eq!(status.code(), code, "{message}");
-            assert_eq!(status.message(), message);
+            assert_eq!(status_from(&error).code(), code, "{error}");
         }
     }
 

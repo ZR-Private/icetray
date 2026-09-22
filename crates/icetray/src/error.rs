@@ -1,15 +1,18 @@
 //! The binary's failures and the exit codes they become. `CliError` is every
 //! failure a one-shot subcommand can end with; `ServeError` every failure
-//! `serve` can end with; `KeyTextFault` why command-line text is not a key.
-//! `main` turns a `CliError` into an exit code through one exhaustive match,
-//! so nothing decides on a message.
+//! `serve` can end with; `KeyTextFault` why command-line text is not a key;
+//! `WireKeyFault` why a wire key is not one. `CliError::exit_code` is the
+//! one exhaustive match from a failure to an exit code, and the service maps
+//! faults to status codes by variant, so nothing decides on a message.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use icetray_core::ErrorKind;
+use icetray_core::key::UUID_BYTES;
+use icetray_core::{ErrorKind, KeyType};
 
 use crate::serve::PeriodicTask;
+use crate::service::WireVariant;
 
 /// The run did what was asked: the doctor found no cost, every lookup was
 /// answered, the daemon drained.
@@ -63,6 +66,29 @@ pub enum KeyTextFault {
     NoGeneration {
         /// The table's configured name.
         table: String,
+    },
+}
+
+/// Why a key from the wire is not a key of the table's type (RFD 010).
+/// Every variant is the caller's fault, `INVALID_ARGUMENT` on the wire.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WireKeyFault {
+    /// The request carries no key, or a `Key` with no variant set.
+    #[error("key is required")]
+    Missing,
+    /// The variant is one the table's key type does not take.
+    #[error("table keys are {expected}, got a {got} key")]
+    VariantMismatch {
+        /// The table's key type.
+        expected: KeyType,
+        /// The variant the wire carried.
+        got: WireVariant,
+    },
+    /// A `bin` key on a uuid table whose length is not a uuid's.
+    #[error("a uuid key is {} bytes, got {bytes}", UUID_BYTES)]
+    UuidLength {
+        /// The length the wire carried.
+        bytes: usize,
     },
 }
 
