@@ -727,7 +727,7 @@ pub struct Finding { pub tier: Tier, pub code: FindingCode, pub message: String,
 pub struct FileReport {
     pub path: String, pub bucket: u32, pub key_type: KeyType, pub rows: i64, pub row_groups: usize,
     pub key_pages: usize, pub value_pages: usize, pub max_key_page_rows: i64, pub max_key_bytes: usize,
-    pub avg_value_page_bytes: u64, pub pages_aligned: bool, pub dictionary_columns: Vec<String>,
+    pub avg_value_page_bytes: u64, pub avg_value_bytes: u64, pub pages_aligned: bool, pub dictionary_columns: Vec<String>,
     pub bloom_bytes: Option<u64>, pub bloom_bits_per_key: Option<f64>, pub key_chunk_bytes: u64,
     pub distinct_page_mins_ratio: f64, pub bounds_present: bool, pub resident_bytes: usize,
 }
@@ -760,6 +760,11 @@ pub fn age_seconds(since: jiff::Timestamp) -> f64;
 /// RFC 3339 in UTC with a `Z` offset through jiff's printer, the fraction of a second only when it is
 /// non-zero; the one place a timestamp becomes log text.
 pub fn log_timestamp(at: jiff::Timestamp) -> String;
+/// An epoch-millisecond count `millis` after `base`: how a writer stamps a snapshot later than the
+/// metadata's last update and increasing with its sequence, which Iceberg requires of a commit. The
+/// one place epoch-millisecond arithmetic happens; saturates at the ends of `i64`, both outside what
+/// `timestamp_from_millis` admits.
+pub fn millis_after(base: i64, millis: i64) -> i64;
 /// In-crate: an Iceberg snapshot's epoch millisecond as a timestamp; out of jiff's range is `Err`,
 /// which `Generation::load` reports as `TableFault::SnapshotTimestampOutOfRange`.
 pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error>;
@@ -949,7 +954,8 @@ concurrently; none calls `Opened::retain`, which is the daemon's. JSON
 lines with `kind` and `table` first: `table` (`info`) and `doctor` lines
 flatten `TableSummary`, so a new measurement in core reaches the CLI
 without a CLI change; `finding` and `file` lines flatten core's `Finding`
-and `FileReport`; a `get` line carries the key, `presence`
+and `FileReport`, the `file` lines only under `doctor --files`; a `get`
+line carries the key, `presence`
 (`present`/`null`/`absent`), the value as standard base64 and, when UTF-8,
 as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
 `elapsed_micros`; a table the doctor could not load is one `refused` line
@@ -1106,7 +1112,7 @@ skip).
 | Bucket routing equals the Iceberg library's transform for long, string, binary, uuid, and fixed keys | U (oracle test against the library, all five types) |
 | Key ordering equals Parquet's for each type; a key of another type than the table's is refused at the Table boundary with Error::KeyType | U, P |
 | A cold hit costs exactly one GET; a warm hit none; a miss none, including misses inside a file's range | P, S |
-| Load costs two GETs per file plus the metadata reads; a load with `previous` reuses every unchanged file by pointer | P |
+| Load costs one footer GET per file and one key-chunk GET per row group, plus the metadata reads; a load with `previous` reuses every unchanged file by pointer | P |
 | An unchanged poll costs one read (hint file or catalog record) | P, C |
 | A refresh verifies only overlap groups that gained a file; a disjoint append verifies zero groups | P (counting) |
 | A duplicate key across files is refused and the previous generation keeps serving | P |
