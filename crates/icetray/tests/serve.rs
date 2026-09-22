@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
-use icetray::serve::OVERALL_SERVICE;
+use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
@@ -706,6 +706,37 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
             ErrorKind::Refused(RefusalReason::NoLocalDir)
         )]
     );
+    Ok(())
+}
+
+/// A periodic task that panics ends the run with the task named, so the
+/// process exits non-zero instead of answering `/ready` 200 from tables
+/// nothing refreshes. A poll interval of zero is what `Config::parse`
+/// refuses as `PollIntervalZero`, and what tokio's interval refuses with a
+/// panic at the first tick of the refresh and sampler tasks; the
+/// configuration is built directly, so the panic is reached. Both tasks
+/// panic at once, and whichever the run joins first is the one named.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_periodic_task_panic_ends_the_run_naming_the_task() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.poll_interval = Duration::ZERO;
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let outcome = tokio::time::timeout(SHUTDOWN_WAIT, stack.serving.join()).await?;
+    let Err(ServeError::Periodic { task, source }) = outcome else {
+        panic!("expected a periodic task failure, got {outcome:?}");
+    };
+    assert!(source.is_panic(), "{source}");
+    match task {
+        PeriodicTask::Refresh { table } => assert_eq!(table, TABLE),
+        PeriodicTask::Sampler => {}
+    }
     Ok(())
 }
 

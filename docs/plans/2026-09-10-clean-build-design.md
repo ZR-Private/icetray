@@ -905,7 +905,12 @@ sampler for `generation_age_seconds` and `process_rss_bytes` as one more
 task on the same period; the tickers start one interval after the first
 loads rather than at once, so a load is not followed by an immediate,
 redundant poll and sample, and a missed tick delays rather than bursts. A
-refresh that swapped a generation in is followed by `Opened::retain`.
+refresh that swapped a generation in is followed by `Opened::retain`. A
+periodic task that ends before the shutdown, which only a panic inside it
+does, ends the run: the log names the task (`refresh of table <name>` or
+`sampler`) with the panic, the daemon drains, and the process exits 1,
+since a daemon whose tables nothing refreshes would otherwise keep
+answering `/ready` 200 from an ageing snapshot (`ServeError::Periodic`).
 `serve` logs JSON to stdout at `info` (the twelve-factor log stream)
 through the binary's own `tracing` event formatter: keys in the order
 time, level, target, message, the event's other fields, the static fields;

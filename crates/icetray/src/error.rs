@@ -9,6 +9,8 @@ use std::process::ExitCode;
 
 use icetray_core::ErrorKind;
 
+use crate::serve::PeriodicTask;
+
 /// The run did what was asked: the doctor found no cost, every lookup was
 /// answered, the daemon drained.
 pub const EXIT_OK: u8 = 0;
@@ -92,9 +94,20 @@ pub enum ServeError {
         /// Each failed table's name and the kind of its failure.
         failures: Vec<(String, ErrorKind)>,
     },
-    /// A task of the daemon panicked or was cancelled.
+    /// The run task itself panicked or was cancelled.
     #[error("task: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// A periodic task ended before the shutdown, which only a panic inside
+    /// it does. The run ends rather than serve on: the tables would
+    /// otherwise stop following their refs, or the gauges stop sampling,
+    /// while `/ready` kept answering 200.
+    #[error("periodic task {task} ended: {source}")]
+    Periodic {
+        /// Which task ended.
+        task: PeriodicTask,
+        /// How it ended, carrying the panic's message.
+        source: tokio::task::JoinError,
+    },
 }
 
 /// The failed tables of a `FirstLoad` as `name (kind)`, comma-separated.
