@@ -24,7 +24,7 @@ use crate::manifest::{DataFileEntry, TableLayout};
 
 /// The thresholds, in one place (RFD 016): each derives from `contract`
 /// where a contract number exists, and each names the analysis section that
-/// set it. Moving one is a one-line edit with its evidence beside it.
+/// set it.
 pub mod thresholds {
     use crate::contract;
 
@@ -139,6 +139,17 @@ pub enum Serviceability {
     Inefficient,
 }
 
+impl Serviceability {
+    /// The verdict `costs` cost findings give: `Inefficient` for any.
+    fn from_costs(costs: usize) -> Self {
+        if costs > 0 {
+            Self::Inefficient
+        } else {
+            Self::Efficient
+        }
+    }
+}
+
 /// A cost finding's penalty per lookup over the contract layout, in RFD
 /// 007's three units; a unit the finding does not affect is `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -149,6 +160,17 @@ pub struct Penalty {
     pub keys_decoded_per_lookup: Option<i64>,
     /// Files a lookup may probe, where the contract probes one.
     pub files_probed_per_lookup: Option<usize>,
+}
+
+impl Penalty {
+    /// A penalty priced in files probed per lookup alone, the unit every
+    /// table-level cost is measured in.
+    pub(crate) fn files_probed(files: usize) -> Self {
+        Self {
+            files_probed_per_lookup: Some(files),
+            ..Self::default()
+        }
+    }
 }
 
 /// A finding's code (RFD 016). Display and serde give the `snake_case` code
@@ -341,6 +363,46 @@ pub struct Finding {
     pub property: Option<WriterProperty>,
 }
 
+impl Finding {
+    /// A cost finding, served at `penalty`'s price; `file` names the data
+    /// file, `None` for a table-level one. The two constructors are the
+    /// only way a finding is built, so the tier and the penalty cannot
+    /// disagree: a cost always carries one and advice never does.
+    pub(crate) fn cost(
+        code: FindingCode,
+        file: Option<&str>,
+        message: String,
+        penalty: Penalty,
+        property: Option<WriterProperty>,
+    ) -> Self {
+        Self {
+            tier: Tier::Cost,
+            code,
+            message,
+            file: file.map(str::to_string),
+            penalty: Some(penalty),
+            property,
+        }
+    }
+
+    /// An advice finding: serving is unaffected, so there is no penalty.
+    pub(crate) fn advice(
+        code: FindingCode,
+        file: Option<&str>,
+        message: String,
+        property: Option<WriterProperty>,
+    ) -> Self {
+        Self {
+            tier: Tier::Advice,
+            code,
+            message,
+            file: file.map(str::to_string),
+            penalty: None,
+            property,
+        }
+    }
+}
+
 /// What the doctor measured about one data file, from its footer, page
 /// indexes, fences, and manifest entry.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -468,11 +530,7 @@ pub fn diagnose(g: &Generation) -> TableReport {
         .iter()
         .filter(|finding| finding.tier == Tier::Cost)
         .count();
-    let serviceability = if costs > 0 {
-        Serviceability::Inefficient
-    } else {
-        Serviceability::Efficient
-    };
+    let serviceability = Serviceability::from_costs(costs);
     let summary = TableSummary {
         table: g.table.clone(),
         snapshot_id: g.snapshot_id,
@@ -530,7 +588,7 @@ fn bloom_extremes(metadata: &ParquetMetaData, key_leaf: usize) -> Option<BloomEx
         let bytes = approx::measured(length);
         let rows = approx::measured(group.num_rows());
         let bytes_per_key = approx::ratio(bytes, rows);
-        let bits_per_key = approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows);
+        let bits_per_key = bits_per_key(bytes, rows);
         if most.is_none_or(|(value, _)| bytes_per_key > value) {
             most = Some((bytes_per_key, row_group));
         }
@@ -759,25 +817,6 @@ fn bounds_intact(entry: &DataFileEntry, (first, last): (&Key, &Key)) -> bool {
     }
 }
 
-/// A finding about the file at `path`.
-fn file_finding(
-    tier: Tier,
-    code: FindingCode,
-    path: &str,
-    message: String,
-    penalty: Option<Penalty>,
-    property: Option<WriterProperty>,
-) -> Finding {
-    Finding {
-        tier,
-        code,
-        message,
-        file: Some(path.to_string()),
-        penalty,
-        property,
-    }
-}
-
 /// Every finding of the finding table that one file's measurements
 /// trigger, in the table's order.
 fn file_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
@@ -793,28 +832,26 @@ fn file_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
 fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if facts.value_dictionary {
-        findings.push(file_finding(
-            Tier::Cost,
+        findings.push(Finding::cost(
             FindingCode::DictionaryEncodedValue,
-            &report.path,
+            Some(&report.path),
             format!(
                 "value column {value} is dictionary-encoded; a hit fetches its dictionary page besides the value page, {gets} extra GET ({property}=false)",
                 value = layout.value_column,
                 gets = DICTIONARY_PAGE_GETS,
                 property = WriterProperty::EnableDictionary,
             ),
-            Some(Penalty {
+            Penalty {
                 extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
                 ..Penalty::default()
-            }),
+            },
             Some(WriterProperty::EnableDictionary),
         ));
     }
     if report.max_key_page_rows > thresholds::KEY_PAGE_ROWS_COST {
-        findings.push(file_finding(
-            Tier::Cost,
+        findings.push(Finding::cost(
             FindingCode::LargeKeyPages,
-            &report.path,
+            Some(&report.path),
             format!(
                 "key pages hold up to {rows} rows, above {limit}; a lookup decodes that many keys ({property}={contract_rows})",
                 rows = report.max_key_page_rows,
@@ -822,10 +859,10 @@ fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
                 property = WriterProperty::PageRowLimit,
                 contract_rows = contract::PAGE_ROWS,
             ),
-            Some(Penalty {
+            Penalty {
                 keys_decoded_per_lookup: Some(report.max_key_page_rows),
                 ..Penalty::default()
-            }),
+            },
             Some(WriterProperty::PageRowLimit),
         ));
     }
@@ -838,39 +875,34 @@ fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if !report.bounds_present {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::BoundsMissing,
-            &report.path,
+            Some(&report.path),
             format!(
                 "the manifest's key bounds for this file are missing or shorter than its exact first or last key; every file of the bucket looks alike to a reader of the manifest ({property}{key}=full)",
                 property = WriterProperty::MetricsColumn,
                 key = layout.key_column,
             ),
-            None,
             Some(WriterProperty::MetricsColumn),
         ));
     }
     if report.distinct_page_mins_ratio < thresholds::DISTINCT_MINS_RATIO_ADVICE {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::ColumnIndexTruncated,
-            &report.path,
+            Some(&report.path),
             format!(
                 "{ratio:.2} of key pages have a distinct minimum in the column index, below {limit}; readers that route by it cannot tell the pages apart ({property}, at least the longest key)",
                 ratio = report.distinct_page_mins_ratio,
                 limit = thresholds::DISTINCT_MINS_RATIO_ADVICE,
                 property = WriterProperty::ColumnIndexTruncateLength,
             ),
-            None,
             Some(WriterProperty::ColumnIndexTruncateLength),
         ));
     }
     if report.avg_value_page_bytes > thresholds::VALUE_PAGE_BYTES_ADVICE {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::LargeValuePages,
-            &report.path,
+            Some(&report.path),
             format!(
                 "value pages decompress to {bytes} bytes each on average, above {limit}; bound them by bytes ({size}={bound}) and shorten the page-size check interval ({check}), which the writer applies between batches",
                 bytes = report.avg_value_page_bytes,
@@ -879,29 +911,25 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut 
                 bound = contract::VALUE_PAGE_BYTES,
                 check = WriterProperty::RowGroupCheckRecordCount,
             ),
-            None,
             Some(WriterProperty::PageSizeBytes),
         ));
     }
     if report.max_key_bytes > contract::KEY_BYTES_ADVICE {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::LongKeys,
-            &report.path,
+            Some(&report.path),
             format!(
                 "keys run to {bytes} bytes, above {limit}; resident bytes per key grow with key length (shorter keys, or a fixed-width long)",
                 bytes = report.max_key_bytes,
                 limit = contract::KEY_BYTES_ADVICE,
             ),
             None,
-            None,
         ));
     }
     if facts.size > thresholds::FILE_BYTES_ADVICE {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::LargeFile,
-            &report.path,
+            Some(&report.path),
             format!(
                 "data file is {size} bytes, above {limit}; first-byte latency of a range GET rises with object size ({property} between {min} and {max})",
                 size = facts.size,
@@ -910,7 +938,6 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut 
                 min = contract::TARGET_FILE_BYTES_MIN,
                 max = contract::TARGET_FILE_BYTES_MAX,
             ),
-            None,
             Some(WriterProperty::TargetFileSizeBytes),
         ));
     }
@@ -924,49 +951,43 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut 
 fn bloom_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     let (Some(bytes), Some(extremes)) = (report.bloom_bytes, facts.bloom_by_row_group) else {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::NoBloomFilter,
-            &report.path,
+            Some(&report.path),
             format!(
                 "no bloom filter on {key}; the bloom residency tier cannot load this file ({property}{key}=true)",
                 key = layout.key_column,
                 property = WriterProperty::BloomFilterEnabled,
             ),
-            None,
             Some(WriterProperty::BloomFilterEnabled),
         ));
         return;
     };
     let (bytes_per_key, largest) = extremes.most_bytes_per_key;
     if bytes_per_key > thresholds::BLOOM_BYTES_PER_KEY_ADVICE {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::BloomOversized,
-            &report.path,
+            Some(&report.path),
             format!(
                 "bloom filter of row group {largest} is {bytes_per_key:.1} bytes per key ({bytes} filter bytes over the file's {rows} rows), above {limit}; the bloom tier's memory follows it ({property}, Iceberg 1.11+)",
                 rows = facts.rows,
                 limit = thresholds::BLOOM_BYTES_PER_KEY_ADVICE,
                 property = WriterProperty::BloomFilterMaxBytes,
             ),
-            None,
             Some(WriterProperty::BloomFilterMaxBytes),
         ));
     }
     let (bits_per_key, smallest) = extremes.fewest_bits_per_key;
     if bits_per_key < thresholds::BLOOM_BITS_PER_KEY_MIN {
-        findings.push(file_finding(
-            Tier::Advice,
+        findings.push(Finding::advice(
             FindingCode::BloomUndersized,
-            &report.path,
+            Some(&report.path),
             format!(
                 "bloom filter of row group {smallest} has {bits_per_key:.1} bits per key, below {limit}; the bloom tier's miss cost rises with the false-positive rate ({property}{key}, Iceberg 1.11+)",
                 limit = thresholds::BLOOM_BITS_PER_KEY_MIN,
                 property = WriterProperty::BloomFilterNdvColumn,
                 key = layout.key_column,
             ),
-            None,
             Some(WriterProperty::BloomFilterNdvColumn),
         ));
     }
@@ -988,36 +1009,28 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
         .count();
     if unbucketed > 0 && g.files.len() > 1 {
         let probed = unbucketed + usize::from(unbucketed < g.files.len());
-        findings.push(Finding {
-            tier: Tier::Cost,
-            code: FindingCode::NoBucketPartition,
-            message: format!(
+        findings.push(Finding::cost(
+            FindingCode::NoBucketPartition,
+            None,
+            format!(
                 "{unbucketed} of {total} files were written under a spec with no bucket transform on {key}; a lookup probes every one of them whose key range covers the key, plus the bucketed file its key hashes to (partition by bucket(N, {key}) and rewrite the unbucketed files)",
                 total = g.files.len(),
             ),
-            file: None,
-            penalty: Some(Penalty {
-                files_probed_per_lookup: Some(probed),
-                ..Penalty::default()
-            }),
-            property: None,
-        });
+            Penalty::files_probed(probed),
+            None,
+        ));
     }
     for (&bucket, &probed) in g.overlapping_buckets() {
-        findings.push(Finding {
-            tier: Tier::Cost,
-            code: FindingCode::OverlappingFiles,
-            message: format!(
+        findings.push(Finding::cost(
+            FindingCode::OverlappingFiles,
+            None,
+            format!(
                 "bucket {bucket} holds {probed} files with intersecting key ranges, checked free of shared keys at load; a lookup there probes up to {probed} files ({property}=false on the write, or a compaction)",
                 property = WriterProperty::SkewSplitting,
             ),
-            file: None,
-            penalty: Some(Penalty {
-                files_probed_per_lookup: Some(probed),
-                ..Penalty::default()
-            }),
-            property: Some(WriterProperty::SkewSplitting),
-        });
+            Penalty::files_probed(probed),
+            Some(WriterProperty::SkewSplitting),
+        ));
     }
     for (&bucket, files) in buckets {
         let bytes: u64 = files.iter().map(|file| file.size).sum();
@@ -1026,17 +1039,15 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
             .max(MIN_EXPLAINED_FILES);
         let held = approx::count(files.len());
         if held > thresholds::FILES_PER_BUCKET_FACTOR * explained {
-            findings.push(Finding {
-                tier: Tier::Advice,
-                code: FindingCode::ManyFilesPerBucket,
-                message: format!(
+            findings.push(Finding::advice(
+                FindingCode::ManyFilesPerBucket,
+                None,
+                format!(
                     "bucket {bucket} holds {held} files where its {bytes} bytes explain {explained} at {target} bytes per file; loads and manifests grow with the file count (compact the bucket to the file size target)",
                     target = contract::TARGET_FILE_BYTES_MAX,
                 ),
-                file: None,
-                penalty: None,
-                property: None,
-            });
+                None,
+            ));
         }
     }
     findings
@@ -1065,9 +1076,14 @@ fn predicted_total(facts: &[FileFacts]) -> ResidentBytes {
         disk_memory: facts.iter().map(|file| file.predicted.disk_memory).sum(),
         disk_bytes: facts.iter().map(|file| file.predicted.disk_bytes).sum(),
         bloom: facts.iter().map(|file| file.predicted.bloom).sum(),
-        bloom_bits_per_key: filters
-            .map(|bytes| approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows)),
+        bloom_bits_per_key: filters.map(|bytes| bits_per_key(bytes, rows)),
     }
+}
+
+/// Filter bits per key: `bytes` of filter over `rows` keys, in the unit RFD
+/// 016 judges a filter's size by. Finite, zero for no rows.
+fn bits_per_key(bytes: u64, rows: u64) -> f64 {
+    approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows)
 }
 
 #[cfg(test)]
@@ -1107,9 +1123,13 @@ mod tests {
     /// Rows of the large-key-page fixture: one page just above the cost
     /// threshold.
     const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_COST + 1;
+    /// How many advice thresholds the large-value-page fixture's one page
+    /// spans: two, so its mean is above the line and not at it.
+    const LARGE_VALUE_PAGE_FACTOR: u64 = 2;
     /// Bytes per value of the large-value-page fixture: `FILE_KEYS` of them
-    /// make one page of twice the advice threshold.
-    const LARGE_VALUE_BYTES: usize = 64 * 1024;
+    /// make one page of `LARGE_VALUE_PAGE_FACTOR` times the advice threshold.
+    const LARGE_VALUE_BYTES: u64 =
+        LARGE_VALUE_PAGE_FACTOR * VALUE_PAGE_BYTES_ADVICE / FILE_KEYS.unsigned_abs();
     /// The length of the long-key fixture's keys, just above the advice
     /// length.
     const LONG_KEY_BYTES: usize = contract::KEY_BYTES_ADVICE + 1;
@@ -1178,6 +1198,9 @@ mod tests {
         ),
     ];
 
+    /// The `snake_case` code of every finding, as the doctor's output and
+    /// the `code` metric label carry it; the Display and serde tests pin
+    /// each, and the order test holds the table's order.
     const CODES: &[(FindingCode, &str)] = &[
         (
             FindingCode::DictionaryEncodedValue,
@@ -1352,12 +1375,10 @@ mod tests {
             .count();
         assert_eq!(report.summary.costs, costs);
         assert_eq!(report.summary.advice, expected.len() - costs);
-        let serviceability = if costs > 0 {
-            Serviceability::Inefficient
-        } else {
-            Serviceability::Efficient
-        };
-        assert_eq!(report.summary.serviceability, serviceability);
+        assert_eq!(
+            report.summary.serviceability,
+            Serviceability::from_costs(costs)
+        );
         for finding in &report.findings {
             assert_eq!(
                 finding.penalty.is_some(),
@@ -1368,12 +1389,10 @@ mod tests {
         }
     }
 
-    /// The penalty of a finding priced in files probed per lookup.
-    fn files_probed(files: usize) -> Penalty {
-        Penalty {
-            files_probed_per_lookup: Some(files),
-            ..Penalty::default()
-        }
+    #[test]
+    fn test_from_costs_is_inefficient_for_any_cost() {
+        assert_eq!(Serviceability::from_costs(0), Serviceability::Efficient);
+        assert_eq!(Serviceability::from_costs(1), Serviceability::Inefficient);
     }
 
     #[test]
@@ -1647,7 +1666,7 @@ mod tests {
             &[(
                 FindingCode::NoBucketPartition,
                 Tier::Cost,
-                Some(files_probed(2)),
+                Some(Penalty::files_probed(2)),
                 None,
                 None,
             )],
@@ -1676,7 +1695,7 @@ mod tests {
             &[(
                 FindingCode::NoBucketPartition,
                 Tier::Cost,
-                Some(files_probed(3)),
+                Some(Penalty::files_probed(3)),
                 None,
                 None,
             )],
@@ -1765,7 +1784,7 @@ mod tests {
             &[(
                 FindingCode::OverlappingFiles,
                 Tier::Cost,
-                Some(files_probed(2)),
+                Some(Penalty::files_probed(2)),
                 Some(WriterProperty::SkewSplitting),
                 None,
             )],
@@ -1886,7 +1905,7 @@ mod tests {
         let keys = testing::long_keys(&testing::keys_from(0, FILE_KEYS));
         table
             .add_file(FileSpec {
-                values: values_of_len(keys.len(), LARGE_VALUE_BYTES),
+                values: values_of_len(keys.len(), usize::try_from(LARGE_VALUE_BYTES).unwrap()),
                 ..file("f", &keys, Partition::Bucket(0), WriterLayout::contract())
             })
             .await;
@@ -2094,7 +2113,7 @@ mod tests {
                 (
                     FindingCode::NoBucketPartition,
                     Tier::Cost,
-                    Some(files_probed(2)),
+                    Some(Penalty::files_probed(2)),
                     None,
                     None,
                 ),
@@ -2204,8 +2223,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_serialize_table_report_snake_case_fields_with_display_strings() {
+    /// The report of a one-file table whose value column is
+    /// dictionary-encoded, so it carries exactly one cost finding, with the
+    /// JSON it serializes to.
+    async fn dictionary_value_report() -> (Table, TableReport, Json) {
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
@@ -2213,7 +2234,12 @@ mod tests {
         let (table, generation) = one_file(layout).await;
         let report = diagnose(&generation);
         let json = serde_json::to_value(&report).unwrap();
+        (table, report, json)
+    }
 
+    #[tokio::test]
+    async fn test_serialize_table_summary_snake_case_fields_with_display_strings() {
+        let (_table, report, json) = dictionary_value_report().await;
         let summary = json["summary"].as_object().unwrap();
         let names: BTreeSet<&str> = summary.keys().map(String::as_str).collect();
         assert_eq!(
@@ -2256,7 +2282,11 @@ mod tests {
             serde_json::to_value(&report.summary).unwrap(),
             json["summary"]
         );
+    }
 
+    #[tokio::test]
+    async fn test_serialize_finding_snake_case_fields_with_display_strings() {
+        let (table, _report, json) = dictionary_value_report().await;
         let finding = &json["findings"][0];
         assert_eq!(finding["tier"], Json::String("cost".to_string()));
         assert_eq!(
@@ -2274,7 +2304,11 @@ mod tests {
         assert_eq!(finding["penalty"]["files_probed_per_lookup"], Json::Null);
         assert_eq!(finding["file"], Json::String(table.path_of("f")));
         assert!(finding["message"].is_string());
+    }
 
+    #[tokio::test]
+    async fn test_serialize_file_report_snake_case_fields_with_display_strings() {
+        let (_table, _report, json) = dictionary_value_report().await;
         let file = json["files"][0].as_object().unwrap();
         let file_names: BTreeSet<&str> = file.keys().map(String::as_str).collect();
         assert_eq!(
