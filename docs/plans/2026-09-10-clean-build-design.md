@@ -296,9 +296,10 @@ impl Storage {
 /// that is present names a snapshot the metadata holds, and metadata whose
 /// ref names a missing snapshot is refused at the parse boundary as
 /// `Error::Json`. `BucketValueMissing` covers a null, another type, or a
-/// negative value where the spec puts the key's bucket. `SnapshotTimestampOutOfRange` is a
+/// negative value where the spec puts the key's bucket; `BucketValueOutOfRange` a bucket at or
+/// past the spec's count, which no key hashes to. `SnapshotTimestampOutOfRange` is a
 /// snapshot timestamp jiff cannot represent, raised by `Generation::load` before any read.
-pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown, SnapshotTimestampOutOfRange { snapshot_id: SnapshotId } }
+pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, BucketValueOutOfRange { path: String, spec_id: i32, bucket: u32, count: u32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown, SnapshotTimestampOutOfRange { snapshot_id: SnapshotId } }
 pub struct Resolved { pub metadata: Arc<TableMetadata>, pub location: String }
 impl Resolved {
     /// A ref the metadata lacks is `TableFault::RefNotFound` under `table`.
@@ -371,7 +372,8 @@ pub struct DataFileEntry { pub path: String, pub bucket: u32, pub bucketing: Opt
 /// manifest whose entries are all deleted serves. Bucket position comes from
 /// each manifest's spec, looked up in the metadata by the id the manifest list
 /// records: missing is `TableFault::SpecMissing`, a partition tuple without a
-/// non-negative integer at the bucket field is `TableFault::BucketValueMissing`.
+/// non-negative integer at the bucket field is `TableFault::BucketValueMissing`,
+/// one at or past the spec's count `TableFault::BucketValueOutOfRange`.
 /// Ordered by (bucketing, bucket, `key_min` with `None` first, path), the same
 /// for the same manifests in any order.
 pub async fn list_data_files(table: &str, md: &TableMetadata, snapshot: &Snapshot, layout: &TableLayout, storage: &Storage) -> Result<Vec<DataFileEntry>>;

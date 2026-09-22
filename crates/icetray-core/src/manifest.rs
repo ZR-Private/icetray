@@ -257,7 +257,8 @@ pub struct DataFileEntry {
 /// manifest list records (missing is `TableFault::SpecMissing`): the spec's
 /// bucket field on the key names the position in the partition tuple whose
 /// integer is the bucket (a non-integer there is
-/// `TableFault::BucketValueMissing`), and a spec with no such field files
+/// `TableFault::BucketValueMissing`, one at or past the spec's count
+/// `TableFault::BucketValueOutOfRange`), and a spec with no such field files
 /// the entry under `UNBUCKETED` with no bucketing. Key bounds come from the
 /// manifest's lower and upper bounds for the key field through
 /// `Key::from_datum`. The result is ordered by (bucketing, bucket, `key_min`
@@ -313,7 +314,7 @@ pub async fn list_data_files(
                 None => (None, UNBUCKETED),
                 Some(field) => (
                     Some(field.bucketing),
-                    bucket_value(table, data_file, spec.spec_id(), field.position)?,
+                    bucket_value(table, data_file, spec.spec_id(), field)?,
                 ),
             };
             entries.push(DataFileEntry {
@@ -331,13 +332,20 @@ pub async fn list_data_files(
     Ok(entries)
 }
 
-/// The bucket in `data_file`'s partition tuple at `position`: an integer
-/// literal there, or `TableFault::BucketValueMissing`.
-fn bucket_value(table: &str, data_file: &DataFile, spec_id: i32, position: usize) -> Result<u32> {
+/// The bucket in `data_file`'s partition tuple at `field`'s position: a
+/// non-negative integer literal there, or `TableFault::BucketValueMissing`;
+/// one at or past `field`'s bucket count, which no key hashes to, is
+/// `TableFault::BucketValueOutOfRange`.
+fn bucket_value(
+    table: &str,
+    data_file: &DataFile,
+    spec_id: i32,
+    field: BucketField,
+) -> Result<u32> {
     let literal = data_file
         .partition()
         .fields()
-        .get(position)
+        .get(field.position)
         .and_then(Option::as_ref);
     let bucket = match literal {
         Some(Literal::Primitive(PrimitiveLiteral::Int(value))) => u32::try_from(*value).ok(),
@@ -360,7 +368,7 @@ fn bucket_value(table: &str, data_file: &DataFile, spec_id: i32, position: usize
         )
         | None => None,
     };
-    bucket.ok_or_else(|| {
+    let bucket = bucket.ok_or_else(|| {
         Error::table_fault(
             table,
             TableFault::BucketValueMissing {
@@ -368,7 +376,20 @@ fn bucket_value(table: &str, data_file: &DataFile, spec_id: i32, position: usize
                 spec_id,
             },
         )
-    })
+    })?;
+    let count = field.bucketing.count;
+    if bucket >= count {
+        return Err(Error::table_fault(
+            table,
+            TableFault::BucketValueOutOfRange {
+                path: data_file.file_path().to_string(),
+                spec_id,
+                bucket,
+                count,
+            },
+        ));
+    }
+    Ok(bucket)
 }
 
 /// The bound recorded for the key field, as a key; `None` when the
@@ -1395,6 +1416,44 @@ mod tests {
         assert_eq!(
             fault_of(list_data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
             TableFault::BucketValueMissing { path, spec_id }
+        );
+    }
+
+    /// A bucket value at the spec's count names a bucket no key hashes to;
+    /// admitted, the file would never be consulted and its keys answered
+    /// absent.
+    #[tokio::test]
+    async fn test_list_data_files_bucket_value_at_or_past_the_count_is_a_table_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
+        let spec_id = md.default_partition_spec_id();
+        let snapshot = testing::write_snapshot(
+            &md,
+            SNAPSHOT_A,
+            None,
+            SEQUENCE_A,
+            md.current_schema_id(),
+            vec![testing::ManifestSpec {
+                spec_id,
+                content: ManifestContentType::Data,
+                entries: vec![
+                    live(&root, "f0", spec_id, Some(BUCKETS - 1), Some((LOW, HIGH))),
+                    live(&root, "f1", spec_id, Some(BUCKETS), Some((LOW, HIGH))),
+                ],
+            }],
+        )
+        .await;
+        let md = testing::with_snapshot(md, snapshot.clone());
+        let layout = derive(&md, &snapshot).unwrap();
+        assert_eq!(
+            fault_of(list_data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
+            TableFault::BucketValueOutOfRange {
+                path: data_path(&root, "f1"),
+                spec_id,
+                bucket: BUCKETS,
+                count: BUCKETS,
+            }
         );
     }
 

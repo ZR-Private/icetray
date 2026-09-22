@@ -93,6 +93,22 @@ pub enum TableFault {
         /// The spec the manifest listed the file under.
         spec_id: i32,
     },
+    /// A data file's partition tuple puts it in a bucket at or past its
+    /// spec's count. No key hashes to that bucket, so a lookup never
+    /// consults the file and a key it holds would be answered absent.
+    #[error(
+        "data file {path} is in bucket {bucket} of partition spec {spec_id}, which has {count} buckets"
+    )]
+    BucketValueOutOfRange {
+        /// The data file's location.
+        path: String,
+        /// The spec the manifest listed the file under.
+        spec_id: i32,
+        /// The bucket the partition tuple records.
+        bucket: u32,
+        /// The spec's bucket count.
+        count: u32,
+    },
     /// The version hint under `root` holds nothing but whitespace.
     #[error("version hint under {root} is empty")]
     VersionHintEmpty {
