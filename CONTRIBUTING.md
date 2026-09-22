@@ -81,7 +81,10 @@ values, writer property names. The string form is derived (`Display`, serde
 string becomes the enum again is a boundary parser (configuration, the
 command line) through one `FromStr`. Identifiers that must not be confused
 with one another are newtypes: a snapshot id is not an `i64`, a byte offset
-is not a row index. `clippy::wildcard_enum_match_arm` is denied, so a match
+is not a row index. An index into a slice is the exception: it stays the
+slice's `usize` and travels inside a view that captures it once (as
+`ColumnChunk` does for a row group); a newtype is for a value that leaves
+the slice it indexes. `clippy::wildcard_enum_match_arm` is denied, so a match
 names every variant and a new variant fails to compile everywhere it matters
 instead of falling into a `_` arm nobody reads. The test is always the same:
 if something can or cannot happen, the compiler says so, not the presence or

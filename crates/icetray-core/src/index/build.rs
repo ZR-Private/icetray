@@ -17,7 +17,7 @@ use parquet::file::serialized_reader::SerializedPageReader;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::{
-    Column, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys, RowRef,
+    Column, ColumnChunk, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys,
     file_fault, identity_of, off_worker, row_index,
 };
 use crate::config::Residency;
@@ -278,8 +278,9 @@ fn verify(
     let mut groups: Vec<GroupRange> = Vec::with_capacity(total);
     let mut longest = 0;
     for row_group in 0..total {
-        let rows = column.rows(row_group);
-        let keys = decode_run(column, shape, row_group, 0..rows, Arc::clone(chunks))?;
+        let chunk = column.group(row_group);
+        let rows = chunk.rows();
+        let keys = decode_run(chunk, shape, 0..rows, Arc::clone(chunks))?;
         if keys.len() < row_index(rows) {
             let reason = RefusalReason::NullKeys {
                 path: path.to_string(),
@@ -287,14 +288,14 @@ fn verify(
             };
             return Err(Error::refused(table, reason));
         }
-        check_utf8(column, row_group, &keys)?;
+        check_utf8(chunk, &keys)?;
         longest = longest.max(keys.max_len());
         if keys.is_empty() {
             fences.push(Vec::new());
             continue;
         }
         if let Some((at, order)) = keys.first_not_increasing() {
-            let reason = not_above_previous(path, row_group, order, keys.get(at));
+            let reason = not_above_previous(chunk, order, keys.get(at));
             return Err(Error::refused(table, reason));
         }
         let first = keys.get(0);
@@ -304,13 +305,13 @@ fn verify(
             if order != Ordering::Greater {
                 return Err(Error::refused(
                     table,
-                    not_above_previous(path, row_group, order, first),
+                    not_above_previous(chunk, order, first),
                 ));
             }
         }
         fences.push(
-            column
-                .page_locations(row_group)
+            chunk
+                .page_locations()
                 .iter()
                 .map(|location| keys.get(row_index(location.first_row_index)))
                 .collect(),
@@ -339,53 +340,44 @@ fn verify(
     })
 }
 
-/// The refusal for `key`, which is not above the key before it in `path`:
+/// The refusal for `key`, which is not above the key before it in `chunk`:
 /// `Equal` is a duplicate, anything else is out of order.
-fn not_above_previous(path: &str, row_group: usize, order: Ordering, key: Key) -> RefusalReason {
+fn not_above_previous(chunk: ColumnChunk<'_>, order: Ordering, key: Key) -> RefusalReason {
+    let path = chunk.column.path.to_string();
     match order {
-        Ordering::Equal => RefusalReason::DuplicateKeys {
-            path: path.to_string(),
-            key,
-        },
+        Ordering::Equal => RefusalReason::DuplicateKeys { path, key },
         Ordering::Less | Ordering::Greater => RefusalReason::Unsorted {
-            path: path.to_string(),
-            row_group,
+            path,
+            row_group: chunk.row_group(),
         },
     }
 }
 
-/// Rows `rows` of the key column of `row_group` decoded from `chunks`, which
+/// Rows `rows` of the key column chunk `chunk` decoded from `chunks`, which
 /// hold at least the pages those rows are in. Exactly those rows come back,
 /// as `read_column` guarantees; a string column's values are not checked
 /// as UTF-8 here, `check_utf8` does that where the run is read back through
 /// `Keys::get`.
 pub(super) fn decode_run(
-    column: &Column<'_>,
+    chunk: ColumnChunk<'_>,
     shape: KeyShape,
-    row_group: usize,
     rows: Range<i64>,
     chunks: Arc<Segments>,
 ) -> Result<Keys> {
     let skip = row_index(rows.start);
     let take = row_index(rows.end - rows.start);
     Ok(match shape {
-        KeyShape::Long => Keys::Long(read_column::<Int64Type>(
-            column, row_group, chunks, skip, take,
-        )?),
-        KeyShape::Str => Keys::Str(read_column::<ByteArrayType>(
-            column, row_group, chunks, skip, take,
-        )?),
-        KeyShape::Bin => Keys::Bin(read_column::<ByteArrayType>(
-            column, row_group, chunks, skip, take,
-        )?),
+        KeyShape::Long => Keys::Long(read_column::<Int64Type>(chunk, chunks, skip, take)?),
+        KeyShape::Str => Keys::Str(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
+        KeyShape::Bin => Keys::Bin(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
         KeyShape::FixedBin => Keys::Bin(
-            read_column::<FixedLenByteArrayType>(column, row_group, chunks, skip, take)?
+            read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?
                 .into_iter()
                 .map(ByteArray::from)
                 .collect(),
         ),
         KeyShape::Uuid => Keys::Uuid(
-            read_column::<FixedLenByteArrayType>(column, row_group, chunks, skip, take)?
+            read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?
                 .iter()
                 .map(|value| {
                     <[u8; UUID_BYTES]>::try_from(value.data()).expect(
@@ -399,19 +391,24 @@ pub(super) fn decode_run(
 
 /// Every value of a `Keys::Str` run is UTF-8, or the file is
 /// `FileFault::KeyNotUtf8`; the other arms hold what their bytes are.
-pub(super) fn check_utf8(column: &Column<'_>, row_group: usize, keys: &Keys) -> Result<()> {
+pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
     if let Keys::Str(run) = keys
         && run
             .iter()
             .any(|value| std::str::from_utf8(value.data()).is_err())
     {
-        return Err(file_fault(column.path, FileFault::KeyNotUtf8 { row_group }));
+        return Err(file_fault(
+            chunk.column.path,
+            FileFault::KeyNotUtf8 {
+                row_group: chunk.row_group(),
+            },
+        ));
     }
     Ok(())
 }
 
-/// `take` records of `column` in `row_group` after skipping `skip`, decoded
-/// from `segments`, which hold at least the pages those rows are in and the
+/// `take` records of `chunk` after skipping `skip`, decoded from
+/// `segments`, which hold at least the pages those rows are in and the
 /// chunk's dictionary page when it has one. Whole pages before the rows
 /// wanted are skipped from their locations without a read; the dictionary
 /// page is read on the way, as the reader requires. Definition levels are
@@ -425,17 +422,16 @@ pub(super) fn check_utf8(column: &Column<'_>, row_group: usize, keys: &Keys) -> 
 /// more rows than any file holds costs no reservation before the check
 /// refuses it.
 fn read_column<T: ParquetDataType>(
-    column: &Column<'_>,
-    row_group: usize,
+    chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
     skip: usize,
     take: usize,
 ) -> Result<Vec<T::T>> {
-    let descr = column.descriptor();
+    let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let pages = CountedPages {
-        inner: column.page_reader(row_group, segments)?,
+        inner: chunk.page_reader(segments)?,
         seen: Arc::clone(&seen),
     };
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
@@ -460,18 +456,18 @@ fn read_column<T: ParquetDataType>(
         records += read;
     }
     let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
-    column.check_pages_read(row_group, skip..skip + take, &seen, records)?;
+    chunk.check_pages_read(skip..skip + take, &seen, records)?;
     Ok(values)
 }
 
-/// Exactly one row of the value column from `segments`: `Some` with the
-/// value, `None` for a null.
+/// Exactly row `row` of the value column chunk `chunk` from `segments`:
+/// `Some` with the value, `None` for a null.
 pub(super) fn read_one<T: ParquetDataType>(
-    column: &Column<'_>,
-    row: RowRef,
+    chunk: ColumnChunk<'_>,
+    row: i64,
     segments: Arc<Segments>,
 ) -> Result<Option<T::T>> {
-    let mut values = read_column::<T>(column, row.row_group, segments, row_index(row.row), 1)?;
+    let mut values = read_column::<T>(chunk, segments, row_index(row), 1)?;
     Ok(values.pop())
 }
 

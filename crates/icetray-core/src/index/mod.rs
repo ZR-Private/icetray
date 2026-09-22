@@ -550,7 +550,7 @@ impl FileIndex {
     /// The rows key page `page` of `row_group` holds, within the row group;
     /// `page` is below `page_count(row_group)`.
     pub fn page_rows(&self, row_group: usize, page: usize) -> Range<i64> {
-        self.key_column().page_rows(row_group, page)
+        self.key_column().group(row_group).page_rows(page)
     }
 
     /// The length in bytes of the file's longest key; at most
@@ -605,11 +605,12 @@ impl FileIndex {
         };
         // Only the value page decides a lookup's label; a key page's origin
         // is not kept.
+        let chunk = self.key_column().group(row_group);
         let segments = match &self.keys {
             KeyResidency::Chunks(chunks) => Arc::clone(chunks),
             KeyResidency::Disk(disk) => {
                 let (segments, _origin) = self
-                    .fetch_pages(&self.key_column(), row_group, page, PageSource::Disk(disk))
+                    .fetch_pages(chunk, page, PageSource::Disk(disk))
                     .await?;
                 segments
             }
@@ -618,12 +619,7 @@ impl FileIndex {
                     return Ok(None);
                 }
                 let (segments, _origin) = self
-                    .fetch_pages(
-                        &self.key_column(),
-                        row_group,
-                        page,
-                        PageSource::Store(cache),
-                    )
+                    .fetch_pages(chunk, page, PageSource::Store(cache))
                     .await?;
                 segments
             }
@@ -656,14 +652,14 @@ impl FileIndex {
         cache: Option<&PageCache>,
     ) -> Result<(Option<Bytes>, PageOrigin)> {
         let page = self.value_page(row)?;
-        let column = self.value_column();
+        let chunk = self.value_column().group(row.row_group);
         let (segments, origin) = self
-            .fetch_pages(&column, row.row_group, page, PageSource::Store(cache))
+            .fetch_pages(chunk, page, PageSource::Store(cache))
             .await?;
         let value = match self.value_shape {
-            ValueShape::Variable => read_one::<ByteArrayType>(&column, row, segments)?
+            ValueShape::Variable => read_one::<ByteArrayType>(chunk, row.row, segments)?
                 .map(|value| Bytes::copy_from_slice(value.data())),
-            ValueShape::Fixed => read_one::<FixedLenByteArrayType>(&column, row, segments)?
+            ValueShape::Fixed => read_one::<FixedLenByteArrayType>(chunk, row.row, segments)?
                 .map(|value| Bytes::copy_from_slice(value.data())),
         };
         Ok((value, origin))
@@ -687,7 +683,7 @@ impl FileIndex {
                 .search(key, row_group, key_page, Arc::clone(chunks))
                 .expect("build decoded this key page from these resident bytes and checked it against its offset index; decoding it again cannot fail")
                 .and_then(|row| self.value_page_index(row))
-                .map(|page| self.value_column().page_range(row_group, page).start),
+                .map(|page| self.value_column().group(row_group).page_range(page).start),
             KeyResidency::Disk(_) | KeyResidency::Filters(_) => None,
         };
         Some(PageRef {
@@ -707,19 +703,13 @@ impl FileIndex {
         page: Option<usize>,
         chunks: &Segments,
     ) -> Result<Keys> {
-        let column = self.key_column();
+        let chunk = self.key_column().group(row_group);
         let rows = match page {
-            Some(page) => column.page_rows(row_group, page),
-            None => 0..column.rows(row_group),
+            Some(page) => chunk.page_rows(page),
+            None => 0..chunk.rows(),
         };
-        let keys = decode_run(
-            &column,
-            self.key_shape,
-            row_group,
-            rows,
-            Arc::new(chunks.clone()),
-        )?;
-        check_utf8(&column, row_group, &keys)?;
+        let keys = decode_run(chunk, self.key_shape, rows, Arc::new(chunks.clone()))?;
+        check_utf8(chunk, &keys)?;
         Ok(keys)
     }
 
@@ -790,9 +780,9 @@ impl FileIndex {
         page: usize,
         segments: Arc<Segments>,
     ) -> Result<Option<RowRef>> {
-        let column = self.key_column();
-        let rows = column.page_rows(row_group, page);
-        let keys = decode_run(&column, self.key_shape, row_group, rows.clone(), segments)?;
+        let chunk = self.key_column().group(row_group);
+        let rows = chunk.page_rows(page);
+        let keys = decode_run(chunk, self.key_shape, rows.clone(), segments)?;
         Ok(keys.binary_search(key).ok().map(|at| RowRef {
             row_group,
             row: rows.start + row_offset(at),
@@ -807,7 +797,8 @@ impl FileIndex {
             return None;
         }
         self.value_column()
-            .page_locations(row.row_group)
+            .group(row.row_group)
+            .page_locations()
             .partition_point(|location| location.first_row_index <= row.row)
             .checked_sub(1)
     }
@@ -825,8 +816,8 @@ impl FileIndex {
         })
     }
 
-    /// Page `page` of `column` in `row_group` and, when the column chunk has
-    /// a dictionary page, that page too, from `source`, as the `Segments`
+    /// Page `page` of `chunk` and, when the column chunk has a dictionary
+    /// page, that page too, from `source`, as the `Segments`
     /// the column reader decodes from without further I/O. The dictionary
     /// page is found the way the reader finds it, as the gap between the
     /// chunk's start and its first data page, so the reader asks for exactly
@@ -836,13 +827,12 @@ impl FileIndex {
     /// page's own; the dictionary page's is not kept.
     async fn fetch_pages(
         &self,
-        column: &Column<'_>,
-        row_group: usize,
+        chunk: ColumnChunk<'_>,
         page: usize,
         source: PageSource<'_>,
     ) -> Result<(Arc<Segments>, PageOrigin)> {
-        let range = column.page_range(row_group, page);
-        let dictionary = column.dictionary_range(row_group);
+        let range = chunk.page_range(page);
+        let dictionary = chunk.dictionary_range();
         let read_dictionary = async {
             match dictionary.clone() {
                 Some(dictionary) => self
@@ -889,15 +879,7 @@ struct Column<'a> {
     path: &'a str,
 }
 
-impl Column<'_> {
-    fn chunk(&self, row_group: usize) -> &ColumnChunkMetaData {
-        self.metadata.row_group(row_group).column(self.leaf)
-    }
-
-    fn rows(&self, row_group: usize) -> i64 {
-        self.metadata.row_group(row_group).num_rows()
-    }
-
+impl<'a> Column<'a> {
     fn descriptor(&self) -> ColumnDescPtr {
         self.metadata
             .file_metadata()
@@ -905,66 +887,100 @@ impl Column<'_> {
             .column(self.leaf)
     }
 
-    /// The column's page locations in `row_group`; build required them.
-    fn page_locations(&self, row_group: usize) -> &[PageLocation] {
-        self.metadata
+    /// The column's chunk in `row_group`, which is below the footer's row
+    /// group count. Every question about one row group is asked of the
+    /// chunk, so the index is named once and cannot drift between calls.
+    fn group(self, row_group: usize) -> ColumnChunk<'a> {
+        ColumnChunk {
+            column: self,
+            row_group,
+        }
+    }
+}
+
+/// One column chunk: a `Column` in one row group, the row group index
+/// carried once for every per-row-group read and check.
+#[derive(Clone, Copy)]
+struct ColumnChunk<'a> {
+    column: Column<'a>,
+    row_group: usize,
+}
+
+impl<'a> ColumnChunk<'a> {
+    /// The row group the chunk lies in; what a fault names.
+    fn row_group(&self) -> usize {
+        self.row_group
+    }
+
+    /// The chunk's entry in the footer.
+    fn metadata(&self) -> &'a ColumnChunkMetaData {
+        self.column
+            .metadata
+            .row_group(self.row_group)
+            .column(self.column.leaf)
+    }
+
+    fn rows(&self) -> i64 {
+        self.column.metadata.row_group(self.row_group).num_rows()
+    }
+
+    /// The chunk's page locations; build required them.
+    fn page_locations(&self) -> &'a [PageLocation] {
+        self.column
+            .metadata
             .offset_index()
-            .expect("build required an offset index on the key and value columns")[row_group]
-            [self.leaf]
+            .expect("build required an offset index on the key and value columns")[self.row_group]
+            [self.column.leaf]
             .page_locations()
     }
 
-    fn page_range(&self, row_group: usize, page: usize) -> Range<u64> {
-        page_range(&self.page_locations(row_group)[page])
+    fn page_range(&self, page: usize) -> Range<u64> {
+        page_range(&self.page_locations()[page])
     }
 
     /// The dictionary page's range when the chunk has one: the bytes between
     /// the chunk's start and its first data page.
-    fn dictionary_range(&self, row_group: usize) -> Option<Range<u64>> {
-        let (start, _) = self.chunk(row_group).byte_range();
-        let first = page_range(self.page_locations(row_group).first()?).start;
+    fn dictionary_range(&self) -> Option<Range<u64>> {
+        let (start, _) = self.metadata().byte_range();
+        let first = page_range(self.page_locations().first()?).start;
         (first != start).then_some(start..first)
     }
 
     /// The rows page `page` holds, within the row group.
-    fn page_rows(&self, row_group: usize, page: usize) -> Range<i64> {
-        let locations = self.page_locations(row_group);
+    fn page_rows(&self, page: usize) -> Range<i64> {
+        let locations = self.page_locations();
         let start = locations[page].first_row_index;
         let end = locations
             .get(page + 1)
-            .map_or_else(|| self.rows(row_group), |next| next.first_row_index);
+            .map_or_else(|| self.rows(), |next| next.first_row_index);
         start..end
     }
 
     /// A page reader over `segments` for the column chunk, positioned at its
     /// start and given every page location, so skipping a page reads no
     /// byte of it.
-    fn page_reader(
-        &self,
-        row_group: usize,
-        segments: Arc<Segments>,
-    ) -> Result<SerializedPageReader<Segments>> {
-        let locations = self.page_locations(row_group).to_vec();
-        let total_rows = row_index(self.rows(row_group));
+    fn page_reader(&self, segments: Arc<Segments>) -> Result<SerializedPageReader<Segments>> {
+        let locations = self.page_locations().to_vec();
+        let total_rows = row_index(self.rows());
         Ok(SerializedPageReader::new(
             segments,
-            self.chunk(row_group),
+            self.metadata(),
             total_rows,
             Some(locations),
         )?)
     }
 
-    /// The page of `row_group` holding row `row`, which is inside the row
-    /// group; the last page for a row at or past its end.
-    fn page_holding(&self, row_group: usize, row: usize) -> usize {
-        let locations = self.page_locations(row_group);
+    /// The page holding row `row`, which is inside the row group; the last
+    /// page for a row at or past its end.
+    fn page_holding(&self, row: usize) -> usize {
+        let locations = self.page_locations();
         locations
             .partition_point(|location| row_index(location.first_row_index) <= row)
             .saturating_sub(1)
             .min(locations.len().saturating_sub(1))
     }
 
-    /// Whether the data pages a reader took from `row_group` are the ones
+    /// Whether the data pages a reader took from the chunk are the ones
     /// the offset index names for rows `rows`, each holding the rows the
     /// index gives it: `seen` is the value count in the header of every
     /// data page the reader read, in order, starting at the page holding
@@ -973,24 +989,25 @@ impl Column<'_> {
     /// rows wanted means no page read. A disagreement is
     /// `FileFault::PageRowsMismatch` naming the first page that does not
     /// fit.
-    fn check_pages_read(
-        &self,
-        row_group: usize,
-        rows: Range<usize>,
-        seen: &[usize],
-        decoded: usize,
-    ) -> Result<()> {
+    fn check_pages_read(&self, rows: Range<usize>, seen: &[usize], decoded: usize) -> Result<()> {
         let (first, expected) = if rows.is_empty() {
             (0, 0)
         } else {
-            let first = self.page_holding(row_group, rows.start);
-            let last = self.page_holding(row_group, rows.end - 1);
+            let first = self.page_holding(rows.start);
+            let last = self.page_holding(rows.end - 1);
             (first, last - first + 1)
         };
-        let mismatch =
-            |page| file_fault(self.path, FileFault::PageRowsMismatch { row_group, page });
+        let mismatch = |page| {
+            file_fault(
+                self.column.path,
+                FileFault::PageRowsMismatch {
+                    row_group: self.row_group,
+                    page,
+                },
+            )
+        };
         for (page, values) in (first..first + expected).zip(seen) {
-            let span = self.page_rows(row_group, page);
+            let span = self.page_rows(page);
             if *values != row_index(span.end - span.start) {
                 return Err(mismatch(page));
             }
@@ -999,7 +1016,7 @@ impl Column<'_> {
             return Err(mismatch(first + seen.len().min(expected.saturating_sub(1))));
         }
         if decoded != rows.end - rows.start {
-            return Err(mismatch(self.page_holding(row_group, rows.start + decoded)));
+            return Err(mismatch(self.page_holding(rows.start + decoded)));
         }
         Ok(())
     }
