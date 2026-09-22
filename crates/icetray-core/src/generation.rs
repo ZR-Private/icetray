@@ -120,15 +120,7 @@ impl Generation {
         previous: Option<&Generation>,
     ) -> Result<Self> {
         let table = config.name.as_str();
-        let snapshot_timestamp =
-            time::timestamp_from_millis(snapshot.timestamp_ms()).map_err(|_out_of_range| {
-                Error::table_fault(
-                    table,
-                    TableFault::SnapshotTimestampOutOfRange {
-                        snapshot_id: SnapshotId(snapshot.snapshot_id()),
-                    },
-                )
-            })?;
+        let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
         let layout = TableLayout::derive(
             table,
             &resolved.metadata,
@@ -139,60 +131,10 @@ impl Generation {
         let entries =
             manifest::list_data_files(table, &resolved.metadata, snapshot, &layout, storage)
                 .await?;
-        let reusable: HashMap<&str, &Arc<LoadedFile>> = previous
-            .map(|generation| {
-                generation
-                    .files
-                    .iter()
-                    .map(|file| (file.entry.path.as_str(), file))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut reused = Vec::new();
-        let mut handles = Vec::new();
-        for entry in entries {
-            let unchanged = reusable
-                .get(entry.path.as_str())
-                .filter(|file| file.entry.size == entry.size);
-            if let Some(file) = unchanged {
-                reused.push(Arc::clone(file));
-            } else {
-                let handle = FileHandle::open(
-                    Arc::clone(storage),
-                    &entry.path,
-                    entry.size,
-                    Arc::clone(&hedge),
-                )?;
-                handles.push((entry, Arc::new(handle)));
-            }
-        }
-        let inspected: Vec<(DataFileEntry, Inspected)> = stream::iter(handles)
-            .map(|(entry, handle)| {
-                let layout = &layout;
-                async move {
-                    let inspected = FileIndex::inspect(
-                        table,
-                        handle,
-                        &layout.key_column,
-                        &layout.value_column,
-                        layout.key_type,
-                    )
-                    .await?;
-                    Ok::<_, Error>((entry, inspected))
-                }
-            })
-            .buffered(LOAD_CONCURRENCY)
-            .try_collect()
-            .await?;
+        let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge)?;
+        let inspected = inspect_all(table, &layout, pending).await?;
         check_budget(table, config, local, &reused, &inspected)?;
-        let built: Vec<Arc<LoadedFile>> = stream::iter(inspected)
-            .map(|(entry, inspected)| async move {
-                let index = inspected.build(config.residency, local).await?;
-                Ok::<_, Error>(Arc::new(LoadedFile { entry, index }))
-            })
-            .buffered(LOAD_CONCURRENCY)
-            .try_collect()
-            .await?;
+        let built = build_all(config.residency, local, inspected).await?;
         let members = reused
             .into_iter()
             .map(|file| Member { file, reused: true })
@@ -418,6 +360,104 @@ fn routes(files: &[Arc<LoadedFile>]) -> Routes {
             .push(at);
     }
     routes
+}
+
+/// The snapshot's timestamp as jiff holds it; one outside jiff's range is
+/// `TableFault::SnapshotTimestampOutOfRange` under `table`.
+fn snapshot_timestamp(table: &str, snapshot: &Snapshot) -> Result<jiff::Timestamp> {
+    time::timestamp_from_millis(snapshot.timestamp_ms()).map_err(|_out_of_range| {
+        Error::table_fault(
+            table,
+            TableFault::SnapshotTimestampOutOfRange {
+                snapshot_id: SnapshotId(snapshot.snapshot_id()),
+            },
+        )
+    })
+}
+
+/// A file the previous generation does not hold, open for inspection.
+type Pending = (DataFileEntry, Arc<FileHandle>);
+
+/// Splits the snapshot's files into those `previous` holds by the same path
+/// at the same size, reused as the same `Arc` (RFD 005; a data file is
+/// immutable, so a path whose size changed is another file and its index
+/// would be stale), and the rest, each opened as a `FileHandle` with the
+/// manifest's size and `hedge`. Opening sends nothing.
+fn reuse_or_open(
+    entries: Vec<DataFileEntry>,
+    previous: Option<&Generation>,
+    storage: &Arc<Storage>,
+    hedge: &Arc<HedgeWindow>,
+) -> Result<(Vec<Arc<LoadedFile>>, Vec<Pending>)> {
+    let reusable: HashMap<&str, &Arc<LoadedFile>> = previous
+        .map(|generation| {
+            generation
+                .files
+                .iter()
+                .map(|file| (file.entry.path.as_str(), file))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut reused = Vec::new();
+    let mut pending = Vec::new();
+    for entry in entries {
+        let unchanged = reusable
+            .get(entry.path.as_str())
+            .filter(|file| file.entry.size == entry.size);
+        if let Some(file) = unchanged {
+            reused.push(Arc::clone(file));
+        } else {
+            let handle = FileHandle::open(
+                Arc::clone(storage),
+                &entry.path,
+                entry.size,
+                Arc::clone(hedge),
+            )?;
+            pending.push((entry, Arc::new(handle)));
+        }
+    }
+    Ok((reused, pending))
+}
+
+/// Inspects every pending file's footer under `layout`, `LOAD_CONCURRENCY`
+/// at a time; the first refusal or fault ends the load.
+async fn inspect_all(
+    table: &str,
+    layout: &TableLayout,
+    pending: Vec<Pending>,
+) -> Result<Vec<(DataFileEntry, Inspected)>> {
+    stream::iter(pending)
+        .map(|(entry, handle)| async move {
+            let inspected = FileIndex::inspect(
+                table,
+                handle,
+                &layout.key_column,
+                &layout.value_column,
+                layout.key_type,
+            )
+            .await?;
+            Ok::<_, Error>((entry, inspected))
+        })
+        .buffered(LOAD_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// Builds every inspected file's index in `residency`, `LOAD_CONCURRENCY`
+/// at a time, after the budget check admitted them all.
+async fn build_all(
+    residency: Residency,
+    local: Option<&LocalDir>,
+    inspected: Vec<(DataFileEntry, Inspected)>,
+) -> Result<Vec<Arc<LoadedFile>>> {
+    stream::iter(inspected)
+        .map(|(entry, inspected)| async move {
+            let index = inspected.build(residency, local).await?;
+            Ok::<_, Error>(Arc::new(LoadedFile { entry, index }))
+        })
+        .buffered(LOAD_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 /// The budget the residency sets, checked before any key chunk is fetched
