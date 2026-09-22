@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use icetray_core::config::Config;
+use icetray_core::config::{Config, ServerConfig};
 use icetray_core::open::open_with;
-use icetray_core::{ErrorKind, Opened, Storage, Table};
+use icetray_core::{ErrorKind, Opened, Storage, Table, open};
 use icetray_proto::v1::icetray_server::IcetrayServer;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
@@ -71,41 +71,78 @@ pub struct Serving {
     task: JoinHandle<Result<(), ServeError>>,
 }
 
+/// Both listeners, bound before any table is opened, so a port that is
+/// taken is reported before a local directory or a cache is touched.
+struct Listeners {
+    grpc: TcpListener,
+    metrics: TcpListener,
+    /// The address the gRPC listener bound.
+    listen: SocketAddr,
+    /// The address the metrics and readiness listener bound.
+    metrics_addr: SocketAddr,
+}
+
+impl Listeners {
+    /// Binds `server`'s two addresses, naming the one that fails.
+    async fn bind(server: &ServerConfig) -> Result<Self, ServeError> {
+        let grpc = bind(server.listen).await?;
+        let metrics = bind(server.metrics_listen).await?;
+        let listen = local_addr(&grpc, server.listen)?;
+        let metrics_addr = local_addr(&metrics, server.metrics_listen)?;
+        Ok(Self {
+            grpc,
+            metrics,
+            listen,
+            metrics_addr,
+        })
+    }
+}
+
 impl Serving {
-    /// Binds both listeners, registers health, opens every table, starts
-    /// the gRPC and HTTP servers, then spawns the run that loads, refreshes,
-    /// and drains. Storage comes from the SDK's default chain (RFD 003).
+    /// Binds both listeners, opens every table through `open` (storage from
+    /// the SDK's default chain, RFD 003), registers health, starts the gRPC
+    /// and HTTP servers, then spawns the run that loads, refreshes, and
+    /// drains. Returns once both listeners accept and the health service
+    /// answers `NOT_SERVING`; the loads run behind it (RFD 012).
     pub async fn start(
         config: Config,
         handle: PrometheusHandle,
         options: ServeOptions,
     ) -> Result<Self, ServeError> {
-        let storage = Arc::new(Storage::with_sdk_defaults(config.storage.clone()).await);
-        Self::start_over(config, storage, handle, options).await
+        let listeners = Listeners::bind(&config.server).await?;
+        let opened = open(&config, None).await?;
+        Ok(Self::start_serving(config, listeners, opened, handle, options).await)
     }
 
-    /// `start` over a storage the caller built, so a test registers its own
-    /// stores and never touches the SDK chain. Returns once both listeners
-    /// accept and the health service answers `NOT_SERVING`; the loads run
-    /// behind it (RFD 012).
+    /// `start` over a storage the caller built, through `open_with`, so a
+    /// test registers its own stores and never touches the SDK chain.
     pub async fn start_over(
         config: Config,
         storage: Arc<Storage>,
         handle: PrometheusHandle,
         options: ServeOptions,
     ) -> Result<Self, ServeError> {
-        let grpc_listener = bind(config.server.listen).await?;
-        let metrics_listener = bind(config.server.metrics_listen).await?;
-        let listen = local_addr(&grpc_listener, config.server.listen)?;
-        let metrics = local_addr(&metrics_listener, config.server.metrics_listen)?;
+        let listeners = Listeners::bind(&config.server).await?;
+        let opened = open_with(&config, None, storage).await?;
+        Ok(Self::start_serving(config, listeners, opened, handle, options).await)
+    }
 
+    /// Registers health as `NOT_SERVING`, starts the servers on `listeners`
+    /// over `opened`, logs `listening`, and spawns the run.
+    async fn start_serving(
+        config: Config,
+        listeners: Listeners,
+        opened: Opened,
+        handle: PrometheusHandle,
+        options: ServeOptions,
+    ) -> Self {
         let (health, health_service) = tonic_health::server::health_reporter();
         health.set_not_serving::<IcetrayServer<Service>>().await;
         health
             .set_service_status(OVERALL_SERVICE, ServingStatus::NotServing)
             .await;
 
-        let opened = Arc::new(open_with(&config, None, storage).await?);
+        let opened = Arc::new(opened);
         let service = Service::new(&opened);
         let (shutdown, _stop) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
@@ -115,19 +152,19 @@ impl Serving {
                 .add_service(health_service)
                 .add_service(IcetrayServer::new(service))
                 .serve_with_incoming_shutdown(
-                    TcpIncoming::from(grpc_listener),
+                    TcpIncoming::from(listeners.grpc),
                     stop(shutdown.subscribe()),
                 ),
         );
         let http = tokio::spawn(serve_http(
-            metrics_listener,
+            listeners.metrics,
             handle.clone(),
             ready.clone(),
             shutdown.subscribe(),
         ));
         tracing::info!(
-            grpc = %listen,
-            metrics = %metrics,
+            grpc = %listeners.listen,
+            metrics = %listeners.metrics_addr,
             tables = opened.tables.len(),
             "listening"
         );
@@ -144,14 +181,14 @@ impl Serving {
             http,
         };
         let task = tokio::spawn(run.run());
-        Ok(Self {
-            listen,
-            metrics,
+        Self {
+            listen: listeners.listen,
+            metrics: listeners.metrics_addr,
             opened,
             ready,
             shutdown,
             task,
-        })
+        }
     }
 
     /// The address the gRPC listener bound.

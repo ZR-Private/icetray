@@ -77,7 +77,8 @@ pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened> {
 
 /// `open` over a storage the caller built, for the testkit and embedders:
 /// a test constructs one with `Storage::new` and never touches the SDK
-/// chain, and registers its own stores on it. The binary uses `open`.
+/// chain, and registers its own stores on it. The binary's subcommands
+/// use `open`; the daemon's in-process tests start it over this.
 pub async fn open_with(
     config: &Config,
     only: Option<&str>,

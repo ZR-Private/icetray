@@ -54,39 +54,20 @@ impl Presence {
     }
 }
 
-/// An `info` line: `kind`, then the summary, whose first field is `table`.
+/// An `info` line (`Kind::Table`) or a `doctor` line (`Kind::Doctor`):
+/// `kind`, then the summary, whose first field is `table`. The two
+/// subcommands print the same summary under their own kind.
 #[derive(Debug, Serialize)]
-pub struct InfoLine<'a> {
+pub struct SummaryLine<'a> {
     kind: Kind,
     #[serde(flatten)]
     summary: &'a TableSummary,
 }
 
-impl<'a> InfoLine<'a> {
-    /// The line for `summary`.
-    pub fn new(summary: &'a TableSummary) -> Self {
-        Self {
-            kind: Kind::Table,
-            summary,
-        }
-    }
-}
-
-/// A `doctor` line: `kind`, then the summary, whose first field is `table`.
-#[derive(Debug, Serialize)]
-pub struct DoctorLine<'a> {
-    kind: Kind,
-    #[serde(flatten)]
-    summary: &'a TableSummary,
-}
-
-impl<'a> DoctorLine<'a> {
-    /// The line for `summary`.
-    pub fn new(summary: &'a TableSummary) -> Self {
-        Self {
-            kind: Kind::Doctor,
-            summary,
-        }
+impl<'a> SummaryLine<'a> {
+    /// The line for `summary` under `kind`.
+    pub fn new(kind: Kind, summary: &'a TableSummary) -> Self {
+        Self { kind, summary }
     }
 }
 
@@ -360,8 +341,14 @@ mod tests {
         };
         let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
         let key = Key::Long(1);
-        assert_eq!(leading_keys(&InfoLine::new(&summary)), ["kind", "table"]);
-        assert_eq!(leading_keys(&DoctorLine::new(&summary)), ["kind", "table"]);
+        assert_eq!(
+            leading_keys(&SummaryLine::new(Kind::Table, &summary)),
+            ["kind", "table"]
+        );
+        assert_eq!(
+            leading_keys(&SummaryLine::new(Kind::Doctor, &summary)),
+            ["kind", "table"]
+        );
         assert_eq!(
             leading_keys(&FindingLine::new(TABLE, &finding)),
             ["kind", "table"]
@@ -383,7 +370,7 @@ mod tests {
     #[test]
     fn test_serialize_info_and_doctor_lines_carry_the_summary_under_their_kind() {
         let summary = summary();
-        let info = serde_json::to_value(InfoLine::new(&summary)).unwrap();
+        let info = serde_json::to_value(SummaryLine::new(Kind::Table, &summary)).unwrap();
         assert_eq!(info["kind"], Json::String("table".to_string()));
         assert_eq!(info["table"], Json::String(TABLE.to_string()));
         assert_eq!(info["snapshot_id"], Json::from(SNAPSHOT));
@@ -391,7 +378,7 @@ mod tests {
             info["serviceability"],
             Json::String("efficient".to_string())
         );
-        let doctor = serde_json::to_value(DoctorLine::new(&summary)).unwrap();
+        let doctor = serde_json::to_value(SummaryLine::new(Kind::Doctor, &summary)).unwrap();
         assert_eq!(doctor["kind"], Json::String("doctor".to_string()));
         assert_eq!(doctor["costs"], Json::from(0));
     }

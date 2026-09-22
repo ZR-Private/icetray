@@ -13,7 +13,7 @@ use icetray_core::{Opened, Serviceability, Table, diagnose, open, time};
 
 use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
-use crate::output::{DoctorLine, FileLine, FindingLine, GetLine, InfoLine, RefusedLine, emit};
+use crate::output::{FileLine, FindingLine, GetLine, Kind, RefusedLine, SummaryLine, emit};
 
 /// Opens every table of `config`, or the one named by `only`; no table is
 /// `CliError::NoTableMatched`. Nothing is loaded.
@@ -56,7 +56,7 @@ pub async fn doctor(
             Ok(()) => {
                 let generation = table.serving()?;
                 let report = diagnose(&generation);
-                emit(&DoctorLine::new(&report.summary))?;
+                emit(&SummaryLine::new(Kind::Doctor, &report.summary))?;
                 for finding in &report.findings {
                     emit(&FindingLine::new(table.name(), finding))?;
                 }
@@ -96,7 +96,10 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     }
     for table in loaded {
         let generation = table.serving()?;
-        emit(&InfoLine::new(&diagnose(&generation).summary))?;
+        emit(&SummaryLine::new(
+            Kind::Table,
+            &diagnose(&generation).summary,
+        ))?;
     }
     Ok(())
 }

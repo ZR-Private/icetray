@@ -60,45 +60,61 @@ async fn run(cli: Cli) -> ExitCode {
             target,
             table,
             files,
-        } => match prepare(&target) {
-            Ok(config) => finish(oneshot::doctor(&config, table.as_deref(), files).await),
-            Err(code) => code,
-        },
+        } => {
+            run_oneshot(&target, |config| async move {
+                oneshot::doctor(&config, table.as_deref(), files).await
+            })
+            .await
+        }
         Command::Get {
             target,
             table,
             keys,
-        } => match prepare(&target) {
-            Ok(config) => finish(
+        } => {
+            run_oneshot(&target, |config| async move {
                 oneshot::get(&config, table.as_deref(), &keys)
                     .await
-                    .map(|()| ExitCode::from(EXIT_OK)),
-            ),
-            Err(code) => code,
-        },
-        Command::Info { target, table } => match prepare(&target) {
-            Ok(config) => finish(
+                    .map(|()| ExitCode::from(EXIT_OK))
+            })
+            .await
+        }
+        Command::Info { target, table } => {
+            run_oneshot(&target, |config| async move {
                 oneshot::info(&config, table.as_deref())
                     .await
-                    .map(|()| ExitCode::from(EXIT_OK)),
-            ),
-            Err(code) => code,
-        },
+                    .map(|()| ExitCode::from(EXIT_OK))
+            })
+            .await
+        }
     }
+}
+
+/// One one-shot subcommand: its configuration prepared from `target`,
+/// `subcommand` run over it, and the outcome finished into the exit code.
+async fn run_oneshot<Fut>(target: &Target, subcommand: impl FnOnce(Config) -> Fut) -> ExitCode
+where
+    Fut: Future<Output = Result<ExitCode, CliError>>,
+{
+    match prepare(target) {
+        Ok(config) => finish(subcommand(config).await),
+        Err(code) => code,
+    }
+}
+
+/// Reports `error` on stderr, where a failure before logging exists goes,
+/// and gives its exit code.
+fn report(error: &CliError) -> ExitCode {
+    eprintln!("{error}");
+    error.exit_code()
 }
 
 /// The one-shot's configuration, with logging to stderr at `warn` under its
 /// `server.log`, since a one-shot's stdout is data. A target that cannot be
-/// used is reported on stderr, before logging exists, with its exit code.
+/// used is reported with its exit code.
 fn prepare(target: &Target) -> Result<Config, ExitCode> {
-    let config = target.config().map_err(|error| {
-        eprintln!("{error}");
-        error.exit_code()
-    })?;
-    logging::init(&config.server.log, LogSink::Stderr, Level::WARN).map_err(|error| {
-        eprintln!("{error}");
-        error.exit_code()
-    })?;
+    let config = target.config().map_err(|error| report(&error))?;
+    logging::init(&config.server.log, LogSink::Stderr, Level::WARN)
+        .map_err(|error| report(&error))?;
     Ok(config)
 }
 
@@ -123,14 +139,10 @@ fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
 async fn serve(path: &Path) -> ExitCode {
     let config = match Config::from_path(path) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(EXIT_FAILURE);
-        }
+        Err(error) => return report(&CliError::Core(error)),
     };
     if let Err(error) = logging::init(&config.server.log, LogSink::Stdout, Level::INFO) {
-        eprintln!("{error}");
-        return error.exit_code();
+        return report(&error);
     }
     if let Err(error) = tikv_jemalloc_ctl::background_thread::write(true) {
         // Background purging is a Linux feature of jemalloc; elsewhere freed
