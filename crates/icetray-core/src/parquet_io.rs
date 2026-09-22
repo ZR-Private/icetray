@@ -346,6 +346,12 @@ impl Segments {
         Self { parts, file_size }
     }
 
+    /// The parts, by ascending range; the disk tier writes its chunk file
+    /// from them once they are verified.
+    pub(crate) fn parts(&self) -> &[(Range<u64>, Bytes)] {
+        &self.parts
+    }
+
     /// Bytes held, summed over the parts.
     pub fn resident_len(&self) -> usize {
         self.parts.iter().map(|(_, bytes)| bytes.len()).sum()

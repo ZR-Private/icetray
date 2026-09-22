@@ -150,6 +150,20 @@ pub struct ResidentBytes {
     pub bloom_bits_per_key: Option<f64>,
 }
 
+impl ResidentBytes {
+    /// The memory `residency` holds: `full`, `disk_memory`, or `bloom`, the
+    /// one mapping from a tier to its field, so a budget check and a test
+    /// name the tier and not the field. `None` only for `Bloom` when
+    /// `bloom` is.
+    pub fn in_tier(&self, residency: Residency) -> Option<u64> {
+        match residency {
+            Residency::Full => Some(self.full),
+            Residency::Disk => Some(self.disk_memory),
+            Residency::Bloom => self.bloom,
+        }
+    }
+}
+
 /// The page a key would decode and, when it can be named without I/O, the
 /// value page its row would fetch; for tests and the doctor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,13 +578,9 @@ impl FileIndex {
             self.key_leaf,
             Some(&self.fences),
         ));
-        let mine = match self.keys {
-            KeyResidency::Chunks(_) => all.full,
-            KeyResidency::Disk(_) => all.disk_memory,
-            KeyResidency::Filters(_) => all
-                .bloom
-                .expect("a bloom index has a bounded filter per row group; build refused the file otherwise"),
-        };
+        let mine = all.in_tier(self.residency()).expect(
+            "a bloom index has a bounded filter per row group; build refused the file otherwise",
+        );
         usize::try_from(mine)
             .expect("resident bytes fit usize on the 64-bit targets the crate supports")
     }
@@ -931,9 +941,8 @@ impl Inspected {
         let ranges = key_chunk_ranges(&metadata, layout.key_leaf);
         let (keys, verified) = match residency {
             Residency::Full => {
-                let parts = fetch_chunk_parts(&handle, &ranges).await?;
-                let chunks = Arc::new(Segments::new(parts, handle.size()));
-                let verified = verify(&table, &column, layout.key_shape, &chunks)?;
+                let (chunks, verified) =
+                    fetch_verified(&table, &handle, &column, layout.key_shape, &ranges).await?;
                 (KeyResidency::Chunks(chunks), verified)
             }
             Residency::Disk => {
@@ -945,9 +954,8 @@ impl Inspected {
             }
             Residency::Bloom => {
                 let filter_ranges = bloom_ranges(&table, &handle, &metadata, layout.key_leaf)?;
-                let parts = fetch_chunk_parts(&handle, &ranges).await?;
-                let chunks = Arc::new(Segments::new(parts, handle.size()));
-                let verified = verify(&table, &column, layout.key_shape, &chunks)?;
+                let (chunks, verified) =
+                    fetch_verified(&table, &handle, &column, layout.key_shape, &ranges).await?;
                 drop(chunks);
                 let filters = read_bloom_filters(&handle, &filter_ranges).await?;
                 (KeyResidency::Filters(filters), verified)
@@ -1373,6 +1381,22 @@ fn key_chunk_ranges(metadata: &ParquetMetaData, key_leaf: usize) -> Vec<Range<u6
         .collect()
 }
 
+/// The key column chunks of `ranges`, fetched and verified: the chunks a
+/// tier keeps (Full), writes (Disk), or drops (Bloom), and what
+/// verification recorded.
+async fn fetch_verified(
+    table: &str,
+    handle: &FileHandle,
+    column: &Column<'_>,
+    shape: KeyShape,
+    ranges: &[Range<u64>],
+) -> Result<(Arc<Segments>, Verified)> {
+    let parts = fetch_chunk_parts(handle, ranges).await?;
+    let chunks = Arc::new(Segments::new(parts, handle.size()));
+    let verified = verify(table, column, shape, &chunks)?;
+    Ok((chunks, verified))
+}
+
 /// Every key column chunk in one `read_ranges` call: one load GET per row
 /// group. Each chunk is copied out of the buffer the store returned: a
 /// store may serve neighbouring ranges from one fetch and hand back slices
@@ -1423,11 +1447,9 @@ async fn disk_chunks(
         let verified = verify(table, column, shape, &chunks)?;
         return Ok((disk, verified));
     }
-    let parts = fetch_chunk_parts(handle, ranges).await?;
-    let chunks = Arc::new(Segments::new(parts.clone(), handle.size()));
-    let verified = verify(table, column, shape, &chunks)?;
-    drop(chunks);
-    let disk = off_worker(|| local.write_chunks(&identity_of(handle), parts.into_iter()))?;
+    let (chunks, verified) = fetch_verified(table, handle, column, shape, ranges).await?;
+    let disk =
+        off_worker(|| local.write_chunks(&identity_of(handle), chunks.parts().iter().cloned()))?;
     Ok((disk, verified))
 }
 
@@ -4315,11 +4337,7 @@ mod tests {
                     .await
                     .unwrap();
                 let predicted = predicted_of(&index);
-                let expected = match residency {
-                    Residency::Full => predicted.full,
-                    Residency::Disk => predicted.disk_memory,
-                    Residency::Bloom => predicted.bloom.unwrap(),
-                };
+                let expected = predicted.in_tier(residency).unwrap();
                 // A uuid key is held inline; the estimate counts the column's width per page.
                 let fence_over = match key_type {
                     KeyType::Uuid => count(ROW_GROUPS * PAGES_PER_GROUP * UUID_BYTES),

@@ -362,24 +362,9 @@ impl LocalDir {
     /// failure is an error.
     pub fn chunks_for(&self, identity: &DataFileIdentity) -> Result<Option<DiskChunks>> {
         let path = self.chunk_path(identity);
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(local_error(path, error)),
-        };
-        match validate(&file, identity) {
-            Ok(parsed) => Ok(Some(DiskChunks::new(
-                file,
-                path,
-                parsed,
-                Arc::clone(&self.stats),
-            ))),
-            Err(ParseFailure::Rejected(rejection)) => {
-                warn_rejected(&path, rejection);
-                Ok(None)
-            }
-            Err(ParseFailure::Io(error)) => Err(local_error(path, error)),
-        }
+        let opened = open_parsed(&path, |file| validate(file, identity))?;
+        Ok(opened
+            .map(|(file, parsed)| DiskChunks::new(file, path, parsed, Arc::clone(&self.stats))))
     }
 
     /// Writes verified key chunks and returns the handle the index keeps.
@@ -402,15 +387,11 @@ impl LocalDir {
         let path = self.chunk_path(identity);
         let mut chunks: Vec<(Range<u64>, Bytes)> = chunks.collect();
         chunks.sort_by_key(|(range, _)| range.start);
-        let header = header_for(identity, &chunks).map_err(|fault| Error::Local {
-            path: path.clone(),
-            fault,
-        })?;
+        let header =
+            header_for(identity, &chunks).map_err(|fault| local_fault(path.clone(), fault))?;
         let temp = self.begin_temp(&path);
-        let file = write_envelope(&temp.path, &header, &chunks).map_err(|fault| Error::Local {
-            path: temp.path.clone(),
-            fault,
-        })?;
+        let file = write_envelope(&temp.path, &header, &chunks)
+            .map_err(|fault| local_fault(temp.path.clone(), fault))?;
         fs::rename(&temp.path, &path).map_err(|error| local_error(path.clone(), error))?;
         drop(temp);
         let encoded_len = u64::try_from(header.encoded_len())
@@ -514,18 +495,8 @@ impl LocalDir {
         if is_temp(path) {
             return Ok(self.lock_in_flight().contains(path));
         }
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(local_error(path.to_path_buf(), error)),
-        };
-        let parsed = match parse_chunk_file(&file) {
-            Ok(parsed) => parsed,
-            Err(ParseFailure::Rejected(rejection)) => {
-                warn_rejected(path, rejection);
-                return Ok(false);
-            }
-            Err(ParseFailure::Io(error)) => return Err(local_error(path.to_path_buf(), error)),
+        let Some((_file, parsed)) = open_parsed(path, parse_chunk_file)? else {
+            return Ok(false);
         };
         if path != self.chunk_path(&parsed.identity) {
             warn_rejected(path, Rejection::NameMismatch);
@@ -680,11 +651,9 @@ impl ChunkFile {
         Ok(Bytes::from(buf))
     }
 
+    /// `fault` at this chunk file's path.
     fn error(&self, fault: LocalFault) -> Error {
-        Error::Local {
-            path: self.path.clone(),
-            fault,
-        }
+        local_fault(self.path.clone(), fault)
     }
 }
 
@@ -990,12 +959,37 @@ fn remove_if_present(path: &Path, len: u64) -> Result<u64> {
     }
 }
 
+/// Opens the file at `path` and parses it with `parse`: `None` when there
+/// is no file or it fails a check, which is logged at warn with the check it
+/// failed; only an I/O failure is an error.
+fn open_parsed<T>(
+    path: &Path,
+    parse: impl FnOnce(&File) -> std::result::Result<T, ParseFailure>,
+) -> Result<Option<(File, T)>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(local_error(path.to_path_buf(), error)),
+    };
+    match parse(&file) {
+        Ok(parsed) => Ok(Some((file, parsed))),
+        Err(ParseFailure::Rejected(rejection)) => {
+            warn_rejected(path, rejection);
+            Ok(None)
+        }
+        Err(ParseFailure::Io(error)) => Err(local_error(path.to_path_buf(), error)),
+    }
+}
+
+/// A failure of the local directory at `path` as the crate's error; the one
+/// place `Error::Local` is built.
+fn local_fault(path: PathBuf, fault: LocalFault) -> Error {
+    Error::Local { path, fault }
+}
+
 /// An I/O failure at `path` as the crate's error.
 fn local_error(path: PathBuf, error: io::Error) -> Error {
-    Error::Local {
-        path,
-        fault: LocalFault::Io(error),
-    }
+    local_fault(path, LocalFault::Io(error))
 }
 
 /// The one warn line for a chunk file that failed a check: the path, the

@@ -2168,13 +2168,8 @@ mod tests {
             assert_eq!(report.summary.residency, residency);
             assert_eq!(report.summary.index_bytes, generation.index_bytes);
             let predicted = report.summary.predicted;
-            let loaded = match residency {
-                Residency::Full => predicted.full,
-                Residency::Disk => predicted.disk_memory,
-                Residency::Bloom => predicted.bloom.unwrap(),
-            };
             assert_eq!(
-                loaded,
+                predicted.in_tier(residency).unwrap(),
                 u64::try_from(generation.index_bytes).unwrap(),
                 "{residency}"
             );

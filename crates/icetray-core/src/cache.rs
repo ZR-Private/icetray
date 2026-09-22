@@ -261,10 +261,31 @@ impl PageCache {
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
         let key = PageKey(key.0, key.1);
-        match self.tier.as_ref() {
-            Tier::Memory(cache) => self.via_memory(cache, &key, fetch).await,
-            Tier::Hybrid { cache, stats } => self.via_hybrid(cache, stats, &key, fetch).await,
-        }
+        let fetches = Arc::clone(&self.fetches);
+        // One call to foyer and not a `get` first: foyer's `get` reports a
+        // disk level that fails to read as an error while its `get_or_fetch`
+        // moves on to the fetch, which is what a disposable directory calls
+        // for (RFD 017). The tiers' entries differ in type, so each arm
+        // reduces its own to the source and the page.
+        let (served, stats) = match self.tier.as_ref() {
+            Tier::Memory(cache) => (
+                cache
+                    .get_or_fetch(&key, || run_fetch(fetch(), fetches))
+                    .await
+                    .map(|entry| (entry.source(), entry.value().0.clone())),
+                None,
+            ),
+            Tier::Hybrid { cache, stats } => (
+                cache
+                    .get_or_fetch(&key, || run_fetch(fetch(), fetches))
+                    .await
+                    .map(|entry| (entry.source(), entry.value().0.clone())),
+                Some(stats.as_ref()),
+            ),
+        };
+        let (source, page) = served.map_err(cache_error)?;
+        self.record(source, stats, &page);
+        Ok((page, origin_of(source)))
     }
 
     /// Lookups served without running a fetch: from memory, or from the
@@ -301,73 +322,26 @@ impl PageCache {
         }
     }
 
-    /// The memory tier's path, one call to foyer: the page from memory,
-    /// else one coalesced fetch.
-    async fn via_memory<F, Fut>(
-        &self,
-        cache: &Cache<PageKey, PageValue>,
-        key: &PageKey,
-        fetch: F,
-    ) -> Result<(Bytes, PageOrigin)>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Bytes>> + Send + 'static,
-    {
-        let fetches = Arc::clone(&self.fetches);
-        let entry = cache
-            .get_or_fetch(key, || run_fetch(fetch(), fetches))
-            .await
-            .map_err(cache_error)?;
-        // The memory tier has no disk level, so a page that did not come
-        // from a fetch was in memory.
-        match entry.source() {
-            Source::Outer => self.record_insert(),
-            Source::Memory | Source::Disk => self.record_hit(),
-        }
-        Ok((entry.value().0.clone(), origin_of(entry.source())))
-    }
-
-    /// The hybrid tier's path, one call to foyer: memory, then the disk
-    /// level, then one coalesced fetch. One call and not a `get` first,
-    /// because foyer's `get` reports a disk level that fails to read as an
-    /// error while its `get_or_fetch` moves on to the fetch, which is what
-    /// a disposable directory calls for (RFD 017).
-    async fn via_hybrid<F, Fut>(
-        &self,
-        cache: &HybridCache<PageKey, PageValue>,
-        stats: &IoStats,
-        key: &PageKey,
-        fetch: F,
-    ) -> Result<(Bytes, PageOrigin)>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Bytes>> + Send + 'static,
-    {
-        let fetches = Arc::clone(&self.fetches);
-        let entry = cache
-            .get_or_fetch(key, || run_fetch(fetch(), fetches))
-            .await
-            .map_err(cache_error)?;
-        self.record_hybrid(entry.source(), stats, entry.value());
-        Ok((entry.value().0.clone(), origin_of(entry.source())))
-    }
-
-    /// Counts how the hybrid tier served a page. From memory: a hit. From
-    /// the disk level: a hit and one local read of the page's length,
-    /// charged beside GETs so a lookup's whole cost is one structure (RFD
-    /// 003). Both are counted per lookup served: foyer reports the source to
-    /// every lookup coalesced onto one disk read alike and names no leader,
-    /// so several lookups served by one read each count a hit and a local
-    /// read, as each would under `DiskChunks::page`; GETs, by contrast, are
-    /// counted per fetch run. From a fetch: nothing here, since `run_fetch`
-    /// counted the one run for every lookup it served.
-    fn record_hybrid(&self, source: Source, stats: &IoStats, value: &PageValue) {
+    /// Counts how a page was served. From memory: a hit. From the disk
+    /// level, which only the hybrid tier has (`stats` is its counter; the
+    /// memory tier is never told `Disk`): a hit and one local read of the
+    /// page's length, charged beside GETs so a lookup's whole cost is one
+    /// structure (RFD 003). Both are counted per lookup served: foyer
+    /// reports the source to every lookup coalesced onto one disk read
+    /// alike and names no leader, so several lookups served by one read
+    /// each count a hit and a local read, as each would under
+    /// `DiskChunks::page`; GETs, by contrast, are counted per fetch run.
+    /// From a fetch: nothing here, since `run_fetch` counted the one run for
+    /// every lookup it served.
+    fn record(&self, source: Source, stats: Option<&IoStats>, page: &Bytes) {
         match source {
             Source::Outer => self.record_insert(),
             Source::Memory => self.record_hit(),
             Source::Disk => {
                 self.record_hit();
-                stats.record_local_read(approx::count(value.0.len()));
+                if let Some(stats) = stats {
+                    stats.record_local_read(approx::count(page.len()));
+                }
             }
         }
     }

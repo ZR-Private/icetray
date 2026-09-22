@@ -444,6 +444,11 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnsizedBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64> }
+impl ResidentBytes {
+    /// The memory a tier holds (`full`, `disk_memory`, `bloom`): the one mapping from a
+    /// tier to its field. `None` only for `Bloom` when `bloom` is.
+    pub fn in_tier(&self, residency: Residency) -> Option<u64>;
+}
 pub struct FileIndex;
 impl FileIndex {
     /// Refuses (typed, under `table`) an unsorted key column, a null key, a
