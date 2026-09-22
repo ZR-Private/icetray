@@ -892,12 +892,37 @@ fn header_for(
         })?;
         spans.push(span);
     }
-    Ok(ChunkFileHeader {
+    Ok(header_of(identity, spans))
+}
+
+/// The header naming `identity` and `spans`, the one layout `write_chunks`
+/// writes and `chunk_file_bytes` measures.
+fn header_of(identity: &DataFileIdentity, spans: Vec<ChunkSpan>) -> ChunkFileHeader {
+    ChunkFileHeader {
         data_file_path: identity.path.clone(),
         data_file_size: identity.size,
         footer_digest: identity.footer_digest.to_vec(),
         chunks: spans,
-    })
+    }
+}
+
+/// The bytes the chunk file `write_chunks` would write for `identity` over
+/// `ranges` occupies: the envelope, the encoded header, and the chunks back
+/// to back. This is what `LocalDir::index_bytes_in_use` measures for the
+/// file once written, so a disk budget checked against it at the footer
+/// stage agrees with the directory after the write.
+pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>]) -> u64 {
+    let spans = ranges
+        .iter()
+        .map(|range| ChunkSpan {
+            data_offset: range.start,
+            length: range.end.saturating_sub(range.start),
+        })
+        .collect::<Vec<_>>();
+    let payload = spans.iter().map(|span| span.length).sum::<u64>();
+    let header = u64::try_from(header_of(identity, spans).encoded_len())
+        .expect("an encoded header's length fits u64 on the supported systems");
+    HEADER_OFFSET + header + payload
 }
 
 /// Writes one chunk file at `path`, which must not exist: the magic byte,

@@ -501,8 +501,10 @@ impl Inspected {
     pub fn handle(&self) -> &Arc<FileHandle>;
     /// What a Disk-tier `build` would add to `local`'s `index/`: zero when a
     /// chunk file with the file's identity already holds every key chunk, so
-    /// a restart is not charged for what is on disk, else
-    /// `predicted().disk_bytes`. Reads the chunk file's header and no chunk.
+    /// a restart is not charged for what is on disk, else the chunk file it
+    /// would write, header and key chunks (`predicted().disk_bytes`), the
+    /// bytes `LocalDir::index_bytes_in_use` then counts for it. Reads the
+    /// chunk file's header and no chunk.
     pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
     /// The chunk stage of `FileIndex::build`.
     pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex>;

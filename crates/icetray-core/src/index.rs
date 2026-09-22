@@ -34,7 +34,7 @@ use crate::config::Residency;
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
-use crate::local::{DataFileIdentity, DiskChunks, LocalDir};
+use crate::local::{DataFileIdentity, DiskChunks, LocalDir, chunk_file_bytes};
 use crate::parquet_io::{FileHandle, Segments};
 
 /// A row's position in a file: its row group and its row within that group.
@@ -893,18 +893,21 @@ impl Inspected {
 
     /// The bytes a Disk-tier `build` would add to `local`'s `index/`: zero
     /// when a chunk file with this file's identity already holds every key
-    /// chunk, since `build` reuses it and writes nothing, otherwise the key
-    /// chunks' bytes (`predicted().disk_bytes`). The disk budget is checked
-    /// against this rather than against the prediction alone, so a restart
-    /// over a directory that already holds the table's chunk files is not
-    /// charged for them twice (RFD 017). Reads the chunk file's header and
-    /// no key chunk; a chunk file that fails a check counts as absent, as
+    /// chunk, since `build` reuses it and writes nothing, otherwise the
+    /// chunk file `build` would write, its header and the key chunks
+    /// (`predicted().disk_bytes`), which is what `LocalDir::index_bytes_in_use`
+    /// counts for the file once written, so the budget is checked in the
+    /// units it is measured in. The disk budget is checked against this
+    /// rather than against the prediction alone, so a restart over a
+    /// directory that already holds the table's chunk files is not charged
+    /// for them twice (RFD 017). Reads the chunk file's header and no key
+    /// chunk; a chunk file that fails a check counts as absent, as
     /// `LocalDir::chunks_for` treats it.
     pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
         let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf);
         Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
             Some(_) => 0,
-            None => self.predicted.disk_bytes,
+            None => chunk_file_bytes(&identity_of(&self.handle), &ranges),
         })
     }
 
@@ -4281,12 +4284,17 @@ mod tests {
         let fresh = inspect(&opened, KeyType::Long).await;
         let disk_bytes = fresh.predicted().disk_bytes;
         assert!(disk_bytes > 0);
-        assert_eq!(
-            fresh.disk_bytes_needed(&local).unwrap(),
-            disk_bytes,
-            "an empty directory takes every chunk"
+        let needed = fresh.disk_bytes_needed(&local).unwrap();
+        assert!(
+            needed > disk_bytes,
+            "an empty directory takes every chunk and the header before them"
         );
         fresh.build(Residency::Disk, Some(&local)).await.unwrap();
+        assert_eq!(
+            local.index_bytes_in_use().unwrap(),
+            needed,
+            "the budget check predicts the bytes the directory then holds"
+        );
         assert_eq!(
             inspect(&opened, KeyType::Long)
                 .await
@@ -4304,10 +4312,7 @@ mod tests {
         ))
         .await;
         let stale = inspect(&other, KeyType::Long).await;
-        assert_eq!(
-            stale.disk_bytes_needed(&local).unwrap(),
-            stale.predicted().disk_bytes
-        );
+        assert!(stale.disk_bytes_needed(&local).unwrap() > stale.predicted().disk_bytes);
         assert_eq!(other.stats().gets(), 1, "no chunk is read for the check");
     }
 
