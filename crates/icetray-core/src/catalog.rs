@@ -227,37 +227,34 @@ impl TableSource {
     /// hint and the metadata file; a static metadata file one; a catalog
     /// source one table load from the catalog and no object-storage read.
     pub async fn resolve(&self, storage: &Storage) -> Result<Resolved> {
-        match self {
-            Self::Static { location } => {
-                let file = current_metadata_file(storage, location).await?;
-                read_metadata(storage, file).await
-            }
-            Self::Catalog { catalog, ident } => load_from_catalog(catalog, ident).await,
-        }
+        Ok(self
+            .resolve_if_changed(storage, None)
+            .await?
+            .expect("with no known location nothing is unchanged, so the metadata is read"))
     }
 
-    /// The current metadata when its location is not `known`, else `None`.
-    /// When nothing moved this costs one small read: a static root reads
-    /// its version hint and parses no metadata; a catalog source costs one
-    /// table load, whose metadata the client parses either way. A static
-    /// source that names a metadata file directly reads nothing and never
-    /// advances.
+    /// The current metadata when its location is not `known`, else `None`;
+    /// with no `known`, the metadata. When nothing moved this costs one
+    /// small read: a static root reads its version hint and parses no
+    /// metadata; a catalog source costs one table load, whose metadata the
+    /// client parses either way. A static source that names a metadata file
+    /// directly reads nothing and never advances.
     pub async fn resolve_if_changed(
         &self,
         storage: &Storage,
-        known: &str,
+        known: Option<&str>,
     ) -> Result<Option<Resolved>> {
         match self {
             Self::Static { location } => {
                 let file = current_metadata_file(storage, location).await?;
-                if file == known {
+                if known == Some(file.as_str()) {
                     return Ok(None);
                 }
                 read_metadata(storage, file).await.map(Some)
             }
             Self::Catalog { catalog, ident } => {
                 let resolved = load_from_catalog(catalog, ident).await?;
-                Ok((resolved.location != known).then_some(resolved))
+                Ok((known != Some(resolved.location.as_str())).then_some(resolved))
             }
         }
     }
@@ -626,7 +623,7 @@ mod tests {
 
         let before = store.gets();
         let unchanged = static_root()
-            .resolve_if_changed(&store.storage, &known.location)
+            .resolve_if_changed(&store.storage, Some(&known.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
@@ -636,7 +633,7 @@ mod tests {
         store.put_hint(SECOND_VERSION.to_string()).await;
         let before = store.gets();
         let advanced = static_root()
-            .resolve_if_changed(&store.storage, &known.location)
+            .resolve_if_changed(&store.storage, Some(&known.location))
             .await
             .unwrap()
             .unwrap();
@@ -666,7 +663,7 @@ mod tests {
         assert_eq!(store.gets(), 1, "the metadata alone; no hint is read");
 
         let unchanged = pinned
-            .resolve_if_changed(&store.storage, &resolved.location)
+            .resolve_if_changed(&store.storage, Some(&resolved.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
@@ -803,12 +800,12 @@ mod tests {
         assert_eq!(resolved.location, created.metadata_location().unwrap());
         assert_eq!(resolved.metadata.uuid(), created.metadata().uuid());
         let unchanged = source
-            .resolve_if_changed(&store.storage, &resolved.location)
+            .resolve_if_changed(&store.storage, Some(&resolved.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
         let moved = source
-            .resolve_if_changed(&store.storage, MISSING_REF)
+            .resolve_if_changed(&store.storage, Some(MISSING_REF))
             .await
             .unwrap();
         assert!(moved.is_some());

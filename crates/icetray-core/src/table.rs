@@ -158,7 +158,7 @@ impl Table {
             known: Mutex::new(None),
             serial: tokio::sync::Mutex::new(()),
         };
-        table.set_state(TableState::Loading);
+        table.publish_state();
         table
     }
 
@@ -274,7 +274,7 @@ impl Table {
     /// current generation, whether or not one serves.
     async fn reload(&self) -> Result<()> {
         let resolved = self.source.resolve(&self.storage).await?;
-        let snapshot = resolved.snapshot_for_ref(&self.config.name, &self.config.r#ref)?;
+        let snapshot = self.ref_snapshot(&resolved)?;
         let previous = self.current();
         self.build_and_admit(&resolved, &snapshot, previous.as_ref())
             .await
@@ -292,13 +292,13 @@ impl Table {
             .expect("a serving generation was admitted, which recorded its metadata location");
         let Some(resolved) = self
             .source
-            .resolve_if_changed(&self.storage, &known)
+            .resolve_if_changed(&self.storage, Some(&known))
             .await?
         else {
             self.in_step(current);
             return Ok(false);
         };
-        let snapshot = resolved.snapshot_for_ref(&self.config.name, &self.config.r#ref)?;
+        let snapshot = self.ref_snapshot(&resolved)?;
         if SnapshotId(snapshot.snapshot_id()) == current.snapshot_id {
             self.remember(&resolved.location);
             self.in_step(current);
@@ -307,6 +307,12 @@ impl Table {
         self.build_and_admit(&resolved, &snapshot, Some(current))
             .await?;
         Ok(true)
+    }
+
+    /// The snapshot the configured ref names in `resolved`, under the
+    /// table's name.
+    fn ref_snapshot(&self, resolved: &Resolved) -> Result<Arc<Snapshot>> {
+        resolved.snapshot_for_ref(&self.config.name, &self.config.r#ref)
     }
 
     /// Builds `snapshot` over `previous`, gates it, and swaps it in.
@@ -337,11 +343,17 @@ impl Table {
     /// `current` is the snapshot the ref names.
     fn in_step(&self, current: &Generation) {
         if matches!(self.state(), TableState::Degraded { .. }) {
-            self.set_state(TableState::Serving {
-                snapshot_id: current.snapshot_id,
-                since: Instant::now(),
-            });
+            self.serve_state(current.snapshot_id);
         }
+    }
+
+    /// Records that `snapshot_id` serves from now; the one writer of
+    /// `TableState::Serving`.
+    fn serve_state(&self, snapshot_id: SnapshotId) {
+        self.set_state(TableState::Serving {
+            snapshot_id,
+            since: Instant::now(),
+        });
     }
 
     /// The strict gate (RFD 007, RFD 016): the doctor's verdict on a built
@@ -416,10 +428,7 @@ impl Table {
         self.generation_info(generation.snapshot_id, true);
         let snapshot_id = generation.snapshot_id;
         self.current.store(Some(Arc::new(generation)));
-        self.set_state(TableState::Serving {
-            snapshot_id,
-            since: Instant::now(),
-        });
+        self.serve_state(snapshot_id);
     }
 
     /// Records the failure's kind as the table's state and hands the
@@ -439,11 +448,17 @@ impl Table {
         *self.known.lock().unwrap_or_else(PoisonError::into_inner) = Some(location.to_string());
     }
 
-    /// Replaces the state and sets the `table_state` gauge to 1 for it and
-    /// 0 for each of the other two.
+    /// Replaces the state and publishes it.
     fn set_state(&self, state: TableState) {
-        let current = state.name();
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+        self.publish_state();
+    }
+
+    /// Sets the `table_state` gauge to 1 for the current state and 0 for
+    /// each of the other two; every state the table is ever in, the initial
+    /// `Loading` included, passes through here.
+    fn publish_state(&self) {
+        let current = self.state().name();
         for name in StateName::ALL {
             metrics::gauge!(
                 metric::TABLE_STATE,

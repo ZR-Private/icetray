@@ -334,8 +334,9 @@ impl TableSource {
     pub async fn resolve(&self, storage: &Storage) -> Result<Resolved>;
     /// One small read when nothing moved: the version hint of a static root,
     /// parsing no metadata, or one table load from the catalog, whose metadata
-    /// the client parses either way; a pinned metadata file reads nothing.
-    pub async fn resolve_if_changed(&self, storage: &Storage, known: &str) -> Result<Option<Resolved>>;
+    /// the client parses either way; a pinned metadata file reads nothing. With
+    /// no `known` location nothing is unchanged, which is how `resolve` reads.
+    pub async fn resolve_if_changed(&self, storage: &Storage, known: Option<&str>) -> Result<Option<Resolved>>;
 }
 /// The metadata file a bare `version` names under `root`: `metadata/v<version>.metadata.json`,
 /// the Hadoop catalog's layout. A writer publishing a snapshot by hand (the testkit's
@@ -671,7 +672,7 @@ impl Table {
     /// Serialized per table. `Ok(true)` when a new generation was swapped in, counting
     /// `generation_swaps_total`. With no current generation it does what `load` does (a table
     /// left `Degraded` with no generation recovers on the next poll). Otherwise
-    /// `resolve_if_changed(&storage, &known)`: `None` is `Ok(false)`; a snapshot whose id equals
+    /// `resolve_if_changed(&storage, Some(&known))`: `None` is `Ok(false)`; a snapshot whose id equals
     /// the current generation's records the new location and is `Ok(false)`; else the build,
     /// the gate, and the swap. `Err` leaves the current generation serving, sets `Degraded`,
     /// and counts `refresh_errors_total{table, reason}` with `reason` the `ErrorKind`'s Display.
