@@ -146,3 +146,17 @@ because it bounds one shared directory whose files outlive the process,
 which no per-table bound can keep from filling. A replica-wide `full`
 budget can be added later as one more server field and one more sum in the
 same check.
+
+The chunk-file budget is a bound on disk, so the loader checks it against
+the `index/` directory as it is when the load begins, plus what the new
+generation would write. The serving generation's chunk files are among what
+is there: they answer lookups until the swap and are deleted only after it,
+so a refresh that replaces every data file needs room for the old set and
+the new one at once, and a table rewritten wholesale is sized at about twice
+its steady footprint. Measuring against the directory as it would be after
+the swap would admit a write that overfills the volume during the load,
+which is the failure the budget exists to prevent. A generation the strict
+gate refuses has already written its new files' chunks; they stay until a
+later swap deletes what no generation references, because the next poll
+rebuilds the same snapshot and reuses them, and deleting them at once would
+make every poll fetch and write them again while the refusal lasts.

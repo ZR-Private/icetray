@@ -310,7 +310,11 @@ file's key column on local disk with only the fence array in memory, and
 the disk level of the value-page cache, bounded by
 `storage.local.page_cache_disk_bytes` (zero turns the level off; any other
 value is at least one 4 MiB block). `index_budget_bytes` bounds the chunk
-files across every table. A disk-tier lookup costs one local read and, on a
+files across every table, measured against the directory as it is when a
+load begins: the serving generation's chunk files stay until the new one
+has swapped in, so a refresh that rewrites every data file needs room for
+both sets, and a table rewritten wholesale wants a budget of about twice
+its steady footprint. A disk-tier lookup costs one local read and, on a
 hit, one GET; a `bloom` table keeps the key column's bloom filters in
 memory instead, needs no disk, and pays two GETs per hit and a GET per miss
 at the filter's false-positive rate. `disk` residency without a local
