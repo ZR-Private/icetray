@@ -367,7 +367,7 @@ impl PageCache {
             Source::Memory => self.record_hit(),
             Source::Disk => {
                 self.record_hit();
-                stats.record_local_read(page_len(value));
+                stats.record_local_read(approx::count(value.0.len()));
             }
         }
     }
@@ -454,12 +454,6 @@ fn backend(error: foyer::Error) -> Error {
     Error::Cache(CacheError::Backend(error))
 }
 
-/// A page's length as the local-read counter takes it. A page longer than
-/// `u64::MAX` bytes cannot be in memory and would saturate rather than wrap.
-fn page_len(value: &PageValue) -> u64 {
-    u64::try_from(value.0.len()).unwrap_or(u64::MAX)
-}
-
 /// A byte bound as the device builder takes it. A bound wider than the
 /// address space cannot be met and saturates rather than wraps.
 fn saturating_usize(bytes: u64) -> usize {
@@ -475,6 +469,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::approx::count;
     use crate::config::LocalConfig;
     use crate::local::LocalDir;
 
@@ -517,11 +512,7 @@ mod tests {
     }
 
     fn page_bytes(page: &[u8]) -> u64 {
-        u64::try_from(page.len()).unwrap()
-    }
-
-    fn count(n: usize) -> u64 {
-        u64::try_from(n).unwrap()
+        count(page.len())
     }
 
     /// A fetch whose future counts its runs in `runs` and answers `page`.

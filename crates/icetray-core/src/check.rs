@@ -527,12 +527,8 @@ fn bloom_extremes(metadata: &ParquetMetaData, key_leaf: usize) -> Option<BloomEx
         let column = group.column(key_leaf);
         column.bloom_filter_offset()?;
         let length = column.bloom_filter_length()?;
-        // intentional: a negative filter length in a footer measures as zero
-        // bytes; nothing the doctor decides rests on it.
-        let bytes = u64::try_from(length).unwrap_or(0);
-        // intentional: a negative row count is refused at build as
-        // FileFault::InconsistentRowCounts; on any footer it measures as zero.
-        let rows = u64::try_from(group.num_rows()).unwrap_or(0);
+        let bytes = approx::measured(length);
+        let rows = approx::measured(group.num_rows());
         let bytes_per_key = approx::ratio(bytes, rows);
         let bits_per_key = approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows);
         if most.is_none_or(|(value, _)| bytes_per_key > value) {
@@ -589,7 +585,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             max_key_bytes: index.max_key_bytes(),
             avg_value_page_bytes: chunks
                 .value_uncompressed_bytes
-                .checked_div(count(pages.value_pages))
+                .checked_div(approx::count(pages.value_pages))
                 .unwrap_or(0),
             avg_value_bytes: chunks
                 .value_uncompressed_bytes
@@ -610,11 +606,6 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
         predicted,
         bloom_by_row_group: bloom_extremes(metadata, index.key_leaf()),
     }
-}
-
-/// A count as the byte and row totals take it.
-fn count(n: usize) -> u64 {
-    u64::try_from(n).expect("a count fits u64 on the supported systems")
 }
 
 /// The file's rows as a count.
@@ -693,9 +684,7 @@ fn chunk_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: usize) -
         let value = group.column(value_leaf);
         facts.key_dictionary |= dictionary_encoded(group.column(key_leaf));
         facts.value_dictionary |= dictionary_encoded(value);
-        // intentional: a negative chunk size in a footer measures as zero
-        // bytes; nothing the doctor decides rests on it.
-        facts.value_uncompressed_bytes += u64::try_from(value.uncompressed_size()).unwrap_or(0);
+        facts.value_uncompressed_bytes += approx::measured(value.uncompressed_size());
     }
     facts
 }
@@ -726,16 +715,16 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
         match columns.get(key_leaf) {
             Some(ColumnIndexMetaData::INT64(native)) => {
                 let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
-                pages += count(mins.len());
-                distinct += count(mins.iter().collect::<BTreeSet<_>>().len());
+                pages += approx::count(mins.len());
+                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
             }
             Some(
                 ColumnIndexMetaData::BYTE_ARRAY(bytes)
                 | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(bytes),
             ) => {
                 let mins: Vec<&[u8]> = bytes.min_values_iter().flatten().collect();
-                pages += count(mins.len());
-                distinct += count(mins.iter().collect::<BTreeSet<_>>().len());
+                pages += approx::count(mins.len());
+                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
             }
             Some(
                 ColumnIndexMetaData::NONE
@@ -1035,7 +1024,7 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
         let explained = bytes
             .div_ceil(contract::TARGET_FILE_BYTES_MAX)
             .max(MIN_EXPLAINED_FILES);
-        let held = count(files.len());
+        let held = approx::count(files.len());
         if held > thresholds::FILES_PER_BUCKET_FACTOR * explained {
             findings.push(Finding {
                 tier: Tier::Advice,
@@ -1871,7 +1860,7 @@ mod tests {
         assert_eq!(report.files[0].key_pages, pages);
         assert_eq!(
             report.files[0].distinct_page_mins_ratio.to_bits(),
-            approx::ratio(1, count(pages)).to_bits(),
+            approx::ratio(1, approx::count(pages)).to_bits(),
             "every cut minimum is the shared prefix"
         );
     }

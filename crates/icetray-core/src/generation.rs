@@ -14,6 +14,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::Snapshot;
 
+use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::config::{Residency, TableConfig};
@@ -438,7 +439,7 @@ fn check_budget(
         Residency::Full => config.resident_budget_bytes.map(|budget| {
             let kept: u64 = reused
                 .iter()
-                .map(|file| memory_bytes(file.index.resident_bytes()))
+                .map(|file| approx::count(file.index.resident_bytes()))
                 .sum();
             let new: u64 = inspected
                 .iter()
@@ -467,11 +468,6 @@ fn check_budget(
         ));
     }
     Ok(())
-}
-
-/// A length in memory as the byte totals take it.
-fn memory_bytes(len: usize) -> u64 {
-    u64::try_from(len).expect("a length in memory fits u64 on the supported systems")
 }
 
 /// Whether the exact key ranges of two files intersect.
@@ -822,6 +818,7 @@ pub(crate) mod testing {
     use parquet::schema::types::ColumnPath;
 
     use super::Generation;
+    use crate::approx::count;
     use crate::catalog::{TableSource, VERSION_HINT, hint_location};
     use crate::config::{
         HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
@@ -871,11 +868,6 @@ pub(crate) mod testing {
     /// The contract's page row limit as the writer takes it.
     pub(crate) fn page_rows() -> usize {
         usize::try_from(PAGE_ROWS).unwrap()
-    }
-
-    /// A count as the byte and row totals take it.
-    pub(crate) fn count(n: usize) -> u64 {
-        u64::try_from(n).unwrap()
     }
 
     /// `VALUE_BYTES` bytes that are a function of `key`.

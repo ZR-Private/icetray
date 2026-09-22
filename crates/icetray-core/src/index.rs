@@ -1787,11 +1787,6 @@ fn row_offset(at: usize) -> i64 {
     i64::try_from(at).expect("a page's rows fit i64")
 }
 
-/// A length in memory as the byte totals take it.
-fn bytes(len: usize) -> u64 {
-    u64::try_from(len).expect("a length in memory fits u64 on the supported systems")
-}
-
 /// The parts every tier's resident bytes are made of, from the footer, so
 /// `predicted_resident_bytes` and `resident_bytes` cannot drift; the doc of
 /// the former says which are exact and which estimated.
@@ -1826,16 +1821,14 @@ impl ResidentSet {
             })
             .sum::<Option<u64>>();
         Self {
-            footer: bytes(kept_footer(metadata, key_leaf).memory_size()),
+            footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
             key_chunks: key_columns().map(|column| column.byte_range().1).sum(),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
                 exact_fence_bytes,
             ),
             filters,
-            // intentional: a negative row count is refused at build; here,
-            // on any footer, it estimates as zero rows.
-            rows: u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(0),
+            rows: approx::measured(metadata.file_metadata().num_rows()),
         }
     }
 }
@@ -1865,7 +1858,7 @@ fn exact_fence_bytes(fences: &[Vec<Key>]) -> u64 {
                 Key::Str(text) => text.len(),
                 Key::Bytes(raw) => raw.len(),
             };
-            bytes(size_of::<Key>() + heap)
+            approx::count(size_of::<Key>() + heap)
         })
         .sum()
 }
@@ -1892,9 +1885,7 @@ fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
                 byte_array_fence_heap(column_index, group.column(key_leaf), pages)
             }
             PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                // intentional: a fixed-width column's width is positive; a
-                // footer that says otherwise estimates as no heap per fence.
-                bytes(pages) * u64::try_from(descr.type_length()).unwrap_or(0)
+                approx::count(pages) * approx::measured(descr.type_length())
             }
             PhysicalType::BOOLEAN
             | PhysicalType::INT32
@@ -1903,7 +1894,7 @@ fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
             | PhysicalType::FLOAT
             | PhysicalType::DOUBLE => 0,
         };
-        total += bytes(pages * size_of::<Key>()) + heap;
+        total += approx::count(pages * size_of::<Key>()) + heap;
     }
     total
 }
@@ -1920,7 +1911,7 @@ fn byte_array_fence_heap(
     match column_index {
         Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => index
             .min_values_iter()
-            .map(|min| bytes(min.map_or(0, <[u8]>::len)))
+            .map(|min| approx::count(min.map_or(0, <[u8]>::len)))
             .sum(),
         None
         | Some(
@@ -1933,13 +1924,11 @@ fn byte_array_fence_heap(
             | ColumnIndexMetaData::DOUBLE(_)
             | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
         ) => {
-            // intentional: a chunk's size and value count are non-negative
-            // in any footer the writer produced; one that says otherwise
-            // estimates as no heap per fence, as does a chunk of no values.
-            let encoded = u64::try_from(chunk.uncompressed_size()).unwrap_or(0);
-            let values = u64::try_from(chunk.num_values()).unwrap_or(0);
+            let encoded = approx::measured(chunk.uncompressed_size());
+            let values = approx::measured(chunk.num_values());
+            // A chunk of no values has no mean, and no heap per fence.
             let mean = encoded.checked_div(values).unwrap_or(0);
-            bytes(pages) * mean
+            approx::count(pages) * mean
         }
     }
 }
@@ -1975,6 +1964,7 @@ mod tests {
     use parquet::schema::types::ColumnPath;
 
     use super::*;
+    use crate::approx::count;
     use crate::config::{HedgeConfig, LocalConfig, StorageConfig};
     use crate::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
     use crate::key::testing::UUID_HALF_BYTES;
@@ -2080,10 +2070,6 @@ mod tests {
 
     fn contract_rows() -> usize {
         group_rows() * ROW_GROUPS
-    }
-
-    fn count(n: usize) -> u64 {
-        u64::try_from(n).unwrap()
     }
 
     fn location() -> String {

@@ -539,12 +539,6 @@ fn observe_latency(kind: ReadKind, elapsed: Duration) {
         .record(time::seconds(elapsed));
 }
 
-/// A count as the `u64` the ratios take. A count above `u64::MAX` cannot
-/// arise from a collection in memory and would saturate rather than wrap.
-fn count(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
 /// One lookup GET as the window remembers it.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -595,8 +589,8 @@ impl HedgeWindow {
         if samples.len() < self.config.window {
             return None;
         }
-        let hedged = count(samples.iter().filter(|sample| sample.hedged).count());
-        let share_with_one_more = approx::ratio(hedged + 1, count(samples.len()));
+        let hedged = approx::count(samples.iter().filter(|sample| sample.hedged).count());
+        let share_with_one_more = approx::ratio(hedged + 1, approx::count(samples.len()));
         if share_with_one_more > self.config.max_rate {
             return None;
         }
@@ -626,7 +620,7 @@ impl HedgeWindow {
 /// reaches it and the walk finds a sample whenever there is one; `None`
 /// only when there are no samples.
 fn nearest_rank(sorted: &[Duration], percentile: f64) -> Option<Duration> {
-    let n = count(sorted.len());
+    let n = approx::count(sorted.len());
     sorted
         .iter()
         .zip(1u64..)
