@@ -126,7 +126,9 @@ where the helper goes.
 ## Layout and docs
 
 - `lib.rs` re-exports the public API. Internals are `pub(crate)`. One
-  significant type per file.
+  concept per file; a concept's closed set of small types (a fault enum, a
+  label value) lives with the type they serve, so a file holds the whole of
+  one mechanism.
 - Every crate root starts with a `//!` header saying what the crate is.
 - Every public item has a `///` comment. `missing_docs` warns, and CI turns
   the warning into a failure.
