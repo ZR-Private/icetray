@@ -41,7 +41,7 @@ redefine.
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`); CONTRIBUTING Constants | |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and epoch-millisecond arithmetic happens (`millis_after`, for a writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the read-kind label enum; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -131,12 +131,18 @@ pub enum LookupResult { ColdHit, WarmHit, Miss }
 // key
 /// The width of an Iceberg uuid and of the FIXED_LEN_BYTE_ARRAY Parquet stores it in.
 pub const UUID_BYTES: usize = 16;
+/// Hex digits per byte in every hex rendering of bytes (key text, chunk file names, the
+/// binary's key parser); the one home for the width.
+pub const HEX_DIGITS_PER_BYTE: usize = 2;
 pub enum KeyType { Long, String, Binary, Uuid }
 impl KeyType {
     /// long -> Long; string -> String; binary and fixed -> Binary; uuid -> Uuid.
     /// Every other type is `None`; the caller that owns the table name turns it
     /// into `Error::Refused { reason: RefusalReason::KeyTypeUnsupported }` (RFD 008).
     pub fn from_iceberg(ty: &iceberg::spec::Type) -> Option<Self>;
+    /// Whether every key of the type has one width: `Long` and `Uuid`; exhaustive, so a
+    /// new key type decides here. A fixture writer sizes its columns by it.
+    pub fn is_fixed_width(self) -> bool;
 }
 /// `Ord` is the served order per type: numeric, UTF-8 bytes, bytewise, and for
 /// `Uuid` bytewise unsigned over its sixteen bytes, which is the order
@@ -159,6 +165,9 @@ impl std::fmt::Display for Key { /* the integer, a Debug-quoted string, 0x-prefi
 pub fn bucket(key: &Key, buckets: u32) -> u32;
 
 // config
+/// Residency when a table says nothing, and the command line's `--residency` default; the
+/// one home for it.
+pub const DEFAULT_RESIDENCY: Residency = Residency::Full;
 pub struct Config { pub server: ServerConfig, pub storage: StorageConfig, pub tables: Vec<TableConfig> }
 impl Config {
     /// TOML or JSON, decided by content (a leading `{` is JSON).

@@ -618,12 +618,13 @@ impl HedgeWindow {
 }
 
 /// The nearest-rank percentile of `sorted`: the sample at 1-based rank
-/// `ceil(percentile * n)` over `n` samples, held to `1..=n`. The rank is
-/// found by walking the sorted samples with their ranks and taking the first
-/// whose share of the samples, `rank / n`, reaches the percentile, so no
-/// float is ever cast to an integer and the result is in range by
-/// construction: a percentile at or below zero gives the smallest sample and
-/// one above one gives the largest. `None` only when there are no samples.
+/// `ceil(percentile * n)` over `n` samples. The rank is found by walking
+/// the sorted samples with their ranks and taking the first whose share of
+/// the samples, `rank / n`, reaches the percentile, so no float is ever
+/// cast to an integer. `percentile` is in `(0, 1]`, which `Config::parse`
+/// holds `HedgeConfig::percentile` to, so the last sample's share of one
+/// reaches it and the walk finds a sample whenever there is one; `None`
+/// only when there are no samples.
 fn nearest_rank(sorted: &[Duration], percentile: f64) -> Option<Duration> {
     let n = count(sorted.len());
     sorted
@@ -631,7 +632,6 @@ fn nearest_rank(sorted: &[Duration], percentile: f64) -> Option<Duration> {
         .zip(1u64..)
         .find(|(_, rank)| approx::ratio(*rank, n) >= percentile)
         .map(|(sample, _)| *sample)
-        .or_else(|| sorted.last().copied())
 }
 
 /// The last credential the SDK chain resolved and when it stops being handed

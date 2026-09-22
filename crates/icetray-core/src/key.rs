@@ -15,6 +15,12 @@ pub const UUID_BYTES: usize = 16;
 /// offsets that end its five groups of 8, 4, 4, 4, and 12 hex digits.
 const UUID_GROUP_ENDS: [usize; 5] = [4, 6, 8, 10, UUID_BYTES];
 
+/// Hex digits per byte, one per nibble, in every hex rendering of bytes: a
+/// key's text form here, a chunk file's name in `local`, and the key text
+/// the binary parses back. The one home for the width, so a parser and a
+/// printer cannot disagree on it.
+pub const HEX_DIGITS_PER_BYTE: usize = 2;
+
 /// The Iceberg type of a table's key column (RFD 008), one of four; Iceberg
 /// `fixed` is served as `Binary`. Display and serde give the lowercase
 /// Iceberg type name that appears in the doctor's output and in logs.
@@ -60,6 +66,17 @@ impl KeyType {
                 | PrimitiveType::TimestamptzNs => None,
             },
             Type::Struct(_) | Type::List(_) | Type::Map(_) => None,
+        }
+    }
+
+    /// Whether every key of the type has one width: a `long` is eight bytes
+    /// and a `uuid` sixteen, while `string` and `binary` keys vary. A
+    /// fixture writer sizes its columns by it. The match names every
+    /// variant, so a new key type decides here and nowhere else.
+    pub fn is_fixed_width(self) -> bool {
+        match self {
+            Self::Long | Self::Uuid => true,
+            Self::String | Self::Binary => false,
         }
     }
 }
@@ -177,9 +194,37 @@ fn long_statistic(statistic: &[u8]) -> Option<i64> {
     }
 }
 
-/// Lowercase hex, two digits per byte, no prefix.
+/// Lowercase hex, `HEX_DIGITS_PER_BYTE` per byte, no prefix.
 fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    bytes
+        .iter()
+        .try_for_each(|byte| write!(f, "{byte:0HEX_DIGITS_PER_BYTE$x}"))
+}
+
+/// Uuid vectors and random keys the tests of this module and of `bucket`
+/// share. Nothing here is compiled outside tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use rand::RngExt;
+    use rand::rngs::StdRng;
+
+    use super::UUID_BYTES;
+
+    /// The width of one of a uuid's two 64-bit halves, the unit
+    /// `java.util.UUID` compares as a signed long and the half a fixture
+    /// numbers its uuids in.
+    pub(crate) const UUID_HALF_BYTES: usize = UUID_BYTES / 2;
+    /// The uuid of the Iceberg specification's appendix B hash vector, as
+    /// bytes, which iceberg-rust's own bucket test states.
+    pub(crate) const SPEC_UUID: [u8; UUID_BYTES] = [
+        0xf7, 0x9c, 0x3e, 0x09, 0x67, 0x7c, 0x4b, 0xbd, 0xa4, 0x79, 0x3f, 0x34, 0x9c, 0xb7, 0x85,
+        0xe7,
+    ];
+
+    /// `len` bytes drawn from `rng`.
+    pub(crate) fn random_bytes(rng: &mut StdRng, len: usize) -> Vec<u8> {
+        (0..len).map(|_| rng.random()).collect()
+    }
 }
 
 impl fmt::Display for Key {
@@ -229,6 +274,7 @@ mod tests {
     use rand::{RngExt, SeedableRng};
     use uuid::Uuid;
 
+    use super::testing::{SPEC_UUID, UUID_HALF_BYTES, random_bytes};
     use super::*;
 
     /// The seed of the long ordering sample; fixed so a failure reproduces.
@@ -273,19 +319,11 @@ mod tests {
     /// bytewise order can disagree.
     const SIGN_BIT_SETTINGS: [(bool, bool); 4] =
         [(false, false), (true, false), (false, true), (true, true)];
-    /// The width of one of a uuid's two 64-bit halves, the unit
-    /// `java.util.UUID` compares as a signed long.
-    const UUID_HALF_BYTES: usize = UUID_BYTES / 2;
     /// The sign bit of a big-endian 64-bit half, in its first byte.
     const HIGH_BIT: u8 = 0x80;
-    /// The uuid of the Iceberg specification's appendix B hash vector, as
-    /// its canonical text; the display test pins the rendering to it.
+    /// `SPEC_UUID` as its canonical text; the display test pins the
+    /// rendering to it.
     const SPEC_UUID_TEXT: &str = "f79c3e09-677c-4bbd-a479-3f349cb785e7";
-    /// The same uuid as bytes.
-    const SPEC_UUID: [u8; UUID_BYTES] = [
-        0xf7, 0x9c, 0x3e, 0x09, 0x67, 0x7c, 0x4b, 0xbd, 0xa4, 0x79, 0x3f, 0x34, 0x9c, 0xb7, 0x85,
-        0xe7,
-    ];
     /// A long inside the statistics range the `within_stats` tests use.
     const INSIDE: i64 = 5;
     /// The lower bound of that range.
@@ -328,10 +366,6 @@ mod tests {
             )
         };
         halves(a).cmp(&halves(b))
-    }
-
-    fn random_bytes(rng: &mut StdRng, len: usize) -> Vec<u8> {
-        (0..len).map(|_| rng.random()).collect()
     }
 
     /// Random text of one to `MAX_STR_CHARS` characters, each drawn from one
@@ -517,6 +551,19 @@ mod tests {
                 KeyType::from_iceberg(&Type::Primitive(primitive)),
                 Some(expected)
             );
+        }
+    }
+
+    #[test]
+    fn test_is_fixed_width_for_long_and_uuid_only() {
+        let cases = [
+            (KeyType::Long, true),
+            (KeyType::String, false),
+            (KeyType::Binary, false),
+            (KeyType::Uuid, true),
+        ];
+        for (key_type, fixed) in cases {
+            assert_eq!(key_type.is_fixed_width(), fixed, "{key_type}");
         }
     }
 

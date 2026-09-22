@@ -32,6 +32,7 @@ mod tests {
 
     use super::*;
     use crate::key::UUID_BYTES;
+    use crate::key::testing::{SPEC_UUID, random_bytes};
 
     /// Appendix B: `bucket` of long 34.
     const SPEC_LONG: i64 = 34;
@@ -39,12 +40,7 @@ mod tests {
     const SPEC_LONG_HASH: i32 = 2_017_239_379;
     /// Appendix B: the hash of string "iceberg".
     const SPEC_STRING_HASH: i32 = 1_210_000_089;
-    /// Appendix B: the uuid vector, as iceberg-rust's own test states it.
-    const SPEC_UUID: [u8; UUID_BYTES] = [
-        0xf7, 0x9c, 0x3e, 0x09, 0x67, 0x7c, 0x4b, 0xbd, 0xa4, 0x79, 0x3f, 0x34, 0x9c, 0xb7, 0x85,
-        0xe7,
-    ];
-    /// Appendix B: the hash of that uuid.
+    /// Appendix B: the hash of `SPEC_UUID`.
     const SPEC_UUID_HASH: i32 = 1_488_055_340;
     /// iceberg-rust's fixed and binary vector, the bytes 0 through 3.
     const SPEC_BYTES: [u8; 4] = [0x00, 0x01, 0x02, 0x03];
@@ -116,10 +112,6 @@ mod tests {
             }
         }
         checked
-    }
-
-    fn random_bytes(rng: &mut StdRng, len: usize) -> Vec<u8> {
-        (0..len).map(|_| rng.random()).collect()
     }
 
     #[test]

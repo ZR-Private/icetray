@@ -20,8 +20,9 @@ const JSON_OPENING: char = '{';
 
 /// The gRPC listener when the file names none. Loopback: RFD 012 has no
 /// mode in which the port is safe to expose directly, so reaching it from
-/// another host is a decision the deployer writes down. 7433 is the port
-/// the prototype ran on.
+/// another host is a decision the deployer writes down. 7433 carries no
+/// meaning beyond being the documented default; `DEFAULT_METRICS_LISTEN`
+/// shares its last three digits so the pair reads as one.
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7433);
 
 /// The listener for `/metrics` and `/ready` (RFD 012) when the file names
@@ -46,8 +47,9 @@ const DEFAULT_STRICT: bool = true;
 
 /// Residency when a table says nothing: `full`, RFD 017's fastest tier, one
 /// GET per hit and none per miss. The other tiers are chosen by the owner
-/// with the doctor's numbers in front of them, never silently.
-const DEFAULT_RESIDENCY: Residency = Residency::Full;
+/// with the doctor's numbers in front of them, never silently. The one home
+/// for the default: the command line's `--residency` falls back to it too.
+pub const DEFAULT_RESIDENCY: Residency = Residency::Full;
 
 /// Hedging when the file says nothing: on. A minority of stalled GETs is
 /// what hedging removes, and the ceiling bounds its cost when there is no
@@ -166,7 +168,7 @@ pub enum ConfigViolation {
     },
     /// Text that names no residency tier; raised by `Residency`'s `FromStr`,
     /// the command line's parser for the setting.
-    #[error("unknown residency {text}; expected full, disk, or bloom")]
+    #[error("unknown residency {text}; expected one of {}", Residency::names())]
     UnknownResidency {
         /// The text as given.
         text: String,
@@ -488,6 +490,16 @@ pub enum Residency {
 impl Residency {
     /// Every tier, for the parser and the tests that hold the names together.
     const ALL: [Self; 3] = [Self::Full, Self::Disk, Self::Bloom];
+
+    /// Every tier's name, comma-separated, for the message that refuses a
+    /// name; rendered from `ALL` so the list cannot lag the enum.
+    fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl fmt::Display for Residency {

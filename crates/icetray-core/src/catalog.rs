@@ -442,10 +442,6 @@ mod tests {
         version_file(&root(), version)
     }
 
-    fn hint_location() -> String {
-        under(&root(), VERSION_HINT)
-    }
-
     /// The in-memory store behind a storage, with the writes the tests make.
     struct Store {
         storage: Storage,
@@ -475,7 +471,7 @@ mod tests {
         }
 
         async fn put_hint(&self, content: impl Into<Bytes>) {
-            self.put(&hint_location(), content).await;
+            self.put(&hint_location(&root()), content).await;
         }
 
         fn gets(&self) -> u64 {

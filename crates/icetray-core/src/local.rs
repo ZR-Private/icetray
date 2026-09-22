@@ -26,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::LocalConfig;
 use crate::error::{Error, Result};
+use crate::key::HEX_DIGITS_PER_BYTE;
 use crate::storage::IoStats;
 
 /// The directory under `LocalConfig::dir` that holds chunk files.
@@ -81,9 +82,6 @@ const MAX_HEADER_BYTES: usize = 1024 * 1024;
 /// The width of the digest a chunk file is named by and a footer is
 /// identified by: the width of SHA-256, which `digest` computes.
 pub const DIGEST_BYTES: usize = 32;
-
-/// Hex digits per byte in a chunk file's name.
-const HEX_DIGITS_PER_BYTE: usize = 2;
 
 /// The digest the chunk file format uses, of a data file's footer for its
 /// identity and of its path for the file name: SHA-256. The one place the
@@ -966,7 +964,7 @@ fn chunk_name(path: &str) -> String {
     hex(&digest(path.as_bytes()))
 }
 
-/// Lowercase hex, two digits per byte.
+/// Lowercase hex, `HEX_DIGITS_PER_BYTE` per byte.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * HEX_DIGITS_PER_BYTE);
@@ -1024,9 +1022,10 @@ mod tests {
     const DATA_FILE_NAME: &str = "part-00000.parquet";
     /// A second synthetic path, so a second chunk file has another name.
     const OTHER_PATH: &str = "s3://example-warehouse/db/kv/data/part-00001.parquet";
-    /// The size the fixture identity records.
+    /// The size the fixture identity records: a contract-sized data file.
     const DATA_SIZE: u64 = 40_000_000;
-    /// A size the fixture identity does not record.
+    /// One byte more than `DATA_SIZE`: the smallest change that makes an
+    /// identity stale.
     const OTHER_SIZE: u64 = DATA_SIZE + 1;
     /// The footer digest the fixture identity carries; any 32 bytes.
     const FOOTER_DIGEST: [u8; DIGEST_BYTES] = [7; DIGEST_BYTES];

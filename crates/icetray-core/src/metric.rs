@@ -47,8 +47,9 @@ pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 pub const FINDINGS: &str = "icetray_findings";
 /// Seconds from the served snapshot's timestamp to now, by `table`.
 pub const GENERATION_AGE_SECONDS: &str = "icetray_generation_age_seconds";
-/// 1 for the serving snapshot and 0 for the previous one, by `table` and
-/// `snapshot_id`; series of older snapshots are removed on swap.
+/// 1 for the serving snapshot and 0 for the one it replaced, by `table` and
+/// `snapshot_id`. No series is ever removed: a replaced snapshot's reads 0
+/// until the process restarts.
 pub const GENERATION_INFO: &str = "icetray_generation_info";
 /// 1 for the table's current state and 0 for the others, by `table` and `state`.
 pub const TABLE_STATE: &str = "icetray_table_state";

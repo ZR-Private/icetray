@@ -369,8 +369,9 @@ impl Table {
     }
 
     /// Makes `generation` the serving one. `generation_info` is set to 0 for
-    /// the snapshot it replaces and 1 for its own (the exporter in the
-    /// binary removes older series); the `findings` gauge is set from
+    /// the snapshot it replaces and 1 for its own (no series is removed; a
+    /// replaced snapshot's reads 0 until the process restarts); the
+    /// `findings` gauge is set from
     /// `findings` for every code, zero for the absent ones, so a code that
     /// cleared on the swap reads zero.
     fn swap(

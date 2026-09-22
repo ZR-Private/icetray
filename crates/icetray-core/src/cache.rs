@@ -484,17 +484,22 @@ mod tests {
     /// its shard held, so a page leaves memory as soon as the next page
     /// lands in its shard.
     const TINY_BYTES: usize = 1;
-    /// A disk level of sixteen blocks.
+    /// A disk level of sixteen blocks: room for every page the disk tests
+    /// evict into it, so a page that left memory is on disk when read back.
     const DISK_BYTES: u64 = 16 * PAGE_CACHE_DISK_BLOCK_BYTES;
-    /// Callers racing for one page.
+    /// Callers racing for one page: enough that coalescing is exercised and
+    /// a fetch run per caller would show in the count.
     const CONCURRENT: usize = 8;
-    /// The file the test pages belong to.
+    /// The file every test page is keyed under; the cache never reads it,
+    /// so any location serves.
     const FILE_ID: &str = "mem://w/db/t/data/f0.parquet";
-    /// The offset of the first test page.
+    /// The page offset the first test page is keyed by; a key never reaches
+    /// the file, so the value is arbitrary.
     const FIRST_OFFSET: u64 = 4;
-    /// The offset of a second test page in the same file.
+    /// A second offset in the same file, so two pages share a file id and
+    /// differ in offset alone.
     const SECOND_OFFSET: u64 = 4_096;
-    /// The first test page's bytes.
+    /// The bytes the first test page holds; served pages are compared to it.
     const PAGE: &[u8] = b"page-bytes";
     /// The second test page's bytes, a different length from `PAGE`.
     const OTHER_PAGE: &[u8] = b"other-page-bytes";

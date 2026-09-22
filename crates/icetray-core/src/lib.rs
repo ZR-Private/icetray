@@ -31,8 +31,8 @@ pub use check::{
     WriterProperty, diagnose,
 };
 pub use config::{
-    Config, ConfigError, ConfigViolation, HedgeConfig, LocalConfig, LogConfig, Residency,
-    RewriteRule, S3Config, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
+    Residency, RewriteRule, S3Config, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
 pub use error::{Error, ErrorKind, LookupResult, RefusalReason, Result, SnapshotId};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};

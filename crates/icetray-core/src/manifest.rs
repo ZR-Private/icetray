@@ -427,8 +427,9 @@ pub(crate) mod testing {
         UnboundPartitionSpec,
     };
 
-    use crate::catalog::{METADATA_DIR, VERSION_HINT, under, version_file};
+    use crate::catalog::{METADATA_DIR, hint_location, version_file};
     use crate::key::Key;
+    use crate::time;
 
     /// The key column of every fixture table.
     pub(crate) const KEY_COLUMN: &str = "key";
@@ -444,7 +445,7 @@ pub(crate) mod testing {
     /// metadata's last update, which the builder set to now, and increasing
     /// with the sequence, as the builder requires of a commit.
     pub(crate) fn snapshot_timestamp(md: &TableMetadata, sequence: i64) -> i64 {
-        md.last_updated_ms() + sequence
+        time::millis_after(md.last_updated_ms(), sequence)
     }
 
     /// A `file://` location for a temporary directory.
@@ -671,7 +672,7 @@ pub(crate) mod testing {
         write_file(&file_io, &location, Bytes::from(json)).await;
         write_file(
             &file_io,
-            &under(md.location(), VERSION_HINT),
+            &hint_location(md.location()),
             Bytes::from(version.to_string()),
         )
         .await;
@@ -702,6 +703,7 @@ mod tests {
     use crate::bucket;
     use crate::config::StorageConfig;
     use crate::error::Error;
+    use crate::key::UUID_BYTES;
 
     /// The table every test names.
     const TABLE: &str = "kv";
@@ -717,23 +719,32 @@ mod tests {
     const BUCKETS: u32 = 4;
     /// The bucket count of the evolved spec.
     const MORE_BUCKETS: u32 = 8;
-    /// The snapshot ids and sequence numbers the tests write.
+    /// The ids of the two fixture snapshots, distinct from every sequence
+    /// number so a test that confuses the two fails.
     const SNAPSHOT_A: i64 = 11;
     const SNAPSHOT_B: i64 = 22;
+    /// Their sequence numbers, in commit order.
     const SEQUENCE_A: i64 = 1;
     const SEQUENCE_B: i64 = 2;
-    /// The record count and size every fixture data file claims.
+    /// The record count every fixture data file claims; nothing here reads
+    /// a data file, so any count serves.
     const RECORDS: u64 = 1_000;
+    /// The size every fixture data file claims, for the same reason.
     const SIZE: u64 = 4_096;
-    /// Key bounds a fixture file claims.
+    /// Key bounds a fixture file claims, `LOW..=HIGH`.
     const LOW: i64 = 10;
     const HIGH: i64 = 20;
+    /// Key bounds of a file below it, `LOWER..=HIGHER`, so the two ranges
+    /// are disjoint.
     const LOWER: i64 = 5;
     const HIGHER: i64 = 7;
     /// Keys the routing tests hash.
     const SAMPLE_KEYS: [i64; 5] = [0, 1, 7, 1_000, -3];
     /// A snapshot id for the placeholder snapshots that derive takes.
     const PLACEHOLDER_SNAPSHOT: i64 = 1;
+    /// The width of the `fixed` value column of the value-type test; any
+    /// width is admitted, so one is enough.
+    const FIXED_VALUE_BYTES: u64 = 8;
 
     fn storage() -> Storage {
         Storage::new(StorageConfig::default())
@@ -820,7 +831,10 @@ mod tests {
             (PrimitiveType::Long, KeyType::Long),
             (PrimitiveType::String, KeyType::String),
             (PrimitiveType::Binary, KeyType::Binary),
-            (PrimitiveType::Fixed(16), KeyType::Binary),
+            (
+                PrimitiveType::Fixed(u64::try_from(UUID_BYTES).unwrap()),
+                KeyType::Binary,
+            ),
             (PrimitiveType::Uuid, KeyType::Uuid),
         ];
         for (primitive, expected) in cases {
@@ -870,7 +884,7 @@ mod tests {
         let root = testing::file_root(dir.path());
         for admitted in [
             PrimitiveType::Binary,
-            PrimitiveType::Fixed(8),
+            PrimitiveType::Fixed(FIXED_VALUE_BYTES),
             PrimitiveType::String,
         ] {
             let md = testing::metadata(

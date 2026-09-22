@@ -822,7 +822,7 @@ pub(crate) mod testing {
     use parquet::schema::types::ColumnPath;
 
     use super::Generation;
-    use crate::catalog::{TableSource, VERSION_HINT, under};
+    use crate::catalog::{TableSource, VERSION_HINT, hint_location};
     use crate::config::{
         HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
     };
@@ -1275,7 +1275,7 @@ pub(crate) mod testing {
         pub(crate) async fn restore_hint(&self, version: u64) {
             manifest_testing::write_file(
                 &FileIO::new_with_fs(),
-                &under(&self.root(), VERSION_HINT),
+                &hint_location(&self.root()),
                 Bytes::from(version.to_string()),
             )
             .await;

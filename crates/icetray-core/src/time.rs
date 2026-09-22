@@ -48,6 +48,16 @@ pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff
     jiff::Timestamp::from_millisecond(millis)
 }
 
+/// An epoch-millisecond count `millis` after `base`: how a writer stamps a
+/// snapshot later than the metadata's last update and increasing with its
+/// sequence, which Iceberg requires of a commit. The one place
+/// epoch-millisecond arithmetic happens. Saturates at the ends of `i64`,
+/// both outside the range `timestamp_from_millis` admits, so an overflow
+/// reads back as `SnapshotTimestampOutOfRange` and never as another time.
+pub fn millis_after(base: i64, millis: i64) -> i64 {
+    base.saturating_add(millis)
+}
+
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
 /// friendly form: `"10s"`, `"250ms"`, `"1m 30s"`. Only that grammar is
 /// accepted: a negative duration (`"-1s"`, `"1s ago"`) and text without a
@@ -60,7 +70,11 @@ pub mod friendly_duration {
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// The parser of the friendly grammar, in its default configuration,
+    /// which accepts every unit designator and no bare number.
     static PARSER: SpanParser = SpanParser::new();
+    /// The printer of the compact form (`1m 30s`, not `1 minute 30
+    /// seconds`), so a written value is short and parses back equal.
     static PRINTER: SpanPrinter = SpanPrinter::new().designator(Designator::Compact);
 
     /// Parses the friendly form; anything else is a deserialization error.
@@ -221,6 +235,23 @@ mod tests {
     fn test_timestamp_from_millis_rejects_out_of_range() {
         assert!(super::timestamp_from_millis(i64::MAX).is_err());
         assert!(super::timestamp_from_millis(i64::MIN).is_err());
+    }
+
+    /// The step a fixture commit is stamped after the metadata's last update.
+    const COMMIT_STEP: i64 = 1;
+
+    #[test]
+    fn test_millis_after_adds_the_step() {
+        assert_eq!(
+            super::millis_after(EPOCH_MILLIS, COMMIT_STEP),
+            EPOCH_MILLIS + COMMIT_STEP
+        );
+    }
+
+    #[test]
+    fn test_millis_after_saturates_outside_i64() {
+        assert_eq!(super::millis_after(i64::MAX, COMMIT_STEP), i64::MAX);
+        assert_eq!(super::millis_after(i64::MIN, -COMMIT_STEP), i64::MIN);
     }
 
     #[test]

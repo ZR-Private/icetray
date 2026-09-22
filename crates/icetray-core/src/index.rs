@@ -1977,6 +1977,7 @@ mod tests {
     use super::*;
     use crate::config::{HedgeConfig, LocalConfig, StorageConfig};
     use crate::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
+    use crate::key::testing::UUID_HALF_BYTES;
     use crate::storage::{HedgeWindow, IoStats, Storage};
 
     /// The table every fixture is built for.
@@ -2103,7 +2104,7 @@ mod tests {
             }
             KeyType::Uuid => {
                 let mut uuid = [UUID_KEY_FILL; UUID_BYTES];
-                uuid[UUID_BYTES / 2..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
+                uuid[UUID_HALF_BYTES..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
                 Key::Uuid(uuid)
             }
         }
