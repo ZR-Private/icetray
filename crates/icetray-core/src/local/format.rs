@@ -48,7 +48,7 @@ pub(super) const MAX_HEADER_BYTES: usize = 1024 * 1024;
 /// or incomplete, `chunks_for` treats it as absent, and `retain` deletes
 /// it. Display gives the `snake_case` name the warn log carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Rejection {
+pub(super) enum Rejection {
     /// The first byte is not `CHUNK_FILE_MAGIC`: not an icetray chunk file.
     WrongMagic,
     /// Any version byte other than `CHUNK_FILE_VERSION`; this build reads
@@ -119,7 +119,7 @@ impl fmt::Display for Rejection {
 /// file failed a check. The two are handled apart: an I/O failure is an
 /// error, a failed check makes the file absent.
 #[derive(Debug)]
-pub(crate) enum ParseFailure {
+pub(super) enum ParseFailure {
     /// The operation's I/O error.
     Io(io::Error),
     /// The check the file failed.
@@ -145,7 +145,7 @@ impl From<Rejection> for ParseFailure {
 /// outside icetray reads a chunk file, so the message is declared here and
 /// not in the client contract. Field numbers are never reused.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub(crate) struct ChunkFileHeader {
+pub(super) struct ChunkFileHeader {
     /// The data file's location as the manifest records it.
     #[prost(string, tag = "1")]
     pub data_file_path: String,
@@ -164,7 +164,7 @@ pub(crate) struct ChunkFileHeader {
 /// One stored chunk: the byte range of the data file it holds. Its bytes
 /// sit in the payload right after the bytes of every span before it.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub(crate) struct ChunkSpan {
+pub(super) struct ChunkSpan {
     /// Where the chunk starts in the data file.
     #[prost(uint64, tag = "1")]
     pub data_offset: u64,
@@ -186,7 +186,7 @@ pub(super) struct StoredSpan {
 
 /// A chunk file that passed every check of its envelope and header.
 #[derive(Debug)]
-pub(crate) struct ParsedChunkFile {
+pub(super) struct ParsedChunkFile {
     /// The identity the header carries.
     pub(super) identity: DataFileIdentity,
     /// The spans in header order with their payload offsets.
@@ -198,7 +198,7 @@ pub(crate) struct ParsedChunkFile {
 /// Reads the envelope and header of an open chunk file, then checks the
 /// header's identity against `identity`. The order of the checks is the
 /// order of the `Rejection` variants.
-pub(crate) fn validate(
+pub(super) fn validate(
     file: &File,
     identity: &DataFileIdentity,
 ) -> std::result::Result<ParsedChunkFile, ParseFailure> {
