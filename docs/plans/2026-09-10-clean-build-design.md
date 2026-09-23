@@ -763,6 +763,9 @@ pub fn seconds(duration: Duration) -> f64;
 pub fn micros(elapsed: Duration) -> u64;
 /// The wall clock now; a caller that needs a timestamp never names the clock (the binary has no `jiff`).
 pub fn now() -> jiff::Timestamp;
+/// The wall clock as a `SystemTime`, for the one boundary that speaks it: the AWS SDK's credential
+/// expiry, which the credential cache compares with `SystemTime`'s own methods. Every other caller uses `now`.
+pub fn system_now() -> SystemTime;
 /// Seconds from `since` to now, the `generation_age_seconds` gauge; a `since` in the future gives a
 /// negative age, kept as measured.
 pub fn age_seconds(since: jiff::Timestamp) -> f64;

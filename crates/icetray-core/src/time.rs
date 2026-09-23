@@ -3,7 +3,7 @@
 //! where either becomes text or a number and back, so no call site carries
 //! its own unit arithmetic.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// A duration as a float of seconds, the unit a Prometheus histogram takes
 /// and the unit its bucket bounds are declared in. The one place a
@@ -19,10 +19,20 @@ pub fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
-/// The wall clock now. The one place it is read, so a caller that needs
-/// "now" as a timestamp never names the clock itself.
+/// The wall clock now as a timestamp, for every caller that keeps time in
+/// `jiff`; a caller that needs "now" never names the clock itself. The one
+/// other read of the clock is `system_now`, for the SDK boundary.
 pub fn now() -> jiff::Timestamp {
     jiff::Timestamp::now()
+}
+
+/// The wall clock now as a `SystemTime`, for the one boundary that speaks
+/// it: the AWS SDK hands a credential's expiry back as a `SystemTime`, and
+/// the credential cache compares and offsets it with `SystemTime`'s own
+/// methods rather than converting a value that can fall outside `jiff`'s
+/// range. Every other caller uses `now`.
+pub fn system_now() -> SystemTime {
+    SystemTime::now()
 }
 
 /// Seconds from `since` to now: the `generation_age_seconds` gauge, from a

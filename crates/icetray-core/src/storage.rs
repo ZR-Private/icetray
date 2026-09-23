@@ -692,7 +692,7 @@ impl SdkCredentials {
         let mut cached = self.cached.lock().await;
         if let Some(entry) = cached
             .as_ref()
-            .filter(|entry| entry.is_fresh(SystemTime::now()))
+            .filter(|entry| entry.is_fresh(time::system_now()))
         {
             return Ok(Arc::clone(&entry.credential));
         }
@@ -712,7 +712,7 @@ impl SdkCredentials {
         *cached = Some(CachedCredential::new(
             Arc::clone(&credential),
             resolved.expiry(),
-            SystemTime::now(),
+            time::system_now(),
         ));
         Ok(credential)
     }
@@ -1727,7 +1727,7 @@ mod tests {
 
     #[test]
     fn test_is_fresh_without_expiry_indefinitely() {
-        let now = SystemTime::now();
+        let now = time::system_now();
         let cached = cached_at(now, None);
         assert!(cached.is_fresh(now));
         assert!(cached.is_fresh(now + ONE_HOUR));
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn test_is_fresh_until_the_margin_before_expiry() {
-        let now = SystemTime::now();
+        let now = time::system_now();
         let cached = cached_at(now, Some(now + ONE_HOUR));
         let margin_starts = now + ONE_HOUR - CREDENTIAL_REFRESH_MARGIN;
         assert!(cached.is_fresh(margin_starts - ONE_SECOND));
@@ -1744,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_is_fresh_for_the_minimum_reuse_inside_the_margin() {
-        let now = SystemTime::now();
+        let now = time::system_now();
         let cached = cached_at(now, Some(now + CREDENTIAL_REFRESH_MARGIN - ONE_SECOND));
         assert!(cached.is_fresh(now));
         assert!(cached.is_fresh(now + CREDENTIAL_MIN_REUSE - ONE_SECOND));
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn test_is_fresh_never_past_expiry() {
-        let now = SystemTime::now();
+        let now = time::system_now();
         let expiring = cached_at(now, Some(now + ONE_SECOND));
         assert!(expiring.is_fresh(now));
         assert!(!expiring.is_fresh(now + ONE_SECOND));
@@ -1783,7 +1783,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_credential_caches_a_credential_beyond_the_margin() {
         let beyond_margin =
-            SystemTime::now() + CREDENTIAL_REFRESH_MARGIN + CREDENTIAL_REFRESH_MARGIN;
+            time::system_now() + CREDENTIAL_REFRESH_MARGIN + CREDENTIAL_REFRESH_MARGIN;
         let (provider, calls) = counting_credentials(vec![test_credentials(Some(beyond_margin))]);
         let first = provider.get_credential().await.unwrap();
         let again = provider.get_credential().await.unwrap();
@@ -1793,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_credential_reuses_a_credential_inside_the_margin() {
-        let inside_margin = SystemTime::now() + CREDENTIAL_REFRESH_MARGIN - ONE_SECOND;
+        let inside_margin = time::system_now() + CREDENTIAL_REFRESH_MARGIN - ONE_SECOND;
         let (provider, calls) = counting_credentials(vec![test_credentials(Some(inside_margin))]);
         let first = provider.get_credential().await.unwrap();
         let again = provider.get_credential().await.unwrap();
@@ -1803,7 +1803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_credential_refreshes_an_expired_credential() {
-        let expired = SystemTime::now() - ONE_SECOND;
+        let expired = time::system_now() - ONE_SECOND;
         let (provider, calls) = counting_credentials(vec![test_credentials(Some(expired))]);
         let first = provider.get_credential().await.unwrap();
         let again = provider.get_credential().await.unwrap();
@@ -1825,7 +1825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_credential_refreshes_once_under_concurrent_expiry() {
-        let expired = SystemTime::now() - ONE_SECOND;
+        let expired = time::system_now() - ONE_SECOND;
         let (provider, calls) = counting_credentials(vec![
             test_credentials(Some(expired)),
             test_credentials(None),
