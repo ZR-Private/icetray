@@ -69,8 +69,8 @@ doctor without inverting the dependency direction.
 ## 3. Frozen public signatures (`icetray-core`)
 
 These are the seams other crates and parallel workers build against. Bodies
-and private items are free; changing a signature below means updating this
-document first.
+and private items are free, and a `pub` item only its own crate calls is not
+listed; changing a signature below means updating this document first.
 
 ```rust
 // error
