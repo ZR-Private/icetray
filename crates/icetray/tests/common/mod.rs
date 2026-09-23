@@ -11,6 +11,7 @@ use http_body_util::{BodyExt as _, Empty};
 use hyper::header::HOST;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use icetray_core::contract::PAGE_ROWS;
 use icetray_testkit::fixture::SAMPLE;
 use tonic::transport::Channel;
 use tonic_health::pb::HealthCheckRequest;
@@ -27,8 +28,11 @@ pub const POLL_STEP: Duration = Duration::from_millis(50);
 /// How long a drain or a failed start may take before the test fails.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
-/// Every id that is a multiple of this has a null value in the nulls fixture.
-pub const NULL_EVERY: u64 = 1_000;
+/// Every id that is a multiple of this has a null value in the nulls
+/// fixture: the contract's page row count, so with ids written in order a
+/// null value opens every page after the first and the `get` null path is
+/// exercised at a page edge.
+pub const NULL_EVERY: u64 = PAGE_ROWS.unsigned_abs();
 
 /// The `SAMPLE` id the nulls fixture holds with a null value: a multiple of
 /// `NULL_EVERY`.
