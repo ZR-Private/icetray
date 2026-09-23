@@ -495,12 +495,11 @@ impl FileIndex {
     /// a positive one key-page GET through the cache. Row-group choice uses
     /// the exact fences, never statistics.
     pub async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>>;
-    /// `None` is a null value, distinct from an absent key.
-    pub async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<Option<Bytes>>;
-    /// `read_value` with the value page's origin, through `fetch_pages`, which returns the
-    /// page's own origin and not the dictionary page's; the frozen `read_value` wraps it, and
-    /// `find` discards the key page's origin.
-    pub(crate) async fn read_value_with_origin(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
+    /// The value at `row` and its value page's origin, through `fetch_pages`, which returns
+    /// the page's own origin and not the dictionary page's: `Fetched` for a cold hit, `Cached`
+    /// for a warm one. `None` is a null value, distinct from an absent key. `find` discards
+    /// the key page's origin.
+    pub async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
     pub fn resident_bytes(&self) -> usize;
     pub fn max_key_bytes(&self) -> usize;
     pub fn metadata(&self) -> &Arc<ParquetMetaData>;

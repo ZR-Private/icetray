@@ -627,26 +627,16 @@ impl FileIndex {
         self.search(key, row_group, page, segments)
     }
 
-    /// The value at `row`: the one value page holding it through `cache`
-    /// (one GET cold, none warm) and, when the value column chunk has a
-    /// dictionary page, that page too (the one extra GET RFD 007 prices),
-    /// then exactly one row decoded. `Some` carries the bytes unchanged;
-    /// `None` is a null value, distinct from an absent key. A row outside
-    /// every page of its row group is `FileFault::PageOutOfRange`.
+    /// The value at `row` and where its page came from: the one value page
+    /// holding it through `cache` (one GET cold, none warm) and, when the
+    /// value column chunk has a dictionary page, that page too (the one
+    /// extra GET RFD 007 prices), then exactly one row decoded. `Some`
+    /// carries the bytes unchanged; `None` is a null value, distinct from an
+    /// absent key. The origin is the value page's: `Fetched` for the GET of
+    /// a cold hit, `Cached` for a warm one; the dictionary page, when there
+    /// is one, does not decide it. A row outside every page of its row group
+    /// is `FileFault::PageOutOfRange`.
     pub async fn read_value(
-        &self,
-        row: RowRef,
-        cache: Option<&PageCache>,
-    ) -> Result<Option<Bytes>> {
-        self.read_value_with_origin(row, cache)
-            .await
-            .map(|(value, _origin)| value)
-    }
-
-    /// `read_value`, with where the value page came from: `Fetched` for the
-    /// GET of a cold hit, `Cached` for a warm one. The dictionary page, when
-    /// there is one, does not decide it.
-    pub(crate) async fn read_value_with_origin(
         &self,
         row: RowRef,
         cache: Option<&PageCache>,
@@ -1192,11 +1182,14 @@ mod tests {
             assert_eq!(row, row_of(i, group_rows), "key {key}");
             assert_eq!(stats.gets(), before + fetched, "find costs no GET");
             let cold = cache.fetches() == fetched;
-            let value = index.read_value(row, Some(&cache)).await.unwrap();
+            let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
             assert_eq!(value.as_deref(), Some(value_for(i).as_slice()), "key {key}");
             if cache.fetches() > fetched {
                 assert!(cold);
+                assert_eq!(origin, PageOrigin::Fetched, "key {key}");
                 fetched += 1;
+            } else {
+                assert_eq!(origin, PageOrigin::Cached, "key {key}");
             }
             assert_eq!(
                 stats.gets(),
@@ -1333,7 +1326,7 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("key {key} not found in {residency}"));
             assert_eq!(row, row_of(i, rows / MANY_ROW_GROUPS), "key {key}");
-            let value = index.read_value(row, Some(&cache)).await.unwrap();
+            let (value, _) = index.read_value(row, Some(&cache)).await.unwrap();
             assert_eq!(value.as_deref(), Some(value_for(i).as_slice()));
         }
         let group_rows = rows / MANY_ROW_GROUPS;
@@ -1411,7 +1404,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let value = index.read_value(row, Some(&cache)).await.unwrap();
+                let (value, _) = index.read_value(row, Some(&cache)).await.unwrap();
                 assert_eq!(
                     value.as_deref(),
                     Some(value_of_len(i, MISALIGNED_VALUE_BYTES).as_slice())
@@ -1466,8 +1459,9 @@ mod tests {
             before,
             "the key dictionary page is in the resident chunk"
         );
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(first).as_slice()));
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(
             stats.gets(),
             before + 2,
@@ -1479,8 +1473,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(second).as_slice()));
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(stats.gets(), before + 2, "both pages cached");
         let other_page = 0;
         let row = index
@@ -1488,7 +1483,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        index.read_value(row, Some(&cache)).await.unwrap();
+        let (_, origin) = index.read_value(row, Some(&cache)).await.unwrap();
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(
             stats.gets(),
             before + 3,
@@ -1521,7 +1517,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(index.read_value(row, Some(&cache)).await.unwrap(), None);
+        assert_eq!(
+            index.read_value(row, Some(&cache)).await.unwrap(),
+            (None, PageOrigin::Fetched)
+        );
         assert_eq!(
             stats.gets(),
             before + 1,
@@ -1533,22 +1532,26 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(present).as_slice()));
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(stats.gets(), before + 1, "and none warm");
         let row = index
             .find(&key_for(0, KeyType::Long), Some(&cache))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(index.read_value(row, Some(&cache)).await.unwrap(), None);
+        assert_eq!(
+            index.read_value(row, Some(&cache)).await.unwrap(),
+            (None, PageOrigin::Cached)
+        );
         assert_eq!(stats.gets(), before + 1);
         // The last row of value page 0 (cached), the first row of value
         // page 1 (one GET), and the last row of the row group (page 1 again).
-        for (i, extra_gets) in [
-            (page_rows() - 1, 0),
-            (page_rows(), 1),
-            (group_rows() - 1, 1),
+        for (i, extra_gets, origin) in [
+            (page_rows() - 1, 0, PageOrigin::Cached),
+            (page_rows(), 1, PageOrigin::Fetched),
+            (group_rows() - 1, 1, PageOrigin::Cached),
         ] {
             let row = index
                 .find(&key_for(i, KeyType::Long), Some(&cache))
@@ -1557,7 +1560,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 index.read_value(row, Some(&cache)).await.unwrap(),
-                None,
+                (None, origin),
                 "row {i}"
             );
             assert_eq!(stats.gets(), before + 1 + extra_gets, "row {i}");
@@ -1567,7 +1570,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let value = index.read_value(row, Some(&cache)).await.unwrap();
+            let (value, _) = index.read_value(row, Some(&cache)).await.unwrap();
             let expected = (!is_null(neighbour)).then(|| value_for(neighbour));
             assert_eq!(value.as_deref(), expected.as_deref(), "row {neighbour}");
         }
@@ -1628,8 +1631,9 @@ mod tests {
                 (gets + find_gets, reads + find_reads),
                 "{residency}: a find with a dictionary-encoded key column"
             );
-            let value = index.read_value(row, Some(&cache)).await.unwrap();
+            let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
             assert_eq!(value.as_deref(), Some(value_for(first).as_slice()));
+            assert_eq!(origin, PageOrigin::Fetched, "{residency}");
             assert_eq!(
                 (stats.gets(), stats.local_reads()),
                 (gets + find_gets + 1, reads + find_reads),
@@ -1675,8 +1679,9 @@ mod tests {
                     row: i64::try_from(i).unwrap()
                 }
             );
-            let value = index.read_value(row, None).await.unwrap();
+            let (value, origin) = index.read_value(row, None).await.unwrap();
             assert_eq!(value.as_deref(), Some(value_for(i).as_slice()));
+            assert_eq!(origin, PageOrigin::Fetched);
             assert_eq!(index.find(&absent_after(key), None).await.unwrap(), None);
         }
     }
@@ -1693,8 +1698,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let value = index.read_value(row, None).await.unwrap();
+            let (value, origin) = index.read_value(row, None).await.unwrap();
             assert_eq!(value.as_deref(), Some(value_for(i).as_slice()));
+            assert_eq!(origin, PageOrigin::Fetched);
         }
     }
 
@@ -1786,8 +1792,9 @@ mod tests {
             .unwrap();
         assert_eq!(row, row_of(hit, group_rows));
         assert_eq!(stats.gets(), before + 1, "a positive fetches its key page");
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(hit).as_slice()));
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(stats.gets(), before + 2, "a cold hit is two GETs");
         let warm = hit + 1;
         let row = index
@@ -1795,8 +1802,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(warm).as_slice()));
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(stats.gets(), before + 2, "a warm hit is none");
 
         let mut negatives = 0;
@@ -1879,8 +1887,9 @@ mod tests {
             (gets, reads + 1),
             "a find is one local read"
         );
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(hit).as_slice()));
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(
             (stats.gets(), stats.local_reads()),
             (gets + 1, reads + 1),
@@ -1892,8 +1901,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let value = index.read_value(row, Some(&cache)).await.unwrap();
+        let (value, origin) = index.read_value(row, Some(&cache)).await.unwrap();
         assert_eq!(value.as_deref(), Some(value_for(warm).as_slice()));
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(
             (stats.gets(), stats.local_reads()),
             (gets + 1, reads + 2),
@@ -2125,10 +2135,8 @@ mod tests {
         let row = find.await.unwrap().unwrap();
         let read = index.read_value(row, Some(&cache));
         assert_send(&read);
-        assert_eq!(
-            read.await.unwrap().as_deref(),
-            Some(value_for(1).as_slice())
-        );
+        let (value, _) = read.await.unwrap();
+        assert_eq!(value.as_deref(), Some(value_for(1).as_slice()));
         let chunks = index.key_chunks_for_verification();
         assert_send(&chunks);
         chunks.await.unwrap();

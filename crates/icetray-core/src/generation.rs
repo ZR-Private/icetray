@@ -272,7 +272,7 @@ impl Generation {
     ) -> Result<(Value, LookupResult)> {
         for file in self.candidates(key) {
             if let Some(row) = file.index.find(key, Some(cache)).await? {
-                let (value, origin) = file.index.read_value_with_origin(row, Some(cache)).await?;
+                let (value, origin) = file.index.read_value(row, Some(cache)).await?;
                 let value = match value {
                     Some(bytes) => Value::Present(bytes),
                     None => Value::Null,
