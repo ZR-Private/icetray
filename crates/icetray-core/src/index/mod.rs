@@ -489,7 +489,9 @@ impl FileIndex {
     /// report. Exact: the footer and the page indexes kept
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
     /// chunks (the footer's compressed sizes, which Full holds and Disk
-    /// writes byte for byte), and the filters (the footer's lengths, header
+    /// writes byte for byte; a chunk the footer cannot place counts as
+    /// zero, and `inspect` refuses such a footer before any budget check
+    /// reads this), and the filters (the footer's lengths, header
     /// included; the in-memory filter drops the header, a few bytes per row
     /// group). Estimated: the fences, one `Key` per key page plus, for
     /// `BYTE_ARRAY` keys, the page's minimum from the column index when the

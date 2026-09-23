@@ -367,7 +367,9 @@ impl ResidentSet {
             .sum::<Option<u64>>();
         Self {
             footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
-            key_chunks: key_columns().map(|column| column.byte_range().1).sum(),
+            key_chunks: key_columns()
+                .map(|column| chunk_range(column).map_or(0, |range| range.end - range.start))
+                .sum(),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
                 exact_fence_bytes,
@@ -499,7 +501,7 @@ mod tests {
 
     /// A column name no fixture has.
     const ABSENT_COLUMN: &str = "absent";
-    /// A bloom filter offset no footer can mean: before the file's first byte.
+    /// A footer offset or size no file can mean: before the file's first byte.
     const NEGATIVE_OFFSET: i64 = -1;
     /// Bytes per value where value pages must be bounded by bytes.
     const LARGE_VALUE_BYTES: usize = 4096;
@@ -769,6 +771,25 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(&loaded, index.key_leaf());
         assert_eq!(from_loaded, predicted_of(&index));
         assert_eq!(from_loaded.full, count(index.resident_bytes()));
+    }
+
+    #[tokio::test]
+    async fn test_predicted_resident_bytes_counts_an_unplaceable_key_chunk_as_zero() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let index = opened.index(KeyType::Long).await;
+        let key_leaf = index.key_leaf();
+        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf);
+        let first_chunk = loaded.row_group(0).column(key_leaf).compressed_size();
+        let patched = with_column_chunk(&loaded, 0, key_leaf, |chunk| {
+            chunk.set_total_compressed_size(NEGATIVE_OFFSET)
+        });
+        let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf);
+        assert_eq!(
+            estimated.full,
+            intact.full - approx::measured(first_chunk),
+            "the chunk the footer cannot place counts for nothing"
+        );
     }
 
     #[tokio::test]
