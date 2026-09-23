@@ -81,8 +81,9 @@ pub enum LocalFault {
     /// The operation's I/O error.
     #[error("{0}")]
     Io(std::io::Error),
-    /// A page read for a byte range no stored chunk contains whole: the
-    /// disk analogue of `Segments` refusing a non-resident byte. Never a
+    /// A page read for a byte range no stored chunk contains whole. The
+    /// chunk file holds the spans its header names and nothing else, so a
+    /// range outside them or straddling two is a caller's error, never a
     /// fetch, and never counted as a read.
     #[error("bytes {start}..{end} are in no stored chunk")]
     RangeNotResident {

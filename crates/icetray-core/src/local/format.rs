@@ -341,7 +341,10 @@ fn check_identity(
 /// The header for `identity` over `chunks`, already sorted by data offset.
 /// A chunk whose bytes are not its range's length, an empty or inverted
 /// range included, is `LocalFault::ChunkLengthMismatch`; one whose range
-/// overlaps the chunk before it is `LocalFault::ChunkOverlap`.
+/// overlaps the chunk before it is `LocalFault::ChunkOverlap`. Both are
+/// checked in every build, not only in debug as `Segments::new` checks its
+/// parts: the header is written to a file that outlives the process and is
+/// trusted by every later reader, so what it promises is verified here.
 pub(super) fn header_for(
     identity: &DataFileIdentity,
     chunks: &[(Range<u64>, Bytes)],
