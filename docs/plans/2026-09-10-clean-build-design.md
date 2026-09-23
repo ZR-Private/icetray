@@ -379,8 +379,6 @@ impl TableLayout {
     /// field of the default spec, in spec order, that buckets the key; a
     /// count of zero there is `TableFault::ZeroBuckets`.
     pub fn derive(table: &str, md: &TableMetadata, snapshot: &Snapshot, key_column: &str, value_column: &str) -> Result<Self>;
-    /// Under the default spec's transform; `0` for a table without one.
-    pub fn bucket_of(&self, key: &Key) -> u32;
 }
 /// `bucketing` is the transform of the file's own manifest's spec, `None`
 /// when that spec has no bucket on the key, and `bucket` is then `0`, the one

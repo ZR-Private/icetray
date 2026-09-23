@@ -126,13 +126,6 @@ impl TableLayout {
             value_field_id: value_field.id,
         })
     }
-
-    /// The bucket `key` falls in under the default spec's transform, or
-    /// `UNBUCKETED` for a table without one.
-    pub fn bucket_of(&self, key: &Key) -> u32 {
-        self.bucketing
-            .map_or(UNBUCKETED, |bucketing| bucketing.bucket_of(key))
-    }
 }
 
 /// The value column is served as opaque bytes (RFD 010), so its Iceberg
@@ -228,7 +221,9 @@ pub struct DataFileEntry {
     /// The file's location as the manifest recorded it.
     pub path: String,
     /// The bucket the file holds, from its partition tuple; `UNBUCKETED`
-    /// when `bucketing` is `None`.
+    /// when `bucketing` is `None`. Routing keys files by `bucketing` first
+    /// and this second, so the sentinel meets no bucketed file's zero there;
+    /// it is a bucket number only where the doctor reports by number alone.
     pub bucket: u32,
     /// The bucket transform of the manifest's own partition spec (RFD 005),
     /// `None` when that spec has no bucket on the key. Files of one
@@ -1011,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_bucketing_present_absent_and_bucket_of() {
+    fn test_derive_bucketing_present_and_absent() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let unbucketed = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
@@ -1022,8 +1017,6 @@ mod tests {
         let routed = derive(&bucketed, &snapshot_with_schema(None)).unwrap();
         assert_eq!(routed.bucketing, Some(bucketing(BUCKETS)));
         for key in SAMPLE_KEYS.map(Key::Long) {
-            assert_eq!(layout.bucket_of(&key), UNBUCKETED);
-            assert_eq!(routed.bucket_of(&key), bucket::bucket(&key, BUCKETS));
             assert_eq!(
                 bucketing(BUCKETS).bucket_of(&key),
                 bucket::bucket(&key, BUCKETS)
