@@ -6,6 +6,9 @@
 //! test's doc comment and asserted with it. `strict` refuses a cost fixture
 //! naming its codes and loads an advice fixture: the doctor's verdicts live
 //! here, the GET costs of the same layouts in `lookup.rs` and `refresh.rs`.
+//! The completeness of `FindingCode::ALL` is core's to prove (its successor
+//! chain in `check.rs`); this file has one test per code by convention,
+//! named after the code, and nothing here checks that count.
 
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
@@ -510,37 +513,6 @@ async fn test_bloom_undersized_is_advice() -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The test above that produces each code. Exhaustive: a code added without
-/// a fixture fails this file to compile.
-fn fixture_test_for(code: FindingCode) -> &'static str {
-    match code {
-        FindingCode::DictionaryEncodedValue => {
-            "test_dictionary_encoded_value_is_a_cost_of_one_extra_get"
-        }
-        FindingCode::LargeKeyPages => "test_large_key_pages_cost_is_the_rows_decoded",
-        FindingCode::NoBucketPartition => "test_no_bucket_partition_is_a_cost",
-        FindingCode::OverlappingFiles => "test_overlapping_files_is_a_cost",
-        FindingCode::BoundsMissing => "test_bounds_missing_is_advice",
-        FindingCode::ColumnIndexTruncated => "test_column_index_truncated_is_advice",
-        FindingCode::LargeValuePages => "test_large_value_pages_is_advice",
-        FindingCode::LongKeys => "test_long_keys_is_advice",
-        FindingCode::LargeFile => "test_large_file_is_advice",
-        FindingCode::ManyFilesPerBucket => "test_many_files_per_bucket_is_advice",
-        FindingCode::NoBloomFilter => "test_no_bloom_filter_is_advice",
-        FindingCode::BloomOversized => "test_bloom_oversized_is_advice",
-        FindingCode::BloomUndersized => "test_bloom_undersized_is_advice",
-    }
-}
-
-#[test]
-fn test_every_finding_code_has_a_fixture() {
-    let names: BTreeSet<&str> = FindingCode::ALL
-        .iter()
-        .map(|&code| fixture_test_for(code))
-        .collect();
-    assert_eq!(names.len(), FindingCode::ALL.len(), "one fixture per code");
 }
 
 /// Without statistics a file has no column index and no manifest bounds;

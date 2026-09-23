@@ -1110,10 +1110,12 @@ fixture per `FindingCode`: `Dictionary::Value`;
 `Statistics::Truncated`; `column_index_truncate` under a shared 64-byte
 prefix; 16 KiB values under the row bound; a padded string key; 9,000 rows
 of 16 KiB in one file; 48,000 ids at a 40 KiB target; `Bloom::Off`;
-`Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. The finding set is bound to
-`FindingCode::ALL` by an exhaustive match asserting one distinct test per
-code; the refusal set, whose variants carry fields and have no `ALL`, is
-bound by review alone. The advice a layout cannot avoid is asserted
+`Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. The completeness of
+`FindingCode::ALL` is proved once, by core's successor chain in `check.rs`
+(a new variant fails that match to compile until it is placed, and the
+chain is compared to the list); the fixture suite has one test per code by
+convention, and the refusal set, whose variants carry fields and have no
+`ALL`, is bound by review alone. The advice a layout cannot avoid is asserted
 beside the designed code. The gated tests carry `#[ignore = "<reason>"]`
 naming their variable and script, so a plain `cargo test` reports them as
 ignored, never as passed; forced without the variable they fail on
