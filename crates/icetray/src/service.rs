@@ -431,7 +431,7 @@ mod tests {
             (
                 Error::Refused {
                     table: TABLE.to_string(),
-                    reason: RefusalReason::NoLocalDir,
+                    reason: RefusalReason::DeleteFiles,
                 },
                 Code::Internal,
             ),

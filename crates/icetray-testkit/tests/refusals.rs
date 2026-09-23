@@ -10,10 +10,10 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
 use iceberg::spec::{PrimitiveType, Struct};
 use icetray_core::approx::count;
-use icetray_core::config::{Residency, TableConfig};
+use icetray_core::config::{ConfigError, ConfigViolation, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
-    Error, ErrorKind, Key, KeyType, RefusalReason, Storage, Table, TableSource, TableState,
+    Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, TINY_BUDGET, TWO_BUCKETS,
@@ -51,11 +51,10 @@ const OVER_CAP_PAD: usize = MAX_KEY_BYTES;
 /// Rows of the over-cap fixture: few, each a few kibibytes, in one bucket.
 const OVER_CAP_IDS: Range<u64> = 0..300;
 
-/// A table whose first load was refused: the reason, and the table and
-/// storage left behind for the state and GET assertions.
+/// A table whose first load was refused: the reason, and the storage left
+/// behind for the GET assertions.
 struct Refused {
     reason: RefusalReason,
-    table: Table,
     storage: Arc<Storage>,
 }
 
@@ -98,7 +97,6 @@ async fn load_refused(config: TableConfig, source: TableSource) -> Result<Refuse
     );
     Ok(Refused {
         reason,
-        table: served.table,
         storage: served.storage,
     })
 }
@@ -411,8 +409,13 @@ async fn test_bloom_tier_without_a_filter_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// Disk residency with no local directory is not a refusal but the
+/// configuration violation `Config::parse` refuses; a configuration built
+/// by hand, as this one is, meets it at the loader instead, before any
+/// chunk is fetched, and the table is left as a refused first load leaves
+/// it: no generation, `Degraded` with the failure's kind.
 #[tokio::test]
-async fn test_disk_tier_without_a_local_directory_is_refused() -> Result<()> {
+async fn test_disk_tier_without_a_local_directory_is_a_config_violation() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         ids: IDS_2K,
@@ -420,9 +423,40 @@ async fn test_disk_tier_without_a_local_directory_is_refused() -> Result<()> {
         ..FixtureSpec::small("kv_nolocal", KeyType::Long)
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-    let refused =
-        refused_through_catalog(&fixture, &catalog, fixture.config(Residency::Disk, false)).await?;
-    assert_eq!(refused.reason, RefusalReason::NoLocalDir);
-    assert!(refused.table.current().is_none());
+    let served = verify::build(
+        Arc::new(Storage::new(verify::storage_config_for_tests())),
+        fixture.config(Residency::Disk, false),
+        fixture.catalog_source(Arc::clone(&catalog)),
+        None,
+        verify::TEST_PAGE_CACHE_BYTES,
+    )
+    .await?;
+    let error = served
+        .table
+        .load()
+        .await
+        .expect_err("the fixture is designed to be refused");
+    assert!(
+        matches!(
+            error,
+            Error::Config(ConfigError::Invalid(
+                ConfigViolation::DiskResidencyWithoutLocalDir
+            ))
+        ),
+        "{error:?}"
+    );
+    assert!(served.table.current().is_none());
+    assert!(
+        matches!(
+            served.table.state(),
+            TableState::Degraded {
+                serving: None,
+                reason: ErrorKind::Config,
+                ..
+            }
+        ),
+        "{:?}",
+        served.table.state()
+    );
     Ok(())
 }

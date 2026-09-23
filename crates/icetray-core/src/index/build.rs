@@ -20,7 +20,7 @@ use super::{
     Column, ColumnChunk, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys,
     file_fault, identity_of, off_worker, row_index,
 };
-use crate::config::Residency;
+use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, UUID_BYTES};
@@ -30,8 +30,10 @@ use crate::parquet_io::{FileHandle, Segments};
 impl Inspected {
     /// The chunk stage of `FileIndex::build`: streams the key chunks once
     /// for verification and keeps what `residency` keeps, as `build`
-    /// documents. The Disk tier without a local directory is refused here,
-    /// before any chunk is fetched.
+    /// documents. The Disk tier with no local directory is the one rule of
+    /// `Config::parse` a configuration built in code can still break, so it
+    /// is raised here as the same `ConfigViolation`, before any chunk is
+    /// fetched.
     pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex> {
         let Self {
             table,
@@ -53,8 +55,9 @@ impl Inspected {
                 (KeyResidency::Chunks(chunks), verified)
             }
             Residency::Disk => {
-                let local =
-                    local.ok_or_else(|| Error::refused(&table, RefusalReason::NoLocalDir))?;
+                let local = local.ok_or(Error::Config(ConfigError::Invalid(
+                    ConfigViolation::DiskResidencyWithoutLocalDir,
+                )))?;
                 let (disk, verified) =
                     disk_chunks(&table, &handle, local, &column, layout.key_shape, &ranges).await?;
                 (KeyResidency::Disk(disk), verified)
@@ -477,6 +480,7 @@ mod tests {
 
     use super::*;
     use crate::approx::count;
+    use crate::config::{ConfigError, ConfigViolation};
     use crate::contract::PAGE_ROWS;
     use crate::generation::testing::{self, KeyColumn, TABLE, cache, refusal_of};
     use crate::index::testing::{
@@ -950,11 +954,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_disk_tier_without_a_local_dir_is_refused_at_the_footer() {
+    async fn test_disk_tier_without_a_local_dir_is_a_config_violation_at_the_footer() {
         let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
-        assert_eq!(
-            refusal_of(opened.build(KeyType::Long, Residency::Disk, None).await),
-            RefusalReason::NoLocalDir
+        let error = opened
+            .build(KeyType::Long, Residency::Disk, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(
+                    ConfigViolation::DiskResidencyWithoutLocalDir
+                ))
+            ),
+            "{error:?}"
         );
         assert_eq!(opened.stats().gets(), 1, "no chunk fetched");
     }

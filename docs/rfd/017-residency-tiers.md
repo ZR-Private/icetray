@@ -41,18 +41,19 @@ tier keeps is the footer, the key column's page indexes and the value
 column's offset index, each file's exact key range and row-group bounds, and
 the fence array; `bloom` adds the filters, `full` the chunks. Every tier
 streams the chunks once at load for the same refusals (RFD 007 (Serving
-tiers)); the tier changes what stays, not what is checked. Three of RFD
-007's refusals are this RFD's: a `full` load over its resident-bytes budget,
-`disk` with no local directory configured, and `bloom` on a table whose
-files carry no key bloom filter.
+tiers)); the tier changes what stays, not what is checked. Two of RFD
+007's refusals are this RFD's: a `full` load over its resident-bytes budget
+and `bloom` on a table whose files carry no key bloom filter. `disk` with no
+local directory configured is not a refusal but a configuration violation:
+the configuration parser refuses it, and the loader raises the same
+violation for a caller that built the configuration by hand.
 
 After reading footers, and before fetching any key chunk, the loader knows
 every tier's resident bytes, and the doctor reports them (RFD 016 (Doctor)),
 so the owner chooses with the numbers in front of them.
 The budget, set per table, turns a `full` load that would exceed
 it into a refusal carrying the bytes needed and the budget, before anything
-expensive is fetched; `disk` without a configured local directory is
-refused the same way.
+expensive is fetched.
 
 The disk tier's chunk files are named by the data file they hold and carry
 its identity (path, size, footer digest). A data file is immutable, so a

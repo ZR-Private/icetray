@@ -56,10 +56,11 @@ Placements settled elsewhere:
   would be a guess; RFD 002 (Serving layout contract) states the clause.
 - Delete files are refused; RFD 009 (Writes between builds) defers
   merge-on-read snapshots.
-- Three refusals belong to RFD 017 (Residency tiers) and are named there: a
-  full-tier load over its resident-bytes budget, disk residency with no
-  local directory configured, and bloom residency on a table whose files
-  carry no key bloom filter.
+- Two refusals belong to RFD 017 (Residency tiers) and are named there: a
+  full-tier load over its resident-bytes budget and bloom residency on a
+  table whose files carry no key bloom filter. Disk residency with no local
+  directory configured is a configuration violation (RFD 011), not a
+  refusal.
 - The key length cap is RFD 008's (Keys); it is a refusal rather than a
   cost because the resident index and its fence array hold whole keys, so
   the cap is the bound on what a key may cost there, and no penalty unit

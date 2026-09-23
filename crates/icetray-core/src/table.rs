@@ -588,9 +588,9 @@ mod tests {
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
         FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
-        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table as Fixture, WriterLayout,
-        bucketing, cache, keys_from, keys_in_bucket, long_keys, two_bucket_table, value_for,
-        values_of,
+        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table as Fixture,
+        WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys, two_bucket_table,
+        value_for, values_of,
     };
     use crate::key::KeyType;
     use crate::manifest::testing::Partition;
@@ -838,18 +838,18 @@ mod tests {
     #[tokio::test]
     async fn test_load_refused_leaves_the_table_degraded_with_no_generation() {
         let (fixture, all) = two_bucket_table().await;
-        let table = table_over(&fixture, fixture.config(Residency::Disk, None)).await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, Some(TINY_BUDGET))).await;
         let error = table.load().await.unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Refused {
-                reason: RefusalReason::NoLocalDir,
-                ..
-            }
-        ));
+        let Error::Refused {
+            reason: reason @ RefusalReason::OverBudget { .. },
+            ..
+        } = error
+        else {
+            panic!("expected an over-budget refusal, got {error:?}");
+        };
         let (serving, kept) = degraded(&table);
         assert_eq!(serving, None);
-        assert_eq!(kept, ErrorKind::Refused(RefusalReason::NoLocalDir));
+        assert_eq!(kept, ErrorKind::Refused(reason));
         assert!(table.current().is_none());
         let error = table.get(&Key::Long(all[0])).await.unwrap_err();
         assert!(matches!(error, Error::NotReady { .. }));

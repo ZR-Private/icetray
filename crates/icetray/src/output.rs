@@ -407,7 +407,7 @@ mod tests {
     fn test_serialize_refused_line_carries_the_kind_as_reason() {
         let error = icetray_core::Error::Refused {
             table: TABLE.to_string(),
-            reason: icetray_core::RefusalReason::NoLocalDir,
+            reason: icetray_core::RefusalReason::DeleteFiles,
         };
         let line = serde_json::to_value(RefusedLine::new(TABLE, &error)).unwrap();
         assert_eq!(line["kind"], Json::String("refused".to_string()));

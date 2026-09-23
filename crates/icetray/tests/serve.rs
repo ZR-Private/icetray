@@ -14,7 +14,7 @@ use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, RefusalReason, Storage, metric};
+use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
@@ -671,8 +671,9 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
     let mut stack = Stack::start_with(
         vec![FixtureSpec::small(TABLE, KeyType::Long)],
         async |setup| {
-            // Disk residency with no `storage.local`: refused as `NoLocalDir`
-            // at load.
+            // Disk residency with no `storage.local`: the configuration is
+            // built here rather than parsed, so the violation `Config::parse`
+            // would refuse is met at the first load.
             setup.config.tables[0].residency = Residency::Disk;
             setup.options.start_failure_grace = FAILURE_GRACE;
             Ok(())
@@ -699,13 +700,7 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
     let Err(ServeError::FirstLoad { failures }) = outcome else {
         panic!("expected a first-load failure, got {outcome:?}");
     };
-    assert_eq!(
-        failures,
-        vec![(
-            TABLE.to_string(),
-            ErrorKind::Refused(RefusalReason::NoLocalDir)
-        )]
-    );
+    assert_eq!(failures, vec![(TABLE.to_string(), ErrorKind::Config)]);
     Ok(())
 }
 

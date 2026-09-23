@@ -888,6 +888,9 @@ pub(crate) mod testing {
     /// The step between written long keys, so the key after any written key
     /// is absent and inside the file's range.
     pub(crate) const KEY_STEP: i64 = 3;
+    /// A resident-bytes budget below any file's resident bytes, so a `full`
+    /// load under it is refused at the footer stage.
+    pub(crate) const TINY_BUDGET: u64 = 1;
     /// Bytes per value where a fixture does not say.
     pub(crate) const VALUE_BYTES: usize = 32;
     /// The mixers that make a value a function of its key or row and of the
@@ -1547,9 +1550,9 @@ mod tests {
     use super::testing::{
         self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
         KEY_STEP, MEM_PREFIX, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
-        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TWO, Table, WriterLayout, bucketing, cache,
-        keys_from, keys_in_bucket, local_dir, long_keys, refusal_of, two_bucket_table, value_for,
-        values_of,
+        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout,
+        bucketing, cache, keys_from, keys_in_bucket, local_dir, long_keys, refusal_of,
+        two_bucket_table, value_for, values_of,
     };
     use super::*;
     use crate::catalog::TableSource;
@@ -1569,8 +1572,6 @@ mod tests {
     const EIGHT: u32 = 8;
     /// Keys per bucket file in the routing tests.
     const KEYS_PER_FILE: i64 = 16;
-    /// A budget below any file's resident bytes.
-    const TINY_BUDGET: u64 = 1;
     /// A false-positive rate far above the contract's: the writer folds the
     /// filter to its one-block minimum, so with `BLOOM_KEYS` keys the
     /// filter passes about a third of the absent keys in range and rules

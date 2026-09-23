@@ -221,9 +221,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         RefusalReason::OverBudget { needed, budget } => {
             format!("{reason} (needed {needed} bytes, budget {budget} bytes)")
         }
-        RefusalReason::KeyTypeUnsupported
-        | RefusalReason::DeleteFiles
-        | RefusalReason::NoLocalDir => reason.to_string(),
+        RefusalReason::KeyTypeUnsupported | RefusalReason::DeleteFiles => reason.to_string(),
     }
 }
 
@@ -313,8 +311,6 @@ pub enum RefusalReason {
         /// The row group without a filter.
         row_group: usize,
     },
-    /// Disk residency with no local directory configured (RFD 017).
-    NoLocalDir,
 }
 
 impl fmt::Display for RefusalReason {
@@ -330,7 +326,6 @@ impl fmt::Display for RefusalReason {
             Self::KeyTooLong { .. } => "key_too_long",
             Self::OverBudget { .. } => "over_budget",
             Self::NoBloomFilter { .. } => "no_bloom_filter",
-            Self::NoLocalDir => "no_local_dir",
         };
         f.write_str(name)
     }
@@ -406,7 +401,6 @@ mod tests {
                 },
                 "no_bloom_filter",
             ),
-            (RefusalReason::NoLocalDir, "no_local_dir"),
         ];
         for (reason, name) in cases {
             assert_eq!(reason.to_string(), name);
@@ -475,9 +469,9 @@ mod tests {
             (
                 Error::Refused {
                     table: TABLE.to_string(),
-                    reason: RefusalReason::NoLocalDir,
+                    reason: RefusalReason::DeleteFiles,
                 },
-                "no_local_dir",
+                "delete_files",
             ),
             (
                 Error::Inefficient {

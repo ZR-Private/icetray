@@ -212,8 +212,15 @@ impl Config {
         } else {
             toml::from_str(text).map_err(ConfigError::Toml)?
         };
-        validate(&config).map_err(ConfigError::Invalid)?;
-        Ok(config)
+        config.validated()
+    }
+
+    /// The configuration, checked against every rule `parse` checks, so a
+    /// configuration built in code is held to the same rules as one read
+    /// from a file; the first rule it breaks is `ConfigError::Invalid`.
+    pub fn validated(self) -> Result<Self> {
+        validate(&self).map_err(ConfigError::Invalid)?;
+        Ok(self)
     }
 
     /// Reads the file, then `parse`s it; a file that cannot be read is

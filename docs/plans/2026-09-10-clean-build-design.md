@@ -123,7 +123,7 @@ pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Confi
 /// `TableLayout::derive`, so it names no file and carries the Iceberg type's
 /// `Display` (the type does not implement `Hash`); a data file whose physical
 /// type contradicts an admitted schema type is `FileFault::ValuePhysicalType`.
-pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize }, NoLocalDir }
+pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize } }
 
 // snapshot
 /// A snapshot id is not an integer; it is never compared with one.
@@ -178,6 +178,9 @@ impl Config {
     /// TOML or JSON, decided by content (a leading `{` is JSON).
     pub fn parse(text: &str) -> Result<Self>;
     pub fn from_path(path: &std::path::Path) -> Result<Self>;
+    /// Every rule `parse` checks, applied to a configuration built in code (the
+    /// command line's `--location` table); the first broken rule is `ConfigError::Invalid`.
+    pub fn validated(self) -> Result<Self>;
 }
 /// `metrics_listen` is required (default 127.0.0.1:9433) and serves `/metrics`
 /// and `/ready`; RFD 012 makes both part of the surface.
@@ -829,9 +832,12 @@ within a file, or shared by two files of a bucket; never reported as
 unsorted), key type mismatch, key type unsupported (the key column's Iceberg
 type is none of long, string, binary, fixed, or uuid), value type
 unsupported (the value column must be Iceberg binary, fixed, or string,
-served as opaque bytes), delete files, key too long, and the three residency
-refusals of RFD 017: over budget, no local directory, no bloom filter. The
-reasons raised for one file carry its path, so a log line names the file.
+served as opaque bytes), delete files, key too long, and the two residency
+refusals of RFD 017: over budget, no bloom filter. Disk residency with no
+local directory is not a refusal but `ConfigViolation::DiskResidencyWithoutLocalDir`:
+`Config::parse` refuses it, and the loader raises the same violation, before
+any chunk is fetched, for a configuration built in code. The reasons raised
+for one file carry its path, so a log line names the file.
 The prototype's per-table `key_chunk_cost` line becomes a `FileReport`
 field, not a finding.
 
@@ -1087,8 +1093,10 @@ long-keyed table for `KeyTypeMismatch`; `write_table_of_types` with an
 `ValueTypeUnsupported`; a by-hand snapshot listing a position-delete file
 for `DeleteFiles`; a `key_pad` over `MAX_KEY_BYTES` for `KeyTooLong`; a
 one-byte budget for `OverBudget`; `Bloom::Off` under `Residency::Bloom`
-for `NoBloomFilter`; `Residency::Disk` without a local directory for
-`NoLocalDir`. One fixture per `FindingCode`: `Dictionary::Value`;
+for `NoBloomFilter`. Beside them, `Residency::Disk` without a local
+directory proves the loader raises `DiskResidencyWithoutLocalDir` for a
+configuration built in code and leaves the table as a refusal does. One
+fixture per `FindingCode`: `Dictionary::Value`;
 `page_rows` at twice `KEY_PAGE_ROWS_COST` with 24-byte values; `buckets:
 0` rolled into twenty 64 KiB files; the interleaved fixture;
 `Statistics::Truncated`; `column_index_truncate` under a shared 64-byte
@@ -1143,7 +1151,7 @@ skip).
 | gRPC maps missing key and wrong key type to `InvalidArgument`, unknown table to `NotFound`, storage failure to `Unavailable`; `MultiGet` answers from one snapshot and fails as a whole when one read fails | P (in-process S3 behind the server) |
 | A null value is served as present-with-null, distinct from absent, at the same GET count | P (nullable fixture) |
 | Bloom tier: a cold hit is exactly two GETs, a warm hit none, a negative miss none; refusals identical to Full plus its own; chunks unreachable after load; a row group without a filter is refused | P (carried from the prototype's residency tests) |
-| Disk tier: a cold hit is one GET and one local read, a miss one local read and no GET; refusals identical to Full plus its own; a restart with matching chunk files fetches footers only; a dropped file's chunk file is deleted; no local directory is a typed refusal | P (temporary directory, counting GETs and local reads) |
+| Disk tier: a cold hit is one GET and one local read, a miss one local read and no GET; refusals identical to Full plus its own; a restart with matching chunk files fetches footers only; a dropped file's chunk file is deleted; no local directory is the configuration violation `Config::parse` refuses, raised by the loader for a configuration built in code | P (temporary directory, counting GETs and local reads) |
 | A uuid key column routes and orders as the reference implementation does, and a uuid-keyed lookup costs the same as a long-keyed one | U (oracle), P |
 | The page cache's disk tier serves a page evicted from memory with a local read and no GET, and survives a restart | P (temporary directory) |
 | Row-group choice never consults column statistics: long string keys sharing a prefix beyond 64 bytes across several row groups all resolve | U (carried from the prototype) |
