@@ -1093,8 +1093,8 @@ hedge-disabled; only `tests/sim.rs` enables hedging.
 
 The acceptance suite is `tests/lookup.rs`, `lookup_s3.rs`, `refresh.rs`,
 `refusals.rs`, `findings.rs`, `residency_bloom.rs`, `residency_disk.rs`
-(P), `sim.rs` (S), `golden.rs` (G), `rest_catalog.rs` (C), and the
-`scale.rs` probe. One fixture per `RefusalReason` variant: descending
+(P), `sim.rs` (S), `golden.rs` (G), and `rest_catalog.rs` (C); the scale
+probe is `examples/scale.rs`, a program run by hand and not a test. One fixture per `RefusalReason` variant: descending
 order for `Unsorted`; a raw nullable key column for `NullKeys`; an
 overlapping append for `DuplicateKeys`; a raw `Utf8` key column on a
 long-keyed table for `KeyTypeMismatch`; `write_table_of_types` with an

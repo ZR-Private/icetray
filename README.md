@@ -404,6 +404,14 @@ dev/golden-tables.sh
 ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 ```
 
+The testkit also carries a scale probe, a program and not a test, that
+writes 1,500 files under a temporary directory, loads them, times lookups
+and a refresh, and prints what it measured:
+
+```sh
+cargo run -p icetray-testkit --example scale --release
+```
+
 `dev/golden-tables.sh` runs the recipe with Spark 3.5 in a container, so
 the host needs neither Spark nor a Java runtime; the recipe itself runs
 anywhere Spark 3.5 has the Iceberg runtime on its classpath and can write to

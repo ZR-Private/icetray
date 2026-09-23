@@ -1,8 +1,9 @@
-//! A scale probe, not a test of a promise: many files per generation, with
-//! timings to stderr and only the weak assertions that the run did its
-//! work. Ignored by default because it writes about 150 MB and takes
-//! minutes; run with `cargo test -p icetray-testkit --test scale --release
-//! -- --ignored --nocapture` and read the timings.
+//! A scale probe, a program and not a test: many files per generation, with
+//! timings to stderr and only the checks that the run did its work. It
+//! writes about 150 MB under a temporary directory and takes minutes; run
+//! with `cargo run -p icetray-testkit --example scale --release` and read
+//! the timings. It lives beside the tests because it uses their fixtures,
+//! and outside them because it measures rather than proves.
 
 use std::time::Instant;
 
@@ -15,17 +16,17 @@ use icetray_testkit::{FixtureSpec, Result, write_fixture};
 
 /// Files per generation, one per bucket: the file count a three-billion-row
 /// table would have at two million rows per file.
-const FILES: u64 = 1_500;
+const FILES: u32 = 1_500;
 
 /// Rows per file: one contract page, so the write finishes in seconds and
 /// the file count alone sets the scale.
 const ROWS_PER_FILE: u64 = 1_000;
 
 /// Rows of the probe's first build: one page in every file.
-const ROWS: u64 = FILES * ROWS_PER_FILE;
+const ROWS: u64 = FILES as u64 * ROWS_PER_FILE;
 
 /// Lookups per timed batch, and the stride that spreads them over the table.
-const LOOKUPS: u64 = 2_000;
+const LOOKUPS: u32 = 2_000;
 const LOOKUP_STRIDE: u64 = 733;
 
 /// Rows the append after the first build adds, across every bucket.
@@ -38,13 +39,11 @@ fn mib(bytes: u64) -> f64 {
     approx::gauge(bytes) / MEBIBYTE
 }
 
-#[tokio::test]
-#[ignore = "writes about 150 MB and takes minutes; run explicitly with --ignored"]
-async fn test_many_files_load_and_lookup() -> Result<()> {
-    let per_lookup = u32::try_from(LOOKUPS).unwrap();
+#[tokio::main]
+async fn main() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
-        buckets: u32::try_from(FILES).unwrap(),
+        buckets: FILES,
         ids: 0..ROWS,
         ..FixtureSpec::small("kv_many", KeyType::Long)
     };
@@ -63,34 +62,42 @@ async fn test_many_files_load_and_lookup() -> Result<()> {
     eprintln!(
         "load: {load:.1?}; files {}, index {:.1} MiB, GETs {}, bytes {:.1} MiB",
         generation.files.len(),
-        mib(u64::try_from(generation.index_bytes).unwrap()),
+        mib(approx::count(generation.index_bytes)),
         stats.gets(),
         mib(stats.bytes())
     );
-    assert_eq!(generation.files.len(), usize::try_from(FILES).unwrap());
+    assert_eq!(
+        approx::count(generation.files.len()),
+        u64::from(FILES),
+        "one file per bucket"
+    );
 
     let started = Instant::now();
-    for i in 0..LOOKUPS {
+    for i in 0..u64::from(LOOKUPS) {
         let key = fixture.key(i * LOOKUP_STRIDE % ROWS);
-        assert!(matches!(
-            served.table.get(&key).await?.value,
-            Value::Present(_)
-        ));
+        assert!(
+            matches!(served.table.get(&key).await?.value, Value::Present(_)),
+            "a written key answers present"
+        );
     }
     let elapsed = started.elapsed();
     eprintln!(
         "{LOOKUPS} cold-ish lookups: {elapsed:.1?} ({:.0?} each)",
-        elapsed / per_lookup
+        elapsed / LOOKUPS
     );
     let started = Instant::now();
-    for i in 0..LOOKUPS {
+    for i in 0..u64::from(LOOKUPS) {
         let key = fixture.absent_near(i * LOOKUP_STRIDE % ROWS);
-        assert_eq!(served.table.get(&key).await?.value, Value::Absent);
+        assert_eq!(
+            served.table.get(&key).await?.value,
+            Value::Absent,
+            "an unwritten key answers absent"
+        );
     }
     let elapsed = started.elapsed();
     eprintln!(
         "{LOOKUPS} misses: {elapsed:.1?} ({:.0?} each)",
-        elapsed / per_lookup
+        elapsed / LOOKUPS
     );
 
     let started = Instant::now();
@@ -102,13 +109,16 @@ async fn test_many_files_load_and_lookup() -> Result<()> {
         started.elapsed()
     );
     let started = Instant::now();
-    assert!(served.table.refresh().await?);
+    assert!(
+        served.table.refresh().await?,
+        "the append is a new snapshot"
+    );
     let generation = served.current();
     eprintln!(
         "refresh: {:.1?}; files {}, index {:.1} MiB",
         started.elapsed(),
         generation.files.len(),
-        mib(u64::try_from(generation.index_bytes).unwrap())
+        mib(approx::count(generation.index_bytes))
     );
     Ok(())
 }
