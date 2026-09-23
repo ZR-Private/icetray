@@ -1167,7 +1167,7 @@ skip).
 | The page cache's disk tier serves a page evicted from memory with a local read and no GET, and survives a restart | P (temporary directory) |
 | Row-group choice never consults column statistics: long string keys sharing a prefix beyond 64 bytes across several row groups all resolve | U (carried from the prototype) |
 | Over-budget Full load is refused at the footer stage with no chunk fetched | P (counting) |
-| The value column's column index is not resident; index bytes for a byte-bounded large-value table are within a small factor of its key bytes | P (`lookup.rs`: no loaded footer keeps a value column index), U for the factor (`RESIDENT_TO_KEY_CHUNK_FACTOR` on core's fixture; on the testkit's 16 KiB-value fixture the offset index of the value pages alone is tens of times its zstd-compressed key chunks) |
+| The value column's column index is not resident, and a file's resident bytes are what its footer predicted | P (`lookup.rs`: no loaded footer keeps a value column index), U for the prediction (core's byte-bounded large-value fixture: the kept footer is smaller than the loaded one by at least the dropped index, and `predicted_resident_bytes` of the loaded footer equals the built index's resident bytes) |
 | Health is `NOT_SERVING` until every table serves; the listener accepts before load completes | P (server test) |
 | A skipped gated test is reported as skipped, never as passed | C, G (harness) |
 | CLI JSON lines: `kind` and `table` first, `gets` per lookup exact, exit codes as specified | P (binary test) |

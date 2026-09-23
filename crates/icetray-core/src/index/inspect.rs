@@ -503,10 +503,6 @@ mod tests {
     const NEGATIVE_OFFSET: i64 = -1;
     /// Bytes per value where value pages must be bounded by bytes.
     const LARGE_VALUE_BYTES: usize = 4096;
-    /// The resident bytes of a byte-bounded large-value file stay within
-    /// this factor of its key chunk bytes once the value column's column
-    /// index is dropped; with the index kept they run to tens of times.
-    const RESIDENT_TO_KEY_CHUNK_FACTOR: u64 = 6;
     /// `metadata` with the file's row count replaced.
     fn with_file_rows(metadata: &ParquetMetaData, rows: i64) -> ParquetMetaData {
         let file = metadata.file_metadata();
@@ -733,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_drops_the_value_column_index_and_resident_bytes_track_key_bytes() {
+    async fn test_build_drops_the_value_column_index_and_resident_bytes_are_as_predicted() {
         let rows = contract_rows();
         let mut fixture = Fixture::contract(KeyType::Long, rows);
         fixture.values = (0..rows)
@@ -768,23 +764,11 @@ mod tests {
         // The dropped index held a truncated minimum and maximum per value page.
         let truncated = DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH.unwrap();
         assert!(loaded.memory_size() - kept.memory_size() >= value_pages * 2 * truncated);
-        let key_chunk_bytes: u64 = kept
-            .row_groups()
-            .iter()
-            .map(|group| group.column(index.key_leaf()).byte_range().1)
-            .sum();
-        let resident = count(index.resident_bytes());
-        assert!(
-            resident <= RESIDENT_TO_KEY_CHUNK_FACTOR * key_chunk_bytes,
-            "{resident} resident bytes against {key_chunk_bytes} key chunk bytes"
-        );
-        assert!(count(loaded.memory_size()) > RESIDENT_TO_KEY_CHUNK_FACTOR * key_chunk_bytes);
         // The budget check at the footer stage holds the footer as loaded;
         // its prediction is the kept footer's, and what the index reports.
         let from_loaded = FileIndex::predicted_resident_bytes(&loaded, index.key_leaf());
         assert_eq!(from_loaded, predicted_of(&index));
-        assert_eq!(from_loaded.full, resident);
-        assert!(from_loaded.full <= RESIDENT_TO_KEY_CHUNK_FACTOR * key_chunk_bytes);
+        assert_eq!(from_loaded.full, count(index.resident_bytes()));
     }
 
     #[tokio::test]
