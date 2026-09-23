@@ -1115,8 +1115,10 @@ of 16 KiB in one file; 48,000 ids at a 40 KiB target; `Bloom::Off`;
 `FindingCode::ALL` is proved once, by core's successor chain in `check.rs`
 (a new variant fails that match to compile until it is placed, and the
 chain is compared to the list); the fixture suite has one test per code by
-convention, and the refusal set, whose variants carry fields and have no
-`ALL`, is bound by review alone. The advice a layout cannot avoid is asserted
+convention. The refusal set, whose variants carry fields and have no `ALL`,
+is bound by the two exhaustive matches in `error.rs` (the label and the
+message detail), which a new variant fails to compile; its fixtures exist
+by the same convention. The advice a layout cannot avoid is asserted
 beside the designed code. The gated tests carry `#[ignore = "<reason>"]`
 naming their variable and script, so a plain `cargo test` reports them as
 ignored, never as passed; forced without the variable they fail on

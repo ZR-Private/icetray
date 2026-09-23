@@ -1,6 +1,9 @@
 //! One fixture per `RefusalReason` variant (RFD 007, RFD 017): each fails
 //! its first load with the named reason and leaves the table with no
 //! generation, `Degraded` with nothing serving.
+//! The variant set itself is bound in core: the label and message-detail
+//! matches in `error.rs` name every variant, so a new one fails to compile
+//! there; one fixture per variant here is by convention, as for findings.
 
 use std::ops::Range;
 use std::sync::Arc;
