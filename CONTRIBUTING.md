@@ -109,7 +109,13 @@ meaning is obvious from the line it is on. A constant has one home: when two
 crates need the same value, it is declared once in the lowest crate both
 depend on and imported from there, never redeclared. A test fixture that
 needs the page row limit imports the contract's constant; it does not write
-`1_000` again. Time is typed: elapsed time
+`1_000` again. Beyond that, a test may use a literal when the test itself
+says what it is: an expected outcome the assertion names ("no more than 7
+GETs"), or input that is plainly made up (`[3, 4, 7, 3]`). A literal that
+restates a production setting imports the production constant, and a
+literal whose meaning the test leaves unsaid gets a name, if only a local
+one (`let flux_capacitors_to_test = 4;`), so the reader is not left to
+guess what the 4 is. Time is typed: elapsed time
 is a `Duration`, a point in monotonic time an `Instant`, a wall-clock
 timestamp a `jiff` type, and arithmetic on them uses their own methods. The
 only place a time value becomes a bare number (a histogram in seconds, an
