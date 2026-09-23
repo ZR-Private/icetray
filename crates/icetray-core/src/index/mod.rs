@@ -861,7 +861,7 @@ impl FileIndex {
         range: Range<u64>,
     ) -> Result<(Bytes, PageOrigin)> {
         match source {
-            PageSource::Store(cache) => self.handle.read_page_with_origin(range, cache).await,
+            PageSource::Store(cache) => self.handle.read_page(range, cache).await,
             PageSource::Disk(disk) => disk
                 .page(range)
                 .await

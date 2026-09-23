@@ -176,7 +176,7 @@ enum Tier {
 /// that joined another caller's fetch counts as `Fetched`, since it waited
 /// on the GET; a page from the disk level is `Cached`, since it cost no GET.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PageOrigin {
+pub enum PageOrigin {
     /// The page came from the caller's fetch, run or joined.
     Fetched,
     /// The page was in memory or on the disk level.
@@ -229,29 +229,19 @@ impl PageCache {
         })
     }
 
-    /// The page at `key`: from memory, from the disk level, or from `fetch`.
-    /// Concurrent callers for one key share one fetch and one disk read.
-    /// `fetch` may be called for a caller that then joins another caller's
-    /// fetch; the future it returns runs only when the cache needs the page
-    /// from outside, and `fetches` counts those runs. A disk level that
-    /// fails to read the page falls through to the fetch (RFD 017: the
-    /// directory is disposable). A failure of the fetch future reaches every
-    /// waiting caller as `CacheError::Fetch` and leaves nothing cached; a
-    /// failure of the cache itself is `CacheError::Backend`.
-    pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<Bytes>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Bytes>> + Send + 'static,
-    {
-        self.fetch_with_origin(key, fetch)
-            .await
-            .map(|(page, _origin)| page)
-    }
-
-    /// `get_or_fetch`, with where the page came from: what the `result`
-    /// label of a lookup is decided by, per call rather than by differencing
-    /// the process-wide counters, which concurrent lookups would confuse.
-    pub(crate) async fn fetch_with_origin<F, Fut>(
+    /// The page at `key` and where it came from: from memory, from the disk
+    /// level, or from `fetch`. Concurrent callers for one key share one
+    /// fetch and one disk read. `fetch` may be called for a caller that then
+    /// joins another caller's fetch; the future it returns runs only when
+    /// the cache needs the page from outside, and `fetches` counts those
+    /// runs. A disk level that fails to read the page falls through to the
+    /// fetch (RFD 017: the directory is disposable). A failure of the fetch
+    /// future reaches every waiting caller as `CacheError::Fetch` and leaves
+    /// nothing cached; a failure of the cache itself is `CacheError::Backend`.
+    /// The origin is what the `result` label of a lookup is decided by, per
+    /// call rather than by differencing the process-wide counters, which
+    /// concurrent lookups would confuse.
+    pub async fn get_or_fetch<F, Fut>(
         &self,
         key: (Arc<str>, u64),
         fetch: F,
@@ -580,7 +570,7 @@ mod tests {
         offset: u64,
         gate: &Arc<Notify>,
         fetch: impl Fn() -> Fut,
-    ) -> Vec<Result<Bytes>>
+    ) -> Vec<Result<(Bytes, PageOrigin)>>
     where
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
@@ -685,13 +675,15 @@ mod tests {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         assert!(matches!(cache.tier.as_ref(), Tier::Memory(_)));
         let runs = Arc::new(AtomicU64::new(0));
-        let page = cache
+        let (page, origin) = cache
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
-        let again = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        assert_eq!(origin, PageOrigin::Fetched);
+        let (again, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&again[..], PAGE);
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
@@ -706,7 +698,7 @@ mod tests {
             .await
             .unwrap();
         cache.close().await.unwrap();
-        let again = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, _) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
@@ -720,14 +712,17 @@ mod tests {
         let answers = race(&cache, FIRST_OFFSET, &gate, || gated(PAGE, &runs, &gate)).await;
         assert_eq!(answers.len(), CONCURRENT);
         for answer in answers {
-            assert_eq!(&answer.unwrap()[..], PAGE);
+            let (page, origin) = answer.unwrap();
+            assert_eq!(&page[..], PAGE);
+            assert_eq!(origin, PageOrigin::Fetched);
         }
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let again = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&again[..], PAGE);
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
     }
@@ -752,7 +747,7 @@ mod tests {
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let page = cache
+        let (page, _) = cache
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
             .await
             .unwrap();
@@ -793,8 +788,9 @@ mod tests {
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let page = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
@@ -812,8 +808,9 @@ mod tests {
         assert_eq!(cache.hits(), 0);
         assert_eq!(stats.local_reads(), 0);
 
-        let page = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         assert_eq!(cache.fetches(), 2);
         assert_eq!(cache.hits(), 1);
@@ -837,7 +834,9 @@ mod tests {
         let answers = race(&cache, FIRST_OFFSET, &gate, never).await;
         assert_eq!(answers.len(), CONCURRENT);
         for answer in answers {
-            assert_eq!(&answer.unwrap()[..], PAGE);
+            let (page, origin) = answer.unwrap();
+            assert_eq!(&page[..], PAGE);
+            assert_eq!(origin, PageOrigin::Cached);
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         assert_eq!(cache.fetches(), 2);
@@ -864,15 +863,16 @@ mod tests {
 
         let (tier, stats) = disk_tier(dir.path());
         let second = PageCache::new(ROOMY_BYTES, Some(tier)).await.unwrap();
-        let page = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         assert_eq!(second.fetches(), 0);
         assert_eq!(second.hits(), 1);
         assert_eq!(stats.local_reads(), 1);
         assert_eq!(stats.local_bytes(), page_bytes(PAGE));
 
-        let again = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, _) = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(second.hits(), 2);
         assert_eq!(stats.local_reads(), 1);
@@ -897,11 +897,12 @@ mod tests {
 
         let (tier, stats) = disk_tier(dir.path());
         let second = PageCache::new(ROOMY_BYTES, Some(tier)).await.unwrap();
-        let page = second
+        let (page, origin) = second
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(second.fetches(), 1);
         assert_eq!(second.hits(), 0);

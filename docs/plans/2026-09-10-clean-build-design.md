@@ -424,10 +424,11 @@ impl FileHandle {
     /// loads with neither and `index` refuses it as `FileFault::MissingPageIndex`.
     /// A failed fetch comes back as the storage error it was, not as a parquet error.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
-    pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<Bytes>;
-    /// `read_page` with where the page came from; a read without a cache is always
-    /// `Fetched`. The frozen `read_page` wraps it.
-    pub(crate) async fn read_page_with_origin(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<(Bytes, PageOrigin)>;
+    /// One page on the lookup path and where it came from: through `cache` when given,
+    /// keyed by file id and `range.start`, so concurrent lookups for one page share one
+    /// fetch; that fetch, and every read without a cache, is one hedged lookup GET, so a
+    /// read without a cache is always `Fetched`.
+    pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<(Bytes, PageOrigin)>;
 }
 /// Why a `Segments` refused a read; carried inside `ParquetError::External`.
 pub enum SegmentsFault { NotResident { offset: u64 }, CrossesResidentRange { start: u64, end: u64, held_start: u64, held_end: u64 } }
@@ -551,9 +552,11 @@ pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_o
 /// `Backend` keeps foyer's error whole: it is `std::error::Error + Send + Sync`
 /// and carries its kind, so a caller matches on it rather than on text.
 pub enum CacheError { Fetch(Arc<Error>), Backend(#[from] foyer::Error) }
-/// Where one call's page came from, in-crate. `Fetched` for a fetch the caller ran or
-/// joined, since it waited on the GET; `Cached` for memory or the disk level, which cost none.
-pub(crate) enum PageOrigin { Fetched, Cached }
+/// Where one call's page came from, returned beside the page by `PageCache::get_or_fetch`
+/// and `FileHandle::read_page`. `Fetched` for a fetch the caller ran or joined, since it
+/// waited on the GET; `Cached` for memory or the disk level, which cost none. Re-exported
+/// from `lib.rs`.
+pub enum PageOrigin { Fetched, Cached }
 /// Clone: clones share one cache and one pair of counters, so every table
 /// holds a clone of the process's one cache.
 pub struct PageCache;
@@ -564,11 +567,10 @@ impl PageCache {
     /// recovers what they hold; a failure is `CacheError::Backend`. A disk
     /// level that fails to read a page falls through to the fetch.
     pub async fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Result<Self>;
-    pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<Bytes>
-    where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
-    /// `get_or_fetch` with where the page came from, per call and never by differencing the
-    /// process-wide counters; the frozen `get_or_fetch` wraps it and drops the origin.
-    pub(crate) async fn fetch_with_origin<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
+    /// The page at `key` and where it came from: memory, the disk level, or `fetch`.
+    /// Concurrent callers for one key share one fetch and one disk read. The origin decides
+    /// a lookup's `result` label per call, never by differencing the process-wide counters.
+    pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
     where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
     /// `fetches` counts fetch futures run, after coalescing: concurrent misses
     /// on one key run one and count one. `hits` counts lookups served without

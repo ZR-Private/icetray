@@ -25,7 +25,7 @@ pub mod table;
 pub mod time;
 
 pub use bucket::bucket;
-pub use cache::{CacheError, PageCache};
+pub use cache::{CacheError, PageCache, PageOrigin};
 pub use catalog::{Resolved, TableFault, TableSource};
 pub use check::{
     FileReport, Finding, FindingCode, Penalty, Serviceability, TableReport, TableSummary, Tier,
