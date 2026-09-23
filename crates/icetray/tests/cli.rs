@@ -59,7 +59,9 @@ const SERVICE_FIELD: &str = "service";
 const SERVICE_VALUE: &str = "icetray";
 
 /// Runs the binary with `args` and `env`, with the configuration variable
-/// cleared first so a test's environment never leaks into another's.
+/// cleared first: a run with no target must be a usage error whatever the
+/// developer's shell exports, and a test that wants the variable passes it
+/// in `env`.
 fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
     Command::new(BIN)
         .args(args)
@@ -438,6 +440,55 @@ async fn test_location_only_flags_are_rejected_under_config() -> TestResult {
     Ok(())
 }
 
+/// A `--location` run reads no configuration file, so the variable that
+/// names one is ignored; a run with no target flag at all reads it.
+#[tokio::test]
+async fn test_location_ignores_the_environment_and_a_bare_run_reads_it() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_env", KeyType::Long)).await?;
+    let missing = dir.path().join("missing.toml");
+    let missing = missing.to_str().expect("a utf-8 temporary path");
+    let located = run(
+        &[&["info"][..], &location(&fixture)].concat(),
+        &[(ENV_CONFIG, missing)],
+    );
+    assert_exit(&located, EXIT_OK);
+    assert_eq!(lines(&located.stdout)[0]["table"], LOCATION_TABLE_NAME);
+
+    let config = write_file(dir.path(), "env.toml", &toml_table(TABLE_A, &fixture))?;
+    let bare = run(&["info"], &[(ENV_CONFIG, &config)]);
+    assert_exit(&bare, EXIT_OK);
+    assert_eq!(lines(&bare.stdout)[0]["table"], TABLE_A);
+    Ok(())
+}
+
+/// Disk residency with no local directory is a configuration violation,
+/// and a `--location` table meets it as a file does: before anything is
+/// opened, so the doctor prints no line and the run ends with exit 1.
+#[tokio::test]
+async fn test_location_is_held_to_the_configuration_rules_like_a_file() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_disk", KeyType::Long)).await?;
+    let located = run(
+        &[
+            &["doctor"][..],
+            &location(&fixture),
+            &["--residency", "disk"],
+        ]
+        .concat(),
+        &[],
+    );
+    assert_exit(&located, EXIT_FAILURE);
+    assert!(located.stdout.is_empty(), "{}", stderr(&located));
+
+    let disk_table = format!("{}residency = \"disk\"\n", toml_table(TABLE_A, &fixture));
+    let config = write_file(dir.path(), "disk.toml", &disk_table)?;
+    let from_file = run(&["doctor", "--config", &config], &[]);
+    assert_exit(&from_file, EXIT_FAILURE);
+    assert!(from_file.stdout.is_empty(), "{}", stderr(&from_file));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -449,7 +500,6 @@ async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
         .arg("get")
         .args(location(&fixture))
         .args(&keys)
-        .env_remove(ENV_CONFIG)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

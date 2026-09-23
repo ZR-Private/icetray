@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use icetray_core::config::{
     Config, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
     TableConfig,
@@ -13,8 +13,11 @@ use icetray_core::config::{
 
 use crate::error::{CliError, RewriteTextFault};
 
-/// The environment variable that names the configuration file when the
-/// flag does not (RFD 012), so a pod passes no flags at all.
+/// The environment variable that names the configuration file when no flag
+/// does (RFD 012), so a pod passes no flags at all. `serve` reads it through
+/// clap, which prints it in the flag's help; a one-shot's `Target` reads it
+/// itself, since clap cannot tell an environment value from a flag and would
+/// count an exported variable as `--config` against `--location`.
 pub const ENV_CONFIG: &str = "ICETRAY_CONFIG";
 
 /// The name a `--location` table is opened and printed under.
@@ -34,10 +37,6 @@ pub const DEFAULT_REF: &str = "main";
 /// What separates the two halves of a `--rewrite FROM=TO` rule; the first
 /// occurrence, since a location may itself carry one.
 const REWRITE_SEPARATOR: char = '=';
-
-/// The clap group that requires one of `--config` and `--location`, so a
-/// run with neither is a usage error before anything is opened.
-const TARGET_GROUP: &str = "target";
 
 /// Serve get-by-key lookups over Apache Iceberg tables, or inspect and
 /// query them.
@@ -98,37 +97,39 @@ pub enum Command {
 }
 
 /// Where the tables come from: a configuration file listing them, or one
-/// table located directly. Exactly one of the two; the column, ref, and
-/// residency flags describe the located table and are refused with a file.
-/// They conflict with `--config` rather than requiring `--location`: clap
-/// waives a requirement whose argument conflicts with a present one, so a
-/// `requires` alone would let `--config` and `--key-column` pass together.
+/// table located directly. At most one of the two; with neither, `config`
+/// reads the file `ICETRAY_CONFIG` names, and a `--location` run never
+/// reads the variable. The column, ref, and residency flags describe the
+/// located table, so they both require `--location` and conflict with
+/// `--config`: clap waives a requirement whose argument conflicts with a
+/// present one, so `requires` alone would let `--config` and `--key-column`
+/// pass together, and the conflict alone would let `--key-column` pass with
+/// no target and go unread under the variable.
 #[derive(Args, Debug)]
-#[command(group(ArgGroup::new(TARGET_GROUP).required(true).args(["config", "location"])))]
 pub struct Target {
-    /// The configuration file listing the tables, TOML or JSON; also read
-    /// from `ICETRAY_CONFIG`.
-    #[arg(long, short, env = ENV_CONFIG)]
+    /// The configuration file listing the tables, TOML or JSON. With
+    /// neither this nor --location, the file `ICETRAY_CONFIG` names.
+    #[arg(long, short)]
     pub config: Option<PathBuf>,
     /// A table root or a metadata file to open without a configuration
-    /// file, under the name `table`.
+    /// file, under the name `table`; `ICETRAY_CONFIG` is ignored.
     #[arg(long, conflicts_with = "config")]
     pub location: Option<String>,
     /// A location prefix rewrite FROM=TO applied before any read; repeatable.
     #[arg(long, value_parser = parse_rewrite)]
     pub rewrite: Vec<RewriteRule>,
     /// The key column of the located table (default: key).
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, requires = "location", conflicts_with = "config")]
     pub key_column: Option<String>,
     /// The value column of the located table (default: value).
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, requires = "location", conflicts_with = "config")]
     pub value_column: Option<String>,
     /// The ref of the located table (default: main).
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, requires = "location", conflicts_with = "config")]
     pub r#ref: Option<String>,
     /// Where the located table keeps its key chunks: full, disk, or bloom
     /// (default: full).
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, requires = "location", conflicts_with = "config")]
     pub residency: Option<Residency>,
 }
 
@@ -155,16 +156,26 @@ fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
 
 impl Target {
     /// The configuration the target denotes: the file parsed (TOML or JSON
-    /// by content, RFD 011), or one table synthesized from the location
-    /// with server and storage defaults, never strict, since the one-shots
-    /// exist to report what `strict` would refuse. The `--rewrite` rules
-    /// are appended to `storage.rewrite` in both cases. Neither target is
-    /// `NoTableMatched`, the state clap's group prevents.
+    /// by content, RFD 011), named by `--config` or, with no target flag,
+    /// by `ICETRAY_CONFIG`; or one table synthesized from the location with
+    /// server and storage defaults, never strict, since the one-shots exist
+    /// to report what `strict` would refuse, and held to every rule
+    /// `Config::parse` checks, so `--residency disk` with no local directory
+    /// fails here as the same violation in a file does. The `--rewrite`
+    /// rules are appended to `storage.rewrite` in every case. No flag and
+    /// no variable is `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
-        let mut config = match (&self.config, &self.location) {
-            (Some(path), _) => Config::from_path(path)?,
-            (None, Some(location)) => self.location_config(location.clone()),
-            (None, None) => return Err(CliError::NoTableMatched { name: None }),
+        self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
+    }
+
+    /// `config` with the variable's value passed in, so a test needs no
+    /// process environment.
+    fn config_with_env(&self, env_path: Option<PathBuf>) -> Result<Config, CliError> {
+        let mut config = match (&self.config, &self.location, env_path) {
+            (Some(path), _, _) => Config::from_path(path)?,
+            (None, Some(location), _) => self.location_config(location.clone()).validated()?,
+            (None, None, Some(path)) => Config::from_path(&path)?,
+            (None, None, None) => return Err(CliError::NoTarget),
         };
         config.storage.rewrite.extend(self.rewrite.iter().cloned());
         Ok(config)
@@ -202,6 +213,7 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use clap::error::ErrorKind;
+    use icetray_core::config::{ConfigError, ConfigViolation};
 
     use super::*;
 
@@ -286,6 +298,21 @@ mod tests {
     }
 
     #[test]
+    fn test_config_location_is_held_to_the_file_rules() {
+        let cli = parse(&["doctor", "--location", LOCATION, "--residency", "disk"]).unwrap();
+        let error = target(cli).config().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CliError::Core(icetray_core::Error::Config(ConfigError::Invalid(
+                    ConfigViolation::DiskResidencyWithoutLocalDir
+                )))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn test_try_parse_rejects_location_flags_without_location() {
         for flag in ["--key-column", "--value-column", "--ref"] {
             let under_config = parse(&["info", "--config", "icetray.toml", flag, "x"]).unwrap_err();
@@ -306,14 +333,42 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
     }
 
+    /// The smallest configuration a file can hold, for the tests that read
+    /// one through the environment.
+    const TOML_ONE_TABLE: &str = r#"
+[[tables]]
+name = "kv"
+source = { type = "static", location = "s3://warehouse/db/kv" }
+ref = "main"
+key_column = "key"
+value_column = "value"
+"#;
+
     #[test]
-    fn test_try_parse_rejects_neither_target_and_both_targets() {
-        let neither = parse(&["info"]).unwrap_err();
-        assert_eq!(
-            neither.kind(),
-            ErrorKind::MissingRequiredArgument,
-            "{neither}"
-        );
+    fn test_config_with_env_reads_the_variable_only_with_no_target_flag() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, TOML_ONE_TABLE.as_bytes()).unwrap();
+        let missing = file.path().with_extension("missing");
+
+        let bare = target(parse(&["info"]).unwrap());
+        let from_env = bare
+            .config_with_env(Some(file.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(from_env.tables[0].name, "kv");
+        let unset = bare.config_with_env(None).unwrap_err();
+        assert!(matches!(unset, CliError::NoTarget), "{unset:?}");
+
+        let located = target(parse(&["info", "--location", LOCATION]).unwrap());
+        let ignoring_env = located.config_with_env(Some(missing.clone())).unwrap();
+        assert_eq!(ignoring_env.tables[0].name, LOCATION_TABLE_NAME);
+
+        let flagged = target(parse(&["info", "--config", file.path().to_str().unwrap()]).unwrap());
+        let from_flag = flagged.config_with_env(Some(missing)).unwrap();
+        assert_eq!(from_flag.tables[0].name, "kv");
+    }
+
+    #[test]
+    fn test_try_parse_rejects_both_targets() {
         let both =
             parse(&["info", "--config", "icetray.toml", "--location", LOCATION]).unwrap_err();
         assert_eq!(both.kind(), ErrorKind::ArgumentConflict, "{both}");

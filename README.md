@@ -189,8 +189,9 @@ file; a table it could not load is one `refused` line. `info` prints one
 is required when more than one table is configured. Keys are typed as
 icetray prints them: a long as its digits, a string as its text, a binary
 key as hex with or without `0x`, a uuid hyphenated or as 32 hex digits.
-`--table` on `doctor` and `info` limits the run to one table. `--config` is
-also read from `ICETRAY_CONFIG`.
+`--table` on `doctor` and `info` limits the run to one table. With neither
+`--config` nor `--location`, the file comes from `ICETRAY_CONFIG`; a
+`--location` run ignores the variable.
 
 One table can be opened without a file. `--location` takes a table root or
 a metadata file and opens it under the name `table`, with `--key-column`

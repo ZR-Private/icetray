@@ -948,14 +948,21 @@ first loads run is honoured as soon as they end, cutting the grace short
 and never flipping to `SERVING`.
 
 **One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
-the target vocabulary after the subcommand: `--config <file>` (also
-`ICETRAY_CONFIG`) or `--location <root or metadata file>` (exactly one, a
-clap group), `--rewrite FROM=TO` under either, and four location-only flags
-(`--key-column`, `--value-column`, `--ref`, `--residency`) that conflict
-with `--config`, since clap waives a `requires` whose argument conflicts
-with a present one. A `--location` table is opened under the name `table`,
-never strict (the one-shots exist to report what `strict` would refuse),
-with defaults `key`, `value`, `main`, `full`. The table filter is a
+the target vocabulary after the subcommand: `--config <file>` or
+`--location <root or metadata file>` (at most one; with neither, the file
+`ICETRAY_CONFIG` names, read by `Target::config` rather than by clap, since
+clap cannot tell an environment value from a flag and would report every
+`--location` run under an exported variable as a conflict; no flag and no
+variable is a usage error), `--rewrite FROM=TO` under either, and four
+location-only flags (`--key-column`, `--value-column`, `--ref`,
+`--residency`) that require `--location` and conflict with `--config`,
+both, since clap waives a `requires` whose argument conflicts with a
+present one. A `--location` table is opened under the name `table`, never
+strict (the one-shots exist to report what `strict` would refuse), with
+defaults `key`, `value`, `main`, `full`, and held to every rule
+`Config::parse` checks through `Config::validated`, so `--residency disk`
+with no local directory fails before anything is opened, as the same
+violation in a file does. The table filter is a
 `--table` flag on all three (a positional before `get`'s keys would make a
 key and a table name indistinguishable); `get` needs it when more than one
 table is configured. Keys are typed in the form `Key`'s `Display` prints
@@ -978,8 +985,8 @@ asked; 1 for a load or read error, a table the doctor could not load (which
 dominates 2), a configuration file that cannot be read or parsed, a
 first-load failure, or a bind failure; 2 when the doctor found a cost
 finding (RFD 016); 64 (`sysexits.h`'s `EX_USAGE`) when the command line or
-the target could not be used, including clap's own errors, no table
-matched, a table name required, a key that does not parse, and a bad log
+the target could not be used, including clap's own errors, no target, no
+table matched, a table name required, a key that does not parse, and a bad log
 field mapping, so clap's default exit code 2 is never used and 2 means one
 thing. A reader that closes stdout ends the run with exit 0 and nothing
 more printed. The one-shots log to stderr at `warn`, since their stdout is

@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, KeyType};
 
+use crate::cli::ENV_CONFIG;
 use crate::logging::StandardField;
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
@@ -29,8 +30,8 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
-/// table matched, a table name required, a key that does not parse, an
-/// unknown log field or two under one name. `sysexits.h`'s `EX_USAGE`,
+/// target, no table matched, a table name required, a key that does not
+/// parse, an unknown log field or two under one name. `sysexits.h`'s `EX_USAGE`,
 /// chosen so that 2 means one thing; clap's default usage code of 2 is never
 /// used.
 pub const EXIT_USAGE: u8 = 64;
@@ -167,6 +168,10 @@ pub enum CliError {
     /// A failure inside `icetray-core`: a load or a read.
     #[error(transparent)]
     Core(#[from] icetray_core::Error),
+    /// Neither `--config` nor `--location` was given and `ICETRAY_CONFIG` is
+    /// unset, so there is nothing to open.
+    #[error("pass --config or --location, or set {ENV_CONFIG}")]
+    NoTarget,
     /// The configuration names no table, or none by the name asked for.
     #[error("{}", no_table_matched(name.as_deref()))]
     NoTableMatched {
@@ -226,7 +231,8 @@ impl CliError {
     pub fn exit_code(&self) -> ExitCode {
         let code = match self {
             Self::Core(_) | Self::Io(_) | Self::Json(_) | Self::Serve(_) => EXIT_FAILURE,
-            Self::NoTableMatched { .. }
+            Self::NoTarget
+            | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
             | Self::Key(_)
             | Self::LogField { .. }
@@ -276,6 +282,7 @@ mod tests {
     #[test]
     fn test_exit_code_usage_variants() {
         let cases = [
+            CliError::NoTarget,
             CliError::NoTableMatched { name: None },
             CliError::NoTableMatched {
                 name: Some(TABLE.to_string()),
