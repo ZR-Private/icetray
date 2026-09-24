@@ -1057,7 +1057,8 @@ hedge-disabled and whose `file_io_props` is a `HashMap`), `sim`
 `serve`, `serve_catalog`, `serve_catalog_with`; `expected_cold_gets`,
 `expected_key_pages`, `predicted_probe`; `verify_hits`, `verify_hit_cost`,
 `verify_misses`; `storage_config_for_tests`, `series_value` (one series
-of a Prometheus text exposition by name and labels),
+of a Prometheus text exposition by name and labels, as the `f64` the
+format carries, `None` only when the series is absent),
 `TEST_PAGE_CACHE_BYTES`, and the GET oracle's fixed counts
 `LOAD_METADATA_GETS`, `METADATA_FILE_GETS`, `LOAD_GETS_PER_FILE`,
 `HINT_POLL_GETS`), and

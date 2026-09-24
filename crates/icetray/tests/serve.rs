@@ -300,13 +300,25 @@ fn wire_key(key: &Key) -> v1::Key {
 
 /// The `requests_total` count of `call` in `exposition`: zero before the
 /// first call, when the series is not yet exposed.
-fn calls(exposition: &str, call: telemetry::Call) -> u64 {
+fn calls(exposition: &str, call: telemetry::Call) -> f64 {
     series_value(
         exposition,
         metric::REQUESTS_TOTAL,
         &[(metric::LABEL_CALL, &call.to_string())],
     )
-    .unwrap_or(0)
+    .unwrap_or(0.0)
+}
+
+/// Asserts that `after` counts `expected` more `call`s than `before`. A
+/// counter's integer is exact in the float the exposition carries it as,
+/// so the difference compares exactly.
+fn assert_counted(before: &str, after: &str, call: telemetry::Call, expected: u64) {
+    let added = calls(after, call) - calls(before, call);
+    assert_eq!(
+        added.to_bits(),
+        approx::gauge(expected).to_bits(),
+        "{call}: {added} counted, {expected} expected"
+    );
 }
 
 /// The code of a failed call.
@@ -593,32 +605,21 @@ async fn test_requests_total_counts_every_call() -> TestResult {
 
     let (status, after) = stack.http_get(METRICS_PATH).await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        calls(&after, telemetry::Call::Get),
-        calls(&before, telemetry::Call::Get) + COUNTED_GETS
-    );
-    assert_eq!(
-        calls(&after, telemetry::Call::MultiGet),
-        calls(&before, telemetry::Call::MultiGet) + 1
-    );
-    assert_eq!(
-        calls(&after, telemetry::Call::TableInfo),
-        calls(&before, telemetry::Call::TableInfo) + 1
-    );
-    assert!(
-        after
-            .lines()
-            .any(|line| line.starts_with(metric::PROCESS_RSS_BYTES)),
-        "the sampler ran after the first loads"
-    );
-    let age_series = format!(
-        "{}{{{}=\"{TABLE}\"}}",
+    assert_counted(&before, &after, telemetry::Call::Get, COUNTED_GETS);
+    assert_counted(&before, &after, telemetry::Call::MultiGet, 1);
+    assert_counted(&before, &after, telemetry::Call::TableInfo, 1);
+    let rss = series_value(&after, metric::PROCESS_RSS_BYTES, &[])
+        .expect("the sampler ran after the first loads");
+    assert!(rss > 0.0, "a running process holds memory: {rss}");
+    let age = series_value(
+        &after,
         metric::GENERATION_AGE_SECONDS,
-        metric::LABEL_TABLE
-    );
+        &[(metric::LABEL_TABLE, TABLE)],
+    )
+    .expect("the serving generation's age is sampled");
     assert!(
-        after.lines().any(|line| line.starts_with(&age_series)),
-        "{age_series} is sampled"
+        age >= 0.0,
+        "the snapshot was committed before the scrape: {age}"
     );
     Ok(())
 }

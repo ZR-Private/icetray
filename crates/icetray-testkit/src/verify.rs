@@ -279,14 +279,19 @@ pub async fn verify_misses(served: &Served, fixture: &Fixture, ids: &[u64]) -> R
     Ok(())
 }
 
-/// The value of the series `name` whose labels include every pair in
-/// `labels`, read from a Prometheus text exposition (`name{label="value",
+/// The value of the first series `name` whose labels include every pair
+/// in `labels`, read from a Prometheus text exposition (`name{label="value",
 /// ..} value`), or `None` when no such series is exposed: a counter appears
 /// only after its first count, so a reading before it is zero to the
-/// caller. The whole name must match, so `requests_total` never reads a
-/// `requests_total_bucket` line.
-pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
-    exposition.lines().find_map(|line| {
+/// caller. The value is the float the format defines, so a gauge's fraction
+/// or a counter's integer reads the same way. The whole name must match, so
+/// `requests_total` does not read a `requests_total_bucket` line.
+///
+/// Panics on a matching line whose value is not a float, which a
+/// conforming exposition does not hold, so a malformed value fails the test
+/// rather than reading as absent.
+pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let (line, value) = exposition.lines().find_map(|line| {
         let rest = line.strip_prefix(name)?;
         let (label_text, value) = match rest.strip_prefix('{') {
             Some(labelled) => labelled.split_once('}')?,
@@ -302,18 +307,25 @@ pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Op
         labels
             .iter()
             .all(|pair| present.contains(pair))
-            .then(|| value.trim().parse().ok())?
-    })
+            .then_some((line, value))
+    })?;
+    let parsed = value
+        .split_whitespace()
+        .next()
+        .and_then(|sample| sample.parse().ok());
+    Some(parsed.unwrap_or_else(|| panic!("the sample value of `{line}` is not a float")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The counts the sample exposition carries, one per series.
-    const GETS: u64 = 3;
-    const MULTI_GETS: u64 = 1;
-    const RSS: u64 = 12_345;
+    /// The values the sample exposition carries, one per series.
+    const GETS: f64 = 3.0;
+    const MULTI_GETS: f64 = 1.0;
+    const SERVING: f64 = 1.0;
+    const RSS: f64 = 12_345.0;
+    const AGE: f64 = 2.5;
 
     /// A scrape as the exporter renders it: a comment line, labelled
     /// counters, a two-label gauge, and an unlabelled gauge.
@@ -322,8 +334,9 @@ mod tests {
             "# TYPE requests_total counter
 requests_total{{call=\"get\"}} {GETS}
 requests_total{{call=\"multi_get\"}} {MULTI_GETS}
-table_state{{table=\"a\",state=\"serving\"}} 1
+table_state{{table=\"a\",state=\"serving\"}} {SERVING}
 process_rss_bytes {RSS}
+generation_age_seconds{{table=\"a\"}} {AGE}
 "
         )
     }
@@ -350,9 +363,28 @@ process_rss_bytes {RSS}
                 "table_state",
                 &[("state", "serving"), ("table", "a")]
             ),
-            Some(1)
+            Some(SERVING)
         );
         assert_eq!(series_value(&scrape, "process_rss_bytes", &[]), Some(RSS));
+    }
+
+    #[test]
+    fn test_series_value_reads_a_fractional_value_as_present() {
+        let scrape = exposition();
+        assert_eq!(
+            series_value(&scrape, "generation_age_seconds", &[("table", "a")]),
+            Some(AGE)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a float")]
+    fn test_series_value_panics_on_a_value_that_is_not_a_float() {
+        series_value(
+            "requests_total{call=\"get\"} three\n",
+            "requests_total",
+            &[],
+        );
     }
 
     #[test]

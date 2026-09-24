@@ -155,7 +155,7 @@ mod tests {
                 &[(metric::LABEL_CALL, &call)],
             )
             .unwrap_or_else(|| panic!("{call} in {exposition}"));
-            assert!(value >= 1, "{value}");
+            assert!(value >= 1.0, "{value}");
         }
     }
 }

@@ -629,19 +629,17 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
 
     let (status, exposition) = http_get(metrics, METRICS_PATH).await?;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        exposition
-            .lines()
-            .any(|line| line.starts_with(PROCESS_RSS_BYTES)),
-        "the scrape carries the process's memory"
-    );
+    let rss = series_value(&exposition, PROCESS_RSS_BYTES, &[])
+        .expect("the scrape carries the process's memory");
+    assert!(rss > 0.0, "a running process holds memory: {rss}");
     assert_eq!(
         series_value(
             &exposition,
             TABLE_STATE,
             &[(LABEL_TABLE, TABLE_A), (LABEL_STATE, &serving_state())]
-        ),
-        Some(1),
+        )
+        .map(f64::to_bits),
+        Some(1.0_f64.to_bits()),
         "the scrape carries the table's state"
     );
 
