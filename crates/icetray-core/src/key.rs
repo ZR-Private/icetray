@@ -75,9 +75,10 @@ impl KeyType {
     }
 
     /// Whether every key of the type has one width: a `long` is eight bytes
-    /// and a `uuid` sixteen, while `string` and `binary` keys vary. A
-    /// fixture writer sizes its columns by it. The match names every
-    /// variant, so a new key type decides here and nowhere else.
+    /// and a `uuid` sixteen, while `string` and `binary` keys vary. The
+    /// testkit's fixture writer consults it to refuse padding a fixed-width
+    /// key. The match names every variant without a wildcard, so a new key
+    /// type does not compile until it states its width here.
     pub fn is_fixed_width(self) -> bool {
         match self {
             Self::Long | Self::Uuid => true,

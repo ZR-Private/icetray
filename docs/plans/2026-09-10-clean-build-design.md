@@ -148,7 +148,8 @@ impl KeyType {
     /// into `Error::Refused { reason: RefusalReason::KeyTypeUnsupported }` (RFD 008).
     pub fn from_iceberg(ty: &iceberg::spec::Type) -> Option<Self>;
     /// Whether every key of the type has one width: `Long` and `Uuid`; exhaustive, so a
-    /// new key type decides here. A fixture writer sizes its columns by it.
+    /// new key type states its width here before it compiles. The fixture writer
+    /// consults it to refuse padding a fixed-width key.
     pub fn is_fixed_width(self) -> bool;
 }
 /// `Ord` is the served order per type: numeric, UTF-8 bytes, bytewise, and for
