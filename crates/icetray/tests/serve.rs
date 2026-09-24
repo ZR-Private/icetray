@@ -12,6 +12,7 @@ use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
+use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, metric};
@@ -367,7 +368,7 @@ async fn test_table_info_describes_the_served_snapshot() -> TestResult {
     assert_eq!(info.records, SMALL_IDS.end - SMALL_IDS.start);
     assert_eq!(info.key_type, i32::from(v1::KeyType::Long));
     assert_eq!(info.snapshot_id, generation.snapshot_id.0);
-    assert_eq!(info.index_bytes, u64::try_from(generation.index_bytes)?);
+    assert_eq!(info.index_bytes, approx::count(generation.index_bytes));
     Ok(())
 }
 
@@ -378,7 +379,7 @@ async fn test_get_costs_one_get_cold_and_none_warm_or_absent() -> TestResult {
     let generation = stack.generation();
     let keys = stack.fixtures[0].keys_at(&SAMPLE[..COLD_IDS]);
     let expected = expected_cold_gets(&generation, &keys)?;
-    assert_eq!(expected, u64::try_from(COLD_IDS)?, "the ids share no page");
+    assert_eq!(expected, approx::count(COLD_IDS), "the ids share no page");
 
     let before = stack.stats.gets();
     for key in &keys {

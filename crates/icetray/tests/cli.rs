@@ -14,6 +14,7 @@ use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
+use icetray_core::approx;
 use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
 use icetray_core::{Key, KeyType, SnapshotId, TableState};
 use icetray_testkit::fixture::{
@@ -215,7 +216,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     assert!(report.iter().all(|line| line["kind"] != "finding"));
     assert_eq!(
         report.iter().filter(|line| line["kind"] == "file").count(),
-        usize::try_from(SMALL_BUCKETS)?
+        approx::length(SMALL_BUCKETS)
     );
     Ok(())
 }

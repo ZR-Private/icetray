@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use icetray_core::approx;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{Error, Key, KeyType, Opened, Table, Value};
 use icetray_proto::v1;
@@ -160,11 +161,6 @@ fn key_type_wire(key_type: KeyType) -> v1::KeyType {
     }
 }
 
-/// A count held in memory as the wire's `uint64`.
-fn wire_count(count: usize) -> u64 {
-    u64::try_from(count).expect("a usize is at most 64 bits on the supported targets")
-}
-
 #[tonic::async_trait]
 impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -231,10 +227,10 @@ impl Icetray for Service {
                 .layout
                 .bucketing
                 .map_or(0, |bucketing| bucketing.count),
-            data_files: wire_count(generation.files.len()),
+            data_files: approx::count(generation.files.len()),
             records: generation.records,
             key_type: i32::from(key_type_wire(generation.layout.key_type)),
-            index_bytes: wire_count(generation.index_bytes),
+            index_bytes: approx::count(generation.index_bytes),
         }))
     }
 }
