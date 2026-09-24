@@ -410,9 +410,8 @@ impl FileIndex {
     /// Refuses, typed under `Error::Refused` for `table`: a key column
     /// whose physical type does not match `key_type` (`Binary` accepts
     /// `BYTE_ARRAY` and `FIXED_LEN_BYTE_ARRAY`, `Uuid` a
-    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), in the Disk tier the
-    /// absence of a local directory, in the Bloom tier a row group without
-    /// a key bloom filter, then, once the chunks are decoded, a null key, a
+    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), in the Bloom tier a row
+    /// group without a key bloom filter, then, once the chunks are decoded, a null key, a
     /// key below the one before it or a row group starting below the
     /// previous one's last key, a key repeated, and a key over
     /// `contract::MAX_KEY_BYTES`. A file that is malformed for serving is
@@ -423,7 +422,10 @@ impl FileIndex {
     /// describe its pages, an unbounded or undecodable bloom filter, a
     /// string key that is not UTF-8, a key page holding other rows than
     /// its offset index says. Footer checks run before any chunk is
-    /// fetched; `inspect` is that stage on its own.
+    /// fetched; `inspect` is that stage on its own. The Disk tier with no
+    /// local directory is `Error::Config` with
+    /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
+    /// fetched.
     ///
     /// Full keeps the chunks in memory. Disk reuses a chunk file in `local`
     /// whose identity matches and holds every chunk (reading the chunks

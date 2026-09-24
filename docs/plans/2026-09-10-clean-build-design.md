@@ -469,10 +469,11 @@ impl FileIndex {
     /// Refuses (typed, under `table`) an unsorted key column, a null key, a
     /// key repeated within the file, a key physical type that does not match
     /// `key_type` (Binary accepts BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY), keys
-    /// over the cap, in the Bloom tier a row group without a key bloom
-    /// filter, and in the Disk tier the absence of a local directory; a value
-    /// column whose physical type is neither BYTE_ARRAY nor
-    /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`. Every tier
+    /// over the cap, and in the Bloom tier a row group without a key bloom
+    /// filter; a value column whose physical type is neither BYTE_ARRAY nor
+    /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`. The Disk tier
+    /// with no local directory is `Error::Config` with
+    /// `ConfigViolation::DiskResidencyWithoutLocalDir`. Every tier
     /// streams the key chunks once for verification, checking every key page
     /// against its offset index; Full keeps the chunks in memory, Disk writes
     /// them through `LocalDir` (or reuses a chunk file with matching identity

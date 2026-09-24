@@ -32,10 +32,10 @@ use crate::parquet_io::{FileHandle, Segments};
 impl Inspected {
     /// The chunk stage of `FileIndex::build`: streams the key chunks once
     /// for verification and keeps what `residency` keeps, as `build`
-    /// documents. The Disk tier with no local directory is the one rule of
-    /// `Config::parse` a configuration built in code can still break, so it
-    /// is raised here as the same `ConfigViolation`, before any chunk is
-    /// fetched.
+    /// documents. The Disk tier with no local directory is the one rule the
+    /// loader re-checks, since a configuration built in code may skip
+    /// `Config::validated`; it is raised here as the same
+    /// `ConfigViolation`, before any chunk is fetched.
     pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex> {
         let Self {
             table,
