@@ -438,7 +438,7 @@ async fn test_many_files_per_bucket_is_advice() -> Result<()> {
     let report = diagnose(&served.current());
     assert_codes(&report, &[], &[FindingCode::ManyFilesPerBucket]);
     assert!(
-        u64::try_from(report.summary.max_files_per_bucket).unwrap() > FILES_PER_BUCKET_FACTOR,
+        approx::count(report.summary.max_files_per_bucket) > FILES_PER_BUCKET_FACTOR,
         "{} files in the fullest bucket",
         report.summary.max_files_per_bucket
     );

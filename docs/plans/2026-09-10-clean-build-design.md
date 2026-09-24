@@ -1067,8 +1067,9 @@ of a Prometheus text exposition by name and labels),
 `TARGET_FILE_BYTES_MAX`, `KEY_BYTES_ADVICE`, `MAX_KEY_BYTES`, and
 `PAGE_CACHE_DISK_BLOCK_BYTES` are imported from `contract` and never
 redeclared; the golden key derivations delegate to `keys`; a `usize`
-widens to `u64` through core's `approx::count` alone. Everything is
-test-only, under `[dev-dependencies]` of the crates that use it.
+widens to `u64` through core's `approx::count`, and a `u64` or `u32`
+narrows to `usize` through `approx::length`. Everything is test-only,
+under `[dev-dependencies]` of the crates that use it.
 
 The fixture writer commits through the Iceberg library's `ClusteredWriter`
 over the rolling data-file writer under `Layout::properties`, grouping ids

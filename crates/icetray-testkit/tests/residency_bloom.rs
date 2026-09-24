@@ -300,7 +300,7 @@ async fn test_bloom_reverifies_grown_groups_by_refetching_chunks() -> Result<()>
     let generation = tiers.bloom.current();
     assert_eq!(
         generation.overlap_groups_verified(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     verify_bloom_hit_cost(&tiers, &fixture, &INTERLEAVED_SAMPLE).await?;
 
@@ -318,11 +318,11 @@ async fn test_bloom_reverifies_grown_groups_by_refetching_chunks() -> Result<()>
     let generation = refresh_both_tiers_priced(&tiers).await?;
     assert_eq!(
         generation.overlap_groups_verified(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     assert_eq!(
         generation.overlapping_buckets().len(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     assert!(
         generation

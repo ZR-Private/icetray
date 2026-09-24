@@ -4,7 +4,7 @@
 //! for `multi_get`, and the GET costs of the layouts the doctor prices or
 //! advises on; `findings.rs` holds the doctor's verdicts on them.
 
-use icetray_core::approx::count;
+use icetray_core::approx::{count, length};
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
 use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Value, diagnose};
@@ -77,7 +77,7 @@ async fn round_trip(spec: FixtureSpec) -> Result<()> {
     let generation = served.current();
     assert_eq!(
         generation.files.len(),
-        usize::try_from(SMALL_BUCKETS).expect("sixteen buckets fit usize"),
+        length(SMALL_BUCKETS),
         "one file per bucket"
     );
     assert_eq!(generation.records, SMALL_IDS.end);
@@ -137,7 +137,7 @@ async fn test_get_several_files_per_bucket() -> Result<()> {
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let generation = served.current();
     assert!(
-        generation.files.len() > usize::try_from(SMALL_BUCKETS).expect("sixteen buckets fit usize"),
+        generation.files.len() > length(SMALL_BUCKETS),
         "rolling produced several files per bucket: {}",
         generation.files.len()
     );
@@ -361,7 +361,7 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
 async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let mut per_layout = Vec::new();
-    let byte_bound = usize::try_from(VALUE_PAGE_BYTES).unwrap();
+    let byte_bound = length(VALUE_PAGE_BYTES);
     for (name, page_bytes) in [("kv_wide_rows", None), ("kv_wide_bytes", Some(byte_bound))] {
         let spec = FixtureSpec {
             value_bytes: WIDE_VALUE_BYTES,

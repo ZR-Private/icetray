@@ -2,7 +2,7 @@
 //! `Layout::contract()` is RFD 002's shape; every other fixture is a struct
 //! update on it, so a test names only the clause it departs from.
 
-use icetray_core::approx::count;
+use icetray_core::approx::{count, length};
 use icetray_core::contract;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
@@ -118,8 +118,7 @@ impl Layout {
             statistics: Statistics::Full,
             bloom: Bloom::Sized,
             row_group_rows: None,
-            target_file_bytes: usize::try_from(contract::TARGET_FILE_BYTES_MAX)
-                .expect("the contract's file size fits usize"),
+            target_file_bytes: length(contract::TARGET_FILE_BYTES_MAX),
         }
     }
 
@@ -203,11 +202,11 @@ mod tests {
     fn test_contract_derives_from_contract_constants() {
         let layout = Layout::contract();
         assert_eq!(
-            u64::try_from(layout.page_rows).unwrap(),
+            count(layout.page_rows),
             u64::try_from(contract::PAGE_ROWS).unwrap()
         );
         assert_eq!(
-            u64::try_from(layout.target_file_bytes).unwrap(),
+            count(layout.target_file_bytes),
             contract::TARGET_FILE_BYTES_MAX
         );
         assert_eq!(layout.page_bytes, None);
@@ -233,7 +232,7 @@ mod tests {
         let sized = Layout::contract().properties(ROWS);
         let filter = sized.bloom_filter_properties(&key).unwrap();
         assert_eq!(filter.fpp.to_bits(), KEY_BLOOM_FPP.to_bits());
-        assert_eq!(filter.ndv, u64::try_from(ROWS).unwrap());
+        assert_eq!(filter.ndv, count(ROWS));
         assert!(sized.bloom_filter_properties(&value).is_none());
 
         let rated = Layout {

@@ -213,7 +213,7 @@ fn run_cold(seed: u64, written: &Written) -> Outcome {
         let served = serve_in_sim(storage, config, TableSource::Static { location }).await?;
         let load = turmoil::elapsed().saturating_sub(started);
         let load_gets = stats.gets();
-        let files = u64::try_from(served.current().files.len())?;
+        let files = approx::count(served.current().files.len());
 
         let before = stats.gets();
         let started = turmoil::elapsed();
@@ -307,7 +307,7 @@ fn run_tail(
     let root = written.dir.path().to_path_buf();
     let config = written.fixture.config(Residency::Full, false);
     let location = written.fixture.metadata_location().to_string();
-    let warm_up = u64::try_from(HEDGE_WINDOW).expect("the window fits u64");
+    let warm_up = approx::count(HEDGE_WINDOW);
     let keys: Vec<Key> = (0..warm_up + measured)
         .map(|i| written.fixture.key(i * stride))
         .collect();

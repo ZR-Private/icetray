@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
+use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::{Error, ErrorKind, KeyType, RefusalReason, TableSource, TableState, Value};
 use icetray_testkit::fixture::{
@@ -84,7 +85,7 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
         .filter(|file| v1.files.iter().any(|old| Arc::ptr_eq(old, file)))
         .count();
     assert_eq!(reused, v1.files.len(), "v1's files are shared by pointer");
-    let new_files = u64::try_from(v2.files.len() - reused).unwrap();
+    let new_files = approx::count(v2.files.len() - reused);
     assert_eq!(
         stats.gets() - before,
         REFRESH_METADATA_GETS + LOAD_GETS_PER_FILE * new_files,
@@ -272,7 +273,7 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     );
     assert_eq!(
         generation.overlapping_buckets().len(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     assert!(
         generation
@@ -282,7 +283,7 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     );
     assert_eq!(
         generation.overlap_groups_verified(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     let served = verify::verify_hit_cost(served, &fixture, &INTERLEAVED_SAMPLE).await?;
     verify::verify_misses(&served, &fixture, &INTERLEAVED_SAMPLE).await?;
@@ -310,7 +311,7 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     let generation = served.current();
     assert_eq!(
         generation.overlap_groups_verified(),
-        usize::try_from(INTERLEAVED_BUCKETS).unwrap()
+        approx::length(INTERLEAVED_BUCKETS)
     );
     assert!(
         generation
@@ -320,9 +321,6 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     );
     let fresh = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     verify::verify_hit_cost(fresh, &fixture, &NEWEST_SAMPLE).await?;
-    assert_eq!(
-        generation.records,
-        u64::try_from(fixture.ids().count()).unwrap()
-    );
+    assert_eq!(generation.records, approx::count(fixture.ids().count()));
     Ok(())
 }

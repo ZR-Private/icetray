@@ -11,6 +11,7 @@ use iceberg::CatalogBuilder as _;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use icetray_core::KeyType;
+use icetray_core::approx;
 use icetray_core::config::{Residency, SourceConfig, TableConfig};
 use icetray_core::{TableSource, Value};
 use icetray_testkit::error::{Precondition, REST_URI_VAR, required_var};
@@ -60,10 +61,7 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
     )
     .await?;
     let generation = served.current();
-    assert_eq!(
-        generation.records,
-        u64::try_from(fixture.ids().count()).unwrap()
-    );
+    assert_eq!(generation.records, approx::count(fixture.ids().count()));
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
         served.table.get(&old_key).await?.value,
