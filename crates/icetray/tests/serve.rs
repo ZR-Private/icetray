@@ -26,8 +26,10 @@ use icetray_testkit::verify::{expected_cold_gets, series_value};
 use icetray_testkit::{
     Fixture, FixtureSpec, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3, write_fixture,
 };
+use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
+use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -111,6 +113,10 @@ const DISPATCH_DELAY: Duration = Duration::from_millis(20);
 /// counter for every test in this binary. Every test that issues an RPC
 /// holds this lock, so the counting test's deltas are exact.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A health `Watch` being collected: every status the stream sent, once
+/// the server has ended it.
+type Watching = JoinHandle<Result<Vec<ServingStatus>, BoxError>>;
 
 /// A running daemon over fixtures in the in-process S3 server, with the
 /// clients to drive it, the catalog the fixtures were written through, and
@@ -213,6 +219,26 @@ impl Stack {
     /// The health status of `service`.
     async fn health_status(&mut self, service: &str) -> Result<ServingStatus, BoxError> {
         health_status(&mut self.health, service).await
+    }
+
+    /// Opens a `Watch` of `service` and collects, in a task, every status
+    /// it sends until the server ends the stream. The watch is registered
+    /// with the health service when this returns.
+    async fn watch_health(&mut self, service: &str) -> Result<Watching, BoxError> {
+        let mut stream = self
+            .health
+            .watch(HealthCheckRequest {
+                service: service.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(tokio::spawn(async move {
+            let mut statuses = Vec::new();
+            while let Some(response) = stream.message().await? {
+                statuses.push(ServingStatus::try_from(response.status)?);
+            }
+            Ok(statuses)
+        }))
     }
 
     /// One `Get` of `key` on `table`.
@@ -662,6 +688,64 @@ async fn test_shutdown_drains_and_returns_ok() -> TestResult {
     let response = in_flight.await??.into_inner();
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
     tokio::time::timeout(SHUTDOWN_WAIT, stack.serving.join()).await??;
+    Ok(())
+}
+
+/// A client watching health holds a stream open, and tonic's graceful
+/// shutdown waits for every connection to close; the drain sends
+/// `NOT_SERVING` on both health names and ends their watches, so the run
+/// returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_ends_health_watches_so_the_drain_finishes() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_small().await?;
+    let watches = [
+        stack.watch_health(OVERALL_SERVICE).await?,
+        stack.watch_health(SERVICE_NAME).await?,
+    ];
+    stack.serving.shutdown();
+    tokio::time::timeout(SHUTDOWN_WAIT, stack.serving.join()).await??;
+    for watch in watches {
+        let statuses = tokio::time::timeout(SHUTDOWN_WAIT, watch).await???;
+        assert_eq!(statuses.first(), Some(&ServingStatus::Serving));
+        assert_eq!(statuses.last(), Some(&ServingStatus::NotServing));
+    }
+    Ok(())
+}
+
+/// A failed start ends the run on its own once the grace is over, and the
+/// watches opened during the grace end with it rather than hold the drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_failed_start_ends_health_watches_so_the_run_ends() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.tables[0].residency = Residency::Disk;
+            setup.options.start_failure_grace = REFRESH_WAIT;
+            Ok(())
+        },
+    )
+    .await?;
+    let watches = [
+        stack.watch_health(OVERALL_SERVICE).await?,
+        stack.watch_health(SERVICE_NAME).await?,
+    ];
+    let outcome = tokio::time::timeout(SHUTDOWN_WAIT, stack.serving.join()).await?;
+    assert!(
+        matches!(outcome, Err(ServeError::FirstLoad { .. })),
+        "expected a first-load failure, got {outcome:?}"
+    );
+    for watch in watches {
+        let statuses = tokio::time::timeout(SHUTDOWN_WAIT, watch).await???;
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == ServingStatus::NotServing),
+            "{statuses:?}"
+        );
+        assert!(!statuses.is_empty());
+    }
     Ok(())
 }
 

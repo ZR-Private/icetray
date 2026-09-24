@@ -2,10 +2,11 @@
 //! service registered before any table loads, every table loaded
 //! concurrently, readiness and `SERVING` once every table serves, one
 //! refresh task per table and one sampler on the poll interval, and a drain
-//! on shutdown that finishes in-flight calls and flushes the page cache's
-//! disk level. A first-load failure keeps health `NOT_SERVING` for a grace
-//! period, so an orchestrator's probe sees it, then ends the run; a
-//! periodic task that panics ends the run at once, with the task named.
+//! on shutdown that ends health watches, finishes in-flight calls, and
+//! flushes the page cache's disk level. A first-load failure keeps health
+//! `NOT_SERVING` for a grace period, so an orchestrator's probe sees it,
+//! then ends the run; a periodic task that panics ends the run at once,
+//! with the task named.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -18,7 +19,7 @@ use futures::future::join_all;
 use icetray_core::config::{Config, ServerConfig};
 use icetray_core::open::open_with;
 use icetray_core::{ErrorKind, Opened, Storage, Table, open};
-use icetray_proto::v1::icetray_server::IcetrayServer;
+use icetray_proto::v1::icetray_server::{IcetrayServer, SERVICE_NAME};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -42,6 +43,10 @@ pub const START_FAILURE_GRACE: Duration = Duration::from_secs(10);
 
 /// The gRPC health protocol's name for the server as a whole.
 pub const OVERALL_SERVICE: &str = "";
+
+/// Every name the health service answers for: the server as a whole and
+/// the `Icetray` service, which change status together.
+const HEALTH_NAMES: [&str; 2] = [OVERALL_SERVICE, SERVICE_NAME];
 
 /// What a caller of `Serving::start` chooses; the binary takes the defaults
 /// and tests shorten the grace.
@@ -137,10 +142,7 @@ impl Serving {
         options: ServeOptions,
     ) -> Self {
         let (health, health_service) = tonic_health::server::health_reporter();
-        health.set_not_serving::<IcetrayServer<Service>>().await;
-        health
-            .set_service_status(OVERALL_SERVICE, ServingStatus::NotServing)
-            .await;
+        set_health(&health, ServingStatus::NotServing).await;
 
         let opened = Arc::new(opened);
         let service = Service::new(&opened);
@@ -373,10 +375,7 @@ impl Run {
 
         retain(&self.opened).await;
         telemetry::sample(&self.opened, &self.handle);
-        self.health.set_serving::<IcetrayServer<Service>>().await;
-        self.health
-            .set_service_status(OVERALL_SERVICE, ServingStatus::Serving)
-            .await;
+        set_health(&self.health, ServingStatus::Serving).await;
         self.ready.send_modify(|ready| *ready = true);
 
         let mut periodic = Periodic::new();
@@ -424,17 +423,42 @@ impl Run {
         Err(error)
     }
 
-    /// Waits for the servers to finish their in-flight work and closes the
-    /// page cache, so the disk level is flushed before the process exits
-    /// (RFD 017).
+    /// Ends every health watch, waits for the servers to finish their
+    /// in-flight work, and closes the page cache, so the disk level is
+    /// flushed before the process exits (RFD 017). tonic's graceful shutdown
+    /// waits for every connection to close, and a `Watch` stream the health
+    /// service still feeds would hold its connection open without end.
     async fn drain(self) -> Result<(), ServeError> {
         let Self {
-            grpc, http, opened, ..
+            mut health,
+            grpc,
+            http,
+            opened,
+            ..
         } = self;
+        withdraw_health(&mut health).await;
         grpc.await??;
         http.await?;
         opened.cache.close().await?;
         Ok(())
+    }
+}
+
+/// Sets every health name to `status`, which every watch of it is sent.
+async fn set_health(health: &HealthReporter, status: ServingStatus) {
+    for name in HEALTH_NAMES {
+        health.set_service_status(name, status).await;
+    }
+}
+
+/// Sets every health name `NOT_SERVING`, then removes it. Removing a name
+/// drops its status sender, so every `Watch` stream on it ends after the
+/// `NOT_SERVING` it has not yet sent; a check or watch that arrives later
+/// is answered `NOT_FOUND` at once instead of opening a stream.
+async fn withdraw_health(health: &mut HealthReporter) {
+    set_health(health, ServingStatus::NotServing).await;
+    for name in HEALTH_NAMES {
+        health.clear_service_status(name).await;
     }
 }
 

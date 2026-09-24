@@ -958,7 +958,11 @@ recorder installs once per process and every later caller gets the same
 handle. SIGTERM or SIGINT drains in-flight requests, flushes the page
 cache's disk level (RFD 017), and exits 0; a shutdown asked for while the
 first loads run is honoured as soon as they end, cutting the grace short
-and never flipping to `SERVING`.
+and never flipping to `SERVING`. Every drain, after a shutdown or a failed
+run, first sets both health names `NOT_SERVING` and then removes them,
+which ends every `Health/Watch` stream: tonic's graceful shutdown waits for
+every connection to close, and an open watch would hold its connection,
+and the drain, without end.
 
 **One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
 the target vocabulary after the subcommand: `--config <file>` or
