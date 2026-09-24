@@ -185,6 +185,24 @@ pub(crate) fn bits_per_key(bytes: u64, rows: u64) -> f64 {
     approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows)
 }
 
+/// A total of per-row-group or per-file predictions that stays at
+/// `u64::MAX` where the plain sum would overflow. A footer that lies can
+/// saturate one file's prediction (see `ResidentSet`), so a total over two
+/// such files would otherwise panic in a debug build and wrap to a small
+/// number in a release one.
+pub(crate) fn saturating_sum(values: impl IntoIterator<Item = u64>) -> u64 {
+    values.into_iter().fold(0, u64::saturating_add)
+}
+
+/// `saturating_sum` of predictions any of which may be absent, as a
+/// missing bloom filter makes one: `None` when any value is.
+pub(crate) fn saturating_sum_all(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values
+        .into_iter()
+        .collect::<Option<Vec<u64>>>()
+        .map(saturating_sum)
+}
+
 /// The page a key would decode and, when it can be named without I/O, the
 /// value page its row would fetch; for tests and the doctor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

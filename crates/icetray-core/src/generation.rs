@@ -481,15 +481,16 @@ fn check_budget<'a>(
     match config.residency {
         Residency::Full => {
             if let Some(budget) = config.resident_budget_bytes {
-                let needed = reused
-                    .iter()
-                    .map(|file| approx::count(file.index.resident_bytes()))
-                    .chain(
-                        inspected
-                            .iter()
-                            .map(|(_, inspected)| inspected.predicted().full),
-                    )
-                    .fold(0, u64::saturating_add);
+                let needed = index::saturating_sum(
+                    reused
+                        .iter()
+                        .map(|file| approx::count(file.index.resident_bytes()))
+                        .chain(
+                            inspected
+                                .iter()
+                                .map(|(_, inspected)| inspected.predicted().full),
+                        ),
+                );
                 if needed > budget {
                     return Err(Error::refused(
                         table,

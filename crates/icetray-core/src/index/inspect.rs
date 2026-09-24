@@ -14,6 +14,7 @@ use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 use super::build::reusable_disk_chunks;
 use super::{
     FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of,
+    saturating_sum, saturating_sum_all,
 };
 use crate::approx;
 use crate::error::{Error, RefusalReason, Result};
@@ -390,25 +391,20 @@ impl ResidentSet {
                 .iter()
                 .map(|group| group.column(key_leaf))
         };
-        let filters = key_columns()
-            .map(|column| {
-                let range = filter_range(
-                    column.bloom_filter_offset()?,
-                    column.bloom_filter_length(),
-                    file_size,
-                )?;
-                Some(range.end - range.start)
-            })
-            .try_fold(0, |sum: u64, len| len.map(|len| sum.saturating_add(len)));
+        let filters = saturating_sum_all(key_columns().map(|column| {
+            let range = filter_range(
+                column.bloom_filter_offset()?,
+                column.bloom_filter_length(),
+                file_size,
+            )?;
+            Some(range.end - range.start)
+        }));
         let placed: Vec<Range<u64>> = key_columns()
             .filter_map(|column| chunk_range(column, file_size))
             .collect();
         Self {
             footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
-            key_chunks: placed
-                .iter()
-                .map(|range| range.end - range.start)
-                .fold(0, u64::saturating_add),
+            key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
             chunk_file: chunk_file_bytes(&identity_of(handle), &placed),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),

@@ -17,7 +17,7 @@ use crate::approx;
 use crate::config::Residency;
 use crate::contract;
 use crate::generation::{Generation, LoadedFile};
-use crate::index::{FileIndex, ResidentBytes, bits_per_key};
+use crate::index::{FileIndex, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all};
 use crate::key::{Key, KeyType};
 use crate::manifest::{DataFileEntry, TableLayout};
 use crate::snapshot::SnapshotId;
@@ -1082,22 +1082,26 @@ fn sort_findings(findings: &mut [Finding]) {
 }
 
 /// Every tier's resident bytes for the table, from the footers alone: each
-/// file's prediction summed per tier. `bloom` is `None` when any file's is,
-/// since the Bloom tier could not load that file, and its bits per key is
-/// the ratio of the summed filter bits to the summed rows.
+/// file's prediction summed per tier, saturating at `u64::MAX` as each
+/// file's does. `bloom` is `None` when any file's is, since the Bloom tier
+/// could not load that file, and its bits per key is the ratio of the
+/// summed filter bits to the summed rows.
 fn predicted_total(facts: &[FileFacts]) -> ResidentBytes {
-    let filters: Option<u64> = facts.iter().map(|file| file.predicted.filter_bytes).sum();
-    let rows: u64 = facts.iter().map(|file| file.rows).sum();
+    let sum = |field: fn(&ResidentBytes) -> u64| {
+        saturating_sum(facts.iter().map(|file| field(&file.predicted)))
+    };
+    let sum_all = |field: fn(&ResidentBytes) -> Option<u64>| {
+        saturating_sum_all(facts.iter().map(|file| field(&file.predicted)))
+    };
+    let filters = sum_all(|predicted| predicted.filter_bytes);
+    let rows = saturating_sum(facts.iter().map(|file| file.rows));
     ResidentBytes {
-        full: facts.iter().map(|file| file.predicted.full).sum(),
-        disk_memory: facts.iter().map(|file| file.predicted.disk_memory).sum(),
-        disk_bytes: facts.iter().map(|file| file.predicted.disk_bytes).sum(),
-        bloom: facts.iter().map(|file| file.predicted.bloom).sum(),
+        full: sum(|predicted| predicted.full),
+        disk_memory: sum(|predicted| predicted.disk_memory),
+        disk_bytes: sum(|predicted| predicted.disk_bytes),
+        bloom: sum_all(|predicted| predicted.bloom),
         bloom_bits_per_key: filters.map(|bytes| bits_per_key(bytes, rows)),
-        key_chunk_bytes: facts
-            .iter()
-            .map(|file| file.predicted.key_chunk_bytes)
-            .sum(),
+        key_chunk_bytes: sum(|predicted| predicted.key_chunk_bytes),
         filter_bytes: filters,
     }
 }
@@ -1732,6 +1736,38 @@ mod tests {
         assert!(extremes.most_bytes_per_key.0 >= file_bytes);
         assert!(extremes.fewest_bits_per_key.1 < groups);
         assert!(extremes.most_bytes_per_key.1 < groups);
+    }
+
+    #[tokio::test]
+    async fn test_predicted_total_saturates_as_each_file_does() {
+        let (_table, generation) = one_file(WriterLayout::contract()).await;
+        let saturated = || {
+            let mut facts = measure(&generation.files[0], &generation.layout);
+            facts.rows = u64::MAX;
+            facts.predicted = ResidentBytes {
+                full: u64::MAX,
+                disk_memory: u64::MAX,
+                disk_bytes: u64::MAX,
+                bloom: Some(u64::MAX),
+                bloom_bits_per_key: None,
+                key_chunk_bytes: u64::MAX,
+                filter_bytes: Some(u64::MAX),
+            };
+            facts
+        };
+        let total = predicted_total(&[saturated(), saturated()]);
+        assert_eq!(
+            total,
+            ResidentBytes {
+                full: u64::MAX,
+                disk_memory: u64::MAX,
+                disk_bytes: u64::MAX,
+                bloom: Some(u64::MAX),
+                bloom_bits_per_key: Some(bits_per_key(u64::MAX, u64::MAX)),
+                key_chunk_bytes: u64::MAX,
+                filter_bytes: Some(u64::MAX),
+            }
+        );
     }
 
     #[tokio::test]
