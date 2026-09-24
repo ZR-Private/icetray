@@ -141,6 +141,8 @@ pub const UUID_BYTES: usize = 16;
 pub const HEX_DIGITS_PER_BYTE: usize = 2;
 pub enum KeyType { Long, String, Binary, Uuid }
 impl KeyType {
+    /// Every key type in declaration order; a test compares it to an exhaustive successor match.
+    pub const ALL: [Self; 4];
     /// long -> Long; string -> String; binary and fixed -> Binary; uuid -> Uuid.
     /// Every other type is `None`; the caller that owns the table name turns it
     /// into `Error::Refused { reason: RefusalReason::KeyTypeUnsupported }` (RFD 008).

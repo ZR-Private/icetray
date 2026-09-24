@@ -56,14 +56,6 @@ pub(super) const FEW_ROWS: usize = 8;
 /// The write batch under a byte bound: the writer checks the bound
 /// between batches, so a small batch makes the bound bind (RFD 002).
 pub(super) const SMALL_BATCH: usize = 8;
-/// The key types.
-pub(super) const KEY_TYPES: [KeyType; 4] = [
-    KeyType::Long,
-    KeyType::String,
-    KeyType::Binary,
-    KeyType::Uuid,
-];
-
 pub(super) fn page_rows() -> usize {
     usize::try_from(PAGE_ROWS).unwrap()
 }

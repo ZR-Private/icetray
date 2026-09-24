@@ -41,6 +41,11 @@ pub enum KeyType {
 }
 
 impl KeyType {
+    /// Every key type, in declaration order, for a caller that covers each.
+    /// Complete: a successor match over every variant, which a new variant
+    /// fails to compile, is compared to this list in tests.
+    pub const ALL: [Self; 4] = [Self::Long, Self::String, Self::Binary, Self::Uuid];
+
     /// The key type an Iceberg column type maps to: long to `Long`, string
     /// to `String`, binary and fixed of any length to `Binary`, uuid to
     /// `Uuid`. Every other type, primitive or nested, is `None`; the caller
@@ -505,6 +510,28 @@ mod tests {
         compared
     }
 
+    /// The key type after `key_type` in declaration order, `None` after the
+    /// last. The match names every variant, so a variant added to the enum
+    /// fails to compile here until it is placed in the chain, and the chain
+    /// is what `ALL` is checked against.
+    fn after(key_type: KeyType) -> Option<KeyType> {
+        match key_type {
+            KeyType::Long => Some(KeyType::String),
+            KeyType::String => Some(KeyType::Binary),
+            KeyType::Binary => Some(KeyType::Uuid),
+            KeyType::Uuid => None,
+        }
+    }
+
+    #[test]
+    fn test_all_lists_every_key_type_once_in_declaration_order() {
+        let mut chain = vec![KeyType::ALL[0]];
+        while let Some(next) = after(*chain.last().unwrap()) {
+            chain.push(next);
+        }
+        assert_eq!(chain, KeyType::ALL);
+    }
+
     #[test]
     fn test_fmt_key_type_lowercase_iceberg_names() {
         let cases = [
@@ -513,6 +540,7 @@ mod tests {
             (KeyType::Binary, "binary"),
             (KeyType::Uuid, "uuid"),
         ];
+        assert_eq!(cases.map(|(key_type, _)| key_type), KeyType::ALL);
         for (key_type, name) in cases {
             assert_eq!(key_type.to_string(), name);
         }
@@ -520,12 +548,7 @@ mod tests {
 
     #[test]
     fn test_serialize_key_type_matches_display() {
-        for key_type in [
-            KeyType::Long,
-            KeyType::String,
-            KeyType::Binary,
-            KeyType::Uuid,
-        ] {
+        for key_type in KeyType::ALL {
             let json = serde_json::to_string(&key_type).unwrap();
             assert_eq!(json, format!("\"{key_type}\""));
             let back: KeyType = serde_json::from_str(&json).unwrap();

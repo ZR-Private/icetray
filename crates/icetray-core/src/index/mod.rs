@@ -1109,7 +1109,7 @@ mod tests {
     use crate::contract::PAGE_ROWS;
     use crate::generation::testing::{self, Dictionary, KeyColumn, cache, column_of};
     use crate::index::testing::{
-        BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, KEY_TYPES, PAGES_PER_GROUP, ROW_GROUPS,
+        BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, PAGES_PER_GROUP, ROW_GROUPS,
         SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows, fault_of, group_rows, key_for,
         location, page_rows, pages_of, predicted_of, row_of, stepped, store, value_for,
         value_of_len, with_pages,
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_and_read_value_every_key_per_type() {
-        for key_type in KEY_TYPES {
+        for key_type in KeyType::ALL {
             let rows = contract_rows();
             let opened = store(&Fixture::contract(key_type, rows)).await;
             let index = opened.index(key_type).await;
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_miss_costs_no_get_inside_or_outside_the_range_per_type() {
-        for key_type in KEY_TYPES {
+        for key_type in KeyType::ALL {
             let opened = store(&Fixture::contract(key_type, contract_rows())).await;
             let index = opened.index(key_type).await;
             let stats = opened.stats();
@@ -1386,7 +1386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_every_key_with_statistics_disabled_across_row_groups_per_type() {
-        for key_type in KEY_TYPES {
+        for key_type in KeyType::ALL {
             let rows = contract_rows();
             let mut fixture = Fixture::contract(key_type, rows);
             fixture.layout.statistics = EnabledStatistics::None;
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bloom_tier_costs_per_type() {
-        for key_type in KEY_TYPES {
+        for key_type in KeyType::ALL {
             check_bloom_costs(key_type).await;
         }
     }
