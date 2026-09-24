@@ -319,6 +319,28 @@ impl Periodic {
             .join_next()
             .await
             .expect("the sampler is in the set until shutdown");
+        self.named(outcome)
+    }
+
+    /// Aborts every task and waits for them to end. Returns the first task
+    /// that ended by a panic rather than by the abort, with its panic: one
+    /// that panicked before the abort, or while running on another thread
+    /// as the abort landed, is reported instead of discarded.
+    async fn shutdown(&mut self) -> Option<(PeriodicTask, JoinError)> {
+        self.tasks.abort_all();
+        let mut panicked = None;
+        while let Some(outcome) = self.tasks.join_next().await {
+            let (task, error) = self.named(outcome);
+            if panicked.is_none() && error.is_panic() {
+                panicked = Some((task, error));
+            }
+        }
+        panicked
+    }
+
+    /// The name of the task that ended with `outcome`, taken out of the
+    /// names, beside how it ended.
+    fn named(&mut self, outcome: Result<Infallible, JoinError>) -> (PeriodicTask, JoinError) {
         match outcome {
             Ok(never) => match never {},
             Err(error) => {
@@ -329,11 +351,6 @@ impl Periodic {
                 (task, error)
             }
         }
-    }
-
-    /// Aborts every task and waits for them to end.
-    async fn shutdown(&mut self) {
-        self.tasks.shutdown().await;
     }
 }
 
@@ -357,9 +374,10 @@ impl Run {
     /// while the tables load is honoured as soon as the loads end: the grace
     /// is cut short, and a run whose loads succeeded drains without ever
     /// flipping to `SERVING`, since the servers stopped accepting when the
-    /// shutdown was asked for. A periodic task that ends before the shutdown
-    /// ends the run as `Periodic`, so the process exits non-zero instead of
-    /// serving on with nothing refreshing.
+    /// shutdown was asked for. A periodic task that panics before the
+    /// shutdown aborts it, a pending shutdown included, ends the run as
+    /// `Periodic`, so the process exits non-zero instead of serving on with
+    /// nothing refreshing.
     async fn run(self) -> Result<(), ServeError> {
         let failures = load_all(&self.opened).await;
         if !failures.is_empty() {
@@ -400,12 +418,15 @@ impl Run {
             ),
         );
 
+        // Biased, the ended task first: when a task has ended and a
+        // shutdown is pending at the same poll, the failure is the outcome.
         let ended = tokio::select! {
-            () = stop(self.shutdown.subscribe()) => None,
+            biased;
             ended = periodic.ended() => Some(ended),
+            () = stop(self.shutdown.subscribe()) => None,
         };
-        periodic.shutdown().await;
-        let Some((task, source)) = ended else {
+        let raced = periodic.shutdown().await;
+        let Some((task, source)) = ended.or(raced) else {
             return self.drain().await;
         };
         tracing::error!(%task, %source, "periodic task ended");
@@ -586,5 +607,44 @@ async fn sample_loop(
     loop {
         ticker.tick().await;
         telemetry::sample(&opened, &handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// A table name for the refresh task that never ends.
+    const TABLE: &str = "kv";
+
+    /// A task that has already panicked when the shutdown aborts the set is
+    /// reported by name with its panic, not discarded with the aborted ones.
+    #[tokio::test]
+    async fn test_shutdown_reports_a_task_that_panicked_before_it() {
+        let mut periodic = Periodic::new();
+        let (unwound, panicked) = oneshot::channel::<()>();
+        periodic.spawn(PeriodicTask::Sampler, async move {
+            let _unwound = unwound;
+            panic!("the sampler fails");
+        });
+        periodic.spawn(
+            PeriodicTask::Refresh {
+                table: TABLE.to_string(),
+            },
+            std::future::pending(),
+        );
+        // The sender drops while the panic unwinds; on this current-thread
+        // runtime the task's poll, and so its completion, ends before this
+        // task runs again.
+        assert!(panicked.await.is_err());
+
+        let reported = periodic.shutdown().await;
+        let Some((task, source)) = reported else {
+            panic!("expected the panicked task, got none");
+        };
+        assert_eq!(task, PeriodicTask::Sampler);
+        assert!(source.is_panic(), "{source}");
     }
 }

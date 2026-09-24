@@ -139,8 +139,8 @@ pub enum ServeError {
     /// The run task itself panicked or was cancelled.
     #[error("task: {0}")]
     Join(#[from] tokio::task::JoinError),
-    /// A periodic task ended before the shutdown, which only a panic inside
-    /// it does. The run ends rather than serve on: the tables would
+    /// A periodic task panicked before the shutdown aborted it; nothing else
+    /// ends one. The run ends rather than serve on: the tables would
     /// otherwise stop following their refs, or the gauges stop sampling,
     /// while `/ready` kept answering 200.
     #[error("periodic task {task} ended: {source}")]

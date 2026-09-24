@@ -940,9 +940,10 @@ task on the same period; the tickers start one interval after the first
 loads rather than at once, so a load is not followed by an immediate,
 redundant poll and sample, and a missed tick delays rather than bursts. A
 refresh that swapped a generation in is followed by `Opened::retain`. A
-periodic task that ends before the shutdown, which only a panic inside it
-does, ends the run: the log names the task (`refresh of table <name>` or
-`sampler`) with the panic, the daemon drains, and the process exits 1,
+periodic task that panics before the shutdown aborts it, the only way one
+ends, ends the run, even when a shutdown was already asked for: the log
+names the task (`refresh of table <name>` or `sampler`) with the panic,
+the daemon drains, and the process exits 1,
 since a daemon whose tables nothing refreshes would otherwise keep
 answering `/ready` 200 from an ageing snapshot (`ServeError::Periodic`).
 `serve` logs JSON to stdout at `info` (the twelve-factor log stream)
