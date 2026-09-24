@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -218,10 +219,10 @@ const MANIFEST_SUFFIX: &str = ".avro";
 /// The id of a by-hand snapshot on a table with none.
 const FIRST_SNAPSHOT_ID: i64 = 1;
 
-/// The milliseconds a by-hand snapshot is stamped past the metadata's last
-/// update: the least step that keeps snapshot timestamps increasing, which
-/// Iceberg requires of a commit.
-const HAND_COMMIT_STEP_MILLIS: i64 = 1;
+/// The time a by-hand snapshot is stamped past the metadata's last update:
+/// one millisecond, the least step Iceberg's timestamps can hold, which keeps
+/// snapshot timestamps increasing, as Iceberg requires of a commit.
+const HAND_COMMIT_STEP: Duration = Duration::from_millis(1);
 
 /// The name the memory catalog is registered under; nothing reads it back.
 const MEMORY_CATALOG_NAME: &str = "memory";
@@ -685,7 +686,7 @@ impl Fixture {
             .with_sequence_number(sequence)
             .with_timestamp_ms(millis_after(
                 self.metadata.last_updated_ms(),
-                HAND_COMMIT_STEP_MILLIS,
+                HAND_COMMIT_STEP,
             ))
             .with_manifest_list(list_path)
             .with_summary(Summary {

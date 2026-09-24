@@ -58,14 +58,17 @@ pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff
     jiff::Timestamp::from_millisecond(millis)
 }
 
-/// An epoch-millisecond count `millis` after `base`: how a writer stamps a
-/// snapshot later than the metadata's last update and increasing with its
-/// sequence, which Iceberg requires of a commit. The one place
-/// epoch-millisecond arithmetic happens. Saturates at the ends of `i64`,
-/// both outside the range `timestamp_from_millis` admits, so an overflow
-/// reads back as `SnapshotTimestampOutOfRange` and never as another time.
-pub fn millis_after(base: i64, millis: i64) -> i64 {
-    base.saturating_add(millis)
+/// The epoch-millisecond count `step` after `base`, an epoch-millisecond
+/// count as Iceberg records a snapshot's timestamp and the metadata's last
+/// update: how a fixture writer, the testkit's or core's tests', stamps a
+/// commit later than the metadata's last update, which Iceberg requires.
+/// No serving path writes a commit; this is public because the testkit is
+/// another crate. `step` counts in whole milliseconds, the unit Iceberg
+/// stamps in, and its remainder is dropped. Saturates at `i64::MAX`,
+/// outside the range `timestamp_from_millis` admits, so an overflow reads
+/// back as `SnapshotTimestampOutOfRange` and never as another time.
+pub fn millis_after(base: i64, step: Duration) -> i64 {
+    base.saturating_add(i64::try_from(step.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
@@ -247,21 +250,29 @@ mod tests {
         assert!(super::timestamp_from_millis(i64::MIN).is_err());
     }
 
-    /// The step a fixture commit is stamped after the metadata's last update.
-    const COMMIT_STEP: i64 = 1;
+    /// The step a fixture commit is stamped after the metadata's last update,
+    /// and the same step in the epoch milliseconds it adds.
+    const COMMIT_STEP: Duration = Duration::from_millis(3);
+    const COMMIT_STEP_MILLIS: i64 = 3;
+    /// Below a millisecond: dropped, as Iceberg's timestamps cannot hold it.
+    const SUB_MILLISECOND: Duration = Duration::from_micros(999);
 
     #[test]
     fn test_millis_after_adds_the_step() {
         assert_eq!(
             super::millis_after(EPOCH_MILLIS, COMMIT_STEP),
-            EPOCH_MILLIS + COMMIT_STEP
+            EPOCH_MILLIS + COMMIT_STEP_MILLIS
+        );
+        assert_eq!(
+            super::millis_after(EPOCH_MILLIS, COMMIT_STEP + SUB_MILLISECOND),
+            EPOCH_MILLIS + COMMIT_STEP_MILLIS
         );
     }
 
     #[test]
     fn test_millis_after_saturates_outside_i64() {
         assert_eq!(super::millis_after(i64::MAX, COMMIT_STEP), i64::MAX);
-        assert_eq!(super::millis_after(i64::MIN, -COMMIT_STEP), i64::MIN);
+        assert_eq!(super::millis_after(EPOCH_MILLIS, Duration::MAX), i64::MAX);
     }
 
     #[test]

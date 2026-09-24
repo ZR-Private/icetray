@@ -42,7 +42,7 @@ redefine.
 | `error` | the one `Error` enum and `Result` | |
 | `snapshot` | `SnapshotId`, the newtype for an Iceberg snapshot id; it has no order and is a metric label, never a gauge value | 015 |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and epoch-millisecond arithmetic happens (`millis_after`, for a writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -795,11 +795,11 @@ pub fn age_seconds(since: jiff::Timestamp) -> f64;
 /// RFC 3339 in UTC with a `Z` offset through jiff's printer, the fraction of a second only when it is
 /// non-zero; the one place a timestamp becomes log text.
 pub fn log_timestamp(at: jiff::Timestamp) -> String;
-/// An epoch-millisecond count `millis` after `base`: how a writer stamps a snapshot later than the
-/// metadata's last update and increasing with its sequence, which Iceberg requires of a commit. The
-/// one place epoch-millisecond arithmetic happens; saturates at the ends of `i64`, both outside what
-/// `timestamp_from_millis` admits.
-pub fn millis_after(base: i64, millis: i64) -> i64;
+/// The epoch-millisecond count `step` after the epoch-millisecond `base`: how a fixture writer (the
+/// testkit's, core's tests') stamps a commit later than the metadata's last update, as Iceberg
+/// requires. No serving path writes a commit; public because the testkit is another crate. Whole
+/// milliseconds of `step`; saturates at `i64::MAX`, outside what `timestamp_from_millis` admits.
+pub fn millis_after(base: i64, step: Duration) -> i64;
 /// In-crate: an Iceberg snapshot's epoch millisecond as a timestamp; out of jiff's range is `Err`,
 /// which `Generation::load` reports as `TableFault::SnapshotTimestampOutOfRange`.
 pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error>;

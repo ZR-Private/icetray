@@ -411,6 +411,7 @@ fn entry_order(a: &DataFileEntry, b: &DataFileEntry) -> Ordering {
 pub(crate) mod testing {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use bytes::Bytes;
     use iceberg::io::FileIO;
@@ -436,11 +437,17 @@ pub(crate) mod testing {
     pub(crate) const VALUE_FIELD_ID: i32 = 2;
     /// The directory under a table root holding its data files.
     pub(crate) const DATA_DIR: &str = "data";
-    /// The timestamp of fixture snapshot `sequence` of `md`: after the
-    /// metadata's last update, which the builder set to now, and increasing
+    /// The time between the stamps of consecutive fixture snapshots: one
+    /// millisecond, the least step Iceberg's timestamps can hold.
+    const SNAPSHOT_STEP: Duration = Duration::from_millis(1);
+
+    /// The timestamp of fixture snapshot `sequence` of `md`: `sequence`
+    /// steps of `SNAPSHOT_STEP` after the metadata's last update, which the
+    /// builder set to now, so it is later than that update and increases
     /// with the sequence, as the builder requires of a commit.
     pub(crate) fn snapshot_timestamp(md: &TableMetadata, sequence: i64) -> i64 {
-        time::millis_after(md.last_updated_ms(), sequence)
+        let steps = u32::try_from(sequence).unwrap();
+        time::millis_after(md.last_updated_ms(), SNAPSHOT_STEP * steps)
     }
 
     /// A `file://` location for a temporary directory.
