@@ -242,14 +242,6 @@ mod tests {
     /// The length the sized value test asks for.
     const OTHER_LEN: usize = 17;
 
-    /// Every key type, so each derivation is checked under all four.
-    const TYPES: [KeyType; 4] = [
-        KeyType::Long,
-        KeyType::String,
-        KeyType::Binary,
-        KeyType::Uuid,
-    ];
-
     /// The padding each type admits: none for the fixed-width types.
     fn pads(key_type: KeyType) -> Vec<usize> {
         match key_type {
@@ -260,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_key_at_padded_is_strictly_increasing_per_type() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for pad in pads(key_type) {
                 let keys: Vec<Key> = SAMPLE_IDS
                     .iter()
@@ -277,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_key_at_is_key_at_padded_with_no_pad() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for id in SAMPLE_IDS {
                 assert_eq!(key_at(id, key_type), key_at_padded(id, key_type, 0));
             }
@@ -286,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_absent_key_from_is_above_its_key_and_not_a_fixture_key() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for pad in pads(key_type) {
                 for id in SAMPLE_IDS {
                     let key = key_at_padded(id, key_type, pad);
@@ -302,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_absent_key_near_is_absent_key_from_key_at() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             assert_eq!(
                 absent_key_near(SAMPLE_IDS[3], key_type),
                 absent_key_from(&key_at(SAMPLE_IDS[3], key_type))
@@ -312,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_far_key_is_above_every_sample_key() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             let far = far_key(key_type);
             assert_eq!(far.key_type(), key_type);
             for pad in pads(key_type) {
@@ -327,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_id_of_inverts_key_at_padded() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for pad in pads(key_type) {
                 for id in SAMPLE_IDS {
                     assert_eq!(id_of(&key_at_padded(id, key_type, pad), pad), Some(id));
@@ -341,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_value_for_is_deterministic_and_distinct_for_neighbours() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for id in SAMPLE_IDS {
                 let key = key_at(id, key_type);
                 let value = value_for(&key);
