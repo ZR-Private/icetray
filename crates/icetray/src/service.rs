@@ -120,15 +120,19 @@ impl From<WireKeyFault> for Status {
 
 /// Core's error as a status (RFD 010): a key of the wrong type is
 /// `INVALID_ARGUMENT`; a read the caller can retry (no generation yet, an
-/// object-store, cache, or local-directory failure) is `UNAVAILABLE`; every
-/// other failure is `INTERNAL`. The message is the error's `Display`.
+/// object-store, cache, or local-directory failure, a catalog or load that
+/// did not answer in time) is `UNAVAILABLE`; every other failure is
+/// `INTERNAL`. The message is the error's `Display`.
 pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {
         Error::KeyType { .. } => Status::invalid_argument(message),
-        Error::NotReady { .. } | Error::ObjectStore(_) | Error::Cache(_) | Error::Local { .. } => {
-            Status::unavailable(message)
-        }
+        Error::NotReady { .. }
+        | Error::ObjectStore(_)
+        | Error::Cache(_)
+        | Error::Local { .. }
+        | Error::CatalogTimeout { .. }
+        | Error::RefreshDeadline { .. } => Status::unavailable(message),
         Error::Iceberg(_)
         | Error::Parquet(_)
         | Error::ObjectStorePath(_)
@@ -238,6 +242,7 @@ impl Icetray for Service {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
@@ -443,6 +448,20 @@ mod tests {
                     fault: FileFault::NoRows,
                 },
                 Code::Internal,
+            ),
+            (
+                Error::CatalogTimeout {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                Code::Unavailable,
+            ),
+            (
+                Error::RefreshDeadline {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                Code::Unavailable,
             ),
         ]
     }

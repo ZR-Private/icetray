@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{Snapshot, TableMetadata};
@@ -238,8 +239,9 @@ impl TableSource {
     /// with no `known`, the metadata. When nothing moved this costs one
     /// small read: a static root reads its version hint and parses no
     /// metadata; a catalog source costs one table load, whose metadata the
-    /// client parses either way. A static source that names a metadata file
-    /// directly reads nothing and never advances.
+    /// client parses either way, within `Storage::catalog_timeout`. A
+    /// static source that names a metadata file directly reads nothing and
+    /// never advances.
     pub async fn resolve_if_changed(
         &self,
         storage: &Storage,
@@ -254,7 +256,7 @@ impl TableSource {
                 read_metadata(storage, file).await.map(Some)
             }
             Self::Catalog { catalog, ident } => {
-                let resolved = load_from_catalog(catalog, ident).await?;
+                let resolved = load_from_catalog(catalog, ident, storage.catalog_timeout()).await?;
                 Ok((known != Some(resolved.location.as_str())).then_some(resolved))
             }
         }
@@ -285,8 +287,22 @@ async fn read_metadata(storage: &Storage, file: String) -> Result<Resolved> {
 
 /// The table as the catalog holds it now. A record without a metadata
 /// location is `TableFault::MetadataLocationUnknown` under the identifier.
-async fn load_from_catalog(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Result<Resolved> {
-    let table = catalog.load_table(ident).await?;
+/// The call runs within `timeout`, and one that runs longer is dropped as
+/// `Error::CatalogTimeout`. The bound is on the call rather than on an HTTP
+/// client handed to the REST builder, so it covers every request the call
+/// makes, the client's configuration and token fetches included, and holds
+/// for any `Catalog`.
+async fn load_from_catalog(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+    timeout: Duration,
+) -> Result<Resolved> {
+    let table = tokio::time::timeout(timeout, catalog.load_table(ident))
+        .await
+        .map_err(|_elapsed| Error::CatalogTimeout {
+            table: ident.to_string(),
+            after: timeout,
+        })??;
     let location = table
         .metadata_location()
         .ok_or_else(|| Error::table_fault(&ident.to_string(), TableFault::MetadataLocationUnknown))?
@@ -398,12 +414,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::StorageConfig;
     use crate::generation::testing::{
         FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, SECOND_SEQUENCE, SECOND_SNAPSHOT,
         SECOND_VERSION, TABLE, THIRD_VERSION, table_fault_of,
     };
     use crate::manifest::testing;
-    use crate::storage::testing::{MEM_PREFIX, MemStore};
+    use crate::storage::testing::{DEADLINE_GUARD, LocalHttp, MEM_PREFIX, MemStore, Reply};
 
     /// The table root under the prefix.
     const ROOT_KEY: &str = "db/kv";
@@ -418,6 +435,9 @@ mod tests {
     const NAMESPACE: &str = "db";
     /// The warehouse of the memory catalog, in its own in-memory storage.
     const WAREHOUSE: &str = "memory://warehouse";
+    /// The catalog timeout of the test that waits on a catalog that never
+    /// answers: short, so the test is quick.
+    const TEST_CATALOG_TIMEOUT: Duration = Duration::from_millis(200);
 
     fn root() -> String {
         format!("{MEM_PREFIX}{ROOT_KEY}")
@@ -734,6 +754,36 @@ mod tests {
         };
         assert_eq!(ident.namespace().as_ref(), &["db", "analytics"]);
         assert_eq!(ident.name(), TABLE);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fails_at_the_catalog_timeout_when_the_catalog_never_answers() {
+        let catalog = LocalHttp::start(Reply::Never);
+        let source = TableSource::from_config(&SourceConfig::Rest {
+            uri: catalog.url(),
+            warehouse: None,
+            namespace: NAMESPACE.to_string(),
+            table: TABLE.to_string(),
+        })
+        .await
+        .unwrap();
+        let storage = Storage::new(StorageConfig {
+            catalog_timeout: TEST_CATALOG_TIMEOUT,
+            ..StorageConfig::default()
+        });
+        let resolved = tokio::time::timeout(DEADLINE_GUARD, source.resolve(&storage))
+            .await
+            .expect("the catalog call ends at its timeout, before the guard");
+        let Err(Error::CatalogTimeout { table, after }) = resolved else {
+            panic!("expected a catalog timeout, got {resolved:?}");
+        };
+        let ident = TableIdent::new(
+            NamespaceIdent::new(NAMESPACE.to_string()),
+            TABLE.to_string(),
+        );
+        assert_eq!(table, ident.to_string());
+        assert_eq!(after, TEST_CATALOG_TIMEOUT);
+        assert!(catalog.requests() > 0, "the call reached the catalog");
     }
 
     #[tokio::test]

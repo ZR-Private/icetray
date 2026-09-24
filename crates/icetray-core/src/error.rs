@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::cache::CacheError;
 use crate::catalog::TableFault;
@@ -96,6 +97,25 @@ pub enum Error {
         /// What went wrong with it.
         fault: LocalFault,
     },
+    /// A catalog call did not answer within `storage.catalog_timeout`, so
+    /// the poll or load that made it failed (RFD 013).
+    #[error("catalog did not answer for table {table} within {after:?}")]
+    CatalogTimeout {
+        /// The table's catalog identifier: the source, since no table has
+        /// been named while the source resolves.
+        table: String,
+        /// The timeout that passed.
+        after: Duration,
+    },
+    /// A first load or a refresh did not finish within
+    /// `server.refresh_deadline`, so it was dropped and failed (RFD 013).
+    #[error("table {table} load did not finish within {after:?}")]
+    RefreshDeadline {
+        /// The table's configured name.
+        table: String,
+        /// The deadline that passed.
+        after: Duration,
+    },
 }
 
 impl Error {
@@ -133,6 +153,8 @@ impl Error {
             Self::File { .. } => ErrorKind::File,
             Self::NotReady { .. } => ErrorKind::NotReady,
             Self::Local { .. } => ErrorKind::Local,
+            Self::CatalogTimeout { .. } => ErrorKind::CatalogTimeout,
+            Self::RefreshDeadline { .. } => ErrorKind::RefreshDeadline,
         }
     }
 }
@@ -172,6 +194,10 @@ pub enum ErrorKind {
     NotReady,
     /// `Error::Local`.
     Local,
+    /// `Error::CatalogTimeout`.
+    CatalogTimeout,
+    /// `Error::RefreshDeadline`.
+    RefreshDeadline,
 }
 
 impl fmt::Display for ErrorKind {
@@ -191,6 +217,8 @@ impl fmt::Display for ErrorKind {
             Self::File => "file",
             Self::NotReady => "not_ready",
             Self::Local => "local",
+            Self::CatalogTimeout => "catalog_timeout",
+            Self::RefreshDeadline => "refresh_deadline",
         };
         f.write_str(name)
     }
@@ -509,6 +537,20 @@ mod tests {
                     table: TABLE.to_string(),
                 },
                 "not_ready",
+            ),
+            (
+                Error::CatalogTimeout {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                "catalog_timeout",
+            ),
+            (
+                Error::RefreshDeadline {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                "refresh_deadline",
             ),
         ]
     }

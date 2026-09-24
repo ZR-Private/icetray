@@ -106,6 +106,7 @@ pub async fn open_with(
             Arc::clone(&storage),
             cache.clone(),
             local.clone(),
+            config.server.refresh_deadline,
         )));
     }
     let complete = tables.len() == config.tables.len();

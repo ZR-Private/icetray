@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use iceberg::Catalog;
 use icetray_core::approx::count;
-use icetray_core::config::{HedgeConfig, StorageConfig, TableConfig};
+use icetray_core::config::{HedgeConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
     Generation, Key, LocalDir, PageCache, Residency, Storage, Table, TableSource, Value,
 };
@@ -88,7 +88,14 @@ pub async fn build(
         local.as_ref().and_then(|local| local.page_tier()),
     )
     .await?;
-    let table = Table::new(config, source, Arc::clone(&storage), cache.clone(), local);
+    let table = Table::new(
+        config,
+        source,
+        Arc::clone(&storage),
+        cache.clone(),
+        local,
+        ServerConfig::default().refresh_deadline,
+    );
     Ok(Served {
         storage,
         cache,

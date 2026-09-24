@@ -99,6 +99,11 @@ pub enum Error {
     NotReady { table: String },
     /// The local directory failed (RFD 017); the fault set is closed.
     Local { path: PathBuf, fault: LocalFault },
+    /// A catalog call ran past `storage.catalog_timeout` (RFD 013); `table` is the
+    /// catalog identifier, as for a fault raised while the source resolves.
+    CatalogTimeout { table: String, after: Duration },
+    /// A first load or refresh ran past `server.refresh_deadline` and was dropped (RFD 013).
+    RefreshDeadline { table: String, after: Duration },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
@@ -109,10 +114,10 @@ impl Error {
 /// label of `refresh_errors_total`: the refusal's own name for `Refused`, `inefficient` for
 /// the strict gate, and the variant's snake_case name for the rest (`iceberg`, `parquet`,
 /// `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
-/// `file`, `not_ready`, `local`). Also what `TableState::Degraded` carries as its reason:
+/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`). Also what `TableState::Degraded` carries as its reason:
 /// `Error` is not `Clone`, so the failure goes to the caller and its kind to the state.
 /// Re-exported from `lib.rs`.
-pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local }
+pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline }
 
 /// Named refusals (RFD 007). Display gives the snake_case name used in logs;
 /// the fields name the file, row group, type, key, or bytes a reader has to
@@ -195,7 +200,7 @@ impl Config {
 /// (default 5 s) and `multi_get_deadline` (15 s, flat) against the client's own shorter
 /// deadline, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
 /// (1000), `drain_deadline` (20 s); and the background path's `refresh_deadline` (5 min) on a
-/// first load or refresh. Every duration is a friendly duration; each is above zero, as are
+/// first load or refresh, which `open_with` hands `Table::new`. Every duration is a friendly duration; each is above zero, as are
 /// the two limits (`ConfigViolation::*Zero`).
 pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub refresh_deadline: Duration, pub drain_deadline: Duration }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
@@ -221,8 +226,8 @@ impl std::str::FromStr for Residency { type Err = ConfigViolation; }
 /// level would hold nothing; `Config::parse` refuses less as `PageCacheDiskTooSmall`.
 pub struct LocalConfig { pub dir: PathBuf, pub index_budget_bytes: Option<u64>, pub page_cache_disk_bytes: u64 }
 /// `max_retries` (default 2, zero allowed) and `connect_timeout` (1 s) for the S3 clients,
-/// `catalog_timeout` (30 s) for each catalog call; both durations are friendly durations
-/// above zero.
+/// `catalog_timeout` (30 s) for each catalog call, read through `Storage::catalog_timeout`;
+/// both durations are friendly durations above zero.
 pub struct StorageConfig { pub s3: Option<S3Config>, pub rewrite: Vec<RewriteRule>, pub hedge: HedgeConfig, pub local: Option<LocalConfig>, pub max_retries: usize, pub connect_timeout: Duration, pub catalog_timeout: Duration }
 pub enum SourceConfig {
     Static { location: String },
@@ -302,6 +307,9 @@ impl Storage {
     /// The hedge settings this storage runs under; `Table::new` builds the table's
     /// `HedgeWindow` from it, so the frozen `Table::new` takes no `HedgeConfig`.
     pub fn hedge_config(&self) -> &HedgeConfig;
+    /// `storage.catalog_timeout`, which bounds each catalog call `TableSource` makes; the
+    /// catalog client never reads through `Storage`, but every resolve has one in hand.
+    pub fn catalog_timeout(&self) -> Duration;
     /// Rewrite rules first, then the store for the `scheme://authority/` prefix;
     /// no store is `ConfigViolation::NoStoreForLocation`, a relative path
     /// `ConfigViolation::LocationNotAbsolute`. `file:///path`, the authority-less
@@ -360,6 +368,8 @@ impl TableSource {
     /// parsing no metadata, or one table load from the catalog, whose metadata
     /// the client parses either way; a pinned metadata file reads nothing. With
     /// no `known` location nothing is unchanged, which is how `resolve` reads.
+    /// A catalog load runs under `tokio::time::timeout` of `storage.catalog_timeout()`
+    /// and past it is `Error::CatalogTimeout`.
     pub async fn resolve_if_changed(&self, storage: &Storage, known: Option<&str>) -> Result<Option<Resolved>>;
 }
 /// The metadata file a bare `version` names under `root`: `metadata/v<version>.metadata.json`,
@@ -699,7 +709,10 @@ pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant
 pub struct Table;
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Sets `table_state` for the state.
-    pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>) -> Self;
+    /// Every `load` and `refresh` runs under `refresh_deadline` once it holds the load lock;
+    /// past it the work is dropped, which releases the lock, and the call is
+    /// `Error::RefreshDeadline`, degrading the table as any failure does.
+    pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>, refresh_deadline: Duration) -> Self;
     /// First load. `Err` leaves the table `Degraded` with no generation and is not counted
     /// under `refresh_errors_total`: a first-load failure is the caller's to report (RFD 005).
     /// On a serving table, a full re-resolve and reload reusing every unchanged file.

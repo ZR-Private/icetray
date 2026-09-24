@@ -38,7 +38,7 @@ use crate::time;
 /// The prefix of the local filesystem store. A `file://` URI and a bare
 /// absolute path both resolve to it, so a table written by a local job and
 /// one whose metadata records URIs read the same way.
-const FILE_PREFIX: &str = "file://";
+pub(crate) const FILE_PREFIX: &str = "file://";
 
 /// The local filesystem scheme with no authority, `file:/path`, the form
 /// Hadoop's `Path` records in the metadata of a table written to a local
@@ -294,6 +294,15 @@ impl Storage {
     /// (RFD 013).
     pub fn hedge_config(&self) -> &HedgeConfig {
         &self.config.hedge
+    }
+
+    /// How long one catalog call may run, from `storage.catalog_timeout`.
+    /// A catalog client speaks to its catalog over HTTP and never through
+    /// this storage, but its bound is storage configuration beside the S3
+    /// client's, and every `TableSource` resolves with a `Storage` in hand
+    /// (RFD 013).
+    pub fn catalog_timeout(&self) -> Duration {
+        self.config.catalog_timeout
     }
 
     /// Resolves a location to a store and a path: the configured rewrite
@@ -793,6 +802,7 @@ pub(crate) mod testing {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -805,6 +815,15 @@ pub(crate) mod testing {
 
     /// The synthetic prefix an in-memory store is registered under.
     pub(crate) const MEM_PREFIX: &str = "mem://w/";
+
+    /// How long a stalled store or catalog takes to answer: an hour, longer
+    /// than any test runs, so to a test it never answers.
+    pub(crate) const STALL: Duration = Duration::from_secs(3600);
+
+    /// How long a test waits for work that a deadline should end: far above
+    /// any deadline a test sets, so only a deadline that is missing reaches
+    /// it.
+    pub(crate) const DEADLINE_GUARD: Duration = Duration::from_secs(10);
 
     /// An in-memory store registered under `MEM_PREFIX` on a fresh storage.
     pub(crate) struct MemStore {
@@ -851,6 +870,9 @@ pub(crate) mod testing {
     pub(crate) enum Reply {
         /// Answers with this status line and an empty body, then closes.
         Status(&'static str),
+        /// Keeps the connection open and never answers, as a wedged store
+        /// or catalog does.
+        Never,
     }
 
     /// An HTTP endpoint on a loopback port, served by a thread of its own
@@ -870,6 +892,7 @@ pub(crate) mod testing {
             let requests = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&requests);
             std::thread::spawn(move || {
+                let mut held = Vec::new();
                 for stream in listener.incoming() {
                     let mut stream = stream.unwrap();
                     read_head(&mut stream);
@@ -880,6 +903,7 @@ pub(crate) mod testing {
                             "HTTP/1.1 {line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         )
                         .unwrap(),
+                        Reply::Never => held.push(stream),
                     }
                 }
             });
