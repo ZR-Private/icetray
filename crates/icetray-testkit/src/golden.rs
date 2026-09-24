@@ -7,7 +7,10 @@
 use std::fmt::{self, Write as _};
 
 use icetray_core::config::{Config, ServerConfig, SourceConfig, StorageConfig, TableConfig};
+use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType, Residency};
+use sha2::digest::OutputSizeUser;
+use sha2::digest::typenum::Unsigned as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{Precondition, Result, required_var};
@@ -63,8 +66,10 @@ pub const CONTRACT_REPEATS: usize = 3;
 /// distinct digests.
 pub const WIDE_REPEATS: usize = 256;
 
-/// The ASCII bytes of one hex SHA-256 digest.
-pub const HEX_DIGEST_BYTES: usize = 64;
+/// The ASCII bytes of one hex SHA-256 digest: the digest's width in hex
+/// digits.
+pub const HEX_DIGEST_BYTES: usize =
+    <Sha256 as OutputSizeUser>::OutputSize::USIZE * HEX_DIGITS_PER_BYTE;
 
 /// The tables the recipe writes. Display gives the table name it uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -210,7 +215,8 @@ fn hex_digest(text: &str) -> String {
     Sha256::digest(text.as_bytes()).iter().fold(
         String::with_capacity(HEX_DIGEST_BYTES),
         |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("formatting into a String cannot fail");
+            write!(hex, "{byte:0HEX_DIGITS_PER_BYTE$x}")
+                .expect("formatting into a String cannot fail");
             hex
         },
     )
