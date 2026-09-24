@@ -18,7 +18,7 @@ use foyer::{
 };
 
 use crate::approx;
-use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
+use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::error::{Error, Result};
 use crate::local::DiskTier;
 use crate::metric;
@@ -34,6 +34,25 @@ const CACHE_NAME: &str = "icetray_pages";
 /// this on a 64-bit target. The file id's own bytes are shared by every
 /// page of the file through the `Arc` and are not charged per entry.
 const ENTRY_OVERHEAD_BYTES: usize = 64;
+
+/// Shards of the memory level. foyer splits the memory budget evenly across
+/// its shards and evicts within each, so a page is held only beside the
+/// pages of its own shard, in that shard's share. Eight is foyer's default,
+/// enough to spread concurrent lookups over separate locks; it is pinned
+/// here so that `min_memory_bytes` is computed from the count the cache
+/// uses.
+pub(crate) const MEMORY_SHARDS: usize = 8;
+
+/// The smallest memory budget the page cache is given: one contract value
+/// page (`contract::VALUE_PAGE_BYTES`) weighed with its entry overhead, for
+/// each of `MEMORY_SHARDS`. Below it a shard's share cannot hold one such
+/// page, and foyer keeps the shard's latest page alone whatever its share,
+/// so the cache would hold a page per shard however small the budget and
+/// the configured bytes would bound nothing. `Config::parse` refuses less
+/// as `ConfigViolation::PageCacheTooSmall`.
+pub(crate) fn min_memory_bytes() -> u64 {
+    approx::count(MEMORY_SHARDS) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
+}
 
 /// The width of the length prefix on an encoded file id: a `u32`, since a
 /// file id is a location and never approaches four gibibytes.
@@ -202,7 +221,9 @@ pub struct PageCache {
 
 impl PageCache {
     /// Opens a cache holding at most `capacity_bytes` of pages in memory,
-    /// each weighed as its bytes plus a fixed per-entry overhead. `disk` is
+    /// each weighed as its bytes plus a fixed per-entry overhead, split
+    /// evenly over `MEMORY_SHARDS`; `Config::parse` admits no budget below
+    /// `min_memory_bytes`. `disk` is
     /// the local level of RFD 017: a page evicted from memory is written
     /// there, served back with a local read and no GET, and recovered when
     /// a new cache opens over the same directory, so it survives a restart.
@@ -214,6 +235,7 @@ impl PageCache {
             None => Tier::Memory(
                 CacheBuilder::new(capacity_bytes)
                     .with_name(CACHE_NAME)
+                    .with_shards(MEMORY_SHARDS)
                     .with_weighter(weigh)
                     .build(),
             ),
@@ -370,6 +392,7 @@ async fn open_hybrid(
         .with_name(CACHE_NAME)
         .with_policy(HybridCachePolicy::WriteOnEviction)
         .memory(capacity_bytes)
+        .with_shards(MEMORY_SHARDS)
         .with_weighter(weigh)
         .storage()
         .with_engine_config(

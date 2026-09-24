@@ -184,7 +184,9 @@ impl Config {
 }
 /// `metrics_listen` is required (default 127.0.0.1:9433) and serves `/metrics`
 /// and `/ready`; RFD 012 makes both part of the surface.
-/// `page_cache_bytes`: at least `contract::VALUE_PAGE_BYTES`, or the cache could hold no page;
+/// `page_cache_bytes`: at least `cache::min_memory_bytes()`, one `contract::VALUE_PAGE_BYTES`
+/// page with its entry overhead for each of the cache's pinned `MEMORY_SHARDS` (foyer splits the
+/// budget per shard and a shard keeps its latest page whatever its share, so less bounds nothing);
 /// `Config::parse` refuses less as `PageCacheTooSmall`, as it refuses a disk level below one block.
 pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the

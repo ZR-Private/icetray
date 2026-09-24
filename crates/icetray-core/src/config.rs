@@ -11,7 +11,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::approx;
-use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
+use crate::cache::min_memory_bytes;
+use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::Result;
 use crate::time;
 
@@ -114,13 +115,16 @@ pub enum ConfigViolation {
     /// Disk residency with no local directory to write chunk files to.
     #[error("disk residency needs a local directory under storage.local")]
     DiskResidencyWithoutLocalDir,
-    /// The memory budget of the page cache cannot hold one value page, so
-    /// the cache would keep a page per shard and nothing an operator chose.
-    #[error("page_cache_bytes {bytes} is below one value page of {minimum} bytes")]
+    /// The memory budget of the page cache cannot hold one value page in
+    /// every shard of its memory level, so the cache would keep a page per
+    /// shard however small the budget, and the budget would bound nothing
+    /// (`cache::min_memory_bytes`).
+    #[error("page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes")]
     PageCacheTooSmall {
         /// The configured budget.
         bytes: u64,
-        /// The smallest budget that holds a page: one contract value page.
+        /// The smallest budget that holds a value page in every shard: one
+        /// contract value page with its entry overhead per shard.
         minimum: u64,
     },
     /// A page cache disk level smaller than its one block, which would hold
@@ -250,10 +254,11 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     {
         return Err(ConfigViolation::IncompleteStaticKeys);
     }
-    if approx::count(config.server.page_cache_bytes) < VALUE_PAGE_BYTES {
+    let minimum = min_memory_bytes();
+    if approx::count(config.server.page_cache_bytes) < minimum {
         return Err(ConfigViolation::PageCacheTooSmall {
             bytes: approx::count(config.server.page_cache_bytes),
-            minimum: VALUE_PAGE_BYTES,
+            minimum,
         });
     }
     if let Some(local) = &config.storage.local
@@ -323,7 +328,9 @@ pub struct ServerConfig {
     #[serde(with = "time::friendly_duration")]
     pub poll_interval: Duration,
     /// The value-page cache budget in bytes; at least one contract value
-    /// page (`contract::VALUE_PAGE_BYTES`), or the cache could hold nothing.
+    /// page with its entry overhead per shard of the cache's memory level
+    /// (`cache::min_memory_bytes`), or the budget would bound
+    /// nothing.
     pub page_cache_bytes: usize,
     /// Log field renames and additions.
     pub log: LogConfig,
@@ -583,6 +590,7 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+    use crate::contract::VALUE_PAGE_BYTES;
     use crate::error::Error;
 
     /// The gRPC listener the full fixture names.
@@ -990,33 +998,23 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_parse_refuses_page_cache_below_one_value_page() {
+    fn test_parse_refuses_page_cache_below_a_value_page_per_shard() {
         let with_budget = |bytes: u64| {
             format!(
                 "[server]\npage_cache_bytes = {bytes}\n{}",
                 TOML_MINIMAL.trim_start()
             )
         };
-        let just_below = VALUE_PAGE_BYTES - 1;
-        assert_eq!(
-            violation(&with_budget(just_below)),
-            ConfigViolation::PageCacheTooSmall {
-                bytes: just_below,
-                minimum: VALUE_PAGE_BYTES,
-            }
-        );
-        assert_eq!(
-            violation(&with_budget(0)),
-            ConfigViolation::PageCacheTooSmall {
-                bytes: 0,
-                minimum: VALUE_PAGE_BYTES,
-            }
-        );
-        let one_page = Config::parse(&with_budget(VALUE_PAGE_BYTES)).unwrap();
-        assert_eq!(
-            approx::count(one_page.server.page_cache_bytes),
-            VALUE_PAGE_BYTES
-        );
+        let minimum = min_memory_bytes();
+        for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
+            assert_eq!(
+                violation(&with_budget(bytes)),
+                ConfigViolation::PageCacheTooSmall { bytes, minimum },
+                "{bytes} bytes"
+            );
+        }
+        let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
+        assert_eq!(approx::count(at_minimum.server.page_cache_bytes), minimum);
     }
 
     #[test]
