@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use icetray_core::check::Tier;
 use icetray_core::{
-    Error, FindingCode, Generation, Key, Serviceability, Storage, Table, Value, diagnose, open,
+    Error, Finding, FindingCode, Generation, Key, Serviceability, Storage, Table, Value, diagnose,
+    open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, WIDE_REPEATS,
@@ -124,8 +125,8 @@ fn cost_codes(golden: &Golden) -> Vec<FindingCode> {
     diagnose(&golden.current())
         .findings
         .iter()
-        .filter(|finding| finding.tier == Tier::Cost)
-        .map(|finding| finding.code)
+        .filter(|finding| finding.tier() == Tier::Cost)
+        .map(Finding::code)
         .collect()
 }
 
@@ -133,8 +134,8 @@ fn advice_codes(golden: &Golden) -> Vec<FindingCode> {
     diagnose(&golden.current())
         .findings
         .iter()
-        .filter(|finding| finding.tier == Tier::Advice)
-        .map(|finding| finding.code)
+        .filter(|finding| finding.tier() == Tier::Advice)
+        .map(Finding::code)
         .collect()
 }
 

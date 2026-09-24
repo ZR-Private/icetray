@@ -22,7 +22,9 @@ use icetray_core::check::thresholds::{
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST,
 };
 use icetray_core::config::Residency;
-use icetray_core::{Error, FindingCode, KeyType, Serviceability, TableReport, Value, diagnose};
+use icetray_core::{
+    Error, Finding, FindingCode, KeyType, Serviceability, TableReport, Value, diagnose,
+};
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
     SECOND_CLASS, SMALL_FILE_BYTES, TWO_BUCKETS, TWO_FILES, UNPARTITIONED_FILE_BYTES,
@@ -98,8 +100,8 @@ fn codes_at(report: &TableReport, tier: Tier) -> BTreeSet<FindingCode> {
     report
         .findings
         .iter()
-        .filter(|finding| finding.tier == tier)
-        .map(|finding| finding.code)
+        .filter(|finding| finding.tier() == tier)
+        .map(Finding::code)
         .collect()
 }
 
@@ -143,11 +145,11 @@ async fn strict_refusal(fixture: &Fixture, catalog: &Arc<dyn Catalog>) -> Result
 }
 
 /// The one finding of `code` in `report`.
-fn finding(report: &TableReport, code: FindingCode) -> &icetray_core::Finding {
+fn finding(report: &TableReport, code: FindingCode) -> &Finding {
     report
         .findings
         .iter()
-        .find(|finding| finding.code == code)
+        .find(|finding| finding.code() == code)
         .unwrap_or_else(|| panic!("{code} in {:?}", report.findings))
 }
 
@@ -181,7 +183,7 @@ async fn test_dictionary_encoded_value_is_a_cost_of_one_extra_get() -> Result<()
     assert_codes(&report, &[FindingCode::DictionaryEncodedValue], &[]);
     assert_eq!(
         finding(&report, FindingCode::DictionaryEncodedValue)
-            .penalty
+            .penalty()
             .and_then(|penalty| penalty.extra_gets_per_hit),
         Some(1)
     );
@@ -223,7 +225,7 @@ async fn test_large_key_pages_cost_is_the_rows_decoded() -> Result<()> {
     assert_codes(&report, &[FindingCode::LargeKeyPages], &[]);
     assert_eq!(
         finding(&report, FindingCode::LargeKeyPages)
-            .penalty
+            .penalty()
             .and_then(|penalty| penalty.keys_decoded_per_lookup),
         Some(LARGE_PAGE_ROWS)
     );
@@ -254,7 +256,7 @@ async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
     );
     assert_eq!(
         finding(&report, FindingCode::NoBucketPartition)
-            .penalty
+            .penalty()
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(generation.files.len())
     );
@@ -282,7 +284,7 @@ async fn test_overlapping_files_is_a_cost() -> Result<()> {
     assert_codes(&report, &[FindingCode::OverlappingFiles], &[]);
     assert_eq!(
         finding(&report, FindingCode::OverlappingFiles)
-            .penalty
+            .penalty()
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(TWO_FILES)
     );
@@ -415,7 +417,7 @@ async fn test_large_file_is_advice() -> Result<()> {
         &[FindingCode::LargeFile, FindingCode::LargeValuePages],
     );
     assert_eq!(
-        finding(&report, FindingCode::LargeFile).file.as_deref(),
+        finding(&report, FindingCode::LargeFile).file(),
         Some(fixture.files()[0].file_path())
     );
     Ok(())

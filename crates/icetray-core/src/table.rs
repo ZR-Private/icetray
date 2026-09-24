@@ -378,7 +378,7 @@ impl Table {
         let report = check::diagnose(generation);
         let mut counts: BTreeMap<FindingCode, u64> = BTreeMap::new();
         for finding in &report.findings {
-            *counts.entry(finding.code).or_default() += 1;
+            *counts.entry(finding.code()).or_default() += 1;
             log_finding(self.name(), finding);
         }
         match report.summary.serviceability {
@@ -540,22 +540,13 @@ impl fmt::Debug for Table {
 /// table, code, tier, and file as fields and the finding's message as the
 /// event's.
 fn log_finding(table: &str, finding: &Finding) {
-    let message = finding.message.as_str();
-    match finding.tier {
-        Tier::Cost => tracing::warn!(
-            table,
-            code = %finding.code,
-            tier = ?finding.tier,
-            file = finding.file.as_deref(),
-            "{message}"
-        ),
-        Tier::Advice => tracing::info!(
-            table,
-            code = %finding.code,
-            tier = ?finding.tier,
-            file = finding.file.as_deref(),
-            "{message}"
-        ),
+    let message = finding.message();
+    let code = finding.code();
+    let tier = finding.tier();
+    let file = finding.file();
+    match tier {
+        Tier::Cost => tracing::warn!(table, code = %code, tier = ?tier, file, "{message}"),
+        Tier::Advice => tracing::info!(table, code = %code, tier = ?tier, file, "{message}"),
     }
 }
 
@@ -563,9 +554,12 @@ fn log_finding(table: &str, finding: &Finding) {
 /// them: what `Error::Inefficient` carries.
 fn cost_codes(findings: &[Finding]) -> Vec<FindingCode> {
     let mut codes = Vec::new();
-    for finding in findings.iter().filter(|finding| finding.tier == Tier::Cost) {
-        if !codes.contains(&finding.code) {
-            codes.push(finding.code);
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.tier() == Tier::Cost)
+    {
+        if !codes.contains(&finding.code()) {
+            codes.push(finding.code());
         }
     }
     codes

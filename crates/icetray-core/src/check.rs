@@ -345,29 +345,23 @@ impl fmt::Display for WriterProperty {
 /// One observation about a generation: its tier and code decide what it
 /// means, the message carries the numbers for a reader, and the property
 /// names what a writer changes; `penalty` is `Some` exactly for a `Cost`.
+/// The fields are private and `cost` and `advice` are the only
+/// constructors, so the tier and the penalty cannot disagree: a cost always
+/// carries one and advice never does. Serializes with the field names of
+/// its getters.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
-    /// Cost or advice.
-    pub tier: Tier,
-    /// The finding's code.
-    pub code: FindingCode,
-    /// The numbers behind the finding and the fix, for a person; nothing
-    /// decides on it.
-    pub message: String,
-    /// The data file the finding is about; `None` for a table-level one.
-    pub file: Option<String>,
-    /// The measured penalty of a cost finding.
-    pub penalty: Option<Penalty>,
-    /// The writer property that fixes it, when one does; the partition spec
-    /// and compaction are named in the message instead.
-    pub property: Option<WriterProperty>,
+    tier: Tier,
+    code: FindingCode,
+    message: String,
+    file: Option<String>,
+    penalty: Option<Penalty>,
+    property: Option<WriterProperty>,
 }
 
 impl Finding {
     /// A cost finding, served at `penalty`'s price; `file` names the data
-    /// file, `None` for a table-level one. The two constructors are the
-    /// only way a finding is built, so the tier and the penalty cannot
-    /// disagree: a cost always carries one and advice never does.
+    /// file, `None` for a table-level one.
     pub(crate) fn cost(
         code: FindingCode,
         file: Option<&str>,
@@ -386,7 +380,9 @@ impl Finding {
     }
 
     /// An advice finding: serving is unaffected, so there is no penalty.
-    pub(crate) fn advice(
+    /// Public so a crate that renders findings can build one in its tests;
+    /// `cost` is crate-private, since only the diagnosis measures a penalty.
+    pub fn advice(
         code: FindingCode,
         file: Option<&str>,
         message: String,
@@ -400,6 +396,38 @@ impl Finding {
             penalty: None,
             property,
         }
+    }
+
+    /// Cost or advice.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    /// The finding's code.
+    pub fn code(&self) -> FindingCode {
+        self.code
+    }
+
+    /// The numbers behind the finding and the fix, for a person; nothing
+    /// decides on it.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The data file the finding is about; `None` for a table-level one.
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_deref()
+    }
+
+    /// The measured penalty; `Some` exactly for a cost finding.
+    pub fn penalty(&self) -> Option<Penalty> {
+        self.penalty
+    }
+
+    /// The writer property that fixes it, when one does; the partition spec
+    /// and compaction are named in the message instead.
+    pub fn property(&self) -> Option<WriterProperty> {
+        self.property
     }
 }
 
@@ -528,7 +556,7 @@ pub fn diagnose(g: &Generation) -> TableReport {
     sort_findings(&mut findings);
     let costs = findings
         .iter()
-        .filter(|finding| finding.tier == Tier::Cost)
+        .filter(|finding| finding.tier() == Tier::Cost)
         .count();
     let serviceability = Serviceability::from_costs(costs);
     let summary = TableSummary {
@@ -1059,7 +1087,7 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
 /// the stable sort keeps, so two runs over one generation print the same
 /// report.
 fn sort_findings(findings: &mut [Finding]) {
-    findings.sort_by_key(|finding| (Reverse(finding.tier), finding.code));
+    findings.sort_by_key(|finding| (Reverse(finding.tier()), finding.code()));
 }
 
 /// Every tier's resident bytes for the table, from the footers alone: each
@@ -1355,11 +1383,11 @@ mod tests {
             .iter()
             .map(|finding| {
                 (
-                    finding.code,
-                    finding.tier,
-                    finding.penalty,
-                    finding.property,
-                    finding.file.clone(),
+                    finding.code(),
+                    finding.tier(),
+                    finding.penalty(),
+                    finding.property(),
+                    finding.file().map(str::to_string),
                 )
             })
             .collect()
@@ -1382,8 +1410,8 @@ mod tests {
         );
         for finding in &report.findings {
             assert_eq!(
-                finding.penalty.is_some(),
-                finding.tier == Tier::Cost,
+                finding.penalty().is_some(),
+                finding.tier() == Tier::Cost,
                 "{:?}",
                 finding.code
             );

@@ -229,7 +229,6 @@ impl<'de> serde::Deserialize<'de> for KeyOrder {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use icetray_core::check::Tier;
     use icetray_core::{
         FindingCode, KeyType, Residency, ResidentBytes, Serviceability, TableFault,
     };
@@ -293,14 +292,7 @@ mod tests {
     }
 
     fn finding() -> Finding {
-        Finding {
-            tier: Tier::Cost,
-            code: FindingCode::NoBucketPartition,
-            message: "sample".to_string(),
-            file: None,
-            penalty: None,
-            property: None,
-        }
+        Finding::advice(FindingCode::LargeFile, None, "sample".to_string(), None)
     }
 
     fn file_report() -> FileReport {
@@ -394,9 +386,9 @@ mod tests {
         assert_eq!(line["kind"], Json::String("finding".to_string()));
         assert_eq!(
             line["code"],
-            Json::String(FindingCode::NoBucketPartition.to_string())
+            Json::String(FindingCode::LargeFile.to_string())
         );
-        assert_eq!(line["tier"], Json::String("cost".to_string()));
+        assert_eq!(line["tier"], Json::String("advice".to_string()));
         let file = file_report();
         let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
         assert_eq!(line["kind"], Json::String("file".to_string()));

@@ -743,7 +743,14 @@ impl FindingCode {
 /// `BloomFilterNdvColumn`) render the property up to its trailing dot and
 /// the finding's message appends the column.
 pub enum WriterProperty { EnableDictionary, ColumnIndexTruncateLength, PageRowLimit, PageSizeBytes, RowGroupCheckRecordCount, TargetFileSizeBytes, MetricsColumn, BloomFilterEnabled, BloomFilterMaxBytes, BloomFilterNdvColumn, SkewSplitting }
-pub struct Finding { pub tier: Tier, pub code: FindingCode, pub message: String, pub file: Option<String>, pub penalty: Option<Penalty>, pub property: Option<WriterProperty> }
+/// Private fields: `cost` (crate-private) and `advice` (public, for a renderer's tests) are the only
+/// constructors, so `penalty` is `Some` exactly for a `Cost`. Serializes under the getters' names.
+pub struct Finding { tier: Tier, code: FindingCode, message: String, file: Option<String>, penalty: Option<Penalty>, property: Option<WriterProperty> }
+impl Finding {
+    pub fn advice(code: FindingCode, file: Option<&str>, message: String, property: Option<WriterProperty>) -> Self;
+    pub fn tier(&self) -> Tier; pub fn code(&self) -> FindingCode; pub fn message(&self) -> &str;
+    pub fn file(&self) -> Option<&str>; pub fn penalty(&self) -> Option<Penalty>; pub fn property(&self) -> Option<WriterProperty>;
+}
 pub struct FileReport {
     pub path: String, pub bucket: u32, pub key_type: KeyType, pub rows: i64, pub row_groups: usize,
     pub key_pages: usize, pub value_pages: usize, pub max_key_page_rows: i64, pub max_key_bytes: usize,

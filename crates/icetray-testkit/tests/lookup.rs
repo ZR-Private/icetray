@@ -391,7 +391,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         let flagged = report
             .findings
             .iter()
-            .any(|finding| finding.code == FindingCode::LargeValuePages);
+            .any(|finding| finding.code() == FindingCode::LargeValuePages);
         for file in &generation.files {
             let column_index = file
                 .index
