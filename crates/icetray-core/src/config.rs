@@ -73,6 +73,61 @@ const DEFAULT_HEDGE_WINDOW: usize = 256;
 /// (RFD 013).
 const DEFAULT_HEDGE_MAX_RATE: f64 = 0.05;
 
+/// How long a `Get` may run when the file says nothing: five seconds. A
+/// live lookup answers well under 200 ms, so a lookup still running at five
+/// seconds is waiting on a wedged store, and failing it frees the caller
+/// to fall back. A shorter deadline the client sends wins.
+const DEFAULT_GET_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a `MultiGet` may run when the file says nothing: fifteen
+/// seconds, flat whatever the batch size. A batch runs a bounded number of
+/// lookups at a time, so a full batch of cold hits takes several GET round
+/// trips; three `Get` deadlines covers that and still fails a wedged store
+/// long before a caller's own patience runs out.
+const DEFAULT_MULTI_GET_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Requests (`Get` and `MultiGet` together) in flight at once when the file
+/// says nothing: 1024. A request that finds every slot taken is refused at
+/// once rather than queued, so a wedged store cannot pile up requests until
+/// the process runs out of memory. A single-pod guess, to revisit with
+/// measurement (RFD 013).
+const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
+
+/// Keys one `MultiGet` may carry when the file says nothing: 1000. A larger
+/// batch is refused before any lookup, so the work one request can ask for,
+/// and the answer it holds in memory, is bounded. A single-pod guess, to
+/// revisit with measurement (RFD 013).
+const DEFAULT_MAX_MULTI_GET_KEYS: usize = 1000;
+
+/// How long a first load or a refresh may run when the file says nothing:
+/// five minutes. A load reads every footer and key chunk of a snapshot, so
+/// it is patient, but bounded: it holds the table's load lock, which
+/// `Opened::retain` waits on for every table in turn.
+const DEFAULT_REFRESH_DEADLINE: Duration = Duration::from_mins(5);
+
+/// How long a shutdown waits for open connections when the file says
+/// nothing: twenty seconds. A request runs at most `DEFAULT_MULTI_GET_DEADLINE`,
+/// so twenty seconds lets the last of them finish and leaves time to flush
+/// the page cache before an orchestrator's usual thirty-second kill.
+const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Retries of one failed object-store request when the file says nothing:
+/// two. A transient error recovers within a retry or two; more retries
+/// against a wedged store only hold the request open longer.
+const DEFAULT_MAX_RETRIES: usize = 2;
+
+/// How long an object-store connection may take to open when the file says
+/// nothing: one second. A connection to the store opens in milliseconds, so
+/// a second is already a failure, and it leaves the retries time to try
+/// another address.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long one catalog call may run when the file says nothing: thirty
+/// seconds. A catalog call is on the background path, a poll or a load that
+/// nobody waits on, so it is patient, but a catalog that never answers must
+/// not hold a poll forever.
+const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What `S3Config`'s `Debug` prints in place of the secret access key.
 const SECRET_PLACEHOLDER: &str = "[redacted]";
 
@@ -159,6 +214,33 @@ pub enum ConfigViolation {
     /// and the runtime's interval refuses a zero period.
     #[error("poll_interval must be above zero")]
     PollIntervalZero,
+    /// A `Get` deadline of zero, which would fail every lookup unstarted.
+    #[error("get_deadline must be above zero")]
+    GetDeadlineZero,
+    /// A `MultiGet` deadline of zero, which would fail every batch unstarted.
+    #[error("multi_get_deadline must be above zero")]
+    MultiGetDeadlineZero,
+    /// No request may be in flight, so every request would be refused.
+    #[error("max_in_flight must be above zero")]
+    MaxInFlightZero,
+    /// No key may be in a `MultiGet`, so every batch would be refused.
+    #[error("max_multi_get_keys must be above zero")]
+    MaxMultiGetKeysZero,
+    /// A refresh deadline of zero, which would fail every load unstarted.
+    #[error("refresh_deadline must be above zero")]
+    RefreshDeadlineZero,
+    /// A drain deadline of zero, which would cut every open request off at
+    /// shutdown.
+    #[error("drain_deadline must be above zero")]
+    DrainDeadlineZero,
+    /// An object-store connect timeout of zero, which would fail every
+    /// connection before it opened.
+    #[error("connect_timeout must be above zero")]
+    ConnectTimeoutZero,
+    /// A catalog timeout of zero, which would fail every catalog call
+    /// unstarted.
+    #[error("catalog_timeout must be above zero")]
+    CatalogTimeoutZero,
     /// A rewrite rule whose `from` is empty: every location starts with the
     /// empty prefix, so the rule would rewrite all of them.
     #[error("a rewrite rule has an empty from prefix")]
@@ -237,9 +319,7 @@ impl Config {
 
 /// The first rule the configuration breaks, or `Ok` when it breaks none.
 fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
-    if config.server.poll_interval.is_zero() {
-        return Err(ConfigViolation::PollIntervalZero);
-    }
+    validate_bounds(&config.server, &config.storage)?;
     validate_hedge(&config.storage.hedge)?;
     if config
         .storage
@@ -293,6 +373,47 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     Ok(())
 }
 
+/// Every interval, deadline, timeout, and limit that a zero would turn into
+/// "refuse everything" or "never pause" is above zero. `max_retries` is
+/// not among them: zero retries is a request tried once.
+fn validate_bounds(
+    server: &ServerConfig,
+    storage: &StorageConfig,
+) -> std::result::Result<(), ConfigViolation> {
+    let durations = [
+        (server.poll_interval, ConfigViolation::PollIntervalZero),
+        (server.get_deadline, ConfigViolation::GetDeadlineZero),
+        (
+            server.multi_get_deadline,
+            ConfigViolation::MultiGetDeadlineZero,
+        ),
+        (
+            server.refresh_deadline,
+            ConfigViolation::RefreshDeadlineZero,
+        ),
+        (server.drain_deadline, ConfigViolation::DrainDeadlineZero),
+        (storage.connect_timeout, ConfigViolation::ConnectTimeoutZero),
+        (storage.catalog_timeout, ConfigViolation::CatalogTimeoutZero),
+    ];
+    let limits = [
+        (server.max_in_flight, ConfigViolation::MaxInFlightZero),
+        (
+            server.max_multi_get_keys,
+            ConfigViolation::MaxMultiGetKeysZero,
+        ),
+    ];
+    if let Some((_, violation)) = durations
+        .into_iter()
+        .find(|(duration, _)| duration.is_zero())
+    {
+        return Err(violation);
+    }
+    match limits.into_iter().find(|(limit, _)| *limit == 0) {
+        Some((_, violation)) => Err(violation),
+        None => Ok(()),
+    }
+}
+
 /// The hedge settings are checked whether or not hedging is enabled, so a
 /// mistyped value is caught before the day it is switched on.
 fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolation> {
@@ -313,9 +434,12 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
     Ok(())
 }
 
-/// Listeners, polling, the page cache, and logging. `metrics_listen` is
-/// always bound: it serves `/metrics` and `/ready`, and RFD 012 makes both
-/// part of the surface.
+/// Listeners, polling, the page cache, logging, and the bounds of the live
+/// and background paths (RFD 013). `metrics_listen` is always bound: it
+/// serves `/metrics` and `/ready`, and RFD 012 makes both part of the
+/// surface. Every duration is written as a friendly duration such as
+/// `"5s"`, and every one of them, `max_in_flight`, and
+/// `max_multi_get_keys` is above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -334,6 +458,28 @@ pub struct ServerConfig {
     pub page_cache_bytes: usize,
     /// Log field renames and additions.
     pub log: LogConfig,
+    /// How long a `Get` may run before it is `DEADLINE_EXCEEDED`; a shorter
+    /// deadline the client sends wins.
+    #[serde(with = "time::friendly_duration")]
+    pub get_deadline: Duration,
+    /// How long a `MultiGet` may run before it is `DEADLINE_EXCEEDED`,
+    /// whatever its size; a shorter deadline the client sends wins.
+    #[serde(with = "time::friendly_duration")]
+    pub multi_get_deadline: Duration,
+    /// Requests, `Get` and `MultiGet` together, in flight at once; one more
+    /// is refused at once as `RESOURCE_EXHAUSTED`, never queued.
+    pub max_in_flight: usize,
+    /// Keys one `MultiGet` may carry; more is `INVALID_ARGUMENT` before any
+    /// lookup.
+    pub max_multi_get_keys: usize,
+    /// How long a table's first load or one refresh may run before it fails
+    /// and the table is `Degraded`; the next poll tries again.
+    #[serde(with = "time::friendly_duration")]
+    pub refresh_deadline: Duration,
+    /// How long a shutdown waits for open requests before it stops waiting,
+    /// closes the page cache, and ends the run.
+    #[serde(with = "time::friendly_duration")]
+    pub drain_deadline: Duration,
 }
 
 impl Default for ServerConfig {
@@ -344,6 +490,12 @@ impl Default for ServerConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             page_cache_bytes: DEFAULT_PAGE_CACHE_BYTES,
             log: LogConfig::default(),
+            get_deadline: DEFAULT_GET_DEADLINE,
+            multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            max_multi_get_keys: DEFAULT_MAX_MULTI_GET_KEYS,
+            refresh_deadline: DEFAULT_REFRESH_DEADLINE,
+            drain_deadline: DEFAULT_DRAIN_DEADLINE,
         }
     }
 }
@@ -452,8 +604,11 @@ pub struct LocalConfig {
     pub page_cache_disk_bytes: u64,
 }
 
-/// Object storage, hedging, and the local directory.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+/// Object storage, hedging, the local directory, and the bounds on every
+/// request to the object store and the catalog (RFD 013). The two
+/// durations are written as friendly durations such as `"1s"` and are
+/// above zero; `max_retries` may be zero.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StorageConfig {
     /// Explicit S3 settings; absent means the SDK's default chain.
@@ -464,6 +619,30 @@ pub struct StorageConfig {
     pub hedge: HedgeConfig,
     /// The local directory; required by disk residency.
     pub local: Option<LocalConfig>,
+    /// Retries of one failed S3 request, on the live and background paths
+    /// alike; zero tries each request once.
+    pub max_retries: usize,
+    /// How long an S3 connection may take to open.
+    #[serde(with = "time::friendly_duration")]
+    pub connect_timeout: Duration,
+    /// How long one catalog call may run before the poll or load that made
+    /// it fails.
+    #[serde(with = "time::friendly_duration")]
+    pub catalog_timeout: Duration,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            s3: None,
+            rewrite: Vec::new(),
+            hedge: HedgeConfig::default(),
+            local: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            catalog_timeout: DEFAULT_CATALOG_TIMEOUT,
+        }
+    }
 }
 
 /// One served table.
@@ -620,6 +799,24 @@ mod tests {
     const MAX_RATE_TOO_HIGH: f64 = 1.5;
     /// A hedge ceiling below the range.
     const MAX_RATE_NEGATIVE: f64 = -0.5;
+    /// The `Get` deadline the full fixture names, `"2s"`.
+    const FIXTURE_GET_DEADLINE: Duration = Duration::from_secs(2);
+    /// The `MultiGet` deadline the full fixture names, `"8s"`.
+    const FIXTURE_MULTI_GET_DEADLINE: Duration = Duration::from_secs(8);
+    /// The in-flight request limit the full fixture names.
+    const FIXTURE_MAX_IN_FLIGHT: usize = 512;
+    /// The `MultiGet` key limit the full fixture names.
+    const FIXTURE_MAX_MULTI_GET_KEYS: usize = 500;
+    /// The refresh deadline the full fixture names, `"10m"`.
+    const FIXTURE_REFRESH_DEADLINE: Duration = Duration::from_mins(10);
+    /// The drain deadline the full fixture names, `"25s"`.
+    const FIXTURE_DRAIN_DEADLINE: Duration = Duration::from_secs(25);
+    /// The S3 retry count the full fixture names.
+    const FIXTURE_MAX_RETRIES: usize = 3;
+    /// The S3 connect timeout the full fixture names, `"500ms"`.
+    const FIXTURE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+    /// The catalog timeout the full fixture names, `"1m"`.
+    const FIXTURE_CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
     /// The top of both hedge ranges, which is inside each.
     const HEDGE_RANGE_TOP: f64 = 1.0;
     /// The bottom of the ceiling's range, which is inside it.
@@ -636,6 +833,12 @@ listen = "{FIXTURE_LISTEN}"
 metrics_listen = "{FIXTURE_METRICS_LISTEN}"
 poll_interval = "30s"
 page_cache_bytes = {FIXTURE_PAGE_CACHE_BYTES}
+get_deadline = "2s"
+multi_get_deadline = "8s"
+max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
+max_multi_get_keys = {FIXTURE_MAX_MULTI_GET_KEYS}
+refresh_deadline = "10m"
+drain_deadline = "25s"
 
 [server.log.fields]
 timestamp = "ts"
@@ -643,6 +846,11 @@ level = "severity"
 
 [server.log.static_fields]
 service = "icetray"
+
+[storage]
+max_retries = {FIXTURE_MAX_RETRIES}
+connect_timeout = "500ms"
+catalog_timeout = "1m"
 
 [storage.s3]
 endpoint = "http://object-store.example:9000"
@@ -705,12 +913,21 @@ table = "profiles"
                 "metrics_listen": FIXTURE_METRICS_LISTEN.to_string(),
                 "poll_interval": "30s",
                 "page_cache_bytes": FIXTURE_PAGE_CACHE_BYTES,
+                "get_deadline": "2s",
+                "multi_get_deadline": "8s",
+                "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
+                "max_multi_get_keys": FIXTURE_MAX_MULTI_GET_KEYS,
+                "refresh_deadline": "10m",
+                "drain_deadline": "25s",
                 "log": {
                     "fields": {"timestamp": "ts", "level": "severity"},
                     "static_fields": {"service": "icetray"}
                 }
             },
             "storage": {
+                "max_retries": FIXTURE_MAX_RETRIES,
+                "connect_timeout": "500ms",
+                "catalog_timeout": "1m",
                 "s3": {
                     "endpoint": "http://object-store.example:9000",
                     "region": "us-example-1",
@@ -792,6 +1009,12 @@ value_column = "value"
                     ]),
                     static_fields: BTreeMap::from([("service".to_string(), "icetray".to_string())]),
                 },
+                get_deadline: FIXTURE_GET_DEADLINE,
+                multi_get_deadline: FIXTURE_MULTI_GET_DEADLINE,
+                max_in_flight: FIXTURE_MAX_IN_FLIGHT,
+                max_multi_get_keys: FIXTURE_MAX_MULTI_GET_KEYS,
+                refresh_deadline: FIXTURE_REFRESH_DEADLINE,
+                drain_deadline: FIXTURE_DRAIN_DEADLINE,
             },
             storage: StorageConfig {
                 s3: Some(S3Config {
@@ -817,6 +1040,9 @@ value_column = "value"
                     index_budget_bytes: Some(FIXTURE_INDEX_BUDGET_BYTES),
                     page_cache_disk_bytes: FIXTURE_PAGE_CACHE_DISK_BYTES,
                 }),
+                max_retries: FIXTURE_MAX_RETRIES,
+                connect_timeout: FIXTURE_CONNECT_TIMEOUT,
+                catalog_timeout: FIXTURE_CATALOG_TIMEOUT,
             },
             tables: vec![
                 TableConfig {
@@ -878,7 +1104,16 @@ value_column = "value"
         assert_eq!(config.server.page_cache_bytes, DEFAULT_PAGE_CACHE_BYTES);
         assert!(config.server.log.fields.is_empty());
         assert!(config.server.log.static_fields.is_empty());
+        assert_eq!(config.server.get_deadline, DEFAULT_GET_DEADLINE);
+        assert_eq!(config.server.multi_get_deadline, DEFAULT_MULTI_GET_DEADLINE);
+        assert_eq!(config.server.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(config.server.max_multi_get_keys, DEFAULT_MAX_MULTI_GET_KEYS);
+        assert_eq!(config.server.refresh_deadline, DEFAULT_REFRESH_DEADLINE);
+        assert_eq!(config.server.drain_deadline, DEFAULT_DRAIN_DEADLINE);
         assert_eq!(config.storage, StorageConfig::default());
+        assert_eq!(config.storage.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(config.storage.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(config.storage.catalog_timeout, DEFAULT_CATALOG_TIMEOUT);
         assert_eq!(config.storage.s3, None);
         assert!(config.storage.rewrite.is_empty());
         assert_eq!(config.storage.hedge, HedgeConfig::default());
@@ -1062,6 +1297,56 @@ locaton = "typo"
     fn test_parse_refuses_poll_interval_zero() {
         let text = format!("{TOML_MINIMAL}\n[server]\npoll_interval = \"0s\"\n");
         assert_eq!(violation(&text), ConfigViolation::PollIntervalZero);
+    }
+
+    #[test]
+    fn test_parse_refuses_a_zero_bound() {
+        let cases = [
+            ("server", "get_deadline", ConfigViolation::GetDeadlineZero),
+            (
+                "server",
+                "multi_get_deadline",
+                ConfigViolation::MultiGetDeadlineZero,
+            ),
+            (
+                "server",
+                "refresh_deadline",
+                ConfigViolation::RefreshDeadlineZero,
+            ),
+            (
+                "server",
+                "drain_deadline",
+                ConfigViolation::DrainDeadlineZero,
+            ),
+            (
+                "storage",
+                "connect_timeout",
+                ConfigViolation::ConnectTimeoutZero,
+            ),
+            (
+                "storage",
+                "catalog_timeout",
+                ConfigViolation::CatalogTimeoutZero,
+            ),
+        ];
+        for (section, key, expected) in cases {
+            let text = format!("{TOML_MINIMAL}\n[{section}]\n{key} = \"0s\"\n");
+            assert_eq!(violation(&text), expected, "{section}.{key}");
+        }
+        let limits = [
+            ("max_in_flight", ConfigViolation::MaxInFlightZero),
+            ("max_multi_get_keys", ConfigViolation::MaxMultiGetKeysZero),
+        ];
+        for (key, expected) in limits {
+            let text = format!("{TOML_MINIMAL}\n[server]\n{key} = 0\n");
+            assert_eq!(violation(&text), expected, "server.{key}");
+        }
+    }
+
+    #[test]
+    fn test_parse_accepts_zero_retries() {
+        let text = format!("{TOML_MINIMAL}\n[storage]\nmax_retries = 0\n");
+        assert_eq!(Config::parse(&text).unwrap().storage.max_retries, 0);
     }
 
     #[test]

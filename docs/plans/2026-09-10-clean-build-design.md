@@ -191,7 +191,13 @@ impl Config {
 /// page with its entry overhead for each of the cache's pinned `MEMORY_SHARDS` (foyer splits the
 /// budget per shard and a shard keeps its latest page whatever its share, so less bounds nothing);
 /// `Config::parse` refuses less as `PageCacheTooSmall`, as it refuses a disk level below one block.
-pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig }
+/// The live-path bounds (RFD 013) the binary's service and shutdown read: `get_deadline`
+/// (default 5 s) and `multi_get_deadline` (15 s, flat) against the client's own shorter
+/// deadline, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
+/// (1000), `drain_deadline` (20 s); and the background path's `refresh_deadline` (5 min) on a
+/// first load or refresh. Every duration is a friendly duration; each is above zero, as are
+/// the two limits (`ConfigViolation::*Zero`).
+pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub refresh_deadline: Duration, pub drain_deadline: Duration }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
 /// standard fields and `static_fields` are added to every event.
 pub struct LogConfig { pub fields: BTreeMap<String, String>, pub static_fields: BTreeMap<String, String> }
@@ -201,7 +207,7 @@ pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
 /// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalZero, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
@@ -214,7 +220,10 @@ impl std::str::FromStr for Residency { type Err = ConfigViolation; }
 /// `contract::PAGE_CACHE_DISK_BLOCK_BYTES`, the level's one block, or the
 /// level would hold nothing; `Config::parse` refuses less as `PageCacheDiskTooSmall`.
 pub struct LocalConfig { pub dir: PathBuf, pub index_budget_bytes: Option<u64>, pub page_cache_disk_bytes: u64 }
-pub struct StorageConfig { pub s3: Option<S3Config>, pub rewrite: Vec<RewriteRule>, pub hedge: HedgeConfig, pub local: Option<LocalConfig> }
+/// `max_retries` (default 2, zero allowed) and `connect_timeout` (1 s) for the S3 clients,
+/// `catalog_timeout` (30 s) for each catalog call; both durations are friendly durations
+/// above zero.
+pub struct StorageConfig { pub s3: Option<S3Config>, pub rewrite: Vec<RewriteRule>, pub hedge: HedgeConfig, pub local: Option<LocalConfig>, pub max_retries: usize, pub connect_timeout: Duration, pub catalog_timeout: Duration }
 pub enum SourceConfig {
     Static { location: String },
     Rest { uri: String, warehouse: Option<String>, namespace: String, table: String },
