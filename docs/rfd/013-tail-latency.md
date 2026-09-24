@@ -1,5 +1,8 @@
 # Tail latency
 
+> Updated 2026-09-24: bounds on the live and background paths, for an
+> object store or catalog that stops answering.
+
 ## Problem
 
 A cold hit costs one GET, and the latency of that GET belongs to the
@@ -42,6 +45,33 @@ The GETs a client waits on are eligible: the value-page GET of a cold hit,
 and under the bloom tier of RFD 017 (Residency tiers) the key-page GET
 before it. Load reads, the footers and key column chunks read while a
 generation is built, are bulk work nobody waits on, and are never hedged.
+
+A hedge cuts the tail of a store that answers; a store or catalog that
+stops answering is bounded instead, on two paths that share one S3 client
+per bucket. The live path, a gRPC request, fails fast. A `Get` has 5
+seconds and a `MultiGet` 15 seconds whatever its size, a shorter deadline
+the client sends wins, and expiry is `DEADLINE_EXCEEDED`, which drops the
+lookup and cancels its GETs; at most 1024 requests run at once, and one
+more is refused with `RESOURCE_EXHAUSTED` rather than queued; a `MultiGet`
+carries at most 1000 keys and runs 32 of its lookups at a time. A live
+lookup expects well under 200 ms, so 5 seconds is already a failure, and
+the refusals keep a wedged store from piling up requests until the process
+runs out of memory. The background path, loads and refreshes, is patient
+but bounded: a catalog call has 30 seconds, and a first load or a refresh
+5 minutes, after which it fails, the table is degraded, and the next poll
+tries again, so no load holds its table's lock longer than that. Both
+paths share the S3 client's bounds: two retries, none started more than a
+minute after the first attempt, a 1-second connect timeout, and 30 seconds
+per attempt, which together end inside the two minutes a cached credential
+is kept short of its expiry (RFD 003). Shutdown waits 20 seconds for open
+requests, which the 15-second cap lets finish, and leaves time to flush
+the page cache before an orchestrator's usual 30-second kill. The
+deadlines, the two limits, the retry count, and the connect and catalog
+timeouts are configuration with these defaults (RFD 011); the retry window,
+the per-attempt timeout, and the fan-out of 32 are constants, the first two
+because the credential margin bounds their sum. 1024 requests in flight
+and 1000 keys per batch are single-pod guesses, to be revisited with
+measurement.
 
 ## Alternatives Considered
 
