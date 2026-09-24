@@ -798,16 +798,23 @@ impl CredentialProvider for SdkCredentials {
 /// single `FileHandle` to a whole generation.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::fmt;
+    use std::future::Future;
     use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use bytes::Bytes;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
 
     use super::{HedgeWindow, Storage};
     use crate::config::StorageConfig;
@@ -862,6 +869,142 @@ pub(crate) mod testing {
             let size = crate::approx::count(bytes.len());
             self.put(location, bytes).await;
             Arc::new(FileHandle::open(Arc::clone(&self.storage), location, size, window).unwrap())
+        }
+    }
+
+    /// A store over `inner` that holds every GET for `hold` before passing
+    /// it on, and counts the GETs in flight at once and the most there have
+    /// been since the last `reset`, so a test can see how many reads a
+    /// caller runs together.
+    #[derive(Debug)]
+    pub(crate) struct Gauged {
+        inner: Arc<dyn ObjectStore>,
+        hold: Duration,
+        in_flight: AtomicUsize,
+        high_water: AtomicUsize,
+    }
+
+    impl Gauged {
+        pub(crate) fn new(inner: Arc<dyn ObjectStore>, hold: Duration) -> Self {
+            Self {
+                inner,
+                hold,
+                in_flight: AtomicUsize::new(0),
+                high_water: AtomicUsize::new(0),
+            }
+        }
+
+        /// The most GETs in flight at once since the last `reset`.
+        pub(crate) fn high_water(&self) -> usize {
+            self.high_water.load(Ordering::SeqCst)
+        }
+
+        /// Starts the high-water mark again from the GETs in flight now.
+        pub(crate) fn reset(&self) {
+            self.high_water
+                .store(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    impl fmt::Display for Gauged {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Gauged({})", self.inner)
+        }
+    }
+
+    impl ObjectStore for Gauged {
+        fn put_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.put_opts(location, payload, opts)
+        }
+
+        fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            opts: PutMultipartOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = object_store::Result<Box<dyn MultipartUpload>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.put_multipart_opts(location, opts)
+        }
+
+        fn get_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            options: GetOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<GetResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.high_water.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(self.hold).await;
+                let answer = self.inner.get_opts(location, options).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                answer
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            prefix: Option<&'life1 Path>,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<ListResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.list_with_delimiter(prefix)
+        }
+
+        fn copy_opts<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 Path,
+            to: &'life2 Path,
+            options: CopyOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.copy_opts(from, to, options)
         }
     }
 

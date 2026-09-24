@@ -698,13 +698,14 @@ pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant
 /// and one tokio mutex that serializes `load` and `refresh`. `known` is what `refresh`
 /// polls against; a failed build does not advance it, so every later poll reads the metadata
 /// again and retries, a transient failure recovers on the next poll, and a persistent refusal
-/// is counted under `refresh_errors_total` once per poll. `load`, `refresh`, `get`, and
-/// `Opened::retain` return `Send` futures: the daemon spawns them onto a multi-thread
-/// runtime, so `manifest::list_data_files` collects the manifest files into a `Vec` before
-/// streaming them and `generation::gather_chunks` streams group positions by value, since an
+/// is counted under `refresh_errors_total` once per poll. `load`, `refresh`, `get`,
+/// `multi_get`, and `Opened::retain` return `Send` futures: the daemon runs them on a
+/// multi-thread runtime, so `manifest::list_data_files` collects the manifest files into a
+/// `Vec` before streaming them, `generation::gather_chunks` streams group positions by value,
+/// and `multi_get` builds its lookups into a `Vec` before streaming them, since an
 /// opaque `impl IntoIterator` fed to `stream::iter` and a closure taking a reference and
 /// returning an `async` block each make every future up the call chain unprovably `Send`;
-/// `table::tests::test_load_refresh_and_get_are_spawnable` and
+/// `table::tests::test_load_refresh_get_and_multi_get_are_spawnable` and
 /// `open::tests::test_retain_is_spawnable` pin the property.
 pub struct Table;
 impl Table {
@@ -738,7 +739,9 @@ impl Table {
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
     /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
     /// the whole call and issues nothing); the lookups run concurrently against that one
-    /// generation, each counted as `get` counts; any `Err` fails the whole call (RFD 010).
+    /// generation, a private `MULTI_GET_FAN_OUT` (32) at a time through `buffered`, so the
+    /// values come back in key order and one batch runs at most that many lookups at once; each
+    /// is counted as `get` counts; any `Err` fails the whole call (RFD 010).
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup>;
     /// Holds the table's load and refresh lock, for `Opened::retain`, which takes every
     /// table's in `tables` order; nothing else ever holds two.

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use futures::future::try_join_all;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use tokio::sync::MutexGuard;
 
@@ -30,6 +30,14 @@ use crate::metric;
 use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
+
+/// The lookups of one `multi_get` in flight at once: 32. A lookup waits on
+/// one GET at a time, and at most one hedge beside it, so a batch holds at
+/// most twice this many GETs open on the store however many keys it
+/// carries, rather than one per key. A full batch of cold hits takes about
+/// thirty GET round trips, inside the `MultiGet` deadline at the latency a
+/// live lookup expects, well under 200 ms each (RFD 013).
+const MULTI_GET_FAN_OUT: usize = 32;
 
 /// Where a table is in its lifecycle. Display gives the `state` metric
 /// label: the variant's name alone, `loading`, `serving`, or `degraded`.
@@ -276,13 +284,24 @@ impl Table {
     /// Several lookups against one generation, answered in key order. Every
     /// key's type is checked before any read, so a mismatch anywhere fails
     /// the whole call and issues nothing; the lookups then run concurrently,
-    /// and any failure fails the whole call (RFD 010).
+    /// `MULTI_GET_FAN_OUT` at a time, and any failure fails the whole call
+    /// (RFD 010).
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup> {
         let generation = self.serving()?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
-        let values = try_join_all(keys.iter().map(|key| self.lookup(&generation, key))).await?;
+        // The lookups are built before the stream, unpolled, so no closure
+        // taking a key by reference lives in the returned future; one would
+        // make it unprovably `Send`, and the gRPC service needs it `Send`.
+        let lookups: Vec<_> = keys
+            .iter()
+            .map(|key| self.lookup(&generation, key))
+            .collect();
+        let values = stream::iter(lookups)
+            .buffered(MULTI_GET_FAN_OUT)
+            .try_collect()
+            .await?;
         Ok(MultiLookup {
             values,
             snapshot_id: generation.snapshot_id,
@@ -623,7 +642,7 @@ mod tests {
     use crate::manifest::testing::Partition;
     use crate::metric::LookupResult;
     use crate::storage::FILE_PREFIX;
-    use crate::storage::testing::{DEADLINE_GUARD, STALL};
+    use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
 
     /// The GETs an unchanged poll costs: the version hint (RFD 005).
     const POLL_GETS: u64 = 1;
@@ -633,6 +652,9 @@ mod tests {
     /// The name of a second, strict table in the metrics tests, beside the
     /// fixture's `TABLE`.
     const STRICT_TABLE: &str = "strict";
+    /// How long the gauged store holds each GET in the fan-out test, so
+    /// the lookups a batch runs together overlap on the store.
+    const FAN_OUT_HOLD: Duration = Duration::from_millis(20);
     /// The refresh deadline of the tests that stall a load: long enough
     /// for the one-file fixture's first load, short enough to keep the test
     /// quick.
@@ -830,10 +852,11 @@ mod tests {
     }
 
     /// The daemon spawns every load, poll, and lookup onto a multi-thread
-    /// runtime, so their futures are `Send`; `tokio::spawn` refuses one that
-    /// is not at compile time.
+    /// runtime, and the gRPC service runs batches there too, so their
+    /// futures are `Send`; `tokio::spawn` refuses one that is not at compile
+    /// time.
     #[tokio::test]
-    async fn test_load_refresh_and_get_are_spawnable() {
+    async fn test_load_refresh_get_and_multi_get_are_spawnable() {
         let (fixture, all) = two_bucket_table().await;
         let table = Arc::new(table_over(&fixture, fixture.config(Residency::Full, None)).await);
         let loaded = tokio::spawn({
@@ -846,6 +869,12 @@ mod tests {
             async move { table.refresh().await }
         });
         assert!(!polled.await.unwrap().unwrap(), "nothing moved");
+        let batch = tokio::spawn({
+            let table = Arc::clone(&table);
+            let keys = vec![Key::Long(all[0])];
+            async move { table.multi_get(&keys).await }
+        });
+        assert_eq!(batch.await.unwrap().unwrap().values, [present(all[0])]);
         let key = Key::Long(all[0]);
         let looked_up = tokio::spawn(async move { table.get(&key).await });
         assert_eq!(looked_up.await.unwrap().unwrap().value, present(all[0]));
@@ -881,6 +910,52 @@ mod tests {
                 values: vec![present(all[0]), Value::Absent, present(all[1])],
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_runs_at_most_the_fan_out_bound_at_once_in_key_order() {
+        let batches_of_the_bound = 3;
+        let key_count = i64::try_from(MULTI_GET_FAN_OUT * batches_of_the_bound).unwrap();
+        let all = keys_from(0, key_count);
+        let keys = long_keys(&all);
+        let mut fixture = Fixture::bucketed(1);
+        // One row per page, so every key is a cold hit on a page of its own
+        // and costs a GET no other key shares.
+        fixture
+            .add_file(FileSpec {
+                name: "f",
+                keys: &keys,
+                values: values_of(&all),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout {
+                    page_rows: 1,
+                    ..WriterLayout::contract()
+                },
+            })
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new()), FAN_OUT_HOLD));
+        fixture
+            .storage
+            .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
+        let config = TableConfig {
+            strict: false,
+            ..fixture.config(Residency::Full, None)
+        };
+        let table = table_over(&fixture, config).await;
+        table.load().await.unwrap();
+        gauged.reset();
+        let answered = table.multi_get(&keys).await.unwrap();
+        let expected: Vec<Value> = all.iter().map(|key| present(*key)).collect();
+        assert_eq!(answered.values, expected);
+        assert_eq!(
+            gauged.high_water(),
+            MULTI_GET_FAN_OUT,
+            "the batch fills the bound and never passes it"
         );
     }
 
