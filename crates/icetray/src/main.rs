@@ -118,8 +118,8 @@ fn prepare(target: &Target) -> Result<Config, ExitCode> {
     Ok(config)
 }
 
-/// A one-shot's outcome as the exit code: a failure is logged, except a
-/// closed stdout, which ends the run quietly with exit 0.
+/// A run's outcome, a one-shot's or `serve`'s, as the exit code: a failure
+/// is logged, except a closed stdout, which ends the run quietly with exit 0.
 fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
     match outcome {
         Ok(code) => code,
@@ -133,9 +133,8 @@ fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
 
 /// `serve`: the configuration from `path`, logging to stdout at `info`
 /// (twelve-factor: the log stream is stdout), jemalloc's background
-/// purging, the metrics recorder, the daemon, and a drain on SIGTERM or
-/// SIGINT. Exits 0 after a drain and 1 when the run failed, which a
-/// first-load failure does on its own (RFD 005).
+/// purging, then the daemon, whose outcome is finished into the exit code
+/// as a one-shot's is.
 async fn serve(path: &Path) -> ExitCode {
     let config = match Config::from_path(path) {
         Ok(config) => config,
@@ -150,32 +149,22 @@ async fn serve(path: &Path) -> ExitCode {
         // schedule.
         tracing::warn!(%error, "jemalloc background purging is unavailable");
     }
-    let handle = match telemetry::install() {
-        Ok(handle) => handle,
-        Err(error) => {
-            tracing::error!(%error, "cannot install the metrics recorder");
-            return ExitCode::from(EXIT_FAILURE);
-        }
-    };
-    let serving = match Serving::start(config, handle, ServeOptions::default()).await {
-        Ok(serving) => serving,
-        Err(error) => {
-            tracing::error!(%error, "cannot start");
-            return ExitCode::from(EXIT_FAILURE);
-        }
-    };
+    finish(daemon(config).await)
+}
+
+/// The metrics recorder, the daemon, and a drain on SIGTERM or SIGINT.
+/// `EXIT_OK` after a drain; a failure to start or a failed run, which a
+/// first-load failure is on its own (RFD 005), is `CliError::Serve`.
+async fn daemon(config: Config) -> Result<ExitCode, CliError> {
+    let handle = telemetry::install()?;
+    let serving = Serving::start(config, handle, ServeOptions::default()).await?;
     tokio::select! {
         () = signalled() => tracing::info!("draining"),
         () = serving.stopped() => {}
     }
     serving.shutdown();
-    match serving.join().await {
-        Ok(()) => ExitCode::from(EXIT_OK),
-        Err(error) => {
-            tracing::error!(%error, "serve failed");
-            ExitCode::from(EXIT_FAILURE)
-        }
-    }
+    serving.join().await?;
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Completes on SIGTERM or SIGINT. A signal the runtime cannot listen for

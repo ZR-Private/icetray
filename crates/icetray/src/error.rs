@@ -1,10 +1,14 @@
 //! The binary's failures and the exit codes they become. `CliError` is every
-//! failure a one-shot subcommand can end with; `ServeError` every failure
-//! `serve` can end with; `KeyTextFault` why command-line text is not a key;
-//! `RewriteTextFault` why `--rewrite` text is not a rule; `WireKeyFault`
-//! why a wire key is not a key. `CliError::exit_code` is the one exhaustive
-//! match from a failure to an exit code, and the service maps faults to
-//! status codes by variant, so nothing decides on a message.
+//! failure a subcommand can end with, `serve`'s included; `ServeError` every
+//! failure of the daemon once its configuration and logging are in place,
+//! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
+//! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
+//! is not a rule; `WireKeyFault` why a wire key is not a key.
+//! `CliError::exit_code` is the one exhaustive match from a subcommand's
+//! failure to an exit code; the two failures before any subcommand runs, a
+//! command line clap refuses and a runtime that cannot start, are mapped in
+//! `main`. The service maps faults to status codes by variant, so nothing
+//! decides on a message.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -161,8 +165,9 @@ fn failure_list(failures: &[(String, ErrorKind)]) -> String {
         .join(", ")
 }
 
-/// Every failure a one-shot subcommand can end with, and the failures of
-/// `serve` wrapped, so `main` has one exit-code mapping.
+/// Every failure a subcommand can end with: a one-shot's, and `serve`'s,
+/// whose daemon failures are wrapped as `Serve`, so every subcommand's exit
+/// code comes from `exit_code`.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// A failure inside `icetray-core`: a load or a read.

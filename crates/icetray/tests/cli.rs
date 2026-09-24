@@ -527,6 +527,22 @@ fn check_log_line(line: &Json) {
     }
 }
 
+/// A daemon that cannot bind its gRPC address fails its start, and the
+/// failure reaches exit 1 like any other: the address is held by this test
+/// for the length of the run.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_exits_1_when_its_listener_is_taken() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_bind", KeyType::Long)).await?;
+    let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut config: Json = serde_json::from_str(&json_config(TABLE_A, &fixture))?;
+    config["server"]["listen"] = Json::String(taken.local_addr()?.to_string());
+    let path = write_file(dir.path(), "serve.json", &config.to_string())?;
+    let output = run(&["serve", "--config", &path], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    Ok(())
+}
+
 /// The `state` label value of a table that serves, as core renders the
 /// state; the state's fields do not reach the label, so any snapshot and
 /// instant give it.
@@ -538,7 +554,7 @@ fn serving_state() -> String {
     .to_string()
 }
 
-/// The conformance run of RFD 012, which `dev/conformance.sh` runs by name:
+/// The conformance run of RFD 012, which the workspace test run carries:
 /// the binary started as an orchestrator starts it (the configuration path
 /// from the environment, a JSON file, no flags), its logs under the
 /// configured field names, the health service answering while the table
