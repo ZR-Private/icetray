@@ -880,9 +880,6 @@ pub(crate) mod testing {
 
     /// The table every fixture is named.
     pub(crate) const TABLE: &str = "kv";
-    /// The synthetic prefix an in-memory store is registered under, in the
-    /// tests that read through one.
-    pub(crate) const MEM_PREFIX: &str = "mem://w/";
     /// The memory budget of a test page cache: every page a test touches
     /// fits, so no test sees an eviction it did not ask for.
     pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -909,6 +906,11 @@ pub(crate) mod testing {
     pub(crate) const TWO: u32 = 2;
     /// Keys in each end-to-end data file.
     pub(crate) const E2E_KEYS: i64 = 24;
+    /// Keys in a one-file fixture: enough that a filter sized to them lands
+    /// between `BLOOM_BITS_PER_KEY_MIN` and `BLOOM_BYTES_PER_KEY_ADVICE` and
+    /// draws no finding of its own (the writer's smallest filter is 32
+    /// bytes plus a header).
+    pub(crate) const FILE_KEYS: i64 = 32;
     /// The snapshot ids and sequence numbers of the end-to-end snapshots.
     pub(crate) const FIRST_SNAPSHOT: i64 = 1_001;
     pub(crate) const SECOND_SNAPSHOT: i64 = 1_002;
@@ -1546,30 +1548,27 @@ mod tests {
     use std::collections::HashMap;
 
     use iceberg::spec::{Operation, Summary};
-    use object_store::memory::InMemory;
-    use object_store::path::Path as ObjectPath;
-    use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 
     use super::testing::{
         self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
-        KEY_STEP, MEM_PREFIX, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
-        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout,
-        bucketing, cache, keys_from, keys_in_bucket, local_dir, long_keys, refusal_of,
-        two_bucket_table, value_for, values_of,
+        KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, THIRD_SEQUENCE,
+        THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout, bucketing, cache,
+        keys_from, keys_in_bucket, local_dir, long_keys, refusal_of, two_bucket_table, value_for,
+        values_of,
     };
     use super::*;
     use crate::catalog::TableSource;
-    use crate::config::{HedgeConfig, StorageConfig};
+    use crate::config::HedgeConfig;
     use crate::key::KeyType;
     use crate::manifest::testing::{
         DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID,
     };
+    use crate::storage::testing::{MEM_PREFIX, MemStore};
 
     /// The metadata location the assembled generations claim.
-    const MEM_METADATA: &str = "mem://w/db/kv/metadata/v1.metadata.json";
-    /// The snapshot id and sequence number of the assembled generations.
-    const SNAPSHOT: i64 = 77;
-    const SEQUENCE: i64 = 1;
+    fn mem_metadata() -> String {
+        format!("{MEM_PREFIX}db/kv/metadata/v1.metadata.json")
+    }
     /// Bucket counts the routing tests use beside the fixture's `TWO`.
     const FOUR: u32 = 4;
     const EIGHT: u32 = 8;
@@ -1602,8 +1601,8 @@ mod tests {
     /// of it is read but its id and sequence number.
     fn placeholder_snapshot() -> Snapshot {
         Snapshot::builder()
-            .with_snapshot_id(SNAPSHOT)
-            .with_sequence_number(SEQUENCE)
+            .with_snapshot_id(FIRST_SNAPSHOT)
+            .with_sequence_number(FIRST_SEQUENCE)
             .with_timestamp_ms(0)
             .with_manifest_list(format!("{MEM_PREFIX}db/kv/metadata/snap.avro"))
             .with_summary(Summary {
@@ -1615,26 +1614,20 @@ mod tests {
 
     /// An in-memory store behind a storage, and the files built over it.
     struct Mem {
-        storage: Arc<Storage>,
-        store: Arc<InMemory>,
+        store: MemStore,
         hedge: Arc<HedgeWindow>,
     }
 
     impl Mem {
         fn new() -> Self {
-            let store = Arc::new(InMemory::new());
-            let storage = Arc::new(Storage::new(StorageConfig::default()));
-            let registered: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&store);
-            storage.register(MEM_PREFIX, registered);
             Self {
-                storage,
-                store,
+                store: MemStore::new(),
                 hedge: Arc::new(HedgeWindow::new(&HedgeConfig::default())),
             }
         }
 
         fn gets(&self) -> u64 {
-            self.storage.stats().gets()
+            self.store.storage.stats().gets()
         }
 
         fn location(name: &str) -> String {
@@ -1657,24 +1650,11 @@ mod tests {
                 values,
                 &WriterLayout::contract(),
             );
-            let size = approx::count(bytes.len());
-            let key = Self::location(name)
-                .strip_prefix(MEM_PREFIX)
-                .unwrap()
-                .to_string();
-            self.store
-                .put(&ObjectPath::from(key), PutPayload::from(bytes))
-                .await
-                .unwrap();
-            let handle = Arc::new(
-                FileHandle::open(
-                    Arc::clone(&self.storage),
-                    &Self::location(name),
-                    size,
-                    Arc::clone(&self.hedge),
-                )
-                .unwrap(),
-            );
+            let handle = self
+                .store
+                .open(&Self::location(name), bytes, Arc::clone(&self.hedge))
+                .await;
+            let size = handle.size();
             let index = FileIndex::build(
                 TABLE,
                 handle,
@@ -1731,7 +1711,7 @@ mod tests {
             TABLE,
             &placeholder_snapshot(),
             jiff::Timestamp::UNIX_EPOCH,
-            MEM_METADATA,
+            &mem_metadata(),
             layout,
             Residency::Full,
             members
@@ -1809,7 +1789,7 @@ mod tests {
                 "key {key} routes to its bucket's file alone"
             );
         }
-        check_present(&generation, &mem.storage, &all).await;
+        check_present(&generation, &mem.store.storage, &all).await;
         let cache = cache().await;
         let before = mem.gets();
         for key in &all {
@@ -1889,8 +1869,8 @@ mod tests {
             }
             assert_eq!(candidates, expected, "key {key}");
         }
-        check_present(&generation, &mem.storage, &all).await;
-        check_present(&generation, &mem.storage, &unbucketed_keys).await;
+        check_present(&generation, &mem.store.storage, &all).await;
+        check_present(&generation, &mem.store.storage, &unbucketed_keys).await;
     }
 
     #[tokio::test]
@@ -1906,7 +1886,7 @@ mod tests {
             .file("f", &keys, &values, None, manifest::UNBUCKETED)
             .await;
         let generation = assemble(vec![file], layout(None)).await.unwrap();
-        assert_eq!(generation.snapshot_id, SnapshotId(SNAPSHOT));
+        assert_eq!(generation.snapshot_id, SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(generation.records, approx::count(keys.len()));
         let cache = cache().await;
         let before = mem.gets();
@@ -2135,13 +2115,13 @@ mod tests {
     ) {
         let page_size = value_page_size(planned, page.value_page_offset.unwrap());
         let cache = cache().await;
-        let (gets, bytes) = (mem.gets(), mem.storage.stats().bytes());
+        let (gets, bytes) = (mem.gets(), mem.store.storage.stats().bytes());
         assert_eq!(
             generation.lookup(&Key::Long(key), &cache).await.unwrap().0,
             Value::Present(Bytes::from(value_for(key)))
         );
         assert_eq!(mem.gets(), gets + 1);
-        assert_eq!(mem.storage.stats().bytes(), bytes + page_size);
+        assert_eq!(mem.store.storage.stats().bytes(), bytes + page_size);
     }
 
     #[tokio::test]
@@ -2347,8 +2327,8 @@ mod tests {
             .unwrap();
         assert_eq!(generation.overlapping_buckets(), &BTreeMap::from([(0, 2)]));
         assert_eq!(generation.overlap_groups_verified(), 1);
-        check_present(&generation, &mem.storage, &first).await;
-        check_present(&generation, &mem.storage, &interleaved).await;
+        check_present(&generation, &mem.store.storage, &first).await;
+        check_present(&generation, &mem.store.storage, &interleaved).await;
         let cache = cache().await;
         assert_eq!(
             generation

@@ -1107,12 +1107,12 @@ mod tests {
     use super::*;
     use crate::approx::count;
     use crate::contract::PAGE_ROWS;
-    use crate::generation::testing::{self, Dictionary, KeyColumn, cache, column_of};
+    use crate::generation::testing::{self, Dictionary, KeyColumn, cache, column_of, page_rows};
     use crate::index::testing::{
         BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, PAGES_PER_GROUP, ROW_GROUPS,
         SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows, fault_of, group_rows, key_for,
-        location, page_rows, pages_of, predicted_of, row_of, stepped, store, value_for,
-        value_of_len, with_pages,
+        location, pages_of, predicted_of, row_of, stepped, store, value_for, value_of_len,
+        with_pages,
     };
     use crate::storage::IoStats;
 

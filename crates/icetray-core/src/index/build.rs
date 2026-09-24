@@ -542,11 +542,11 @@ mod tests {
     use crate::approx::count;
     use crate::config::{ConfigError, ConfigViolation};
     use crate::contract::PAGE_ROWS;
-    use crate::generation::testing::{self, KeyColumn, TABLE, cache, refusal_of};
+    use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
     use crate::index::testing::{
         FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
-        group_rows, key_for, location, longs, page_rows, pages_of, predicted_of, row_of, stepped,
-        store, store_file, with_column_chunk, with_group_rows, with_pages,
+        group_rows, key_for, location, longs, pages_of, predicted_of, row_of, stepped, store,
+        store_file, with_column_chunk, with_group_rows, with_pages,
     };
     use crate::index::{Column, FileFault, KeyShape, RowRef};
     use crate::key::KeyType;

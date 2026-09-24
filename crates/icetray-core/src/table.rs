@@ -580,8 +580,8 @@ mod tests {
     use crate::config::Residency;
     use crate::error::{ErrorKind, RefusalReason};
     use crate::generation::testing::{
-        Bloom, Bounds, Dictionary, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
-        FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
+        Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
+        FIRST_VERSION, FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
         THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table as Fixture,
         WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys, two_bucket_table,
         value_for, values_of,
@@ -590,9 +590,6 @@ mod tests {
     use crate::manifest::testing::Partition;
     use crate::metric::LookupResult;
 
-    /// Keys in a one-file fixture: enough that its bloom filter, sized to
-    /// them, draws no finding of its own.
-    const FILE_KEYS: i64 = 32;
     /// The GETs an unchanged poll costs: the version hint (RFD 005).
     const POLL_GETS: u64 = 1;
     /// The positions in bucket 0's key list that the duplicate file

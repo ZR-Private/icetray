@@ -453,6 +453,7 @@ mod tests {
     use super::*;
     use crate::approx::count;
     use crate::config::LocalConfig;
+    use crate::generation::testing::TABLE;
     use crate::local::LocalDir;
 
     /// A memory budget with room for every page a test inserts.
@@ -480,8 +481,6 @@ mod tests {
     const PAGE: &[u8] = b"page-bytes";
     /// The second test page's bytes, a different length from `PAGE`.
     const OTHER_PAGE: &[u8] = b"other-page-bytes";
-    /// The table a failing fetch names.
-    const TABLE: &str = "t";
     /// Offsets tried to find one whose key shares a shard with an anchor's;
     /// with foyer's shard count in the single digits, the first few suffice.
     const SHARD_SEARCH_OFFSETS: u64 = 1024;

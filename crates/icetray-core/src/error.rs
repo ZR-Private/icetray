@@ -339,6 +339,7 @@ impl fmt::Display for RefusalReason {
 mod tests {
     use super::*;
     use crate::config::ConfigViolation;
+    use crate::generation::testing::TABLE;
 
     /// A synthetic data file location for the reasons that name one.
     const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
@@ -410,9 +411,6 @@ mod tests {
             assert_eq!(reason.to_string(), name);
         }
     }
-
-    /// The table the crate-raised sample errors name.
-    const TABLE: &str = "kv";
 
     /// One error of every variant that wraps a library's or the local
     /// directory's failure, each beside its `reason` label.

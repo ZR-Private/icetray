@@ -416,20 +416,16 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use futures::future::join_all;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{ObjectStoreExt as _, PutPayload};
     use parquet::arrow::ArrowWriter;
     use parquet::file::FOOTER_SIZE;
     use parquet::file::metadata::FooterTail;
     use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 
     use super::*;
-    use crate::config::{HedgeConfig, StorageConfig};
-    use crate::contract::PAGE_ROWS;
+    use crate::config::HedgeConfig;
+    use crate::generation::testing::{cache, page_rows};
+    use crate::storage::testing::{MEM_PREFIX, MemStore};
 
-    /// The synthetic prefix the in-memory store is registered under.
-    const MEM_PREFIX: &str = "mem://w/";
     /// The fixture file's key under the prefix.
     const FILE_KEY: &str = "db/t/data/f0.parquet";
     /// A key under the prefix that no object is stored at.
@@ -452,8 +448,6 @@ mod tests {
     const CONCURRENT: usize = 8;
     /// The percentile and rate that make a one-sample window hedge-ready.
     const TOP: f64 = 1.0;
-    /// The memory budget of a test page cache.
-    const CACHE_BYTES: usize = 1024 * 1024;
     /// The first held range of the `Segments` fixture.
     const FIRST_HELD: Range<u64> = 10..16;
     /// The bytes `FIRST_HELD` holds.
@@ -468,10 +462,6 @@ mod tests {
     const GAP_OFFSET: u64 = 17;
     /// A read that starts inside `FIRST_HELD` and ends past it.
     const STRADDLING: Range<u64> = 14..18;
-
-    fn page_rows() -> usize {
-        usize::try_from(PAGE_ROWS).unwrap()
-    }
 
     fn rows_per_group() -> usize {
         page_rows() * PAGES_PER_ROW_GROUP
@@ -538,23 +528,15 @@ mod tests {
         file: Bytes,
         config: &HedgeConfig,
     ) -> (Arc<FileHandle>, Arc<HedgeWindow>, Bytes) {
-        let size = approx::count(file.len());
-        let store = Arc::new(InMemory::new());
-        store
-            .put(&Path::from(FILE_KEY), PutPayload::from(file.clone()))
-            .await
-            .unwrap();
-        let storage = Arc::new(Storage::new(StorageConfig::default()));
-        storage.register(MEM_PREFIX, store);
         let window = Arc::new(HedgeWindow::new(config));
-        let handle = FileHandle::open(
-            storage,
-            &format!("{MEM_PREFIX}{FILE_KEY}"),
-            size,
-            Arc::clone(&window),
-        )
-        .unwrap();
-        (Arc::new(handle), window, file)
+        let handle = MemStore::new()
+            .open(
+                &format!("{MEM_PREFIX}{FILE_KEY}"),
+                file.clone(),
+                Arc::clone(&window),
+            )
+            .await;
+        (handle, window, file)
     }
 
     /// The byte range of the first value page of the first row group.
@@ -748,7 +730,7 @@ mod tests {
         let stats = handle.storage().stats();
         let metadata = handle.load_metadata().await.unwrap();
         let range = first_value_page(&metadata);
-        let cache = PageCache::new(CACHE_BYTES, None).await.unwrap();
+        let cache = cache().await;
         let before = stats.gets();
 
         let (cold, origin) = handle.read_page(range.clone(), Some(&cache)).await.unwrap();
@@ -773,7 +755,7 @@ mod tests {
         let stats = handle.storage().stats();
         let metadata = handle.load_metadata().await.unwrap();
         let range = first_value_page(&metadata);
-        let cache = PageCache::new(CACHE_BYTES, None).await.unwrap();
+        let cache = cache().await;
         let before = stats.gets();
 
         let pages =

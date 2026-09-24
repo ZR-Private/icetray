@@ -732,6 +732,66 @@ impl CredentialProvider for SdkCredentials {
     }
 }
 
+/// The prefix the tests register in-memory stores under, and the in-memory
+/// store the tests that read objects through a `Storage` build on, from a
+/// single `FileHandle` to a whole generation.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
+
+    use super::{HedgeWindow, Storage};
+    use crate::config::StorageConfig;
+    use crate::parquet_io::FileHandle;
+
+    /// The synthetic prefix an in-memory store is registered under.
+    pub(crate) const MEM_PREFIX: &str = "mem://w/";
+
+    /// An in-memory store registered under `MEM_PREFIX` on a fresh storage.
+    pub(crate) struct MemStore {
+        pub(crate) storage: Arc<Storage>,
+        pub(crate) store: Arc<InMemory>,
+    }
+
+    impl MemStore {
+        pub(crate) fn new() -> Self {
+            let store = Arc::new(InMemory::new());
+            let storage = Arc::new(Storage::new(StorageConfig::default()));
+            let registered: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&store);
+            storage.register(MEM_PREFIX, registered);
+            Self { storage, store }
+        }
+
+        /// Writes `bytes` at `location`, which is under `MEM_PREFIX`.
+        pub(crate) async fn put(&self, location: &str, bytes: impl Into<Bytes>) {
+            let key = location
+                .strip_prefix(MEM_PREFIX)
+                .expect("a test location is under the in-memory prefix");
+            self.store
+                .put(&Path::from(key), PutPayload::from(bytes.into()))
+                .await
+                .unwrap();
+        }
+
+        /// Writes `bytes` at `location` and opens a handle over them that
+        /// reads through `window`.
+        pub(crate) async fn open(
+            &self,
+            location: &str,
+            bytes: Bytes,
+            window: Arc<HedgeWindow>,
+        ) -> Arc<FileHandle> {
+            let size = crate::approx::count(bytes.len());
+            self.put(location, bytes).await;
+            Arc::new(FileHandle::open(Arc::clone(&self.storage), location, size, window).unwrap())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
@@ -748,11 +808,10 @@ mod tests {
     };
     use tokio::sync::Notify;
 
+    use super::testing::MEM_PREFIX;
     use super::*;
     use crate::config::RewriteRule;
 
-    /// The synthetic prefix tests register in-memory stores under.
-    const MEM_PREFIX: &str = "mem://w/";
     /// The key of the one test object under the prefix.
     const OBJECT_KEY: &str = "db/t/f.bin";
     /// A key nothing was written under.

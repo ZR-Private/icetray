@@ -396,14 +396,14 @@ mod tests {
         MAIN_BRANCH, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
         TableMetadata,
     };
-    use object_store::memory::InMemory;
-    use object_store::path::Path as ObjectPath;
-    use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 
     use super::*;
-    use crate::config::StorageConfig;
-    use crate::generation::testing::{MEM_PREFIX, TABLE, table_fault_of};
+    use crate::generation::testing::{
+        FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, SECOND_SEQUENCE, SECOND_SNAPSHOT,
+        SECOND_VERSION, TABLE, THIRD_VERSION, table_fault_of,
+    };
     use crate::manifest::testing;
+    use crate::storage::testing::{MEM_PREFIX, MemStore};
 
     /// The table root under the prefix.
     const ROOT_KEY: &str = "db/kv";
@@ -411,16 +411,6 @@ mod tests {
     const TAG: &str = "serving";
     /// A ref no metadata has.
     const MISSING_REF: &str = "nightly";
-    /// The two snapshots the metadata versions carry.
-    const FIRST_SNAPSHOT: i64 = 101;
-    const SECOND_SNAPSHOT: i64 = 202;
-    /// Their sequence numbers.
-    const FIRST_SEQUENCE: i64 = 1;
-    const SECOND_SEQUENCE: i64 = 2;
-    /// The metadata versions written.
-    const FIRST_VERSION: u64 = 1;
-    const SECOND_VERSION: u64 = 2;
-    const THIRD_VERSION: u64 = 3;
     /// Bytes that are not UTF-8: a lone continuation byte, then a digit.
     const NOT_UTF8: &[u8] = &[0xff, b'1'];
     /// The catalog name and namespace of the memory-catalog test.
@@ -439,25 +429,18 @@ mod tests {
 
     /// The in-memory store behind a storage, with the writes the tests make.
     struct Store {
-        storage: Storage,
-        store: Arc<InMemory>,
+        mem: MemStore,
     }
 
     impl Store {
         fn new() -> Self {
-            let store = Arc::new(InMemory::new());
-            let storage = Storage::new(StorageConfig::default());
-            let registered: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&store);
-            storage.register(MEM_PREFIX, registered);
-            Self { storage, store }
+            Self {
+                mem: MemStore::new(),
+            }
         }
 
         async fn put(&self, location: &str, bytes: impl Into<Bytes>) {
-            let key = location.strip_prefix(MEM_PREFIX).unwrap();
-            self.store
-                .put(&ObjectPath::from(key), PutPayload::from(bytes.into()))
-                .await
-                .unwrap();
+            self.mem.put(location, bytes).await;
         }
 
         async fn put_metadata(&self, version: u64, md: &TableMetadata) {
@@ -470,7 +453,7 @@ mod tests {
         }
 
         fn gets(&self) -> u64 {
-            self.storage.stats().gets()
+            self.mem.storage.stats().gets()
         }
     }
 
@@ -548,7 +531,7 @@ mod tests {
         for hint in hints {
             store.put_hint(hint.clone()).await;
             let before = store.gets();
-            let resolved = static_root().resolve(&store.storage).await.unwrap();
+            let resolved = static_root().resolve(&store.mem.storage).await.unwrap();
             assert_eq!(resolved.location, expected, "hint {hint:?}");
             assert_eq!(
                 resolved.metadata.current_snapshot_id(),
@@ -560,7 +543,7 @@ mod tests {
         let resolved = TableSource::Static {
             location: format!("{}/", root()),
         }
-        .resolve(&store.storage)
+        .resolve(&store.mem.storage)
         .await
         .unwrap();
         assert_eq!(resolved.location, expected);
@@ -572,7 +555,7 @@ mod tests {
         for content in ["", "  \n\t"] {
             store.put_hint(content).await;
             assert_eq!(
-                table_fault_of(static_root().resolve(&store.storage).await, &root()),
+                table_fault_of(static_root().resolve(&store.mem.storage).await, &root()),
                 TableFault::VersionHintEmpty { root: root() }
             );
         }
@@ -593,7 +576,7 @@ mod tests {
         for (content, hint) in cases {
             store.put_hint(content).await;
             assert_eq!(
-                table_fault_of(static_root().resolve(&store.storage).await, &root()),
+                table_fault_of(static_root().resolve(&store.mem.storage).await, &root()),
                 TableFault::VersionHintMalformed { root: root(), hint }
             );
         }
@@ -604,12 +587,12 @@ mod tests {
         let store = Store::new();
         store.put_metadata(FIRST_VERSION, &first_metadata()).await;
         store.put_hint(FIRST_VERSION.to_string()).await;
-        let known = static_root().resolve(&store.storage).await.unwrap();
+        let known = static_root().resolve(&store.mem.storage).await.unwrap();
         assert_eq!(known.location, metadata_location(FIRST_VERSION));
 
         let before = store.gets();
         let unchanged = static_root()
-            .resolve_if_changed(&store.storage, Some(&known.location))
+            .resolve_if_changed(&store.mem.storage, Some(&known.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
@@ -619,7 +602,7 @@ mod tests {
         store.put_hint(SECOND_VERSION.to_string()).await;
         let before = store.gets();
         let advanced = static_root()
-            .resolve_if_changed(&store.storage, Some(&known.location))
+            .resolve_if_changed(&store.mem.storage, Some(&known.location))
             .await
             .unwrap()
             .unwrap();
@@ -640,7 +623,7 @@ mod tests {
         let pinned = TableSource::Static {
             location: metadata_location(FIRST_VERSION),
         };
-        let resolved = pinned.resolve(&store.storage).await.unwrap();
+        let resolved = pinned.resolve(&store.mem.storage).await.unwrap();
         assert_eq!(resolved.location, metadata_location(FIRST_VERSION));
         assert_eq!(
             resolved.metadata.current_snapshot_id(),
@@ -649,7 +632,7 @@ mod tests {
         assert_eq!(store.gets(), 1, "the metadata alone; no hint is read");
 
         let unchanged = pinned
-            .resolve_if_changed(&store.storage, Some(&resolved.location))
+            .resolve_if_changed(&store.mem.storage, Some(&resolved.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
@@ -709,7 +692,7 @@ mod tests {
                 json_without_first_snapshot(false),
             )
             .await;
-        let parsed = static_root().resolve(&store.storage).await.unwrap();
+        let parsed = static_root().resolve(&store.mem.storage).await.unwrap();
         assert_eq!(parsed.metadata.snapshots().len(), 1);
         assert!(parsed.metadata.snapshot_for_ref(TAG).is_none());
 
@@ -721,7 +704,7 @@ mod tests {
             .await;
         // iceberg-rust validates refs inside its deserializer, so the
         // refusal arrives as the JSON parse error.
-        let dangling = static_root().resolve(&store.storage).await;
+        let dangling = static_root().resolve(&store.mem.storage).await;
         assert!(
             matches!(dangling, Err(Error::Json(_))),
             "a ref to a missing snapshot is refused by the parser, got {dangling:?}"
@@ -782,16 +765,16 @@ mod tests {
             ident: created.identifier().clone(),
         };
         let store = Store::new();
-        let resolved = source.resolve(&store.storage).await.unwrap();
+        let resolved = source.resolve(&store.mem.storage).await.unwrap();
         assert_eq!(resolved.location, created.metadata_location().unwrap());
         assert_eq!(resolved.metadata.uuid(), created.metadata().uuid());
         let unchanged = source
-            .resolve_if_changed(&store.storage, Some(&resolved.location))
+            .resolve_if_changed(&store.mem.storage, Some(&resolved.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
         let moved = source
-            .resolve_if_changed(&store.storage, Some(MISSING_REF))
+            .resolve_if_changed(&store.mem.storage, Some(MISSING_REF))
             .await
             .unwrap();
         assert!(moved.is_some());

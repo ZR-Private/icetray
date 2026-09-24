@@ -7,9 +7,6 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
-use object_store::memory::InMemory;
-use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStoreExt as _, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::bloom_filter::Sbbf;
@@ -20,12 +17,11 @@ use parquet::file::properties::{
 };
 
 use crate::approx::count;
-use crate::config::{HedgeConfig, Residency, StorageConfig};
-use crate::contract::PAGE_ROWS;
+use crate::config::{HedgeConfig, Residency};
 use crate::error::{Error, Result};
 use crate::generation::testing::{
-    self, Bloom, Dictionary, KEY_STEP, KeyColumn, MEM_PREFIX, TABLE, column_of, key_array,
-    key_data_type, with_dictionary, with_key_bloom,
+    self, Bloom, Dictionary, KEY_STEP, KeyColumn, TABLE, column_of, key_array, key_data_type,
+    page_rows, with_dictionary, with_key_bloom,
 };
 use crate::index::{FileFault, FileIndex, ResidentBytes, RowRef};
 use crate::key::testing::UUID_HALF_BYTES;
@@ -33,6 +29,7 @@ use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::LocalDir;
 use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
 use crate::parquet_io::FileHandle;
+use crate::storage::testing::{MEM_PREFIX, MemStore};
 use crate::storage::{HedgeWindow, IoStats, Storage};
 
 /// The fixture file's key under the prefix.
@@ -56,10 +53,6 @@ pub(super) const FEW_ROWS: usize = 8;
 /// The write batch under a byte bound: the writer checks the bound
 /// between batches, so a small batch makes the bound bind (RFD 002).
 pub(super) const SMALL_BATCH: usize = 8;
-pub(super) fn page_rows() -> usize {
-    usize::try_from(PAGE_ROWS).unwrap()
-}
-
 pub(super) fn group_rows() -> usize {
     page_rows() * PAGES_PER_GROUP
 }
@@ -261,23 +254,17 @@ pub(super) async fn store(fixture: &Fixture) -> Opened {
 }
 
 pub(super) async fn store_file(file: Bytes) -> Opened {
-    let object_store = Arc::new(InMemory::new());
-    object_store
-        .put(&ObjectPath::from(FILE_KEY), PutPayload::from(file.clone()))
-        .await
-        .unwrap();
-    let storage = Arc::new(Storage::new(StorageConfig::default()));
-    storage.register(MEM_PREFIX, object_store);
-    let handle = FileHandle::open(
-        Arc::clone(&storage),
-        &location(),
-        count(file.len()),
-        Arc::new(HedgeWindow::new(&HedgeConfig::default())),
-    )
-    .unwrap();
+    let mem = MemStore::new();
+    let handle = mem
+        .open(
+            &location(),
+            file.clone(),
+            Arc::new(HedgeWindow::new(&HedgeConfig::default())),
+        )
+        .await;
     Opened {
-        storage,
-        handle: Arc::new(handle),
+        storage: mem.storage,
+        handle,
         file,
     }
 }

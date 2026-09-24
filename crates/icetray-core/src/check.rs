@@ -1113,25 +1113,16 @@ mod tests {
     };
     use super::*;
     use crate::generation::testing::{
-        self, Bloom, Bounds, Dictionary, FileSpec, KEY_STEP, TABLE, Table, WriterLayout,
+        self, Bloom, Bounds, Dictionary, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
+        FileSpec, KEY_STEP, TABLE, TWO, Table, WriterLayout,
     };
     use crate::local::LocalDir;
     use crate::manifest::testing::{
         KEY_COLUMN, Partition, VALUE_COLUMN, bucket_spec, unpartitioned,
     };
 
-    /// The snapshot every fixture commits as, with its sequence number and
-    /// metadata version.
-    const SNAPSHOT: i64 = 1_001;
-    const SEQUENCE: i64 = 1;
-    const VERSION: u64 = 1;
-    /// Bucket counts.
+    /// A bucket count beside the fixture's `TWO`.
     const ONE: u32 = 1;
-    const TWO: u32 = 2;
-    /// Keys per fixture file: enough that a filter sized to them lands
-    /// between `BLOOM_BITS_PER_KEY_MIN` and `BLOOM_BYTES_PER_KEY_ADVICE`
-    /// (the writer's smallest filter is 32 bytes plus a header).
-    const FILE_KEYS: i64 = 32;
     /// Keys in the two-bucket contract fixture, and the fewest either
     /// bucket may get, for the same reason.
     const CONTRACT_KEYS: i64 = 96;
@@ -1271,10 +1262,12 @@ mod tests {
             .collect()
     }
 
-    /// Commits every file added to `table` as `SNAPSHOT` and loads it in
+    /// Commits every file added to `table` as `FIRST_SNAPSHOT` and loads it in
     /// `residency`.
     async fn load(table: &mut Table, residency: Residency, local: Option<&LocalDir>) -> Generation {
-        table.commit(SNAPSHOT, None, SEQUENCE, VERSION).await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
         let config = table.config(residency, None);
         table.load(&config, local, None).await.unwrap()
     }
@@ -1572,7 +1565,7 @@ mod tests {
         assert_findings(&report, &[]);
         let summary = &report.summary;
         assert_eq!(summary.table, TABLE);
-        assert_eq!(summary.snapshot_id, SnapshotId(SNAPSHOT));
+        assert_eq!(summary.snapshot_id, SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(summary.residency, Residency::Full);
         assert_eq!(summary.file_count, CONTRACT_FILES);
         assert_eq!(summary.buckets, Some(TWO));
@@ -2281,7 +2274,7 @@ mod tests {
             ])
         );
         assert_eq!(summary["table"], Json::String(TABLE.to_string()));
-        assert_eq!(summary["snapshot_id"], Json::from(SNAPSHOT));
+        assert_eq!(summary["snapshot_id"], Json::from(FIRST_SNAPSHOT));
         assert_eq!(
             summary["serviceability"],
             Json::String("inefficient".to_string())

@@ -534,11 +534,11 @@ mod tests {
     use crate::approx::count;
     use crate::config::Residency;
     use crate::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
-    use crate::generation::testing::{self, Bloom, KeyColumn, TABLE, refusal_of};
+    use crate::generation::testing::{self, Bloom, KeyColumn, TABLE, page_rows, refusal_of};
     use crate::index::testing::{
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH,
-        ValueColumn, contract_rows, fault_of, key_for, location, longs, page_rows, pages_of,
-        predicted_of, stepped, store, value_of_len, with_column_chunk, with_group_rows, with_pages,
+        ValueColumn, contract_rows, fault_of, key_for, location, longs, pages_of, predicted_of,
+        stepped, store, value_of_len, with_column_chunk, with_group_rows, with_pages,
     };
     use crate::index::{FileFault, FileIndex};
     use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
