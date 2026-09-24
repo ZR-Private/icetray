@@ -11,13 +11,14 @@ use std::time::Duration;
 use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
+use icetray::service::Service;
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
-use icetray_proto::v1::icetray_server::SERVICE_NAME;
+use icetray_proto::v1::icetray_server::{Icetray as _, SERVICE_NAME};
 use icetray_proto::v1::{
     self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
@@ -109,6 +110,22 @@ const S3_SCHEME: &str = "s3://";
 /// once any GOAWAY has arrived, so a request must be on the wire, or
 /// already answered, before the server starts closing.
 const DISPATCH_DELAY: Duration = Duration::from_millis(20);
+
+/// The `Get` deadline the deadline tests configure: short, so a call over a
+/// held store ends quickly.
+const SHORT_DEADLINE: Duration = Duration::from_millis(300);
+
+/// The `MultiGet` deadline the deadline tests configure: longer than the
+/// `Get` deadline, so each call is seen to run under its own.
+const SHORT_BATCH_DEADLINE: Duration = SHORT_DEADLINE.saturating_mul(2);
+
+/// A client deadline shorter than every deadline the server is configured
+/// with in the test that sends it.
+const CLIENT_DEADLINE: Duration = Duration::from_millis(200);
+
+/// How long past its deadline a call may take to be answered: the timer's
+/// wake-up and one loopback round trip, with room for a loaded machine.
+const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
 /// The `metrics` recorder is process-global, so `requests_total` is one
 /// counter for every test in this binary. Every test that issues an RPC
@@ -318,6 +335,28 @@ fn assert_counted(before: &str, after: &str, call: telemetry::Call, expected: u6
         added.to_bits(),
         approx::gauge(expected).to_bits(),
         "{call}: {added} counted, {expected} expected"
+    );
+}
+
+/// `call`'s outcome beside how long it took.
+async fn timed<T>(call: impl Future<Output = T>) -> (T, Duration) {
+    let started = tokio::time::Instant::now();
+    let outcome = call.await;
+    (outcome, started.elapsed())
+}
+
+/// Asserts that a call answered `code` no sooner than `deadline` and within
+/// `DEADLINE_MARGIN` of it.
+fn assert_ended_at<T: std::fmt::Debug>(
+    outcome: Result<T, Status>,
+    elapsed: Duration,
+    deadline: Duration,
+    code: Code,
+) {
+    assert_eq!(code_of(outcome), code);
+    assert!(
+        elapsed >= deadline && elapsed < deadline + DEADLINE_MARGIN,
+        "answered after {elapsed:?}, deadline {deadline:?}"
     );
 }
 
@@ -842,5 +881,79 @@ async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestRe
         panic!("expected a first-load failure, got {outcome:?}");
     };
     assert_eq!(failures.len(), 1);
+    Ok(())
+}
+
+/// Over a store that has stopped answering, a `Get` ends at the configured
+/// `get_deadline` and a `MultiGet` at `multi_get_deadline`, each with
+/// `DEADLINE_EXCEEDED`, instead of waiting on the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_and_multi_get_end_at_their_deadlines_over_a_held_store() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.get_deadline = SHORT_DEADLINE;
+            setup.config.server.multi_get_deadline = SHORT_BATCH_DEADLINE;
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
+    stack.s3.hold();
+
+    let (outcome, elapsed) = tokio::time::timeout(
+        SHUTDOWN_WAIT,
+        timed(stack.get(TABLE, Some(wire_key(&keys[0])))),
+    )
+    .await?;
+    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
+
+    let (outcome, elapsed) =
+        tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.multi_get(TABLE, &keys[1..]))).await?;
+    assert_ended_at(
+        outcome,
+        elapsed,
+        SHORT_BATCH_DEADLINE,
+        Code::DeadlineExceeded,
+    );
+    assert!(stack.s3.held() > 0, "the calls reached the held store");
+    Ok(())
+}
+
+/// A client deadline shorter than the server's is the one a call runs
+/// under, and its expiry is `DEADLINE_EXCEEDED` too. The service is called
+/// directly with the `grpc-timeout` header a client sends: a tonic client
+/// runs its own timer on that header and reports its expiry as `CANCELLED`
+/// before the server's answer arrives, so over a channel the server's code
+/// is not what the caller sees.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_shorter_client_deadline_wins() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let stack = Stack::ready_small().await?;
+    let server = ServerConfig::default();
+    assert!(server.get_deadline > CLIENT_DEADLINE + DEADLINE_MARGIN);
+    assert!(server.multi_get_deadline > CLIENT_DEADLINE + DEADLINE_MARGIN);
+    let service = Service::new(stack.serving.opened(), &server);
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
+    stack.s3.hold();
+
+    let mut get = tonic::Request::new(GetRequest {
+        table: TABLE.to_string(),
+        key: Some(wire_key(&keys[0])),
+    });
+    get.set_timeout(CLIENT_DEADLINE);
+    let (outcome, elapsed) = tokio::time::timeout(SHUTDOWN_WAIT, timed(service.get(get))).await?;
+    assert_ended_at(outcome, elapsed, CLIENT_DEADLINE, Code::DeadlineExceeded);
+
+    let mut batch = tonic::Request::new(MultiGetRequest {
+        table: TABLE.to_string(),
+        keys: keys[1..].iter().map(wire_key).collect(),
+    });
+    batch.set_timeout(CLIENT_DEADLINE);
+    let (outcome, elapsed) =
+        tokio::time::timeout(SHUTDOWN_WAIT, timed(service.multi_get(batch))).await?;
+    assert_ended_at(outcome, elapsed, CLIENT_DEADLINE, Code::DeadlineExceeded);
     Ok(())
 }

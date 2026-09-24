@@ -71,6 +71,35 @@ pub fn millis_after(base: i64, step: Duration) -> i64 {
     base.saturating_add(i64::try_from(step.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// The most digits a `grpc-timeout` value carries, by the gRPC over HTTP/2
+/// protocol's `TimeoutValue`.
+const GRPC_TIMEOUT_MAX_DIGITS: usize = 8;
+
+/// A `grpc-timeout` header's text as the deadline a client sent: one to
+/// `GRPC_TIMEOUT_MAX_DIGITS` ASCII digits then one unit, `H`, `M`, `S`,
+/// `m`, `u`, or `n` for hours down to nanoseconds, as the gRPC over HTTP/2
+/// protocol spells it. `None` for any other text, which the caller treats
+/// as no client deadline, as tonic's own reading of the header does.
+pub fn grpc_timeout(text: &str) -> Option<Duration> {
+    let (digits, unit) = text.split_at_checked(text.len().checked_sub(1)?)?;
+    if digits.is_empty()
+        || digits.len() > GRPC_TIMEOUT_MAX_DIGITS
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    match unit {
+        "H" => Some(Duration::from_hours(value)),
+        "M" => Some(Duration::from_mins(value)),
+        "S" => Some(Duration::from_secs(value)),
+        "m" => Some(Duration::from_millis(value)),
+        "u" => Some(Duration::from_micros(value)),
+        "n" => Some(Duration::from_nanos(value)),
+        _ => None,
+    }
+}
+
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
 /// friendly form: `"10s"`, `"250ms"`, `"1m 30s"`. Only that grammar is
 /// accepted: a negative duration (`"-1s"`, `"1s ago"`) and text without a
@@ -273,6 +302,46 @@ mod tests {
     fn test_millis_after_saturates_outside_i64() {
         assert_eq!(super::millis_after(i64::MAX, COMMIT_STEP), i64::MAX);
         assert_eq!(super::millis_after(EPOCH_MILLIS, Duration::MAX), i64::MAX);
+    }
+
+    /// The largest value `grpc-timeout` carries: eight nines.
+    const GRPC_TIMEOUT_MAX_VALUE: u64 = 99_999_999;
+
+    #[test]
+    fn test_grpc_timeout_reads_every_unit() {
+        let cases = [
+            ("2H", Duration::from_hours(2)),
+            ("3M", Duration::from_mins(3)),
+            ("10S", TEN_SECONDS),
+            ("250m", QUARTER_SECOND),
+            ("7u", Duration::from_micros(7)),
+            ("9n", Duration::from_nanos(9)),
+            ("99999999S", Duration::from_secs(GRPC_TIMEOUT_MAX_VALUE)),
+            ("0m", Duration::ZERO),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(super::grpc_timeout(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_grpc_timeout_refuses_what_the_protocol_does_not_spell() {
+        for text in [
+            "",
+            "S",
+            "10",
+            "10s",
+            "10ms",
+            "+5S",
+            "-5S",
+            " 5S",
+            "5 S",
+            "123456789S",
+            "5Sx",
+            "5é",
+        ] {
+            assert_eq!(super::grpc_timeout(text), None, "{text:?}");
+        }
     }
 
     #[test]

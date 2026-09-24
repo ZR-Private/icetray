@@ -1,14 +1,21 @@
 //! An S3-protocol server in the test process (RFD 014): `s3s` speaking
 //! HTTP/1 over loopback, `s3s-fs` storing objects in a temporary directory.
 //! The real `object_store` client drives it, so a test exercises the request
-//! path the server uses and counts every GET at the client.
+//! path the server uses and counts every GET at the client. `hold` stalls
+//! every request until `release`, for the tests of what a wedged store does
+//! to a caller.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use hyper::Request;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
@@ -19,6 +26,7 @@ use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::Result;
@@ -46,7 +54,30 @@ pub struct S3Fixture {
     addr: SocketAddr,
     bucket: String,
     root: TempDir,
+    gate: Arc<Gate>,
     accept_loop: JoinHandle<()>,
+}
+
+/// Whether the server holds requests, and how many it has held. A request
+/// that arrives while `closed` is true waits until it turns false, or until
+/// its connection is dropped.
+struct Gate {
+    closed: watch::Sender<bool>,
+    held: AtomicUsize,
+}
+
+impl Gate {
+    /// Waits while the gate is closed, counting the request as held when it
+    /// has to wait.
+    async fn pass(&self) {
+        let mut closed = self.closed.subscribe();
+        if *closed.borrow_and_update() {
+            self.held.fetch_add(1, Ordering::SeqCst);
+        }
+        // intentional: the sender lives in the gate this borrows, so the
+        // wait cannot see it closed.
+        let _ = closed.wait_for(|closed| !*closed).await;
+    }
 }
 
 impl fmt::Debug for S3Fixture {
@@ -79,13 +110,36 @@ impl S3Fixture {
         };
         let listener = TcpListener::bind(LOOPBACK_ANY_PORT).await?;
         let addr = listener.local_addr()?;
-        let accept_loop = tokio::spawn(accept(listener, service));
+        let gate = Arc::new(Gate {
+            closed: watch::Sender::new(false),
+            held: AtomicUsize::new(0),
+        });
+        let accept_loop = tokio::spawn(accept(listener, service, Arc::clone(&gate)));
         Ok(Self {
             addr,
             bucket: bucket.to_string(),
             root,
+            gate,
             accept_loop,
         })
+    }
+
+    /// Holds every request that arrives from now until `release`: its
+    /// connection is accepted and the request is answered once released,
+    /// so a client sees a store that has stopped answering.
+    pub fn hold(&self) {
+        self.gate.closed.send_replace(true);
+    }
+
+    /// Answers the held requests and every later one again.
+    pub fn release(&self) {
+        self.gate.closed.send_replace(false);
+    }
+
+    /// How many requests have arrived while the server was held, over its
+    /// whole life: a test waits on it to know its calls reached the store.
+    pub fn held(&self) -> usize {
+        self.gate.held.load(Ordering::SeqCst)
     }
 
     /// `http://127.0.0.1:<port>`.
@@ -146,8 +200,8 @@ impl S3Fixture {
 /// The accept loop: every connection is served on its own task in one
 /// `JoinSet`, which aborts them all when the loop is aborted and dropped.
 /// Finished tasks are joined as connections arrive, so the set does not
-/// grow with the connection count.
-async fn accept(listener: TcpListener, service: S3Service) {
+/// grow with the connection count. Every request passes `gate` first.
+async fn accept(listener: TcpListener, service: S3Service, gate: Arc<Gate>) {
     let mut connections = JoinSet::new();
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -163,8 +217,19 @@ async fn accept(listener: TcpListener, service: S3Service) {
             }
         }
         let service = service.clone();
+        let gate = Arc::clone(&gate);
         connections.spawn(async move {
-            let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+            let gated = service_fn(move |request: Request<Incoming>| {
+                let service = service.clone();
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.pass().await;
+                    // `S3Service` also has an inherent `call` over another
+                    // body type; the trait method is the one hyper's body fits.
+                    hyper::service::Service::call(&service, request).await
+                }
+            });
+            let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), gated);
             if let Err(error) = connection.await {
                 // A client closing its pooled connection ends it with an error
                 // that is nobody's failure.
@@ -176,11 +241,59 @@ async fn accept(listener: TcpListener, service: S3Service) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use icetray_core::Storage;
+
     use super::*;
 
     /// The bucket the server is started with; any name the filesystem
     /// admits as a directory works.
     const BUCKET: &str = "icetray-test";
+
+    /// The object the hold test reads.
+    const OBJECT: &str = "held/object";
+
+    /// The object's bytes.
+    const BODY: &[u8] = b"held";
+
+    /// How long the hold test waits to see a held read not answered.
+    const HELD_WAIT: Duration = Duration::from_millis(300);
+
+    /// How long a released read may take before the test fails.
+    const RELEASED_WAIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hold_stalls_reads_until_release() {
+        let s3 = S3Fixture::start(BUCKET).await.unwrap();
+        let path = s3.root().join(BUCKET).join(OBJECT);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, BODY).unwrap();
+        let storage = Arc::new(Storage::new(s3.storage_config()));
+        let uri = s3.uri(OBJECT);
+        assert_eq!(storage.read_all(&uri).await.unwrap().as_ref(), BODY);
+        assert_eq!(s3.held(), 0, "nothing is held before hold");
+
+        s3.hold();
+        let read = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            let uri = uri.clone();
+            async move { storage.read_all(&uri).await }
+        });
+        tokio::time::sleep(HELD_WAIT).await;
+        assert!(!read.is_finished(), "a held read is not answered");
+        assert_eq!(s3.held(), 1);
+
+        s3.release();
+        let body = tokio::time::timeout(RELEASED_WAIT, read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.as_ref(), BODY);
+        assert_eq!(storage.read_all(&uri).await.unwrap().as_ref(), BODY);
+        assert_eq!(s3.held(), 1, "a read after release is not held");
+    }
 
     #[tokio::test]
     async fn test_storage_config_points_at_the_bound_endpoint_with_hedging_off() {

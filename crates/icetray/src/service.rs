@@ -1,36 +1,48 @@
 //! The gRPC service over the generated contract (RFD 010): `Get`,
 //! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
 //! read under the table's key type, and core's errors mapped to status codes
-//! by variant. Every call is counted under `requests_total`.
+//! by variant. Every call is counted under `requests_total`. `Get` and
+//! `MultiGet` run under their deadlines (RFD 013): the server's for the
+//! method, or the client's `grpc-timeout` when that is shorter.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
-use icetray_core::approx;
+use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{Error, Key, KeyType, Opened, Table, Value};
+use icetray_core::{Error, Key, KeyType, Opened, Table, Value, approx, time};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
     GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
 };
+use tokio::time::Instant;
+use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
-use crate::error::WireKeyFault;
+use crate::error::{CallFault, WireKeyFault};
 use crate::telemetry::{self, Call};
 
-/// The served tables by name. Clone: tonic hands one clone to every
-/// connection, and they share the tables.
+/// The header a client's deadline arrives in, by the gRPC over HTTP/2
+/// protocol. tonic leaves it in the request's metadata.
+const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
+
+/// The served tables by name and the bounds each call runs under. Clone:
+/// tonic hands one clone to every connection, and they share the tables.
 #[derive(Clone)]
 pub struct Service {
     tables: Arc<HashMap<String, Arc<Table>>>,
+    get_deadline: Duration,
+    multi_get_deadline: Duration,
 }
 
 impl Service {
-    /// The service over every table `opened` holds, by configured name.
-    pub fn new(opened: &Opened) -> Self {
+    /// The service over every table `opened` holds, by configured name,
+    /// under `server`'s request bounds.
+    pub fn new(opened: &Opened, server: &ServerConfig) -> Self {
         let tables = opened
             .tables
             .iter()
@@ -38,6 +50,8 @@ impl Service {
             .collect();
         Self {
             tables: Arc::new(tables),
+            get_deadline: server.get_deadline,
+            multi_get_deadline: server.multi_get_deadline,
         }
     }
 
@@ -118,6 +132,79 @@ impl From<WireKeyFault> for Status {
     }
 }
 
+/// A call's own bound as a status: each fault's code, with the fault's
+/// `Display` as the message.
+impl From<CallFault> for Status {
+    fn from(fault: CallFault) -> Self {
+        let message = fault.to_string();
+        match fault {
+            CallFault::DeadlineExceeded { .. } => Self::deadline_exceeded(message),
+        }
+    }
+}
+
+/// When a call reached the server, stamped by `StampArrival` into the
+/// request's extensions.
+#[derive(Clone, Copy, Debug)]
+struct Arrival(Instant);
+
+/// The interceptor that stamps every call's `Arrival`, installed as a
+/// server layer. tonic runs its own timer on a client's `grpc-timeout`,
+/// which answers `CANCELLED`; it starts that timer after calling the layers
+/// inside it and polls the handler before the timer, so a deadline counted
+/// from this stamp passes no later than tonic's, and the handler's
+/// `DEADLINE_EXCEEDED` is what the server answers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StampArrival;
+
+impl Interceptor for StampArrival {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request.extensions_mut().insert(Arrival(Instant::now()));
+        Ok(request)
+    }
+}
+
+/// The deadline a call runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Deadline {
+    /// When the call started counting.
+    from: Instant,
+    /// How long it may run.
+    after: Duration,
+}
+
+impl Deadline {
+    /// `request`'s deadline: `server`, or the client's `grpc-timeout` when
+    /// that is shorter, counted from the call's `Arrival`, or from now for a
+    /// call that did not pass `StampArrival`. A header that does not parse
+    /// is no client deadline, as tonic's own reading of it is.
+    fn of<T>(request: &Request<T>, server: Duration) -> Self {
+        let from = request
+            .extensions()
+            .get::<Arrival>()
+            .map_or_else(Instant::now, |arrival| arrival.0);
+        let client = request
+            .metadata()
+            .get(GRPC_TIMEOUT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(time::grpc_timeout);
+        let after = client.map_or(server, |client| client.min(server));
+        Self { from, after }
+    }
+
+    /// Runs `work` until the deadline; past it, `work` is dropped and the
+    /// call is `DEADLINE_EXCEEDED`. A deadline past the clock's range
+    /// cannot pass, so `work` then runs unbounded.
+    async fn run<T>(self, work: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
+        let Some(at) = self.from.checked_add(self.after) else {
+            return work.await;
+        };
+        tokio::time::timeout_at(at, work)
+            .await
+            .map_err(|_elapsed| CallFault::DeadlineExceeded { after: self.after })?
+    }
+}
+
 /// Core's error as a status (RFD 010): a key of the wrong type is
 /// `INVALID_ARGUMENT`; a read the caller can retry (no generation yet, an
 /// object-store, cache, or local-directory failure, a catalog or load that
@@ -165,11 +252,9 @@ fn key_type_wire(key_type: KeyType) -> v1::KeyType {
     }
 }
 
-#[tonic::async_trait]
-impl Icetray for Service {
-    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        telemetry::count(Call::Get);
-        let request = request.into_inner();
+impl Service {
+    /// `Get` inside its deadline.
+    async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let table = self.table(&request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, generation.layout.key_type)?;
@@ -182,12 +267,11 @@ impl Icetray for Service {
         }))
     }
 
-    async fn multi_get(
+    /// `MultiGet` inside its deadline.
+    async fn lookup_batch(
         &self,
-        request: Request<MultiGetRequest>,
+        request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        telemetry::count(Call::MultiGet);
-        let request = request.into_inner();
         let table = self.table(&request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
         let keys = request
@@ -214,6 +298,24 @@ impl Icetray for Service {
             results,
             snapshot_id: lookup.snapshot_id.0,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl Icetray for Service {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        telemetry::count(Call::Get);
+        let deadline = Deadline::of(&request, self.get_deadline);
+        deadline.run(self.lookup(request.into_inner())).await
+    }
+
+    async fn multi_get(
+        &self,
+        request: Request<MultiGetRequest>,
+    ) -> Result<Response<MultiGetResponse>, Status> {
+        telemetry::count(Call::MultiGet);
+        let deadline = Deadline::of(&request, self.multi_get_deadline);
+        deadline.run(self.lookup_batch(request.into_inner())).await
     }
 
     async fn table_info(
@@ -367,6 +469,22 @@ mod tests {
         ];
         for fault in faults {
             assert_eq!(Status::from(fault).code(), Code::InvalidArgument);
+        }
+    }
+
+    /// A deadline for the sample fault.
+    const SAMPLE_DEADLINE: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn test_from_call_fault_code_per_variant() {
+        let cases = [(
+            CallFault::DeadlineExceeded {
+                after: SAMPLE_DEADLINE,
+            },
+            Code::DeadlineExceeded,
+        )];
+        for (fault, code) in cases {
+            assert_eq!(Status::from(fault).code(), code);
         }
     }
 

@@ -279,7 +279,11 @@ file count, row count, key type, and resident index bytes; clients switch
 on the key type to choose the key variant. A key is a oneof of `long`,
 `str`, and `bin`, where `bin` carries binary, fixed, and uuid keys; the
 wrong variant is an `INVALID_ARGUMENT` error, a table the server does not
-serve is `NOT_FOUND`, and a miss is a normal answer, never an error.
+serve is `NOT_FOUND`, and a miss is a normal answer, never an error. A
+`Get` or `MultiGet` still running at its deadline (`server.get_deadline` or
+`server.multi_get_deadline`, or the client's own when that is shorter) is
+`DEADLINE_EXCEEDED`. A tonic client times its own deadline too and reports
+its expiry as `CANCELLED` from its side of the call.
 
 The listener speaks plaintext gRPC and terminates no TLS. icetray expects a
 private network or a service mesh that encrypts traffic and authenticates

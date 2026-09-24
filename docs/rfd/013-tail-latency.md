@@ -51,12 +51,15 @@ stops answering is bounded instead, on two paths that share one S3 client
 per bucket. The live path, a gRPC request, fails fast. A `Get` has 5
 seconds and a `MultiGet` 15 seconds whatever its size, a shorter deadline
 the client sends wins, and expiry is `DEADLINE_EXCEEDED`, which drops the
-lookup and cancels its GETs; at most 1024 requests run at once, and one
-more is refused with `RESOURCE_EXHAUSTED` rather than queued; a `MultiGet`
-carries at most 1000 keys and runs 32 of its lookups at a time. A live
-lookup expects well under 200 ms, so 5 seconds is already a failure, and
-the refusals keep a wedged store from piling up requests until the process
-runs out of memory. The background path, loads and refreshes, is patient
+lookup; a page GET the lookup started runs on inside the page cache, which
+spawns it, under the S3 client's bounds below, and fills the cache for the
+next caller. At most 1024 requests run at once, and one more is refused
+with `RESOURCE_EXHAUSTED` rather than queued; a `MultiGet` carries at most
+1000 keys and runs 32 of its lookups at a time. A live lookup expects well
+under 200 ms, so 5 seconds is already a failure, and the refusals keep a
+wedged store from piling up requests until the process runs out of memory.
+The cap counts requests, not GETs: the page GETs of requests past their
+deadline can outlast them, each for no longer than the S3 client's bounds. The background path, loads and refreshes, is patient
 but bounded: a catalog call has 30 seconds, and a first load or a refresh
 5 minutes, after which it fails, the table is degraded, and the next poll
 tries again, so no load holds its table's lock longer than that. Both

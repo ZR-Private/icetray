@@ -3,7 +3,8 @@
 //! failure of the daemon once its configuration and logging are in place,
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
 //! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
-//! is not a rule; `WireKeyFault` why a wire key is not a key.
+//! is not a rule; `WireKeyFault` why a wire key is not a key; `CallFault`
+//! why the service ended a call on one of its own bounds.
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
 //! failure to an exit code; the two failures before any subcommand runs, a
 //! command line clap refuses and a runtime that cannot start, are mapped in
@@ -12,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, KeyType};
@@ -109,6 +111,19 @@ pub enum WireKeyFault {
     UuidLength {
         /// The length the wire carried.
         bytes: usize,
+    },
+}
+
+/// Why the service ended a call on one of its own bounds (RFD 013) rather
+/// than on its lookup's outcome. Each variant has its own status code.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CallFault {
+    /// The call ran past its deadline: the server's for the method, or the
+    /// client's when that was shorter. `DEADLINE_EXCEEDED` on the wire.
+    #[error("the call did not finish within {after:?}")]
+    DeadlineExceeded {
+        /// The deadline that passed.
+        after: Duration,
     },
 }
 

@@ -42,7 +42,7 @@ redefine.
 | `error` | the one `Error` enum and `Result` | |
 | `snapshot` | `SnapshotId`, the newtype for an Iceberg snapshot id; it has no order and is a metric label, never a gauge value | 015 |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), a `grpc-timeout` header becomes a `Duration` (`grpc_timeout`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -826,6 +826,10 @@ pub fn log_timestamp(at: jiff::Timestamp) -> String;
 /// requires. No serving path writes a commit; public because the testkit is another crate. Whole
 /// milliseconds of `step`; saturates at `i64::MAX`, outside what `timestamp_from_millis` admits.
 pub fn millis_after(base: i64, step: Duration) -> i64;
+/// A `grpc-timeout` header's text (one to eight ASCII digits, then `H`, `M`, `S`, `m`, `u`, or `n`)
+/// as the deadline a client sent; `None` for anything else, which the service treats as no client
+/// deadline, as tonic does.
+pub fn grpc_timeout(text: &str) -> Option<Duration>;
 /// In-crate: an Iceberg snapshot's epoch millisecond as a timestamp; out of jiff's range is `Err`,
 /// which `Generation::load` reports as `TableFault::SnapshotTimestampOutOfRange`.
 pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error>;
@@ -1003,6 +1007,24 @@ which ends every `Health/Watch` stream: tonic's graceful shutdown waits for
 every connection to close, and an open watch would hold its connection,
 and the drain, without end.
 
+**The service.** `Service::new(&Opened, &ServerConfig)` serves `Get`,
+`MultiGet`, and `TableInfo` over the opened tables. A wire key is read under
+the served generation's key type (`key_from_wire`, a fault is
+`WireKeyFault`, `INVALID_ARGUMENT`); core's errors become status codes by
+variant (`status_from`); the service's own bounds are `CallFault`, one code
+per variant. `Get` runs under `server.get_deadline` and `MultiGet` under
+`server.multi_get_deadline`, or the client's `grpc-timeout` when shorter
+(read through `time::grpc_timeout`); past it the lookup future is dropped
+and the call is `DEADLINE_EXCEEDED` (`CallFault::DeadlineExceeded`). A page
+fetch the lookup started runs on inside the page cache, which spawns it,
+under the S3 client's own bounds, and its page is cached for the next
+caller. The deadline counts from the arrival `StampArrival` records, an
+interceptor installed as a server layer: tonic starts its own
+`grpc-timeout` timer, which answers `CANCELLED`, after the layers inside it
+are called and polls the handler before that timer, so the handler's
+`DEADLINE_EXCEEDED` is the server's answer. A tonic client runs the same
+timer on its own side and reports `CANCELLED` first.
+
 **One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
 the target vocabulary after the subcommand: `--config <file>` or
 `--location <root or metadata file>` (at most one; with neither, the file
@@ -1077,7 +1099,9 @@ acceptance tests share, each declared once: `NAMESPACE`, `IDS_4K`, `IDS_2K`,
 `LONG_KEY_EXTRA`, `LONG_KEY_BYTES`, `LONG_KEY_PAD`, `SECOND_CLASS`,
 `THIRD_CLASS`, `TWO_FILES`, `THREE_FILES`, `TAIL`, `INTERLEAVED_SAMPLE`,
 `NEWEST_SAMPLE`), `s3` (`S3Fixture`, whose `storage_config` is
-hedge-disabled and whose `file_io_props` is a `HashMap`), `sim`
+hedge-disabled, whose `file_io_props` is a `HashMap`, and whose `hold`
+stalls every request until `release`, with `held` counting the requests
+that arrived while held), `sim`
 (`serve_s3`, `serve_s3_with`, `SlowEvery`, `sim_s3_store`, `SIM_S3_PORT`),
 `verify` (`Served` with `load` and `current`; `build`, `serve_over`,
 `serve`, `serve_catalog`, `serve_catalog_with`; `expected_cold_gets`,
