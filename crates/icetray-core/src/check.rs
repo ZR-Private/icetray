@@ -17,7 +17,7 @@ use crate::approx;
 use crate::config::Residency;
 use crate::contract;
 use crate::generation::{Generation, LoadedFile};
-use crate::index::{FileIndex, ResidentBytes};
+use crate::index::{FileIndex, ResidentBytes, bits_per_key};
 use crate::key::{Key, KeyType};
 use crate::manifest::{DataFileEntry, TableLayout};
 use crate::snapshot::SnapshotId;
@@ -475,7 +475,9 @@ pub struct FileReport {
     /// Filter bits per row of the file; `None` with `bloom_bytes`.
     pub bloom_bits_per_key: Option<f64>,
     /// The key column's compressed chunk bytes: what the Full tier holds
-    /// and the Disk tier writes.
+    /// beyond the Disk tier's memory, and the payload of the chunk file the
+    /// Disk tier writes, whose whole size, header included, is the
+    /// prediction's `disk_bytes`.
     pub key_chunk_bytes: u64,
     /// The share of key pages whose column-index minimum is distinct; 1.0
     /// when every page is addressable by it, and 1.0 for a file whose
@@ -648,8 +650,7 @@ fn by_bucket(facts: &[FileFacts]) -> Buckets<'_> {
 fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
     let index = &file.index;
     let metadata = index.metadata();
-    let predicted =
-        FileIndex::predicted_resident_bytes(metadata, index.key_leaf(), index.handle().size());
+    let predicted = FileIndex::predicted_resident_bytes(metadata, index.key_leaf(), index.handle());
     let pages = page_facts(metadata, index.key_leaf(), index.value_leaf());
     let chunks = chunk_facts(metadata, index.key_leaf(), index.value_leaf());
     let mut dictionary_columns = Vec::new();
@@ -680,9 +681,9 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
                 .unwrap_or(0),
             pages_aligned: pages.aligned,
             dictionary_columns,
-            bloom_bytes: bloom_filter_bytes(&predicted),
+            bloom_bytes: predicted.filter_bytes,
             bloom_bits_per_key: predicted.bloom_bits_per_key,
-            key_chunk_bytes: predicted.disk_bytes,
+            key_chunk_bytes: predicted.key_chunk_bytes,
             distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf()),
             bounds_present: bounds_intact(&file.entry, index.key_range()),
             resident_bytes: index.resident_bytes(),
@@ -699,16 +700,6 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
 fn rows_of(index: &FileIndex) -> u64 {
     u64::try_from(index.rows())
         .expect("FileIndex::build refused a negative row count as FileFault::InconsistentRowCounts")
-}
-
-/// The key column's filter bytes as the footer bounds them: what the Bloom
-/// tier holds beyond the Disk tier's memory, since both hold the footer and
-/// the fences and only the Bloom tier the filters. `None` when a row group
-/// lacks a filter.
-fn bloom_filter_bytes(predicted: &ResidentBytes) -> Option<u64> {
-    predicted
-        .bloom
-        .map(|bloom| bloom.saturating_sub(predicted.disk_memory))
 }
 
 /// What the offset indexes say about a file's pages.
@@ -1095,10 +1086,7 @@ fn sort_findings(findings: &mut [Finding]) {
 /// since the Bloom tier could not load that file, and its bits per key is
 /// the ratio of the summed filter bits to the summed rows.
 fn predicted_total(facts: &[FileFacts]) -> ResidentBytes {
-    let filters: Option<u64> = facts
-        .iter()
-        .map(|file| bloom_filter_bytes(&file.predicted))
-        .sum();
+    let filters: Option<u64> = facts.iter().map(|file| file.predicted.filter_bytes).sum();
     let rows: u64 = facts.iter().map(|file| file.rows).sum();
     ResidentBytes {
         full: facts.iter().map(|file| file.predicted.full).sum(),
@@ -1106,13 +1094,12 @@ fn predicted_total(facts: &[FileFacts]) -> ResidentBytes {
         disk_bytes: facts.iter().map(|file| file.predicted.disk_bytes).sum(),
         bloom: facts.iter().map(|file| file.predicted.bloom).sum(),
         bloom_bits_per_key: filters.map(|bytes| bits_per_key(bytes, rows)),
+        key_chunk_bytes: facts
+            .iter()
+            .map(|file| file.predicted.key_chunk_bytes)
+            .sum(),
+        filter_bytes: filters,
     }
-}
-
-/// Filter bits per key: `bytes` of filter over `rows` keys, in the unit RFD
-/// 016 judges a filter's size by. Finite, zero for no rows.
-fn bits_per_key(bytes: u64, rows: u64) -> f64 {
-    approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows)
 }
 
 #[cfg(test)]
@@ -2211,7 +2198,7 @@ mod tests {
                     FileIndex::predicted_resident_bytes(
                         file.index.metadata(),
                         file.index.key_leaf(),
-                        file.index.handle().size(),
+                        file.index.handle(),
                     )
                 })
                 .collect();
@@ -2225,6 +2212,10 @@ mod tests {
             );
             assert_eq!(
                 predicted.disk_bytes,
+                per_file.iter().map(|file| file.disk_bytes).sum::<u64>()
+            );
+            assert_eq!(
+                predicted.key_chunk_bytes,
                 report
                     .files
                     .iter()
@@ -2236,12 +2227,16 @@ mod tests {
                 per_file.iter().map(|file| file.bloom).sum::<Option<u64>>()
             );
             assert_eq!(
-                predicted.bloom.map(|bloom| bloom - predicted.disk_memory),
+                predicted.filter_bytes,
                 report
                     .files
                     .iter()
                     .map(|file| file.bloom_bytes)
-                    .sum::<Option<u64>>(),
+                    .sum::<Option<u64>>()
+            );
+            assert_eq!(
+                predicted.bloom.map(|bloom| bloom - predicted.disk_memory),
+                predicted.filter_bytes,
                 "the filters are what the bloom tier holds beyond the disk tier's memory"
             );
             assert!(predicted.bloom_bits_per_key.unwrap() >= BLOOM_BITS_PER_KEY_MIN);

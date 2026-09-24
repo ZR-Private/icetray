@@ -432,5 +432,5 @@ pub(super) fn longs(values: &[i64]) -> Vec<Option<Key>> {
 
 /// `predicted_resident_bytes` of a built index's own footer.
 pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
-    FileIndex::predicted_resident_bytes(index.metadata(), index.key_leaf(), index.handle().size())
+    FileIndex::predicted_resident_bytes(index.metadata(), index.key_leaf(), index.handle())
 }

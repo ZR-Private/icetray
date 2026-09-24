@@ -318,7 +318,9 @@ files across every table, measured against the directory as it is when a
 load begins: the serving generation's chunk files stay until the new one
 has swapped in, so a refresh that rewrites every data file needs room for
 both sets, and a table rewritten wholesale wants a budget of about twice
-its steady footprint. A disk-tier lookup costs one local read and, on a
+its steady footprint. The steady footprint is the doctor's
+`predicted.disk_bytes`: each chunk file's header and key chunks, the bytes
+the budget is charged. A disk-tier lookup costs one local read and, on a
 hit, one GET; a `bloom` table keeps the key column's bloom filters in
 memory instead, needs no disk, and pays two GETs per hit and a GET per miss
 at the filter's false-positive rate. `disk` residency without a local

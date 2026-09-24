@@ -266,7 +266,6 @@ impl DiskChunks {
     pub async fn page(&self, range: Range<u64>) -> Result<Bytes>;
     /// Whether one stored chunk holds the whole range; checked before a reused file skips the chunk fetch.
     pub fn holds(&self, range: &Range<u64>) -> bool;
-    pub fn bytes_on_disk(&self) -> u64;
 }
 /// What a chunk file is named by and validated against; written into its
 /// header inside the RFD 011 envelope as a `ChunkFileHeader` message.
@@ -458,7 +457,10 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// file holds, its end past the file's last byte included.
 pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
-pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64> }
+/// `disk_bytes` is the whole chunk file the Disk tier writes (envelope, header, key chunks), the
+/// figure `index_budget_bytes` is charged; `key_chunk_bytes` and `filter_bytes` are the parts the
+/// Full and Bloom tiers hold beyond `disk_memory`.
+pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64>, pub key_chunk_bytes: u64, pub filter_bytes: Option<u64> }
 impl ResidentBytes {
     /// The memory a tier holds (`full`, `disk_memory`, `bloom`): the one mapping from a
     /// tier to its field. `None` only for `Bloom` when `bloom` is.
@@ -487,14 +489,15 @@ impl FileIndex {
     /// `generation` checks every file against a budget before any key chunk
     /// is fetched (RFD 017).
     pub async fn inspect(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType) -> Result<Inspected>;
-    /// Every tier's resident bytes for a file of `file_size` bytes, from the
+    /// Every tier's resident bytes for the file `handle` opens, from the
     /// footer alone, the same from the footer as loaded and as kept: no other
     /// column's column index is counted either way, so the budget check at
     /// the footer stage predicts what `resident_bytes` reports. A key chunk
-    /// past `file_size` counts as zero (`inspect` refuses it) and a filter
+    /// past the file's size counts as zero (`inspect` refuses it) and a filter
     /// past it makes `bloom` `None` (a Bloom build refuses it); the totals
-    /// saturate.
-    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, file_size: u64) -> ResidentBytes;
+    /// saturate. `disk_bytes` is the chunk file for the handle's identity,
+    /// header and key chunks, so the handle has loaded its footer.
+    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, handle: &FileHandle) -> ResidentBytes;
     pub fn key_range(&self) -> (&Key, &Key);
     pub fn may_contain(&self, key: &Key) -> bool;
     /// Exact position. Full: decodes one resident key page, no I/O. Disk:

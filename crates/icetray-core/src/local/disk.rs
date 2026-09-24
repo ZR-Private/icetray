@@ -35,8 +35,6 @@ pub(super) struct ChunkFile {
     path: PathBuf,
     /// Ascending by data offset, so a page's span is found by binary search.
     pub(super) spans: Vec<StoredSpan>,
-    /// The payload's length: the sum of the spans.
-    payload_bytes: u64,
     stats: Arc<IoStats>,
 }
 
@@ -52,7 +50,6 @@ impl DiskChunks {
                 file,
                 path,
                 spans: parsed.spans,
-                payload_bytes: parsed.payload_bytes,
                 stats,
             }),
         }
@@ -86,12 +83,6 @@ impl DiskChunks {
     /// the file holds.
     pub fn holds(&self, range: &Range<u64>) -> bool {
         self.shared.locate(range.start, range.end).is_some()
-    }
-
-    /// The payload's length: what the chunk file costs the index budget
-    /// beyond its header.
-    pub fn bytes_on_disk(&self) -> u64 {
-        self.shared.payload_bytes
     }
 }
 

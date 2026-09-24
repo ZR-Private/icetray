@@ -192,8 +192,6 @@ pub(super) struct ParsedChunkFile {
     pub(super) identity: DataFileIdentity,
     /// The spans in header order with their payload offsets.
     pub(super) spans: Vec<StoredSpan>,
-    /// The payload's length: the sum of the spans.
-    pub(super) payload_bytes: u64,
 }
 
 /// Reads the envelope and header of an open chunk file, then checks the
@@ -266,7 +264,6 @@ pub(super) fn parse_chunk_file(file: &File) -> std::result::Result<ParsedChunkFi
             footer_digest,
         },
         spans,
-        payload_bytes,
     })
 }
 
@@ -803,7 +800,10 @@ mod tests {
         assert_eq!(header.encoded_len(), header_len);
         assert_eq!(&bytes[header_end..], [FIRST_BYTES, SECOND_BYTES].concat());
         assert_eq!(bytes.len(), header_end + at(payload_len()));
-        assert_eq!(disk.bytes_on_disk(), payload_len());
+        assert_eq!(
+            approx::count(bytes.len()),
+            chunk_file_bytes(&identity(), &[FIRST_RANGE, SECOND_RANGE])
+        );
         assert_eq!(
             disk.shared.spans,
             vec![

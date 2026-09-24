@@ -138,21 +138,30 @@ pub enum FileFault {
 
 /// Every tier's resident bytes for one file, from the footer alone (RFD
 /// 017), so the budget check and the table owner see the numbers before any
-/// key chunk is fetched. `bloom` and `bloom_bits_per_key` are `None` when a
-/// row group lacks a key bloom filter or the footer does not bound one.
-/// Serializes with these field names: the doctor's summary carries it.
+/// key chunk is fetched, and the two parts the tiers differ by. `bloom`,
+/// `filter_bytes`, and `bloom_bits_per_key` are `None` when a row group
+/// lacks a key bloom filter or the footer does not bound one. Serializes
+/// with these field names: the doctor's summary carries it.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct ResidentBytes {
     /// Footer, page indexes, key chunks, and fences.
     pub full: u64,
     /// Footer, page indexes, and fences: the memory the disk tier keeps.
     pub disk_memory: u64,
-    /// The key chunks: what the disk tier writes to its chunk file.
+    /// The chunk file the disk tier writes, its envelope and header and the
+    /// key chunks: what `LocalConfig::index_budget_bytes` is charged for the
+    /// file, so a budget sized from this figure admits the load.
     pub disk_bytes: u64,
     /// Footer, page indexes, filters, and fences.
     pub bloom: Option<u64>,
     /// Filter bits per row of the file; the bloom tier's miss cost follows it.
     pub bloom_bits_per_key: Option<f64>,
+    /// The key column's compressed chunk bytes: what the Full tier holds
+    /// beyond the Disk tier's memory, and the chunk file's payload.
+    pub key_chunk_bytes: u64,
+    /// The key column's bloom filter bytes as the footer bounds them: what
+    /// the Bloom tier holds beyond the Disk tier's memory.
+    pub filter_bytes: Option<u64>,
 }
 
 impl ResidentBytes {
@@ -167,6 +176,13 @@ impl ResidentBytes {
             Residency::Bloom => self.bloom,
         }
     }
+}
+
+/// Filter bits per key: `bytes` of filter over `rows` keys, the unit RFD
+/// 016 judges a filter's size by and `ResidentBytes::bloom_bits_per_key`
+/// reports. Finite, zero for no rows.
+pub(crate) fn bits_per_key(bytes: u64, rows: u64) -> f64 {
+    approx::ratio(bytes.saturating_mul(u64::from(u8::BITS)), rows)
 }
 
 /// The page a key would decode and, when it can be named without I/O, the
@@ -467,7 +483,7 @@ impl FileIndex {
         let layout = Layout::inspect(table, &handle, &loaded, key_column, value_column, key_type)?;
         let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf));
         drop(loaded);
-        let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf, handle.size());
+        let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf, &handle);
         tracing::debug!(
             path = %handle.location,
             full = predicted.full,
@@ -485,8 +501,8 @@ impl FileIndex {
         })
     }
 
-    /// Every tier's resident bytes for a file of `file_size` bytes, from
-    /// its footer alone (RFD 017), the same given the footer as loaded or as
+    /// Every tier's resident bytes for the file `handle` opens, from its
+    /// footer alone (RFD 017), the same given the footer as loaded or as
     /// `FileIndex` keeps it (`metadata()`): the column index of every column
     /// but the key is never resident and is not counted either way, so a
     /// budget check at the footer stage predicts what `resident_bytes` will
@@ -494,13 +510,16 @@ impl FileIndex {
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
     /// chunks (the footer's compressed sizes, which Full holds and Disk
     /// writes byte for byte; a chunk the footer cannot place, by a negative
-    /// field or an end past `file_size`, counts as zero, and `inspect`
+    /// field or an end past the file's size, counts as zero, and `inspect`
     /// refuses such a footer before any budget check reads this), and the
     /// filters (the footer's lengths, header included; the in-memory filter
     /// drops the header, a few bytes per row group; `bloom` is `None` when a
     /// row group's filter is absent or one a Bloom-tier `build` refuses as
-    /// `FileFault::UnplaceableBloomFilter`). Every total saturates at
-    /// `u64::MAX` rather than wrapping. Estimated: the fences, one `Key` per key page plus, for
+    /// `FileFault::UnplaceableBloomFilter`), and the chunk file (the
+    /// envelope and the header the Disk tier writes for the handle's
+    /// identity over the key chunks, then the chunks; the identity carries
+    /// the footer digest, so `handle` has loaded its footer). Every total
+    /// saturates at `u64::MAX` rather than wrapping. Estimated: the fences, one `Key` per key page plus, for
     /// `BYTE_ARRAY` keys, the page's minimum from the column index when the
     /// file has one, which a writer may truncate, else the chunk's mean
     /// encoded bytes per value, and for `FIXED_LEN_BYTE_ARRAY` keys the
@@ -509,11 +528,9 @@ impl FileIndex {
     pub fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
-        file_size: u64,
+        handle: &FileHandle,
     ) -> ResidentBytes {
-        tiers(&ResidentSet::from_footer(
-            metadata, key_leaf, file_size, None,
-        ))
+        tiers(&ResidentSet::from_footer(metadata, key_leaf, handle, None))
     }
 
     /// The tier the index was built in.
@@ -594,7 +611,7 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.key_leaf,
-            self.handle.size(),
+            &self.handle,
             Some(&self.fences),
         ));
         let mine = all.in_tier(self.residency()).expect(

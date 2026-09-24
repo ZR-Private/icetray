@@ -285,6 +285,8 @@ mod tests {
                 disk_bytes: 1,
                 bloom: None,
                 bloom_bits_per_key: None,
+                key_chunk_bytes: 1,
+                filter_bytes: None,
             },
             costs: 0,
             advice: 0,

@@ -12,7 +12,9 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
 use super::build::reusable_disk_chunks;
-use super::{FileFault, KeyShape, ResidentBytes, ValueShape, file_fault, identity_of};
+use super::{
+    FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of,
+};
 use crate::approx;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
@@ -59,7 +61,7 @@ impl Inspected {
         let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
         Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
             Some(_) => 0,
-            None => chunk_file_bytes(&identity_of(&self.handle), &ranges),
+            None => self.predicted.disk_bytes,
         })
     }
 }
@@ -363,23 +365,25 @@ pub(super) fn bloom_ranges(
 pub(super) struct ResidentSet {
     footer: u64,
     key_chunks: u64,
+    chunk_file: u64,
     fences: u64,
     filters: Option<u64>,
     rows: u64,
 }
 
 impl ResidentSet {
-    /// From `metadata` of a file of `file_size` bytes, with the fences exact
+    /// From `metadata` of the file `handle` opens, with the fences exact
     /// when `fences` is given and estimated from the footer otherwise. A
-    /// key chunk `chunk_range` cannot place counts as zero, and the filters
-    /// are `None` when any row group's filter is one `filter_range` cannot
-    /// place.
+    /// key chunk `chunk_range` cannot place counts as zero and is left out
+    /// of the chunk file, and the filters are `None` when any row group's
+    /// filter is one `filter_range` cannot place.
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
-        file_size: u64,
+        handle: &FileHandle,
         fences: Option<&[Vec<Key>]>,
     ) -> Self {
+        let file_size = handle.size();
         let key_columns = || {
             metadata
                 .row_groups()
@@ -396,13 +400,16 @@ impl ResidentSet {
                 Some(range.end - range.start)
             })
             .try_fold(0, |sum: u64, len| len.map(|len| sum.saturating_add(len)));
+        let placed: Vec<Range<u64>> = key_columns()
+            .filter_map(|column| chunk_range(column, file_size))
+            .collect();
         Self {
             footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
-            key_chunks: key_columns()
-                .map(|column| {
-                    chunk_range(column, file_size).map_or(0, |range| range.end - range.start)
-                })
+            key_chunks: placed
+                .iter()
+                .map(|range| range.end - range.start)
                 .fold(0, u64::saturating_add),
+            chunk_file: chunk_file_bytes(&identity_of(handle), &placed),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
                 exact_fence_bytes,
@@ -419,13 +426,13 @@ pub(super) fn tiers(set: &ResidentSet) -> ResidentBytes {
     ResidentBytes {
         full: footer_and_fences.saturating_add(set.key_chunks),
         disk_memory: footer_and_fences,
-        disk_bytes: set.key_chunks,
+        disk_bytes: set.chunk_file,
         bloom: set
             .filters
             .map(|filters| footer_and_fences.saturating_add(filters)),
-        bloom_bits_per_key: set
-            .filters
-            .map(|filters| approx::ratio(filters.saturating_mul(u64::from(u8::BITS)), set.rows)),
+        bloom_bits_per_key: set.filters.map(|filters| bits_per_key(filters, set.rows)),
+        key_chunk_bytes: set.key_chunks,
+        filter_bytes: set.filters,
     }
 }
 
@@ -682,7 +689,7 @@ mod tests {
             assert_eq!(fault_of(inspect(patched)), FileFault::InconsistentRowCounts);
         }
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, opened.handle.size())
+            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, &opened.handle)
                 .bloom_bits_per_key,
             Some(0.0),
             "a negative row count estimates as no rows"
@@ -859,7 +866,7 @@ mod tests {
         // The budget check at the footer stage holds the footer as loaded;
         // its prediction is the kept footer's, and what the index reports.
         let from_loaded =
-            FileIndex::predicted_resident_bytes(&loaded, index.key_leaf(), opened.handle.size());
+            FileIndex::predicted_resident_bytes(&loaded, index.key_leaf(), &opened.handle);
         assert_eq!(from_loaded, predicted_of(&index));
         assert_eq!(from_loaded.full, count(index.resident_bytes()));
     }
@@ -871,14 +878,14 @@ mod tests {
         let index = opened.index(KeyType::Long).await;
         let key_leaf = index.key_leaf();
         let size = opened.handle.size();
-        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf, size);
+        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf, &opened.handle);
         let first_chunk = loaded.row_group(0).column(key_leaf).compressed_size();
         let unplaceable = [NEGATIVE_OFFSET, i64::try_from(size).unwrap(), i64::MAX / 2];
         for claimed in unplaceable {
             let patched = with_column_chunk(&loaded, 0, key_leaf, |chunk| {
                 chunk.set_total_compressed_size(claimed)
             });
-            let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf, size);
+            let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle);
             assert_eq!(
                 estimated.full,
                 intact.full - approx::measured(first_chunk),
@@ -940,7 +947,7 @@ mod tests {
         assert_eq!(path, location());
         assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&patched, key_leaf, opened.handle.size()).bloom,
+            FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle).bloom,
             None
         );
         assert!(bloom_ranges(TABLE, &opened.handle, index.metadata(), key_leaf).is_ok());
@@ -977,7 +984,7 @@ mod tests {
                 FileFault::UnplaceableBloomFilter { row_group: 0 }
             );
             assert_eq!(
-                FileIndex::predicted_resident_bytes(&patched, key_leaf, size).bloom,
+                FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle).bloom,
                 None
             );
         }
@@ -1020,12 +1027,12 @@ mod tests {
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
         let local = testing::local_dir(dir.path(), opened.stats(), None);
         let fresh = inspect(&opened, KeyType::Long).await;
-        let disk_bytes = fresh.predicted().disk_bytes;
-        assert!(disk_bytes > 0);
+        let predicted = *fresh.predicted();
+        assert!(predicted.disk_bytes > predicted.key_chunk_bytes);
         let needed = fresh.disk_bytes_needed(&local).unwrap();
-        assert!(
-            needed > disk_bytes,
-            "an empty directory takes every chunk and the header before them"
+        assert_eq!(
+            needed, predicted.disk_bytes,
+            "an empty directory takes the whole chunk file the doctor reports"
         );
         fresh.build(Residency::Disk, Some(&local)).await.unwrap();
         assert_eq!(
@@ -1050,7 +1057,10 @@ mod tests {
         ))
         .await;
         let stale = inspect(&other, KeyType::Long).await;
-        assert!(stale.disk_bytes_needed(&local).unwrap() > stale.predicted().disk_bytes);
+        assert_eq!(
+            stale.disk_bytes_needed(&local).unwrap(),
+            stale.predicted().disk_bytes
+        );
         assert_eq!(other.stats().gets(), 1, "no chunk is read for the check");
     }
 
@@ -1088,7 +1098,10 @@ mod tests {
                 .unwrap();
             let before = stats.local_bytes();
             disk.key_chunks_for_verification().await.unwrap();
-            assert_eq!(stats.local_bytes() - before, predicted_of(&disk).disk_bytes);
+            assert_eq!(
+                stats.local_bytes() - before,
+                predicted_of(&disk).key_chunk_bytes
+            );
         }
     }
 

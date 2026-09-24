@@ -218,12 +218,11 @@ impl LocalDir {
         fs::rename(&temp.path, &path).map_err(|error| local_error(path.clone(), error))?;
         drop(temp);
         let encoded_len = approx::count(header.encoded_len());
-        let (spans, payload_bytes) = stored_spans(&header.chunks, HEADER_OFFSET + encoded_len)
+        let (spans, _) = stored_spans(&header.chunks, HEADER_OFFSET + encoded_len)
             .expect("header_for admits only non-empty, ascending, disjoint spans");
         let parsed = ParsedChunkFile {
             identity: identity.clone(),
             spans,
-            payload_bytes,
         };
         Ok(DiskChunks::new(file, path, parsed, Arc::clone(&self.stats)))
     }
@@ -563,9 +562,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (local, _) = open(dir.path());
         let written = write(&local);
-        assert_eq!(written.bytes_on_disk(), payload_len());
+        assert_eq!(
+            local.index_bytes_in_use().unwrap(),
+            chunk_file_bytes(&identity(), &[FIRST_RANGE, SECOND_RANGE])
+        );
         let found = local.chunks_for(&identity()).unwrap().unwrap();
-        assert_eq!(found.bytes_on_disk(), payload_len());
         assert_eq!(found.shared.spans, written.shared.spans);
         assert_eq!(found.shared.spans.len(), 2);
         assert_eq!(entries(&local.index_dir), vec![chunk_file(&local)]);
