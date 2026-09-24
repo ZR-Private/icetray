@@ -244,7 +244,7 @@ mod tests {
             let generation = table.current().unwrap();
             assert_eq!(generation.residency, Residency::Disk);
             let identities = generation.identities();
-            assert_eq!(identities.len(), usize::try_from(TWO).unwrap());
+            assert_eq!(identities.len(), crate::approx::length(TWO));
             for identity in &identities {
                 assert!(
                     local.chunks_for(identity).unwrap().is_some(),

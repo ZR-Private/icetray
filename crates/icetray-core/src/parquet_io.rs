@@ -17,6 +17,7 @@ use parquet::file::metadata::{
 };
 use parquet::file::reader::{ChunkReader, Length};
 
+use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::error::{Error, Result};
 use crate::local::{self, DIGEST_BYTES};
@@ -215,8 +216,7 @@ impl MetadataFetch for LoadFetch {
 /// them: in the one tail read when it fit the prefetch, otherwise the eight
 /// bytes in the tail read and the metadata in the read that followed.
 fn footer_digest(size: u64, fetched: &Fetched) -> [u8; DIGEST_BYTES] {
-    let footer_size =
-        u64::try_from(FOOTER_SIZE).expect("the footer's eight bytes fit u64 on every target");
+    let footer_size = approx::count(FOOTER_SIZE);
     let tail = assemble(fetched, size - footer_size..size);
     let tail: [u8; FOOTER_SIZE] = tail
         .as_slice()
@@ -225,8 +225,7 @@ fn footer_digest(size: u64, fetched: &Fetched) -> [u8; DIGEST_BYTES] {
     let metadata_len = FooterTail::try_new(&tail)
         .expect("the metadata reader decoded this footer tail")
         .metadata_length();
-    let metadata_len =
-        u64::try_from(metadata_len).expect("a footer's metadata length fits u64 on every target");
+    let metadata_len = approx::count(metadata_len);
     local::digest(&assemble(fetched, size - footer_size - metadata_len..size))
 }
 
@@ -234,8 +233,7 @@ fn footer_digest(size: u64, fetched: &Fetched) -> [u8; DIGEST_BYTES] {
 /// one another. Every byte of the range is in some part; the metadata
 /// reader decoded it from them.
 fn assemble(fetched: &Fetched, range: Range<u64>) -> Vec<u8> {
-    let len = usize::try_from(range.end - range.start)
-        .expect("a footer's length fits usize on the 64-bit targets the crate supports");
+    let len = approx::length(range.end - range.start);
     let mut out = vec![0u8; len];
     let mut covered: Vec<Range<u64>> = Vec::with_capacity(fetched.len());
     for (held, bytes) in fetched {
@@ -326,9 +324,9 @@ impl Segments {
     /// fault, checked in debug builds.
     pub fn new(mut parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self {
         debug_assert!(
-            parts.iter().all(|(range, bytes)| {
-                u64::try_from(bytes.len()).is_ok_and(|len| len == range.end - range.start)
-            }),
+            parts
+                .iter()
+                .all(|(range, bytes)| { approx::count(bytes.len()) == range.end - range.start }),
             "each part's bytes are exactly its range's length"
         );
         parts.sort_by_key(|(range, _)| range.start);
@@ -370,8 +368,7 @@ impl Segments {
 
 /// The offset of `start` within a range that contains it.
 fn offset_within(range: &Range<u64>, start: u64) -> usize {
-    usize::try_from(start - range.start)
-        .expect("a u64 fits usize on the 64-bit targets the crate supports")
+    approx::length(start - range.start)
 }
 
 /// A `SegmentsFault` as the parquet reader receives it.
@@ -398,7 +395,7 @@ impl ChunkReader for Segments {
         // Saturating: a length that would carry the end past `u64::MAX`
         // cannot lie inside any held range and is refused like one that
         // merely runs past this range's end.
-        let end = start.saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        let end = start.saturating_add(approx::count(length));
         if end > range.end {
             return Err(refusal(SegmentsFault::CrossesResidentRange {
                 start,
@@ -541,7 +538,7 @@ mod tests {
         file: Bytes,
         config: &HedgeConfig,
     ) -> (Arc<FileHandle>, Arc<HedgeWindow>, Bytes) {
-        let size = u64::try_from(file.len()).unwrap();
+        let size = approx::count(file.len());
         let store = Arc::new(InMemory::new());
         store
             .put(&Path::from(FILE_KEY), PutPayload::from(file.clone()))
@@ -568,11 +565,11 @@ mod tests {
     }
 
     fn file_slice<'a>(file: &'a Bytes, range: &Range<u64>) -> &'a [u8] {
-        &file[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()]
+        &file[approx::length(range.start)..approx::length(range.end)]
     }
 
     fn prefetch_bytes() -> u64 {
-        u64::try_from(FOOTER_PREFETCH_BYTES).unwrap()
+        approx::count(FOOTER_PREFETCH_BYTES)
     }
 
     /// The thrift metadata's length, read from the file's own footer.
@@ -609,7 +606,7 @@ mod tests {
     }
 
     fn range_len(range: &Range<u64>) -> usize {
-        usize::try_from(range.end - range.start).unwrap()
+        approx::length(range.end - range.start)
     }
 
     #[tokio::test]
@@ -617,7 +614,7 @@ mod tests {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
         let stats = handle.storage().stats();
         assert!(handle.size() > prefetch_bytes());
-        assert_eq!(handle.size(), u64::try_from(file.len()).unwrap());
+        assert_eq!(handle.size(), approx::count(file.len()));
 
         let metadata = handle.load_metadata().await.unwrap();
         assert_eq!(stats.gets(), 1);

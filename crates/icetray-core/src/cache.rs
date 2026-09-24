@@ -121,7 +121,7 @@ impl Code for PageKey {
             .take(len)
             .read_to_end(&mut id)
             .map_err(foyer::Error::io_error)?;
-        if u64::try_from(id.len()) != Ok(len) {
+        if approx::count(id.len()) != len {
             return Err(foyer::Error::io_error(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("file id of {len} bytes ends after {} bytes", id.len()),
@@ -385,7 +385,7 @@ async fn open_hybrid(
     disk: &DiskTier,
 ) -> Result<HybridCache<PageKey, PageValue>> {
     let device = FsDeviceBuilder::new(disk.dir())
-        .with_capacity(saturating_usize(disk.capacity_bytes()))
+        .with_capacity(approx::length(disk.capacity_bytes()))
         .build()
         .map_err(backend)?;
     HybridCacheBuilder::new()
@@ -397,7 +397,7 @@ async fn open_hybrid(
         .storage()
         .with_engine_config(
             BlockEngineConfig::new(device)
-                .with_block_size(saturating_usize(PAGE_CACHE_DISK_BLOCK_BYTES)),
+                .with_block_size(approx::length(PAGE_CACHE_DISK_BLOCK_BYTES)),
         )
         .with_recover_mode(RecoverMode::Quiet)
         .build()
@@ -439,12 +439,6 @@ fn cache_error(error: foyer::Error) -> Error {
 /// A failure of the cache itself as the crate's error.
 fn backend(error: foyer::Error) -> Error {
     Error::Cache(CacheError::Backend(error))
-}
-
-/// A byte bound as the device builder takes it. A bound wider than the
-/// address space cannot be met and saturates rather than wraps.
-fn saturating_usize(bytes: u64) -> usize {
-    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -579,7 +573,7 @@ mod tests {
     /// a page of its own shard and by nothing else.
     fn offset_sharing_shard(cache: &HybridCache<PageKey, PageValue>, anchor: &PageKey) -> u64 {
         let memory = cache.memory();
-        let shards = u64::try_from(memory.shards()).unwrap();
+        let shards = count(memory.shards());
         let shard_of = |key: &PageKey| memory.hash(key) % shards;
         (anchor.1 + 1..anchor.1 + 1 + SHARD_SEARCH_OFFSETS)
             .find(|offset| shard_of(&PageKey(Arc::clone(&anchor.0), *offset)) == shard_of(anchor))
@@ -645,7 +639,7 @@ mod tests {
                 .position(|window| window == page)
             {
                 let at = from + found;
-                file.write_all_at(&flipped, u64::try_from(at).unwrap())
+                file.write_all_at(&flipped, count(at))
                     .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
                 copies += 1;
                 from = at + page.len();
@@ -681,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_encode_page_value_is_the_raw_bytes() {
-        let block = vec![0; saturating_usize(PAGE_CACHE_DISK_BLOCK_BYTES)];
+        let block = vec![0; approx::length(PAGE_CACHE_DISK_BLOCK_BYTES)];
         let cases: [&[u8]; 3] = [PAGE, b"", &block];
         for page in cases {
             let value = PageValue(Bytes::copy_from_slice(page));

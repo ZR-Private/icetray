@@ -1661,7 +1661,7 @@ mod tests {
                 values,
                 &WriterLayout::contract(),
             );
-            let size = u64::try_from(bytes.len()).unwrap();
+            let size = approx::count(bytes.len());
             let key = Self::location(name)
                 .strip_prefix(MEM_PREFIX)
                 .unwrap()
@@ -1696,7 +1696,7 @@ mod tests {
                     path: Self::location(name),
                     bucket,
                     bucketing,
-                    records: u64::try_from(keys.len()).unwrap(),
+                    records: approx::count(keys.len()),
                     size,
                     key_min: bounds.map(|(min, _)| Key::Long(*min)),
                     key_max: bounds.map(|(_, max)| Key::Long(*max)),
@@ -1767,7 +1767,7 @@ mod tests {
                 (file.entry.path.clone(), offset)
             })
             .collect();
-        let distinct = u64::try_from(pages.len()).unwrap();
+        let distinct = approx::count(pages.len());
         assert!(distinct >= 1);
         let cache = cache().await;
         let before = storage.stats().gets();
@@ -1803,7 +1803,7 @@ mod tests {
         let generation = assemble(files, layout(Some(bucketing(FOUR))))
             .await
             .unwrap();
-        assert_eq!(generation.files.len(), usize::try_from(FOUR).unwrap());
+        assert_eq!(generation.files.len(), approx::length(FOUR));
         assert_eq!(generation.overlapping_buckets().len(), 0);
         for key in &all {
             let bucket = bucketing(FOUR).bucket_of(&Key::Long(*key));
@@ -1911,7 +1911,7 @@ mod tests {
             .await;
         let generation = assemble(vec![file], layout(None)).await.unwrap();
         assert_eq!(generation.snapshot_id, SnapshotId(SNAPSHOT));
-        assert_eq!(generation.records, u64::try_from(keys.len()).unwrap());
+        assert_eq!(generation.records, approx::count(keys.len()));
         let cache = cache().await;
         let before = mem.gets();
         assert_eq!(
@@ -2480,7 +2480,7 @@ mod tests {
             time::timestamp_from_millis(committed.timestamp_ms()).unwrap()
         );
         assert_eq!(first.files.len(), 2);
-        assert_eq!(first.records, u64::try_from(all.len()).unwrap());
+        assert_eq!(first.records, approx::count(all.len()));
         assert_eq!(
             first.index_bytes,
             first
@@ -2745,7 +2745,7 @@ mod tests {
         assert_eq!(needed, predicted);
         let generous = table.config(Residency::Full, Some(predicted));
         let loaded = table.load(&generous, None, None).await.unwrap();
-        assert_eq!(u64::try_from(loaded.index_bytes).unwrap(), predicted);
+        assert_eq!(approx::count(loaded.index_bytes), predicted);
     }
 
     #[tokio::test]

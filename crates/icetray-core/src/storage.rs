@@ -818,7 +818,7 @@ mod tests {
     const TEST_PROVIDER: &str = "test";
 
     fn payload_len() -> u64 {
-        u64::try_from(PAYLOAD.len()).unwrap()
+        approx::count(PAYLOAD.len())
     }
 
     fn range_bytes(range: &Range<u64>) -> u64 {

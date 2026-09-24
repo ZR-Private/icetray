@@ -541,7 +541,7 @@ mod tests {
             (PrimitiveType::Binary, KeyType::Binary),
             (PrimitiveType::Fixed(1), KeyType::Binary),
             (
-                PrimitiveType::Fixed(u64::try_from(UUID_BYTES).unwrap()),
+                PrimitiveType::Fixed(crate::approx::count(UUID_BYTES)),
                 KeyType::Binary,
             ),
             (PrimitiveType::Uuid, KeyType::Uuid),

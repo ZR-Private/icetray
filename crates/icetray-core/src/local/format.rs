@@ -13,6 +13,7 @@ use bytes::Bytes;
 use prost::Message as _;
 
 use super::{DIGEST_BYTES, DataFileIdentity, LocalFault, digest};
+use crate::approx;
 use crate::key::HEX_DIGITS_PER_BYTE;
 
 /// The first byte of a chunk file (RFD 011): identifies the file as an
@@ -36,7 +37,7 @@ pub(super) const LENGTH_OFFSET: u64 = VERSION_OFFSET + 1;
 pub(super) const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 /// Where the encoded header starts: right after its length prefix. The
 /// payload starts where the header ends.
-pub(super) const HEADER_OFFSET: u64 = LENGTH_OFFSET + LENGTH_PREFIX_BYTES as u64;
+pub(super) const HEADER_OFFSET: u64 = LENGTH_OFFSET + approx::count(LENGTH_PREFIX_BYTES);
 /// The largest encoded header a chunk file may carry, written or read. A
 /// header is one data file path, one digest, and about twenty bytes per
 /// stored chunk, one per row group, so a mebibyte holds tens of thousands
@@ -228,8 +229,7 @@ pub(super) fn parse_chunk_file(file: &File) -> std::result::Result<ParsedChunkFi
     read_header_bytes(file, &mut length, LENGTH_OFFSET)?;
     let header_len = u32::from_le_bytes(length);
     let payload_offset = HEADER_OFFSET + u64::from(header_len);
-    let header_len = usize::try_from(header_len)
-        .expect("a u32 header length fits usize on the supported 64-bit systems");
+    let header_len = approx::length(header_len);
     if header_len > MAX_HEADER_BYTES {
         return Err(Rejection::HeaderTooLarge { len: header_len }.into());
     }
@@ -352,8 +352,7 @@ pub(super) fn header_for(
     let mut spans = Vec::with_capacity(chunks.len());
     let mut data_end = 0;
     for (range, bytes) in chunks {
-        let len = u64::try_from(bytes.len())
-            .expect("a buffer's length fits u64 on the supported systems");
+        let len = approx::count(bytes.len());
         let range_len = range.end.checked_sub(range.start).filter(|len| *len > 0);
         if range_len != Some(len) {
             return Err(LocalFault::ChunkLengthMismatch {
@@ -405,8 +404,7 @@ pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>
         .iter()
         .map(|span| span.length)
         .fold(0, u64::saturating_add);
-    let header = u64::try_from(header_of(identity, spans).encoded_len())
-        .expect("an encoded header's length fits u64 on the supported systems");
+    let header = approx::count(header_of(identity, spans).encoded_len());
     HEADER_OFFSET.saturating_add(header).saturating_add(payload)
 }
 
@@ -502,7 +500,7 @@ mod tests {
     const EXTRA: &[u8] = b"!";
 
     fn at(offset: u64) -> usize {
-        usize::try_from(offset).unwrap()
+        approx::length(offset)
     }
 
     fn append(path: &Path, bytes: &[u8]) {
@@ -630,12 +628,12 @@ mod tests {
         assert_eq!(
             rejection_of(&path, &identity()),
             Rejection::HeaderTooLarge {
-                len: usize::try_from(u32::MAX).unwrap()
+                len: approx::length(u32::MAX)
             }
         );
         assert!(local.chunks_for(&identity()).unwrap().is_none());
         let freed = local.retain(&HashSet::new()).unwrap();
-        assert_eq!(freed, u64::try_from(envelope.len()).unwrap());
+        assert_eq!(freed, approx::count(envelope.len()));
         assert!(entries(&local.index_dir).is_empty());
     }
 
@@ -812,12 +810,12 @@ mod tests {
                 StoredSpan {
                     data_offset: FIRST_RANGE.start,
                     length: range_len(&FIRST_RANGE),
-                    file_offset: u64::try_from(header_end).unwrap(),
+                    file_offset: approx::count(header_end),
                 },
                 StoredSpan {
                     data_offset: SECOND_RANGE.start,
                     length: range_len(&SECOND_RANGE),
-                    file_offset: u64::try_from(header_end).unwrap() + range_len(&FIRST_RANGE),
+                    file_offset: approx::count(header_end) + range_len(&FIRST_RANGE),
                 },
             ]
         );
@@ -854,7 +852,7 @@ mod tests {
         let (local, _) = open(dir.path());
         let (start, end, len) = length_mismatch_of(&local, FIRST_RANGE, SECOND_BYTES);
         assert_eq!(start..end, FIRST_RANGE);
-        assert_eq!(len, u64::try_from(SECOND_BYTES.len()).unwrap());
+        assert_eq!(len, approx::count(SECOND_BYTES.len()));
     }
 
     #[test]

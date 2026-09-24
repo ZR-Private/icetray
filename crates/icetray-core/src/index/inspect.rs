@@ -827,7 +827,7 @@ mod tests {
         fixture.values = (0..rows)
             .map(|i| Some(value_of_len(i, LARGE_VALUE_BYTES)))
             .collect();
-        fixture.layout.page_bytes = usize::try_from(VALUE_PAGE_BYTES).unwrap();
+        fixture.layout.page_bytes = approx::length(VALUE_PAGE_BYTES);
         fixture.layout.write_batch = SMALL_BATCH;
         let opened = store(&fixture).await;
         let loaded = opened.handle.load_metadata().await.unwrap();

@@ -78,7 +78,7 @@ pub(super) fn chunks() -> Vec<(Range<u64>, Bytes)> {
 }
 
 pub(super) fn payload_len() -> u64 {
-    u64::try_from(FIRST_BYTES.len() + SECOND_BYTES.len()).unwrap()
+    crate::approx::count(FIRST_BYTES.len() + SECOND_BYTES.len())
 }
 
 pub(super) fn range_len(range: &Range<u64>) -> u64 {

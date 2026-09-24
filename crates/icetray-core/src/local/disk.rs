@@ -11,6 +11,7 @@ use bytes::Bytes;
 
 use super::format::{ParsedChunkFile, StoredSpan};
 use super::{LocalFault, local_fault};
+use crate::approx;
 use crate::error::{Error, Result};
 use crate::storage::IoStats;
 
@@ -112,9 +113,9 @@ impl ChunkFile {
     /// `len` bytes at `offset` of the chunk file by positioned read: no seek
     /// on the shared handle, and never a map.
     fn read_at(&self, offset: u64, len: u64) -> Result<Bytes> {
-        let len = usize::try_from(len).expect(
-            "a span's length is bounded by the chunk file's size, which fits usize on the supported 64-bit systems",
-        );
+        // A span's length is bounded by the chunk file's size, which
+        // `parse_chunk_file` checked against the file on disk.
+        let len = approx::length(len);
         let mut buf = vec![0u8; len];
         self.file
             .read_exact_at(&mut buf, offset)

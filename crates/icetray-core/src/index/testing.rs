@@ -95,12 +95,12 @@ pub(super) fn key_for(i: usize, key_type: KeyType) -> Key {
         KeyType::String => Key::Str(format!("user:{n:012}")),
         KeyType::Binary => {
             let mut bytes = vec![BINARY_KEY_TAG];
-            bytes.extend_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
+            bytes.extend_from_slice(&count(n).to_be_bytes());
             Key::Bytes(bytes)
         }
         KeyType::Uuid => {
             let mut uuid = [UUID_KEY_FILL; UUID_BYTES];
-            uuid[UUID_HALF_BYTES..].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
+            uuid[UUID_HALF_BYTES..].copy_from_slice(&count(n).to_be_bytes());
             Key::Uuid(uuid)
         }
     }

@@ -28,6 +28,7 @@ use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::schema::types::ColumnDescPtr;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
+use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::config::Residency;
 use crate::error::{Error, Result};
@@ -597,8 +598,7 @@ impl FileIndex {
         let mine = all.in_tier(self.residency()).expect(
             "a bloom index has a bounded filter per row group; build refused the file otherwise",
         );
-        usize::try_from(mine)
-            .expect("resident bytes fit usize on the 64-bit targets the crate supports")
+        approx::length(mine)
     }
 
     /// The exact position of `key`, or `None` for a key the file does not
@@ -1215,7 +1215,7 @@ mod tests {
         assert_eq!(stats.hedges(), 0);
         assert_eq!(cache.fetches(), fetched);
         assert_eq!(cache.hits(), count(rows) - fetched);
-        usize::try_from(fetched).unwrap()
+        approx::length(fetched)
     }
 
     #[tokio::test]

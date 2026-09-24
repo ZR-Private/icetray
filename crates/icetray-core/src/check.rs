@@ -1906,7 +1906,7 @@ mod tests {
         let keys = testing::long_keys(&testing::keys_from(0, FILE_KEYS));
         table
             .add_file(FileSpec {
-                values: values_of_len(keys.len(), usize::try_from(LARGE_VALUE_BYTES).unwrap()),
+                values: values_of_len(keys.len(), approx::length(LARGE_VALUE_BYTES)),
                 ..file("f", &keys, Partition::Bucket(0), WriterLayout::contract())
             })
             .await;
@@ -1994,7 +1994,7 @@ mod tests {
         assert_eq!(report.summary.buckets_with_files, 1);
         assert_eq!(
             report.summary.max_files_per_bucket,
-            usize::try_from(MANY_FILES).unwrap()
+            approx::length(MANY_FILES)
         );
     }
 
@@ -2171,7 +2171,7 @@ mod tests {
             let predicted = report.summary.predicted;
             assert_eq!(
                 predicted.in_tier(residency).unwrap(),
-                u64::try_from(generation.index_bytes).unwrap(),
+                approx::count(generation.index_bytes),
                 "{residency}"
             );
             let resident: usize = report.files.iter().map(|file| file.resident_bytes).sum();

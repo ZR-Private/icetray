@@ -33,6 +33,7 @@ use format::{
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
+use crate::approx;
 use crate::config::LocalConfig;
 use crate::error::{Error, RefusalReason, Result};
 use crate::storage::IoStats;
@@ -216,8 +217,7 @@ impl LocalDir {
             .map_err(|fault| local_fault(temp.path.clone(), fault))?;
         fs::rename(&temp.path, &path).map_err(|error| local_error(path.clone(), error))?;
         drop(temp);
-        let encoded_len = u64::try_from(header.encoded_len())
-            .expect("an encoded header's length fits u64 on the supported systems");
+        let encoded_len = approx::count(header.encoded_len());
         let (spans, payload_bytes) = stored_spans(&header.chunks, HEADER_OFFSET + encoded_len)
             .expect("header_for admits only non-empty, ascending, disjoint spans");
         let parsed = ParsedChunkFile {
@@ -614,7 +614,7 @@ mod tests {
         let temp = stale_temp(&path);
         fs::write(&temp, LEFTOVER).unwrap();
         let chunk_len = fs::metadata(&path).unwrap().len();
-        let temp_len = u64::try_from(LEFTOVER.len()).unwrap();
+        let temp_len = approx::count(LEFTOVER.len());
 
         let freed = local.retain(&HashSet::new()).unwrap();
         assert_eq!(freed, chunk_len + temp_len);
@@ -684,7 +684,7 @@ mod tests {
         fs::write(&open_write.path, LEFTOVER).unwrap();
         let leftover = stale_temp(&path);
         fs::write(&leftover, LEFTOVER).unwrap();
-        let leftover_len = u64::try_from(LEFTOVER.len()).unwrap();
+        let leftover_len = approx::count(LEFTOVER.len());
 
         assert_eq!(local.retain(&HashSet::new()).unwrap(), leftover_len);
         assert_eq!(entries(&local.index_dir), vec![open_write.path.clone()]);
@@ -760,7 +760,7 @@ mod tests {
         fs::write(&temp, LEFTOVER).unwrap();
         assert_eq!(
             local.index_bytes_in_use().unwrap(),
-            expected + u64::try_from(LEFTOVER.len()).unwrap()
+            expected + approx::count(LEFTOVER.len())
         );
     }
 

@@ -21,6 +21,7 @@ use super::{
     Column, ColumnChunk, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys,
     file_fault, identity_of, off_worker, row_index,
 };
+use crate::approx;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::{Error, RefusalReason, Result};
@@ -138,8 +139,7 @@ impl PageReader for CountedPages {
         let page = self.inner.get_next_page()?;
         match &page {
             Some(Page::DataPage { num_values, .. } | Page::DataPageV2 { num_values, .. }) => {
-                let values = usize::try_from(*num_values)
-                    .expect("a page's value count fits usize on the supported systems");
+                let values = approx::length(*num_values);
                 let at = self.next_page;
                 self.next_page += 1;
                 let rows = self.page_rows[at];
@@ -889,8 +889,7 @@ mod tests {
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let (range, bytes) = &parts[0];
         let mut pages = pages_of(loaded, key_leaf);
-        let header_at =
-            usize::try_from(u64::try_from(pages[0].offset).unwrap() - range.start).unwrap();
+        let header_at = approx::length(u64::try_from(pages[0].offset).unwrap() - range.start);
         let varint = num_values_varint(&bytes[header_at..]);
         let varint = header_at + varint.start..header_at + varint.end;
         let written = zigzag_varint(claimed);
