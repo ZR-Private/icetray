@@ -244,9 +244,10 @@ mod tests {
 
     /// The padding each type admits: none for the fixed-width types.
     fn pads(key_type: KeyType) -> Vec<usize> {
-        match key_type {
-            KeyType::Long | KeyType::Uuid => vec![0],
-            KeyType::String | KeyType::Binary => vec![0, PAD],
+        if key_type.is_fixed_width() {
+            vec![0]
+        } else {
+            vec![0, PAD]
         }
     }
 
