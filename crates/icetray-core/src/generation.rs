@@ -253,21 +253,17 @@ impl Generation {
         self.verified_groups
     }
 
-    /// One lookup: the candidates are probed in order and the first whose
-    /// `find` answers gives the row, whose value page is read through
-    /// `cache`. `Present` carries the bytes, `Null` is a present key with a
-    /// null value, `Absent` a key no candidate holds. The GET cost is the
-    /// index's: in the Full tier one GET for a cold hit, none for a warm hit
-    /// or a miss.
-    pub async fn get(&self, key: &Key, cache: &PageCache) -> Result<Value> {
-        self.lookup(key, cache).await.map(|(value, _result)| value)
-    }
-
-    /// `get`, with the `result` label the lookup earns: `Miss` for an absent
-    /// key; for a present one, `ColdHit` when its value page came from
-    /// outside the cache (a fetch this lookup ran or joined) and `WarmHit`
-    /// when the cache served it from memory or its disk level. Only the
-    /// value page decides it; a key-page GET in the Bloom tier does not.
+    /// One lookup and the `result` label it earns: the candidates are probed
+    /// in order and the first whose `find` answers gives the row, whose
+    /// value page is read through `cache`. `Present` carries the bytes,
+    /// `Null` is a present key with a null value, `Absent` a key no
+    /// candidate holds. The GET cost is the index's: in the Full tier one
+    /// GET for a cold hit, none for a warm hit or a miss. The label is
+    /// `Miss` for an absent key; for a present one, `ColdHit` when its value
+    /// page came from outside the cache (a fetch this lookup ran or joined)
+    /// and `WarmHit` when the cache served it from memory or its disk level.
+    /// Only the value page decides it; a key-page GET in the Bloom tier does
+    /// not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
@@ -298,7 +294,7 @@ impl Generation {
     /// key is absent from every file whose fences cover it, or the tier is
     /// Disk or Bloom, where naming one would take a read), the first
     /// candidate that would decode a key page for it, the first probe.
-    /// `None` for a key no candidate would decode a page for, which `get`
+    /// `None` for a key no candidate would decode a page for, which `lookup`
     /// answers `Absent` with no I/O.
     pub fn plan(&self, keys: &[Key]) -> Vec<Option<(Arc<LoadedFile>, PageRef)>> {
         keys.iter().map(|key| self.plan_one(key)).collect()
@@ -1773,7 +1769,7 @@ mod tests {
         let before = storage.stats().gets();
         for (key, raw) in typed.iter().zip(keys) {
             assert_eq!(
-                generation.get(key, &cache).await.unwrap(),
+                generation.lookup(key, &cache).await.unwrap().0,
                 Value::Present(Bytes::from(value_for(*raw))),
                 "key {key}"
             );
@@ -1819,7 +1815,7 @@ mod tests {
         for key in &all {
             let absent = Key::Long(key + 1);
             assert_eq!(
-                generation.get(&absent, &cache).await.unwrap(),
+                generation.lookup(&absent, &cache).await.unwrap().0,
                 Value::Absent
             );
         }
@@ -1915,23 +1911,39 @@ mod tests {
         let cache = cache().await;
         let before = mem.gets();
         assert_eq!(
-            generation.get(&Key::Long(keys[1]), &cache).await.unwrap(),
+            generation
+                .lookup(&Key::Long(keys[1]), &cache)
+                .await
+                .unwrap()
+                .0,
             Value::Present(Bytes::from(value_for(keys[1])))
         );
         assert_eq!(mem.gets(), before + 1, "a cold hit is one GET");
         assert_eq!(
-            generation.get(&Key::Long(keys[0]), &cache).await.unwrap(),
+            generation
+                .lookup(&Key::Long(keys[0]), &cache)
+                .await
+                .unwrap()
+                .0,
             Value::Present(Bytes::from(value_for(keys[0])))
         );
         assert_eq!(mem.gets(), before + 1, "a warm hit is none");
         assert_eq!(
-            generation.get(&Key::Long(null_key), &cache).await.unwrap(),
+            generation
+                .lookup(&Key::Long(null_key), &cache)
+                .await
+                .unwrap()
+                .0,
             Value::Null
         );
         assert_eq!(mem.gets(), before + 1, "a null on the cached page is none");
         for absent in [keys[1] + 1, keys[0] - 1, keys.last().unwrap() + 1] {
             assert_eq!(
-                generation.get(&Key::Long(absent), &cache).await.unwrap(),
+                generation
+                    .lookup(&Key::Long(absent), &cache)
+                    .await
+                    .unwrap()
+                    .0,
                 Value::Absent
             );
         }
@@ -2112,7 +2124,7 @@ mod tests {
             .unwrap()
     }
 
-    /// A cold `get` of `key` costs one GET of exactly the page `page` of
+    /// A cold `lookup` of `key` costs one GET of exactly the page `page` of
     /// `planned` names.
     async fn assert_cold_hit_reads_the_planned_page(
         generation: &Generation,
@@ -2125,7 +2137,7 @@ mod tests {
         let cache = cache().await;
         let (gets, bytes) = (mem.gets(), mem.storage.stats().bytes());
         assert_eq!(
-            generation.get(&Key::Long(key), &cache).await.unwrap(),
+            generation.lookup(&Key::Long(key), &cache).await.unwrap().0,
             Value::Present(Bytes::from(value_for(key)))
         );
         assert_eq!(mem.gets(), gets + 1);
@@ -2340,9 +2352,10 @@ mod tests {
         let cache = cache().await;
         assert_eq!(
             generation
-                .get(&Key::Long(first[1] + 2), &cache)
+                .lookup(&Key::Long(first[1] + 2), &cache)
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             Value::Absent
         );
     }
@@ -2414,7 +2427,7 @@ mod tests {
         let cache = cache().await;
         for key in keys {
             assert_eq!(
-                generation.get(&Key::Long(*key), &cache).await.unwrap(),
+                generation.lookup(&Key::Long(*key), &cache).await.unwrap().0,
                 Value::Present(Bytes::from(value_for(*key))),
                 "key {key}"
             );
@@ -2426,7 +2439,11 @@ mod tests {
         let cache = cache().await;
         for key in keys {
             assert_eq!(
-                generation.get(&Key::Long(key + 1), &cache).await.unwrap(),
+                generation
+                    .lookup(&Key::Long(key + 1), &cache)
+                    .await
+                    .unwrap()
+                    .0,
                 Value::Absent,
                 "key {}",
                 key + 1
@@ -2782,7 +2799,7 @@ mod tests {
         let cache = cache().await;
         for key in &all {
             assert_eq!(
-                loaded.get(&Key::Long(*key), &cache).await.unwrap(),
+                loaded.lookup(&Key::Long(*key), &cache).await.unwrap().0,
                 Value::Present(Bytes::from(value_for(*key)))
             );
         }

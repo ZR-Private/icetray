@@ -635,11 +635,10 @@ impl Generation {
     /// different bucketings that share a number share one entry.
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize>;
     pub fn overlap_groups_verified(&self) -> usize;
-    pub async fn get(&self, key: &Key, cache: &PageCache) -> Result<Value>;
-    /// `get` with the `result` label: `Miss` for `Absent`; for a present key `ColdHit` when
+    /// One lookup and its `result` label: `Miss` for `Absent`; for a present key `ColdHit` when
     /// its value page was `Fetched` and `WarmHit` when `Cached`. Only the value page decides
-    /// it, never a key-page GET in the Bloom tier or a chunk-file read in the Disk tier. The
-    /// frozen `get` wraps it and drops the label.
+    /// it, never a key-page GET in the Bloom tier or a chunk-file read in the Disk tier.
+    /// `Table::get` is the public lookup.
     pub(crate) async fn lookup(&self, key: &Key, cache: &PageCache) -> Result<(Value, LookupResult)>;
     /// Which (file, value page) each key would fetch; the oracle for cost
     /// tests. The first candidate whose `page_of` names a value page, which in
