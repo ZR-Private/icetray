@@ -13,6 +13,7 @@ use parquet::column::reader::ColumnReaderImpl;
 use parquet::data_type::{
     ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArrayType, Int64Type,
 };
+use parquet::errors::ParquetError;
 use parquet::file::serialized_reader::SerializedPageReader;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
@@ -89,14 +90,39 @@ impl Inspected {
     }
 }
 
-/// A page reader that records the value count in the header of every data
-/// page it hands the column reader, so that what a decode produced can be
-/// checked against the rows the offset index gives those pages. The
-/// dictionary page is handed through uncounted; the pages the column reader
-/// skips from their locations are never read and never seen.
+/// A page reader that checks the value count in the header of every data
+/// page before the column reader sees it, and records it, so that what a
+/// decode produced can be checked against the rows the offset index gives
+/// those pages. The column reader sizes a decode by the header's count, so
+/// a data page claiming more values than the offset index gives it rows
+/// (`check_pages_read` requires one value per row of every page read, nulls
+/// included) is refused here, before the reader holds it, and recorded as
+/// refused.
+/// The dictionary page is handed through unchecked and uncounted; the pages
+/// the column reader skips from their locations are never read and never
+/// seen.
 struct CountedPages {
     inner: SerializedPageReader<Segments>,
-    seen: Arc<Mutex<Vec<usize>>>,
+    /// The rows the offset index gives each of the chunk's data pages, in
+    /// page order: the pages the inner reader hands out or skips, one for
+    /// one, since it reads by those locations.
+    page_rows: Vec<usize>,
+    /// The position among the chunk's data pages of the next data page
+    /// handed out or skipped.
+    next_page: usize,
+    tally: Arc<Mutex<PageTally>>,
+}
+
+/// What a `CountedPages` saw, shared with the `read_column` call that reads
+/// through it, since the column reader owns the page reader.
+#[derive(Default)]
+struct PageTally {
+    /// The header value count of every data page handed to the column
+    /// reader, in order.
+    seen: Vec<usize>,
+    /// The data page refused for a header that claims more values than its
+    /// rows; the reader's error then stands for this refusal.
+    refused: Option<usize>,
 }
 
 impl Iterator for CountedPages {
@@ -114,10 +140,17 @@ impl PageReader for CountedPages {
             Some(Page::DataPage { num_values, .. } | Page::DataPageV2 { num_values, .. }) => {
                 let values = usize::try_from(*num_values)
                     .expect("a page's value count fits usize on the supported systems");
-                self.seen
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(values);
+                let at = self.next_page;
+                self.next_page += 1;
+                let rows = self.page_rows[at];
+                let mut tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
+                if values > rows {
+                    tally.refused = Some(at);
+                    return Err(ParquetError::General(format!(
+                        "data page {at} claims {values} values for {rows} rows"
+                    )));
+                }
+                tally.seen.push(values);
             }
             Some(Page::DictionaryPage { .. }) | None => {}
         }
@@ -129,7 +162,15 @@ impl PageReader for CountedPages {
     }
 
     fn skip_next_page(&mut self) -> parquet::errors::Result<()> {
-        self.inner.skip_next_page()
+        let data_page = self
+            .inner
+            .peek_next_page()?
+            .is_some_and(|page| !page.is_dict);
+        self.inner.skip_next_page()?;
+        if data_page {
+            self.next_page += 1;
+        }
+        Ok(())
     }
 
     fn at_record_boundary(&mut self) -> parquet::errors::Result<bool> {
@@ -421,9 +462,14 @@ pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
 /// each page holding the rows the index gives it; a page that does not is
 /// `FileFault::PageRowsMismatch`, so no row position rests on an offset
 /// index the pages contradict. `take` is the footer's number and sizes no
-/// buffer: the values grow with what the pages hold, so a footer claiming
-/// more rows than any file holds costs no reservation before the check
-/// refuses it.
+/// buffer by itself: the column reader sizes the values and levels of each
+/// decode by the smaller of the records still wanted and the current
+/// page's header count, and a data page whose header claims more values
+/// than the offset index gives it rows is refused as
+/// `FileFault::PageRowsMismatch` before the reader decodes it. Those
+/// buffers are therefore bounded by the page's span in the offset index,
+/// and the span of a row group's last page runs to the row group's row
+/// count, which the footer alone states.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -432,34 +478,48 @@ fn read_column<T: ParquetDataType>(
 ) -> Result<Vec<T::T>> {
     let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
-    let seen = Arc::new(Mutex::new(Vec::new()));
+    let tally = Arc::new(Mutex::new(PageTally::default()));
     let pages = CountedPages {
         inner: chunk.page_reader(segments)?,
-        seen: Arc::clone(&seen),
+        page_rows: (0..chunk.page_locations().len())
+            .map(|page| {
+                let rows = chunk.page_rows(page);
+                row_index(rows.end - rows.start)
+            })
+            .collect(),
+        next_page: 0,
+        tally: Arc::clone(&tally),
     };
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
-    let skipped = if skip > 0 {
-        reader.skip_records(skip)?
-    } else {
-        0
-    };
     let mut values = Vec::new();
     let mut def_levels = Vec::new();
-    let mut records = 0;
-    while skipped == skip && records < take {
-        let (read, _, _) = reader.read_records(
-            take - records,
-            nullable.then_some(&mut def_levels),
-            None,
-            &mut values,
-        )?;
-        if read == 0 {
-            break;
+    let mut decode = || -> parquet::errors::Result<usize> {
+        let skipped = if skip > 0 {
+            reader.skip_records(skip)?
+        } else {
+            0
+        };
+        let mut records = 0;
+        while skipped == skip && records < take {
+            let (read, _, _) = reader.read_records(
+                take - records,
+                nullable.then_some(&mut def_levels),
+                None,
+                &mut values,
+            )?;
+            if read == 0 {
+                break;
+            }
+            records += read;
         }
-        records += read;
+        Ok(records)
+    };
+    let decoded = decode();
+    let tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(page) = tally.refused {
+        return Err(chunk.page_rows_mismatch(page));
     }
-    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
-    chunk.check_pages_read(skip..skip + take, &seen, records)?;
+    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded?)?;
     Ok(values)
 }
 
@@ -744,6 +804,150 @@ mod tests {
                 page: 0,
             }
         );
+    }
+
+    /// The low four bits of a compact-thrift field header: the field's type.
+    const THRIFT_TYPE_MASK: u8 = 0x0f;
+    /// The shift that brings a compact-thrift field header's high four bits,
+    /// the field id's delta from the one before, down to the low four.
+    const THRIFT_DELTA_SHIFT: u8 = 4;
+    /// Compact thrift's type code for an `i32`, written as a zigzag varint.
+    const THRIFT_I32: u8 = 5;
+    /// Compact thrift's type code for a struct.
+    const THRIFT_STRUCT: u8 = 12;
+    /// The field id of `data_page_header` in parquet's `PageHeader`.
+    const DATA_PAGE_HEADER_FIELD: u8 = 5;
+    /// The bit of a varint byte that says another byte follows.
+    const VARINT_CONTINUES: u8 = 0x80;
+
+    /// The byte range of the value count in a data page header in compact
+    /// thrift: the varint of `num_values`, the first field of the header's
+    /// `data_page_header` struct. Every field before that struct is an
+    /// `i32`, as parquet writes a data page's header.
+    fn num_values_varint(header: &[u8]) -> Range<usize> {
+        let varint_end = |from: usize| {
+            from + header[from..]
+                .iter()
+                .position(|byte| byte & VARINT_CONTINUES == 0)
+                .unwrap()
+                + 1
+        };
+        let mut at = 0;
+        let mut field = 0;
+        loop {
+            let byte = header[at];
+            field += byte >> THRIFT_DELTA_SHIFT;
+            at += 1;
+            match byte & THRIFT_TYPE_MASK {
+                THRIFT_I32 => at = varint_end(at),
+                THRIFT_STRUCT if field == DATA_PAGE_HEADER_FIELD => {
+                    assert_eq!(
+                        header[at],
+                        (1 << THRIFT_DELTA_SHIFT) | THRIFT_I32,
+                        "num_values is the struct's first field"
+                    );
+                    return at + 1..varint_end(at + 1);
+                }
+                other => panic!("field {field} has type {other}, not in a data page header"),
+            }
+        }
+    }
+
+    /// The most bytes a varint of an `i32` takes: seven bits per byte.
+    const I32_VARINT_BYTES: usize = 5;
+
+    /// `value` as compact thrift reads an `i32`: zigzag, then a varint,
+    /// padded with continuation bytes to `I32_VARINT_BYTES`, so every value
+    /// moves the pages after it by the same bytes and the value the header
+    /// held already proves the move right.
+    fn zigzag_varint(value: i32) -> Vec<u8> {
+        let mut rest = ((value << 1) ^ (value >> (i32::BITS - 1))).cast_unsigned();
+        (0..I32_VARINT_BYTES)
+            .map(|at| {
+                let low = u8::try_from(rest & u32::from(!VARINT_CONTINUES)).unwrap();
+                rest >>= u8::BITS - 1;
+                if at + 1 == I32_VARINT_BYTES {
+                    low
+                } else {
+                    low | VARINT_CONTINUES
+                }
+            })
+            .collect()
+    }
+
+    /// The fixture's key chunks and footer with the header of the first key
+    /// page of row group 0 claiming `claimed` values: the varint rewritten
+    /// in the chunk's bytes, and the page, the chunk, and every later page
+    /// of the chunk moved in the footer by the change in the varint's width.
+    async fn with_first_page_values(
+        opened: &Opened,
+        loaded: &ParquetMetaData,
+        key_leaf: usize,
+        claimed: i32,
+    ) -> (ParquetMetaData, Arc<Segments>) {
+        let ranges = key_chunk_ranges(loaded, key_leaf, opened.handle.size());
+        let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
+        let (range, bytes) = &parts[0];
+        let mut pages = pages_of(loaded, key_leaf);
+        let header_at =
+            usize::try_from(u64::try_from(pages[0].offset).unwrap() - range.start).unwrap();
+        let varint = num_values_varint(&bytes[header_at..]);
+        let varint = header_at + varint.start..header_at + varint.end;
+        let written = zigzag_varint(claimed);
+        let grown = written.len() - varint.len();
+        let mut patched = bytes[..varint.start].to_vec();
+        patched.extend_from_slice(&written);
+        patched.extend_from_slice(&bytes[varint.end..]);
+        let start = range.start;
+        parts[0] = (start..start + count(patched.len()), Bytes::from(patched));
+        pages[0].compressed_page_size += i32::try_from(grown).unwrap();
+        for page in &mut pages[1..] {
+            page.offset += i64::try_from(grown).unwrap();
+        }
+        let chunk_len = loaded.row_group(0).column(key_leaf).compressed_size();
+        let metadata = with_column_chunk(&with_pages(loaded, key_leaf, pages), 0, key_leaf, |c| {
+            c.set_total_compressed_size(chunk_len + i64::try_from(grown).unwrap())
+        });
+        (
+            metadata,
+            Arc::new(Segments::new(parts, opened.handle.size())),
+        )
+    }
+
+    /// A key page whose header claims more values than the rows its offset
+    /// index gives it is refused before the column reader decodes it, so the
+    /// claim sizes no buffer: the reader would size its first decode by the
+    /// smaller of the claim and the row group's rows.
+    #[tokio::test]
+    async fn test_verify_refuses_a_page_header_claiming_more_values_than_its_rows() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let path = location();
+        let span = i32::try_from(PAGE_ROWS).unwrap();
+        for claimed in [span, span + 1, i32::MAX] {
+            let (metadata, chunks) =
+                with_first_page_values(&opened, &loaded, key_leaf, claimed).await;
+            let column = Column {
+                metadata: &metadata,
+                leaf: key_leaf,
+                path: &path,
+            };
+            let verified =
+                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups);
+            if claimed == span {
+                assert_eq!(verified.unwrap().len(), ROW_GROUPS, "the count as written");
+                continue;
+            }
+            assert_eq!(
+                fault_of(verified),
+                FileFault::PageRowsMismatch {
+                    row_group: 0,
+                    page: 0,
+                },
+                "{claimed} values claimed"
+            );
+        }
     }
 
     /// `rows` binary keys that do not compress: digests of the row number,

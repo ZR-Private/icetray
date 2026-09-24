@@ -1000,28 +1000,30 @@ impl<'a> ColumnChunk<'a> {
             let last = self.page_holding(rows.end - 1);
             (first, last - first + 1)
         };
-        let mismatch = |page| {
-            file_fault(
-                self.column.path,
-                FileFault::PageRowsMismatch {
-                    row_group: self.row_group,
-                    page,
-                },
-            )
-        };
         for (page, values) in (first..first + expected).zip(seen) {
             let span = self.page_rows(page);
             if *values != row_index(span.end - span.start) {
-                return Err(mismatch(page));
+                return Err(self.page_rows_mismatch(page));
             }
         }
         if seen.len() != expected {
-            return Err(mismatch(first + seen.len().min(expected.saturating_sub(1))));
+            return Err(self.page_rows_mismatch(first + seen.len().min(expected.saturating_sub(1))));
         }
         if decoded != rows.end - rows.start {
-            return Err(mismatch(self.page_holding(rows.start + decoded)));
+            return Err(self.page_rows_mismatch(self.page_holding(rows.start + decoded)));
         }
         Ok(())
+    }
+
+    /// `FileFault::PageRowsMismatch` for data page `page` of the chunk.
+    fn page_rows_mismatch(&self, page: usize) -> Error {
+        file_fault(
+            self.column.path,
+            FileFault::PageRowsMismatch {
+                row_group: self.row_group,
+                page,
+            },
+        )
     }
 }
 
