@@ -56,7 +56,7 @@ impl Inspected {
     /// chunk; a chunk file that fails a check counts as absent, as
     /// `LocalDir::chunks_for` treats it.
     pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
-        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf);
+        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
         Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
             Some(_) => 0,
             None => chunk_file_bytes(&identity_of(&self.handle), &ranges),
@@ -87,6 +87,7 @@ impl Layout {
         key_type: KeyType,
     ) -> Result<Self> {
         let path = handle.location.as_str();
+        let size = handle.size();
         let schema = metadata.file_metadata().schema_descr();
         let key_leaf = leaf(path, schema, key_column)?;
         let value_leaf = leaf(path, schema, value_column)?;
@@ -96,8 +97,8 @@ impl Layout {
             return Err(file_fault(path, FileFault::NoRows));
         }
         check_row_counts(path, metadata)?;
-        check_offset_index(path, metadata, key_leaf)?;
-        check_offset_index(path, metadata, value_leaf)?;
+        check_offset_index(path, metadata, key_leaf, size)?;
+        check_offset_index(path, metadata, value_leaf, size)?;
         Ok(Self {
             key_leaf,
             value_leaf,
@@ -193,15 +194,21 @@ fn check_row_counts(path: &str, metadata: &ParquetMetaData) -> Result<()> {
     Ok(())
 }
 
-/// The offset index of `leaf` in every row group, checked once so that the
-/// lookup path converts its numbers with no fallible step: an index is
-/// present, the column chunk has a non-negative offset and size, every
-/// page has a non-negative offset and size and lies inside the chunk, the
+/// The offset index of `leaf` in every row group of a file of `file_size`
+/// bytes, checked once so that the lookup path converts its numbers with no
+/// fallible step: an index is present, the column chunk has a non-negative
+/// offset and size and ends at or before the file's last byte, every page
+/// has a non-negative offset and size and lies inside the chunk, the
 /// first page is at row zero, first rows are strictly increasing and inside
 /// the row group, and a row group with rows has a page. A footer without
 /// the index is `FileFault::MissingPageIndex`; one whose index fails a
 /// check is `FileFault::InconsistentOffsetIndex`.
-fn check_offset_index(path: &str, metadata: &ParquetMetaData, leaf: usize) -> Result<()> {
+fn check_offset_index(
+    path: &str,
+    metadata: &ParquetMetaData,
+    leaf: usize,
+    file_size: u64,
+) -> Result<()> {
     let offset_index = metadata
         .offset_index()
         .ok_or_else(|| file_fault(path, FileFault::MissingPageIndex))?;
@@ -216,7 +223,7 @@ fn check_offset_index(path: &str, metadata: &ParquetMetaData, leaf: usize) -> Re
         if rows > 0 && locations.is_empty() {
             return Err(inconsistent());
         }
-        let chunk = chunk_range(group.column(leaf)).ok_or_else(inconsistent)?;
+        let chunk = chunk_range(group.column(leaf), file_size).ok_or_else(inconsistent)?;
         let mut previous: Option<i64> = None;
         for location in locations {
             let in_chunk = u64::try_from(location.offset).is_ok_and(|start| {
@@ -263,11 +270,13 @@ pub(super) fn kept_footer(metadata: &ParquetMetaData, key_leaf: usize) -> Parque
 
 /// The byte range of a column chunk from its footer fields: from the
 /// dictionary page when the chunk has one, else the first data page, for
-/// the chunk's compressed size. `None` when a field is negative or the end
-/// does not fit `u64`. Parquet's `byte_range` asserts on a negative field,
-/// so every chunk the index reads goes through this check at build, before
-/// anything asks parquet for its range.
-fn chunk_range(chunk: &ColumnChunkMetaData) -> Option<Range<u64>> {
+/// the chunk's compressed size. `None` when a field is negative or the
+/// chunk ends past `file_size`, the file's last byte, so no chunk range the
+/// index reads claims more bytes than the file holds. Parquet's `byte_range`
+/// asserts on a negative field, so every chunk the index reads goes
+/// through this check at build, before anything asks parquet for its
+/// range.
+fn chunk_range(chunk: &ColumnChunkMetaData, file_size: u64) -> Option<Range<u64>> {
     let negative = chunk.data_page_offset() < 0
         || chunk.compressed_size() < 0
         || chunk
@@ -277,27 +286,43 @@ fn chunk_range(chunk: &ColumnChunkMetaData) -> Option<Range<u64>> {
         return None;
     }
     let (start, len) = chunk.byte_range();
-    Some(start..start.checked_add(len)?)
+    let end = start.checked_add(len)?;
+    (end <= file_size).then_some(start..end)
 }
 
-/// The byte range of the key column chunk of every row group, in row group
-/// order; build checked every chunk's offset and size.
-pub(super) fn key_chunk_ranges(metadata: &ParquetMetaData, key_leaf: usize) -> Vec<Range<u64>> {
+/// The byte range of the key column chunk of every row group of a file of
+/// `file_size` bytes, in row group order; build checked every chunk's
+/// offset and size against that size.
+pub(super) fn key_chunk_ranges(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    file_size: u64,
+) -> Vec<Range<u64>> {
     metadata
         .row_groups()
         .iter()
         .map(|group| {
-            chunk_range(group.column(key_leaf))
+            chunk_range(group.column(key_leaf), file_size)
                 .expect("column chunk offsets and sizes were checked at build")
         })
         .collect()
 }
 
+/// The byte range of a bloom filter from its footer fields, `None` when the
+/// offset is negative, the length is absent or negative, or the filter ends
+/// past `file_size`, the file's last byte.
+fn filter_range(offset: i64, length: Option<i32>, file_size: u64) -> Option<Range<u64>> {
+    let start = u64::try_from(offset).ok()?;
+    let end = start.checked_add(u64::try_from(length?).ok()?)?;
+    (end <= file_size).then_some(start..end)
+}
+
 /// The byte range of the key column's bloom filter in every row group. The
 /// Bloom tier stands the filter in for the key chunk, so a row group without
 /// one is `RefusalReason::NoBloomFilter`, and one whose filter the footer
-/// places nowhere a file can hold, with a negative offset, no length, or a
-/// negative or overflowing length, is `FileFault::UnplaceableBloomFilter`.
+/// places nowhere the file holds, with a negative offset, no length, a
+/// negative length, or an end past the file's last byte, is
+/// `FileFault::UnplaceableBloomFilter`.
 pub(super) fn bloom_ranges(
     table: &str,
     handle: &FileHandle,
@@ -320,21 +345,21 @@ pub(super) fn bloom_ranges(
                     },
                 ));
             };
-            let unplaceable = || file_fault(path, FileFault::UnplaceableBloomFilter { row_group });
-            let offset = u64::try_from(offset).map_err(|_| unplaceable())?;
-            let len = column
-                .bloom_filter_length()
-                .and_then(|len| u64::try_from(len).ok())
-                .ok_or_else(unplaceable)?;
-            let end = offset.checked_add(len).ok_or_else(unplaceable)?;
-            Ok(offset..end)
+            filter_range(offset, column.bloom_filter_length(), handle.size())
+                .ok_or_else(|| file_fault(path, FileFault::UnplaceableBloomFilter { row_group }))
         })
         .collect()
 }
 
 /// The parts every tier's resident bytes are made of, from the footer, so
 /// `predicted_resident_bytes` and `resident_bytes` cannot drift; the doc of
-/// the former says which are exact and which estimated.
+/// the former says which are exact and which estimated. The parts are sums
+/// over row groups of footer numbers, and they saturate: a key chunk or
+/// filter is bounded by the file's size, but a footer may place every row
+/// group's chunk over the same bytes, and the fence estimate multiplies a
+/// footer's byte count, so the sum of a footer that lies is bounded by
+/// nothing, and one that would wrap stays at `u64::MAX` instead of wrapping
+/// to a small number.
 pub(super) struct ResidentSet {
     footer: u64,
     key_chunks: u64,
@@ -344,11 +369,15 @@ pub(super) struct ResidentSet {
 }
 
 impl ResidentSet {
-    /// From `metadata`, with the fences exact when `fences` is given and
-    /// estimated from the footer otherwise.
+    /// From `metadata` of a file of `file_size` bytes, with the fences exact
+    /// when `fences` is given and estimated from the footer otherwise. A
+    /// key chunk `chunk_range` cannot place counts as zero, and the filters
+    /// are `None` when any row group's filter is one `filter_range` cannot
+    /// place.
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        file_size: u64,
         fences: Option<&[Vec<Key>]>,
     ) -> Self {
         let key_columns = || {
@@ -359,17 +388,21 @@ impl ResidentSet {
         };
         let filters = key_columns()
             .map(|column| {
-                column
-                    .bloom_filter_offset()
-                    .and(column.bloom_filter_length())
-                    .and_then(|len| u64::try_from(len).ok())
+                let range = filter_range(
+                    column.bloom_filter_offset()?,
+                    column.bloom_filter_length(),
+                    file_size,
+                )?;
+                Some(range.end - range.start)
             })
-            .sum::<Option<u64>>();
+            .try_fold(0, |sum: u64, len| len.map(|len| sum.saturating_add(len)));
         Self {
             footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
             key_chunks: key_columns()
-                .map(|column| chunk_range(column).map_or(0, |range| range.end - range.start))
-                .sum(),
+                .map(|column| {
+                    chunk_range(column, file_size).map_or(0, |range| range.end - range.start)
+                })
+                .fold(0, u64::saturating_add),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
                 exact_fence_bytes,
@@ -380,13 +413,16 @@ impl ResidentSet {
     }
 }
 
-/// The tiers' totals from their parts.
+/// The tiers' totals from their parts, saturating as the parts do.
 pub(super) fn tiers(set: &ResidentSet) -> ResidentBytes {
+    let footer_and_fences = set.footer.saturating_add(set.fences);
     ResidentBytes {
-        full: set.footer + set.key_chunks + set.fences,
-        disk_memory: set.footer + set.fences,
+        full: footer_and_fences.saturating_add(set.key_chunks),
+        disk_memory: footer_and_fences,
         disk_bytes: set.key_chunks,
-        bloom: set.filters.map(|filters| set.footer + filters + set.fences),
+        bloom: set
+            .filters
+            .map(|filters| footer_and_fences.saturating_add(filters)),
         bloom_bits_per_key: set
             .filters
             .map(|filters| approx::ratio(filters.saturating_mul(u64::from(u8::BITS)), set.rows)),
@@ -416,7 +452,7 @@ fn exact_fence_bytes(fences: &[Vec<Key>]) -> u64 {
 /// documents.
 fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
     let descr = metadata.file_metadata().schema_descr().column(key_leaf);
-    let mut total = 0;
+    let mut total: u64 = 0;
     for (row_group, group) in metadata.row_groups().iter().enumerate() {
         let pages = metadata
             .offset_index()
@@ -441,7 +477,9 @@ fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
             | PhysicalType::FLOAT
             | PhysicalType::DOUBLE => 0,
         };
-        total += approx::count(pages * size_of::<Key>()) + heap;
+        total = total
+            .saturating_add(approx::count(pages * size_of::<Key>()))
+            .saturating_add(heap);
     }
     total
 }
@@ -475,7 +513,7 @@ fn byte_array_fence_heap(
             let values = approx::measured(chunk.num_values());
             // A chunk of no values has no mean, and no heap per fence.
             let mean = encoded.checked_div(values).unwrap_or(0);
-            approx::count(pages) * mean
+            approx::count(pages).saturating_mul(mean)
         }
     }
 }
@@ -644,7 +682,8 @@ mod tests {
             assert_eq!(fault_of(inspect(patched)), FileFault::InconsistentRowCounts);
         }
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&disagreeing[0], 0).bloom_bits_per_key,
+            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, opened.handle.size())
+                .bloom_bits_per_key,
             Some(0.0),
             "a negative row count estimates as no rows"
         );
@@ -655,8 +694,9 @@ mod tests {
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
         let loaded = opened.handle.load_metadata().await.unwrap();
         let path = location();
+        let size = opened.handle.size();
         for leaf in [0, 1] {
-            assert!(check_offset_index(&path, &loaded, leaf).is_ok());
+            assert!(check_offset_index(&path, &loaded, leaf, size).is_ok());
             let pages = pages_of(&loaded, leaf);
             assert_eq!(pages.len(), PAGES_PER_GROUP);
             let (chunk_start, chunk_len) = loaded.row_group(0).column(leaf).byte_range();
@@ -686,11 +726,12 @@ mod tests {
             ] {
                 let patched = with_pages(&loaded, leaf, contradicting);
                 assert_eq!(
-                    fault_of(check_offset_index(&path, &patched, leaf)),
+                    fault_of(check_offset_index(&path, &patched, leaf, size)),
                     FileFault::InconsistentOffsetIndex { row_group: 0 }
                 );
             }
-            assert!(check_offset_index(&path, &with_pages(&loaded, leaf, pages), leaf).is_ok());
+            let restored = with_pages(&loaded, leaf, pages);
+            assert!(check_offset_index(&path, &restored, leaf, size).is_ok());
         }
     }
 
@@ -714,7 +755,56 @@ mod tests {
             ];
             for patched in &negative {
                 assert_eq!(
-                    fault_of(check_offset_index(&path, patched, leaf)),
+                    fault_of(check_offset_index(
+                        &path,
+                        patched,
+                        leaf,
+                        opened.handle.size()
+                    )),
+                    FileFault::InconsistentOffsetIndex { row_group: 0 }
+                );
+            }
+        }
+    }
+
+    /// A column chunk the footer places past the file's last byte is refused
+    /// at the footer, before any range is read, so no reader sizes a buffer
+    /// by the claim; a chunk that ends at the last byte is accepted.
+    #[tokio::test]
+    async fn test_inspect_refuses_a_column_chunk_that_runs_past_the_file() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let size = opened.handle.size();
+        let inspect = |metadata: &ParquetMetaData| {
+            super::Layout::inspect(
+                TABLE,
+                &opened.handle,
+                metadata,
+                KEY_COLUMN,
+                VALUE_COLUMN,
+                KeyType::Long,
+            )
+            .map(|layout| layout.key_leaf)
+        };
+        for leaf in [0, 1] {
+            let (start, _) = loaded.row_group(0).column(leaf).byte_range();
+            let sized = |len: i64| {
+                with_column_chunk(&loaded, 0, leaf, |chunk| {
+                    chunk.set_total_compressed_size(len)
+                })
+            };
+            let ending_at = |end: u64| sized(i64::try_from(end - start).unwrap());
+            assert!(
+                inspect(&ending_at(size)).is_ok(),
+                "a chunk may end at the file's last byte"
+            );
+            let past_the_end = [
+                ending_at(size + 1),
+                sized(i64::MAX - i64::try_from(start).unwrap()),
+            ];
+            for patched in &past_the_end {
+                assert_eq!(
+                    fault_of(inspect(patched)),
                     FileFault::InconsistentOffsetIndex { row_group: 0 }
                 );
             }
@@ -768,7 +858,8 @@ mod tests {
         assert!(loaded.memory_size() - kept.memory_size() >= value_pages * 2 * truncated);
         // The budget check at the footer stage holds the footer as loaded;
         // its prediction is the kept footer's, and what the index reports.
-        let from_loaded = FileIndex::predicted_resident_bytes(&loaded, index.key_leaf());
+        let from_loaded =
+            FileIndex::predicted_resident_bytes(&loaded, index.key_leaf(), opened.handle.size());
         assert_eq!(from_loaded, predicted_of(&index));
         assert_eq!(from_loaded.full, count(index.resident_bytes()));
     }
@@ -779,17 +870,21 @@ mod tests {
         let loaded = opened.handle.load_metadata().await.unwrap();
         let index = opened.index(KeyType::Long).await;
         let key_leaf = index.key_leaf();
-        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf);
+        let size = opened.handle.size();
+        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf, size);
         let first_chunk = loaded.row_group(0).column(key_leaf).compressed_size();
-        let patched = with_column_chunk(&loaded, 0, key_leaf, |chunk| {
-            chunk.set_total_compressed_size(NEGATIVE_OFFSET)
-        });
-        let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf);
-        assert_eq!(
-            estimated.full,
-            intact.full - approx::measured(first_chunk),
-            "the chunk the footer cannot place counts for nothing"
-        );
+        let unplaceable = [NEGATIVE_OFFSET, i64::try_from(size).unwrap(), i64::MAX / 2];
+        for claimed in unplaceable {
+            let patched = with_column_chunk(&loaded, 0, key_leaf, |chunk| {
+                chunk.set_total_compressed_size(claimed)
+            });
+            let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf, size);
+            assert_eq!(
+                estimated.full,
+                intact.full - approx::measured(first_chunk),
+                "the chunk the footer cannot place counts for nothing: {claimed}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -845,10 +940,47 @@ mod tests {
         assert_eq!(path, location());
         assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&patched, key_leaf).bloom,
+            FileIndex::predicted_resident_bytes(&patched, key_leaf, opened.handle.size()).bloom,
             None
         );
         assert!(bloom_ranges(TABLE, &opened.handle, index.metadata(), key_leaf).is_ok());
+    }
+
+    /// A bloom filter the footer places past the file's last byte is
+    /// refused before any range is read; one that ends at the last byte is
+    /// placed.
+    #[tokio::test]
+    async fn test_bloom_ranges_with_a_filter_past_the_file_is_a_file_fault() {
+        let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
+        let index = opened.index(KeyType::Long).await;
+        let key_leaf = index.key_leaf();
+        let size = opened.handle.size();
+        let offset = index
+            .metadata()
+            .row_group(0)
+            .column(key_leaf)
+            .bloom_filter_offset()
+            .unwrap();
+        let sized = |len: i32| {
+            with_column_chunk(index.metadata(), 0, key_leaf, |chunk| {
+                chunk.set_bloom_filter_length(Some(len))
+            })
+        };
+        let ending_at =
+            |end: u64| sized(i32::try_from(end - u64::try_from(offset).unwrap()).unwrap());
+        let ranges =
+            |metadata: &ParquetMetaData| bloom_ranges(TABLE, &opened.handle, metadata, key_leaf);
+        assert!(ranges(&ending_at(size)).is_ok());
+        for patched in [ending_at(size + 1), sized(i32::MAX)] {
+            assert_eq!(
+                fault_of(ranges(&patched)),
+                FileFault::UnplaceableBloomFilter { row_group: 0 }
+            );
+            assert_eq!(
+                FileIndex::predicted_resident_bytes(&patched, key_leaf, size).bloom,
+                None
+            );
+        }
     }
 
     /// The footer stage over the fixture: `FileIndex::inspect` for `opened`.

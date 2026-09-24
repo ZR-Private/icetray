@@ -390,7 +390,9 @@ fn header_of(identity: &DataFileIdentity, spans: Vec<ChunkSpan>) -> ChunkFileHea
 /// `ranges` occupies: the envelope, the encoded header, and the chunks back
 /// to back. This is what `LocalDir::index_bytes_in_use` measures for the
 /// file once written, so a disk budget checked against it at the footer
-/// stage agrees with the directory after the write.
+/// stage agrees with the directory after the write. Saturates rather than
+/// wraps: every range is bounded by its data file, but a footer that lies
+/// may repeat one range in every row group.
 pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>]) -> u64 {
     let spans = ranges
         .iter()
@@ -399,10 +401,13 @@ pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>
             length: range.end.saturating_sub(range.start),
         })
         .collect::<Vec<_>>();
-    let payload = spans.iter().map(|span| span.length).sum::<u64>();
+    let payload = spans
+        .iter()
+        .map(|span| span.length)
+        .fold(0, u64::saturating_add);
     let header = u64::try_from(header_of(identity, spans).encoded_len())
         .expect("an encoded header's length fits u64 on the supported systems");
-    HEADER_OFFSET + header + payload
+    HEADER_OFFSET.saturating_add(header).saturating_add(payload)
 }
 
 /// Writes one chunk file at `path`, which must not exist: the magic byte,

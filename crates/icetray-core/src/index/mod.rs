@@ -67,8 +67,8 @@ pub enum FileFault {
     #[error("the footer's row counts disagree with one another")]
     InconsistentRowCounts,
     /// A column's offset index does not describe its pages in a row group:
-    /// the column chunk the pages lie in has a negative offset or size, a
-    /// row group with rows has no page, a page has a negative offset or
+    /// the column chunk the pages lie in has a negative offset or size or
+    /// ends past the file's last byte, a row group with rows has no page, a page has a negative offset or
     /// size or lies outside its column chunk, the first page does not start
     /// at row zero, or the pages' first rows are not strictly increasing
     /// within the row group.
@@ -104,10 +104,11 @@ pub enum FileFault {
         /// The row group whose filter is unreadable.
         row_group: usize,
     },
-    /// The footer names a row group's bloom filter but places it nowhere a
-    /// file can hold: a negative offset, no length, or a length negative or
-    /// past the end of `u64`, so the filter cannot be read as one bounded
-    /// range. A footer with no filter at all is a refusal, not a fault.
+    /// The footer names a row group's bloom filter but places it nowhere the
+    /// file holds: a negative offset, no length, a negative length, or an
+    /// end past the file's last byte, so the filter cannot be read as one
+    /// range of the file. A footer with no filter at all is a refusal, not a
+    /// fault.
     #[error("bloom filter of row group {row_group} has no place the footer can hold")]
     UnplaceableBloomFilter {
         /// The row group whose filter the footer cannot place.
@@ -463,7 +464,7 @@ impl FileIndex {
         let layout = Layout::inspect(table, &handle, &loaded, key_column, value_column, key_type)?;
         let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf));
         drop(loaded);
-        let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf);
+        let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf, handle.size());
         tracing::debug!(
             path = %handle.location,
             full = predicted.full,
@@ -481,26 +482,35 @@ impl FileIndex {
         })
     }
 
-    /// Every tier's resident bytes for this file, from the footer alone
-    /// (RFD 017), the same given the footer as loaded or as `FileIndex`
-    /// keeps it (`metadata()`): the column index of every column but the
-    /// key is never resident and is not counted either way, so a budget
-    /// check at the footer stage predicts what `resident_bytes` will
+    /// Every tier's resident bytes for a file of `file_size` bytes, from
+    /// its footer alone (RFD 017), the same given the footer as loaded or as
+    /// `FileIndex` keeps it (`metadata()`): the column index of every column
+    /// but the key is never resident and is not counted either way, so a
+    /// budget check at the footer stage predicts what `resident_bytes` will
     /// report. Exact: the footer and the page indexes kept
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
     /// chunks (the footer's compressed sizes, which Full holds and Disk
-    /// writes byte for byte; a chunk the footer cannot place counts as
-    /// zero, and `inspect` refuses such a footer before any budget check
-    /// reads this), and the filters (the footer's lengths, header
-    /// included; the in-memory filter drops the header, a few bytes per row
-    /// group). Estimated: the fences, one `Key` per key page plus, for
+    /// writes byte for byte; a chunk the footer cannot place, by a negative
+    /// field or an end past `file_size`, counts as zero, and `inspect`
+    /// refuses such a footer before any budget check reads this), and the
+    /// filters (the footer's lengths, header included; the in-memory filter
+    /// drops the header, a few bytes per row group; `bloom` is `None` when a
+    /// row group's filter is absent or one a Bloom-tier `build` refuses as
+    /// `FileFault::UnplaceableBloomFilter`). Every total saturates at
+    /// `u64::MAX` rather than wrapping. Estimated: the fences, one `Key` per key page plus, for
     /// `BYTE_ARRAY` keys, the page's minimum from the column index when the
     /// file has one, which a writer may truncate, else the chunk's mean
     /// encoded bytes per value, and for `FIXED_LEN_BYTE_ARRAY` keys the
     /// column's width, which over-counts a uuid key, held inline, by
     /// `UUID_BYTES` per page. `resident_bytes` shares the definitions.
-    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> ResidentBytes {
-        tiers(&ResidentSet::from_footer(metadata, key_leaf, None))
+    pub fn predicted_resident_bytes(
+        metadata: &ParquetMetaData,
+        key_leaf: usize,
+        file_size: u64,
+    ) -> ResidentBytes {
+        tiers(&ResidentSet::from_footer(
+            metadata, key_leaf, file_size, None,
+        ))
     }
 
     /// The tier the index was built in.
@@ -581,6 +591,7 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.key_leaf,
+            self.handle.size(),
             Some(&self.fences),
         ));
         let mine = all.in_tier(self.residency()).expect(
@@ -714,11 +725,11 @@ impl FileIndex {
         match &self.keys {
             KeyResidency::Chunks(chunks) => Ok(Arc::clone(chunks)),
             KeyResidency::Disk(disk) => {
-                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf);
+                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf, self.handle.size());
                 chunks_from_disk(disk, &ranges, self.handle.size()).await
             }
             KeyResidency::Filters(_) => {
-                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf);
+                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf, self.handle.size());
                 let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
                 Ok(Arc::new(Segments::new(parts, self.handle.size())))
             }

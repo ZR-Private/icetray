@@ -466,7 +466,9 @@ async fn build_all(
 /// (the reused files' chunk files among them) plus the bytes every new
 /// file would write, which is nothing for a file whose chunk file is
 /// already there. Bloom takes no budget. Over is
-/// `RefusalReason::OverBudget` carrying both numbers.
+/// `RefusalReason::OverBudget` carrying both numbers. The sums saturate,
+/// as the predictions they add do: a need that would wrap stays at
+/// `u64::MAX` instead of wrapping to a small number that fits the budget.
 fn check_budget(
     table: &str,
     config: &TableConfig,
@@ -476,24 +478,24 @@ fn check_budget(
 ) -> Result<()> {
     let bound = match config.residency {
         Residency::Full => config.resident_budget_bytes.map(|budget| {
-            let kept: u64 = reused
+            let needed = reused
                 .iter()
                 .map(|file| approx::count(file.index.resident_bytes()))
-                .sum();
-            let new: u64 = inspected
-                .iter()
-                .map(|(_, inspected)| inspected.predicted().full)
-                .sum();
-            Ok::<_, Error>((budget, kept + new))
+                .chain(
+                    inspected
+                        .iter()
+                        .map(|(_, inspected)| inspected.predicted().full),
+                )
+                .fold(0, u64::saturating_add);
+            Ok::<_, Error>((budget, needed))
         }),
         Residency::Disk => local.and_then(|local| {
             local.index_budget().map(|budget| {
                 let in_use = local.index_bytes_in_use()?;
-                let new = inspected
-                    .iter()
-                    .map(|(_, inspected)| inspected.disk_bytes_needed(local))
-                    .sum::<Result<u64>>()?;
-                Ok((budget, in_use + new))
+                let new = inspected.iter().try_fold(0, |sum: u64, (_, inspected)| {
+                    Ok::<_, Error>(sum.saturating_add(inspected.disk_bytes_needed(local)?))
+                })?;
+                Ok((budget, in_use.saturating_add(new)))
             })
         }),
         Residency::Bloom => None,

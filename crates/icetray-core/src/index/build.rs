@@ -47,7 +47,7 @@ impl Inspected {
             leaf: layout.key_leaf,
             path: &handle.location,
         };
-        let ranges = key_chunk_ranges(&metadata, layout.key_leaf);
+        let ranges = key_chunk_ranges(&metadata, layout.key_leaf, handle.size());
         let (keys, verified) = match residency {
             Residency::Full => {
                 let (chunks, verified) =
@@ -695,7 +695,7 @@ mod tests {
         metadata: &ParquetMetaData,
         key_leaf: usize,
     ) -> Arc<Segments> {
-        let ranges = key_chunk_ranges(metadata, key_leaf);
+        let ranges = key_chunk_ranges(metadata, key_leaf, opened.handle.size());
         let parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         Arc::new(Segments::new(parts, opened.handle.size()))
     }

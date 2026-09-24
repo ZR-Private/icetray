@@ -449,8 +449,10 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// `InconsistentRowCounts`, `InconsistentOffsetIndex`, and `PageRowsMismatch`
 /// are a footer that the file contradicts: a negative count or row groups
 /// that do not sum to the file's, an offset index whose pages are not where
-/// or what it says, a key or value page holding other rows than its offset
-/// index gives it.
+/// or what it says (a column chunk running past the file's last byte among
+/// them), a key or value page holding other rows than its offset index gives
+/// it. `UnplaceableBloomFilter` is a filter the footer places nowhere the
+/// file holds, its end past the file's last byte included.
 pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64> }
@@ -481,11 +483,14 @@ impl FileIndex {
     /// `generation` checks every file against a budget before any key chunk
     /// is fetched (RFD 017).
     pub async fn inspect(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType) -> Result<Inspected>;
-    /// Every tier's resident bytes for this file, from the footer alone, the
-    /// same from the footer as loaded and as kept: no other column's column
-    /// index is counted either way, so the budget check at the footer stage
-    /// predicts what `resident_bytes` reports.
-    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> ResidentBytes;
+    /// Every tier's resident bytes for a file of `file_size` bytes, from the
+    /// footer alone, the same from the footer as loaded and as kept: no other
+    /// column's column index is counted either way, so the budget check at
+    /// the footer stage predicts what `resident_bytes` reports. A key chunk
+    /// past `file_size` counts as zero (`inspect` refuses it) and a filter
+    /// past it makes `bloom` `None` (a Bloom build refuses it); the totals
+    /// saturate.
+    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, file_size: u64) -> ResidentBytes;
     pub fn key_range(&self) -> (&Key, &Key);
     pub fn may_contain(&self, key: &Key) -> bool;
     /// Exact position. Full: decodes one resident key page, no I/O. Disk:
