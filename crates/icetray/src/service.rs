@@ -260,21 +260,13 @@ mod tests {
     /// The value of the sample string key.
     const STR_VALUE: &str = "user:42";
 
-    /// Every key type, so each pairing with a wire variant is tried.
-    const TYPES: [KeyType; 4] = [
-        KeyType::Long,
-        KeyType::String,
-        KeyType::Binary,
-        KeyType::Uuid,
-    ];
-
     fn wire(variant: v1::key::Key) -> v1::Key {
         v1::Key { key: Some(variant) }
     }
 
     #[test]
     fn test_key_from_wire_missing_key_or_variant_is_missing_for_every_type() {
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             assert_eq!(key_from_wire(None, key_type), Err(WireKeyFault::Missing));
             assert_eq!(
                 key_from_wire(Some(v1::Key { key: None }), key_type),
@@ -320,7 +312,7 @@ mod tests {
             v1::key::Key::Str(STR_VALUE.to_string()),
             v1::key::Key::Bin(vec![0u8; UUID_BYTES]),
         ];
-        for key_type in TYPES {
+        for key_type in KeyType::ALL {
             for variant in &variants {
                 let matches = matches!(
                     (variant, key_type),
@@ -493,6 +485,7 @@ mod tests {
             (KeyType::Binary, v1::KeyType::Binary),
             (KeyType::Uuid, v1::KeyType::Uuid),
         ];
+        assert_eq!(cases.map(|(key_type, _)| key_type), KeyType::ALL);
         for (key_type, wire) in cases {
             assert_eq!(key_type_wire(key_type), wire);
         }
