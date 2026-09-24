@@ -21,7 +21,9 @@ use futures::future::{Either, select};
 use object_store::aws::{AmazonS3Builder, AwsCredential};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{CredentialProvider, ObjectStore, ObjectStoreExt};
+use object_store::{
+    BackoffConfig, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, RetryConfig,
+};
 // Reads are timed on tokio's clock: a paused runtime (the simulation) advances
 // it virtually, so the hedge window and the timer that consults it agree; the
 // wall clock would feed the window real durations under a virtual timer.
@@ -58,12 +60,46 @@ const S3_SCHEMES: [&str; 2] = ["s3://", "s3a://"];
 const S3_STORE_NAME: &str = "S3";
 
 /// How long before its expiry a cached credential stops being handed out.
-/// Two minutes is longer than any one request with its retries takes, so a
-/// request signed with a credential from the cache never reaches the store
-/// after that credential expired, and it is short next to the hour-long
-/// lifetime of role and SSO credentials, so the chain is consulted about
-/// once per lifetime rather than once per GET (RFD 003).
+/// Two minutes is longer than any one S3 request with its retries can take,
+/// `S3_RETRY_TIMEOUT` plus `S3_MAX_BACKOFF` plus `S3_REQUEST_TIMEOUT`, which
+/// a compile-time assertion below holds it to, so a request signed with a
+/// credential from the cache never reaches the store after that credential
+/// expired. It is short next to the hour-long lifetime of role and SSO
+/// credentials, so the chain is consulted about once per lifetime rather
+/// than once per GET (RFD 003).
 const CREDENTIAL_REFRESH_MARGIN: Duration = Duration::from_secs(120);
+
+/// How long after an S3 request's first attempt the client may still start
+/// another; `max_retries` bounds the count, this the time. A retry is sent
+/// with the credential the first attempt was signed with, so the last one
+/// must end inside `CREDENTIAL_REFRESH_MARGIN`: one minute, plus a backoff
+/// and a whole attempt, does.
+const S3_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The longest pause between two attempts of one S3 request. The first
+/// pause and the growth between pauses are `object_store`'s defaults; the
+/// cap is ours so that the bound on a request with its retries is stated in
+/// this module's constants.
+const S3_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long one attempt of an S3 request may run, from connecting to the
+/// last byte of the body: thirty seconds, `object_store`'s own default,
+/// set here so the credential bound is stated in this module. A load reads
+/// whole key column chunks, which take seconds on a slow link; a lookup
+/// under the default `Get` deadline of five seconds is dropped, with its
+/// read, long before an attempt runs this long.
+const S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An S3 request with its retries ends inside the credential margin: the
+/// last attempt starts within `S3_RETRY_TIMEOUT` plus one backoff of the
+/// first and runs at most `S3_REQUEST_TIMEOUT`.
+const _: () = assert!(
+    S3_RETRY_TIMEOUT
+        .saturating_add(S3_MAX_BACKOFF)
+        .saturating_add(S3_REQUEST_TIMEOUT)
+        .as_nanos()
+        < CREDENTIAL_REFRESH_MARGIN.as_nanos()
+);
 
 /// The least time a credential the chain has just resolved is handed out
 /// before the chain is asked again, when its expiry is already inside
@@ -379,15 +415,31 @@ impl Storage {
     /// table is absent, so the addressing style does not depend on whether
     /// the table is written; the region falls back to the SDK's when the
     /// file names none. Credentials come from exactly one
-    /// `CredentialSource`.
+    /// `CredentialSource`. Every request retries at most `max_retries`
+    /// times and within `S3_RETRY_TIMEOUT`, each attempt connects within
+    /// `connect_timeout` and ends within `S3_REQUEST_TIMEOUT`, so a wedged
+    /// store fails a request instead of holding it.
     fn s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         let default_s3 = S3Config::default();
         let s3 = self.config.s3.as_ref().unwrap_or(&default_s3);
         let source = self.credential_source();
         tracing::debug!(bucket, credentials = %source, "building s3 store");
+        let client = ClientOptions::new()
+            .with_allow_http(s3.allow_http)
+            .with_connect_timeout(self.config.connect_timeout)
+            .with_timeout(S3_REQUEST_TIMEOUT);
+        let retry = RetryConfig {
+            backoff: BackoffConfig {
+                max_backoff: S3_MAX_BACKOFF,
+                ..BackoffConfig::default()
+            },
+            max_retries: self.config.max_retries,
+            retry_timeout: S3_RETRY_TIMEOUT,
+        };
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(bucket)
-            .with_allow_http(s3.allow_http)
+            .with_client_options(client)
+            .with_retry(retry)
             .with_virtual_hosted_style_request(!s3.path_style);
         if let Some(endpoint) = s3.endpoint.as_deref() {
             builder = builder.with_endpoint(endpoint);
@@ -737,7 +789,10 @@ impl CredentialProvider for SdkCredentials {
 /// single `FileHandle` to a whole generation.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -790,6 +845,68 @@ pub(crate) mod testing {
             Arc::new(FileHandle::open(Arc::clone(&self.storage), location, size, window).unwrap())
         }
     }
+
+    /// What the local HTTP endpoint does with every request it reads.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Reply {
+        /// Answers with this status line and an empty body, then closes.
+        Status(&'static str),
+    }
+
+    /// An HTTP endpoint on a loopback port, served by a thread of its own
+    /// so it answers whatever runtime the test runs on, that counts the
+    /// requests it reads. The thread outlives the test; the process ends it.
+    pub(crate) struct LocalHttp {
+        /// The endpoint's address.
+        pub(crate) addr: SocketAddr,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl LocalHttp {
+        /// Binds a loopback port and serves every connection with `reply`.
+        pub(crate) fn start(reply: Reply) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    read_head(&mut stream);
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    match reply {
+                        Reply::Status(line) => write!(
+                            stream,
+                            "HTTP/1.1 {line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .unwrap(),
+                    }
+                }
+            });
+            Self { addr, requests }
+        }
+
+        /// `http://` and the endpoint's address.
+        pub(crate) fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        /// The requests read so far.
+        pub(crate) fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Reads one request's head, through the blank line that ends it, or
+    /// to the end of the stream. The requests the tests send carry no body.
+    fn read_head(stream: &mut TcpStream) {
+        let end_of_head = b"\r\n\r\n";
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(end_of_head) && stream.read(&mut byte).unwrap() == 1 {
+            head.push(byte[0]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,12 +925,17 @@ mod tests {
     };
     use tokio::sync::Notify;
 
-    use super::testing::MEM_PREFIX;
+    use super::testing::{LocalHttp, MEM_PREFIX, Reply};
     use super::*;
     use crate::config::RewriteRule;
 
     /// The key of the one test object under the prefix.
     const OBJECT_KEY: &str = "db/t/f.bin";
+    /// The bucket the S3 client tests address.
+    const BUCKET: &str = "bucket-a";
+    /// The status line of a store that is up and refusing work, which the
+    /// S3 client retries.
+    const UNAVAILABLE: &str = "503 Service Unavailable";
     /// A key nothing was written under.
     const MISSING_KEY: &str = "db/t/absent.bin";
     /// The test object's bytes.
@@ -1414,6 +1536,39 @@ mod tests {
         ));
         let located = storage.locate("s3://bucket-a/x").unwrap();
         assert_eq!(located.path, Path::from("x"));
+    }
+
+    /// A storage whose S3 stores reach `endpoint` over plain HTTP, path
+    /// style and unsigned, retrying `max_retries` times.
+    fn s3_storage_at(endpoint: &LocalHttp, max_retries: usize) -> Storage {
+        Storage::new(StorageConfig {
+            s3: Some(S3Config {
+                endpoint: Some(endpoint.url()),
+                allow_http: true,
+                path_style: true,
+                ..S3Config::default()
+            }),
+            max_retries,
+            ..StorageConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_read_all_retries_an_unavailable_s3_store_max_retries_times() {
+        let retry_counts = [StorageConfig::default().max_retries, 0];
+        for max_retries in retry_counts {
+            let endpoint = LocalHttp::start(Reply::Status(UNAVAILABLE));
+            let storage = s3_storage_at(&endpoint, max_retries);
+            let result = storage
+                .read_all(&format!("s3://{BUCKET}/{OBJECT_KEY}"))
+                .await;
+            assert!(matches!(result, Err(Error::ObjectStore(_))), "{result:?}");
+            assert_eq!(
+                endpoint.requests(),
+                1 + max_retries,
+                "{max_retries} retries"
+            );
+        }
     }
 
     #[test]
