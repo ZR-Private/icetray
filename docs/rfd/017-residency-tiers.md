@@ -150,7 +150,13 @@ same check.
 
 The chunk-file budget is a bound on disk, so the loader checks it against
 the `index/` directory as it is when the load begins, plus what the new
-generation would write. The serving generation's chunk files are among what
+generation would write. Several disk tables load at once, so each load
+reserves what it would write from the check until its writes finish, and
+the check counts every other load's reservation too: two loads that fit
+alone but not together cannot both pass, and which one is refused depends
+on which reaches the check first. A reservation still held after its chunk
+files land counts them twice, which errs toward refusal: it can refuse a
+load that would have fit. The serving generation's chunk files are among what
 is there: they answer lookups until the swap and are deleted only after it,
 so a refresh that replaces every data file needs room for the old set and
 the new one at once, and a table rewritten wholesale is sized at about twice

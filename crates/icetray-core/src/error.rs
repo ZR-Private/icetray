@@ -297,9 +297,13 @@ pub enum RefusalReason {
         /// The length of the file's longest key.
         bytes: usize,
     },
-    /// A full-residency load would exceed its resident-bytes budget (RFD 017).
+    /// A load would exceed its budget (RFD 017): a full-residency table's
+    /// resident-bytes budget, or the local directory's chunk-file budget
+    /// shared by every disk-residency table.
     OverBudget {
-        /// The resident bytes the load would need.
+        /// The bytes the load would need: the table's resident bytes for
+        /// full residency; for disk, the bytes `index/` would hold, other
+        /// loads' reservations included.
         needed: u64,
         /// The budget it is held to.
         budget: u64,

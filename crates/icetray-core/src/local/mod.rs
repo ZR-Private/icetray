@@ -34,7 +34,7 @@ use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::LocalConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, RefusalReason, Result};
 use crate::storage::IoStats;
 
 /// The directory under `LocalConfig::dir` that holds chunk files.
@@ -150,6 +150,9 @@ pub struct LocalDir {
     in_flight: Mutex<HashSet<PathBuf>>,
     /// The sequence number of the next temporary file name.
     next_temp: AtomicU64,
+    /// The bytes every outstanding `Reservation` holds: disk-tier loads
+    /// that passed the budget and have not finished writing.
+    reserved: Mutex<u64>,
 }
 
 impl LocalDir {
@@ -170,6 +173,7 @@ impl LocalDir {
             stats,
             in_flight: Mutex::new(HashSet::new()),
             next_temp: AtomicU64::new(0),
+            reserved: Mutex::new(0),
         })
     }
 
@@ -246,15 +250,59 @@ impl LocalDir {
     }
 
     /// The bytes every file under `index/` occupies, a write in progress
-    /// included, since the budget is disk. `generation` compares this and
-    /// `index_budget` with the bytes a disk-tier load needs, at the footer
-    /// stage (RFD 017); this module refuses nothing itself.
+    /// included, since the budget is disk. `reserve` checks this, with the
+    /// reservations outstanding, against `index_budget` for the bytes a
+    /// disk-tier load needs, at the footer stage (RFD 017).
     pub fn index_bytes_in_use(&self) -> Result<u64> {
         Ok(self
             .index_files()?
             .iter()
             .map(|(_, metadata)| metadata.len())
             .sum())
+    }
+
+    /// Holds `needed` bytes of `index/` for a disk-tier load of `table`
+    /// until the returned `Reservation` drops. Refused as
+    /// `RefusalReason::OverBudget` when the bytes `index/` holds, plus every
+    /// reservation outstanding, plus `needed` exceed `index_budget`; that
+    /// sum is the refusal's `needed`, `u64::MAX` for a sum past `u64`,
+    /// which is over any budget. The directory is listed, the sum
+    /// checked, and the bytes held under one lock, so of two loads that each
+    /// fit alone but not together the one that reaches the lock second is
+    /// refused. A load holds its reservation until it has finished writing:
+    /// a chunk file that has landed, or is being written, is counted by
+    /// `index_bytes_in_use` and by the reservation both until it drops. That
+    /// double count errs toward refusal: it can refuse a load that would
+    /// have fit. With no budget nothing is
+    /// refused, `index/` is not listed, and nothing is held.
+    pub(crate) fn reserve(&self, table: &str, needed: u64) -> Result<Reservation<'_>> {
+        let Some(budget) = self.index_budget else {
+            return Ok(Reservation {
+                local: self,
+                bytes: 0,
+            });
+        };
+        let mut reserved = self.lock_reserved();
+        let total = self
+            .index_bytes_in_use()?
+            .checked_add(*reserved)
+            .and_then(|held| held.checked_add(needed));
+        match total {
+            Some(total) if total <= budget => {
+                *reserved += needed;
+                Ok(Reservation {
+                    local: self,
+                    bytes: needed,
+                })
+            }
+            Some(_) | None => Err(Error::refused(
+                table,
+                RefusalReason::OverBudget {
+                    needed: total.unwrap_or(u64::MAX),
+                    budget,
+                },
+            )),
+        }
     }
 
     /// The bytes chunk files may occupy across every table, from
@@ -349,6 +397,13 @@ impl LocalDir {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The bytes reservations hold. A panic while it was held leaves the
+    /// count whole (an addition or subtraction either happened or did not),
+    /// so poisoning is recovered from rather than propagated.
+    fn lock_reserved(&self) -> MutexGuard<'_, u64> {
+        self.reserved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A temporary file one `write_chunks` call has open, held in
@@ -363,6 +418,20 @@ struct InFlight<'a> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         self.dir.lock_in_flight().remove(&self.path);
+    }
+}
+
+/// Bytes of `index/` that `LocalDir::reserve` holds for one disk-tier
+/// load, released when this drops.
+#[derive(Debug)]
+pub(crate) struct Reservation<'a> {
+    local: &'a LocalDir,
+    bytes: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        *self.local.lock_reserved() -= self.bytes;
     }
 }
 
@@ -431,6 +500,7 @@ fn warn_rejected(path: &Path, rejection: Rejection) {
 mod tests {
 
     use super::*;
+    use crate::generation::testing::{TABLE, local_dir, refusal_of};
     use crate::local::format::{CHUNK_FILE_MAGIC, MAGIC_OFFSET, chunk_name};
     use crate::local::testing::{
         DATA_SIZE, DISK_CACHE_BYTES, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE,
@@ -692,6 +762,43 @@ mod tests {
             local.index_bytes_in_use().unwrap(),
             expected + u64::try_from(LEFTOVER.len()).unwrap()
         );
+    }
+
+    /// Two disk-tier loads that each fit the budget beside what `index/`
+    /// holds, but not together: the second is refused while the first holds
+    /// its reservation, and admitted once the first drops it.
+    #[test]
+    fn test_reserve_refuses_what_fits_alone_but_not_beside_an_outstanding_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (unbounded, stats) = open(dir.path());
+        write(&unbounded);
+        let in_use = unbounded.index_bytes_in_use().unwrap();
+        let one_load = payload_len();
+        let budget = in_use + one_load;
+        let local = local_dir(dir.path(), stats, Some(budget));
+
+        let first = local.reserve(TABLE, one_load).unwrap();
+        assert_eq!(
+            refusal_of(local.reserve(TABLE, one_load)),
+            RefusalReason::OverBudget {
+                needed: in_use + 2 * one_load,
+                budget,
+            }
+        );
+        assert!(
+            local.reserve(TABLE, 0).is_ok(),
+            "the budget is full, not exceeded"
+        );
+        drop(first);
+        let second = local.reserve(TABLE, one_load).unwrap();
+        assert_eq!(
+            refusal_of(local.reserve(TABLE, 1)),
+            RefusalReason::OverBudget {
+                needed: budget + 1,
+                budget,
+            }
+        );
+        drop(second);
     }
 
     #[test]

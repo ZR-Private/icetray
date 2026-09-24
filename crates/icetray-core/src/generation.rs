@@ -21,7 +21,7 @@ use crate::config::{Residency, TableConfig};
 use crate::error::{Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
-use crate::local::{DataFileIdentity, LocalDir};
+use crate::local::{DataFileIdentity, LocalDir, Reservation};
 use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
 use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
@@ -102,9 +102,10 @@ impl Generation {
     /// checks the budget `config` and `local` set before any chunk is
     /// fetched (Full: `config.resident_budget_bytes` against the reused
     /// files' resident bytes plus every new file's predicted full bytes;
-    /// Disk: `local.index_budget()` against the bytes `index/` holds plus
-    /// what every new file would write there; over either is
-    /// `RefusalReason::OverBudget`), then builds the new indexes at the
+    /// Disk: `local.index_budget()` against the bytes `index/` holds, what
+    /// other tables' loads have reserved, and what every new file would
+    /// write there, reserved until the new indexes are built; over either
+    /// is `RefusalReason::OverBudget`), then builds the new indexes at the
     /// same concurrency and assembles the generation: files sorted, overlap
     /// groups found, and every group that gained a file merged to refuse a
     /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
@@ -133,8 +134,10 @@ impl Generation {
                 .await?;
         let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge)?;
         let inspected = inspect_all(table, &layout, pending).await?;
-        check_budget(table, config, local, &reused, &inspected)?;
-        let built = build_all(config.residency, local, inspected).await?;
+        let reservation = check_budget(table, config, local, &reused, &inspected)?;
+        let built = build_all(config.residency, local, inspected).await;
+        drop(reservation);
+        let built = built?;
         let members = reused
             .into_iter()
             .map(|file| Member { file, reused: true })
@@ -462,53 +465,55 @@ async fn build_all(
 /// The budget the residency sets, checked before any key chunk is fetched
 /// (RFD 017). Full: `config.resident_budget_bytes`, against the resident
 /// bytes of the reused files plus the predicted full bytes of every new
-/// one. Disk: `local.index_budget()`, against the bytes `index/` holds
-/// (the reused files' chunk files among them) plus the bytes every new
-/// file would write, which is nothing for a file whose chunk file is
-/// already there. Bloom takes no budget. Over is
-/// `RefusalReason::OverBudget` carrying both numbers. The sums saturate,
+/// one; the budget is the table's alone, and the check holds nothing. Disk:
+/// `local.index_budget()`, shared by every table, reserved through
+/// `LocalDir::reserve` for the bytes every new file would write, which is
+/// nothing for a file whose chunk file is already there, against the bytes
+/// `index/` holds (the reused files' chunk files among them) and every
+/// other load's outstanding reservation. The reservation returned must be
+/// held until the load has finished writing. Bloom takes no budget. Over
+/// is `RefusalReason::OverBudget` carrying both numbers. The sums saturate,
 /// as the predictions they add do: a need that would wrap stays at
 /// `u64::MAX` instead of wrapping to a small number that fits the budget.
-fn check_budget(
+fn check_budget<'a>(
     table: &str,
     config: &TableConfig,
-    local: Option<&LocalDir>,
+    local: Option<&'a LocalDir>,
     reused: &[Arc<LoadedFile>],
     inspected: &[(DataFileEntry, Inspected)],
-) -> Result<()> {
-    let bound = match config.residency {
-        Residency::Full => config.resident_budget_bytes.map(|budget| {
-            let needed = reused
-                .iter()
-                .map(|file| approx::count(file.index.resident_bytes()))
-                .chain(
-                    inspected
-                        .iter()
-                        .map(|(_, inspected)| inspected.predicted().full),
-                )
-                .fold(0, u64::saturating_add);
-            Ok::<_, Error>((budget, needed))
-        }),
-        Residency::Disk => local.and_then(|local| {
-            local.index_budget().map(|budget| {
-                let in_use = local.index_bytes_in_use()?;
+) -> Result<Option<Reservation<'a>>> {
+    match config.residency {
+        Residency::Full => {
+            if let Some(budget) = config.resident_budget_bytes {
+                let needed = reused
+                    .iter()
+                    .map(|file| approx::count(file.index.resident_bytes()))
+                    .chain(
+                        inspected
+                            .iter()
+                            .map(|(_, inspected)| inspected.predicted().full),
+                    )
+                    .fold(0, u64::saturating_add);
+                if needed > budget {
+                    return Err(Error::refused(
+                        table,
+                        RefusalReason::OverBudget { needed, budget },
+                    ));
+                }
+            }
+            Ok(None)
+        }
+        Residency::Disk => match local {
+            Some(local) if local.index_budget().is_some() => {
                 let new = inspected.iter().try_fold(0, |sum: u64, (_, inspected)| {
                     Ok::<_, Error>(sum.saturating_add(inspected.disk_bytes_needed(local)?))
                 })?;
-                Ok((budget, in_use.saturating_add(new)))
-            })
-        }),
-        Residency::Bloom => None,
-    };
-    if let Some((budget, needed)) = bound.transpose()?
-        && needed > budget
-    {
-        return Err(Error::refused(
-            table,
-            RefusalReason::OverBudget { needed, budget },
-        ));
+                local.reserve(table, new).map(Some)
+            }
+            Some(_) | None => Ok(None),
+        },
+        Residency::Bloom => Ok(None),
     }
-    Ok(())
 }
 
 /// Whether the exact key ranges of two files intersect.

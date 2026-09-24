@@ -248,8 +248,9 @@ impl LocalDir {
     /// over every table sharing the directory.
     pub fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64>;
     /// The bytes every file under `index/` occupies, and the bound from
-    /// `LocalConfig::index_budget_bytes`; `generation` compares them at the
-    /// footer stage (RFD 017).
+    /// `LocalConfig::index_budget_bytes`; a crate-internal `reserve` checks
+    /// them with every outstanding reservation and holds a load's bytes
+    /// until it has written (RFD 017).
     pub fn index_bytes_in_use(&self) -> Result<u64>;
     pub fn index_budget(&self) -> Option<u64>;
     /// `None` when `page_cache_disk_bytes` is zero; otherwise a level of at
@@ -603,8 +604,11 @@ impl Generation {
     /// budget is checked at the footer stage, before any key chunk is fetched:
     /// Full compares `config.resident_budget_bytes` with the reused files'
     /// resident bytes plus every new file's predicted full bytes; Disk
-    /// compares `local.index_budget()` with the bytes `index/` holds plus every
-    /// new file's `Inspected::disk_bytes_needed`; Bloom takes none; over is
+    /// compares `local.index_budget()` with the bytes `index/` holds, every
+    /// other load's outstanding reservation, and every new file's
+    /// `Inspected::disk_bytes_needed`, reserving the last until the new
+    /// indexes are built (the budget is shared by every table); Bloom takes
+    /// none; over is
     /// `RefusalReason::OverBudget`. A file is reused from `previous` when its
     /// path and size are unchanged. Overlap groups that gained a file are
     /// verified one at a time, so the load holds one group's key chunks at
