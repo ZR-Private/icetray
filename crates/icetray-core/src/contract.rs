@@ -1,6 +1,9 @@
-//! The serving layout's numbers as named constants (RFD 002, RFD 008). This
-//! module is the one home for every constant another module or crate needs;
-//! none redeclares them.
+//! The serving layout's numbers as named constants (RFD 002, RFD 008): the
+//! page row limit, the value page byte bound, the page cache's disk block,
+//! the target file size, and the key length cap and advice. A constant that
+//! is not a layout number lives with what it bounds and is exported from
+//! there: a key's widths in `key`, the doctor's thresholds in
+//! `check::thresholds`, a configuration default in `config`.
 
 /// Rows per key page and per value page in the served layout. A lookup
 /// decodes one key page and fetches one value page, so the row count sets

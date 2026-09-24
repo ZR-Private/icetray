@@ -75,9 +75,11 @@ Deployers whose pipelines emit JSON hand icetray the file directly, under
 the surface RFD 012 (Deployment contract) defines; nothing in this
 repository converts between the syntaxes.
 
-The envelope is a rule with no artifact behind it yet. Whichever persisted
-thing comes first pays for its reader and writer; anything persisted later
-pays nothing.
+The chunk file of RFD 017 (Residency tiers) is the first artifact under
+the envelope: its magic byte, version byte, and length-prefixed
+`ChunkFileHeader` message are the envelope, and the core crate's chunk
+file format reads and writes them. A later persisted artifact follows the
+same rule under a magic byte of its own.
 
 Open question: whether individual settings may also be set from the
 environment, above the file. For: a container often varies one or two

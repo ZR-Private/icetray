@@ -46,7 +46,7 @@ redefine.
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
-| `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, key length cap and advice, file size target); the one home for every constant another crate needs | 002, 008 |
+| `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, the page cache's disk block, file size target, key length cap and advice); a shared constant that is not a layout number lives with what it bounds (`key`, `check::thresholds`, `config`) | 002, 008 |
 | `config` | the configuration schema and its validation; TOML and JSON parsing; defaults | 011 |
 | `storage` | every byte read from object storage: store per prefix, location rewriting, request counting, credential chain with cached refresh, hedging | 003, 013 |
 | `local` | the optional local directory: chunk files for disk residency (naming by data-file identity, reuse on restart, deletion with the generation), a disk budget, local-read counting, and the `DiskTier` handle `cache` uses for its disk level. A directory module: `local/mod.rs` holds the public surface and `LocalDir`, `local/format.rs` the chunk file format (envelope, header, checks, writer), `local/disk.rs` the read side (`DiskChunks`, `DiskTier`), and `local/testing.rs` the fixtures the three files' tests share | 017, 012 |
