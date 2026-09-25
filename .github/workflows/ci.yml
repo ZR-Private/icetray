@@ -25,11 +25,16 @@ jobs:
       # tag cannot re-point CI at different code. Renovate keeps the SHAs
       # current.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      # rustup is preinstalled on the runner; `rustup show` installs the
-      # toolchain named in rust-toolchain.toml, so CI and every developer
-      # machine run the same compiler and the same clippy.
+      # rustup is preinstalled on the runner. `rustup toolchain install`
+      # with no argument installs the active toolchain, the one
+      # rust-toolchain.toml names, with its components, so CI and every
+      # developer machine run the same compiler and the same clippy. It
+      # installs regardless of rustup's auto-install setting; `rustup show`
+      # installs only through auto-install, which rustup 1.28.0 removed and
+      # a machine can turn off. It runs before the cache action, which keys
+      # on the installed rustc.
       - name: install toolchain
-        run: rustup show
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
@@ -42,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: install toolchain
-        run: rustup show
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
