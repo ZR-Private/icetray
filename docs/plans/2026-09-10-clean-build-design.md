@@ -74,6 +74,10 @@ listed; changing a signature below means updating this document first.
 
 ```rust
 // error
+// Core's `Error` carries iceberg, parquet, and object_store errors as variants, and `Resolved`
+// exposes iceberg's `TableMetadata`, because core has no consumer outside this workspace, which
+// versions its crates together, and the binary matches only on the variants; a consumer of core
+// outside the workspace is what changes that, and library types then come off the public surface.
 pub enum Error {
     Iceberg(#[from] iceberg::Error),
     Parquet(#[from] parquet::errors::ParquetError),
