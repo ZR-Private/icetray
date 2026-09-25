@@ -35,7 +35,7 @@ its residency (RFD 017 (Residency tiers)) requires.
 A cost finding means every answer is right and some lookups do more work,
 so it carries its penalty in one of three units: extra GETs per hit, key
 bytes or rows decoded per lookup, or files probed per lookup. Advice affects
-memory, load time, or tuning, and nothing a lookup returns.
+memory, load time, or tuning, and never makes a lookup's answer wrong.
 
 Placements settled elsewhere:
 
@@ -65,8 +65,8 @@ Placements settled elsewhere:
   same reason (RFD 016).
 - Value pages whose mean uncompressed size is above the lookup's 64 MiB
   value page ceiling (RFD 004) are advice. A lookup into a page over the
-  ceiling is refused with a file fault rather than answered, so no served
-  answer is wrong and no penalty unit prices it; and the trigger is a
+  ceiling is refused with a file fault rather than answered, so no
+  lookup's answer is wrong and no penalty unit prices it; and the trigger is a
   file's mean page size, which can miss one oversized page and can be
   raised above the ceiling by a large value dictionary, so it cannot name
   the lookups refused and does not decide whether the table serves (RFD

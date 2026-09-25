@@ -121,13 +121,13 @@ const DISTINCT_MINS_UNOBSERVABLE: f64 = 1.0;
 
 /// What a finding bears on (RFD 007). `Cost`: every answer is right and
 /// some lookups do more work, with the penalty measured; `Advice`: memory,
-/// load time, or tuning, and nothing a lookup returns. Serde gives the
+/// load time, or tuning, and never a wrong answer. Serde gives the
 /// lowercase name. The derived order puts `Advice` first; the report sorts
 /// by its reverse, costs first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// Tuning the writer could do; serving is unaffected.
+    /// Tuning the writer could do; no lookup's answer is wrong for it.
     Advice,
     /// Served correctly at a measured price per lookup; a refusal when the
     /// table is `strict`.
@@ -394,7 +394,8 @@ impl Finding {
         }
     }
 
-    /// An advice finding: serving is unaffected, so there is no penalty.
+    /// An advice finding: no answer is wrong and no priced work is added,
+    /// so there is no penalty.
     /// Public so a crate that renders findings can build one in its tests;
     /// `cost` is crate-private, since only the diagnosis measures a penalty.
     pub fn advice(
