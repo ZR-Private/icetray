@@ -73,7 +73,7 @@ impl DiskChunks {
             .await
             .map_err(|error| match error.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
-                Err(cancelled) => self.shared.error(LocalFault::Join(cancelled)),
+                Err(canceled) => self.shared.error(LocalFault::Join(canceled)),
             })?
     }
 

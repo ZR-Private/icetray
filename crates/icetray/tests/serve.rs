@@ -751,9 +751,9 @@ async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult
     )
     .expect("a swap sets the swap time");
     assert!(swapped_at > 0.0, "{swapped_at}");
-    assert!(labelled_with(&scrape, metric::LABEL_TABLE) > 0);
+    assert!(labeled_with(&scrape, metric::LABEL_TABLE) > 0);
     assert_eq!(
-        labelled_with(&scrape, SNAPSHOT_ID_LABEL),
+        labeled_with(&scrape, SNAPSHOT_ID_LABEL),
         0,
         "a series per snapshot would grow with every swap"
     );
@@ -766,7 +766,7 @@ const SNAPSHOT_ID_LABEL: &str = "snapshot_id";
 
 /// The sample lines of a Prometheus text exposition whose labels include
 /// `label`.
-fn labelled_with(exposition: &str, label: &str) -> usize {
+fn labeled_with(exposition: &str, label: &str) -> usize {
     exposition
         .lines()
         .filter(|line| !line.starts_with('#'))

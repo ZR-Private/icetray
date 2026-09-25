@@ -71,7 +71,7 @@ pub enum CacheError {
     Fetch(Arc<Error>),
     /// The fetch the cache ran for the caller did not finish within the
     /// fetch deadline of the handle that ran it, so the fetch was dropped,
-    /// and an S3 GET it had open was cancelled with it. Every waiter
+    /// and an S3 GET it had open was canceled with it. Every waiter
     /// coalesced onto that fetch receives this, and nothing is cached for
     /// the page.
     #[error("fetch of {path} at offset {offset} did not finish within {after:?}")]
@@ -281,7 +281,7 @@ impl PageCache {
 
     /// This handle on the same cache and counters, its fetches ending at
     /// `deadline` from their start: past it the fetch future is dropped,
-    /// cancelling an S3 GET it has open, and every caller waiting on it receives
+    /// canceling an S3 GET it has open, and every caller waiting on it receives
     /// `CacheError::FetchDeadline`. A `Table` holds its cache this way,
     /// bounded by `server.get_deadline`.
     pub(crate) fn with_fetch_deadline(self, deadline: Duration) -> Self {

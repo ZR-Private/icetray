@@ -122,10 +122,10 @@ pub enum LocalFault {
         /// The encoded header's length.
         len: usize,
     },
-    /// The blocking task that ran a page read was cancelled: the runtime
+    /// The blocking task that ran a page read was canceled: the runtime
     /// shut down under it. A panic in that task is resumed on the caller
     /// instead, never turned into an error.
-    #[error("page read task was cancelled: {0}")]
+    #[error("page read task was canceled: {0}")]
     Join(tokio::task::JoinError),
 }
 

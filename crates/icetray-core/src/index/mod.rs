@@ -1757,15 +1757,15 @@ mod tests {
                 "row {i}"
             );
             assert_eq!(stats.gets(), before + 1 + extra_gets, "row {i}");
-            let neighbour = i - 1;
+            let neighbor = i - 1;
             let row = index
-                .find(&key_for(neighbour, KeyType::Long), Some(&cache))
+                .find(&key_for(neighbor, KeyType::Long), Some(&cache))
                 .await
                 .unwrap()
                 .unwrap();
             let (value, _) = index.read_value(row, Some(&cache)).await.unwrap();
-            let expected = (!is_null(neighbour)).then(|| value_for(neighbour));
-            assert_eq!(value.as_deref(), expected.as_deref(), "row {neighbour}");
+            let expected = (!is_null(neighbor)).then(|| value_for(neighbor));
+            assert_eq!(value.as_deref(), expected.as_deref(), "row {neighbor}");
         }
     }
 
@@ -1899,7 +1899,7 @@ mod tests {
 
     /// The same check on the lookup path, for the one key page a find
     /// decodes and the one value page a read fetches: a page boundary the
-    /// offset index has shifted by one row is a fault, never a neighbour's
+    /// offset index has shifted by one row is a fault, never a neighbor's
     /// row or value.
     #[tokio::test]
     async fn test_lookup_refuses_a_page_whose_rows_differ_from_its_offset_index() {

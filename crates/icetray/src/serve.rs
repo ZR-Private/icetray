@@ -220,7 +220,7 @@ impl Serving {
     }
 
     /// Completes when the run is ending: a caller asked for `shutdown`, or
-    /// the run failed its first loads and signalled it itself.
+    /// the run failed its first loads and signaled it itself.
     pub async fn stopped(&self) {
         stop(self.shutdown.subscribe()).await;
     }
@@ -452,7 +452,7 @@ impl Run {
         self.fail(ServeError::Periodic { task, source }).await
     }
 
-    /// Ends the run with `error`: the shutdown is signalled, so the servers
+    /// Ends the run with `error`: the shutdown is signaled, so the servers
     /// and the readiness listener stop, and the drain's own failure is
     /// logged, since `error` is the outcome that names the cause.
     async fn fail(self, error: ServeError) -> Result<(), ServeError> {

@@ -1363,7 +1363,7 @@ mod tests {
             let found: Vec<&DebugValue> = self
                 .0
                 .iter()
-                .filter(|(key, ..)| labelled(key.key(), name, labels))
+                .filter(|(key, ..)| labeled(key.key(), name, labels))
                 .map(|(.., value)| value)
                 .collect();
             assert_eq!(found.len(), 1, "{name} {labels:?}");
@@ -1385,7 +1385,7 @@ mod tests {
         }
 
         /// The series, of any name, that carry `label`.
-        fn labelled_with(&self, label: &str) -> usize {
+        fn labeled_with(&self, label: &str) -> usize {
             self.0
                 .iter()
                 .filter(|(key, ..)| key.key().labels().any(|have| have.key() == label))
@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     /// Whether `key` is `name` with exactly `labels`.
-    fn labelled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
+    fn labeled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
         key.name() == name
             && key.labels().count() == labels.len()
             && labels.iter().all(|(label, value)| {
@@ -1476,8 +1476,8 @@ mod tests {
             (started..=time::unix_seconds(time::now())).contains(&swapped_at),
             "{swapped_at} is not between the test's start and now"
         );
-        assert!(series.labelled_with(metric::LABEL_TABLE) > 0);
-        assert_eq!(series.labelled_with(LABEL_SNAPSHOT_ID), 0);
+        assert!(series.labeled_with(metric::LABEL_TABLE) > 0);
+        assert_eq!(series.labeled_with(LABEL_SNAPSHOT_ID), 0);
         assert_eq!(
             series.counter(
                 metric::REFRESH_ERRORS_TOTAL,

@@ -211,7 +211,7 @@ async fn fetch_verified(
 
 /// Every key column chunk in one `read_ranges` call: one load GET per row
 /// group. Each chunk is copied out of the buffer the store returned: a
-/// store may serve neighbouring ranges from one fetch and hand back slices
+/// store may serve neighboring ranges from one fetch and hand back slices
 /// of it, and a slice keeps the whole fetch alive, so the bytes held would
 /// exceed the chunks by whatever lay between them. The copy is paid once at
 /// load.

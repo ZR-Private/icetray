@@ -174,7 +174,7 @@ pub enum ServeError {
         /// The deadline that passed.
         after: Duration,
     },
-    /// The run task itself panicked or was cancelled.
+    /// The run task itself panicked or was canceled.
     #[error("task: {0}")]
     Join(#[from] tokio::task::JoinError),
     /// A periodic task panicked before the shutdown aborted it; nothing else

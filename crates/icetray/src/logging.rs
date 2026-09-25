@@ -238,7 +238,7 @@ pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
         .with(layer)
         .try_init()
     {
-        tracing::warn!(%error, "logging was already initialised; keeping the installed subscriber");
+        tracing::warn!(%error, "logging was already initialized; keeping the installed subscriber");
     }
 }
 

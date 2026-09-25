@@ -364,7 +364,7 @@ impl Storage {
     }
 
     /// Reads several byte ranges of one object in one call to the store.
-    /// One load GET per range: the store may coalesce neighbouring ranges on
+    /// One load GET per range: the store may coalesce neighboring ranges on
     /// the wire, and RFD 003 states its promises in logical GETs, for which
     /// this count is exact.
     pub(crate) async fn read_ranges(

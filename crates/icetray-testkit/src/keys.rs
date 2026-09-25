@@ -62,7 +62,7 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
 /// The multiplier that spreads a key's seed before the xorshift stream
-/// starts: the golden ratio's fractional bits, so neighbouring keys start
+/// starts: the golden ratio's fractional bits, so neighboring keys start
 /// far apart.
 const SEED_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -200,7 +200,7 @@ pub fn value_for(key: &Key) -> Vec<u8> {
 
 /// The `len`-byte value stored for `key` in a table with values of that
 /// length: a xorshift64 stream seeded from the key (a long's bits, or
-/// FNV-1a over the key's bytes), deterministic, distinct for neighbouring
+/// FNV-1a over the key's bytes), deterministic, distinct for neighboring
 /// keys, and incompressible, so a fixture of `n` rows occupies about
 /// `n * len` bytes on disk after zstd.
 pub fn value_for_len(key: &Key, len: usize) -> Vec<u8> {
@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_for_is_deterministic_and_distinct_for_neighbours() {
+    fn test_value_for_is_deterministic_and_distinct_for_neighbors() {
         for key_type in KeyType::ALL {
             for id in SAMPLE_IDS {
                 let key = key_at(id, key_type);

@@ -1000,7 +1000,7 @@ pub(crate) mod testing {
     /// Bytes per value where a fixture does not say.
     pub(crate) const VALUE_BYTES: usize = 32;
     /// The mixers that make a value a function of its key or row and of the
-    /// byte's position, distinct for neighbouring keys: two small primes and
+    /// byte's position, distinct for neighboring keys: two small primes and
     /// a prime modulus under 256, so every byte is in range.
     const VALUE_KEY_MIX: i64 = 31;
     const VALUE_BYTE_MIX: i64 = 7;
@@ -1039,7 +1039,7 @@ pub(crate) mod testing {
         value_of_len(key, VALUE_BYTES)
     }
 
-    /// `len` bytes that are a function of `mix`, distinct for neighbouring
+    /// `len` bytes that are a function of `mix`, distinct for neighboring
     /// mixes.
     pub(crate) fn value_of_len(mix: i64, len: usize) -> Vec<u8> {
         (0..len)

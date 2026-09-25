@@ -157,7 +157,7 @@ async fn daemon(config: Config) -> Result<ExitCode, CliError> {
     let handle = telemetry::install()?;
     let serving = Serving::start(config, handle, ServeOptions::default()).await?;
     tokio::select! {
-        () = signalled() => tracing::info!("draining"),
+        () = signaled() => tracing::info!("draining"),
         () = serving.stopped() => {}
     }
     serving.shutdown();
@@ -167,7 +167,7 @@ async fn daemon(config: Config) -> Result<ExitCode, CliError> {
 
 /// Completes on SIGTERM or SIGINT. A signal the runtime cannot listen for
 /// is logged, and the daemon then waits for the other.
-async fn signalled() {
+async fn signaled() {
     let terminate = async {
         match signal(SignalKind::terminate()) {
             Ok(mut terminate) => {

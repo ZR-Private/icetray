@@ -302,7 +302,7 @@ pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Op
     let (line, value) = exposition.lines().find_map(|line| {
         let rest = line.strip_prefix(name)?;
         let (label_text, value) = match rest.strip_prefix('{') {
-            Some(labelled) => labelled.split_once('}')?,
+            Some(labeled) => labeled.split_once('}')?,
             None => ("", rest.strip_prefix(' ')?),
         };
         let present: Vec<(&str, &str)> = label_text
@@ -335,8 +335,8 @@ mod tests {
     const RSS: f64 = 12_345.0;
     const AGE: f64 = 2.5;
 
-    /// A scrape as the exporter renders it: a comment line, labelled
-    /// counters, a two-label gauge, and an unlabelled gauge.
+    /// A scrape as the exporter renders it: a comment line, labeled
+    /// counters, a two-label gauge, and an unlabeled gauge.
     fn exposition() -> String {
         format!(
             "# TYPE requests_total counter

@@ -170,9 +170,9 @@ impl hyper::rt::Read for TurmoilConnection {
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // SAFETY: the cursor hands out uninitialised memory. tokio's `ReadBuf`
-        // tracks how many of those bytes the read initialised and filled, and
-        // only that many are advanced below, so no uninitialised byte is ever
+        // SAFETY: the cursor hands out uninitialized memory. tokio's `ReadBuf`
+        // tracks how many of those bytes the read initialized and filled, and
+        // only that many are advanced below, so no uninitialized byte is ever
         // exposed as read data.
         let mut read_buf = tokio::io::ReadBuf::uninit(unsafe { buf.as_mut() });
         let filled = match tokio::io::AsyncRead::poll_read(self.project().io, cx, &mut read_buf) {
@@ -180,7 +180,7 @@ impl hyper::rt::Read for TurmoilConnection {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         };
-        // SAFETY: `filled` counts bytes the read above initialised.
+        // SAFETY: `filled` counts bytes the read above initialized.
         unsafe { buf.advance(filled) };
         Poll::Ready(Ok(()))
     }
