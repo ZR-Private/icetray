@@ -12,6 +12,10 @@ rustup.pkg-path = "rustup"
 colima.pkg-path = "colima"
 docker-client.pkg-path = "docker-client"
 docker-compose.pkg-path = "docker-compose"
+# The performance sweep: samply profiles the benchmark program
+# (crates/icetray-testkit/examples), ghz drives the gRPC server under load.
+samply.pkg-path = "samply"
+ghz.pkg-path = "ghz"
 
 [options]
 systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]

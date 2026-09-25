@@ -12,8 +12,14 @@
       "docker-compose": {
         "pkg-path": "docker-compose"
       },
+      "ghz": {
+        "pkg-path": "ghz"
+      },
       "rustup": {
         "pkg-path": "rustup"
+      },
+      "samply": {
+        "pkg-path": "samply"
       }
     },
     "hook": {
@@ -35,13 +41,13 @@
       "description": "Container runtimes with minimal setup",
       "install_id": "colima",
       "license": "MIT",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "colima-0.10.3",
       "pname": "colima",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:02:13.264229Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:58:08.069434Z",
       "stabilities": [
         "unstable"
       ],
@@ -64,13 +70,13 @@
       "description": "Container runtimes with minimal setup",
       "install_id": "colima",
       "license": "MIT",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "colima-0.10.3",
       "pname": "colima",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:37:23.310096Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:30:08.939280Z",
       "stabilities": [
         "unstable"
       ],
@@ -93,13 +99,13 @@
       "description": "Container runtimes with minimal setup",
       "install_id": "colima",
       "license": "MIT",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "colima-0.10.3",
       "pname": "colima",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T06:16:42.732727Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:07:16.410955Z",
       "stabilities": [
         "unstable"
       ],
@@ -122,13 +128,13 @@
       "description": "Open source project to pack, ship and run any application as a lightweight container",
       "install_id": "docker-client",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-29.8.0",
       "pname": "docker-client",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:02:13.520773Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:58:08.321204Z",
       "stabilities": [
         "unstable"
       ],
@@ -151,13 +157,13 @@
       "description": "Open source project to pack, ship and run any application as a lightweight container",
       "install_id": "docker-client",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-29.8.0",
       "pname": "docker-client",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:37:23.716697Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:30:09.326751Z",
       "stabilities": [
         "unstable"
       ],
@@ -180,13 +186,13 @@
       "description": "Open source project to pack, ship and run any application as a lightweight container",
       "install_id": "docker-client",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-29.8.0",
       "pname": "docker-client",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T06:16:43.154498Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:07:16.848358Z",
       "stabilities": [
         "unstable"
       ],
@@ -209,13 +215,13 @@
       "description": "Docker CLI plugin to define and run multi-container applications with Docker",
       "install_id": "docker-compose",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-compose-5.5.1",
       "pname": "docker-compose",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:02:13.521309Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:58:08.321642Z",
       "stabilities": [
         "unstable"
       ],
@@ -238,13 +244,13 @@
       "description": "Docker CLI plugin to define and run multi-container applications with Docker",
       "install_id": "docker-compose",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-compose-5.5.1",
       "pname": "docker-compose",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:37:23.717224Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:30:09.327281Z",
       "stabilities": [
         "unstable"
       ],
@@ -267,13 +273,13 @@
       "description": "Docker CLI plugin to define and run multi-container applications with Docker",
       "install_id": "docker-compose",
       "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "docker-compose-5.5.1",
       "pname": "docker-compose",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T06:16:43.155050Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:07:16.848895Z",
       "stabilities": [
         "unstable"
       ],
@@ -290,19 +296,106 @@
       "priority": 5
     },
     {
+      "attr_path": "ghz",
+      "broken": false,
+      "derivation": "/nix/store/6rmraa92vpc1y7bymj8rnd3p7vqcim70-ghz-0.121.0.drv",
+      "description": "Simple gRPC benchmarking and load testing tool",
+      "install_id": "ghz",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "ghz-0.121.0",
+      "pname": "ghz",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:58:08.911522Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.121.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/96pkb37cywzcwmr5mv3h2dnvmflq4rd1-ghz-0.121.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "ghz",
+      "broken": false,
+      "derivation": "/nix/store/bg3ycj68kxmgrmjqw6ygwb2ly46l16yw-ghz-0.121.0.drv",
+      "description": "Simple gRPC benchmarking and load testing tool",
+      "install_id": "ghz",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "ghz-0.121.0",
+      "pname": "ghz",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:30:10.301596Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.121.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/gmcd3v33314jdxd44p8dk5bn87r3k3lg-ghz-0.121.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "ghz",
+      "broken": false,
+      "derivation": "/nix/store/7dsfm8j4i80xwkml7hykr21j2f8fhhn9-ghz-0.121.0.drv",
+      "description": "Simple gRPC benchmarking and load testing tool",
+      "install_id": "ghz",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "ghz-0.121.0",
+      "pname": "ghz",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:07:17.876788Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.121.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/a25zzm41w9yk98a4gn4dc72yimzwgagg-ghz-0.121.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
       "attr_path": "rustup",
       "broken": false,
       "derivation": "/nix/store/giys4s2xxxknf28ki87gh560m834yg6p-rustup-1.29.0.drv",
       "description": "Rust toolchain installer",
       "install_id": "rustup",
       "license": "[ Apache-2.0, MIT ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "rustup-1.29.0",
       "pname": "rustup",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:03:53.482429Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:59:46.889170Z",
       "stabilities": [
         "unstable"
       ],
@@ -325,13 +418,13 @@
       "description": "Rust toolchain installer",
       "install_id": "rustup",
       "license": "[ Apache-2.0, MIT ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "rustup-1.29.0",
       "pname": "rustup",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T05:39:33.752983Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:32:21.888793Z",
       "stabilities": [
         "unstable"
       ],
@@ -354,13 +447,13 @@
       "description": "Rust toolchain installer",
       "install_id": "rustup",
       "license": "[ Apache-2.0, MIT ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=eaad089433ca2bb662274377d33df3d0e51ef28b",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
       "name": "rustup-1.29.0",
       "pname": "rustup",
-      "rev": "eaad089433ca2bb662274377d33df3d0e51ef28b",
-      "rev_count": 1072397,
-      "rev_date": "2026-09-11T18:00:29Z",
-      "scrape_date": "2026-09-13T06:19:00.819380Z",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:09:34.600490Z",
       "stabilities": [
         "unstable"
       ],
@@ -371,6 +464,93 @@
       ],
       "outputs": {
         "out": "/nix/store/yfb4m0ppkap16a2isbfaxqn4kgy0xz4r-rustup-1.29.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "samply",
+      "broken": false,
+      "derivation": "/nix/store/pqa2w45kqw8wlycxx3q2wczaw6fv0skv-samply-0.13.1.drv",
+      "description": "Command line profiler for macOS and Linux",
+      "install_id": "samply",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "samply-0.13.1",
+      "pname": "samply",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:59:47.196931Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.13.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/cywm118vdba04pnhkfij3h75dhcpfpah-samply-0.13.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "samply",
+      "broken": false,
+      "derivation": "/nix/store/1m0gv9jaznqssmyb4jjxg1hpqjky1c2z-samply-0.13.1.drv",
+      "description": "Command line profiler for macOS and Linux",
+      "install_id": "samply",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "samply-0.13.1",
+      "pname": "samply",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:32:22.309285Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.13.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/23aw34qhdvl3anlp8jwrz1af699j9v5g-samply-0.13.1"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "samply",
+      "broken": false,
+      "derivation": "/nix/store/5p7hlg1s70hwfjy6dkhyfcqrvbzazx70-samply-0.13.1.drv",
+      "description": "Command line profiler for macOS and Linux",
+      "install_id": "samply",
+      "license": "[ Apache-2.0, MIT ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "samply-0.13.1",
+      "pname": "samply",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:09:35.074760Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.13.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/6l4ccqzdvkfxrbzx3gba0ph41hg6dhvy-samply-0.13.1"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
