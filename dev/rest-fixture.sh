@@ -14,7 +14,11 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 NAME=icetray-rest
-IMAGE=apache/iceberg-rest-fixture:latest
+# A release tag rather than `latest`, which is rebuilt from Iceberg's main
+# branch, so the catalog under test is a release and moves when this line
+# does. 1.10.1 is the newest release published as a fixture image; Iceberg
+# 1.11.0 has none.
+IMAGE=apache/iceberg-rest-fixture:1.10.1
 
 case "${1:-}" in
 up)

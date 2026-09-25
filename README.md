@@ -446,6 +446,7 @@ cargo run -p icetray-testkit --example scale --release
 Spark nor a Java runtime; the recipe itself runs anywhere Spark 4.1 has the
 Iceberg runtime on its classpath and can write to any object store or local
 directory. Spark 4.1 is the newest line Iceberg 1.11 ships a runtime for.
+The REST suite runs against the `apache/iceberg-rest-fixture:1.10.1` image.
 The recipe is also the worked example of the contract: the properties it
 sets are the ones a table owner sets.
 
