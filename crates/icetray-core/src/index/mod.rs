@@ -41,7 +41,7 @@ use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_on
 pub use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
 use page_header::check_value_page_headers;
-pub use page_header::{ChunkPage, HeaderField, PageHeaderFault, WireType};
+pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
 
 /// A row's position in a file: its row group and its row within that group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

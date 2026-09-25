@@ -63,6 +63,14 @@ Placements settled elsewhere:
   would cost tens of nanoseconds per row, seconds to minutes on a large
   table, so the doctor hashes every key and refuses such a file under the
   same reason (RFD 016).
+- Value pages whose mean uncompressed size is above the lookup's 64 MiB
+  value page ceiling (RFD 004) are advice. A lookup into a page over the
+  ceiling is refused with a file fault rather than answered, so no served
+  answer is wrong and no penalty unit prices it; and the trigger is a
+  file's mean page size, which can miss one oversized page and can be
+  raised above the ceiling by a large value dictionary, so it cannot name
+  the lookups refused and does not decide whether the table serves (RFD
+  016).
 - A value column that is not binary, fixed, or string is refused because
   the wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)), so a typed column has no defined encoding and any answer

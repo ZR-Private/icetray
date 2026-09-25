@@ -57,6 +57,13 @@ pub mod thresholds {
     /// which makes it 1 MiB.
     pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16;
 
+    /// Mean uncompressed value page bytes above which
+    /// `value_pages_over_ceiling` is advice: the lookup's own ceiling on a
+    /// value page's declared size, 64 MiB, held where the lookup enforces
+    /// it and not redeclared here, so the finding and the refusal it warns
+    /// of cannot drift apart.
+    pub use crate::index::MOST_VALUE_PAGE_BYTES;
+
     /// Data file bytes above which `large_file` is advice: twice
     /// `contract::TARGET_FILE_BYTES_MAX`. First-byte latency of a range GET
     /// is three to four times higher on objects of 256 MiB and above than
@@ -204,6 +211,11 @@ pub enum FindingCode {
     ColumnIndexTruncated,
     /// The mean uncompressed value page is above the advice threshold.
     LargeValuePages,
+    /// The mean uncompressed value page is above
+    /// `thresholds::MOST_VALUE_PAGE_BYTES`, the most a value page a lookup
+    /// reads may declare; a lookup into a page over it is refused with a
+    /// file fault.
+    ValuePagesOverCeiling,
     /// A key is longer than `contract::KEY_BYTES_ADVICE`.
     LongKeys,
     /// A data file is larger than the advice threshold.
@@ -227,7 +239,7 @@ impl FindingCode {
     /// admitted generation, so a code the generation does not raise reads
     /// zero. Complete: a successor match over every variant, which a new
     /// variant fails to compile, is compared to this list in tests.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
@@ -235,6 +247,7 @@ impl FindingCode {
         Self::BoundsMissing,
         Self::ColumnIndexTruncated,
         Self::LargeValuePages,
+        Self::ValuePagesOverCeiling,
         Self::LongKeys,
         Self::LargeFile,
         Self::ManyFilesPerBucket,
@@ -254,6 +267,7 @@ impl fmt::Display for FindingCode {
             Self::BoundsMissing => "bounds_missing",
             Self::ColumnIndexTruncated => "column_index_truncated",
             Self::LargeValuePages => "large_value_pages",
+            Self::ValuePagesOverCeiling => "value_pages_over_ceiling",
             Self::LongKeys => "long_keys",
             Self::LargeFile => "large_file",
             Self::ManyFilesPerBucket => "many_files_per_bucket",
@@ -455,7 +469,10 @@ pub struct FileReport {
     /// The length in bytes of the longest key.
     pub max_key_bytes: usize,
     /// Mean uncompressed bytes of a value page, the value column's
-    /// uncompressed chunk bytes over its pages: what a hit decompresses.
+    /// uncompressed chunk bytes over its data pages: what a hit
+    /// decompresses. A dictionary page's bytes are counted in: the footer
+    /// gives its compressed extent and no uncompressed size, so taking them
+    /// out would take a read of its header.
     pub avg_value_page_bytes: u64,
     /// Mean uncompressed bytes of one value, the value column's
     /// uncompressed chunk bytes over the file's rows. Against
@@ -889,7 +906,8 @@ fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 }
 
 /// The per-file advice apart from the bloom filter: bounds, column index,
-/// value pages, key length, file size. The one `f64` comparison is on
+/// value pages (over the advice line, and over the lookup's ceiling), key
+/// length, file size. The one `f64` comparison is on
 /// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
 /// a zero denominator), so a plain comparison is total.
 fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
@@ -930,6 +948,20 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut 
                 size = WriterProperty::PageSizeBytes,
                 bound = contract::VALUE_PAGE_BYTES,
                 check = WriterProperty::RowGroupCheckRecordCount,
+            ),
+            Some(WriterProperty::PageSizeBytes),
+        ));
+    }
+    if report.avg_value_page_bytes > thresholds::MOST_VALUE_PAGE_BYTES {
+        findings.push(Finding::advice(
+            FindingCode::ValuePagesOverCeiling,
+            Some(&report.path),
+            format!(
+                "value pages decompress to {bytes} bytes each on average, above the {ceiling}-byte ceiling on a value page a lookup reads; a lookup into a value page above it is refused with a file fault, so its keys are not served. The trigger is the mean of the value column's uncompressed bytes over its data pages, the dictionary page's bytes included: it can miss one oversized page among smaller ones, and a large value dictionary can raise it above the ceiling when no page is ({size}={bound})",
+                bytes = report.avg_value_page_bytes,
+                ceiling = thresholds::MOST_VALUE_PAGE_BYTES,
+                size = WriterProperty::PageSizeBytes,
+                bound = contract::VALUE_PAGE_BYTES,
             ),
             Some(WriterProperty::PageSizeBytes),
         ));
@@ -1112,14 +1144,16 @@ mod tests {
 
     use super::thresholds::{
         BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, VALUE_PAGE_ADVICE_FACTOR,
-        VALUE_PAGE_BYTES_ADVICE,
+        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, MOST_VALUE_PAGE_BYTES,
+        VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
+    use crate::error::Error;
     use crate::generation::testing::{
         self, Bloom, Bounds, Dictionary, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
         FileSpec, KEY_STEP, TABLE, TWO, Table, WriterLayout,
     };
+    use crate::index::{FileFault, HeaderField};
     use crate::local::LocalDir;
     use crate::manifest::testing::{
         KEY_COLUMN, Partition, VALUE_COLUMN, bucket_spec, unpartitioned,
@@ -1141,6 +1175,12 @@ mod tests {
     /// make one page of `LARGE_VALUE_PAGE_FACTOR` times the advice threshold.
     const LARGE_VALUE_BYTES: u64 =
         LARGE_VALUE_PAGE_FACTOR * VALUE_PAGE_BYTES_ADVICE / FILE_KEYS.unsigned_abs();
+    /// Bytes per value of the over-ceiling fixture: `FILE_KEYS` of them
+    /// make one page just over `MOST_VALUE_PAGE_BYTES`.
+    const OVER_CEILING_VALUE_BYTES: u64 = MOST_VALUE_PAGE_BYTES / FILE_KEYS.unsigned_abs() + 1;
+    /// The over-ceiling fixture's column index truncation: its one page's
+    /// minimum and maximum would otherwise be two whole values of megabytes.
+    const OVER_CEILING_INDEX_TRUNCATE: usize = 16;
     /// The length of the long-key fixture's keys, just above the advice
     /// length.
     const LONG_KEY_BYTES: usize = contract::KEY_BYTES_ADVICE + 1;
@@ -1223,6 +1263,10 @@ mod tests {
         (FindingCode::BoundsMissing, "bounds_missing"),
         (FindingCode::ColumnIndexTruncated, "column_index_truncated"),
         (FindingCode::LargeValuePages, "large_value_pages"),
+        (
+            FindingCode::ValuePagesOverCeiling,
+            "value_pages_over_ceiling",
+        ),
         (FindingCode::LongKeys, "long_keys"),
         (FindingCode::LargeFile, "large_file"),
         (FindingCode::ManyFilesPerBucket, "many_files_per_bucket"),
@@ -1459,7 +1503,8 @@ mod tests {
             FindingCode::OverlappingFiles => Some(FindingCode::BoundsMissing),
             FindingCode::BoundsMissing => Some(FindingCode::ColumnIndexTruncated),
             FindingCode::ColumnIndexTruncated => Some(FindingCode::LargeValuePages),
-            FindingCode::LargeValuePages => Some(FindingCode::LongKeys),
+            FindingCode::LargeValuePages => Some(FindingCode::ValuePagesOverCeiling),
+            FindingCode::ValuePagesOverCeiling => Some(FindingCode::LongKeys),
             FindingCode::LongKeys => Some(FindingCode::LargeFile),
             FindingCode::LargeFile => Some(FindingCode::ManyFilesPerBucket),
             FindingCode::ManyFilesPerBucket => Some(FindingCode::NoBloomFilter),
@@ -1967,6 +2012,67 @@ mod tests {
         );
         assert_eq!(report.files[0].value_pages, 1);
         assert!(report.files[0].avg_value_page_bytes > VALUE_PAGE_BYTES_ADVICE);
+    }
+
+    /// A value page just over the lookup ceiling draws `value_pages_over_ceiling`
+    /// beside `large_value_pages`, and a lookup into it is refused with the
+    /// file fault the message names.
+    #[tokio::test]
+    async fn test_diagnose_value_pages_over_the_lookup_ceiling_is_advice() {
+        let mut table = Table::bucketed(ONE);
+        let keys = testing::long_keys(&testing::keys_from(0, FILE_KEYS));
+        let layout = WriterLayout {
+            column_index_truncate: Some(OVER_CEILING_INDEX_TRUNCATE),
+            ..WriterLayout::contract()
+        };
+        table
+            .add_file(FileSpec {
+                values: values_of_len(keys.len(), approx::length(OVER_CEILING_VALUE_BYTES)),
+                ..file("f", &keys, Partition::Bucket(0), layout)
+            })
+            .await;
+        let generation = load(&mut table, Residency::Full, None).await;
+        let report = diagnose(&generation);
+        let path = Some(table.path_of("f"));
+        assert_findings(
+            &report,
+            &[
+                (
+                    FindingCode::LargeValuePages,
+                    Tier::Advice,
+                    None,
+                    Some(WriterProperty::PageSizeBytes),
+                    path.clone(),
+                ),
+                (
+                    FindingCode::ValuePagesOverCeiling,
+                    Tier::Advice,
+                    None,
+                    Some(WriterProperty::PageSizeBytes),
+                    path,
+                ),
+            ],
+        );
+        assert_eq!(report.files[0].value_pages, 1);
+        assert!(report.files[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
+        let error = generation
+            .lookup(&keys[0], &testing::cache().await)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::File {
+                    fault: FileFault::PageHeaderOverBound {
+                        field: HeaderField::UncompressedPageSize,
+                        allowed: MOST_VALUE_PAGE_BYTES,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

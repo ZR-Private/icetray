@@ -19,11 +19,12 @@ use icetray_core::approx;
 use icetray_core::check::Tier;
 use icetray_core::check::thresholds::{
     BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-    FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST,
+    FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, MOST_VALUE_PAGE_BYTES,
 };
 use icetray_core::config::Residency;
 use icetray_core::{
-    Error, Finding, FindingCode, KeyType, Serviceability, TableReport, Value, diagnose,
+    Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Serviceability, TableReport,
+    Value, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -65,6 +66,20 @@ const SHARED_PREFIX_PAD: usize = 64;
 /// rows per bucket), so one shared cut minimum in three is well below the
 /// advice ratio.
 const SMALL_PAGE_ROWS: usize = 100;
+
+/// Rows of the over-ceiling fixture, all in one value page: enough that
+/// the key filter, sized to them, draws no bloom advice of its own.
+const OVER_CEILING_ROWS: u64 = 16;
+
+/// Bytes per value of the over-ceiling fixture: `OVER_CEILING_ROWS` of them
+/// make one value page just over `MOST_VALUE_PAGE_BYTES`.
+const OVER_CEILING_VALUE_BYTES: u64 = MOST_VALUE_PAGE_BYTES / OVER_CEILING_ROWS + 1;
+
+/// The over-ceiling fixture cuts its statistics and column index to this
+/// many bytes, so the value column's page minimum and maximum, each a
+/// whole value of megabytes otherwise, stay small in the footer. The key
+/// is a long, whose statistics no length cuts, so its bounds stay exact.
+const OVER_CEILING_TRUNCATE: usize = 16;
 
 /// Rows of the large-file fixture, at `WIDE_VALUE_BYTES` of incompressible
 /// value each: 9,000 rows is 140.6 MiB, ten percent over `FILE_BYTES_ADVICE`
@@ -362,6 +377,67 @@ async fn test_large_value_pages_is_advice() -> Result<()> {
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
     let report = diagnose(&served.current());
     assert_codes(&report, &[], &[FindingCode::LargeValuePages]);
+    Ok(())
+}
+
+/// One value page just over the lookup's ceiling, written by the Iceberg
+/// writer as one file of incompressible values: the doctor advises on it
+/// beside `large_value_pages`, `strict` still loads it, and a lookup into
+/// the page is refused with the file fault the finding's message names.
+#[tokio::test]
+async fn test_value_pages_over_ceiling_is_advice() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: 0..OVER_CEILING_ROWS,
+        buckets: ONE_BUCKET,
+        value_bytes: approx::length(OVER_CEILING_VALUE_BYTES),
+        layout: Layout {
+            statistics: Statistics::Truncated(OVER_CEILING_TRUNCATE),
+            column_index_truncate: Some(OVER_CEILING_TRUNCATE),
+            ..Layout::contract()
+        },
+        ..FixtureSpec::small("kv_ceilingpages", KeyType::Long)
+    };
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
+    let report = diagnose(&served.current());
+    assert_codes(
+        &report,
+        &[],
+        &[
+            FindingCode::LargeValuePages,
+            FindingCode::ValuePagesOverCeiling,
+        ],
+    );
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].value_pages, 1);
+    assert!(report.files[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
+    assert_eq!(
+        finding(&report, FindingCode::ValuePagesOverCeiling).property(),
+        Some(WriterProperty::PageSizeBytes)
+    );
+    let error = served
+        .table
+        .get(&fixture.key(0))
+        .await
+        .expect_err("the value page is over the ceiling");
+    assert!(
+        matches!(
+            error,
+            Error::File {
+                fault: FileFault::PageHeaderOverBound {
+                    field: HeaderField::UncompressedPageSize,
+                    allowed: MOST_VALUE_PAGE_BYTES,
+                    ..
+                },
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "an advice-only table loads under strict"
+    );
     Ok(())
 }
 

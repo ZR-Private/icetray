@@ -546,6 +546,10 @@ pub enum HeaderField { PageType, UncompressedPageSize, CompressedPageSize, DataP
 pub enum PageHeaderFault { Truncated, VarintTooLong, OutOfRange, FieldIdOverflow, UnknownWireType(u8), WireTypeMismatch { field: i16, wire: WireType }, Unskippable(WireType), TooDeep, Missing(HeaderField), Negative(HeaderField), UnknownPageType(i32), UnexpectedPageType(parquet::basic::PageType) }
 /// The Thrift compact protocol's wire types, by their codes.
 pub enum WireType { BoolTrue, BoolFalse, Byte, I16, I32, I64, Double, Binary, List, Set, Map, Struct }
+/// The most uncompressed bytes a value page (data, v2 data, or dictionary) a lookup reads may
+/// declare: 64 MiB, sixteen times the 4 MiB message a tonic client accepts by default. Public so
+/// `check::thresholds` re-exports it as the trigger of `value_pages_over_ceiling`.
+pub const MOST_VALUE_PAGE_BYTES: u64;
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 /// `disk_bytes` is the whole chunk file the Disk tier writes (envelope, header, key chunks), the
 /// figure `index_budget_bytes` is charged; `key_chunk_bytes` and `filter_bytes` are the parts the
@@ -855,11 +859,11 @@ impl Table {
 pub enum Tier { Advice, Cost }
 pub enum Serviceability { Efficient, Inefficient }
 pub struct Penalty { pub extra_gets_per_hit: Option<u32>, pub keys_decoded_per_lookup: Option<i64>, pub files_probed_per_lookup: Option<usize> }
-pub enum FindingCode { DictionaryEncodedValue, LargeKeyPages, NoBucketPartition, OverlappingFiles, BoundsMissing, ColumnIndexTruncated, LargeValuePages, LongKeys, LargeFile, ManyFilesPerBucket, NoBloomFilter, BloomOversized, BloomUndersized }
+pub enum FindingCode { DictionaryEncodedValue, LargeKeyPages, NoBucketPartition, OverlappingFiles, BoundsMissing, ColumnIndexTruncated, LargeValuePages, ValuePagesOverCeiling, LongKeys, LargeFile, ManyFilesPerBucket, NoBloomFilter, BloomOversized, BloomUndersized }
 impl FindingCode {
     /// Every code in finding-table order, for the `findings` gauge, which `table` sets for every
     /// code on every admitted generation, zero for the absent ones; a test proves it complete.
-    pub const ALL: [FindingCode; 13];
+    pub const ALL: [FindingCode; 14];
 }
 /// Writer properties the doctor names; Display gives the property string.
 /// The per-column ones (`MetricsColumn`, `BloomFilterEnabled`,
@@ -885,7 +889,7 @@ pub struct TableSummary { pub table: String, pub snapshot_id: SnapshotId, pub se
 pub struct TableReport { pub summary: TableSummary, pub findings: Vec<Finding>, pub files: Vec<FileReport> }
 pub fn diagnose(g: &Generation) -> TableReport;
 /// The thresholds, in one place, each with the analysis section that set it.
-pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16; pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES /* 1 MiB: where a page's transfer reaches the order of a round trip; the cost below it is linear and small */; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; }
+pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16; pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES /* 1 MiB: where a page's transfer reaches the order of a round trip; the cost below it is linear and small */; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; pub use crate::index::MOST_VALUE_PAGE_BYTES /* re-exported, not redeclared: the lookup's value page ceiling is the trigger of `value_pages_over_ceiling` */; }
 
 // contract (the layout's numbers; every other crate imports these, none redeclares them)
 pub const PAGE_ROWS: i64 = 1_000;
@@ -967,6 +971,7 @@ form of the `FindingCode` variant; code never compares these strings:
 | `bounds_missing` | Advice | manifest lacks key bounds, or its bounds are shorter than the file's exact first or last key | | `write.metadata.metrics.column.<key>` |
 | `column_index_truncated` | Advice | distinct page minimums ratio below threshold | | `parquet.columnindex.truncate.length` |
 | `large_value_pages` | Advice | mean uncompressed value page above 1 MiB (`FileReport::avg_value_bytes` beside it says how many values a hit fetches for one; reported, not thresholded) | | `write.parquet.page-size-bytes` and the row-group-check properties |
+| `value_pages_over_ceiling` | Advice | mean uncompressed value page above `MOST_VALUE_PAGE_BYTES` (64 MiB), the ceiling above which a lookup into a value page is refused with a file fault; the mean counts the dictionary page's bytes, so it can miss one oversized page and a large value dictionary can raise it when no page is over | | `write.parquet.page-size-bytes` |
 | `long_keys` | Advice | key bytes above `KEY_BYTES_ADVICE` | | |
 | `large_file` | Advice | data file above `FILE_BYTES_ADVICE` | | `write.target-file-size-bytes` |
 | `many_files_per_bucket` | Advice | files in a bucket above twice what the bucket's bytes divided by `TARGET_FILE_BYTES_MAX` explain (a rolled sorted task is not many files) | | compaction |
@@ -1321,7 +1326,9 @@ fixture per `FindingCode`: `Dictionary::Value`;
 `page_rows` at twice `KEY_PAGE_ROWS_COST` with 24-byte values; `buckets:
 0` rolled into twenty 64 KiB files; the interleaved fixture;
 `Statistics::Truncated`; `column_index_truncate` under a shared 64-byte
-prefix; 16 KiB values under the row bound; a padded string key; 9,000 rows
+prefix; 16 KiB values under the row bound; sixteen rows of values just
+over a sixteenth of `MOST_VALUE_PAGE_BYTES` in one page, statistics and
+column index cut to 16 bytes; a padded string key; 9,000 rows
 of 16 KiB in one file; 48,000 ids at a 40 KiB target; `Bloom::Off`;
 `Bloom::Fpp(1e-12)`; `Bloom::Fpp(0.5)`. The completeness of
 `FindingCode::ALL` is proved once, by core's successor chain in `check.rs`

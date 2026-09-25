@@ -28,7 +28,8 @@ measured defaults kept in one documented table.
 The refusal reasons and cost findings are RFD 007's lists, grouped by its
 tiers, and the doctor reports each cost finding with the penalty RFD 007
 assigns it. The advice: missing or truncated manifest bounds, value pages
-over 1 MiB, keys over 128 bytes, data files over 128 MiB, a truncated
+over 1 MiB, value pages over the lookup's 64 MiB value page ceiling (RFD
+004 (Resident key-chunk index)), keys over 128 bytes, data files over 128 MiB, a truncated
 column index, more files per bucket than the table's size and file-size
 target explain, and a key bloom filter absent, oversized, or undersized for
 its row group's key count, reported as the filter's bits per key. The
@@ -38,7 +39,14 @@ itself reaches the order of a round trip rather than at the contract's
 64 KiB bound; the bound stays the recipe for large values, where a row limit
 alone leaves pages of megabytes, and the doctor reports the mean value size
 beside the mean page size so an owner sees how many values a hit fetches for
-the one it wanted. An advice names the Iceberg or Parquet writer property
+the one it wanted. The ceiling line warns of lookups refused rather than
+slowed: a lookup into a value page over the ceiling is refused with a file
+fault. It is advice, not a cost, because RFD 007's penalty units price
+answers served; and not a refusal, because its trigger is the file's mean
+value page size, the dictionary page's bytes included (the footer gives no
+uncompressed size for that page apart), which can miss one oversized page
+among small ones and can pass the ceiling on a large value dictionary when
+no page does. An advice names the Iceberg or Parquet writer property
 that fixes it when one does; long keys and many files per bucket are the
 owner's data and its compaction, which no writer property sets, so those
 two name none. The summary also carries each residency tier's resident

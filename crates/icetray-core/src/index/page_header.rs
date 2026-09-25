@@ -86,7 +86,7 @@ pub(super) const MOST_KEY_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// value in a page over it is not served, over gRPC or by a one-shot,
 /// though the value itself may be small: a page bounded by rows alone
 /// passes the ceiling at a thousand values of 128 KiB.
-pub(super) const MOST_VALUE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MOST_VALUE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The bytes a `BYTE_ARRAY` value's `PLAIN` length prefix takes, the
 /// fewest a dictionary entry of a byte array takes: an empty value is its

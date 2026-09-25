@@ -103,7 +103,8 @@ overlapping files within a bucket each carry a measured penalty in extra
 GETs per hit, key bytes decoded per lookup, or files probed per lookup. A
 priced table is refused when its `strict` setting is on, which is the
 default, and served with its penalty reported when it is off. Everything
-else (truncated bounds, oversized value pages, long keys, oversized files,
+else (truncated bounds, oversized value pages, value pages above the 64 MiB
+a lookup reads, long keys, oversized files,
 a truncated column index, too many files per bucket, a bloom filter that
 is absent or badly sized) is advice, which names the writer property to
 change and never affects whether a table serves.
