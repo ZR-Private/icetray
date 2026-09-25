@@ -206,9 +206,9 @@ struct KeysToVerify {
 
 impl KeysToVerify {
     /// `verify` of this column over `chunks`, run on the blocking pool
-    /// (`on_blocking_pool`): decoding every key of a file is the CPU-bound
-    /// part of a load, and inline it would hold the async worker that also
-    /// answers lookups. The builds a load has in flight each wait on at
+    /// (`on_blocking_pool`): decoding every key of a file is CPU-bound
+    /// work that grows with the file, and inline it would hold the async
+    /// worker that also answers lookups. The builds a load has in flight each wait on at
     /// most one verification, so a load runs at most `LOAD_CONCURRENCY`
     /// of them at once, each on its own blocking-pool thread.
     async fn verify(&self, chunks: &Arc<Segments>) -> Result<Verified> {
