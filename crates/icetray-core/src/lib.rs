@@ -39,7 +39,7 @@ pub use config::{
 pub use error::{Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
 pub use index::{
-    ChunkPage, FileFault, FileIndex, HeaderField, Inspected, PageHeaderFault, PageRef,
+    ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, Inspected, PageHeaderFault, PageRef,
     ResidentBytes, RowRef, WireType,
 };
 pub use key::{Key, KeyType};

@@ -622,6 +622,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use iceberg::io::FileIO;
     use metrics::{Key as MetricKey, SharedString, Unit};
     use metrics_util::CompositeKey;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -636,11 +637,13 @@ mod tests {
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
         THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table as Fixture,
-        WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys, two_bucket_table,
-        value_for, values_of,
+        WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys, parquet,
+        two_bucket_table, value_for, values_of,
     };
+    use crate::index::testing::with_dictionary_one_entry_short;
+    use crate::index::{DecodedPart, FileFault};
     use crate::key::KeyType;
-    use crate::manifest::testing::Partition;
+    use crate::manifest::testing::{self as manifest_testing, Partition};
     use crate::metric::LookupResult;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
@@ -1170,6 +1173,97 @@ mod tests {
         assert_eq!(
             table.current().unwrap().snapshot_id,
             SnapshotId(THIRD_SNAPSHOT)
+        );
+    }
+
+    /// String keys for `ids`, each written `repeats` times in a row.
+    fn string_keys(ids: Range<usize>, repeats: usize) -> Vec<Key> {
+        ids.flat_map(|id| std::iter::repeat_n(Key::Str(format!("key:{id:06}")), repeats))
+            .collect()
+    }
+
+    /// An unpartitioned contract-layout file of `keys` with `dictionary`
+    /// encoding, the value at each position `value_for` of it.
+    fn string_file<'a>(name: &'a str, keys: &'a [Key], dictionary: Dictionary) -> FileSpec<'a> {
+        FileSpec {
+            name,
+            keys,
+            values: (0..keys.len())
+                .map(|at| Some(value_for(i64::try_from(at).unwrap())))
+                .collect(),
+            partition: Partition::None,
+            bounds: Bounds::Exact,
+            layout: WriterLayout {
+                dictionary,
+                ..WriterLayout::contract()
+            },
+        }
+    }
+
+    /// A refresh onto a file parquet panics decoding, a string key
+    /// dictionary counting one entry more than its body holds, fails with
+    /// `FileFault::DecoderPanicked` instead of panicking the task that runs
+    /// it, and the previous generation keeps serving.
+    #[tokio::test]
+    async fn test_refresh_onto_a_file_parquet_panics_decoding_keeps_serving() {
+        let file_keys = usize::try_from(FILE_KEYS).unwrap();
+        let mut fixture = Fixture::new(KeyType::String, manifest_testing::unpartitioned());
+        let served = string_keys(0..file_keys, 1);
+        fixture
+            .add_file(string_file("f", &served, Dictionary::Off))
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+
+        let repeats = 2;
+        let repeated = string_keys(file_keys..2 * file_keys, repeats);
+        let short = string_file("short", &repeated, Dictionary::Key);
+        let written = parquet(KeyType::String, short.keys, &short.values, &short.layout);
+        fixture.add_file(short).await;
+        let key_leaf = 0;
+        let (patched, _) = with_dictionary_one_entry_short(&written, key_leaf);
+        let path = fixture.path_of("short");
+        manifest_testing::write_file(&FileIO::new_with_fs(), &path, patched).await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+
+        let error = table.refresh().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::File {
+                    path: ref at,
+                    fault: FileFault::DecoderPanicked {
+                        part: DecodedPart::Pages { row_group: 0, .. },
+                        ..
+                    },
+                } if *at == path
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            table.current().unwrap().snapshot_id,
+            SnapshotId(FIRST_SNAPSHOT)
+        );
+        let (serving, kept) = degraded(&table);
+        assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
+        assert_eq!(kept, ErrorKind::File);
+        let first = served[0].clone();
+        assert_eq!(
+            table.get(&first).await.unwrap(),
+            Lookup {
+                value: present(0),
+                snapshot_id: SnapshotId(FIRST_SNAPSHOT),
+            }
         );
     }
 

@@ -139,7 +139,13 @@ body, the lengths a delta-length or delta byte-array page carries, stay
 unchecked. Parquet's decoder reads those; Iceberg's default writer uses v1
 pages, which do not carry them for key columns. A memory limit on the
 process is the backstop for what the checks do not cover (RFD 012
-(Deployment contract)).
+(Deployment contract)). A page body that holds fewer values than its header
+counts, which the header checks cannot see, makes parquet panic for a
+byte-array page, in release builds too. The index runs the footer load, a
+bloom filter's parse, and the decode of a column chunk's pages under
+`catch_unwind`, so such a panic is a file fault, `DecoderPanicked`, like
+the refusals above: on a refresh the previous generation keeps serving, and
+at lookup that lookup fails.
 
 One question stays open. Decoded key arrays as an opt-in: under a per-table
 memory budget they remove the per-lookup decode for tables that can afford

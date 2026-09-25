@@ -12,11 +12,12 @@ mod build;
 mod inspect;
 mod page_header;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use std::cmp::Ordering;
 use std::mem::size_of;
 use std::ops::Range;
+use std::panic::UnwindSafe;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -177,6 +178,60 @@ pub enum FileFault {
         /// The physical type the file stores the column as.
         got: PhysicalType,
     },
+    /// Parquet panicked decoding part of the file. Parquet panics, in
+    /// release builds too, on malformed input no check ahead of it reads:
+    /// a byte-array page whose body holds fewer values than its header
+    /// counts, among others. The footer load, a bloom filter's parse, and
+    /// the decode of a column chunk's pages run under `catch_unwind`, so
+    /// such a panic ends that load or that lookup with this fault instead
+    /// of the task running it.
+    #[error("parquet panicked decoding {part}: {message}")]
+    DecoderPanicked {
+        /// What parquet was decoding.
+        part: DecodedPart,
+        /// The panic's message, for a person reading the log; nothing
+        /// decides on it.
+        message: String,
+    },
+}
+
+/// The part of a file parquet was decoding when it panicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedPart {
+    /// The footer: the thrift metadata and the page indexes.
+    Footer,
+    /// The key column's bloom filter of a row group.
+    BloomFilter {
+        /// The row group whose filter was decoding.
+        row_group: usize,
+    },
+    /// Pages of a column chunk.
+    Pages {
+        /// The row group holding the chunk.
+        row_group: usize,
+        /// The last page parquet's page reader handed the column reader
+        /// before the panic; `None` when it had handed out none.
+        page: Option<ChunkPage>,
+    },
+}
+
+impl std::fmt::Display for DecodedPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Footer => f.write_str("the footer"),
+            Self::BloomFilter { row_group } => {
+                write!(f, "the bloom filter of row group {row_group}")
+            }
+            Self::Pages {
+                row_group,
+                page: Some(page),
+            } => write!(f, "row group {row_group} at {page}"),
+            Self::Pages {
+                row_group,
+                page: None,
+            } => write!(f, "row group {row_group} before its first page"),
+        }
+    }
 }
 
 /// Every tier's resident bytes for one file, from the footer alone (RFD
@@ -500,7 +555,8 @@ impl FileIndex {
     /// string key that is not UTF-8, a key page header parquet would not
     /// read to the numbers the index reads or that declares more than its
     /// page can hold, a key page holding other rows than its offset index
-    /// says. Footer checks run before any chunk is
+    /// says, a footer, key page, or bloom filter parquet panics decoding
+    /// (`FileFault::DecoderPanicked`). Footer checks run before any chunk is
     /// fetched; `inspect` is that stage on its own. The Disk tier with no
     /// local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
@@ -735,7 +791,8 @@ impl FileIndex {
     /// decodes them, and one that parquet would not read to the same
     /// numbers or that declares more than its page can hold is
     /// `FileFault::MalformedPageHeader` or `FileFault::PageHeaderOverBound`
-    /// (`check_value_page_headers`).
+    /// (`check_value_page_headers`). A page parquet panics decoding is
+    /// `FileFault::DecoderPanicked`.
     pub async fn read_value(
         &self,
         row: RowRef,
@@ -1169,6 +1226,34 @@ fn row_offset(at: usize) -> i64 {
     i64::try_from(at).expect("a page's rows fit i64")
 }
 
+/// `decode`, a synchronous call that hands bytes of the file at `path` to
+/// parquet, with a panic inside it as `FileFault::DecoderPanicked` at the
+/// part `part` names once the panic is caught. The caller states why
+/// `decode` is unwind-safe: what it mutates is dropped with the panic, or
+/// left whole.
+pub(crate) fn unless_panicked<T>(
+    path: &str,
+    decode: impl FnOnce() -> T + UnwindSafe,
+    part: impl FnOnce() -> DecodedPart,
+) -> Result<T> {
+    std::panic::catch_unwind(decode).map_err(|payload| decoder_panicked(path, part(), &*payload))
+}
+
+/// `FileFault::DecoderPanicked` at `part` of the file at `path`, for a
+/// panic whose payload is `payload`.
+pub(crate) fn decoder_panicked(
+    path: &str,
+    part: DecodedPart,
+    payload: &(dyn std::any::Any + Send),
+) -> Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic that carries no message".to_string());
+    file_fault(path, FileFault::DecoderPanicked { part, message })
+}
+
 /// `Error::File` for the file at `path`.
 fn file_fault(path: &str, fault: FileFault) -> Error {
     Error::File {
@@ -1190,8 +1275,8 @@ mod tests {
         BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened,
         PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows,
         fault_of, group_rows, header_at, key_for, location, moved_by_header, pages_of,
-        predicted_of, row_of, stepped, store, store_file, value_for, value_of_len, with_group_rows,
-        with_header_claims, with_pages,
+        predicted_of, row_of, stepped, store, store_file, value_for, value_of_len,
+        with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
     };
     use crate::storage::IoStats;
 
@@ -2360,6 +2445,42 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A value dictionary whose header counts one entry more than its body
+    /// holds passes every header bound, the count below the row group's
+    /// rows. Parquet panics decoding the entry that is not there; the
+    /// lookup ends in `FileFault::DecoderPanicked` naming the dictionary
+    /// page, and a lookup into another row group still serves.
+    #[tokio::test]
+    async fn test_read_value_a_value_dictionary_short_of_its_count_is_a_file_fault() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.dictionary = Dictionary::Value;
+        let value_leaf = 1;
+        let (short, written) = with_dictionary_one_entry_short(&fixture.write(), value_leaf);
+        assert!(u64::from(written) < count(group_rows()), "{written}");
+        let opened = store_file(short).await;
+        let index = opened.index(KeyType::Long).await;
+        let fault = fault_of(index.read_value(row_of(0, group_rows()), None).await);
+        assert!(
+            matches!(
+                fault,
+                FileFault::DecoderPanicked {
+                    part: DecodedPart::Pages {
+                        row_group: 0,
+                        page: Some(ChunkPage::Dictionary),
+                    },
+                    ..
+                }
+            ),
+            "{fault:?}"
+        );
+        let elsewhere = group_rows();
+        let (value, _) = index
+            .read_value(row_of(elsewhere, group_rows()), None)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some(value_for(elsewhere).as_slice()));
     }
 
     #[tokio::test]

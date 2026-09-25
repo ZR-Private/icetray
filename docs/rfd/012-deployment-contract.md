@@ -128,7 +128,9 @@ file that trips the limit takes down every replica that loads it, because
 all of them load the same snapshot and restart into the same file; a limit
 alone would turn one bad file into a fleet-wide crash loop, which is why the
 cases the checks know are refused instead and, on a refresh, the last good
-generation keeps serving.
+generation keeps serving. A panic inside parquet's decoding of a file would
+crash-loop the fleet the same way, so the index catches it and refuses the
+file as a fault too.
 
 Conveniences a given platform expects (its metric naming, its secret
 injection, any log structure beyond renamed fields) are the wrapper's

@@ -422,7 +422,8 @@ it, but the lengths inside a delta-encoded page still size buffers from the
 file, and there the limit is what stops the process. A file that trips it takes down every
 replica that loads it, since they all load the same snapshot and restart
 into the same file; that is why the cases the checks know are refused
-instead, which on a refresh keeps the last good generation serving.
+instead, which on a refresh keeps the last good generation serving. A panic
+inside parquet's decoding of a file is caught and refused the same way.
 
 A local volume is optional. Mount one to run disk-residency tables or to
 keep a disk level of the page cache across restarts. Everything in it is a

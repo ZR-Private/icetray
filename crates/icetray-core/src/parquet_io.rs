@@ -5,9 +5,11 @@
 //! any byte outside them rather than fetching it.
 
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use bytes::{Buf, Bytes};
+use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use parquet::arrow::async_reader::MetadataFetch;
 use parquet::errors::ParquetError;
@@ -20,6 +22,7 @@ use parquet::file::reader::{ChunkReader, Length};
 use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::error::{Error, Result};
+use crate::index::{DecodedPart, decoder_panicked};
 use crate::local::{self, DIGEST_BYTES};
 use crate::storage::{HedgeWindow, Located, Storage};
 
@@ -149,8 +152,9 @@ impl FileHandle {
     /// page indexes are read when the file has them; a file whose columns
     /// lack an offset index comes back with neither index, and `index`
     /// refuses it as `FileFault::MissingPageIndex`. A fetch that failed
-    /// comes back as the storage error it was. On return `footer_digest`
-    /// is set.
+    /// comes back as the storage error it was, and a panic inside parquet's
+    /// decode of the footer as `FileFault::DecoderPanicked`. On return
+    /// `footer_digest` is set.
     pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>> {
         self.load_metadata_prefetching(FOOTER_PREFETCH_BYTES).await
     }
@@ -162,7 +166,7 @@ impl FileHandle {
         prefetch: usize,
     ) -> Result<Arc<ParquetMetaData>> {
         let fetched = Arc::new(Mutex::new(Vec::new()));
-        let metadata = ParquetMetaDataReader::new()
+        let load = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Optional)
             .with_prefetch_hint(Some(prefetch))
             .load_and_finish(
@@ -171,8 +175,14 @@ impl FileHandle {
                     fetched: Arc::clone(&fetched),
                 },
                 self.size,
-            )
+            );
+        // Unwind-safe: the reader and what it decoded are dropped with a
+        // panic; the fetched ranges are pushed whole under their lock, and
+        // the handle's footer digest is set only after a load returns.
+        let metadata = AssertUnwindSafe(load)
+            .catch_unwind()
             .await
+            .map_err(|payload| decoder_panicked(&self.location, DecodedPart::Footer, &*payload))?
             .map_err(reclaim)?;
         let fetched = fetched.lock().unwrap_or_else(PoisonError::into_inner);
         self.footer_digest

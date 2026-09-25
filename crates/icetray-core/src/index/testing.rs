@@ -11,7 +11,9 @@ use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::bloom_filter::Sbbf;
-use parquet::file::metadata::{ColumnChunkMetaDataBuilder, ParquetMetaData};
+use parquet::file::metadata::{
+    ColumnChunkMetaDataBuilder, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader,
+};
 use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 use parquet::file::properties::{
     DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties, WriterVersion,
@@ -27,7 +29,7 @@ use crate::generation::testing::{
 use crate::index::page_header::{
     COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
     DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, NIBBLE_BITS, NIBBLE_MASK,
-    NUM_VALUES_FIELD, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD,
+    NUM_VALUES_FIELD, PageBody, PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD,
     UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
 };
 use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, RowRef, WireType};
@@ -509,23 +511,27 @@ fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
 /// The most bytes a varint of an `i32` takes: seven bits per byte.
 const I32_VARINT_BYTES: usize = 5;
 
-/// `value` as compact thrift reads an `i32`: zigzag, then a varint,
-/// padded with continuation bytes to `I32_VARINT_BYTES`, so every value
-/// moves the pages after it by the same bytes and the value the header
-/// held already proves the move right.
-fn zigzag_varint(value: i32) -> Vec<u8> {
+/// `value` as compact thrift reads an `i32`: zigzag, then a varint of
+/// `width` bytes, padded with continuation bytes. `with_header_claims`
+/// pads every value to `I32_VARINT_BYTES`, so every value moves the pages
+/// after it by the same bytes and the value the header held already
+/// proves the move right; `with_claim_in_place` keeps the width the
+/// header had. `value` fits `width`.
+fn zigzag_varint(value: i32, width: usize) -> Vec<u8> {
     let mut rest = ((value << 1) ^ (value >> (i32::BITS - 1))).cast_unsigned();
-    (0..I32_VARINT_BYTES)
+    let varint = (0..width)
         .map(|at| {
             let low = u8::try_from(rest & u32::from(!VARINT_CONTINUES)).unwrap();
             rest >>= u8::BITS - 1;
-            if at + 1 == I32_VARINT_BYTES {
+            if at + 1 == width {
                 low
             } else {
                 low | VARINT_CONTINUES
             }
         })
-        .collect()
+        .collect();
+    assert_eq!(rest, 0, "{value} does not fit a varint of {width} bytes");
+    varint
 }
 
 /// Where the header of `page` of row group 0's `leaf` chunk starts, as an
@@ -552,9 +558,59 @@ pub(super) fn with_header_claims(
     for (field, claimed) in claims {
         let varint = header_varint(&patched[header_at..], *field);
         let varint = header_at + varint.start..header_at + varint.end;
-        patched.splice(varint, zigzag_varint(*claimed));
+        patched.splice(varint, zigzag_varint(*claimed, I32_VARINT_BYTES));
     }
     patched
+}
+
+/// `file` with `field` of the header of `page` of row group 0's `leaf`
+/// chunk claiming `claimed`, in a varint as wide as the one it replaces:
+/// no byte after it moves, so the file's own footer still places every
+/// page and the file loads as written.
+fn with_claim_in_place(
+    file: &[u8],
+    metadata: &ParquetMetaData,
+    leaf: usize,
+    page: ChunkPage,
+    field: HeaderField,
+    claimed: i32,
+) -> Bytes {
+    let (chunk_start, _) = metadata.row_group(0).column(leaf).byte_range();
+    let at = approx::length(chunk_start) + header_at(metadata, leaf, page);
+    let varint = header_varint(&file[at..], field);
+    let varint = at + varint.start..at + varint.end;
+    let mut patched = file.to_vec();
+    let width = varint.len();
+    patched.splice(varint, zigzag_varint(claimed, width));
+    Bytes::from(patched)
+}
+
+/// `file` with the dictionary page header of row group 0's `leaf` chunk
+/// counting one entry more than its body holds, in place
+/// (`with_claim_in_place`), and the count it held.
+pub(crate) fn with_dictionary_one_entry_short(file: &Bytes, leaf: usize) -> (Bytes, u32) {
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .parse_and_finish(file)
+        .unwrap();
+    let (chunk_start, _) = metadata.row_group(0).column(leaf).byte_range();
+    let PageBody::Dictionary { num_values } =
+        PageHeader::read(&file[approx::length(chunk_start)..])
+            .unwrap()
+            .body
+    else {
+        panic!("column {leaf} of row group 0 starts with its dictionary page");
+    };
+    let claimed = i32::try_from(num_values + 1).unwrap();
+    let patched = with_claim_in_place(
+        file,
+        &metadata,
+        leaf,
+        ChunkPage::Dictionary,
+        HeaderField::NumValues,
+        claimed,
+    );
+    (patched, num_values)
 }
 
 /// `loaded` with the header of `page` of row group 0's `leaf` chunk grown

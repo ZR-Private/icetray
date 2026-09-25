@@ -4,6 +4,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -19,8 +20,8 @@ use parquet::file::serialized_reader::SerializedPageReader;
 use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
 use super::{
-    Column, ColumnChunk, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys,
-    file_fault, identity_of, off_worker, row_index,
+    ChunkPage, Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected,
+    KeyResidency, KeyShape, Keys, file_fault, identity_of, off_worker, row_index, unless_panicked,
 };
 use crate::approx;
 use crate::config::{ConfigError, ConfigViolation, Residency};
@@ -124,6 +125,9 @@ struct PageTally {
     /// The data page refused for a header that claims more values than its
     /// rows; the reader's error then stands for this refusal.
     refused: Option<usize>,
+    /// The last page handed to the column reader, dictionary or data: the
+    /// page a panic in parquet's decoding is reported at.
+    taken: Option<ChunkPage>,
 }
 
 impl Iterator for CountedPages {
@@ -151,8 +155,15 @@ impl PageReader for CountedPages {
                     )));
                 }
                 tally.seen.push(values);
+                tally.taken = Some(ChunkPage::Data(at));
             }
-            Some(Page::DictionaryPage { .. }) | None => {}
+            Some(Page::DictionaryPage { .. }) => {
+                self.tally
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .taken = Some(ChunkPage::Dictionary);
+            }
+            None => {}
         }
         Ok(page)
     }
@@ -269,7 +280,8 @@ pub(super) fn reusable_disk_chunks(
 /// footer bounds: a header, then a bitset of exactly the header's length,
 /// holding at least one block. A filter that does not decode so, or whose
 /// bitset holds no block (fewer than `parquet::bloom_filter::BITSET_MIN_LENGTH`
-/// bytes; a check indexes the first block), is `FileFault::CorruptBloomFilter`.
+/// bytes; a check indexes the first block), is `FileFault::CorruptBloomFilter`,
+/// and one parquet panics parsing is `FileFault::DecoderPanicked`.
 async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Result<Vec<Sbbf>> {
     let bytes = handle.read_ranges(ranges).await?;
     bytes
@@ -282,7 +294,14 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
                     FileFault::CorruptBloomFilter { row_group },
                 )
             };
-            let filter = Sbbf::from_bytes(bytes).map_err(|error| {
+            // Unwind-safe: `from_bytes` reads the bytes and mutates nothing
+            // it does not return.
+            let parsed = unless_panicked(
+                &handle.location,
+                || Sbbf::from_bytes(bytes),
+                || DecodedPart::BloomFilter { row_group },
+            )?;
+            let filter = parsed.map_err(|error| {
                 tracing::debug!(%error, path = %handle.location, row_group, "bloom filter does not decode");
                 corrupt()
             })?;
@@ -488,7 +507,7 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// page whose values run out short of its header's count ends the decode
 /// in an error, which is `FileFault::PageRowsMismatch` when a header read
 /// on the way disagrees with the offset index and `Error::Parquet`
-/// otherwise.
+/// otherwise, or, for a byte-array page, in a panic inside parquet.
 ///
 /// Three allocations happen inside parquet before this function sees what
 /// sized them. The page reader reserves a page's uncompressed size from its
@@ -503,15 +522,50 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// the resident chunks, the chunk file, or, in the Bloom tier, the data
 /// file again. A delta-length or delta byte-array page sizes its lengths
 /// by the count in its encoded data, which no check reads.
+///
+/// Parquet panics on some page bodies the headers do not reveal: a
+/// byte-array page holding fewer values than its header counts, a
+/// dictionary page among them, and others. The decode runs under
+/// `catch_unwind`, so a panic is `FileFault::DecoderPanicked` at the last
+/// page the column reader took, and ends this load or lookup rather than
+/// the task running it.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
     skip: usize,
     take: usize,
 ) -> Result<Vec<T::T>> {
+    let tally = Arc::new(Mutex::new(PageTally::default()));
+    // Unwind-safe: the page reader, the column reader, and the buffers are
+    // built inside `decode` and dropped with a panic; the footer `chunk`
+    // borrows is only read, and the tally `decode` shares holds each
+    // page's record whole, written under its lock.
+    let decode = AssertUnwindSafe(|| decode_records::<T>(chunk, segments, skip, take, &tally));
+    let (values, decoded) = unless_panicked(chunk.column.path, decode, || DecodedPart::Pages {
+        row_group: chunk.row_group(),
+        page: tally.lock().unwrap_or_else(PoisonError::into_inner).taken,
+    })??;
+    let tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(page) = tally.refused {
+        return Err(chunk.page_rows_mismatch(page));
+    }
+    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)?;
+    Ok(values)
+}
+
+/// The decode `read_column` runs under `catch_unwind`: the values of
+/// `take` records after skipping `skip`, and how many records the column
+/// reader produced or the error it ended in, with what the page reader
+/// saw recorded in `tally`.
+fn decode_records<T: ParquetDataType>(
+    chunk: ColumnChunk<'_>,
+    segments: Arc<Segments>,
+    skip: usize,
+    take: usize,
+    tally: &Arc<Mutex<PageTally>>,
+) -> Result<(Vec<T::T>, parquet::errors::Result<usize>)> {
     let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
-    let tally = Arc::new(Mutex::new(PageTally::default()));
     let pages = CountedPages {
         inner: chunk.page_reader(segments)?,
         page_rows: (0..chunk.page_locations().len())
@@ -521,7 +575,7 @@ fn read_column<T: ParquetDataType>(
             })
             .collect(),
         next_page: 0,
-        tally: Arc::clone(&tally),
+        tally: Arc::clone(tally),
     };
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
     let batch_records = row_index(DECODE_BATCH_RECORDS);
@@ -553,12 +607,7 @@ fn read_column<T: ParquetDataType>(
         Ok(records)
     };
     let decoded = decode();
-    let tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(page) = tally.refused {
-        return Err(chunk.page_rows_mismatch(page));
-    }
-    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)?;
-    Ok(values)
+    Ok((values, decoded))
 }
 
 /// Exactly row `row` of the value column chunk `chunk` from `segments`:
@@ -582,7 +631,9 @@ mod tests {
     use crate::approx::count;
     use crate::config::{ConfigError, ConfigViolation};
     use crate::generation::testing::Dictionary;
-    use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
+    use crate::generation::testing::{
+        self, KeyColumn, TABLE, cache, column_of, page_rows, refusal_of,
+    };
     use crate::index::page_header::{
         MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK, PAGE_ENCODING_ALLOWANCE_BYTES,
         PageBody, PageHeader,
@@ -590,11 +641,12 @@ mod tests {
     use crate::index::testing::{
         FEW_ROWS, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows,
         fault_of, group_rows, header_at, key_for, location, longs, moved_by_header, pages_of,
-        predicted_of, row_of, stepped, store, store_file, with_column_chunk, with_group_rows,
-        with_header_claims, with_pages,
+        predicted_of, row_of, stepped, store, store_file, with_column_chunk,
+        with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
     };
     use crate::index::{
-        ChunkPage, Column, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef, WireType,
+        ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
+        WireType,
     };
     use crate::key::KeyType;
     use parquet::basic::PageType;
@@ -1256,6 +1308,47 @@ mod tests {
             fault_of(verify_groups(&metadata, key_leaf, KeyShape::Str, &chunks)),
             over_bound(page, HeaderField::NumValues, claimed, held)
         );
+    }
+
+    /// A byte-array key dictionary whose header counts one entry more than
+    /// its body holds passes every header bound: the count stays below the
+    /// row group's rows, which repeated keys leave above the distinct keys
+    /// the dictionary holds. Parquet panics decoding the entry that is not
+    /// there; the load ends in `FileFault::DecoderPanicked` naming the
+    /// dictionary page, in every tier, before the repeated keys are seen.
+    #[tokio::test]
+    async fn test_build_a_key_dictionary_short_of_its_count_is_a_file_fault() {
+        let repeats = 2;
+        let keys = (0..contract_rows())
+            .map(|i| Some(key_for(i / repeats, KeyType::String)))
+            .collect();
+        let mut fixture = Fixture::with_keys(column_of(KeyType::String), keys);
+        fixture.layout.dictionary = Dictionary::Key;
+        let key_leaf = 0;
+        let (short, written) = with_dictionary_one_entry_short(&fixture.write(), key_leaf);
+        assert_eq!(u64::from(written), count(group_rows() / repeats));
+        let opened = store_file(short).await;
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let fault = fault_of(
+                opened
+                    .build_in(KeyType::String, residency, dir.path())
+                    .await,
+            );
+            assert!(
+                matches!(
+                    fault,
+                    FileFault::DecoderPanicked {
+                        part: DecodedPart::Pages {
+                            row_group: 0,
+                            page: Some(ChunkPage::Dictionary),
+                        },
+                        ..
+                    }
+                ),
+                "{residency:?}: {fault:?}"
+            );
+        }
     }
 
     /// A key page whose header declares compressed bytes past its place in

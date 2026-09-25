@@ -514,7 +514,17 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// parquet decodes into, a compressed size past its place in
 /// the offset index, v2 level lengths that are negative or whose sum, which
 /// parquet adds as `i32`s, is above the page's uncompressed size.
-pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
+/// `DecoderPanicked` is a panic inside parquet, which it raises in release
+/// builds too on input no check ahead of it reads (a byte-array page holding
+/// fewer values than its header counts among them), caught where the index
+/// hands file bytes to parquet: the footer load, a bloom filter's parse,
+/// and the decode of a column chunk's pages. It names the part and carries
+/// the panic's message for the log; nothing decides on the message.
+pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize }, DecoderPanicked { part: DecodedPart, message: String } }
+/// What parquet was decoding when it panicked: the footer, a row group's key
+/// bloom filter, or a column chunk's pages at the last page the column
+/// reader took (`None` before its first).
+pub enum DecodedPart { Footer, BloomFilter { row_group: usize }, Pages { row_group: usize, page: Option<ChunkPage> } }
 /// A page of a column chunk as a fault names it: the dictionary page, or a
 /// data page by its position in the offset index.
 pub enum ChunkPage { Dictionary, Data(usize) }
