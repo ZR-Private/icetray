@@ -304,7 +304,7 @@ async fn test_golden_unpartitioned_is_priced() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
-async fn test_golden_overlap_serves_and_prices_overlap_when_present() -> Result<()> {
+async fn test_golden_overlap_serves_and_prices_overlap() -> Result<()> {
     let golden = open_golden(GoldenTable::Overlap250k, false).await?;
     let keys: Vec<Key> = IDS_250K
         .iter()
@@ -316,11 +316,14 @@ async fn test_golden_overlap_serves_and_prices_overlap_when_present() -> Result<
         hits(&golden, &keys, |key| golden::wide_value(&long_text(key))).await?,
         cold
     );
+    assert!(
+        !generation.overlapping_buckets().is_empty(),
+        "overlap_250k has no overlapping files: dev/golden-tables.py writes it with \
+         skew_splitting(spark, True) \
+         (spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled), \
+         so each bucket is split across several sorted tasks; regenerate the table"
+    );
     let costs = cost_codes(&golden);
-    if generation.overlapping_buckets().is_empty() {
-        assert!(costs.is_empty(), "{costs:?}");
-    } else {
-        assert!(costs.contains(&FindingCode::OverlappingFiles), "{costs:?}");
-    }
+    assert!(costs.contains(&FindingCode::OverlappingFiles), "{costs:?}");
     Ok(())
 }
