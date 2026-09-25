@@ -2,8 +2,8 @@
 //! service registered before any table loads, every table loaded
 //! concurrently, readiness and `SERVING` once every table serves, one
 //! refresh task per table and one sampler on the poll interval, and a drain
-//! on shutdown that ends health watches, finishes in-flight calls, and
-//! flushes the page cache's disk level. A first-load failure keeps health
+//! on shutdown that ends health watches, waits up to the drain deadline for
+//! in-flight calls, and flushes the page cache's disk level. A first-load failure keeps health
 //! `NOT_SERVING` for a grace period, so an orchestrator's probe sees it,
 //! then ends the run; a periodic task that panics ends the run at once,
 //! with the task named.
@@ -179,6 +179,7 @@ impl Serving {
             handle,
             options,
             poll_interval: config.server.poll_interval,
+            drain_deadline: config.server.drain_deadline,
             shutdown: shutdown.clone(),
             ready: ready_tx,
             grpc,
@@ -227,14 +228,16 @@ impl Serving {
     }
 
     /// Asks the run to drain: the servers stop accepting, in-flight calls
-    /// finish, the refresh tasks end, and the page cache's disk level is
-    /// flushed. `join` reports how it went.
+    /// finish or the drain stops waiting for them at its deadline, the
+    /// refresh tasks end, and the page cache's disk level is flushed.
+    /// `join` reports how it went.
     pub fn shutdown(&self) {
         self.shutdown.send_modify(|stop| *stop = true);
     }
 
-    /// Waits for the run to end: `Ok` after a drain, `FirstLoad` when a table
-    /// failed its first load, or the failure that ended it.
+    /// Waits for the run to end: `Ok` after a drain, `DrainOverran` after a
+    /// drain that passed its deadline, `FirstLoad` when a table failed its
+    /// first load, or the failure that ended it.
     pub async fn join(self) -> Result<(), ServeError> {
         self.task.await?
     }
@@ -364,6 +367,7 @@ struct Run {
     handle: PrometheusHandle,
     options: ServeOptions,
     poll_interval: Duration,
+    drain_deadline: Duration,
     shutdown: watch::Sender<bool>,
     ready: watch::Sender<bool>,
     grpc: JoinHandle<Result<(), tonic::transport::Error>>,
@@ -446,22 +450,43 @@ impl Run {
         Err(error)
     }
 
-    /// Ends every health watch, waits for the servers to finish their
-    /// in-flight work, and closes the page cache, so the disk level is
-    /// flushed before the process exits (RFD 017). tonic's graceful shutdown
-    /// waits for every connection to close, and a `Watch` stream the health
-    /// service still feeds would hold its connection open without end.
+    /// Ends every health watch, waits up to the drain deadline for the
+    /// servers to finish their in-flight work, and closes the page cache, so
+    /// the disk level is flushed before the process exits (RFD 017). tonic's
+    /// graceful shutdown waits for every connection to close, and a `Watch`
+    /// stream the health service still feeds would hold its connection open
+    /// without end. Past the deadline both server tasks are aborted, the
+    /// cache is still closed, and the drain is `DrainOverran`, the close's
+    /// own failure logged beside it. tonic serves each connection on a task
+    /// of its own, which the abort does not reach: a call still open ends
+    /// with the process.
     async fn drain(self) -> Result<(), ServeError> {
         let Self {
             mut health,
-            grpc,
-            http,
+            mut grpc,
+            mut http,
             opened,
+            drain_deadline,
             ..
         } = self;
         withdraw_health(&mut health).await;
-        grpc.await??;
-        http.await?;
+        let servers = tokio::time::timeout(drain_deadline, async {
+            (&mut grpc).await??;
+            (&mut http).await?;
+            Ok::<(), ServeError>(())
+        })
+        .await;
+        let Ok(served) = servers else {
+            grpc.abort();
+            http.abort();
+            if let Err(error) = opened.cache.close().await {
+                tracing::error!(%error, "page cache close after the drain overran");
+            }
+            return Err(ServeError::DrainOverran {
+                after: drain_deadline,
+            });
+        };
+        served?;
         opened.cache.close().await?;
         Ok(())
     }

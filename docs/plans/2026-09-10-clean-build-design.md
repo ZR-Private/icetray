@@ -999,7 +999,12 @@ standard fields mapped to one emitted name, is refused at startup with exit
 64. Prometheus histograms use the prototype's buckets (100 µs to 2 s); the
 recorder installs once per process and every later caller gets the same
 handle. SIGTERM or SIGINT drains in-flight requests, flushes the page
-cache's disk level (RFD 017), and exits 0; a shutdown asked for while the
+cache's disk level (RFD 017), and exits 0. The drain waits at most
+`server.drain_deadline` for the servers' connections; past it, it stops
+waiting and aborts both server tasks (tonic serves each connection on a
+task of its own, so a call still open ends with the process), closes the
+page cache all the same, and ends the run with
+`ServeError::DrainOverran { after }`, exit 1. A shutdown asked for while the
 first loads run is honoured as soon as they end, cutting the grace short
 and never flipping to `SERVING`. Every drain, after a shutdown or a failed
 run, first sets both health names `NOT_SERVING` and then removes them,
@@ -1069,7 +1074,8 @@ as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
 every table with `strict` off. Exit codes: 0 for a run that did what was
 asked; 1 for a load or read error, a table the doctor could not load (which
 dominates 2), a configuration file that cannot be read or parsed, a
-first-load failure, or a bind failure; 2 when the doctor found a cost
+first-load failure, a bind failure, or a drain that passed its deadline;
+2 when the doctor found a cost
 finding (RFD 016); 64 (`sysexits.h`'s `EX_USAGE`) when the command line or
 the target could not be used, including clap's own errors, no target, no
 table matched, a table name required, a key that does not parse, and a bad log

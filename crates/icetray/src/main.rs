@@ -154,7 +154,8 @@ async fn serve(path: &Path) -> ExitCode {
 
 /// The metrics recorder, the daemon, and a drain on SIGTERM or SIGINT.
 /// `EXIT_OK` after a drain; a failure to start or a failed run, which a
-/// first-load failure is on its own (RFD 005), is `CliError::Serve`.
+/// first-load failure is on its own (RFD 005), and a drain that passed its
+/// deadline, are `CliError::Serve`.
 async fn daemon(config: Config) -> Result<ExitCode, CliError> {
     let handle = telemetry::install()?;
     let serving = Serving::start(config, handle, ServeOptions::default()).await?;

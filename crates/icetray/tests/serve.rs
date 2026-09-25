@@ -96,7 +96,7 @@ const NEW_IDS: std::ops::Range<u64> = SMALL_IDS.end..SMALL_IDS.end + APPENDED_ID
 
 /// The ids of the fixture the health test loads: five times the small
 /// fixture, so the load comfortably outlasts the first health round trip
-/// and the readiness probe; the S3 fixture has no hook to hold a load open.
+/// and the readiness probe.
 const HEALTH_RACE_IDS: std::ops::Range<u64> = 0..100_000;
 
 /// The file prefix of the refresh test's append.
@@ -134,6 +134,10 @@ const IN_FLIGHT_CAP: usize = 2;
 /// How soon a refused call is answered: one loopback round trip, far
 /// inside `SHORT_DEADLINE`, so the refusal is seen not to wait for a slot.
 const REFUSED_WITHIN: Duration = Duration::from_millis(100);
+
+/// The drain deadline the overrun test configures: short, and far inside
+/// the default `get_deadline`, so the held call outlasts the drain.
+const SHORT_DRAIN: Duration = Duration::from_millis(300);
 
 /// The `metrics` recorder is process-global, so `requests_total` is one
 /// counter for every test in this binary. Every test that issues an RPC
@@ -715,9 +719,8 @@ async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult
 
 /// A `Get` issued before `shutdown` and awaited after it completes, and the
 /// drain ends `Ok`. The cold `Get` over loopback S3 is answered within the
-/// dispatch delay, so what the drain does with a stream still open when the
-/// shutdown arrives is not held under test here: the S3 fixture has no hook
-/// to stall a read, which a proof of that would need.
+/// dispatch delay; a call still open when the drain deadline passes is
+/// `test_drain_stops_waiting_at_its_deadline`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shutdown_drains_and_returns_ok() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -1096,5 +1099,57 @@ async fn test_multi_get_over_max_keys_is_invalid_argument_before_any_lookup() ->
     for hit in &response.results {
         assert_eq!(hit.presence, i32::from(v1::Presence::Present));
     }
+    Ok(())
+}
+
+/// A call held on a stalled store when the shutdown arrives keeps its
+/// connection open past the drain deadline; the drain stops waiting at the
+/// deadline and the run ends with `DrainOverran` instead of waiting out the
+/// call. The page cache is closed on that path too, which a memory-only
+/// cache gives no way to observe.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drain_stops_waiting_at_its_deadline() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.drain_deadline = SHORT_DRAIN;
+            Ok(())
+        },
+    )
+    .await?;
+    assert!(ServerConfig::default().get_deadline > SHORT_DRAIN + DEADLINE_MARGIN);
+    let mut serving = stack.serving;
+    serving.ready().await;
+    let key = stack.fixtures[0].key(SAMPLE[0]);
+    stack.s3.hold();
+    let mut client = stack.client.clone();
+    let in_flight = tokio::spawn(async move {
+        client
+            .get(GetRequest {
+                table: TABLE.to_string(),
+                key: Some(wire_key(&key)),
+            })
+            .await
+    });
+    poll_until(SHUTDOWN_WAIT, "the call reaching the store", async || {
+        Ok((stack.s3.held() == 1).then_some(()))
+    })
+    .await?;
+
+    serving.shutdown();
+    let (outcome, elapsed) = tokio::time::timeout(SHUTDOWN_WAIT, timed(serving.join())).await?;
+    let Err(ServeError::DrainOverran { after }) = outcome else {
+        panic!("expected the drain to overrun, got {outcome:?}");
+    };
+    assert_eq!(after, SHORT_DRAIN);
+    assert!(
+        elapsed >= SHORT_DRAIN && elapsed < SHORT_DRAIN + DEADLINE_MARGIN,
+        "the run ended after {elapsed:?}, drain deadline {SHORT_DRAIN:?}"
+    );
+    assert!(
+        !in_flight.is_finished(),
+        "the drain did not wait out the call"
+    );
     Ok(())
 }

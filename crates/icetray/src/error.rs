@@ -28,7 +28,8 @@ use crate::service::WireVariant;
 pub const EXIT_OK: u8 = 0;
 
 /// The run failed: a load or read error, a table the doctor could not load,
-/// a first-load failure, a listener that would not bind.
+/// a first-load failure, a listener that would not bind, a drain that
+/// passed its deadline.
 pub const EXIT_FAILURE: u8 = 1;
 
 /// The doctor found a cost finding (RFD 016): the table serves, at a price a
@@ -143,7 +144,7 @@ pub enum CallFault {
     },
 }
 
-/// Why `serve` ended other than by a drain.
+/// Why `serve` ended other than by a drain that finished in time.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     /// A listener could not bind its configured address.
@@ -170,6 +171,14 @@ pub enum ServeError {
     FirstLoad {
         /// Each failed table's name and the kind of its failure.
         failures: Vec<(String, ErrorKind)>,
+    },
+    /// The drain waited `server.drain_deadline` for open calls and stopped
+    /// waiting; the page cache was closed, and a call still open ends with
+    /// the process, its caller answered by a closed connection.
+    #[error("drain did not finish within {after:?}, calls were still open")]
+    DrainOverran {
+        /// The deadline that passed.
+        after: Duration,
     },
     /// The run task itself panicked or was cancelled.
     #[error("task: {0}")]
@@ -309,6 +318,9 @@ mod tests {
             CliError::Io(std::io::Error::other("sample")),
             CliError::Json(serde_json::from_str::<u8>("sample").unwrap_err()),
             CliError::Serve(serve_error()),
+            CliError::Serve(ServeError::DrainOverran {
+                after: ServerConfig::default().drain_deadline,
+            }),
         ];
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_FAILURE), "{error}");
