@@ -5,6 +5,7 @@
 //! is fetched. Immutable once built; a `Table` builds the next one beside
 //! it, reusing every file whose path is unchanged, and swaps atomically.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -109,7 +110,10 @@ impl Generation {
     /// other tables' loads have reserved, and what every new file would
     /// write there, reserved until the new indexes are built; over either
     /// is `RefusalReason::OverBudget`), then builds the new indexes at the
-    /// same concurrency and assembles the generation: files sorted, overlap
+    /// same concurrency, refusing a bucketed file whose fences or first or
+    /// last key hash to another bucket than its manifest entry records
+    /// (`RefusalReason::KeyOutsideBucket`; a reused file was checked when
+    /// it was built), and assembles the generation: files sorted, overlap
     /// groups found, and every group that gained a file merged to refuse a
     /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
     /// `previous`. A snapshot timestamp jiff cannot represent is
@@ -138,7 +142,7 @@ impl Generation {
         let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge)?;
         let inspected = inspect_all(table, &layout, pending).await?;
         let reservation = check_budget(table, config, local, &reused, &inspected)?;
-        let built = build_all(config.residency, local, inspected).await;
+        let built = build_all(table, config.residency, local, inspected).await;
         drop(reservation);
         let built = built?;
         let members = reused
@@ -446,8 +450,11 @@ async fn inspect_all(
 }
 
 /// Builds every inspected file's index in `residency`, `LOAD_CONCURRENCY`
-/// at a time, after the budget check admitted them all.
+/// at a time, after the budget check admitted them all, and refuses a
+/// file whose fences or first or last key fall outside its recorded bucket
+/// (`refuse_fences_outside_bucket`).
 async fn build_all(
+    table: &str,
     residency: Residency,
     local: Option<&LocalDir>,
     inspected: Vec<(DataFileEntry, Inspected)>,
@@ -455,7 +462,9 @@ async fn build_all(
     stream::iter(inspected)
         .map(|(entry, inspected)| async move {
             let index = inspected.build(residency, local).await?;
-            Ok::<_, Error>(Arc::new(LoadedFile { entry, index }))
+            let file = LoadedFile { entry, index };
+            refuse_fences_outside_bucket(table, &file)?;
+            Ok::<_, Error>(Arc::new(file))
         })
         .buffered(LOAD_CONCURRENCY)
         .try_collect()
@@ -515,6 +524,53 @@ fn check_budget<'a>(
         },
         Residency::Bloom => Ok(None),
     }
+}
+
+/// `RefusalReason::KeyOutsideBucket` under `table` for the first of `keys`
+/// that hashes to another bucket under `entry`'s bucketing than the one
+/// `entry` records; `Ok` for an unbucketed entry. Routing sends a key only
+/// to the files of the bucket it hashes to, so a key held elsewhere would
+/// answer `Absent` though present (RFD 007).
+fn refuse_outside_bucket<K: Borrow<Key>>(
+    table: &str,
+    entry: &DataFileEntry,
+    keys: impl IntoIterator<Item = K>,
+) -> Result<()> {
+    let Some(bucketing) = entry.bucketing else {
+        return Ok(());
+    };
+    for key in keys {
+        let key = key.borrow();
+        let computed = bucketing.bucket_of(key);
+        if computed != entry.bucket {
+            return Err(Error::refused(
+                table,
+                RefusalReason::KeyOutsideBucket {
+                    path: entry.path.clone(),
+                    key: key.clone(),
+                    recorded: entry.bucket,
+                    computed,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The load's bucket check: `refuse_outside_bucket` over `file`'s fences
+/// (the first key of every key page) and its first and last key, all held
+/// once the index is built, so the check costs one hash per key page and
+/// no decode: O(pages), not O(rows). It refuses a file recorded under the
+/// wrong bucket, whose keys all hash elsewhere, and a file whose keys
+/// change bucket at a page boundary or at either end; it serves a file
+/// whose keys change bucket between two fences, which a writer that
+/// partitions by bucket does not produce. Hashing every key would add a
+/// murmur3 hash per row to every load, tens of nanoseconds each, which is
+/// seconds to minutes on a table of billions of rows.
+fn refuse_fences_outside_bucket(table: &str, file: &LoadedFile) -> Result<()> {
+    let (first, last) = file.index.key_range();
+    let fences = file.index.fences().iter().flatten();
+    refuse_outside_bucket(table, &file.entry, fences.chain([first, last]))
 }
 
 /// Whether the exact key ranges of two files intersect.
@@ -2803,6 +2859,47 @@ mod tests {
             on_disk,
             "nothing live frees all"
         );
+    }
+
+    /// The bucket `f`'s manifest entry records in the bucket-check tests,
+    /// and the other bucket, which its keys hash to.
+    const RECORDED: u32 = 1;
+    const COMPUTED: u32 = 0;
+
+    /// A two-bucket table with one file `f` of `keys` recorded under
+    /// `RECORDED`, committed as `FIRST_SNAPSHOT`.
+    async fn one_file_under(keys: &[i64]) -> Table {
+        let mut table = Table::bucketed(TWO);
+        table.add_long_file("f", keys, RECORDED).await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        table
+    }
+
+    /// A file whose keys all hash to `COMPUTED` but whose manifest records
+    /// `RECORDED`: its first key is a fence, so every tier's load refuses it
+    /// before it can answer one of its keys `Absent`.
+    #[tokio::test]
+    async fn test_load_a_file_recorded_under_another_bucket_is_refused() {
+        let all = keys_from(0, E2E_KEYS);
+        let keys = keys_in_bucket(&all, bucketing(TWO), COMPUTED);
+        let table = one_file_under(&keys).await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        for residency in Residency::ALL {
+            let config = table.config(residency, None);
+            assert_eq!(
+                refusal_of(table.load(&config, Some(&local), None).await),
+                RefusalReason::KeyOutsideBucket {
+                    path: table.path_of("f"),
+                    key: Key::Long(keys[0]),
+                    recorded: RECORDED,
+                    computed: COMPUTED,
+                },
+                "{residency}"
+            );
+        }
     }
 
     #[test]

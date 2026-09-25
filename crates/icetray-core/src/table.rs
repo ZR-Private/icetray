@@ -1295,6 +1295,55 @@ mod tests {
         assert_eq!(kept, ErrorKind::Inefficient);
     }
 
+    /// A refresh onto a file whose keys hash to bucket 0 but whose manifest
+    /// records bucket 1 is refused as `KeyOutsideBucket`, and the previous
+    /// generation keeps serving.
+    #[tokio::test]
+    async fn test_refresh_onto_a_file_outside_its_bucket_keeps_serving() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let (hashed, recorded) = (0, 1);
+        let appended = keys_in_bucket(
+            &keys_from(all.last().unwrap() + KEY_STEP, E2E_KEYS),
+            bucketing(TWO),
+            hashed,
+        );
+        fixture
+            .add_long_file("misplaced", &appended, recorded)
+            .await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+        let error = table.refresh().await.unwrap_err();
+        let expected = RefusalReason::KeyOutsideBucket {
+            path: fixture.path_of("misplaced"),
+            key: Key::Long(appended[0]),
+            recorded,
+            computed: hashed,
+        };
+        assert!(
+            matches!(error, Error::Refused { ref reason, .. } if *reason == expected),
+            "{error:?}"
+        );
+        assert_eq!(
+            table.current().unwrap().snapshot_id,
+            SnapshotId(FIRST_SNAPSHOT)
+        );
+        let (serving, kept) = degraded(&table);
+        assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
+        assert_eq!(kept, ErrorKind::Refused(expected));
+        assert_eq!(
+            table.get(&Key::Long(all[0])).await.unwrap().value,
+            present(all[0])
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_concurrent_polls_swap_once() {
         let (mut fixture, all) = two_bucket_table().await;

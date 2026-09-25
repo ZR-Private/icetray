@@ -17,7 +17,8 @@ owner what a deviation costs, and the two must agree on one classification.
 ## Decision
 
 A table icetray cannot serve correctly (unsorted files, null or duplicate
-keys, a key column whose physical type does not match the schema, a value
+keys, keys outside their file's recorded bucket, a key column whose
+physical type does not match the schema, a value
 column that is not binary, fixed, or string, delete files, keys over 4,096
 bytes, and the residency refusals of RFD 017 (Residency tiers)) will be
 refused at load with a named reason; a
@@ -50,6 +51,17 @@ Placements settled elsewhere:
   priced in files probed per lookup; a duplicate key across overlapping
   files is a refusal, detected as RFD 005 (Generations and refresh)
   describes ([prototype findings, finding 9](../analysis/2026-09-10-prototype-findings.md#9-spark-writes-several-sorted-files-per-bucket-sometimes-overlapping)).
+- Keys outside their file's recorded bucket are a refusal: routing sends a
+  key only to the files of the bucket it hashes to, taking each file's
+  bucket from its manifest entry, so a key held in a file recorded under
+  another bucket answers absent though present. The load hashes each new
+  file's fences (the first key of every key page, RFD 004) and its first
+  and last key under the file's own bucketing, which costs one hash per
+  key page and refuses a file recorded under the wrong bucket. It serves a
+  file whose keys change bucket between two fences, which a writer that
+  partitions by bucket does not produce; hashing every key at every load
+  would cost tens of nanoseconds per row, seconds to minutes on a large
+  table.
 - A value column that is not binary, fixed, or string is refused because
   the wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)), so a typed column has no defined encoding and any answer

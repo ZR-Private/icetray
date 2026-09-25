@@ -128,11 +128,14 @@ pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Confi
 /// act on, and `Error::Refused`'s message carries them. Clone, not Copy.
 /// `DuplicateKeys` names the file the key appears in again: the same file
 /// for a duplicate within one file, the later file of a bucket otherwise.
+/// `KeyOutsideBucket` names a bucketed file, the first key found hashing to
+/// another bucket than its manifest entry records, and both buckets; the load
+/// hashes each new file's fences and first and last key.
 /// `ValueTypeUnsupported` is raised from the snapshot's schema by
 /// `TableLayout::derive`, so it names no file and carries the Iceberg type's
 /// `Display` (the type does not implement `Hash`); a data file whose physical
 /// type contradicts an admitted schema type is `FileFault::ValuePhysicalType`.
-pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize } }
+pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyOutsideBucket { path: String, key: Key, recorded: u32, computed: u32 }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize } }
 
 // snapshot
 /// A snapshot id is not an integer; it is never compared with one. Not a gauge value (an `f64`
@@ -714,7 +717,10 @@ impl Generation {
     /// indexes are built (the budget is shared by every table); Bloom takes
     /// none; over is
     /// `RefusalReason::OverBudget`. A file is reused from `previous` when its
-    /// path and size are unchanged. Overlap groups that gained a file are
+    /// path and size are unchanged. Each new bucketed file's fences and first
+    /// and last key are hashed under its own bucketing once its index is
+    /// built, and one outside the recorded bucket is
+    /// `RefusalReason::KeyOutsideBucket`. Overlap groups that gained a file are
     /// verified one at a time, so the load holds one group's key chunks at
     /// once and not the table's (RFD 017).
     /// `hedge` is the table's hedge window, handed to every FileHandle it opens.
@@ -965,7 +971,9 @@ Refusals (never findings; `Error::Refused` at load) are the `RefusalReason`
 variants: unsorted (a key below the one before it, within a row group or
 across two), null keys, duplicate keys (a key equal to the one before it
 within a file, or shared by two files of a bucket; never reported as
-unsorted), key type mismatch, key type unsupported (the key column's Iceberg
+unsorted), key outside bucket (a fence or the first or last key of a
+bucketed file hashes to another bucket than its manifest entry records;
+one hash per key page at load), key type mismatch, key type unsupported (the key column's Iceberg
 type is none of long, string, binary, fixed, or uuid), value type
 unsupported (the value column must be Iceberg binary, fixed, or string,
 served as opaque bytes), delete files, key too long, and the two residency
@@ -1196,7 +1204,7 @@ of the key), `layout` (`Layout` with `page_rows`, `page_bytes`,
 `KEY_COLUMN`, `VALUE_COLUMN`), `fixture` (`FixtureSpec` with `small` and
 `interleaved`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
 `keys_at`, and the sources `catalog_source`, `root_source`,
-`pinned_source`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
+`pinned_source`, and `raw_file_in_bucket`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
 `write_table_of_types`, `position_delete_file`, `memory_catalog_local`,
 `memory_catalog_s3` (their `MemoryCatalog` re-exported at the crate root, so a
 caller without `iceberg` can hold it), `local_catalog`, `residue_class`; the constants
@@ -1238,7 +1246,9 @@ over the rolling data-file writer under `Layout::properties`, grouping ids
 by the library's own bucket transform. Raw files (`RawFile`, committed
 through `fast_append`, which admits any data file) produce what the writer
 cannot: a key column whose Parquet type contradicts the schema, a null
-key, and the two unsupported-type tables. By-hand snapshots
+key, the two unsupported-type tables, and keys recorded under a bucket
+they do not hash to (`Fixture::raw_file_in_bucket`, the fixture's own rows
+with the bucket as the partition tuple). By-hand snapshots
 (`Fixture::commit_by_hand`) write a data manifest, a delete manifest when
 there are delete files, the manifest list, and the metadata at
 `catalog::version_file(root, n)` under `Operation::Overwrite`, then the
@@ -1287,7 +1297,9 @@ The acceptance suite is `tests/lookup.rs`, `lookup_s3.rs`, `refresh.rs`,
 (P), `sim.rs` (S), `golden.rs` (G), and `rest_catalog.rs` (C); the scale
 probe is `examples/scale.rs`, a program run by hand and not a test. One fixture per `RefusalReason` variant: descending
 order for `Unsorted`; a raw nullable key column for `NullKeys`; an
-overlapping append for `DuplicateKeys`; a raw `Utf8` key column on a
+overlapping append for `DuplicateKeys`; a raw file of bucket-0 keys
+recorded under bucket 1 (`Fixture::raw_file_in_bucket`) for
+`KeyOutsideBucket`; a raw `Utf8` key column on a
 long-keyed table for `KeyTypeMismatch`; `write_table_of_types` with an
 `Int` key for `KeyTypeUnsupported` and a `Long` value for
 `ValueTypeUnsupported`; a by-hand snapshot listing a position-delete file

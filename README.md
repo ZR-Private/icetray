@@ -93,8 +93,9 @@ same file-size target or it undoes the layout.
 
 Deviations fall into three tiers, and the line between them is what a
 client could observe. A table icetray cannot serve correctly is refused at
-load with a named reason: unsorted files, null or duplicate keys, a key
-column whose physical type contradicts the schema, an unsupported key or
+load with a named reason: unsorted files, null or duplicate keys, keys
+outside their file's recorded bucket, a key column whose physical type
+contradicts the schema, an unsupported key or
 value type, delete files, keys over the cap, and the residency refusals
 below. A table that serves correctly but slowly is priced: a dictionary
 encoded value column, key pages over 2,000 rows, no bucket partition, and

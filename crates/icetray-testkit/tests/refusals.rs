@@ -16,7 +16,7 @@ use icetray_core::approx::count;
 use icetray_core::config::{ConfigError, ConfigViolation, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
-    Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState,
+    Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, TINY_BUDGET, TWO_BUCKETS,
@@ -53,6 +53,12 @@ const OVER_CAP_PAD: usize = MAX_KEY_BYTES;
 
 /// Rows of the over-cap fixture: few, each a few kibibytes, in one bucket.
 const OVER_CAP_IDS: Range<u64> = 0..300;
+
+/// Ids the misplaced-bucket fixture draws its raw file's keys from: above
+/// the fixture's own `IDS_2K`, so no key is written twice, and enough that
+/// each of two buckets gets dozens.
+const STRAY_IDS: Range<u64> = IDS_2K.end..IDS_2K.end + STRAY_ID_COUNT;
+const STRAY_ID_COUNT: u64 = 100;
 
 /// A table whose first load was refused: the reason, and the storage left
 /// behind for the GET assertions.
@@ -356,6 +362,41 @@ async fn test_key_over_the_cap_is_refused() -> Result<()> {
         panic!("{:?}", refused.reason);
     };
     assert!(bytes > MAX_KEY_BYTES, "{bytes} bytes");
+    Ok(())
+}
+
+/// A raw file whose keys all hash to bucket 0, recorded under bucket 1:
+/// its first key is a fence, so the load refuses it rather than answer its
+/// keys `Absent`.
+#[tokio::test]
+async fn test_file_recorded_under_another_bucket_is_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: IDS_2K,
+        buckets: TWO_BUCKETS,
+        ..FixtureSpec::small("kv_misbucketed", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let (hashed, recorded) = (0, 1);
+    let ids: Vec<u64> = STRAY_IDS
+        .filter(|&id| bucket(&fixture.key(id), TWO_BUCKETS) == hashed)
+        .collect();
+    let raw = fixture.raw_file_in_bucket(RAW_FILE, &ids, i32::try_from(recorded).unwrap())?;
+    fixture.append_raw(catalog.as_ref(), raw).await?;
+    let refused =
+        refused_through_catalog(&fixture, &catalog, fixture.config(Residency::Full, false)).await?;
+    let RefusalReason::KeyOutsideBucket {
+        path,
+        key,
+        recorded: recorded_at,
+        computed,
+    } = &refused.reason
+    else {
+        panic!("{:?}", refused.reason);
+    };
+    assert_eq!(path, &format!("{}/{DATA_DIR}/{RAW_FILE}", fixture.root()));
+    assert_eq!(key, &fixture.key(ids[0]), "the first key, a fence");
+    assert_eq!((*recorded_at, *computed), (recorded, hashed));
     Ok(())
 }
 

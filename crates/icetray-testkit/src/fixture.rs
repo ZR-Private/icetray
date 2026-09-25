@@ -334,8 +334,10 @@ impl FixtureSpec {
 
 /// A Parquet file to commit as it is, for what the library's writer cannot
 /// produce: a key column whose Parquet type contradicts the schema, a null
-/// key, or a table of a type icetray refuses. Raw fixtures use unpartitioned
-/// tables, so the partition tuple is `Struct::empty()`.
+/// key, a table of a type icetray refuses, or keys recorded under a bucket
+/// they do not hash to. `partition` is the tuple of the table's default
+/// spec: `Struct::empty()` on an unpartitioned table, the bucket on a
+/// bucketed one (`Fixture::raw_file_in_bucket`).
 #[derive(Clone, Debug)]
 pub struct RawFile {
     /// The file's name under the table's data directory, extension included.
@@ -579,6 +581,28 @@ impl Fixture {
         self.commit_files(catalog, files).await?;
         self.ids.extend(ids);
         Ok(())
+    }
+
+    /// The rows of `ids`, which ascend, as one raw file named `name` in this
+    /// fixture's key type, values, and layout, with exact bounds, recorded
+    /// under `bucket` whatever buckets its keys hash to: how a test commits
+    /// a file whose keys fall outside its recorded bucket, which the
+    /// library's writer, grouping rows by the bucket they hash to, cannot.
+    /// `bucket` is the partition tuple's integer. `append_raw` commits it;
+    /// the ids are not added to the fixture's.
+    pub fn raw_file_in_bucket(&self, name: &str, ids: &[u64], bucket: i32) -> Result<RawFile> {
+        let schema = self.metadata.current_schema();
+        let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
+        let keys: Vec<Key> = ids.iter().map(|&id| self.key(id)).collect();
+        let rows = batch(&arrow_schema, &self.spec, ids, &keys)?;
+        let bounds = keys.first().cloned().zip(keys.last().cloned());
+        RawFile::from_batch(
+            name,
+            &rows,
+            &self.spec.layout,
+            Struct::from_iter([Some(Literal::int(bucket))]),
+            bounds,
+        )
     }
 
     /// Uploads `file` under the table's data directory through the table's

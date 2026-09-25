@@ -246,6 +246,14 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         RefusalReason::DuplicateKeys { path, key } => {
             format!("{reason} (file {path}, key {key})")
         }
+        RefusalReason::KeyOutsideBucket {
+            path,
+            key,
+            recorded,
+            computed,
+        } => format!(
+            "{reason} (file {path}, key {key} hashes to bucket {computed}, the manifest records bucket {recorded})"
+        ),
         RefusalReason::OverBudget { needed, budget } => {
             format!("{reason} (needed {needed} bytes, budget {budget} bytes)")
         }
@@ -294,6 +302,21 @@ pub enum RefusalReason {
         path: String,
         /// The repeated key.
         key: Key,
+    },
+    /// A key of a bucketed data file hashes to another bucket than the one
+    /// its manifest entry records (RFD 007). Routing sends a key only to the
+    /// files of its own bucket, so such a key would answer `Absent` though
+    /// present. The load hashes each file's fences and its first and last
+    /// key (`Generation::load`).
+    KeyOutsideBucket {
+        /// The data file's location.
+        path: String,
+        /// The first key found outside the bucket.
+        key: Key,
+        /// The bucket the manifest records for the file.
+        recorded: u32,
+        /// The bucket the key hashes to under the file's own bucketing.
+        computed: u32,
     },
     /// The key column's physical type is not the one its Iceberg type maps
     /// to, or is a `FIXED_LEN_BYTE_ARRAY` of a width that cannot hold it: a
@@ -354,6 +377,7 @@ impl fmt::Display for RefusalReason {
             Self::Unsorted { .. } => "unsorted",
             Self::NullKeys { .. } => "null_keys",
             Self::DuplicateKeys { .. } => "duplicate_keys",
+            Self::KeyOutsideBucket { .. } => "key_outside_bucket",
             Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
@@ -398,6 +422,15 @@ mod tests {
                     key: Key::Long(1),
                 },
                 "duplicate_keys",
+            ),
+            (
+                RefusalReason::KeyOutsideBucket {
+                    path: FILE_PATH.to_string(),
+                    key: Key::Long(1),
+                    recorded: 1,
+                    computed: 0,
+                },
+                "key_outside_bucket",
             ),
             (
                 RefusalReason::KeyTypeMismatch {
