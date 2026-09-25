@@ -43,6 +43,13 @@ pub fn age_seconds(since: jiff::Timestamp) -> f64 {
     now().duration_since(since).as_secs_f64()
 }
 
+/// A wall-clock timestamp as seconds since the Unix epoch, with the
+/// fraction: the `generation_swapped_at_seconds` gauge, the unit Prometheus
+/// reads a time in. The one place a timestamp becomes epoch seconds.
+pub fn unix_seconds(at: jiff::Timestamp) -> f64 {
+    at.as_duration().as_secs_f64()
+}
+
 /// A wall-clock timestamp as log text: RFC 3339 in UTC with a `Z` offset,
 /// through jiff's own printer, with the fraction of a second only when it
 /// is non-zero. The one place a timestamp becomes text.
@@ -225,6 +232,19 @@ mod tests {
     /// Milliseconds since the epoch with a fraction of a second, so the
     /// round trip carries the milliseconds.
     const EPOCH_MILLIS: i64 = 1_700_000_000_123;
+
+    /// `EPOCH_MILLIS` in seconds, the fraction kept.
+    const EPOCH_SECONDS: f64 = 1_700_000_000.123;
+
+    #[test]
+    fn test_unix_seconds_counts_from_the_epoch_with_the_fraction() {
+        assert_eq!(
+            super::unix_seconds(jiff::Timestamp::UNIX_EPOCH).to_bits(),
+            0.0f64.to_bits()
+        );
+        let at = super::timestamp_from_millis(EPOCH_MILLIS).unwrap();
+        assert_eq!(super::unix_seconds(at).to_bits(), EPOCH_SECONDS.to_bits());
+    }
 
     #[test]
     fn test_timestamp_from_millis_zero_is_the_epoch() {

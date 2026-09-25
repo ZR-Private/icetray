@@ -54,8 +54,9 @@ each named for the kind of quantity it yields (a ratio, a gauge reading, a
 count, a length), so every call site says what the float is for, and the
 loss of precision on very large values is accepted there by design. Ids
 and offsets never pass through them; the snapshot id that motivated the
-rule travels as a label on an info metric instead (RFD 012 (Deployment
-contract)).
+rule is left to logs and the table-info reply, and metrics report the
+snapshot's sequence number, a count of commits, instead (RFD 012
+(Deployment contract)).
 
 ## Alternatives Considered
 

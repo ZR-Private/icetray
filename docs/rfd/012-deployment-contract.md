@@ -67,9 +67,12 @@ counts, and latency histograms by kind (load, lookup), read from the
 request counter of RFD 003 (One storage stack); lookup latency by table and
 by result (cold hit, warm hit, miss); hedge counts; the resident index's
 live bytes per table beside process memory, because a residency tier that
-sheds bytes is not visible in process memory on every platform; and a
-generation info metric with the snapshot id as a label
-([prototype findings, finding 14](../analysis/2026-09-10-prototype-findings.md#14-metrics)).
+sheds bytes is not visible in process memory on every platform; and per
+table, the serving snapshot's sequence number and when it was swapped in.
+The snapshot id itself is in logs and the table-info reply, not in
+metrics: as a gauge value it loses digits
+([prototype findings, finding 14](../analysis/2026-09-10-prototype-findings.md#14-metrics)),
+and as a label it adds a series with every swap.
 
 The gRPC listener and its health service come up before any table has
 loaded. Readiness turns true only once every configured table serves its

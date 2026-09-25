@@ -323,9 +323,11 @@ Counters: `icetray_requests_total{call}`, `icetray_object_gets_total{kind}`,
 because a residency tier that sheds bytes is not visible in process memory
 on every platform), `icetray_page_cache_bytes`,
 `icetray_findings{table,code}`, `icetray_generation_age_seconds{table}`,
-`icetray_generation_info{table,snapshot_id}` (1 for the serving snapshot,
-with the id as a label so no digits are lost), and
-`icetray_table_state{table,state}`. Every label value is the name of an
+`icetray_generation_sequence_number{table}` (the serving snapshot's
+sequence number), `icetray_generation_swapped_at_seconds{table}` (when it
+was swapped in, in Unix seconds), and `icetray_table_state{table,state}`.
+No metric carries the snapshot id, so the series count does not grow with
+swaps; the id is in the swap's log line and in `TableInfo`. Every label value is the name of an
 enum variant, so the set of values is closed.
 
 Logs are JSON events on stdout at `info`, one object per line. The standard

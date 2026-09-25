@@ -715,7 +715,57 @@ async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
     assert_eq!(Some(response.value), stack.fixtures[0].value(&new_key));
     assert_eq!(response.snapshot_id, advanced.snapshot_id);
+
+    let (status, scrape) = stack.http_get(METRICS_PATH).await?;
+    assert_eq!(status, StatusCode::OK);
+    let sequence_number = stack.fixtures[0]
+        .metadata()
+        .current_snapshot()
+        .expect("the append committed a snapshot")
+        .sequence_number();
+    assert_eq!(
+        series_value(
+            &scrape,
+            metric::GENERATION_SEQUENCE_NUMBER,
+            &[(metric::LABEL_TABLE, TABLE)]
+        )
+        .map(f64::to_bits),
+        Some(approx::signed_gauge(sequence_number).to_bits()),
+        "the served snapshot's sequence number"
+    );
+    let swapped_at = series_value(
+        &scrape,
+        metric::GENERATION_SWAPPED_AT_SECONDS,
+        &[(metric::LABEL_TABLE, TABLE)],
+    )
+    .expect("a swap sets the swap time");
+    assert!(swapped_at > 0.0, "{swapped_at}");
+    assert!(labelled_with(&scrape, metric::LABEL_TABLE) > 0);
+    assert_eq!(
+        labelled_with(&scrape, SNAPSHOT_ID_LABEL),
+        0,
+        "a series per snapshot would grow with every swap"
+    );
     Ok(())
+}
+
+/// The label no metric carries: the snapshot id is in the logs and the
+/// table-info reply, and a series per snapshot would grow with every swap.
+const SNAPSHOT_ID_LABEL: &str = "snapshot_id";
+
+/// The sample lines of a Prometheus text exposition whose labels include
+/// `label`.
+fn labelled_with(exposition: &str, label: &str) -> usize {
+    exposition
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('{')?.1.split_once('}'))
+        .filter(|(labels, _)| {
+            labels
+                .split(',')
+                .any(|pair| pair.split_once('=').is_some_and(|(name, _)| name == label))
+        })
+        .count()
 }
 
 /// A `Get` issued before `shutdown` and awaited after it completes, and the

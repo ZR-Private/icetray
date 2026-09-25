@@ -30,10 +30,8 @@ static INSTALLING: Mutex<()> = Mutex::new(());
 /// Installs the Prometheus recorder once per process and returns its handle;
 /// every later call returns the same handle, since a `metrics` recorder is
 /// global and the daemon's tests start several servers in one process.
-/// Histograms use `LATENCY_BUCKETS`. No idle timeout: the exporter's only
-/// series removal is an idle timeout, which would also drop live gauges that
-/// core sets only on change, so a `generation_info` series of a replaced
-/// snapshot reads 0 until the process restarts.
+/// Histograms use `LATENCY_BUCKETS`. No idle timeout: it would drop live
+/// gauges that core sets only on change.
 pub fn install() -> Result<PrometheusHandle, ServeError> {
     let _installing = INSTALLING.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(handle) = HANDLE.get() {

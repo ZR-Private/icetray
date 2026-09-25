@@ -41,7 +41,7 @@ redefine.
 |---|---|---|
 | `error` | the one `Error` enum and `Result` | |
 | `snapshot` | `SnapshotId`, the newtype for an Iceberg snapshot id; it has no order and is a metric label, never a gauge value | 015 |
-| `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
+| `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`, and `signed_gauge` for a sequence number), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
 | `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
@@ -131,8 +131,12 @@ pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Confi
 pub enum RefusalReason { Unsorted { path: String, row_group: usize }, NullKeys { path: String, row_group: usize }, DuplicateKeys { path: String, key: Key }, KeyTypeMismatch { path: String, expected: KeyType, got: parquet::basic::Type }, KeyTypeUnsupported, ValueTypeUnsupported { got: String }, DeleteFiles, KeyTooLong { path: String, bytes: usize }, OverBudget { needed: u64, budget: u64 }, NoBloomFilter { path: String, row_group: usize } }
 
 // snapshot
-/// A snapshot id is not an integer; it is never compared with one.
+/// A snapshot id is not an integer; it is never compared with one. Not a gauge value (an `f64`
+/// loses its low digits) nor a metric label (a series per swap); logs and `TableInfo` carry it.
 pub struct SnapshotId(pub i64);
+/// A snapshot's sequence number, Iceberg's count of the table's commits; a newtype beside the id,
+/// and a gauge value (`generation_sequence_number`), exact in an `f64` up to 2^53 commits.
+pub struct SequenceNumber(pub i64);
 
 // metric
 /// Metric label values for lookups.
@@ -667,7 +671,7 @@ impl PageCache {
 // generation
 pub struct LoadedFile { pub entry: DataFileEntry, pub index: FileIndex }
 pub struct Generation {
-    pub table: String, pub snapshot_id: SnapshotId, pub metadata_location: String,
+    pub table: String, pub snapshot_id: SnapshotId, pub sequence_number: SequenceNumber, pub metadata_location: String,
     pub layout: TableLayout, pub residency: Residency, pub files: Vec<Arc<LoadedFile>> /* sorted by (bucketing, bucket, exact first key, path) */,
     pub records: u64, pub index_bytes: usize, pub loaded_at: Instant,
     /// The snapshot's own timestamp, from `snapshot.timestamp_ms()` through
@@ -804,8 +808,9 @@ impl Table {
 // then `Serving`; `index_bytes{table}` through `approx::gauge_len`; `findings{table, code}`
 // set for every `FindingCode::ALL` entry from the admitted generation's counts, zero for
 // the absent ones, so the gauge always describes the serving generation and a refused
-// generation's findings reach only the logs and the error; `generation_info` 0 for the
-// replaced snapshot and 1 for the new; `table_state{table, state}` 1 for the current state
+// generation's findings reach only the logs and the error; `generation_sequence_number{table}`
+// through `approx::signed_gauge` and `generation_swapped_at_seconds{table}` through
+// `time::unix_seconds(time::now())`, one series each per table; `table_state{table, state}` 1 for the current state
 // and 0 for the other two on every state change; one info event with `files`, `reused`
 // (by `Arc::ptr_eq`), `records`, `residency`, `index_bytes`.
 
@@ -868,6 +873,9 @@ pub fn system_now() -> SystemTime;
 /// Seconds from `since` to now, the `generation_age_seconds` gauge; a `since` in the future gives a
 /// negative age, kept as measured.
 pub fn age_seconds(since: jiff::Timestamp) -> f64;
+/// Seconds since the Unix epoch with the fraction, the `generation_swapped_at_seconds` gauge; the one
+/// place a timestamp becomes epoch seconds.
+pub fn unix_seconds(at: jiff::Timestamp) -> f64;
 /// RFC 3339 in UTC with a `Z` offset through jiff's printer, the fraction of a second only when it is
 /// non-zero; the one place a timestamp becomes log text.
 pub fn log_timestamp(at: jiff::Timestamp) -> String;
@@ -1346,11 +1354,13 @@ Histograms: `icetray_lookup_seconds{table,result}`,
 `icetray_process_rss_bytes`, `icetray_page_cache_bytes`,
 `icetray_findings{table,code}`, `icetray_generation_age_seconds{table}`
 (the served snapshot's timestamp to now, through the time-conversion
-helpers), `icetray_generation_info{table,snapshot_id}` (1 for the serving
-snapshot, 0 for the previous; a replaced snapshot's series reads 0 until the
-process restarts, since the exporter's only series removal is an idle
-timeout, which would also drop the live gauges `table` sets only on change,
-so the recorder installs none), `icetray_table_state{table,state}`.
+helpers), `icetray_generation_sequence_number{table}` (the serving
+snapshot's sequence number) and `icetray_generation_swapped_at_seconds{table}`
+(when it was swapped in, in Unix seconds), `icetray_table_state{table,state}`.
+No metric carries the snapshot id: a label per snapshot would add a series
+with every swap for the life of the process, since the recorder installs
+no idle timeout (it would drop the live gauges `table` sets only on
+change). The id is in the swap's log event and in `TableInfo`.
 
 Every label value is the `Display` of an enum, never a literal string at the
 call site: `kind` from a read-kind enum, `result` from `LookupResult`, `call`
@@ -1361,7 +1371,8 @@ gate, and the variant's snake_case name otherwise, `code` from `FindingCode`,
 
 Ownership: `table` emits `lookups_total`, `lookup_seconds`,
 `refresh_errors_total`, `generation_swaps_total`, `index_bytes`, `findings`,
-`generation_info`, and `table_state`; `cache` the two page-cache counters and
+`generation_sequence_number`, `generation_swapped_at_seconds`, and
+`table_state`; `cache` the two page-cache counters and
 the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
 series; the binary samples `generation_age_seconds` (from
 `Generation::snapshot_timestamp` against now) and `process_rss_bytes` once

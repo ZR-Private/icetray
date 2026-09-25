@@ -446,12 +446,11 @@ impl Table {
         }
     }
 
-    /// Makes `generation` the serving one. `generation_info` is set to 0 for
-    /// the snapshot it replaces and 1 for its own (no series is removed; a
-    /// replaced snapshot's reads 0 until the process restarts); the
-    /// `findings` gauge is set from
-    /// `findings` for every code, zero for the absent ones, so a code that
-    /// cleared on the swap reads zero.
+    /// Makes `generation` the serving one. The table's
+    /// `generation_sequence_number` and `generation_swapped_at_seconds`
+    /// gauges are set from it and the clock; the `findings` gauge is set
+    /// from `findings` for every code, zero for the absent ones, so a code
+    /// that cleared on the swap reads zero.
     fn swap(
         &self,
         generation: Generation,
@@ -488,10 +487,16 @@ impl Table {
             )
             .set(approx::gauge(findings.get(&code).copied().unwrap_or(0)));
         }
-        if let Some(previous) = previous {
-            self.generation_info(previous.snapshot_id, false);
-        }
-        self.generation_info(generation.snapshot_id, true);
+        metrics::gauge!(
+            metric::GENERATION_SEQUENCE_NUMBER,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(approx::signed_gauge(generation.sequence_number.0));
+        metrics::gauge!(
+            metric::GENERATION_SWAPPED_AT_SECONDS,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(time::unix_seconds(time::now()));
         let snapshot_id = generation.snapshot_id;
         self.current.store(Some(Arc::new(generation)));
         self.serve_state(snapshot_id);
@@ -533,17 +538,6 @@ impl Table {
             )
             .set(approx::gauge(u64::from(name == current)));
         }
-    }
-
-    /// Sets `generation_info` for one snapshot: 1 while it serves, 0 once
-    /// replaced.
-    fn generation_info(&self, snapshot_id: SnapshotId, serving: bool) {
-        metrics::gauge!(
-            metric::GENERATION_INFO,
-            metric::LABEL_TABLE => self.config.name.clone(),
-            metric::LABEL_SNAPSHOT_ID => snapshot_id.to_string()
-        )
-        .set(approx::gauge(u64::from(serving)));
     }
 
     /// `Error::KeyType` for a key of another type than the generation's.
@@ -1252,6 +1246,14 @@ mod tests {
             }
         }
 
+        /// The series, of any name, that carry `label`.
+        fn labelled_with(&self, label: &str) -> usize {
+            self.0
+                .iter()
+                .filter(|(key, ..)| key.key().labels().any(|have| have.key() == label))
+                .count()
+        }
+
         fn samples(&self, name: &str, labels: &[(&str, String)]) -> usize {
             match self.find(name, labels) {
                 DebugValue::Histogram(values) => values.len(),
@@ -1274,8 +1276,13 @@ mod tests {
         (metric::LABEL_TABLE, TABLE.to_string())
     }
 
+    /// The label no generation metric carries: a series per snapshot would
+    /// grow with every swap.
+    const LABEL_SNAPSHOT_ID: &str = "snapshot_id";
+
     #[test]
     fn test_metrics_follow_lookups_swaps_and_failures() {
+        let started = time::unix_seconds(time::now());
         let (reason, series) = recorded(async {
             let (mut fixture, all) = two_bucket_table().await;
             let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
@@ -1319,17 +1326,20 @@ mod tests {
             series.counter(metric::GENERATION_SWAPS_TOTAL, &[table_label()]),
             1
         );
-        let info = |snapshot: i64| {
-            series.gauge(
-                metric::GENERATION_INFO,
-                &[
-                    table_label(),
-                    (metric::LABEL_SNAPSHOT_ID, SnapshotId(snapshot).to_string()),
-                ],
-            )
-        };
-        assert_eq!(info(SECOND_SNAPSHOT).to_bits(), approx::gauge(1).to_bits());
-        assert_eq!(info(FIRST_SNAPSHOT).to_bits(), approx::gauge(0).to_bits());
+        assert_eq!(
+            series
+                .gauge(metric::GENERATION_SEQUENCE_NUMBER, &[table_label()])
+                .to_bits(),
+            approx::signed_gauge(SECOND_SEQUENCE).to_bits(),
+            "the swapped-in snapshot's, not the refused one's"
+        );
+        let swapped_at = series.gauge(metric::GENERATION_SWAPPED_AT_SECONDS, &[table_label()]);
+        assert!(
+            (started..=time::unix_seconds(time::now())).contains(&swapped_at),
+            "{swapped_at} is not between the test's start and now"
+        );
+        assert!(series.labelled_with(metric::LABEL_TABLE) > 0);
+        assert_eq!(series.labelled_with(LABEL_SNAPSHOT_ID), 0);
         assert_eq!(
             series.counter(
                 metric::REFRESH_ERRORS_TOTAL,

@@ -47,10 +47,12 @@ pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 pub const FINDINGS: &str = "icetray_findings";
 /// Seconds from the served snapshot's timestamp to now, by `table`.
 pub const GENERATION_AGE_SECONDS: &str = "icetray_generation_age_seconds";
-/// 1 for the serving snapshot and 0 for the one it replaced, by `table` and
-/// `snapshot_id`. No series is ever removed: a replaced snapshot's reads 0
-/// until the process restarts.
-pub const GENERATION_INFO: &str = "icetray_generation_info";
+/// The serving snapshot's sequence number, by `table`: one series per
+/// table, which each swap overwrites.
+pub const GENERATION_SEQUENCE_NUMBER: &str = "icetray_generation_sequence_number";
+/// When the serving generation was swapped in, in seconds since the Unix
+/// epoch, by `table`.
+pub const GENERATION_SWAPPED_AT_SECONDS: &str = "icetray_generation_swapped_at_seconds";
 /// 1 for the table's current state and 0 for the others, by `table` and `state`.
 pub const TABLE_STATE: &str = "icetray_table_state";
 
@@ -67,9 +69,6 @@ pub const LABEL_RESULT: &str = "result";
 pub const LABEL_REASON: &str = "reason";
 /// The `code` label: the finding, from `FindingCode`.
 pub const LABEL_CODE: &str = "code";
-/// The `snapshot_id` label: the snapshot id as a label, never a gauge value,
-/// because an `f64` loses its low digits (RFD 015).
-pub const LABEL_SNAPSHOT_ID: &str = "snapshot_id";
 /// The `state` label: the table's lifecycle state, from `TableState`.
 pub const LABEL_STATE: &str = "state";
 

@@ -48,6 +48,6 @@ pub use manifest::{Bucketing, DataFileEntry, TableLayout, list_data_files};
 pub use metric::LookupResult;
 pub use open::{Opened, open};
 pub use parquet_io::{FileHandle, Segments, SegmentsFault};
-pub use snapshot::SnapshotId;
+pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{HedgeWindow, IoStats, Located, Storage};
 pub use table::{Table, TableState};

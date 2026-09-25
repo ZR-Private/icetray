@@ -26,6 +26,12 @@ pub fn ratio(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+/// A signed count as a metric gauge value: a snapshot's sequence number,
+/// which counts the table's commits.
+pub fn signed_gauge(value: i64) -> f64 {
+    value as f64
+}
+
 /// A count or byte total as a metric gauge value.
 pub fn gauge(value: u64) -> f64 {
     value as f64
