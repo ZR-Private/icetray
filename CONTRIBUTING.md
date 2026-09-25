@@ -11,8 +11,13 @@ tool can check it.
 ## Toolchain
 
 - `rust-toolchain.toml` pins the exact stable version and the `rustfmt` and
-  `clippy` components. rustup installs it on first use, locally and in CI.
-  Bumping it is its own commit.
+  `clippy` components. CI installs it explicitly with `rustup toolchain
+  install`. Locally, rustup installs it the first time you run `cargo` in
+  the repository, through auto-install. Every rustup release except 1.28.0
+  auto-installs by default. Since 1.28.1, `rustup set auto-install
+  disable` or `RUSTUP_AUTO_INSTALL=0` turns it off. Without auto-install,
+  run `rustup toolchain install` in the repository yourself. Bumping the
+  pin is its own commit.
 - `.flox/env/manifest.toml` declares the development environment: `flox
   activate` puts rustup and the container runtime on PATH. It is a
   convenience, not a requirement. Nothing in CI, the hooks, or the `dev/`
