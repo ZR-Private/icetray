@@ -81,21 +81,17 @@ pub fn millis_after(base: i64, step: Duration) -> i64 {
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
 /// friendly form: `"10s"`, `"250ms"`, `"1m 30s"`. Only that grammar is
 /// accepted: a negative duration (`"-1s"`, `"1s ago"`) and text without a
-/// unit designator (`"10"`) are errors. Serialization writes the compact
-/// friendly form, so a value written by this module reads back equal.
+/// unit designator (`"10"`) are errors.
 pub mod friendly_duration {
     use std::time::Duration;
 
-    use jiff::fmt::friendly::{Designator, SpanParser, SpanPrinter};
+    use jiff::fmt::friendly::SpanParser;
     use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer};
 
     /// The parser of the friendly grammar, in its default configuration,
     /// which accepts every unit designator and no bare number.
     static PARSER: SpanParser = SpanParser::new();
-    /// The printer of the compact form (`1m 30s`, not `1 minute 30
-    /// seconds`), so a written value is short and parses back equal.
-    static PRINTER: SpanPrinter = SpanPrinter::new().designator(Designator::Compact);
 
     /// Parses the friendly form; anything else is a deserialization error.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
@@ -104,22 +100,17 @@ pub mod friendly_duration {
             .parse_unsigned_duration(&text)
             .map_err(D::Error::custom)
     }
-
-    /// Writes the compact friendly form, units balanced up to hours.
-    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&PRINTER.unsigned_duration_to_string(duration))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
 
     /// A field carrying the `with` module, so the tests go through serde
     /// exactly as a configuration field does.
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
     struct Holder {
         #[serde(with = "super::friendly_duration")]
         elapsed: Duration,
@@ -131,7 +122,7 @@ mod tests {
     const ONE_MINUTE: Duration = Duration::from_secs(60);
     /// The value `"250ms"` denotes.
     const QUARTER_SECOND: Duration = Duration::from_millis(250);
-    /// A value that spans two units, `"1m 30s"`, for the round trip.
+    /// The value `"1m 30s"` denotes, which spans two units.
     const NINETY_SECONDS: Duration = Duration::from_secs(90);
     /// A duration with a fractional second, so the float carries it.
     const ONE_AND_A_HALF_SECONDS: Duration = Duration::from_millis(1500);
@@ -322,13 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_round_trips_compact_form() {
-        let holder = Holder {
-            elapsed: NINETY_SECONDS,
-        };
-        let json = serde_json::to_string(&holder).unwrap();
-        assert_eq!(json, "{\"elapsed\":\"1m 30s\"}");
-        let back: Holder = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, holder);
+    fn test_deserialize_parses_two_units() {
+        assert_eq!(parse("1m 30s").unwrap().elapsed, NINETY_SECONDS);
     }
 }

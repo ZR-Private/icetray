@@ -169,35 +169,6 @@ impl Key {
             Self::Uuid(bytes) => Cow::Borrowed(bytes),
         }
     }
-
-    /// Whether `min <= key <= max` in the key's own order, where `min` and
-    /// `max` are Parquet statistics: for `Long` the eight little-endian bytes
-    /// of an INT64, for every other type the raw bytes. A statistic that
-    /// cannot be read never excludes: a `Long` bound of any other width
-    /// answers `true`, since a false miss is a wrong answer (RFD 007) and a
-    /// probe that could have been pruned is only a cost.
-    pub fn within_stats(&self, min: &[u8], max: &[u8]) -> bool {
-        match self {
-            Self::Long(value) => {
-                let (Some(low), Some(high)) = (long_statistic(min), long_statistic(max)) else {
-                    return true;
-                };
-                low <= *value && *value <= high
-            }
-            Self::Str(_) | Self::Bytes(_) | Self::Uuid(_) => {
-                let bytes = self.as_bytes();
-                min <= &*bytes && &*bytes <= max
-            }
-        }
-    }
-}
-
-/// An INT64 statistic as a long, or `None` when it is not exactly eight bytes.
-fn long_statistic(statistic: &[u8]) -> Option<i64> {
-    match <[u8; size_of::<i64>()]>::try_from(statistic) {
-        Ok(bytes) => Some(i64::from_le_bytes(bytes)),
-        Err(_) => None,
-    }
 }
 
 /// Lowercase hex, `HEX_DIGITS_PER_BYTE` per byte, no prefix.
@@ -311,13 +282,6 @@ mod tests {
     /// would not tell the two apart.
     const UTF8_WIDTH_RANGES: [std::ops::Range<u32>; 4] =
         [0x20..0x80, 0x80..0x800, 0x800..0xD800, 0x1_0000..0x11_0000];
-    /// The statistics truncation length of the truncation test: nine bytes,
-    /// inside the fifth character of `TRUNCATION_PREFIX`, so the writer's
-    /// UTF-8 boundary search is exercised as well as the cut.
-    const TRUNCATE_BYTES: usize = 9;
-    /// Two-byte characters every key of the truncation test starts with, so
-    /// the written bounds are cut prefixes and not the keys themselves.
-    const TRUNCATION_PREFIX: &str = "éééééééé";
     /// Random uuids drawn; each is expanded to every `SIGN_BIT_SETTINGS`.
     const UUID_DRAWS: usize = 128;
     /// The settings of the two halves' sign bits each drawn uuid is expanded
@@ -330,11 +294,11 @@ mod tests {
     /// `SPEC_UUID` as its canonical text; the display test pins the
     /// rendering to it.
     const SPEC_UUID_TEXT: &str = "f79c3e09-677c-4bbd-a479-3f349cb785e7";
-    /// A long inside the statistics range the `within_stats` tests use.
+    /// A long inside the range from `LOW` to `HIGH`.
     const INSIDE: i64 = 5;
-    /// The lower bound of that range.
+    /// A negative long, the lower end of that range.
     const LOW: i64 = -10;
-    /// The upper bound of that range.
+    /// A positive long, the upper end of that range.
     const HIGH: i64 = 10;
 
     /// Random uuids with every combination of the two halves' sign bits.
@@ -468,9 +432,8 @@ mod tests {
     }
 
     /// Asserts that each row group's written bounds are exact and equal the
-    /// least and greatest of the keys written into it under `Key`'s order,
-    /// and that every key is within its row group's bounds. Returns the keys
-    /// checked.
+    /// least and greatest of the keys written into it under `Key`'s order.
+    /// Returns the keys whose row groups were checked.
     fn assert_statistics_are_key_bounds(keys: &[Key], statistics: &[Statistics]) -> usize {
         let chunks = keys.chunks(ROW_GROUP_KEYS);
         assert_eq!(statistics.len(), chunks.len());
@@ -484,13 +447,7 @@ mod tests {
             let max_bytes = stats.max_bytes_opt().unwrap();
             assert_eq!(min_bytes, &*min.as_bytes());
             assert_eq!(max_bytes, &*max.as_bytes());
-            for key in chunk {
-                assert!(
-                    key.within_stats(min_bytes, max_bytes),
-                    "{key} within its row group"
-                );
-                checked += 1;
-            }
+            checked += chunk.len();
         }
         checked
     }
@@ -818,44 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn test_within_stats_holds_under_writer_truncated_statistics() {
-        let sample: Vec<String> = str_sample()
-            .iter()
-            .map(|text| format!("{TRUNCATION_PREFIX}{text}"))
-            .collect();
-        let keys: Vec<Key> = sample.iter().map(|text| Key::Str(text.clone())).collect();
-        let values: Vec<ByteArray> = sample
-            .iter()
-            .map(|text| ByteArray::from(text.as_str()))
-            .collect();
-        let properties = WriterProperties::builder()
-            .set_statistics_truncate_length(Some(TRUNCATE_BYTES))
-            .build();
-        let statistics = write_column::<ByteArrayType>(
-            key_field(PhysicalType::BYTE_ARRAY, Some(LogicalType::String), None),
-            properties,
-            &values,
-        );
-        let mut checked = 0;
-        for (chunk, stats) in keys.chunks(ROW_GROUP_KEYS).zip(&statistics) {
-            assert!(!stats.min_is_exact() && !stats.max_is_exact());
-            let min = stats.min_bytes_opt().unwrap();
-            let max = stats.max_bytes_opt().unwrap();
-            assert!(min.len() <= TRUNCATE_BYTES && max.len() <= TRUNCATE_BYTES);
-            // The cut lands on a character boundary, so both bounds are text.
-            assert!(std::str::from_utf8(min).is_ok() && std::str::from_utf8(max).is_ok());
-            for key in chunk {
-                assert!(key.as_bytes().len() > TRUNCATE_BYTES);
-                assert!(key.within_stats(min, max), "{key} within cut bounds");
-                checked += 1;
-            }
-            // A key before the shared prefix is still excluded.
-            assert!(!Key::Str(String::new()).within_stats(min, max));
-        }
-        assert_eq!(checked, ORDER_KEYS);
-    }
-
-    #[test]
     fn test_as_bytes_per_type() {
         assert_eq!(&*Key::Long(1).as_bytes(), &[1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(&*Key::Long(-1).as_bytes(), &[u8::MAX; size_of::<i64>()]);
@@ -888,39 +807,6 @@ mod tests {
         );
         assert_eq!(Key::from_datum(&Datum::int(1)), None);
         assert_eq!(Key::from_datum(&Datum::bool(true)), None);
-    }
-
-    #[test]
-    fn test_within_stats_long_boundaries() {
-        let low = LOW.to_le_bytes();
-        let high = HIGH.to_le_bytes();
-        assert!(Key::Long(INSIDE).within_stats(&low, &high));
-        assert!(Key::Long(LOW).within_stats(&low, &high));
-        assert!(Key::Long(HIGH).within_stats(&low, &high));
-        assert!(!Key::Long(LOW - 1).within_stats(&low, &high));
-        assert!(!Key::Long(HIGH + 1).within_stats(&low, &high));
-        assert!(Key::Long(INSIDE).within_stats(&INSIDE.to_le_bytes(), &INSIDE.to_le_bytes()));
-    }
-
-    #[test]
-    fn test_within_stats_long_unreadable_statistic_never_excludes() {
-        let low = LOW.to_le_bytes();
-        let high = HIGH.to_le_bytes();
-        // Each key would be excluded if the unreadable bound were read as
-        // the readable one beside it; the unreadable bound admits it instead.
-        assert!(Key::Long(LOW - 1).within_stats(&low[1..], &high));
-        assert!(Key::Long(HIGH + 1).within_stats(&low, &[]));
-        assert!(Key::Long(INSIDE).within_stats(&high, &[0; size_of::<i64>() + 1]));
-    }
-
-    #[test]
-    fn test_within_stats_bytes_prefix_cases() {
-        assert!(Key::Str("abc".into()).within_stats(b"ab", b"abd"));
-        assert!(Key::Bytes(b"ab".to_vec()).within_stats(b"a", b"ab"));
-        assert!(!Key::Str("ab".into()).within_stats(b"abc", b"abd"));
-        assert!(!Key::Bytes(b"abe".to_vec()).within_stats(b"ab", b"abd"));
-        assert!(Key::Uuid(SPEC_UUID).within_stats(&SPEC_UUID[..1], &SPEC_UUID));
-        assert!(!Key::Uuid(SPEC_UUID).within_stats(&SPEC_UUID, &SPEC_UUID[..1]));
     }
 
     #[test]

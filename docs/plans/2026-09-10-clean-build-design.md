@@ -49,7 +49,7 @@ the re-exports at the crate root (`icetray_core::FileIndex`).
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`, and `signed_gauge` for a sequence number), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
 | `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
-| `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
+| `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary) | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, the page cache's disk block, file size target, key length cap and advice); a shared constant that is not a layout number lives with what it bounds (`key`, `check::thresholds`, `config`) | 002, 008 |
 | `config` | the configuration schema and its validation; TOML and JSON parsing; defaults | 011 |
@@ -189,8 +189,6 @@ impl Key {
     pub(crate) fn from_datum(datum: &iceberg::spec::Datum) -> Option<Self>;
     /// The bytes the bucket transform and byte-wise comparisons see.
     pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]>;
-    /// A statistic that cannot be read never excludes.
-    pub fn within_stats(&self, min: &[u8], max: &[u8]) -> bool;
 }
 impl std::fmt::Display for Key { /* the integer, a Debug-quoted string, 0x-prefixed hex, a hyphenated uuid */ }
 
