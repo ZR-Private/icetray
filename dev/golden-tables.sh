@@ -11,9 +11,12 @@
 # Then: ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 set -euo pipefail
 
-# The Spark the recipe was written for (3.5) with Python, on a multi-arch
-# image, so the same run works on an arm64 laptop and an amd64 runner.
-IMAGE=apache/spark:3.5.9-python3
+# The newest Spark line Iceberg ships a runtime for (4.1; Iceberg 1.11 has
+# none for 4.2), with Python and the Java 17+ that Spark 4 requires (this
+# image carries 21), on a multi-arch image, so the same run works on an
+# arm64 laptop and an amd64 runner. Its Scala (2.13) must match the
+# runtime's suffix in the recipe's ICEBERG_PACKAGE.
+IMAGE=apache/spark:4.1.3-python3
 # The driver runs everything in local mode; the wide tables hold gigabytes
 # of incompressible values, and less than this spills or fails the job.
 DRIVER_MEMORY=4g

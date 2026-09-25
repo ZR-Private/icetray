@@ -6,15 +6,17 @@ serving cost RFD 007 prices and whose findings RFD 016 reports. Run it against
 any object store or local directory; the tests locate the result through
 ICETRAY_GOLDEN_WAREHOUSE.
 
-    pip install 'pyspark==3.5.*'
+    pip install 'pyspark==4.1.*'
     python3 dev/golden-tables.py --warehouse s3a://bucket/prefix/warehouse
     python3 dev/golden-tables.py --warehouse file:///tmp/icetray-golden
 
 Without Spark on the host, dev/golden-tables.sh runs this script with Spark in
 a container against a warehouse under target/.
 
-Needs Spark 3.5 with the Iceberg runtime on its classpath; --packages adds it
-from Maven when it is absent. A Hadoop catalog is used so that a table root
+Needs Spark 4.1 (Java 17 or later) with the Iceberg runtime on its classpath;
+--packages adds it from Maven when it is absent. 4.1 is the newest Spark line
+Iceberg 1.11 ships a runtime for, and the runtime's Scala suffix (2.13) must
+match the Spark build's. A Hadoop catalog is used so that a table root
 and its version hint are the only handles a reader needs, with no catalog
 service to run.
 
@@ -31,7 +33,7 @@ column whose physical type contradicts the schema.
 import argparse
 import time
 
-ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.1"
+ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0"
 CATALOG = "golden"
 
 # Decimal gigabytes, the unit the per-table line prints file bytes in.

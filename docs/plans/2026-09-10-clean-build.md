@@ -98,10 +98,15 @@ One worker.
    which the library requires before it loads a table; the client is now
    built with the library's in-memory factory, a placeholder that is never
    asked to build because every byte goes through `Storage`.
-3. Golden tables: `dev/golden-tables.sh` runs the recipe with Spark in a
-   container against `target/golden-warehouse`, and `dev/test-golden.sh`
-   runs the golden tests (`icetray-testkit/tests/golden.rs`, ignored tests)
-   against it. The first run found that a Hadoop catalog records locations
+3. Golden tables: `dev/golden-tables.sh` runs the recipe with Spark 4.1.3
+   and Iceberg 1.11.0 (`iceberg-spark-runtime-4.1_2.13`) in a container
+   against `target/golden-warehouse`, and `dev/test-golden.sh` runs the
+   golden tests (`icetray-testkit/tests/golden.rs`, ignored tests) against
+   it. The tables were first written by Spark 3.5.9 with Iceberg 1.10.1;
+   the move to 4.1 changed the Parquet writer from parquet-mr 1.16.0 to
+   1.17.1 and left every property the doctor reads the same (rows, pages,
+   alignment, dictionary, bloom filter bytes, bounds, format version 2),
+   and the golden tests passed unchanged. The first run found that a Hadoop catalog records locations
    as `file:/path`, with no authority, which `Storage::locate` refused as
    relative; the form is accepted now. The recipe's contract tables drew
    `large_value_pages` advice at the doctor's first threshold of 128 KiB:

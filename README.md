@@ -441,11 +441,13 @@ and a refresh, and prints what it measured:
 cargo run -p icetray-testkit --example scale --release
 ```
 
-`dev/golden-tables.sh` runs the recipe with Spark 3.5 in a container, so
-the host needs neither Spark nor a Java runtime; the recipe itself runs
-anywhere Spark 3.5 has the Iceberg runtime on its classpath and can write to
-any object store or local directory. It is also the worked example of the
-contract: the properties it sets are the ones a table owner sets.
+`dev/golden-tables.sh` runs the recipe with Spark 4.1.3 and Iceberg 1.11.0
+(`iceberg-spark-runtime-4.1_2.13`) in a container, so the host needs neither
+Spark nor a Java runtime; the recipe itself runs anywhere Spark 4.1 has the
+Iceberg runtime on its classpath and can write to any object store or local
+directory. Spark 4.1 is the newest line Iceberg 1.11 ships a runtime for.
+The recipe is also the worked example of the contract: the properties it
+sets are the ones a table owner sets.
 
 ## Design
 
