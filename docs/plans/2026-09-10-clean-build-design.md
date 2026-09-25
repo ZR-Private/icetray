@@ -1066,8 +1066,11 @@ waiting and aborts both server tasks (tonic serves each connection on a
 task of its own, so a call still open ends with the process), closes the
 page cache all the same, and ends the run with
 `ServeError::DrainOverran { after }`, exit 1. A shutdown asked for while the
-first loads run is honoured as soon as they end, cutting the grace short
-and never flipping to `SERVING`. Every drain, after a shutdown or a failed
+first loads run ends them where they wait and drains, `Ok` (exit 0), never
+flipping to `SERVING`: a dropped load swaps nothing in, releases its disk
+budget reservation, and leaves no partial chunk file, and what it did
+write the next start's retention deletes unless a table references it. A
+shutdown asked for once the first loads have failed cuts the grace short. Every drain, after a shutdown or a failed
 run, first sets both health names `NOT_SERVING` and then removes them,
 which ends every `Health/Watch` stream: tonic's graceful shutdown waits for
 every connection to close, and an open watch would hold its connection,

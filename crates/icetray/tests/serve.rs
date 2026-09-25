@@ -15,7 +15,7 @@ use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, metric};
+use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
@@ -136,6 +136,11 @@ const IN_FLIGHT_CAP: usize = 2;
 /// inside `SHORT_DEADLINE`, so the refusal is seen not to wait for a slot.
 const REFUSED_WITHIN: Duration = Duration::from_millis(100);
 
+/// How soon a shutdown during the first loads ends the run: the drain of a
+/// daemon that never served, with room for a loaded machine, and far inside
+/// the refresh deadline the held load would otherwise wait out.
+const FIRST_LOAD_SHUTDOWN_WITHIN: Duration = Duration::from_secs(1);
+
 /// The drain deadline the overrun test configures: short, and far inside
 /// the default `get_deadline`, so the held call outlasts the drain.
 const SHORT_DRAIN: Duration = Duration::from_millis(300);
@@ -171,6 +176,9 @@ struct Setup {
     fixtures: Vec<Fixture>,
     config: Config,
     options: ServeOptions,
+    /// Holds the in-process store before the daemon starts, so the first
+    /// loads wait on it until it is released.
+    hold_store: bool,
 }
 
 /// A configuration over `s3` serving `tables` with both listeners on
@@ -216,13 +224,18 @@ impl Stack {
             fixtures,
             config: config_over(&s3, tables),
             options: ServeOptions::default(),
+            hold_store: false,
         };
         configure(&mut setup).await?;
         let Setup {
             fixtures,
             config,
             options,
+            hold_store,
         } = setup;
+        if hold_store {
+            s3.hold();
+        }
         let storage = Arc::new(Storage::new(s3.storage_config()));
         let stats = storage.stats();
         let serving = Serving::start_over(config, storage, telemetry::install()?, options).await?;
@@ -922,9 +935,12 @@ async fn test_periodic_task_panic_ends_the_run_naming_the_task() -> TestResult {
     Ok(())
 }
 
-/// A shutdown asked for while the first loads run is honoured as soon as
-/// they end: a failed start whose grace is `SHUTDOWN_WAIT` long reports its
-/// failure well inside the grace instead of sleeping it out.
+/// A shutdown asked for once the first loads have failed cuts the grace
+/// short: a failed start whose grace is `SHUTDOWN_WAIT` long reports its
+/// failure well inside the grace instead of sleeping it out. The shutdown
+/// waits for the table to be `Degraded`, which the load sets on the run's
+/// task in the poll that ends the loads, so the loads' outcome is in hand
+/// before the shutdown is asked for.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -937,12 +953,50 @@ async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestRe
         },
     )
     .await?;
+    let table = Arc::clone(&stack.serving.opened().tables[0]);
+    poll_until(REFRESH_WAIT, "the first load failing", async || {
+        Ok(matches!(table.state(), TableState::Degraded { .. }).then_some(()))
+    })
+    .await?;
     stack.serving.shutdown();
     let outcome = tokio::time::timeout(REFRESH_WAIT, stack.serving.join()).await?;
     let Err(ServeError::FirstLoad { failures }) = outcome else {
         panic!("expected a first-load failure, got {outcome:?}");
     };
     assert_eq!(failures.len(), 1);
+    Ok(())
+}
+
+/// A shutdown asked for while a first load waits on a store that has
+/// stopped answering ends the load and the run at once, `Ok`, instead of
+/// waiting for the load to reach its refresh deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_during_the_first_loads_ends_them() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    assert!(ServerConfig::default().refresh_deadline > SHUTDOWN_WAIT);
+    let stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.hold_store = true;
+            Ok(())
+        },
+    )
+    .await?;
+    poll_until(
+        SHUTDOWN_WAIT,
+        "the first load reaching the store",
+        async || Ok((stack.s3.held() > 0).then_some(())),
+    )
+    .await?;
+
+    stack.serving.shutdown();
+    let (outcome, elapsed) =
+        tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.serving.join())).await?;
+    outcome?;
+    assert!(
+        elapsed < FIRST_LOAD_SHUTDOWN_WITHIN,
+        "the run ended {elapsed:?} after the shutdown"
+    );
     Ok(())
 }
 

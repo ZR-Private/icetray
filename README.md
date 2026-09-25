@@ -274,6 +274,8 @@ logged, health stays `NOT_SERVING` for ten seconds so an orchestrator's
 probe sees the refusal beside its logged reason, and the process exits 1.
 A silently missing table is worse than a crash at boot. SIGTERM or SIGINT
 drains in-flight requests, flushes the page cache's disk level, and exits 0.
+A signal that arrives while the first loads run ends them where they wait,
+so a slow first load does not hold the drain past an orchestrator's grace.
 The drain waits at most `server.drain_deadline` for open calls. Past it,
 the drain stops waiting, the page cache is still flushed, and the process
 exits 1; a call still open ends with the process.

@@ -375,15 +375,30 @@ struct Run {
 impl Run {
     /// The loads, then either the failed start (the grace, the drain, and
     /// `FirstLoad`) or the serving run until shutdown. A shutdown asked for
-    /// while the tables load is honoured as soon as the loads end: the grace
-    /// is cut short, and a run whose loads succeeded drains without ever
-    /// flipping to `SERVING`, since the servers stopped accepting when the
-    /// shutdown was asked for. A periodic task that panics before the
-    /// shutdown aborts it, a pending shutdown included, ends the run as
-    /// `Periodic`, so the process exits non-zero instead of serving on with
-    /// nothing refreshing.
+    /// while the tables load ends the loads where they are waiting and
+    /// drains: no table serves, so a lookup is refused at once rather than
+    /// held open, the drain ends `Ok` well inside its deadline, and the page
+    /// cache is closed before an orchestrator's grace runs out. A
+    /// dropped load swaps nothing in, releases its disk budget reservation,
+    /// and leaves no partial chunk file, since a chunk file is written
+    /// under a temporary name and renamed; what it did write, the next
+    /// start's retention deletes unless a table references it. A shutdown
+    /// asked for once the loads have failed cuts the grace short. A
+    /// periodic task that panics before the shutdown aborts it, a pending
+    /// shutdown included, ends the run as `Periodic`, so the process exits
+    /// non-zero instead of serving on with nothing refreshing.
     async fn run(self) -> Result<(), ServeError> {
-        let failures = load_all(&self.opened).await;
+        // Biased, the loads first: when they have ended and a shutdown is
+        // pending at the same poll, their outcome stands.
+        let loaded = tokio::select! {
+            biased;
+            failures = load_all(&self.opened) => Some(failures),
+            () = stop(self.shutdown.subscribe()) => None,
+        };
+        let Some(failures) = loaded else {
+            tracing::info!("shutdown during the first loads");
+            return self.drain().await;
+        };
         if !failures.is_empty() {
             tokio::select! {
                 () = tokio::time::sleep(self.options.start_failure_grace) => {}
