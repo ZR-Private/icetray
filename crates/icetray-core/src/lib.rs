@@ -38,7 +38,10 @@ pub use config::{
 };
 pub use error::{Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
-pub use index::{FileFault, FileIndex, Inspected, PageRef, ResidentBytes, RowRef};
+pub use index::{
+    ChunkPage, FileFault, FileIndex, HeaderField, Inspected, PageHeaderFault, PageRef,
+    ResidentBytes, RowRef, WireType,
+};
 pub use key::{Key, KeyType};
 pub use local::{DataFileIdentity, DiskChunks, DiskTier, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout, list_data_files};

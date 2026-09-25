@@ -491,7 +491,27 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// them), a key or value page holding other rows than its offset index gives
 /// it. `UnplaceableBloomFilter` is a filter the footer places nowhere the
 /// file holds, its end past the file's last byte included.
-pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
+/// `MalformedPageHeader` and `PageHeaderOverBound` are a key page header,
+/// read ahead of parquet with the index's own compact-thrift reader, that
+/// parquet would not read to the same numbers or that declares more than
+/// its page can hold: an uncompressed size above its rows times the key
+/// cap and an encoding allowance, a dictionary of more values than its row
+/// group's rows, a compressed size past its place in the offset index.
+pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
+/// A page of a column chunk as a fault names it: the dictionary page, or a
+/// data page by its position in the offset index.
+pub enum ChunkPage { Dictionary, Data(usize) }
+/// The `PageHeader` fields a page-header fault names.
+pub enum HeaderField { PageType, UncompressedPageSize, CompressedPageSize, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, NumValues }
+/// Why a key page header is not one parquet reads to the pre-scan's numbers:
+/// truncated, a varint past 64 bits or an integer past its field's width, a
+/// field id overflow, an unknown wire type, a field parquet reads sent as
+/// another wire type, a set, map, or boolean list parquet cannot skip in
+/// step, nesting past parquet's skip depth, a missing or negative field, an
+/// unknown page type, or a page type its place does not hold.
+pub enum PageHeaderFault { Truncated, VarintTooLong, OutOfRange, FieldIdOverflow, UnknownWireType(u8), WireTypeMismatch { field: i16, wire: WireType }, Unskippable(WireType), TooDeep, Missing(HeaderField), Negative(HeaderField), UnknownPageType(i32), UnexpectedPageType(parquet::basic::PageType) }
+/// The Thrift compact protocol's wire types, by their codes.
+pub enum WireType { BoolTrue, BoolFalse, Byte, I16, I32, I64, Double, Binary, List, Set, Map, Struct }
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
 /// `disk_bytes` is the whole chunk file the Disk tier writes (envelope, header, key chunks), the
 /// figure `index_budget_bytes` is charged; `key_chunk_bytes` and `filter_bytes` are the parts the
@@ -513,7 +533,8 @@ impl FileIndex {
     /// with no local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`. Every tier
     /// streams the key chunks once for verification, checking every key page
-    /// against its offset index; Full keeps the chunks in memory, Disk writes
+    /// header against what its page can hold before parquet reads it, and
+    /// every key page against its offset index; Full keeps the chunks in memory, Disk writes
     /// them through `LocalDir` (or reuses a chunk file with matching identity
     /// and skips the chunk fetch), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are

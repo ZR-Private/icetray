@@ -90,6 +90,27 @@ Resident bytes per key grow with key length
 so long keys push a table toward another residency (RFD 017) and the cap in
 RFD 008.
 
+Parquet sizes buffers from numbers in a page's header before the index can
+check the page: it reserves the page's declared uncompressed size, up to
+2 GiB, and sizes a dictionary by its declared value count. Every replica
+loads the same snapshot, so a file that lies in either would make each one
+that loads it allocate what it claims. Load therefore reads the header of
+every key page ahead of parquet, with a reader of its own for the Thrift
+compact encoding that refuses any header parquet would read to other
+numbers, and refuses as a file fault a data page declaring more
+uncompressed bytes than its rows could encode to with every key at the cap
+of RFD 008 (Keys), a dictionary of more values than its row group has rows
+or of more bytes than those values at the cap, and a compressed size past
+the page's place in the offset index. On a refresh the refusal leaves the
+previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
+run far past the cap can meet this refusal before the key-length one. What
+the pre-scan does not cover: its bounds rest on the footer's row counts, so
+a footer claiming billions of rows widens them; value pages and a value
+column's dictionary, read at lookup, are not pre-scanned; and the value
+counts inside a page body, the lengths a delta-length or delta byte-array
+page carries, stay unchecked. Parquet's decoder reads those; Iceberg's
+default writer uses v1 pages, which do not carry them for key columns.
+
 One question stays open. Decoded key arrays as an opt-in: under a per-table
 memory budget they remove the per-lookup decode for tables that can afford
 the memory; withholding them keeps one code path and one memory model until

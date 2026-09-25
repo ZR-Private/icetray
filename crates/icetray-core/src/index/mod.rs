@@ -10,6 +10,7 @@
 
 mod build;
 mod inspect;
+mod page_header;
 #[cfg(test)]
 mod testing;
 
@@ -38,6 +39,7 @@ use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one};
 pub use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
+pub use page_header::{ChunkPage, HeaderField, PageHeaderFault, WireType};
 
 /// A row's position in a file: its row group and its row within that group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -89,6 +91,39 @@ pub enum FileFault {
         row_group: usize,
         /// The page, counted among the column's data pages in the row group.
         page: usize,
+    },
+    /// A key page's header does not decode as the compact-thrift
+    /// `PageHeader` parquet reads it as, or is not a header of the page its
+    /// place in the chunk holds; checked before parquet reads it (RFD 004).
+    #[error("the header of {page} of row group {row_group} does not decode: {fault}")]
+    MalformedPageHeader {
+        /// The row group holding the page.
+        row_group: usize,
+        /// The page.
+        page: ChunkPage,
+        /// What is wrong with its header.
+        fault: PageHeaderFault,
+    },
+    /// A key page's header declares more than its page can hold: an
+    /// uncompressed size above what its rows could encode to at the key
+    /// cap, a dictionary of more values than the row group has rows, or a
+    /// compressed size past the page's place in the chunk. Parquet sizes a
+    /// buffer by the first two before it reads a byte of the page, so the
+    /// header is refused before parquet reads it (RFD 004).
+    #[error(
+        "{page} of row group {row_group} declares {field} {declared}, above the {allowed} it can hold"
+    )]
+    PageHeaderOverBound {
+        /// The row group holding the page.
+        row_group: usize,
+        /// The page.
+        page: ChunkPage,
+        /// The header field that declares too much.
+        field: HeaderField,
+        /// What the header declares.
+        declared: u64,
+        /// The most the page can hold.
+        allowed: u64,
     },
     /// A row position lies outside every page of its row group.
     #[error("row {row} is outside every page of row group {row_group}")]
@@ -454,8 +489,10 @@ impl FileIndex {
     /// Iceberg type, so the file contradicts it), no rows, row counts that
     /// disagree, no offset index on either column or one that does not
     /// describe its pages, an unbounded or undecodable bloom filter, a
-    /// string key that is not UTF-8, a key page holding other rows than
-    /// its offset index says. Footer checks run before any chunk is
+    /// string key that is not UTF-8, a key page header parquet would not
+    /// read to the numbers the index reads or that declares more than its
+    /// page can hold, a key page holding other rows than its offset index
+    /// says. Footer checks run before any chunk is
     /// fetched; `inspect` is that stage on its own. The Disk tier with no
     /// local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is

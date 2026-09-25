@@ -17,6 +17,7 @@ use parquet::errors::ParquetError;
 use parquet::file::serialized_reader::SerializedPageReader;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
+use super::page_header::check_page_headers;
 use super::{
     Column, ColumnChunk, FileFault, FileIndex, GroupRange, Inspected, KeyResidency, KeyShape, Keys,
     file_fault, identity_of, off_worker, row_index,
@@ -305,8 +306,10 @@ struct Verified {
 /// contract requires of them (RFD 007): no null, UTF-8 in a string column,
 /// every key above the one before it within a row group and across row
 /// groups (a key equal to the one before it is a duplicate, a key below
-/// it is unsorted), none over `contract::MAX_KEY_BYTES`. Every key page is
-/// checked against the rows its offset index gives it on the way. Records
+/// it is unsorted), none over `contract::MAX_KEY_BYTES`. Every key page
+/// header of a row group is checked against what its page can hold before
+/// the row group is decoded (`check_page_headers`), and every key page
+/// against the rows its offset index gives it on the way. Records
 /// the exact first and last key of the file and of every row group, the
 /// longest key, and the fences. Nothing here consults column statistics.
 fn verify(
@@ -323,6 +326,7 @@ fn verify(
     for row_group in 0..total {
         let chunk = column.group(row_group);
         let rows = chunk.rows();
+        check_page_headers(chunk, chunks)?;
         let keys = decode_run(chunk, shape, 0..rows, Arc::clone(chunks))?;
         if keys.len() < row_index(rows) {
             let reason = RefusalReason::NullKeys {
@@ -487,16 +491,17 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// otherwise.
 ///
 /// Three allocations happen inside parquet before this function sees what
-/// sized them, and are not bounded here. The page reader reserves a page's
-/// uncompressed size from its header, at most `i32::MAX` bytes, when it
-/// decodes the page (a Snappy chunk zero-fills it), and hands out the
-/// decoded page after: no public parquet API reads a page header ahead of
-/// the page reader, since `PageReader::peek_next_page` returns rows and
-/// levels but no sizes and the only public header type, in
-/// `parquet::format`, is deprecated. A dictionary page's value count, from
-/// its header, sizes the dictionary it decodes into. A delta-length or
+/// sized them. The page reader reserves a page's uncompressed size from its
+/// header when it decodes the page (a Snappy chunk zero-fills it), and a
+/// dictionary page's value count, from its header, sizes the dictionary it
+/// decodes into; `verify` reads the header of every key page ahead of the
+/// page reader and refuses one that declares more than its page can hold
+/// (`check_page_headers`) before the row group's first decode. A value
+/// page and a value column's dictionary page, decoded here at lookup, are
+/// not read ahead, so their headers' sizes, at most `i32::MAX` bytes, and
+/// the dictionary's value count are used as declared. A delta-length or
 /// delta byte-array page sizes its lengths by the count in its encoded
-/// data.
+/// data, which no check reads.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -573,14 +578,24 @@ mod tests {
     use super::*;
     use crate::approx::count;
     use crate::config::{ConfigError, ConfigViolation};
+    use crate::generation::testing::Dictionary;
     use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
+    use crate::index::page_header::{
+        COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
+        DICTIONARY_PAGE_HEADER_FIELD, MOST_BYTES_PER_VALUE, NIBBLE_BITS, NIBBLE_MASK,
+        NUM_VALUES_FIELD, PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader, TYPE_FIELD,
+        UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
+    };
     use crate::index::testing::{
         FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
         group_rows, key_for, location, longs, pages_of, predicted_of, row_of, stepped, store,
         store_file, with_column_chunk, with_group_rows, with_pages,
     };
-    use crate::index::{Column, FileFault, KeyShape, RowRef};
+    use crate::index::{
+        ChunkPage, Column, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef, WireType,
+    };
     use crate::key::KeyType;
+    use parquet::basic::PageType;
 
     /// Rows per row group in the hand-written fixtures with two row groups.
     const TINY_GROUP_ROWS: usize = 2;
@@ -837,25 +852,12 @@ mod tests {
         );
     }
 
-    /// The low four bits of a compact-thrift field header: the field's type.
-    const THRIFT_TYPE_MASK: u8 = 0x0f;
-    /// The shift that brings a compact-thrift field header's high four bits,
-    /// the field id's delta from the one before, down to the low four.
-    const THRIFT_DELTA_SHIFT: u8 = 4;
-    /// Compact thrift's type code for an `i32`, written as a zigzag varint.
-    const THRIFT_I32: u8 = 5;
-    /// Compact thrift's type code for a struct.
-    const THRIFT_STRUCT: u8 = 12;
-    /// The field id of `data_page_header` in parquet's `PageHeader`.
-    const DATA_PAGE_HEADER_FIELD: u8 = 5;
-    /// The bit of a varint byte that says another byte follows.
-    const VARINT_CONTINUES: u8 = 0x80;
-
-    /// The byte range of the value count in a data page header in compact
-    /// thrift: the varint of `num_values`, the first field of the header's
-    /// `data_page_header` struct. Every field before that struct is an
-    /// `i32`, as parquet writes a data page's header.
-    fn num_values_varint(header: &[u8]) -> Range<usize> {
+    /// The byte range of `field`'s varint in a page header in compact
+    /// thrift, as parquet writes a data or dictionary page's header: `i32`
+    /// fields, then the page-specific struct, whose first field is
+    /// `num_values`. `field` is one of the header's `i32` fields or
+    /// `NumValues`.
+    fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
         let varint_end = |from: usize| {
             from + header[from..]
                 .iter()
@@ -863,23 +865,47 @@ mod tests {
                 .unwrap()
                 + 1
         };
+        let wanted = match field {
+            HeaderField::PageType => Some(TYPE_FIELD),
+            HeaderField::UncompressedPageSize => Some(UNCOMPRESSED_PAGE_SIZE_FIELD),
+            HeaderField::CompressedPageSize => Some(COMPRESSED_PAGE_SIZE_FIELD),
+            HeaderField::NumValues => None,
+            HeaderField::DataPageHeader
+            | HeaderField::DataPageHeaderV2
+            | HeaderField::DictionaryPageHeader => panic!("{field} is a struct, not a varint"),
+        };
         let mut at = 0;
-        let mut field = 0;
+        let mut id = 0;
         loop {
             let byte = header[at];
-            field += byte >> THRIFT_DELTA_SHIFT;
+            id += i16::from(byte >> NIBBLE_BITS);
             at += 1;
-            match byte & THRIFT_TYPE_MASK {
-                THRIFT_I32 => at = varint_end(at),
-                THRIFT_STRUCT if field == DATA_PAGE_HEADER_FIELD => {
-                    assert_eq!(
-                        header[at],
-                        (1 << THRIFT_DELTA_SHIFT) | THRIFT_I32,
-                        "num_values is the struct's first field"
-                    );
-                    return at + 1..varint_end(at + 1);
+            let code = byte & NIBBLE_MASK;
+            if code == WireType::I32.code() {
+                let end = varint_end(at);
+                if wanted == Some(id) {
+                    return at..end;
                 }
-                other => panic!("field {field} has type {other}, not in a data page header"),
+                at = end;
+            } else if code == WireType::Struct.code() && wanted.is_none() {
+                assert!(
+                    [
+                        DATA_PAGE_HEADER_FIELD,
+                        DICTIONARY_PAGE_HEADER_FIELD,
+                        DATA_PAGE_HEADER_V2_FIELD
+                    ]
+                    .contains(&id),
+                    "field {id} is not a page-specific header"
+                );
+                let num_values = u8::try_from(NUM_VALUES_FIELD).unwrap();
+                assert_eq!(
+                    header[at],
+                    (num_values << NIBBLE_BITS) | WireType::I32.code(),
+                    "num_values is the struct's first field"
+                );
+                return at + 1..varint_end(at + 1);
+            } else {
+                panic!("field {id} has type {code}, not in a page header as parquet writes it");
             }
         }
     }
@@ -906,22 +932,51 @@ mod tests {
             .collect()
     }
 
-    /// The fixture's key chunks and footer with the header of the first key
-    /// page of row group 0 claiming `claimed` values: the varint rewritten
-    /// in the chunk's bytes, and the page, the chunk, and every later page
-    /// of the chunk moved in the footer by the change in the varint's width.
-    async fn with_first_page_values(
+    /// Where the header of `page` of row group 0's key chunk starts, as an
+    /// offset into the chunk's bytes.
+    fn header_at(metadata: &ParquetMetaData, key_leaf: usize, page: ChunkPage) -> usize {
+        let pages = pages_of(metadata, key_leaf);
+        let (chunk_start, _) = metadata.row_group(0).column(key_leaf).byte_range();
+        let start = match page {
+            ChunkPage::Dictionary => chunk_start,
+            ChunkPage::Data(at) => u64::try_from(pages[at].offset).unwrap(),
+        };
+        approx::length(start - chunk_start)
+    }
+
+    /// The header of `page` of row group 0's key chunk, as read ahead of
+    /// parquet.
+    fn header_of(
+        metadata: &ParquetMetaData,
+        key_leaf: usize,
+        chunks: &Segments,
+        page: ChunkPage,
+    ) -> PageHeader {
+        let (range, bytes) = &chunks.parts()[0];
+        assert_eq!(
+            range.start,
+            metadata.row_group(0).column(key_leaf).byte_range().0
+        );
+        PageHeader::read(&bytes[header_at(metadata, key_leaf, page)..]).unwrap()
+    }
+
+    /// The fixture's key chunks and footer with `field` in the header of
+    /// `page` of row group 0 claiming `claimed`: the varint rewritten in the
+    /// chunk's bytes, and the page, the chunk, and every later page of the
+    /// chunk moved in the footer by the change in the varint's width.
+    async fn with_first_group_header(
         opened: &Opened,
         loaded: &ParquetMetaData,
         key_leaf: usize,
+        page: ChunkPage,
+        field: HeaderField,
         claimed: i32,
     ) -> (ParquetMetaData, Arc<Segments>) {
         let ranges = key_chunk_ranges(loaded, key_leaf, opened.handle.size());
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let (range, bytes) = &parts[0];
-        let mut pages = pages_of(loaded, key_leaf);
-        let header_at = approx::length(u64::try_from(pages[0].offset).unwrap() - range.start);
-        let varint = num_values_varint(&bytes[header_at..]);
+        let header_at = header_at(loaded, key_leaf, page);
+        let varint = header_varint(&bytes[header_at..], field);
         let varint = header_at + varint.start..header_at + varint.end;
         let written = zigzag_varint(claimed);
         let grown = written.len() - varint.len();
@@ -930,18 +985,48 @@ mod tests {
         patched.extend_from_slice(&bytes[varint.end..]);
         let start = range.start;
         parts[0] = (start..start + count(patched.len()), Bytes::from(patched));
-        pages[0].compressed_page_size += i32::try_from(grown).unwrap();
-        for page in &mut pages[1..] {
-            page.offset += i64::try_from(grown).unwrap();
+        let grown = i64::try_from(grown).unwrap();
+        let mut pages = pages_of(loaded, key_leaf);
+        let moved = match page {
+            ChunkPage::Dictionary => 0,
+            ChunkPage::Data(at) => {
+                pages[at].compressed_page_size += i32::try_from(grown).unwrap();
+                at + 1
+            }
+        };
+        for page in &mut pages[moved..] {
+            page.offset += grown;
         }
-        let chunk_len = loaded.row_group(0).column(key_leaf).compressed_size();
+        let chunk = loaded.row_group(0).column(key_leaf);
+        let (chunk_len, first_data_page) = (chunk.compressed_size(), chunk.data_page_offset());
         let metadata = with_column_chunk(&with_pages(loaded, key_leaf, pages), 0, key_leaf, |c| {
-            c.set_total_compressed_size(chunk_len + i64::try_from(grown).unwrap())
+            let c = c.set_total_compressed_size(chunk_len + grown);
+            match page {
+                ChunkPage::Dictionary => c.set_data_page_offset(first_data_page + grown),
+                ChunkPage::Data(_) => c,
+            }
         });
         (
             metadata,
             Arc::new(Segments::new(parts, opened.handle.size())),
         )
+    }
+
+    /// `verify` of the key column over `metadata` and `chunks`, down to the
+    /// row groups it verified.
+    fn verify_groups(
+        metadata: &ParquetMetaData,
+        key_leaf: usize,
+        shape: KeyShape,
+        chunks: &Arc<Segments>,
+    ) -> Result<usize> {
+        let path = location();
+        let column = Column {
+            metadata,
+            leaf: key_leaf,
+            path: &path,
+        };
+        verify(TABLE, &column, shape, chunks).map(|verified| verified.groups.len())
     }
 
     /// A key page whose header claims more values than the rows its offset
@@ -956,8 +1041,15 @@ mod tests {
         let path = location();
         let span = i32::try_from(PAGE_ROWS).unwrap();
         for claimed in [span, span + 1, i32::MAX] {
-            let (metadata, chunks) =
-                with_first_page_values(&opened, &loaded, key_leaf, claimed).await;
+            let (metadata, chunks) = with_first_group_header(
+                &opened,
+                &loaded,
+                key_leaf,
+                ChunkPage::Data(0),
+                HeaderField::NumValues,
+                claimed,
+            )
+            .await;
             let column = Column {
                 metadata: &metadata,
                 leaf: key_leaf,
@@ -1005,7 +1097,15 @@ mod tests {
         let loaded = opened.handle.load_metadata().await.unwrap();
         let key_leaf = 0;
         let path = location();
-        let (metadata, chunks) = with_first_page_values(&opened, &loaded, key_leaf, i32::MAX).await;
+        let (metadata, chunks) = with_first_group_header(
+            &opened,
+            &loaded,
+            key_leaf,
+            ChunkPage::Data(0),
+            HeaderField::NumValues,
+            i32::MAX,
+        )
+        .await;
         let first_page = pages_of(&metadata, key_leaf)[0].clone();
         let one_page = with_pages(&metadata, key_leaf, vec![first_page]);
         let lying = with_group_rows(&one_page, 0, SPAN_OF_I32_MAX_ROWS);
@@ -1022,6 +1122,234 @@ mod tests {
                 row_group: 0,
                 page: 0,
             }
+        );
+    }
+
+    /// The bound on an uncompressed page of `values` values: every value a
+    /// key at the cap with its encoding, plus the page's allowance.
+    fn page_bound(values: u64) -> u64 {
+        values * MOST_BYTES_PER_VALUE + PAGE_ENCODING_ALLOWANCE_BYTES
+    }
+
+    /// The fault `FileFault::PageHeaderOverBound` names for row group 0.
+    fn over_bound(page: ChunkPage, field: HeaderField, declared: i32, allowed: u64) -> FileFault {
+        FileFault::PageHeaderOverBound {
+            row_group: 0,
+            page,
+            field,
+            declared: u64::try_from(declared).unwrap(),
+            allowed,
+        }
+    }
+
+    /// A key page whose header declares an uncompressed size above what its
+    /// rows could encode to with every key at the cap is refused before
+    /// parquet reads the page, which would reserve the declared size and
+    /// decompress into it; a size at the bound is left to parquet, whose
+    /// decompression then finds the page's real size.
+    #[tokio::test]
+    async fn test_verify_refuses_a_key_page_declaring_more_uncompressed_bytes_than_its_rows_hold() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let chunks = key_chunks(&opened, &loaded, key_leaf).await;
+        let page = ChunkPage::Data(0);
+        let written = header_of(&loaded, key_leaf, &chunks, page).uncompressed_page_size;
+        let allowed = page_bound(count(page_rows()));
+        let at_bound = i32::try_from(allowed).unwrap();
+        for claimed in [
+            i32::try_from(written).unwrap(),
+            at_bound,
+            at_bound + 1,
+            i32::MAX,
+        ] {
+            let (metadata, chunks) = with_first_group_header(
+                &opened,
+                &loaded,
+                key_leaf,
+                page,
+                HeaderField::UncompressedPageSize,
+                claimed,
+            )
+            .await;
+            let verified = verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks);
+            if claimed == at_bound {
+                assert!(
+                    matches!(verified, Err(Error::Parquet(_))),
+                    "at the bound parquet decodes the page: {verified:?}"
+                );
+                continue;
+            }
+            if claimed < at_bound {
+                assert_eq!(verified.unwrap(), ROW_GROUPS, "the size as written");
+                continue;
+            }
+            assert_eq!(
+                fault_of(verified),
+                over_bound(page, HeaderField::UncompressedPageSize, claimed, allowed),
+                "{claimed} bytes declared"
+            );
+        }
+    }
+
+    /// A dictionary page declaring more values than its row group has rows
+    /// is refused before parquet sizes the dictionary by the count, and so
+    /// is one whose uncompressed size is above what that count of keys at
+    /// the cap could encode to.
+    #[tokio::test]
+    async fn test_verify_refuses_a_dictionary_declaring_more_than_its_row_group_holds() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.dictionary = Dictionary::Key;
+        let opened = store(&fixture).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let chunks = key_chunks(&opened, &loaded, key_leaf).await;
+        let page = ChunkPage::Dictionary;
+        let written = header_of(&loaded, key_leaf, &chunks, page);
+        let rows = count(group_rows());
+        assert_eq!(
+            written.body,
+            PageBody::Dictionary {
+                num_values: u32::try_from(rows).unwrap()
+            },
+            "every key of the row group is in its dictionary"
+        );
+        let rows_claim = i32::try_from(rows).unwrap();
+        for claimed in [rows_claim, rows_claim + 1, i32::MAX] {
+            let (metadata, chunks) = with_first_group_header(
+                &opened,
+                &loaded,
+                key_leaf,
+                page,
+                HeaderField::NumValues,
+                claimed,
+            )
+            .await;
+            let verified = verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks);
+            if claimed == rows_claim {
+                assert_eq!(verified.unwrap(), ROW_GROUPS, "the count as written");
+                continue;
+            }
+            assert_eq!(
+                fault_of(verified),
+                over_bound(page, HeaderField::NumValues, claimed, rows),
+                "{claimed} values declared"
+            );
+        }
+        let (metadata, chunks) = with_first_group_header(
+            &opened,
+            &loaded,
+            key_leaf,
+            page,
+            HeaderField::UncompressedPageSize,
+            i32::MAX,
+        )
+        .await;
+        assert_eq!(
+            fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+            over_bound(
+                page,
+                HeaderField::UncompressedPageSize,
+                i32::MAX,
+                page_bound(rows)
+            )
+        );
+    }
+
+    /// A key page whose header declares compressed bytes past its place in
+    /// the offset index is refused.
+    #[tokio::test]
+    async fn test_verify_refuses_a_key_page_whose_compressed_size_runs_past_its_place() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let chunks = key_chunks(&opened, &loaded, key_leaf).await;
+        let page = ChunkPage::Data(0);
+        let written = header_of(&loaded, key_leaf, &chunks, page).compressed_page_size;
+        let written = i32::try_from(written).unwrap();
+        for claimed in [written, written + 1] {
+            let (metadata, chunks) = with_first_group_header(
+                &opened,
+                &loaded,
+                key_leaf,
+                page,
+                HeaderField::CompressedPageSize,
+                claimed,
+            )
+            .await;
+            let verified = verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks);
+            if claimed == written {
+                assert_eq!(verified.unwrap(), ROW_GROUPS, "the size as written");
+                continue;
+            }
+            assert_eq!(
+                fault_of(verified),
+                over_bound(
+                    page,
+                    HeaderField::CompressedPageSize,
+                    claimed,
+                    u64::try_from(written).unwrap()
+                )
+            );
+        }
+    }
+
+    /// A key page header that parquet would not read to the numbers the
+    /// pre-scan reads, or that is not a data page where the offset index
+    /// places one, is refused as malformed.
+    #[tokio::test]
+    async fn test_verify_refuses_a_malformed_key_page_header() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let page = ChunkPage::Data(0);
+        let malformed = |fault| FileFault::MalformedPageHeader {
+            row_group: 0,
+            page,
+            fault,
+        };
+        let past_known_types = PageType::DATA_PAGE_V2 as i32 + 1;
+        for (field, claimed, fault) in [
+            (
+                HeaderField::PageType,
+                PageType::INDEX_PAGE as i32,
+                PageHeaderFault::UnexpectedPageType(PageType::INDEX_PAGE),
+            ),
+            (
+                HeaderField::PageType,
+                past_known_types,
+                PageHeaderFault::UnknownPageType(past_known_types),
+            ),
+            (
+                HeaderField::UncompressedPageSize,
+                -1,
+                PageHeaderFault::Negative(HeaderField::UncompressedPageSize),
+            ),
+            (
+                HeaderField::NumValues,
+                -1,
+                PageHeaderFault::Negative(HeaderField::NumValues),
+            ),
+        ] {
+            let (metadata, chunks) =
+                with_first_group_header(&opened, &loaded, key_leaf, page, field, claimed).await;
+            assert_eq!(
+                fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+                malformed(fault),
+                "{field} {claimed}"
+            );
+        }
+        let ranges = key_chunk_ranges(&loaded, key_leaf, opened.handle.size());
+        let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
+        let mut bytes = parts[0].1.to_vec();
+        let past_known_wire_types = WireType::Struct.code() + 1;
+        let at = header_at(&loaded, key_leaf, page);
+        bytes[at] = (bytes[at] & !NIBBLE_MASK) | past_known_wire_types;
+        parts[0].1 = Bytes::from(bytes);
+        let chunks = Arc::new(Segments::new(parts, opened.handle.size()));
+        assert_eq!(
+            fault_of(verify_groups(&loaded, key_leaf, KeyShape::Long, &chunks)),
+            malformed(PageHeaderFault::UnknownWireType(past_known_wire_types))
         );
     }
 
