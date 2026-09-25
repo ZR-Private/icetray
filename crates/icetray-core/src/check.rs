@@ -1142,6 +1142,8 @@ fn predicted_total(facts: &[FileFacts]) -> ResidentBytes {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::Value as Json;
 
     use super::thresholds::{
@@ -1314,7 +1316,11 @@ mod tests {
 
     /// Commits every file added to `table` as `FIRST_SNAPSHOT` and loads it in
     /// `residency`.
-    async fn load(table: &mut Table, residency: Residency, local: Option<&LocalDir>) -> Generation {
+    async fn load(
+        table: &mut Table,
+        residency: Residency,
+        local: Option<&Arc<LocalDir>>,
+    ) -> Generation {
         table
             .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
             .await;

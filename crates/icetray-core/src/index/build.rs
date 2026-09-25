@@ -22,14 +22,15 @@ use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
 use super::{
     ChunkPage, Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected,
-    KeyResidency, KeyShape, Keys, file_fault, identity_of, off_worker, row_index, unless_panicked,
+    KeyResidency, KeyShape, Keys, file_fault, identity_of, on_blocking_pool, row_index,
+    unless_panicked,
 };
 use crate::approx;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, UUID_BYTES};
-use crate::local::{DiskChunks, LocalDir};
+use crate::local::{DiskChunks, LocalDir, LocalFault, Reservation};
 use crate::parquet_io::{FileHandle, Segments};
 
 impl Inspected {
@@ -38,11 +39,14 @@ impl Inspected {
     /// documents. The Disk tier with no local directory is the one rule the
     /// loader re-checks, since a configuration built in code may skip
     /// `Config::validated`; it is raised here as the same
-    /// `ConfigViolation`, before any chunk is fetched.
+    /// `ConfigViolation`, before any chunk is fetched. A Disk-tier chunk
+    /// file write holds `reservation`, the load's hold on `local`'s budget,
+    /// until the write ends.
     pub(crate) async fn build(
         self,
         residency: Residency,
-        local: Option<&LocalDir>,
+        local: Option<&Arc<LocalDir>>,
+        reservation: Option<&Arc<Reservation>>,
     ) -> Result<FileIndex> {
         let Self {
             table,
@@ -68,7 +72,7 @@ impl Inspected {
                 let local = local.ok_or(Error::Config(ConfigError::Invalid(
                     ConfigViolation::DiskResidencyWithoutLocalDir,
                 )))?;
-                let (disk, verified) = disk_chunks(&to_verify, local, &ranges).await?;
+                let (disk, verified) = disk_chunks(&to_verify, local, reservation, &ranges).await?;
                 (KeyResidency::Disk(disk), verified)
             }
             Residency::Bloom => {
@@ -208,16 +212,17 @@ impl KeysToVerify {
     /// `verify` of this column over `chunks`, run on the blocking pool
     /// (`on_blocking_pool`): decoding every key of a file is CPU-bound
     /// work that grows with the file, and inline it would hold the async
-    /// worker that also answers lookups. The builds a load has in flight each wait on at
-    /// most one verification, so a load runs at most `LOAD_CONCURRENCY`
-    /// of them at once, each on its own blocking-pool thread.
+    /// worker that also answers lookups. The builds a load has in flight
+    /// each wait on at most one verification, so a load runs at most
+    /// `LOAD_CONCURRENCY` of them at once, each on its own blocking-pool
+    /// thread. A canceled task is `Error::VerifyCanceled` for the file.
     async fn verify(&self, chunks: &Arc<Segments>) -> Result<Verified> {
         let table = self.table.clone();
         let handle = Arc::clone(&self.handle);
         let metadata = Arc::clone(&self.metadata);
         let (leaf, shape) = (self.leaf, self.shape);
         let chunks = Arc::clone(chunks);
-        on_blocking_pool(&self.handle.location, move || {
+        on_blocking_pool(move || {
             let column = Column {
                 metadata: &metadata,
                 leaf,
@@ -226,29 +231,8 @@ impl KeysToVerify {
             verify(&table, &column, shape, &chunks)
         })
         .await
+        .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?
     }
-}
-
-/// Runs `work` on the blocking pool and waits for it, so the async worker
-/// awaiting it goes on polling other tasks, and several awaited at once
-/// run on several threads. A panic in `work` is resumed here, as an inline
-/// call would raise it. A caller that stops waiting does not stop `work`:
-/// it runs to its end and its result is dropped. A task the pool dropped
-/// unstarted, because the runtime shut down, is `Error::VerifyCanceled`
-/// for the file at `path`.
-async fn on_blocking_pool<T: Send + 'static>(
-    path: &str,
-    work: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| match error.try_into_panic() {
-            Ok(payload) => std::panic::resume_unwind(payload),
-            Err(canceled) => Error::VerifyCanceled {
-                path: path.to_string(),
-                source: canceled,
-            },
-        })?
 }
 
 /// The key column chunks of `ranges`, fetched and verified: the chunks a
@@ -301,10 +285,15 @@ pub(super) async fn chunks_from_disk(
 /// The disk tier's key chunks: a chunk file in `local` whose identity
 /// (path, size, footer digest) matches and holds every chunk range is read
 /// back and verified, no GET; otherwise the chunks are fetched, verified,
-/// and written, replacing any file at that name.
+/// and written, replacing any file at that name. The write runs on the
+/// blocking pool (`on_blocking_pool`) and holds `reservation` until it
+/// ends, so bytes it lands after its caller stopped waiting stay reserved
+/// until they are on disk. A canceled write is `Error::Local` on the chunk
+/// file's path with `LocalFault::Join`.
 async fn disk_chunks(
     to_verify: &KeysToVerify,
-    local: &LocalDir,
+    local: &Arc<LocalDir>,
+    reservation: Option<&Arc<Reservation>>,
     ranges: &[Range<u64>],
 ) -> Result<(DiskChunks, Verified)> {
     let handle = &to_verify.handle;
@@ -314,8 +303,19 @@ async fn disk_chunks(
         return Ok((disk, verified));
     }
     let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
-    let disk =
-        off_worker(|| local.write_chunks(&identity_of(handle), chunks.parts().iter().cloned()))?;
+    let identity = identity_of(handle);
+    let path = local.chunk_path(&identity);
+    let (local, reservation) = (Arc::clone(local), reservation.cloned());
+    let disk = on_blocking_pool(move || {
+        let written = local.write_chunks(&identity, chunks.parts().iter().cloned());
+        drop(reservation);
+        written
+    })
+    .await
+    .map_err(|canceled| Error::Local {
+        path,
+        fault: LocalFault::Join(canceled),
+    })??;
     Ok((disk, verified))
 }
 
@@ -683,9 +683,6 @@ pub(super) fn read_one<T: ParquetDataType>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use futures::FutureExt;
     use parquet::file::metadata::ParquetMetaDataReader;
 
     use super::*;
@@ -716,42 +713,6 @@ mod tests {
     /// Rows per row group in the hand-written fixtures with two row groups.
     const TINY_GROUP_ROWS: usize = 2;
 
-    /// A marker a test panics with, so the panic's payload is known by type.
-    struct Marker;
-
-    /// Work on the blocking pool leaves the runtime's thread polling other
-    /// tasks: on the current-thread runtime, whose one thread inline work
-    /// would hold, the work waits for a message that a task spawned on the
-    /// runtime sends, the stand-in for a lookup answered while a file
-    /// verifies, and receives it.
-    #[tokio::test]
-    async fn test_on_blocking_pool_leaves_the_runtime_polling_other_tasks() {
-        const HELD_AT_MOST: Duration = Duration::from_secs(30);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let lookup = tokio::spawn(async move { sender.send(()) });
-        let held = on_blocking_pool(&location(), move || Ok(receiver.recv_timeout(HELD_AT_MOST)))
-            .await
-            .unwrap();
-        assert_eq!(
-            held,
-            Ok(()),
-            "the held work never heard from the spawned task: the runtime did not poll it"
-        );
-        lookup.await.unwrap().unwrap();
-    }
-
-    /// A panic in work on the blocking pool is resumed on the caller, with
-    /// its payload, as an inline call would raise it.
-    #[tokio::test]
-    async fn test_on_blocking_pool_resumes_a_panic_on_the_caller() {
-        let outcome = AssertUnwindSafe(on_blocking_pool(&location(), || -> Result<()> {
-            std::panic::panic_any(Marker)
-        }))
-        .catch_unwind()
-        .await;
-        let payload = outcome.expect_err("the work panicked");
-        assert!(payload.downcast::<Marker>().is_ok());
-    }
     /// A row count a footer may claim for one row group that no file holds:
     /// two to the fiftieth, eight pebibytes of long keys, beyond the address
     /// space of the supported targets, so a buffer reserved for that many

@@ -298,7 +298,7 @@ impl Opened {
         &self,
         key_type: KeyType,
         residency: Residency,
-        local: Option<&LocalDir>,
+        local: Option<&Arc<LocalDir>>,
     ) -> Result<FileIndex> {
         FileIndex::build(
             TABLE,

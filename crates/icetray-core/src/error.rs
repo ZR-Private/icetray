@@ -116,12 +116,15 @@ pub enum Error {
         /// The deadline that passed.
         after: Duration,
     },
-    /// The blocking task that verified a data file's keys was canceled:
-    /// the runtime shut down under it. A panic in that task is resumed on
+    /// The blocking task that verified keys was canceled: the runtime shut
+    /// down under it. The task checked one data file's keys at load, an
+    /// overlap group's keys for a key two files share, or one file's keys
+    /// against its bucket in the doctor. A panic in that task is resumed on
     /// the caller instead, never turned into an error.
     #[error("key verification of file {path} was canceled: {source}")]
     VerifyCanceled {
-        /// The data file's location.
+        /// The data file's location; for an overlap group, its first file
+        /// in file order.
         path: String,
         /// The canceled task's outcome.
         source: tokio::task::JoinError,
@@ -134,6 +137,14 @@ impl Error {
         Self::Refused {
             table: table.to_string(),
             reason,
+        }
+    }
+
+    /// `Error::VerifyCanceled` for the file at `path`.
+    pub(crate) fn verify_canceled(path: &str, source: tokio::task::JoinError) -> Self {
+        Self::VerifyCanceled {
+            path: path.to_string(),
+            source,
         }
     }
 

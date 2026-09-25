@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(opened.stats().gets(), 1, "the footer alone");
         assert!(Arc::ptr_eq(&inspected.handle, &opened.handle));
         let predicted = *inspected.predicted();
-        let index = inspected.build(Residency::Full, None).await.unwrap();
+        let index = inspected.build(Residency::Full, None, None).await.unwrap();
         assert_eq!(
             opened.stats().gets(),
             1 + count(ROW_GROUPS),
@@ -1089,7 +1089,10 @@ mod tests {
             needed, predicted.disk_bytes,
             "an empty directory takes the whole chunk file the doctor reports"
         );
-        fresh.build(Residency::Disk, Some(&local)).await.unwrap();
+        fresh
+            .build(Residency::Disk, Some(&local), None)
+            .await
+            .unwrap();
         assert_eq!(
             local.index_bytes_in_use().unwrap(),
             needed,

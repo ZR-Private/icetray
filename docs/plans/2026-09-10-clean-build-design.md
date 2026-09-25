@@ -116,8 +116,10 @@ pub enum Error {
     CatalogTimeout { table: String, after: Duration },
     /// A first load or refresh ran past `server.refresh_deadline` and was dropped (RFD 013).
     RefreshDeadline { table: String, after: Duration },
-    /// The blocking task verifying a data file's keys was canceled as the runtime shut
-    /// down; a panic in it is resumed on the caller instead. `UNAVAILABLE` at the service.
+    /// The blocking task verifying keys (a file's at load, an overlap group's merge, or a
+    /// file's doctor bucket check) was canceled as the runtime shut down; `path` is the file,
+    /// or the group's first file in file order. A panic in it is resumed on the caller
+    /// instead. `UNAVAILABLE` at the service.
     VerifyCanceled { path: String, source: tokio::task::JoinError },
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -309,7 +311,10 @@ impl LocalDir {
     /// The bytes every file under `index/` occupies, and the bound from
     /// `LocalConfig::index_budget_bytes`; a crate-internal `reserve` checks
     /// them with every outstanding reservation and holds a load's bytes
-    /// until it has written (RFD 017).
+    /// until it has written (RFD 017). `reserve` takes `self: &Arc<Self>`
+    /// and its `Reservation` owns an `Arc<LocalDir>`, so the load shares it,
+    /// as an `Arc<Reservation>`, with every chunk file write it starts, and a
+    /// write that outlives a dropped load keeps its bytes held until it ends.
     pub fn index_bytes_in_use(&self) -> Result<u64>;
     pub(crate) fn index_budget(&self) -> Option<u64>;
     /// `None` when `page_cache_disk_bytes` is zero; otherwise a level of at
@@ -584,13 +589,13 @@ impl FileIndex {
     /// header against what its page can hold before parquet reads it, and
     /// every key page against its offset index; the verification runs on the
     /// blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
-    /// them through `LocalDir` (or reuses a chunk file with matching identity
+    /// them through `LocalDir`, also on the blocking pool (or reuses a chunk file with matching identity
     /// and skips the chunk fetch), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are
     /// taken; it is never part of the resident set. `build` is `inspect`
     /// followed by `Inspected::build`; only tests call it (`#[cfg(test)]`),
     /// since the loader runs the two stages apart around its budget check.
-    pub(crate) async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
+    pub(crate) async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&Arc<LocalDir>>) -> Result<Self>;
     /// The footer stage of `build` on its own: one GET, every footer check,
     /// the footer trimmed to what the index keeps, and the prediction, so
     /// `generation` checks every file against a budget before any key chunk
@@ -654,8 +659,9 @@ impl Inspected {
     /// bytes `LocalDir::index_bytes_in_use` then counts for it. Reads the
     /// chunk file's header and no chunk.
     pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
-    /// The chunk stage of `FileIndex::build`.
-    pub(crate) async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex>;
+    /// The chunk stage of `FileIndex::build`. A Disk-tier chunk file write
+    /// holds `reservation`, the load's hold on the budget, until it ends.
+    pub(crate) async fn build(self, residency: Residency, local: Option<&Arc<LocalDir>>, reservation: Option<&Arc<Reservation>>) -> Result<FileIndex>;
 }
 /// A decoded run of keys in file order, one arm per key type over the values
 /// parquet decoded, searched and compared in the served order; an in-crate
@@ -738,10 +744,10 @@ impl Generation {
     /// built, and one outside the recorded bucket is
     /// `RefusalReason::KeyOutsideBucket`. Overlap groups that gained a file are
     /// verified one at a time, so the load holds one group's key chunks at
-    /// once and not the table's (RFD 017).
+    /// once and not the table's (RFD 017); each merge runs on the blocking pool.
     /// `hedge` is the table's hedge window, handed to every FileHandle it opens.
     /// The table's name is `config.name`; `load` takes no second copy of it.
-    pub(crate) async fn load(config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
+    pub(crate) async fn load(config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&Arc<LocalDir>>, previous: Option<&Generation>) -> Result<Self>;
     /// The files that may hold `key`, in file order: under every bucketing
     /// the files carry, the files of the bucket the key falls in under it,
     /// and every file without a bucketing, narrowed to those whose exact key
@@ -757,8 +763,8 @@ impl Generation {
     pub fn overlap_groups_verified(&self) -> usize;
     /// The doctor's full bucket check (RFD 016): every key of every bucketed
     /// file decoded one key page at a time from `key_chunks_for_verification`,
-    /// `LOAD_CONCURRENCY` files at a time, and hashed under the file's own
-    /// bucketing; the first outside the recorded bucket is
+    /// `LOAD_CONCURRENCY` files at a time, each file's check on the blocking
+    /// pool, and hashed under the file's own bucketing; the first outside the recorded bucket is
     /// `RefusalReason::KeyOutsideBucket`. No load or refresh calls it.
     pub async fn verify_buckets(&self) -> Result<()>;
     /// One lookup and its `result` label: `Miss` for `Absent`; for a present key `ColdHit` when

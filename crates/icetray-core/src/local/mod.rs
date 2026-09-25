@@ -122,10 +122,10 @@ pub enum LocalFault {
         /// The encoded header's length.
         len: usize,
     },
-    /// The blocking task that ran a page read was canceled: the runtime
-    /// shut down under it. A panic in that task is resumed on the caller
-    /// instead, never turned into an error.
-    #[error("page read task was canceled: {0}")]
+    /// The blocking task that ran a page read or a chunk file's write was
+    /// canceled: the runtime shut down under it. A panic in that task is
+    /// resumed on the caller instead, never turned into an error.
+    #[error("blocking task was canceled: {0}")]
     Join(tokio::task::JoinError),
 }
 
@@ -268,16 +268,18 @@ impl LocalDir {
     /// which is over any budget. The directory is listed, the sum
     /// checked, and the bytes held under one lock, so of two loads that each
     /// fit alone but not together the one that reaches the lock second is
-    /// refused. A load holds its reservation until it has finished writing:
-    /// a chunk file that has landed, or is being written, is counted by
-    /// `index_bytes_in_use` and by the reservation both until it drops. That
-    /// double count errs toward refusal: it can refuse a load that would
-    /// have fit. With no budget nothing is
-    /// refused, `index/` is not listed, and nothing is held.
-    pub(crate) fn reserve(&self, table: &str, needed: u64) -> Result<Reservation<'_>> {
+    /// refused. A load holds its reservation until it has finished writing,
+    /// and each chunk file write it starts holds it too, so a write that
+    /// outlives a load dropped mid-build keeps its bytes reserved until it
+    /// ends: a chunk file that has landed, or is being written, is counted
+    /// by `index_bytes_in_use` and by the reservation both until it drops.
+    /// That double count errs toward refusal: it can refuse a load that
+    /// would have fit. With no budget nothing is refused, `index/` is not
+    /// listed, and nothing is held.
+    pub(crate) fn reserve(self: &Arc<Self>, table: &str, needed: u64) -> Result<Reservation> {
         let Some(budget) = self.index_budget else {
             return Ok(Reservation {
-                local: self,
+                local: Arc::clone(self),
                 bytes: 0,
             });
         };
@@ -290,7 +292,7 @@ impl LocalDir {
             Some(total) if total <= budget => {
                 *reserved += needed;
                 Ok(Reservation {
-                    local: self,
+                    local: Arc::clone(self),
                     bytes: needed,
                 })
             }
@@ -324,7 +326,7 @@ impl LocalDir {
     }
 
     /// The final path of the chunk file for `identity`.
-    fn chunk_path(&self, identity: &DataFileIdentity) -> PathBuf {
+    pub(crate) fn chunk_path(&self, identity: &DataFileIdentity) -> PathBuf {
         self.index_dir.join(chunk_name(&identity.path))
     }
 
@@ -423,12 +425,12 @@ impl Drop for InFlight<'_> {
 /// Bytes of `index/` that `LocalDir::reserve` holds for one disk-tier
 /// load, released when this drops.
 #[derive(Debug)]
-pub(crate) struct Reservation<'a> {
-    local: &'a LocalDir,
+pub(crate) struct Reservation {
+    local: Arc<LocalDir>,
     bytes: u64,
 }
 
-impl Drop for Reservation<'_> {
+impl Drop for Reservation {
     fn drop(&mut self) {
         *self.local.lock_reserved() -= self.bytes;
     }

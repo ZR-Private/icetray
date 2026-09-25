@@ -440,7 +440,7 @@ impl Table {
             snapshot,
             &self.storage,
             Arc::clone(&self.hedge),
-            self.local.as_deref(),
+            self.local.as_ref(),
             previous.map(Arc::as_ref),
         )
         .await?;

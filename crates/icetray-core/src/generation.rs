@@ -32,14 +32,15 @@ use crate::time;
 
 /// Files worked on at once while a generation loads: footers loaded at the
 /// footer stage, then chunks fetched and verified at the chunk stage, then
-/// the key chunks of one overlap group gathered for its merge. Each file in
-/// flight is one GET or local read waiting, and at the chunk stage one
-/// file's key chunks in memory and at most one verification of them on
-/// the blocking pool; sixteen keeps a load of hundreds of files a few
-/// round trips deep, and its verifications on up to sixteen threads,
-/// without holding more than sixteen files' chunks before they are kept or
-/// dropped. The bound is per load: tables loading at once each run their
-/// own sixteen.
+/// the key chunks of one overlap group gathered for its merge; and files
+/// checked at once by the doctor's bucket check. Each file in flight is one
+/// GET or local read waiting, and at the chunk stage one file's key chunks
+/// in memory and at most one blocking-pool task over them at a time (its
+/// verification, then in the Disk tier its chunk file's write); sixteen
+/// keeps a load of hundreds of files a few round trips deep, and its
+/// verifications and writes on up to sixteen threads, without holding more
+/// than sixteen files' chunks before they are kept or dropped. The bound is
+/// per load: tables loading at once each run their own sixteen.
 const LOAD_CONCURRENCY: usize = 16;
 
 /// One data file with its manifest entry and its resident index.
@@ -128,7 +129,7 @@ impl Generation {
         snapshot: &Snapshot,
         storage: &Arc<Storage>,
         hedge: Arc<HedgeWindow>,
-        local: Option<&LocalDir>,
+        local: Option<&Arc<LocalDir>>,
         previous: Option<&Generation>,
     ) -> Result<Self> {
         let table = config.name.as_str();
@@ -146,7 +147,14 @@ impl Generation {
         let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge)?;
         let inspected = inspect_all(table, &layout, pending).await?;
         let reservation = check_budget(table, config, local, &reused, &inspected)?;
-        let built = build_all(table, config.residency, local, inspected).await;
+        let built = build_all(
+            table,
+            config.residency,
+            local,
+            reservation.as_ref(),
+            inspected,
+        )
+        .await;
         drop(reservation);
         let built = built?;
         let members = reused
@@ -176,6 +184,11 @@ impl Generation {
     /// before its merge and dropped after, so the load holds one group's
     /// chunks at once and not the table's (RFD 017: the Disk tier reads
     /// them back from the chunk files, the Bloom tier fetches them again).
+    /// Each merge runs on the blocking pool (`index::on_blocking_pool`),
+    /// one at a time for this load; while it runs, the async worker goes on
+    /// polling other tasks, and the task goes on polling the other loads it
+    /// joins. A canceled merge is `Error::VerifyCanceled` for the group's
+    /// first file.
     async fn assemble(
         table: &str,
         snapshot: &Snapshot,
@@ -198,8 +211,12 @@ impl Generation {
             .filter(|group| !group.iter().all(|&at| members[at].reused))
             .collect();
         for group in &to_verify {
-            let chunks = gather_chunks(&files, group).await?;
-            index::off_worker(|| refuse_duplicates(table, &files, group, &chunks))?;
+            let members = gather_members(&files, group).await?;
+            let first = files[group[0]].index.handle().location.clone();
+            let owned_table = table.to_string();
+            index::on_blocking_pool(move || refuse_duplicates(&owned_table, &members))
+                .await
+                .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
         }
         let records = files.iter().map(|file| file.entry.records).sum();
         let index_bytes = files.iter().map(|file| file.index.resident_bytes()).sum();
@@ -270,8 +287,11 @@ impl Generation {
     /// chunks come as `FileIndex::key_chunks_for_verification` hands them
     /// out (Full: resident, Disk: one local read per row group, Bloom: one
     /// GET per row group), `LOAD_CONCURRENCY` files at a time, and are
-    /// decoded one key page at a time. The doctor calls it after a load; no
-    /// load or refresh does.
+    /// decoded one key page at a time, each file's check on the blocking
+    /// pool (`index::on_blocking_pool`), so up to `LOAD_CONCURRENCY` checks
+    /// run at once on their own threads. A canceled check is
+    /// `Error::VerifyCanceled` for its file. The doctor calls it after a
+    /// load; no load or refresh does.
     pub async fn verify_buckets(&self) -> Result<()> {
         let table = self.table.as_str();
         stream::iter(
@@ -282,7 +302,13 @@ impl Generation {
         )
         .map(|file| async move {
             let chunks = file.index.key_chunks_for_verification().await?;
-            index::off_worker(|| refuse_any_key_outside_bucket(table, &file, &chunks))
+            let path = file.index.handle().location.clone();
+            let owned_table = table.to_string();
+            index::on_blocking_pool(move || {
+                refuse_any_key_outside_bucket(&owned_table, &file, &chunks)
+            })
+            .await
+            .map_err(|canceled| Error::verify_canceled(&path, canceled))?
         })
         .buffered(LOAD_CONCURRENCY)
         .try_collect::<()>()
@@ -486,16 +512,18 @@ async fn inspect_all(
 /// Builds every inspected file's index in `residency`, `LOAD_CONCURRENCY`
 /// at a time, after the budget check admitted them all, and refuses a
 /// file whose fences or first or last key fall outside its recorded bucket
-/// (`refuse_fences_outside_bucket`).
+/// (`refuse_fences_outside_bucket`). Every Disk-tier chunk file write holds
+/// `reservation`, the load's hold on the budget, until it ends.
 async fn build_all(
     table: &str,
     residency: Residency,
-    local: Option<&LocalDir>,
+    local: Option<&Arc<LocalDir>>,
+    reservation: Option<&Arc<Reservation>>,
     inspected: Vec<(DataFileEntry, Inspected)>,
 ) -> Result<Vec<Arc<LoadedFile>>> {
     stream::iter(inspected)
         .map(|(entry, inspected)| async move {
-            let index = inspected.build(residency, local).await?;
+            let index = inspected.build(residency, local, reservation).await?;
             let file = LoadedFile { entry, index };
             refuse_fences_outside_bucket(table, &file)?;
             Ok::<_, Error>(Arc::new(file))
@@ -514,17 +542,18 @@ async fn build_all(
 /// nothing for a file whose chunk file is already there, against the bytes
 /// `index/` holds (the reused files' chunk files among them) and every
 /// other load's outstanding reservation. The reservation returned must be
-/// held until the load has finished writing. Bloom takes no budget. Over
+/// held until the load has finished writing; every chunk file write shares
+/// it and holds it until the write ends. Bloom takes no budget. Over
 /// is `RefusalReason::OverBudget` carrying both numbers. The sums saturate,
 /// as the predictions they add do: a need that would wrap stays at
 /// `u64::MAX` instead of wrapping to a small number that fits the budget.
-fn check_budget<'a>(
+fn check_budget(
     table: &str,
     config: &TableConfig,
-    local: Option<&'a LocalDir>,
+    local: Option<&Arc<LocalDir>>,
     reused: &[Arc<LoadedFile>],
     inspected: &[(DataFileEntry, Inspected)],
-) -> Result<Option<Reservation<'a>>> {
+) -> Result<Option<Arc<Reservation>>> {
     match config.residency {
         Residency::Full => {
             if let Some(budget) = config.resident_budget_bytes {
@@ -552,7 +581,7 @@ fn check_budget<'a>(
                 let new = inspected.iter().try_fold(0, |sum: u64, (_, inspected)| {
                     Ok::<_, Error>(sum.saturating_add(inspected.disk_bytes_needed(local)?))
                 })?;
-                local.reserve(table, new).map(Some)
+                local.reserve(table, new).map(|held| Some(Arc::new(held)))
             }
             Some(_) | None => Ok(None),
         },
@@ -776,20 +805,28 @@ fn widest_per_bucket(files: &[Arc<LoadedFile>], groups: &[Vec<usize>]) -> BTreeM
     widest
 }
 
-/// The key chunks of every member of one `group`, by position: what its
-/// merge decodes from, gathered `LOAD_CONCURRENCY` members at a time. Full
-/// hands out its resident chunks; Disk reads them back as local reads;
-/// Bloom fetches them again (RFD 017). The positions are streamed by value:
-/// a closure taking a reference and returning an `async` block makes every
-/// future up the call chain unprovably `Send`, and a load must be spawnable.
-async fn gather_chunks(
-    files: &[Arc<LoadedFile>],
-    group: &[usize],
-) -> Result<HashMap<usize, Arc<Segments>>> {
+/// One file of an overlap group with the key chunks its merge decodes
+/// from, owned, so that the merge can move to the blocking pool.
+struct GroupMember {
+    /// The file's position in the generation's files.
+    at: usize,
+    file: Arc<LoadedFile>,
+    chunks: Arc<Segments>,
+}
+
+/// Every member of one `group` with its key chunks, in the group's order:
+/// what its merge decodes from, gathered `LOAD_CONCURRENCY` members at a
+/// time. Full hands out its resident chunks; Disk reads them back as local
+/// reads; Bloom fetches them again (RFD 017). The positions are streamed by
+/// value: a closure taking a reference and returning an `async` block makes
+/// every future up the call chain unprovably `Send`, and a load must be
+/// spawnable.
+async fn gather_members(files: &[Arc<LoadedFile>], group: &[usize]) -> Result<Vec<GroupMember>> {
     stream::iter(group.iter().copied())
         .map(|at| async move {
-            let chunks = files[at].index.key_chunks_for_verification().await?;
-            Ok::<_, Error>((at, chunks))
+            let file = Arc::clone(&files[at]);
+            let chunks = file.index.key_chunks_for_verification().await?;
+            Ok::<_, Error>(GroupMember { at, file, chunks })
         })
         .buffered(LOAD_CONCURRENCY)
         .try_collect()
@@ -801,7 +838,7 @@ async fn gather_chunks(
 struct KeyCursor<'a> {
     /// The file's position in the generation's files.
     at: usize,
-    index: &'a FileIndex,
+    file: &'a LoadedFile,
     chunks: &'a Arc<Segments>,
     row_group: usize,
     page: usize,
@@ -810,13 +847,13 @@ struct KeyCursor<'a> {
 }
 
 impl<'a> KeyCursor<'a> {
-    /// A cursor on the first key of file `at`; `None` for a file with no
-    /// key page, which `FileIndex::build` does not produce.
-    fn open(at: usize, index: &'a FileIndex, chunks: &'a Arc<Segments>) -> Result<Option<Self>> {
+    /// A cursor on the first key of `member`'s file; `None` for a file
+    /// with no key page, which `FileIndex::build` does not produce.
+    fn open(member: &'a GroupMember) -> Result<Option<Self>> {
         let mut cursor = Self {
-            at,
-            index,
-            chunks,
+            at: member.at,
+            file: &member.file,
+            chunks: &member.chunks,
             row_group: 0,
             page: 0,
             keys: Keys::Long(Vec::new()),
@@ -833,15 +870,14 @@ impl<'a> KeyCursor<'a> {
     /// Decodes the next key page that holds a key; `false` once the file
     /// is exhausted.
     fn fill(&mut self) -> Result<bool> {
-        while self.row_group < self.index.metadata().num_row_groups() {
-            if self.page >= self.index.page_count(self.row_group) {
+        let index = &self.file.index;
+        while self.row_group < index.metadata().num_row_groups() {
+            if self.page >= index.page_count(self.row_group) {
                 self.row_group += 1;
                 self.page = 0;
                 continue;
             }
-            self.keys = self
-                .index
-                .decode_keys(self.row_group, Some(self.page), self.chunks)?;
+            self.keys = index.decode_keys(self.row_group, Some(self.page), self.chunks)?;
             self.page += 1;
             self.position = 0;
             if !self.keys.is_empty() {
@@ -868,38 +904,32 @@ fn head_order(cursors: &[KeyCursor<'_>], a: usize, b: usize) -> Ordering {
         .cmp_at(cursors[a].position, &cursors[b].keys, cursors[b].position)
 }
 
-/// Merges the sorted key runs of `group` and refuses the first key two
-/// files share. Every file is sorted and free of duplicates on its own
+/// Merges the sorted key runs of a group's `members` and refuses the first
+/// key two files share. Every file is sorted and free of duplicates on its own
 /// (`FileIndex::build` checked), so two equal heads at the front of the
 /// merge are exactly a key in two files. The cursors are kept in a vector
 /// ordered by head; each step takes the least, advances it, and reinserts
 /// it by binary search. The refusal names the key and the later of the two
 /// files in file order (RFD 007).
-fn refuse_duplicates(
-    table: &str,
-    files: &[Arc<LoadedFile>],
-    group: &[usize],
-    chunks: &HashMap<usize, Arc<Segments>>,
-) -> Result<()> {
-    let mut cursors: Vec<KeyCursor<'_>> = group
+fn refuse_duplicates(table: &str, members: &[GroupMember]) -> Result<()> {
+    let mut cursors: Vec<KeyCursor<'_>> = members
         .iter()
-        .filter_map(|&at| {
-            let chunks = chunks
-                .get(&at)
-                .expect("gather_chunks fetched every group member's chunks");
-            KeyCursor::open(at, &files[at].index, chunks).transpose()
-        })
+        .filter_map(|member| KeyCursor::open(member).transpose())
         .collect::<Result<_>>()?;
     let mut order: Vec<usize> = (0..cursors.len()).collect();
     order.sort_by(|&a, &b| head_order(&cursors, a, b));
     while order.len() > 1 {
         let (least, next) = (order[0], order[1]);
         if head_order(&cursors, least, next) == Ordering::Equal {
-            let later = cursors[least].at.max(cursors[next].at);
+            let later = if cursors[least].at > cursors[next].at {
+                least
+            } else {
+                next
+            };
             return Err(Error::refused(
                 table,
                 RefusalReason::DuplicateKeys {
-                    path: files[later].entry.path.clone(),
+                    path: cursors[later].file.entry.path.clone(),
                     key: cursors[least].head(),
                 },
             ));
@@ -1590,7 +1620,7 @@ pub(crate) mod testing {
         pub(crate) async fn load(
             &self,
             config: &TableConfig,
-            local: Option<&LocalDir>,
+            local: Option<&Arc<LocalDir>>,
             previous: Option<&Generation>,
         ) -> Result<Generation> {
             let source = TableSource::Static {
@@ -1639,16 +1669,18 @@ pub(crate) mod testing {
         dir: &std::path::Path,
         stats: Arc<IoStats>,
         budget: Option<u64>,
-    ) -> LocalDir {
-        LocalDir::open(
-            &LocalConfig {
-                dir: dir.to_path_buf(),
-                index_budget_bytes: budget,
-                page_cache_disk_bytes: 0,
-            },
-            stats,
+    ) -> Arc<LocalDir> {
+        Arc::new(
+            LocalDir::open(
+                &LocalConfig {
+                    dir: dir.to_path_buf(),
+                    index_budget_bytes: budget,
+                    page_cache_disk_bytes: 0,
+                },
+                stats,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 }
 
