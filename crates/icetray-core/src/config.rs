@@ -304,8 +304,9 @@ pub enum ConfigViolation {
         /// The location as the process tried to resolve it.
         location: String,
     },
-    /// Text that names no residency tier; raised by `Residency`'s `FromStr`,
-    /// the command line's parser for the setting.
+    /// Text that names no residency tier; raised by `Residency`'s `FromStr`.
+    /// The command line reads the names it offers back through it, and
+    /// clap refuses any other text before it gets here.
     #[error("unknown residency {text}; expected one of {}", Residency::names())]
     UnknownResidency {
         /// The text as given.
@@ -855,16 +856,20 @@ impl Residency {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// The tier's lowercase name, as the file spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Disk => "disk",
+            Self::Bloom => "bloom",
+        }
+    }
 }
 
 impl fmt::Display for Residency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Full => "full",
-            Self::Disk => "disk",
-            Self::Bloom => "bloom",
-        };
-        f.write_str(name)
+        f.write_str(self.name())
     }
 }
 

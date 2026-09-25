@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 use icetray_core::config::{
     Config, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
@@ -33,6 +34,12 @@ pub const DEFAULT_VALUE_COLUMN: &str = "value";
 /// branch, the value of `iceberg::spec::MAIN_BRANCH`, which this crate does
 /// not depend on.
 pub const DEFAULT_REF: &str = "main";
+
+/// The residencies a `--location` table can run. A one-shot is one load and
+/// exit, and no flag supplies the local directory a disk tier needs, so
+/// `disk` is not offered; the doctor under `full` already reports each
+/// tier's predicted bytes.
+const LOCATED_RESIDENCIES: [Residency; 2] = [Residency::Full, Residency::Bloom];
 
 /// What separates the two halves of a `--rewrite FROM=TO` rule; the first
 /// occurrence, since a location may itself carry one.
@@ -128,10 +135,26 @@ pub struct Target {
     /// The ref of the located table (default: main).
     #[arg(long, requires = "location", conflicts_with = "config")]
     pub r#ref: Option<String>,
-    /// Where the located table keeps its key chunks: full, disk, or bloom
-    /// (default: full).
-    #[arg(long, requires = "location", conflicts_with = "config")]
+    /// Where the located table keeps its key chunks (default: full). Disk
+    /// is not offered: a one-shot loads once and exits, and the doctor
+    /// under full reports every tier's predicted bytes.
+    #[arg(
+        long,
+        requires = "location",
+        conflicts_with = "config",
+        value_parser = located_residency()
+    )]
     pub residency: Option<Residency>,
+}
+
+/// `--residency`'s parser: the name of one of `LOCATED_RESIDENCIES`, read
+/// through `Residency`'s `FromStr`. Clap refuses any other word, `disk`
+/// included, as a usage error that lists the accepted names.
+fn located_residency() -> impl TypedValueParser<Value = Residency> {
+    PossibleValuesParser::new(LOCATED_RESIDENCIES.map(Residency::name)).map(|name| {
+        name.parse()
+            .expect("a possible value is the name of a residency")
+    })
 }
 
 /// A `--rewrite` rule from `FROM=TO`, split at the first `=`. The rule's
@@ -160,9 +183,8 @@ impl Target {
     /// that matches, so a command-line rule takes precedence over the file's
     /// for the same prefix. Only then is the whole validated, so the
     /// command-line rules and a located table are held to every rule
-    /// `Config::parse` checks: `--residency disk` with no local directory,
-    /// or an empty `--rewrite` prefix, is the same violation a file would
-    /// be. No flag and no variable is `NoTarget`.
+    /// `Config::parse` checks: an empty `--rewrite` prefix is the same
+    /// violation a file would be. No flag and no variable is `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
         self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
     }
@@ -298,21 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_location_is_held_to_the_file_rules() {
-        let cli = parse(&["doctor", "--location", LOCATION, "--residency", "disk"]).unwrap();
-        let error = target(cli).config().unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CliError::Core(icetray_core::Error::Config(ConfigError::Invalid(
-                    ConfigViolation::DiskResidencyWithoutLocalDir
-                )))
-            ),
-            "{error:?}"
-        );
-    }
-
-    #[test]
     fn test_try_parse_rejects_location_flags_without_location() {
         for flag in ["--key-column", "--value-column", "--ref"] {
             let under_config = parse(&["info", "--config", "icetray.toml", flag, "x"]).unwrap_err();
@@ -329,7 +336,7 @@ mod tests {
             );
         }
         let error =
-            parse(&["info", "--config", "icetray.toml", "--residency", "disk"]).unwrap_err();
+            parse(&["info", "--config", "icetray.toml", "--residency", "bloom"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
     }
 
@@ -381,9 +388,23 @@ value_column = "value"
     }
 
     #[test]
-    fn test_try_parse_rejects_an_unknown_residency() {
-        let error = parse(&["info", "--location", LOCATION, "--residency", "memory"]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{error}");
+    fn test_try_parse_offers_a_located_table_full_and_bloom_only() {
+        for residency in [Residency::Full, Residency::Bloom] {
+            let cli = parse(&[
+                "info",
+                "--location",
+                LOCATION,
+                "--residency",
+                &residency.to_string(),
+            ])
+            .unwrap();
+            assert_eq!(target(cli).residency, Some(residency));
+        }
+        for refused in [&Residency::Disk.to_string(), "memory"] {
+            let error =
+                parse(&["info", "--location", LOCATION, "--residency", refused]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue, "{refused}: {error}");
+        }
     }
 
     /// A negative long key, as `Key`'s `Display` prints one.

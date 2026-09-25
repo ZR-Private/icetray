@@ -216,7 +216,9 @@ key as hex with or without `0x`, a uuid hyphenated or as 32 hex digits.
 One table can be opened without a file. `--location` takes a table root or
 a metadata file and opens it under the name `table`, with `--key-column`
 (default `key`), `--value-column` (default `value`), `--ref` (default
-`main`), and `--residency` (default `full`); `--rewrite FROM=TO` applies a
+`main`), and `--residency` (`full` or `bloom`, default `full`; `disk` is a
+usage error, since a one-shot loads once and exits and the doctor under
+`full` already reports every tier's predicted bytes); `--rewrite FROM=TO` applies a
 prefix rewrite under either target and may be repeated. A command-line rule
 takes precedence over the file's for the same prefix, and is checked with
 the file's, so an empty `FROM` exits 1 as it does in a file. A located table is
@@ -250,8 +252,9 @@ table the doctor could not load (which dominates 2), a configuration that
 cannot be read or parsed or breaks one of its rules (a bad log field
 mapping among them), or a listener that would not bind; 64 when the
 command line could not be used: neither or both of `--config` and
-`--location`, a location flag with `--config`, no table matched, `--table`
-required, or a key that does not parse. The
+`--location`, a location flag with `--config`, a `--residency` other than
+`full` or `bloom`, no table matched, `--table` required, or a key that does
+not parse. The
 one-shots log to stderr at `warn`, since their stdout is data.
 
 ## Serving

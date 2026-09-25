@@ -225,12 +225,15 @@ pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, 
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
-/// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
+/// `UnknownResidency` is raised by `Residency`'s `FromStr`, which the command line reads the names it
+/// offers back through; clap refuses any other text before it gets there.
 pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalTooShort { interval: Duration, minimum: Duration }, PollIntervalTooLong { interval: Duration, maximum: Duration }, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, LogFieldCollision { name: String, first: StandardField, second: StandardField }, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
+/// `name` is the lowercase name `Display` prints and the file spells.
 pub enum Residency { Full, Disk, Bloom }
+impl Residency { pub const fn name(self) -> &'static str; }
 /// Exactly the lowercase names `Display` prints (`full`, `disk`, `bloom`); any other word is
 /// `ConfigViolation::UnknownResidency`. The one boundary parser for the setting when it arrives
 /// from the command line; the file reads the same names through serde.
@@ -1106,9 +1109,12 @@ both, since clap waives a `requires` whose argument conflicts with a
 present one. A `--location` table is opened under the name `table`, never
 strict (the one-shots exist to report what `strict` would refuse), with
 defaults `key`, `value`, `main`, `full`, and held to every rule
-`Config::parse` checks through `Config::validated`, so `--residency disk`
-with no local directory fails before anything is opened, as the same
-violation in a file does. The table filter is a
+`Config::parse` checks through `Config::validated`. `--residency` offers
+`full` and `bloom` only, through a `PossibleValuesParser` over
+`Residency::name` read back by `Residency`'s `FromStr`, so clap refuses
+`disk` as a usage error naming the accepted values: a one-shot is one load
+and exit, no flag supplies the `storage.local` a disk tier needs, and the
+doctor under `full` already reports every tier's predicted bytes. The table filter is a
 `--table` flag on all three (a positional before `get`'s keys would make a
 key and a table name indistinguishable); `get` needs it when more than one
 table is configured. Keys are typed in the form `Key`'s `Display` prints

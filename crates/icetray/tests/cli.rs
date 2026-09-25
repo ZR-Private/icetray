@@ -463,24 +463,33 @@ async fn test_location_ignores_the_environment_and_a_bare_run_reads_it() -> Test
     Ok(())
 }
 
-/// Disk residency with no local directory is a configuration violation,
-/// and a `--location` table meets it as a file does: before anything is
-/// opened, so the doctor prints no line and the run ends with exit 1.
+/// A `--location` table runs full or bloom; `disk` is not among the
+/// residencies it offers, so clap refuses it as a usage error before
+/// anything is opened. A file's disk table with no local directory is the
+/// configuration violation, exit 1.
 #[tokio::test]
-async fn test_location_is_held_to_the_configuration_rules_like_a_file() -> TestResult {
+async fn test_location_offers_full_and_bloom_and_refuses_disk_as_usage() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_disk", KeyType::Long)).await?;
-    let located = run(
-        &[
-            &["doctor"][..],
-            &location(&fixture),
-            &["--residency", "disk"],
-        ]
-        .concat(),
-        &[],
-    );
-    assert_exit(&located, EXIT_FAILURE);
-    assert!(located.stdout.is_empty(), "{}", stderr(&located));
+    let located = |residency: &str| {
+        run(
+            &[
+                &["info"][..],
+                &location(&fixture),
+                &["--residency", residency],
+            ]
+            .concat(),
+            &[],
+        )
+    };
+    let disk = located("disk");
+    assert_exit(&disk, EXIT_USAGE);
+    assert!(disk.stdout.is_empty(), "{}", stderr(&disk));
+    for residency in ["full", "bloom"] {
+        let output = located(residency);
+        assert_exit(&output, EXIT_OK);
+        assert_eq!(lines(&output.stdout)[0]["residency"], residency);
+    }
 
     let disk_table = format!("{}residency = \"disk\"\n", toml_table(TABLE_A, &fixture));
     let config = write_file(dir.path(), "disk.toml", &disk_table)?;
