@@ -163,6 +163,9 @@ gets a paragraph; a sentence carrying no load gets deleted.
   in-process is an in-process test. Only what genuinely needs sockets,
   processes, or containers goes to an end-to-end tier, and those run per
   batch, not per change.
+- A test never sleeps a fixed time to let something happen: it waits for
+  the condition, polling within a bound that fails with a message, or holds
+  a fixture so the order is forced.
 - A test proves what it claims. Run it and read the output. If the number
   you assert on is zero when it should not be, the test passed without
   proving anything.
