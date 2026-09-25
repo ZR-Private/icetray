@@ -18,6 +18,7 @@ use aws_config::SdkConfig;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use bytes::Bytes;
 use futures::future::{Either, select};
+use metrics::{Counter, Histogram};
 use object_store::aws::{AmazonS3Builder, AwsCredential};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -117,14 +118,58 @@ const CREDENTIAL_MIN_REUSE: Duration = Duration::from_secs(30);
 /// (RFD 003): object-store GETs and local reads are counted in the same
 /// place. Every GET a `Storage` issues is counted here whether or not it
 /// succeeds, so the counts are the test oracle of RFD 014 and the source of
-/// the request metrics of RFD 012.
-#[derive(Debug, Default)]
+/// the request metrics of RFD 012. The metric handles are registered once,
+/// when the stats are built, with the recorder current then, so a GET
+/// formats no label and looks up no series; a process installs its
+/// recorder before it builds a `Storage`, since stats built earlier record
+/// to no recorder.
+#[derive(Debug)]
 pub struct IoStats {
     gets: AtomicU64,
     bytes: AtomicU64,
     hedges: AtomicU64,
     local_reads: AtomicU64,
     local_bytes: AtomicU64,
+    load: KindMetrics,
+    lookup: KindMetrics,
+    hedges_total: Counter,
+    local_reads_total: Counter,
+    local_bytes_total: Counter,
+}
+
+/// The metric handles of one `ReadKind`, under its `kind` label.
+#[derive(Debug)]
+struct KindMetrics {
+    gets: Counter,
+    bytes: Counter,
+    get_seconds: Histogram,
+}
+
+impl KindMetrics {
+    fn new(kind: ReadKind) -> Self {
+        Self {
+            gets: metrics::counter!(metric::OBJECT_GETS_TOTAL, metric::LABEL_KIND => kind.to_string()),
+            bytes: metrics::counter!(metric::OBJECT_BYTES_TOTAL, metric::LABEL_KIND => kind.to_string()),
+            get_seconds: metrics::histogram!(metric::OBJECT_GET_SECONDS, metric::LABEL_KIND => kind.to_string()),
+        }
+    }
+}
+
+impl Default for IoStats {
+    fn default() -> Self {
+        Self {
+            gets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            hedges: AtomicU64::new(0),
+            local_reads: AtomicU64::new(0),
+            local_bytes: AtomicU64::new(0),
+            load: KindMetrics::new(ReadKind::Load),
+            lookup: KindMetrics::new(ReadKind::Lookup),
+            hedges_total: metrics::counter!(metric::HEDGES_TOTAL),
+            local_reads_total: metrics::counter!(metric::LOCAL_READS_TOTAL),
+            local_bytes_total: metrics::counter!(metric::LOCAL_BYTES_TOTAL),
+        }
+    }
 }
 
 impl IoStats {
@@ -155,14 +200,26 @@ impl IoStats {
         self.local_bytes.load(Ordering::Relaxed)
     }
 
+    /// The metric handles of the `kind` path.
+    fn of(&self, kind: ReadKind) -> &KindMetrics {
+        match kind {
+            ReadKind::Load => &self.load,
+            ReadKind::Lookup => &self.lookup,
+        }
+    }
+
     /// One GET of `len` requested bytes on the `kind` path.
     pub(crate) fn record_get(&self, kind: ReadKind, len: u64) {
         self.gets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(len, Ordering::Relaxed);
-        metrics::counter!(metric::OBJECT_GETS_TOTAL, metric::LABEL_KIND => kind.to_string())
-            .increment(1);
-        metrics::counter!(metric::OBJECT_BYTES_TOTAL, metric::LABEL_KIND => kind.to_string())
-            .increment(len);
+        let metrics = self.of(kind);
+        metrics.gets.increment(1);
+        metrics.bytes.increment(len);
+    }
+
+    /// One observation of the GET latency histogram on the `kind` path.
+    fn record_latency(&self, kind: ReadKind, elapsed: Duration) {
+        self.of(kind).get_seconds.record(time::seconds(elapsed));
     }
 
     /// A hedge: one more lookup GET of the same `len`, issued because the
@@ -170,7 +227,7 @@ impl IoStats {
     /// counts once more under its own name (RFD 013).
     pub(crate) fn record_hedge(&self, len: u64) {
         self.hedges.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(metric::HEDGES_TOTAL).increment(1);
+        self.hedges_total.increment(1);
         self.record_get(ReadKind::Lookup, len);
     }
 
@@ -180,8 +237,8 @@ impl IoStats {
     pub(crate) fn record_local_read(&self, len: u64) {
         self.local_reads.fetch_add(1, Ordering::Relaxed);
         self.local_bytes.fetch_add(len, Ordering::Relaxed);
-        metrics::counter!(metric::LOCAL_READS_TOTAL).increment(1);
-        metrics::counter!(metric::LOCAL_BYTES_TOTAL).increment(len);
+        self.local_reads_total.increment(1);
+        self.local_bytes_total.increment(len);
     }
 }
 
@@ -330,14 +387,19 @@ impl Storage {
     /// whatever the outcome.
     pub async fn read_all(&self, location: &str) -> Result<Bytes> {
         let l = self.locate(location)?;
-        observed(ReadKind::Load, self.get_all(&l)).await
+        observed(&self.stats, ReadKind::Load, self.get_all(&l)).await
     }
 
     /// Reads one byte range on the load path. One load GET, never hedged:
     /// footers and key chunks are bulk work nobody waits on (RFD 013).
     pub(crate) async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes> {
         self.stats.record_get(ReadKind::Load, range_len(&range));
-        observed(ReadKind::Load, l.store.get_range(&l.path, range)).await
+        observed(
+            &self.stats,
+            ReadKind::Load,
+            l.store.get_range(&l.path, range),
+        )
+        .await
     }
 
     /// Reads one byte range on the lookup path, hedged against the table's
@@ -359,7 +421,7 @@ impl Storage {
         let (answer, hedged) = self.race(l, range, len, window.delay()).await;
         let elapsed = started.elapsed();
         window.record(elapsed, hedged);
-        observe_latency(ReadKind::Lookup, elapsed);
+        self.stats.record_latency(ReadKind::Lookup, elapsed);
         answer.map_err(Error::from)
     }
 
@@ -375,7 +437,12 @@ impl Storage {
         for range in ranges {
             self.stats.record_get(ReadKind::Load, range_len(range));
         }
-        observed(ReadKind::Load, l.store.get_ranges(&l.path, ranges)).await
+        observed(
+            &self.stats,
+            ReadKind::Load,
+            l.store.get_ranges(&l.path, ranges),
+        )
+        .await
     }
 
     /// The location with the first matching rewrite rule applied, or the
@@ -586,22 +653,17 @@ fn range_len(range: &Range<u64>) -> u64 {
     range.end.saturating_sub(range.start)
 }
 
-/// Runs one store request and records its latency under `kind` whatever the
-/// outcome: a request that failed took time too.
+/// Runs one store request and records its latency under `kind` in `stats`
+/// whatever the outcome: a request that failed took time too.
 async fn observed<T>(
+    stats: &IoStats,
     kind: ReadKind,
     request: impl Future<Output = object_store::Result<T>>,
 ) -> Result<T> {
     let started = Instant::now();
     let answer = request.await;
-    observe_latency(kind, started.elapsed());
+    stats.record_latency(kind, started.elapsed());
     answer.map_err(Error::from)
-}
-
-/// One observation of the GET latency histogram.
-fn observe_latency(kind: ReadKind, elapsed: Duration) {
-    metrics::histogram!(metric::OBJECT_GET_SECONDS, metric::LABEL_KIND => kind.to_string())
-        .record(time::seconds(elapsed));
 }
 
 /// One lookup GET as the window remembers it.

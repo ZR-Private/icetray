@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
+use metrics::{Counter, Histogram};
 use tokio::sync::MutexGuard;
 
 use crate::approx;
@@ -26,7 +27,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::Key;
 use crate::local::LocalDir;
-use crate::metric;
+use crate::metric::{self, LookupResult};
 use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
@@ -149,6 +150,53 @@ pub struct Table {
     /// How long one `load` or `refresh` may hold `serial` doing its work,
     /// from `server.refresh_deadline`.
     refresh_deadline: Duration,
+    lookups: LookupMetrics,
+}
+
+/// A table's lookup metric handles, one pair per `LookupResult` under the
+/// table's name, registered once in `Table::new` with the recorder current
+/// then, so a lookup clones no name, formats no label, and looks up no
+/// series.
+struct LookupMetrics {
+    cold_hit: ResultMetrics,
+    warm_hit: ResultMetrics,
+    miss: ResultMetrics,
+}
+
+/// `lookups_total` and `lookup_seconds` of one table and result.
+struct ResultMetrics {
+    total: Counter,
+    seconds: Histogram,
+}
+
+impl LookupMetrics {
+    fn new(table: &str) -> Self {
+        let of = |result: LookupResult| ResultMetrics {
+            total: metrics::counter!(
+                metric::LOOKUPS_TOTAL,
+                metric::LABEL_TABLE => table.to_string(),
+                metric::LABEL_RESULT => result.to_string()
+            ),
+            seconds: metrics::histogram!(
+                metric::LOOKUP_SECONDS,
+                metric::LABEL_TABLE => table.to_string(),
+                metric::LABEL_RESULT => result.to_string()
+            ),
+        };
+        Self {
+            cold_hit: of(LookupResult::ColdHit),
+            warm_hit: of(LookupResult::WarmHit),
+            miss: of(LookupResult::Miss),
+        }
+    }
+
+    fn of(&self, result: LookupResult) -> &ResultMetrics {
+        match result {
+            LookupResult::ColdHit => &self.cold_hit,
+            LookupResult::WarmHit => &self.warm_hit,
+            LookupResult::Miss => &self.miss,
+        }
+    }
 }
 
 impl Table {
@@ -157,7 +205,8 @@ impl Table {
     /// lookup runs through `cache` ends at `get_deadline` from its start,
     /// failing as `CacheError::FetchDeadline` for every lookup waiting on
     /// it (RFD 013); load reads do not go through the cache and are not
-    /// bounded by it.
+    /// bounded by it. The lookup metrics are registered here, with the
+    /// recorder current then: a process installs its recorder first.
     pub fn new(
         config: TableConfig,
         source: TableSource,
@@ -168,6 +217,7 @@ impl Table {
         get_deadline: Duration,
     ) -> Self {
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
+        let lookups = LookupMetrics::new(&config.name);
         let table = Self {
             config,
             source,
@@ -180,6 +230,7 @@ impl Table {
             known: Mutex::new(None),
             serial: tokio::sync::Mutex::new(()),
             refresh_deadline,
+            lookups,
         };
         table.publish_state();
         table
@@ -556,18 +607,9 @@ impl Table {
         let started = Instant::now();
         let (value, result) = generation.lookup(key, &self.cache).await?;
         let elapsed = started.elapsed();
-        metrics::counter!(
-            metric::LOOKUPS_TOTAL,
-            metric::LABEL_TABLE => self.config.name.clone(),
-            metric::LABEL_RESULT => result.to_string()
-        )
-        .increment(1);
-        metrics::histogram!(
-            metric::LOOKUP_SECONDS,
-            metric::LABEL_TABLE => self.config.name.clone(),
-            metric::LABEL_RESULT => result.to_string()
-        )
-        .record(time::seconds(elapsed));
+        let metrics = self.lookups.of(result);
+        metrics.total.increment(1);
+        metrics.seconds.record(time::seconds(elapsed));
         Ok(value)
     }
 }

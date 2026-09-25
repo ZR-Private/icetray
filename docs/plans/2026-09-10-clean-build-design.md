@@ -277,7 +277,9 @@ pub enum SourceConfig {
 /// (RFD 003): object-store GETs and local reads are counted in the same place.
 /// Every GET is counted whether or not it succeeds; a hedge is a GET and
 /// counts as one, and once more under `hedges` (RFD 013).
-pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64 */ }
+/// Its metric handles (per `ReadKind` and the unlabeled ones) are registered in `Default`,
+/// with the recorder current then.
+pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64; the metric handles */ }
 impl IoStats { pub fn gets(&self) -> u64; pub fn bytes(&self) -> u64; pub fn hedges(&self) -> u64; pub fn local_reads(&self) -> u64; pub fn local_bytes(&self) -> u64; }
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`;
 /// the hedge delay is its configured percentile, capped by the hedge rate.
@@ -1436,7 +1438,10 @@ Ownership: `table` emits `lookups_total`, `lookup_seconds`,
 `generation_sequence_number`, `generation_swapped_at_seconds`, and
 `table_state`; `cache` the two page-cache counters and
 the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
-series; the binary samples `generation_age_seconds` (from
+series. The per-lookup and per-GET series are recorded through handles
+registered once (a table's per `LookupResult` in `Table::new`, storage's per
+`ReadKind` when its `IoStats` is built) with the recorder current then, so
+the binary installs its recorder before it opens the tables. The binary samples `generation_age_seconds` (from
 `Generation::snapshot_timestamp` against now) and `process_rss_bytes` once
 after the first loads and then every `poll_interval`, running the
 recorder's upkeep with each sample, and counts `requests_total`. `icetray_findings{table,code}` describes the serving

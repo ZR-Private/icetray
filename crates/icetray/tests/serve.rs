@@ -230,9 +230,10 @@ impl Stack {
         if hold_store {
             s3.hold();
         }
+        let recorder = telemetry::install()?;
         let storage = Arc::new(Storage::new(s3.storage_config()));
         let stats = storage.stats();
-        let serving = Serving::start_over(config, storage, telemetry::install()?, options).await?;
+        let serving = Serving::start_over(config, storage, recorder, options).await?;
         let channel = Channel::from_shared(format!("http://{}", serving.listen_addr()))?
             .connect()
             .await?;
