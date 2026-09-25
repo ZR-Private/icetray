@@ -187,7 +187,8 @@ async fn within<T>(
 /// deadline and its fetch's pass moments apart, and the call answers one
 /// code whichever passes first; a read the caller can
 /// retry (no generation yet, an object-store, cache, or local-directory
-/// failure, a catalog or load that did not answer in time) is
+/// failure, a catalog or load that did not answer in time, a load's key
+/// verification canceled as the runtime shut down) is
 /// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
 /// error's `Display`.
 pub fn status_from(error: &Error) -> Status {
@@ -200,7 +201,8 @@ pub fn status_from(error: &Error) -> Status {
         | Error::Cache(CacheError::Fetch(_) | CacheError::Backend(_))
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
-        | Error::RefreshDeadline { .. } => Status::unavailable(message),
+        | Error::RefreshDeadline { .. }
+        | Error::VerifyCanceled { .. } => Status::unavailable(message),
         Error::Iceberg(_)
         | Error::Parquet(_)
         | Error::ObjectStorePath(_)
@@ -598,7 +600,27 @@ mod tests {
                 },
                 Code::Unavailable,
             ),
+            (
+                Error::VerifyCanceled {
+                    path: "mem://f0.parquet".to_string(),
+                    source: canceled_task(),
+                },
+                Code::Unavailable,
+            ),
         ]
+    }
+
+    /// The outcome of a task aborted before it ran: the `JoinError` a
+    /// canceled task leaves.
+    fn canceled_task() -> tokio::task::JoinError {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let task = tokio::spawn(std::future::pending::<()>());
+                task.abort();
+                task.await.unwrap_err()
+            })
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub enum Error {
     CatalogTimeout { table: String, after: Duration },
     /// A first load or refresh ran past `server.refresh_deadline` and was dropped (RFD 013).
     RefreshDeadline { table: String, after: Duration },
+    /// The blocking task verifying a data file's keys was canceled as the runtime shut
+    /// down; a panic in it is resumed on the caller instead. `UNAVAILABLE` at the service.
+    VerifyCanceled { path: String, source: tokio::task::JoinError },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
@@ -126,10 +129,10 @@ impl Error {
 /// label of `refresh_errors_total`: the refusal's own name for `Refused`, `inefficient` for
 /// the strict gate, and the variant's snake_case name for the rest (`iceberg`, `parquet`,
 /// `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
-/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`). Also what `TableState::Degraded` carries as its reason:
+/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`, `verify_canceled`). Also what `TableState::Degraded` carries as its reason:
 /// `Error` is not `Clone`, so the failure goes to the caller and its kind to the state.
 /// Re-exported from `lib.rs`.
-pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline }
+pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline, VerifyCanceled }
 
 /// Named refusals (RFD 007). Display gives the snake_case name used in logs;
 /// the fields name the file, row group, type, key, or bytes a reader has to
@@ -577,7 +580,8 @@ impl FileIndex {
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`. Every tier
     /// streams the key chunks once for verification, checking every key page
     /// header against what its page can hold before parquet reads it, and
-    /// every key page against its offset index; Full keeps the chunks in memory, Disk writes
+    /// every key page against its offset index; the verification runs on the
+    /// blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
     /// them through `LocalDir` (or reuses a chunk file with matching identity
     /// and skips the chunk fetch), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are

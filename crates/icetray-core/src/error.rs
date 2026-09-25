@@ -116,6 +116,16 @@ pub enum Error {
         /// The deadline that passed.
         after: Duration,
     },
+    /// The blocking task that verified a data file's keys was canceled:
+    /// the runtime shut down under it. A panic in that task is resumed on
+    /// the caller instead, never turned into an error.
+    #[error("key verification of file {path} was canceled: {source}")]
+    VerifyCanceled {
+        /// The data file's location.
+        path: String,
+        /// The canceled task's outcome.
+        source: tokio::task::JoinError,
+    },
 }
 
 impl Error {
@@ -155,6 +165,7 @@ impl Error {
             Self::Local { .. } => ErrorKind::Local,
             Self::CatalogTimeout { .. } => ErrorKind::CatalogTimeout,
             Self::RefreshDeadline { .. } => ErrorKind::RefreshDeadline,
+            Self::VerifyCanceled { .. } => ErrorKind::VerifyCanceled,
         }
     }
 }
@@ -198,6 +209,8 @@ pub enum ErrorKind {
     CatalogTimeout,
     /// `Error::RefreshDeadline`.
     RefreshDeadline,
+    /// `Error::VerifyCanceled`.
+    VerifyCanceled,
 }
 
 impl fmt::Display for ErrorKind {
@@ -219,6 +232,7 @@ impl fmt::Display for ErrorKind {
             Self::Local => "local",
             Self::CatalogTimeout => "catalog_timeout",
             Self::RefreshDeadline => "refresh_deadline",
+            Self::VerifyCanceled => "verify_canceled",
         };
         f.write_str(name)
     }
@@ -530,7 +544,7 @@ mod tests {
     }
 
     /// One error of every variant the crate raises itself, each beside its
-    /// `reason` label; their fields are all `Clone`.
+    /// `reason` label.
     fn raised_cases() -> Vec<(Error, &'static str)> {
         vec![
             (
@@ -589,7 +603,27 @@ mod tests {
                 },
                 "refresh_deadline",
             ),
+            (
+                Error::VerifyCanceled {
+                    path: FILE_PATH.to_string(),
+                    source: canceled_task(),
+                },
+                "verify_canceled",
+            ),
         ]
+    }
+
+    /// The outcome of a task aborted before it ran: the `JoinError` a
+    /// canceled task leaves.
+    fn canceled_task() -> tokio::task::JoinError {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let task = tokio::spawn(std::future::pending::<()>());
+                task.abort();
+                task.await.unwrap_err()
+            })
     }
 
     #[test]

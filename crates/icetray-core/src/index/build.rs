@@ -15,6 +15,7 @@ use parquet::data_type::{
     ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArrayType, Int64Type,
 };
 use parquet::errors::ParquetError;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::serialized_reader::SerializedPageReader;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
@@ -50,30 +51,30 @@ impl Inspected {
             layout,
             predicted: _,
         } = self;
-        let column = Column {
-            metadata: &metadata,
+        let to_verify = KeysToVerify {
+            table,
+            handle: Arc::clone(&handle),
+            metadata: Arc::clone(&metadata),
             leaf: layout.key_leaf,
-            path: &handle.location,
+            shape: layout.key_shape,
         };
         let ranges = key_chunk_ranges(&metadata, layout.key_leaf, handle.size());
         let (keys, verified) = match residency {
             Residency::Full => {
-                let (chunks, verified) =
-                    fetch_verified(&table, &handle, &column, layout.key_shape, &ranges).await?;
+                let (chunks, verified) = fetch_verified(&to_verify, &ranges).await?;
                 (KeyResidency::Chunks(chunks), verified)
             }
             Residency::Disk => {
                 let local = local.ok_or(Error::Config(ConfigError::Invalid(
                     ConfigViolation::DiskResidencyWithoutLocalDir,
                 )))?;
-                let (disk, verified) =
-                    disk_chunks(&table, &handle, local, &column, layout.key_shape, &ranges).await?;
+                let (disk, verified) = disk_chunks(&to_verify, local, &ranges).await?;
                 (KeyResidency::Disk(disk), verified)
             }
             Residency::Bloom => {
-                let filter_ranges = bloom_ranges(&table, &handle, &metadata, layout.key_leaf)?;
-                let (chunks, verified) =
-                    fetch_verified(&table, &handle, &column, layout.key_shape, &ranges).await?;
+                let filter_ranges =
+                    bloom_ranges(&to_verify.table, &handle, &metadata, layout.key_leaf)?;
+                let (chunks, verified) = fetch_verified(&to_verify, &ranges).await?;
                 drop(chunks);
                 let filters = read_bloom_filters(&handle, &filter_ranges).await?;
                 (KeyResidency::Filters(filters), verified)
@@ -193,19 +194,74 @@ impl PageReader for CountedPages {
     }
 }
 
+/// The key column of one file being built, owned, so that its
+/// verification can move to the blocking pool.
+struct KeysToVerify {
+    table: String,
+    handle: Arc<FileHandle>,
+    metadata: Arc<ParquetMetaData>,
+    leaf: usize,
+    shape: KeyShape,
+}
+
+impl KeysToVerify {
+    /// `verify` of this column over `chunks`, run on the blocking pool
+    /// (`on_blocking_pool`): decoding every key of a file is the CPU-bound
+    /// part of a load, and inline it would hold the async worker that also
+    /// answers lookups. The builds a load has in flight each wait on at
+    /// most one verification, so a load runs at most `LOAD_CONCURRENCY`
+    /// of them at once, each on its own blocking-pool thread.
+    async fn verify(&self, chunks: &Arc<Segments>) -> Result<Verified> {
+        let table = self.table.clone();
+        let handle = Arc::clone(&self.handle);
+        let metadata = Arc::clone(&self.metadata);
+        let (leaf, shape) = (self.leaf, self.shape);
+        let chunks = Arc::clone(chunks);
+        on_blocking_pool(&self.handle.location, move || {
+            let column = Column {
+                metadata: &metadata,
+                leaf,
+                path: &handle.location,
+            };
+            verify(&table, &column, shape, &chunks)
+        })
+        .await
+    }
+}
+
+/// Runs `work` on the blocking pool and waits for it, so the async worker
+/// awaiting it goes on polling other tasks, and several awaited at once
+/// run on several threads. A panic in `work` is resumed here, as an inline
+/// call would raise it. A caller that stops waiting does not stop `work`:
+/// it runs to its end and its result is dropped. A task the pool dropped
+/// unstarted, because the runtime shut down, is `Error::VerifyCanceled`
+/// for the file at `path`.
+async fn on_blocking_pool<T: Send + 'static>(
+    path: &str,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| match error.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(canceled) => Error::VerifyCanceled {
+                path: path.to_string(),
+                source: canceled,
+            },
+        })?
+}
+
 /// The key column chunks of `ranges`, fetched and verified: the chunks a
 /// tier keeps (Full), writes (Disk), or drops (Bloom), and what
 /// verification recorded.
 async fn fetch_verified(
-    table: &str,
-    handle: &FileHandle,
-    column: &Column<'_>,
-    shape: KeyShape,
+    to_verify: &KeysToVerify,
     ranges: &[Range<u64>],
 ) -> Result<(Arc<Segments>, Verified)> {
+    let handle = &to_verify.handle;
     let parts = fetch_chunk_parts(handle, ranges).await?;
     let chunks = Arc::new(Segments::new(parts, handle.size()));
-    let verified = verify(table, column, shape, &chunks)?;
+    let verified = to_verify.verify(&chunks).await?;
     Ok((chunks, verified))
 }
 
@@ -247,19 +303,17 @@ pub(super) async fn chunks_from_disk(
 /// back and verified, no GET; otherwise the chunks are fetched, verified,
 /// and written, replacing any file at that name.
 async fn disk_chunks(
-    table: &str,
-    handle: &FileHandle,
+    to_verify: &KeysToVerify,
     local: &LocalDir,
-    column: &Column<'_>,
-    shape: KeyShape,
     ranges: &[Range<u64>],
 ) -> Result<(DiskChunks, Verified)> {
+    let handle = &to_verify.handle;
     if let Some(disk) = reusable_disk_chunks(handle, local, ranges)? {
         let chunks = chunks_from_disk(&disk, ranges, handle.size()).await?;
-        let verified = verify(table, column, shape, &chunks)?;
+        let verified = to_verify.verify(&chunks).await?;
         return Ok((disk, verified));
     }
-    let (chunks, verified) = fetch_verified(table, handle, column, shape, ranges).await?;
+    let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
     let disk =
         off_worker(|| local.write_chunks(&identity_of(handle), chunks.parts().iter().cloned()))?;
     Ok((disk, verified))
@@ -629,7 +683,10 @@ pub(super) fn read_one<T: ParquetDataType>(
 
 #[cfg(test)]
 mod tests {
-    use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+    use std::time::Duration;
+
+    use futures::FutureExt;
+    use parquet::file::metadata::ParquetMetaDataReader;
 
     use super::*;
     use crate::approx::count;
@@ -658,6 +715,43 @@ mod tests {
 
     /// Rows per row group in the hand-written fixtures with two row groups.
     const TINY_GROUP_ROWS: usize = 2;
+
+    /// A marker a test panics with, so the panic's payload is known by type.
+    struct Marker;
+
+    /// Work on the blocking pool leaves the runtime's thread polling other
+    /// tasks: on the current-thread runtime, whose one thread inline work
+    /// would hold, the work waits for a message that a task spawned on the
+    /// runtime sends, the stand-in for a lookup answered while a file
+    /// verifies, and receives it.
+    #[tokio::test]
+    async fn test_on_blocking_pool_leaves_the_runtime_polling_other_tasks() {
+        const HELD_AT_MOST: Duration = Duration::from_secs(30);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let lookup = tokio::spawn(async move { sender.send(()) });
+        let held = on_blocking_pool(&location(), move || Ok(receiver.recv_timeout(HELD_AT_MOST)))
+            .await
+            .unwrap();
+        assert_eq!(
+            held,
+            Ok(()),
+            "the held work never heard from the spawned task: the runtime did not poll it"
+        );
+        lookup.await.unwrap().unwrap();
+    }
+
+    /// A panic in work on the blocking pool is resumed on the caller, with
+    /// its payload, as an inline call would raise it.
+    #[tokio::test]
+    async fn test_on_blocking_pool_resumes_a_panic_on_the_caller() {
+        let outcome = AssertUnwindSafe(on_blocking_pool(&location(), || -> Result<()> {
+            std::panic::panic_any(Marker)
+        }))
+        .catch_unwind()
+        .await;
+        let payload = outcome.expect_err("the work panicked");
+        assert!(payload.downcast::<Marker>().is_ok());
+    }
     /// A row count a footer may claim for one row group that no file holds:
     /// two to the fiftieth, eight pebibytes of long keys, beyond the address
     /// space of the supported targets, so a buffer reserved for that many

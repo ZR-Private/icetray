@@ -34,9 +34,12 @@ use crate::time;
 /// footer stage, then chunks fetched and verified at the chunk stage, then
 /// the key chunks of one overlap group gathered for its merge. Each file in
 /// flight is one GET or local read waiting, and at the chunk stage one
-/// file's key chunks in memory; sixteen keeps a load of hundreds of files a
-/// few round trips deep without holding more than sixteen files' chunks
-/// before they are kept or dropped.
+/// file's key chunks in memory and at most one verification of them on
+/// the blocking pool; sixteen keeps a load of hundreds of files a few
+/// round trips deep, and its verifications on up to sixteen threads,
+/// without holding more than sixteen files' chunks before they are kept or
+/// dropped. The bound is per load: tables loading at once each run their
+/// own sixteen.
 const LOAD_CONCURRENCY: usize = 16;
 
 /// One data file with its manifest entry and its resident index.
