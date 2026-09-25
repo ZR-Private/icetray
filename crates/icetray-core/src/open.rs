@@ -42,6 +42,23 @@ impl Opened {
     /// is the one place chunk files are deleted: the serve loop calls it
     /// after every table's first `load` and after any `refresh` that
     /// swapped, and a one-shot subcommand may call it before exit.
+    ///
+    /// Every lock is taken because a load in flight has written chunk files
+    /// that no serving generation references yet, and a live set computed
+    /// beside it would delete them from under the generation about to swap
+    /// in. The locks are taken one at a time in `tables` order, so two
+    /// calls at once cannot each hold a lock the other waits for. The cost
+    /// is that a slow table holds retention up, and with it the next load
+    /// or refresh of every table whose lock is already held. A load or
+    /// refresh gives its lock up once the refresh deadline has passed since
+    /// it took it (`server.refresh_deadline`, five minutes by default), and
+    /// the lock is fair, so a request queued behind it comes next: each
+    /// lock is waited for at most one refresh deadline, and one slow table
+    /// holds the others up at most that long, plus the deletes. A table
+    /// whose lock is not yet taken can start a refresh while an earlier one
+    /// is waited for, so when several tables are slow, a table early in
+    /// `tables` can be held up one refresh deadline for each slow table
+    /// after it.
     pub async fn retain(&self) -> Result<u64> {
         let Some(local) = &self.local else {
             return Ok(0);

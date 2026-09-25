@@ -851,7 +851,10 @@ impl Opened {
     /// union of every table's `Generation::identities`) is computed and applied. The one
     /// place chunk files are deleted: the serve loop calls it after every table's first
     /// `load` and after any `refresh` that returned `Ok(true)`; a one-shot subcommand may
-    /// call it before exit.
+    /// call it before exit. Each lock is waited for at most one refresh deadline, since a
+    /// load or refresh gives its lock up by then and the lock is fair, so one slow table
+    /// holds the others' next refresh up at most that long; with several slow tables, an
+    /// early table can wait one deadline per slow table after it (RFD 017, Consequences).
     pub async fn retain(&self) -> Result<u64>;
 }
 /// Builds storage from the SDK chain, one cache, and every configured table

@@ -167,3 +167,18 @@ gate refuses has already written its new files' chunks; they stay until a
 later swap deletes what no generation references, because the next poll
 rebuilds the same snapshot and reuses them, and deleting them at once would
 make every poll fetch and write them again while the refusal lasts.
+
+Chunk files no serving generation references are deleted with every
+table's load lock held, taken in configuration order, because a load in
+flight has written chunk files its generation will reference once it
+swaps in, and a live set computed beside it would delete them. The cost is
+that a slow table holds the deletion up, and with it the next refresh of
+every table whose lock the deletion already holds. A refresh gives its
+lock up once the refresh deadline of RFD 013 (Tail latency) has passed,
+five minutes by default, so one slow table holds the others up at most
+that long; when several are slow, a table early in the order can wait one
+deadline for each slow table after it, since a table whose lock is not yet
+taken can start a refresh meanwhile. The cost is accepted: a live set
+computed without the locks could miss a load in flight, and taking them
+all at once rather than in order would let two deletions at once each hold
+a lock the other waits for.
