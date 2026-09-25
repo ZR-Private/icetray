@@ -28,7 +28,6 @@ use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::schema::types::ColumnDescPtr;
-use tokio::task::JoinError;
 
 use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
@@ -1214,27 +1213,6 @@ pub(crate) fn identity_of(handle: &FileHandle) -> DataFileIdentity {
     }
 }
 
-/// Runs `work` on the blocking pool and waits for it: a load's and the
-/// doctor's CPU-bound or blocking work over a file or an overlap group,
-/// which inline would hold the async worker that also answers lookups.
-/// The worker awaiting it goes on polling other tasks, and several awaited
-/// at once, as the futures of one `buffered` stream are, run on several
-/// threads. `work` owns what it reads, as the `'static` bound requires. A
-/// panic in `work` is resumed here, as an inline call would raise it. A
-/// caller that stops waiting does not stop `work`: it runs to its end and
-/// its result is dropped. `Err` is the task the pool dropped unstarted
-/// because the runtime shut down; the caller names it for the work it was.
-pub(crate) async fn on_blocking_pool<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> std::result::Result<T, JoinError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| match error.try_into_panic() {
-            Ok(payload) => std::panic::resume_unwind(payload),
-            Err(canceled) => canceled,
-        })
-}
-
 /// The byte range of a page from its offset-index location; build checked
 /// every location's offset and size.
 fn page_range(location: &PageLocation) -> Range<u64> {
@@ -1294,10 +1272,7 @@ fn file_fault(path: &str, fault: FileFault) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::AssertUnwindSafe;
-    use std::time::Duration;
 
-    use futures::FutureExt;
     use parquet::file::page_index::column_index::ColumnIndexMetaData;
 
     use super::*;
@@ -1321,41 +1296,6 @@ mod tests {
     /// statistics, so an earlier row group's bound covers later ones.
     const MANY_ROW_GROUPS: usize = 4;
 
-    /// A marker a test panics with, so the panic's payload is known by type.
-    struct Marker;
-
-    /// Work on the blocking pool leaves the runtime's thread polling other
-    /// tasks: on the current-thread runtime, whose one thread inline work
-    /// would hold, the work waits for a message that a task spawned on the
-    /// runtime sends, the stand-in for a lookup answered while a file
-    /// verifies, and receives it.
-    #[tokio::test]
-    async fn test_on_blocking_pool_leaves_the_runtime_polling_other_tasks() {
-        const HELD_AT_MOST: Duration = Duration::from_secs(30);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let lookup = tokio::spawn(async move { sender.send(()) });
-        let held = on_blocking_pool(move || receiver.recv_timeout(HELD_AT_MOST))
-            .await
-            .unwrap();
-        assert_eq!(
-            held,
-            Ok(()),
-            "the held work never heard from the spawned task: the runtime did not poll it"
-        );
-        lookup.await.unwrap().unwrap();
-    }
-
-    /// A panic in work on the blocking pool is resumed on the caller, with
-    /// its payload, as an inline call would raise it.
-    #[tokio::test]
-    async fn test_on_blocking_pool_resumes_a_panic_on_the_caller() {
-        let outcome =
-            AssertUnwindSafe(on_blocking_pool(|| std::panic::panic_any::<Marker>(Marker)))
-                .catch_unwind()
-                .await;
-        let payload = outcome.expect_err("the work panicked");
-        assert!(payload.downcast::<Marker>().is_ok());
-    }
     /// Bytes per value in the misaligned fixture: enough that the page byte
     /// bound splits value pages far more often than the row limit.
     const MISALIGNED_VALUE_BYTES: usize = 512;

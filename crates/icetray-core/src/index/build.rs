@@ -22,10 +22,10 @@ use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
 use super::{
     ChunkPage, Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected,
-    KeyResidency, KeyShape, Keys, file_fault, identity_of, on_blocking_pool, row_index,
-    unless_panicked,
+    KeyResidency, KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
 };
 use crate::approx;
+use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
 use crate::error::{Error, RefusalReason, Result};

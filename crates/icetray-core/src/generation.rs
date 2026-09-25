@@ -16,6 +16,7 @@ use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::Snapshot;
 
 use crate::approx;
+use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::config::{Residency, TableConfig};
@@ -184,7 +185,7 @@ impl Generation {
     /// before its merge and dropped after, so the load holds one group's
     /// chunks at once and not the table's (RFD 017: the Disk tier reads
     /// them back from the chunk files, the Bloom tier fetches them again).
-    /// Each merge runs on the blocking pool (`index::on_blocking_pool`),
+    /// Each merge runs on the blocking pool (`blocking::on_blocking_pool`),
     /// one at a time for this load; while it runs, the async worker goes on
     /// polling other tasks, and the task goes on polling the other loads it
     /// joins. A canceled merge is `Error::VerifyCanceled` for the group's
@@ -214,7 +215,7 @@ impl Generation {
             let members = gather_members(&files, group).await?;
             let first = files[group[0]].index.handle().location.clone();
             let owned_table = table.to_string();
-            index::on_blocking_pool(move || refuse_duplicates(&owned_table, &members))
+            blocking::on_blocking_pool(move || refuse_duplicates(&owned_table, &members))
                 .await
                 .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
         }
@@ -288,7 +289,7 @@ impl Generation {
     /// out (Full: resident, Disk: one local read per row group, Bloom: one
     /// GET per row group), `LOAD_CONCURRENCY` files at a time, and are
     /// decoded one key page at a time, each file's check on the blocking
-    /// pool (`index::on_blocking_pool`), so up to `LOAD_CONCURRENCY` checks
+    /// pool (`blocking::on_blocking_pool`), so up to `LOAD_CONCURRENCY` checks
     /// run at once on their own threads. A canceled check is
     /// `Error::VerifyCanceled` for its file. The doctor calls it after a
     /// load; no load or refresh does.
@@ -304,7 +305,7 @@ impl Generation {
             let chunks = file.index.key_chunks_for_verification().await?;
             let path = file.index.handle().location.clone();
             let owned_table = table.to_string();
-            index::on_blocking_pool(move || {
+            blocking::on_blocking_pool(move || {
                 refuse_any_key_outside_bucket(&owned_table, &file, &chunks)
             })
             .await

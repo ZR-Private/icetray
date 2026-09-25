@@ -12,6 +12,7 @@ use bytes::Bytes;
 use super::format::{ParsedChunkFile, StoredSpan};
 use super::{LocalFault, local_fault};
 use crate::approx;
+use crate::blocking::on_blocking_pool;
 use crate::error::{Error, Result};
 use crate::storage::IoStats;
 
@@ -69,12 +70,9 @@ impl DiskChunks {
         })?;
         self.shared.stats.record_local_read(len);
         let shared = Arc::clone(&self.shared);
-        tokio::task::spawn_blocking(move || shared.read_at(file_offset, len))
+        on_blocking_pool(move || shared.read_at(file_offset, len))
             .await
-            .map_err(|error| match error.try_into_panic() {
-                Ok(payload) => std::panic::resume_unwind(payload),
-                Err(canceled) => self.shared.error(LocalFault::Join(canceled)),
-            })?
+            .map_err(|canceled| self.shared.error(LocalFault::Join(canceled)))?
     }
 
     /// Whether one stored chunk holds the whole of `range`, so `page` would

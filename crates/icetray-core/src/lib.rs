@@ -4,6 +4,7 @@
 //! and the testkit build on this crate; it depends on neither.
 
 pub mod approx;
+mod blocking;
 mod bucket;
 mod cache;
 pub mod catalog;
