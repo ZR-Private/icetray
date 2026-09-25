@@ -98,22 +98,26 @@ One worker.
    which the library requires before it loads a table; the client is now
    built with the library's in-memory factory, a placeholder that is never
    asked to build because every byte goes through `Storage`.
-3. Golden tables: `dev/golden-tables.sh` runs the recipe with Spark 4.1.3
-   and Iceberg 1.11.0 (`iceberg-spark-runtime-4.1_2.13`) in a container
-   against `target/golden-warehouse`, and `dev/test-golden.sh` runs the
-   golden tests (`icetray-testkit/tests/golden.rs`, ignored tests) against
-   it. The tables were first written by Spark 3.5.9 with Iceberg 1.10.1;
-   the move to 4.1 changed the Parquet writer from parquet-mr 1.16.0 to
-   1.17.1 and left every property the doctor reads the same (rows, pages,
-   alignment, dictionary, bloom filter bytes, bounds, format version 2),
-   and the golden tests passed unchanged. The first run found that a Hadoop catalog records locations
-   as `file:/path`, with no authority, which `Storage::locate` refused as
-   relative; the form is accepted now. The recipe's contract tables drew
-   `large_value_pages` advice at the doctor's first threshold of 128 KiB:
-   192-byte values in 1,000-row pages decompress to about 192 KB. The
-   threshold moved to 1 MiB after stage 4 measured the cost as linear with
-   no step (RFD 016): the recipe is unchanged, and the doctor reports the
-   mean value size beside the mean page size instead.
+3. Golden tables: `dev/golden-tables.sh` runs the recipe with Spark 4.1.3 and
+   Iceberg 1.11.0 (`iceberg-spark-runtime-4.1_2.13`) in a container against
+   `target/golden-warehouse`, and `dev/test-golden.sh` runs the golden tests
+   (`icetray-testkit/tests/golden.rs`, ignored tests) against it. The first
+   run found that a Hadoop catalog records locations as `file:/path`, with no
+   authority, which `Storage::locate` refused as relative; the form is
+   accepted now. The recipe's contract tables drew `large_value_pages` advice
+   at the doctor's first threshold of 128 KiB: 192-byte values in 1,000-row
+   pages decompress to about 192 KB. The threshold moved to 1 MiB after stage
+   4 measured the cost as linear with no step (RFD 016): the recipe is
+   unchanged, and the doctor reports the mean value size beside the mean page
+   size instead. The tables were first written by Spark 3.5.9 with Iceberg
+   1.10.1; the move to 4.1 changed the Parquet writer from parquet-mr 1.16.0
+   to 1.17.1 and left the table format at version 2 and what the doctor reads
+   the same (rows, pages, alignment, dictionary, bloom filter bytes, bounds)
+   but for `str_2m`'s compressed key bytes, 0.03 percent fewer; the golden
+   tests passed unchanged. One contract table, `long_v3_50k`, is written in
+   format version 3: iceberg-rust 0.10.1 reads its metadata and manifests, and
+   icetray serves it at one GET per cold hit with the doctor finding it
+   efficient.
 4. Conformance run: the binary's `test_serve_conformance_from_the_environment`
    starts the server the way a pod starts it (the path from `ICETRAY_CONFIG`,
    a JSON file, no flags) and checks the JSON logs under the configured

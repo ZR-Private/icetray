@@ -35,7 +35,7 @@ pub enum TestkitError {
     /// A filesystem or socket failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// Metadata that could not be written as JSON.
+    /// Metadata that could not be written or read as JSON.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     /// A failure building or using an `object_store` client.

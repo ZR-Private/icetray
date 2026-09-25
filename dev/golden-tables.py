@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Write the golden Iceberg tables the layout tests read.
 
-One contract-shaped table per key type, plus the off-contract layouts whose
-serving cost RFD 007 prices and whose findings RFD 016 reports. Run it against
-any object store or local directory; the tests locate the result through
-ICETRAY_GOLDEN_WAREHOUSE.
+One contract-shaped table per key type, one more in table format version 3,
+plus the off-contract layouts whose serving cost RFD 007 prices and whose
+findings RFD 016 reports. Run it against any object store or local
+directory; the tests locate the result through ICETRAY_GOLDEN_WAREHOUSE.
 
     pip install 'pyspark==4.1.*'
     python3 dev/golden-tables.py --warehouse s3a://bucket/prefix/warehouse
@@ -66,6 +66,7 @@ ROWS_2M = 2_000_000
 ROWS_1M = 1_000_000
 ROWS_500K = 500_000
 ROWS_250K = 250_000
+ROWS_50K = 50_000
 # Bucket counts: four for the contract tables, two for the wide and overlap
 # tables, none for the unpartitioned table.
 FOUR_BUCKETS = 4
@@ -95,6 +96,11 @@ WIDE = {
     "write.parquet.row-group-check-min-record-count": "4",
     "write.parquet.row-group-check-max-record-count": "16",
 }
+
+# Iceberg 1.11 creates a table in format version 2 unless told otherwise;
+# this asks for version 3 (row lineage, deletion vectors), the version a
+# table owner on a current writer may already have chosen.
+FORMAT_V3 = {"format-version": "3"}
 
 LONG_KEY = f"id * {KEY_STEP}"
 STRING_KEY = (
@@ -189,6 +195,13 @@ def contract_tables(spark):
         LONG_KEY,
         WIDE_REPEATS,
         incompressible=True,
+    )
+    fill(
+        spark,
+        create(spark, "long_v3_50k", "BIGINT", FOUR_BUCKETS, extra=FORMAT_V3),
+        ROWS_50K,
+        LONG_KEY,
+        CONTRACT_REPEATS,
     )
 
 

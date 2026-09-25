@@ -39,7 +39,11 @@ const ROWS_500K: u64 = 500_000;
 /// Rows of `long_wide_250k` and `overlap_250k`.
 const ROWS_250K: u64 = 250_000;
 
-/// Buckets of the contract tables and `default_layout_1m` (`create(..., 4)`).
+/// Rows of `long_v3_50k`.
+const ROWS_50K: u64 = 50_000;
+
+/// Buckets of the contract tables, `long_v3_50k`, and `default_layout_1m`
+/// (`create(..., 4)`).
 const FOUR_BUCKETS: u32 = 4;
 
 /// Buckets of the wide and overlap tables (`create(..., 2, extra=WIDE)`).
@@ -83,6 +87,9 @@ pub enum GoldenTable {
     /// `long_wide_250k`: the contract layout with byte-bounded pages and
     /// sixteen-kibibyte values.
     LongWide250k,
+    /// `long_v3_50k`: the contract layout, long keys, in table format
+    /// version 3 (the recipe's `FORMAT_V3`).
+    LongV3_50k,
     /// `default_layout_1m`: the writer's defaults, priced by the doctor.
     DefaultLayout1m,
     /// `unpartitioned_500k`: no bucket partition.
@@ -98,6 +105,7 @@ impl GoldenTable {
         match self {
             Self::Long2m
             | Self::LongWide250k
+            | Self::LongV3_50k
             | Self::DefaultLayout1m
             | Self::Unpartitioned500k
             | Self::Overlap250k => KeyType::Long,
@@ -109,7 +117,11 @@ impl GoldenTable {
     /// The bucket count the table was created with; zero is unpartitioned.
     pub fn buckets(self) -> u32 {
         match self {
-            Self::Long2m | Self::Str2m | Self::Bin16_500k | Self::DefaultLayout1m => FOUR_BUCKETS,
+            Self::Long2m
+            | Self::Str2m
+            | Self::Bin16_500k
+            | Self::LongV3_50k
+            | Self::DefaultLayout1m => FOUR_BUCKETS,
             Self::LongWide250k | Self::Overlap250k => TWO_BUCKETS,
             Self::Unpartitioned500k => UNPARTITIONED,
         }
@@ -122,6 +134,7 @@ impl GoldenTable {
             Self::DefaultLayout1m => ROWS_1M,
             Self::Bin16_500k | Self::Unpartitioned500k => ROWS_500K,
             Self::LongWide250k | Self::Overlap250k => ROWS_250K,
+            Self::LongV3_50k => ROWS_50K,
         }
     }
 }
@@ -133,6 +146,7 @@ impl fmt::Display for GoldenTable {
             Self::Str2m => "str_2m",
             Self::Bin16_500k => "bin16_500k",
             Self::LongWide250k => "long_wide_250k",
+            Self::LongV3_50k => "long_v3_50k",
             Self::DefaultLayout1m => "default_layout_1m",
             Self::Unpartitioned500k => "unpartitioned_500k",
             Self::Overlap250k => "overlap_250k",
@@ -228,11 +242,12 @@ mod tests {
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
 
     /// Every table, beside the name the recipe writes it under.
-    const NAMES: [(GoldenTable, &str); 7] = [
+    const NAMES: [(GoldenTable, &str); 8] = [
         (GoldenTable::Long2m, "long_2m"),
         (GoldenTable::Str2m, "str_2m"),
         (GoldenTable::Bin16_500k, "bin16_500k"),
         (GoldenTable::LongWide250k, "long_wide_250k"),
+        (GoldenTable::LongV3_50k, "long_v3_50k"),
         (GoldenTable::DefaultLayout1m, "default_layout_1m"),
         (GoldenTable::Unpartitioned500k, "unpartitioned_500k"),
         (GoldenTable::Overlap250k, "overlap_250k"),

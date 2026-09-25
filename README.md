@@ -425,8 +425,9 @@ pass they did not earn; under a plain `cargo test` they show as ignored.
 followed by `dev/rest-fixture.sh up` starts the reference catalog in a
 container. `dev/test-golden.sh` runs the layout tests against the golden
 tables `dev/golden-tables.py` writes, one contract-shaped table per key
-type plus the off-contract layouts whose cost and advice findings the doctor
-reports:
+type, one more in table format version 3 (the rest are version 2, the
+writer's default), and the off-contract layouts whose cost and advice
+findings the doctor reports:
 
 ```sh
 dev/golden-tables.sh

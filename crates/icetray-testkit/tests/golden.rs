@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use iceberg::spec::{FormatVersion, TableMetadata};
 use icetray_core::check::Tier;
 use icetray_core::{
     Error, Finding, FindingCode, Generation, Key, Serviceability, Storage, Table, Value, diagnose,
@@ -28,6 +29,9 @@ const IDS_500K: [u64; 5] = [0, 1, 12_345, 249_999, 499_999];
 
 /// Ids looked up on the quarter-million-row tables.
 const IDS_250K: [u64; 5] = [0, 1, 12_345, 123_456, 249_999];
+
+/// Ids looked up on the fifty-thousand-row table.
+const IDS_50K: [u64; 5] = [0, 1, 12_345, 24_999, 49_999];
 
 /// The value a byte of a binary key is flipped with to make an absent key.
 const FLIP: u8 = 0xff;
@@ -227,6 +231,29 @@ async fn test_golden_wide_values_are_byte_bounded() -> Result<()> {
         value
     })
     .await
+}
+
+/// A contract table in table format version 3 serves as version 2 does:
+/// the doctor finds it efficient with no cost finding, and a cold hit costs
+/// the value pages the oracle names. Its files are small, so the writer's
+/// fixed-size bloom filter may draw advice; that is the doctor's to report.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_format_v3_contract_serves_one_get_per_hit() -> Result<()> {
+    let golden = open_golden(GoldenTable::LongV3_50k, false).await?;
+    let generation = golden.current();
+    let metadata: TableMetadata = serde_json::from_slice(
+        &golden
+            .storage
+            .read_all(&generation.metadata_location)
+            .await?,
+    )?;
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    let report = diagnose(&generation);
+    assert_eq!(report.summary.serviceability, Serviceability::Efficient);
+    assert!(cost_codes(&golden).is_empty(), "{:?}", report.findings);
+    let keys: Vec<Key> = IDS_50K.iter().map(|&id| golden::long_key(id)).collect();
+    verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
 
 #[tokio::test]
