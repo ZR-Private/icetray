@@ -23,7 +23,7 @@ use super::{
 };
 use crate::approx;
 use crate::config::{ConfigError, ConfigViolation, Residency};
-use crate::contract::MAX_KEY_BYTES;
+use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, UUID_BYTES};
 use crate::local::{DiskChunks, LocalDir};
@@ -94,12 +94,11 @@ impl Inspected {
 /// A page reader that checks the value count in the header of every data
 /// page before the column reader sees it, and records it, so that what a
 /// decode produced can be checked against the rows the offset index gives
-/// those pages. The column reader sizes a decode by the header's count, so
-/// a data page claiming more values than the offset index gives it rows
-/// (`check_pages_read` requires one value per row of every page read, nulls
-/// included) is refused here, before the reader holds it, and recorded as
-/// refused.
-/// The dictionary page is handed through unchecked and uncounted; the pages
+/// those pages. The column reader takes the header's count as the values
+/// the page holds, so a data page claiming more values than the offset
+/// index gives it rows (`check_pages_read` requires one value per row of
+/// every page read, nulls included) is refused here, before the reader
+/// holds it, and recorded as refused. The dictionary page is handed through unchecked and uncounted; the pages
 /// the column reader skips from their locations are never read and never
 /// seen.
 struct CountedPages {
@@ -451,6 +450,15 @@ pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
     Ok(())
 }
 
+/// The most records one `read_records` call asks the column reader for:
+/// sixteen pages of the served layout, so a call's overhead is spread over
+/// many pages. The reader sizes the value and level buffers of a call by
+/// the records asked for, capped by the values its page has left, so the
+/// buffers a call grows hold at most this many entries, under a mebibyte
+/// for any Parquet type, whatever a footer claims for a row group or a
+/// header for a page.
+const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
+
 /// `take` records of `chunk` after skipping `skip`, decoded from
 /// `segments`, which hold at least the pages those rows are in and the
 /// chunk's dictionary page when it has one. Whole pages before the rows
@@ -461,15 +469,34 @@ pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
 /// were decoded, from exactly the pages the offset index names for them,
 /// each page holding the rows the index gives it; a page that does not is
 /// `FileFault::PageRowsMismatch`, so no row position rests on an offset
-/// index the pages contradict. `take` is the footer's number and sizes no
-/// buffer by itself: the column reader sizes the values and levels of each
-/// decode by the smaller of the records still wanted and the current
-/// page's header count, and a data page whose header claims more values
-/// than the offset index gives it rows is refused as
-/// `FileFault::PageRowsMismatch` before the reader decodes it. Those
-/// buffers are therefore bounded by the page's span in the offset index,
-/// and the span of a row group's last page runs to the row group's row
-/// count, which the footer alone states.
+/// index the pages contradict.
+///
+/// `take` is the footer's number and sizes no buffer by itself. The column
+/// reader is asked for at most `DECODE_BATCH_RECORDS` records a call, into
+/// a batch buffer and a level buffer cleared before each call, and the
+/// batch is appended to the result after it. The column reader sizes the
+/// values and levels of a call by the smaller of the records asked for and
+/// the values its page has left, so no value or level buffer it grows
+/// holds more than a batch, whatever the footer claims for the row group
+/// or a header for its page, and the result grows only with values
+/// decoded. A data page whose header claims more values than the offset
+/// index gives it rows is refused before the column reader decodes it. A
+/// page whose values run out short of its header's count ends the decode
+/// in an error, which is `FileFault::PageRowsMismatch` when a header read
+/// on the way disagrees with the offset index and `Error::Parquet`
+/// otherwise.
+///
+/// Three allocations happen inside parquet before this function sees what
+/// sized them, and are not bounded here. The page reader reserves a page's
+/// uncompressed size from its header, at most `i32::MAX` bytes, when it
+/// decodes the page (a Snappy chunk zero-fills it), and hands out the
+/// decoded page after: no public parquet API reads a page header ahead of
+/// the page reader, since `PageReader::peek_next_page` returns rows and
+/// levels but no sizes and the only public header type, in
+/// `parquet::format`, is deprecated. A dictionary page's value count, from
+/// its header, sizes the dictionary it decodes into. A delta-length or
+/// delta byte-array page sizes its lengths by the count in its encoded
+/// data.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -491,7 +518,9 @@ fn read_column<T: ParquetDataType>(
         tally: Arc::clone(&tally),
     };
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
+    let batch_records = row_index(DECODE_BATCH_RECORDS);
     let mut values = Vec::new();
+    let mut batch = Vec::new();
     let mut def_levels = Vec::new();
     let mut decode = || -> parquet::errors::Result<usize> {
         let skipped = if skip > 0 {
@@ -501,12 +530,15 @@ fn read_column<T: ParquetDataType>(
         };
         let mut records = 0;
         while skipped == skip && records < take {
+            batch.clear();
+            def_levels.clear();
             let (read, _, _) = reader.read_records(
-                take - records,
+                (take - records).min(batch_records),
                 nullable.then_some(&mut def_levels),
                 None,
-                &mut values,
+                &mut batch,
             )?;
+            values.append(&mut batch);
             if read == 0 {
                 break;
             }
@@ -519,7 +551,7 @@ fn read_column<T: ParquetDataType>(
     if let Some(page) = tally.refused {
         return Err(chunk.page_rows_mismatch(page));
     }
-    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded?)?;
+    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)?;
     Ok(values)
 }
 
@@ -541,7 +573,6 @@ mod tests {
     use super::*;
     use crate::approx::count;
     use crate::config::{ConfigError, ConfigViolation};
-    use crate::contract::PAGE_ROWS;
     use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
     use crate::index::testing::{
         FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
@@ -947,6 +978,51 @@ mod tests {
                 "{claimed} values claimed"
             );
         }
+    }
+
+    /// A row count a footer may claim for one row group: two to the
+    /// thirty-first, one more than `i32::MAX`, so a row group with a single
+    /// page gives that page a span with room for a header claiming
+    /// `i32::MAX` values, and the span check lets the claim through.
+    const SPAN_OF_I32_MAX_ROWS: i64 = 1 << 31;
+
+    /// A footer that gives row group 0 one key page spanning
+    /// `SPAN_OF_I32_MAX_ROWS` rows, whose header claims `i32::MAX` values
+    /// over the thousand the page holds, is refused as a page that does not
+    /// hold the rows its header claims, and the claim sizes no buffer on the
+    /// way. The column reader sizes each decode by the smaller of the
+    /// records a call asks for and the values its page has left: with one
+    /// call for the whole row group that is `i32::MAX` longs, 16 GiB,
+    /// reserved and zeroed before the page runs out. `read_column` asks for
+    /// at most `DECODE_BATCH_RECORDS` records a call, into buffers it clears
+    /// before each call, so no value or level buffer the reader grows holds
+    /// more than a batch, whatever the footer or the header claims; the
+    /// decode then fails where the page's values end, and the header's
+    /// count, checked against the offset index, is the refusal.
+    #[tokio::test]
+    async fn test_verify_refuses_a_page_claiming_i32_max_values_in_a_span_that_holds_them() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let path = location();
+        let (metadata, chunks) = with_first_page_values(&opened, &loaded, key_leaf, i32::MAX).await;
+        let first_page = pages_of(&metadata, key_leaf)[0].clone();
+        let one_page = with_pages(&metadata, key_leaf, vec![first_page]);
+        let lying = with_group_rows(&one_page, 0, SPAN_OF_I32_MAX_ROWS);
+        let column = Column {
+            metadata: &lying,
+            leaf: key_leaf,
+            path: &path,
+        };
+        assert_eq!(
+            fault_of(
+                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups)
+            ),
+            FileFault::PageRowsMismatch {
+                row_group: 0,
+                page: 0,
+            }
+        );
     }
 
     /// `rows` binary keys that do not compress: digests of the row number,

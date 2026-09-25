@@ -1025,11 +1025,18 @@ impl<'a> ColumnChunk<'a> {
     /// index gives it: `seen` is the value count in the header of every
     /// data page the reader read, in order, starting at the page holding
     /// the first row (the pages before it were skipped from their
-    /// locations, unread), and `decoded` is how many rows it produced. No
-    /// rows wanted means no page read. A disagreement is
-    /// `FileFault::PageRowsMismatch` naming the first page that does not
-    /// fit.
-    fn check_pages_read(&self, rows: Range<usize>, seen: &[usize], decoded: usize) -> Result<()> {
+    /// locations, unread), and `decoded` is how many rows it produced, or
+    /// the error the decode ended in. No rows wanted means no page read. A
+    /// disagreement is `FileFault::PageRowsMismatch` naming the first page
+    /// that does not fit. The header counts are checked before a decode
+    /// error is returned, so a page that ran out of values short of the
+    /// count its header claims is refused as the mismatch it is.
+    fn check_pages_read(
+        &self,
+        rows: Range<usize>,
+        seen: &[usize],
+        decoded: parquet::errors::Result<usize>,
+    ) -> Result<()> {
         let (first, expected) = if rows.is_empty() {
             (0, 0)
         } else {
@@ -1043,6 +1050,7 @@ impl<'a> ColumnChunk<'a> {
                 return Err(self.page_rows_mismatch(page));
             }
         }
+        let decoded = decoded?;
         if seen.len() != expected {
             return Err(self.page_rows_mismatch(first + seen.len().min(expected.saturating_sub(1))));
         }
