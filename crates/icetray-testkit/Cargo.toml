@@ -36,5 +36,11 @@ turmoil = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+clap.workspace = true
 # The container-gated catalog test writes its fixture through a REST catalog.
 iceberg-catalog-rest = { workspace = true }
+icetray = { path = "../icetray" }
+libc = "0.2.189"
+memory-stats.workspace = true
+rand.workspace = true
+tikv-jemallocator.workspace = true
