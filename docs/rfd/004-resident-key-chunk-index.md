@@ -103,11 +103,21 @@ of RFD 008 (Keys), a dictionary of more values than its row group has rows
 or of more bytes than those values at the cap, a compressed size past
 the page's place in the offset index, and a v2 data page whose level
 lengths are negative or add up past its uncompressed size, which parquet
-adds as 32-bit integers that two lengths near the maximum overflow. On a refresh the refusal leaves the
+adds as 32-bit integers that two lengths near the maximum overflow. Those
+bounds rest on the footer's row counts, so a footer claiming billions of
+rows widens them; a ceiling that does not rest on the footer closes that
+for key pages. No key page, data or dictionary, may declare more than 64
+MiB uncompressed, sixteen times the contract's largest key page of 1,000
+keys at the cap (about 4 MiB) and far above the 1 MiB pages writers aim
+for; and no key dictionary may count more entries than 64 MiB holds at the
+fewest bytes an entry of its type takes (8 for a long, the 4-byte length
+of a byte array, a fixed-width column's width). Parquet keeps each entry in
+8 bytes for a long and 32 for a byte array, so a dictionary at that count
+still takes up to 512 MiB, and a fixed-width key of width 0 is bounded
+only by its rows. On a refresh the refusal leaves the
 previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
 run far past the cap can meet this refusal before the key-length one. What
-the pre-scan does not cover: its bounds rest on the footer's row counts, so
-a footer claiming billions of rows widens them; value pages and a value
+the pre-scan does not cover: value pages and a value
 column's dictionary, read at lookup, are not pre-scanned; and the value
 counts inside a page body, the lengths a delta-length or delta byte-array
 page carries, stay unchecked. Parquet's decoder reads those; Iceberg's

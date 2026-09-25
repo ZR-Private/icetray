@@ -326,7 +326,7 @@ fn verify(
     for row_group in 0..total {
         let chunk = column.group(row_group);
         let rows = chunk.rows();
-        check_page_headers(chunk, chunks)?;
+        check_page_headers(chunk, shape, chunks)?;
         let keys = decode_run(chunk, shape, 0..rows, Arc::clone(chunks))?;
         if keys.len() < row_index(rows) {
             let reason = RefusalReason::NullKeys {
@@ -584,9 +584,9 @@ mod tests {
     use crate::index::page_header::{
         COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
         DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, MOST_BYTES_PER_VALUE,
-        NIBBLE_BITS, NIBBLE_MASK, NUM_VALUES_FIELD, PAGE_ENCODING_ALLOWANCE_BYTES, PageBody,
-        PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD, UNCOMPRESSED_PAGE_SIZE_FIELD,
-        VARINT_CONTINUES,
+        MOST_KEY_PAGE_BYTES, NIBBLE_BITS, NIBBLE_MASK, NUM_VALUES_FIELD,
+        PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD,
+        TYPE_FIELD, UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
     };
     use crate::index::testing::{
         FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
@@ -1285,6 +1285,82 @@ mod tests {
                 i32::MAX,
                 page_bound(rows)
             )
+        );
+    }
+
+    /// A row count a footer may claim for a row group of `PAGES_PER_GROUP`
+    /// pages: two to the thirty-first, which widens the last page's span,
+    /// and with it the span-derived bounds, past any page a header can
+    /// declare.
+    const INFLATED_GROUP_ROWS: i64 = 1 << 31;
+
+    /// A key page declaring more than `MOST_KEY_PAGE_BYTES` uncompressed is
+    /// refused even when the footer claims so many rows for its row group
+    /// that the span bound alone would admit it.
+    #[tokio::test]
+    async fn test_verify_refuses_a_key_page_over_the_ceiling_whatever_its_footer_claims() {
+        let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let last = PAGES_PER_GROUP - 1;
+        let page = ChunkPage::Data(last);
+        let claimed = i32::try_from(MOST_KEY_PAGE_BYTES + 1).unwrap();
+        let (patched, chunks) = with_first_group_header(
+            &opened,
+            &loaded,
+            key_leaf,
+            page,
+            HeaderField::UncompressedPageSize,
+            claimed,
+        )
+        .await;
+        let metadata = with_group_rows(&patched, 0, INFLATED_GROUP_ROWS);
+        let span = INFLATED_GROUP_ROWS - pages_of(&metadata, key_leaf)[last].first_row_index;
+        assert!(
+            page_bound(u64::try_from(span).unwrap()) > u64::try_from(claimed).unwrap(),
+            "the span bound alone admits the claim"
+        );
+        assert_eq!(
+            fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+            over_bound(
+                page,
+                HeaderField::UncompressedPageSize,
+                claimed,
+                MOST_KEY_PAGE_BYTES
+            )
+        );
+    }
+
+    /// A key dictionary declaring more entries than `MOST_KEY_PAGE_BYTES`
+    /// holds at the fewest bytes an `INT64` entry takes is refused, even
+    /// when the footer claims more rows for its row group than that.
+    #[tokio::test]
+    async fn test_verify_refuses_a_dictionary_counting_more_entries_than_the_ceiling_holds() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.dictionary = Dictionary::Key;
+        let opened = store(&fixture).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let page = ChunkPage::Dictionary;
+        let most = MOST_KEY_PAGE_BYTES / count(size_of::<i64>());
+        let claimed = i32::try_from(most + 1).unwrap();
+        let (patched, chunks) = with_first_group_header(
+            &opened,
+            &loaded,
+            key_leaf,
+            page,
+            HeaderField::NumValues,
+            claimed,
+        )
+        .await;
+        let metadata = with_group_rows(&patched, 0, INFLATED_GROUP_ROWS);
+        assert!(
+            INFLATED_GROUP_ROWS > i64::from(claimed),
+            "the row bound alone admits the claim"
+        );
+        assert_eq!(
+            fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+            over_bound(page, HeaderField::NumValues, claimed, most)
         );
     }
 
