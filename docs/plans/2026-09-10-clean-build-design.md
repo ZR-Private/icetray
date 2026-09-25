@@ -49,7 +49,7 @@ redefine.
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, the page cache's disk block, file size target, key length cap and advice); a shared constant that is not a layout number lives with what it bounds (`key`, `check::thresholds`, `config`) | 002, 008 |
 | `config` | the configuration schema and its validation; TOML and JSON parsing; defaults | 011 |
 | `storage` | every byte read from object storage: store per prefix, location rewriting, request counting, credential chain with cached refresh, hedging | 003, 013 |
-| `local` | the optional local directory: chunk files for disk residency (naming by data-file identity, reuse on restart, deletion with the generation), a disk budget, local-read counting, and the `DiskTier` handle `cache` uses for its disk level. A directory module: `local/mod.rs` holds the public surface and `LocalDir`, `local/format.rs` the chunk file format (envelope, header, checks, writer), `local/disk.rs` the read side (`DiskChunks`, `DiskTier`), and `local/testing.rs` the fixtures the three files' tests share | 017, 012 |
+| `local` | the optional local directory: chunk files for disk residency (naming by data-file identity, reuse on restart, deletion with the generation), a disk budget, local-read counting, and the `DiskLevel` handle `cache` uses for its disk level. A directory module: `local/mod.rs` holds the public surface and `LocalDir`, `local/format.rs` the chunk file format (envelope, header, checks, writer), `local/disk.rs` the read side (`DiskChunks`, `DiskLevel`), and `local/testing.rs` the fixtures the three files' tests share | 017, 012 |
 | `catalog` | where the current metadata comes from (static root with version hint, metadata file, any catalog incl. REST); one-read change detection | 005 |
 | `manifest` | snapshot to live data files; table layout (key and value columns, bucket transform) derived from the snapshot's schema and each manifest's partition spec; delete-file refusal | 005, 009 |
 | `parquet_io` | Parquet byte access: one-GET footer load, `Segments` (in-memory `ChunkReader` that never fetches) | 004, 006 |
@@ -303,7 +303,7 @@ impl LocalDir {
     pub fn index_budget(&self) -> Option<u64>;
     /// `None` when `page_cache_disk_bytes` is zero; otherwise a level of at
     /// least one block, which `Config::parse` has checked.
-    pub fn page_tier(&self) -> Option<DiskTier>;
+    pub fn page_cache_level(&self) -> Option<DiskLevel>;
 }
 /// A key page read from local disk on demand. Not a `ChunkReader`: the index
 /// wraps the bytes a page read returns in a `Segments`.
@@ -324,8 +324,8 @@ pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest
 /// the `cache/` directory, its size bound, and the `IoStats` a page served
 /// from it is charged to as one local read, the same counter `LocalDir`
 /// charges chunk reads to (RFD 003).
-pub struct DiskTier;
-impl DiskTier { pub fn dir(&self) -> &Path; pub fn capacity_bytes(&self) -> u64; }
+pub struct DiskLevel;
+impl DiskLevel { pub fn dir(&self) -> &Path; pub fn capacity_bytes(&self) -> u64; }
 pub struct Located { pub store: Arc<dyn ObjectStore>, pub path: object_store::path::Path }
 pub struct Storage;
 impl Storage {
@@ -678,7 +678,7 @@ impl PageCache {
     /// Async and fallible because opening the level opens its files and
     /// recovers what they hold; a failure is `CacheError::Backend`. A disk
     /// level that fails to read a page falls through to the fetch.
-    pub async fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Result<Self>;
+    pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self>;
     /// The page at `key` and where it came from: memory, the disk level, or `fetch`.
     /// Concurrent callers for one key share one fetch and one disk read. The origin decides
     /// a lookup's `result` label per call, never by differencing the process-wide counters.
@@ -954,7 +954,7 @@ pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened>;
 /// The body of `open` over a storage the caller built, for the testkit and embedders: a test
 /// constructs one with `Storage::new`, registers its own stores on it, and never touches the
 /// SDK chain. `LocalDir::open` when configured, one `PageCache` with the directory's
-/// `page_tier`, one `Table` per configured name matching `only`. The binary uses `open`; the
+/// `page_cache_level`, one `Table` per configured name matching `only`. The binary uses `open`; the
 /// disk-tier acceptance tests count `Opened::retain` over two tables through this.
 pub async fn open_with(config: &Config, only: Option<&str>, storage: Arc<Storage>) -> Result<Opened>;
 ```
@@ -1045,7 +1045,7 @@ Health is `grpc.health.v1` from the tonic health crate, not our proto.
 **Local directory.** Optional (`storage.local`). Chunk files under
 `index/`, named by a digest of the data file's path, each carrying a
 `ChunkFileHeader` inside the RFD 011 envelope; the page cache's disk level
-under `cache/`, handed to `PageCache` as a `DiskTier`, or none when
+under `cache/`, handed to `PageCache` as a `DiskLevel`, or none when
 `page_cache_disk_bytes` is zero; any other size is at least one block,
 `contract::PAGE_CACHE_DISK_BLOCK_BYTES`, which `Config::parse` checks.
 Disk residency reads pages with positioned reads on a blocking pool, never
@@ -1386,7 +1386,7 @@ skip).
 | Bloom tier: a cold hit is exactly two GETs, a warm hit none, a negative miss none; refusals identical to Full plus its own; chunks unreachable after load; a row group without a filter is refused | P (carried from the prototype's residency tests) |
 | Disk tier: a cold hit is one GET and one local read, a miss one local read and no GET; refusals identical to Full plus its own; a restart with matching chunk files fetches footers only; a dropped file's chunk file is deleted; no local directory is the configuration violation `Config::parse` refuses, raised by the loader for a configuration built in code | P (temporary directory, counting GETs and local reads) |
 | A uuid key column routes and orders as the reference implementation does, and a uuid-keyed lookup costs the same as a long-keyed one | U (oracle), P |
-| The page cache's disk tier serves a page evicted from memory with a local read and no GET, and survives a restart | P (temporary directory) |
+| The page cache's disk level serves a page evicted from memory with a local read and no GET, and survives a restart | P (temporary directory) |
 | Row-group choice never consults column statistics: long string keys sharing a prefix beyond 64 bytes across several row groups all resolve | U (carried from the prototype) |
 | Over-budget Full load is refused at the footer stage with no chunk fetched | P (counting) |
 | The value column's column index is not resident, and a file's resident bytes are what its footer predicted | P (`lookup.rs`: no loaded footer keeps a value column index), U for the prediction (core's byte-bounded large-value fixture: the kept footer is smaller than the loaded one by at least the dropped index, and `predicted_resident_bytes` of the loaded footer equals the built index's resident bytes) |

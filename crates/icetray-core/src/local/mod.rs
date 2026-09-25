@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-pub use disk::{DiskChunks, DiskTier};
+pub use disk::{DiskChunks, DiskLevel};
 pub(crate) use format::chunk_file_bytes;
 use format::{
     HEADER_OFFSET, MAX_HEADER_BYTES, ParseFailure, ParsedChunkFile, Rejection, chunk_name,
@@ -315,8 +315,8 @@ impl LocalDir {
     /// A level is at least one block, `contract::PAGE_CACHE_DISK_BLOCK_BYTES`,
     /// which `Config::parse` checks: below that the level has no block to
     /// write into and would hold nothing.
-    pub fn page_tier(&self) -> Option<DiskTier> {
-        (self.page_cache_disk_bytes > 0).then(|| DiskTier {
+    pub fn page_cache_level(&self) -> Option<DiskLevel> {
+        (self.page_cache_disk_bytes > 0).then(|| DiskLevel {
             dir: self.cache_dir.clone(),
             capacity_bytes: self.page_cache_disk_bytes,
             stats: Arc::clone(&self.stats),
@@ -803,20 +803,20 @@ mod tests {
     }
 
     #[test]
-    fn test_page_tier_none_at_zero_budget() {
+    fn test_page_cache_level_none_at_zero_budget() {
         let dir = tempfile::tempdir().unwrap();
         let local = LocalDir::open(&config(dir.path(), 0), Arc::new(IoStats::default())).unwrap();
-        assert!(local.page_tier().is_none());
+        assert!(local.page_cache_level().is_none());
     }
 
     #[test]
-    fn test_page_tier_some_with_the_cache_dir_otherwise() {
+    fn test_page_cache_level_some_with_the_cache_dir_otherwise() {
         let dir = tempfile::tempdir().unwrap();
         let (local, _) = open(dir.path());
-        let tier = local.page_tier().unwrap();
-        assert_eq!(tier.dir(), dir.path().join(CACHE_DIR));
-        assert_eq!(tier.capacity_bytes(), DISK_CACHE_BYTES);
-        assert!(tier.dir().is_dir());
+        let level = local.page_cache_level().unwrap();
+        assert_eq!(level.dir(), dir.path().join(CACHE_DIR));
+        assert_eq!(level.capacity_bytes(), DISK_CACHE_BYTES);
+        assert!(level.dir().is_dir());
     }
 
     #[tokio::test]

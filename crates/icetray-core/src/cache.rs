@@ -21,7 +21,7 @@ use foyer::{
 use crate::approx;
 use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::error::{Error, Result};
-use crate::local::DiskTier;
+use crate::local::DiskLevel;
 use crate::metric;
 use crate::storage::IoStats;
 
@@ -196,11 +196,11 @@ enum FetchFailed {
     Deadline { page: PageKey, after: Duration },
 }
 
-/// The cache's levels. Both are one type to the rest of the crate; which
-/// one runs is decided once, by whether a local directory is configured
-/// (RFD 017).
+/// The cache's levels: memory alone, or memory over a disk level. Both are
+/// one type to the rest of the crate; which one runs is decided once, by
+/// whether a local directory is configured (RFD 017).
 #[derive(Debug)]
-enum Tier {
+enum Level {
     /// Memory only: an evicted page is gone, and the next request for it
     /// fetches it again.
     Memory(Cache<PageKey, PageValue>),
@@ -239,7 +239,7 @@ fn origin_of(source: Source) -> PageOrigin {
 /// which bounds the fetches that clone runs.
 #[derive(Clone, Debug)]
 pub struct PageCache {
-    tier: Arc<Tier>,
+    level: Arc<Level>,
     hits: Arc<AtomicU64>,
     fetches: Arc<AtomicU64>,
     /// How long a fetch this handle runs may take; `None` is no bound.
@@ -257,22 +257,22 @@ impl PageCache {
     /// Opening the level opens its files and reads back what they hold,
     /// which is why this is async and can fail; a failure is
     /// `CacheError::Backend`.
-    pub async fn new(capacity_bytes: usize, disk: Option<DiskTier>) -> Result<Self> {
-        let tier = match disk {
-            None => Tier::Memory(
+    pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self> {
+        let level = match disk {
+            None => Level::Memory(
                 CacheBuilder::new(capacity_bytes)
                     .with_name(CACHE_NAME)
                     .with_shards(MEMORY_SHARDS)
                     .with_weighter(weigh)
                     .build(),
             ),
-            Some(disk) => Tier::Hybrid {
+            Some(disk) => Level::Hybrid {
                 cache: open_hybrid(capacity_bytes, &disk).await?,
                 stats: Arc::clone(disk.stats()),
             },
         };
         Ok(Self {
-            tier: Arc::new(tier),
+            level: Arc::new(level),
             hits: Arc::default(),
             fetches: Arc::default(),
             fetch_deadline: None,
@@ -326,17 +326,17 @@ impl PageCache {
         // One call to foyer and not a `get` first: foyer's `get` reports a
         // disk level that fails to read as an error while its `get_or_fetch`
         // moves on to the fetch, which is what a disposable directory calls
-        // for (RFD 017). The tiers' entries differ in type, so each arm
+        // for (RFD 017). The levels' entries differ in type, so each arm
         // reduces its own to the source and the page.
-        let (served, stats) = match self.tier.as_ref() {
-            Tier::Memory(cache) => (
+        let (served, stats) = match self.level.as_ref() {
+            Level::Memory(cache) => (
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 None,
             ),
-            Tier::Hybrid { cache, stats } => (
+            Level::Hybrid { cache, stats } => (
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
@@ -366,9 +366,9 @@ impl PageCache {
     /// Bytes charged against the memory budget: each page in memory at its
     /// length plus the per-entry overhead. The disk level is not counted.
     pub fn usage(&self) -> usize {
-        match self.tier.as_ref() {
-            Tier::Memory(cache) => cache.usage(),
-            Tier::Hybrid { cache, .. } => cache.memory().usage(),
+        match self.level.as_ref() {
+            Level::Memory(cache) => cache.usage(),
+            Level::Hybrid { cache, .. } => cache.memory().usage(),
         }
     }
 
@@ -377,15 +377,15 @@ impl PageCache {
     /// draining (RFD 012). A memory-only cache has nothing to flush and
     /// returns `Ok`. A failure of the level is `CacheError::Backend`.
     pub async fn close(&self) -> Result<()> {
-        match self.tier.as_ref() {
-            Tier::Memory(_) => Ok(()),
-            Tier::Hybrid { cache, .. } => cache.close().await.map_err(backend),
+        match self.level.as_ref() {
+            Level::Memory(_) => Ok(()),
+            Level::Hybrid { cache, .. } => cache.close().await.map_err(backend),
         }
     }
 
     /// Counts how a page was served. From memory: a hit. From the disk
-    /// level, which only the hybrid tier has (`stats` is its counter; the
-    /// memory tier is never told `Disk`): a hit and one local read of the
+    /// level, which only `Level::Hybrid` has (`stats` is its counter;
+    /// `Level::Memory` is never told `Disk`): a hit and one local read of the
     /// page's length, charged beside GETs so a lookup's whole cost is one
     /// structure (RFD 003). Both are counted per lookup served: foyer
     /// reports the source to every lookup coalesced onto one disk read
@@ -431,7 +431,7 @@ impl PageCache {
 /// block to write into.
 async fn open_hybrid(
     capacity_bytes: usize,
-    disk: &DiskTier,
+    disk: &DiskLevel,
 ) -> Result<HybridCache<PageKey, PageValue>> {
     let device = FsDeviceBuilder::new(disk.dir())
         .with_capacity(approx::length(disk.capacity_bytes()))
@@ -651,8 +651,8 @@ mod tests {
         panic!("fetch ran for a page the cache holds")
     }
 
-    /// A disk tier over `dir` with a fresh counter, as `LocalDir` hands it out.
-    fn disk_tier(dir: &Path) -> (DiskTier, Arc<IoStats>) {
+    /// A disk level over `dir` with a fresh counter, as `LocalDir` hands it out.
+    fn disk_level(dir: &Path) -> (DiskLevel, Arc<IoStats>) {
         let stats = Arc::new(IoStats::default());
         let config = LocalConfig {
             dir: dir.to_path_buf(),
@@ -660,13 +660,13 @@ mod tests {
             page_cache_disk_bytes: DISK_BYTES,
         };
         let local = LocalDir::open(&config, Arc::clone(&stats)).unwrap();
-        (local.page_tier().unwrap(), stats)
+        (local.page_cache_level().unwrap(), stats)
     }
 
-    /// The hybrid cache behind a `PageCache` built with a disk tier.
+    /// The hybrid cache behind a `PageCache` built with a disk level.
     fn hybrid(cache: &PageCache) -> &HybridCache<PageKey, PageValue> {
-        let Tier::Hybrid { cache, .. } = cache.tier.as_ref() else {
-            panic!("a cache with a disk tier is hybrid");
+        let Level::Hybrid { cache, .. } = cache.level.as_ref() else {
+            panic!("a cache with a disk level is hybrid");
         };
         cache
     }
@@ -793,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_without_disk_is_memory_only() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-        assert!(matches!(cache.tier.as_ref(), Tier::Memory(_)));
+        assert!(matches!(cache.level.as_ref(), Level::Memory(_)));
         let runs = Arc::new(AtomicU64::new(0));
         let (page, origin) = cache
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_close_memory_tier_is_ok_and_keeps_serving() {
+    async fn test_close_memory_level_is_ok_and_keeps_serving() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         cache
@@ -944,8 +944,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_fetch_serves_a_hybrid_page_from_memory_before_eviction() {
         let dir = tempfile::tempdir().unwrap();
-        let (tier, stats) = disk_tier(dir.path());
-        let cache = PageCache::new(ROOMY_BYTES, Some(tier)).await.unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         cache
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
@@ -966,8 +966,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_fetch_serves_evicted_page_from_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let (tier, stats) = disk_tier(dir.path());
-        let cache = PageCache::new(TINY_BYTES, Some(tier)).await.unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(TINY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&cache, &runs).await;
         assert_eq!(cache.fetches(), 2);
@@ -991,8 +991,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_fetch_charges_every_lookup_coalesced_onto_one_disk_read() {
         let dir = tempfile::tempdir().unwrap();
-        let (tier, stats) = disk_tier(dir.path());
-        let cache = PageCache::new(TINY_BYTES, Some(tier)).await.unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(TINY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&cache, &runs).await;
         let gate = Arc::new(Notify::new());
@@ -1019,16 +1019,16 @@ mod tests {
     #[tokio::test]
     async fn test_new_recovers_the_disk_level_on_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let (tier, first_stats) = disk_tier(dir.path());
-        let first = PageCache::new(TINY_BYTES, Some(tier)).await.unwrap();
+        let (level, first_stats) = disk_level(dir.path());
+        let first = PageCache::new(TINY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&first, &runs).await;
         assert_eq!(first_stats.local_reads(), 0);
         first.close().await.unwrap();
         drop(first);
 
-        let (tier, stats) = disk_tier(dir.path());
-        let second = PageCache::new(ROOMY_BYTES, Some(tier)).await.unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let second = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
         let (page, origin) = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
         assert_eq!(&page[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
@@ -1052,17 +1052,17 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_fetch_fetches_a_page_whose_disk_copy_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let (tier, _) = disk_tier(dir.path());
-        let cache_dir = tier.dir().to_path_buf();
-        let first = PageCache::new(TINY_BYTES, Some(tier)).await.unwrap();
+        let (level, _) = disk_level(dir.path());
+        let cache_dir = level.dir().to_path_buf();
+        let first = PageCache::new(TINY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         evict_to_disk(&first, &runs).await;
         first.close().await.unwrap();
         drop(first);
         assert!(corrupt_on_disk(&cache_dir, PAGE) >= 1);
 
-        let (tier, stats) = disk_tier(dir.path());
-        let second = PageCache::new(ROOMY_BYTES, Some(tier)).await.unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let second = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
         let (page, origin) = second
             .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
             .await

@@ -122,17 +122,17 @@ impl ChunkFile {
 
 /// The page cache's disk level (RFD 017): the `cache/` directory, its size
 /// bound, and the counter a page served from it is charged to, handed to
-/// `PageCache` by `LocalDir::page_tier`. Pages there are keyed by file and
-/// offset and evicted by size alone, never for staleness, since a data
-/// file never changes.
+/// `PageCache` by `LocalDir::page_cache_level`. Pages there are keyed by
+/// file and offset and evicted by size alone, never for staleness, since a
+/// data file never changes.
 #[derive(Clone, Debug)]
-pub struct DiskTier {
+pub struct DiskLevel {
     pub(super) dir: PathBuf,
     pub(super) capacity_bytes: u64,
     pub(super) stats: Arc<IoStats>,
 }
 
-impl DiskTier {
+impl DiskLevel {
     /// The directory the level lives in; it exists once `LocalDir::open`
     /// has returned.
     pub fn dir(&self) -> &Path {

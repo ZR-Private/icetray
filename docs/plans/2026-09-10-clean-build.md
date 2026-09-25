@@ -39,7 +39,7 @@ signatures.
    in-memory store.
 5. `local`: the directory layout, chunk-file identity and reuse, deletion
    with the generation, disk budget accounting, local-read counting,
-   `DiskChunks` with positioned reads on a blocking pool, and the `DiskTier`
+   `DiskChunks` with positioned reads on a blocking pool, and the `DiskLevel`
    handle the page cache's disk level is built from. Built here rather than
    in stage 2 because `FileIndex::build` and `PageCache::new` call into it
    and nothing is stubbed.

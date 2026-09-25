@@ -107,7 +107,7 @@ pub async fn open_with(
     };
     let cache = PageCache::new(
         config.server.page_cache_bytes,
-        local.as_ref().and_then(|local| local.page_tier()),
+        local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
     let mut tables = Vec::with_capacity(config.tables.len());

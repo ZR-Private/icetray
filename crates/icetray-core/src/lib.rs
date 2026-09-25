@@ -43,7 +43,7 @@ pub use index::{
     ResidentBytes, RowRef, WireType,
 };
 pub use key::{Key, KeyType};
-pub use local::{DataFileIdentity, DiskChunks, DiskTier, LocalDir, LocalFault};
+pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout, list_data_files};
 pub use metric::LookupResult;
 pub use open::{Opened, open};

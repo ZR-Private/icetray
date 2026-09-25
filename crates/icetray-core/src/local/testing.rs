@@ -33,7 +33,7 @@ pub(super) const SECOND_BYTES: &[u8] = b"wxyz";
 pub(super) const INNER_RANGE: Range<u64> = 102..105;
 /// The bytes `INNER_RANGE` covers.
 pub(super) const INNER_BYTES: &[u8] = b"cde";
-/// A page cache disk bound above zero, so `page_tier` is `Some`.
+/// A page cache disk bound above zero, so `page_cache_level` is `Some`.
 pub(super) const DISK_CACHE_BYTES: u64 = 1024;
 /// The empty range at the first chunk's end.
 pub(super) const EMPTY_AT_FIRST_END: Range<u64> = 106..106;

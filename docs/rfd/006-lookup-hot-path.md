@@ -83,7 +83,7 @@ A layout the resident index does not cover fails loudly, as an error in
 the counting tests of RFD 014 (Test layering), instead of as an
 unexplained GET in production.
 
-Open question: a decompressed-page cache tier. For it: decompression is
+Open question: a decompressed-page cache level. For it: decompression is
 most of a warm hit, so caching decompressed pages would bring a repeated
 hit down to the lookup logic alone. Against it: a decompressed page costs
 its compression ratio in extra memory, so the same budget holds fewer

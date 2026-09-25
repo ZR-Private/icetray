@@ -71,7 +71,7 @@ impl Served {
 }
 
 /// `config` from `source` over `storage`, not yet loaded: a `cache_bytes`
-/// page cache on `local`'s page tier when there is one, and the table in
+/// page cache on `local`'s disk level when there is one, and the table in
 /// `Loading`. A test that asserts on a refused table's state or needs a
 /// cache of another size builds here and calls `Served::load` itself. The
 /// disk-tier tests build the storage first and open their `LocalDir` over
@@ -85,7 +85,7 @@ pub async fn build(
 ) -> Result<Served> {
     let cache = PageCache::new(
         cache_bytes,
-        local.as_ref().and_then(|local| local.page_tier()),
+        local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
     let table = Table::new(
