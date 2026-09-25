@@ -125,6 +125,8 @@ pub struct Table {
     config: TableConfig,
     source: TableSource,
     storage: Arc<Storage>,
+    /// The process's page cache, through a handle whose fetches end at the
+    /// table's `get_deadline`.
     cache: PageCache,
     local: Option<Arc<LocalDir>>,
     hedge: Arc<HedgeWindow>,
@@ -151,7 +153,11 @@ pub struct Table {
 
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Every `load`
-    /// and `refresh` runs within `refresh_deadline`.
+    /// and `refresh` runs within `refresh_deadline`. Every page fetch a
+    /// lookup runs through `cache` ends at `get_deadline` from its start,
+    /// failing as `CacheError::FetchDeadline` for every lookup waiting on
+    /// it (RFD 013); load reads do not go through the cache and are not
+    /// bounded by it.
     pub fn new(
         config: TableConfig,
         source: TableSource,
@@ -159,13 +165,14 @@ impl Table {
         cache: PageCache,
         local: Option<Arc<LocalDir>>,
         refresh_deadline: Duration,
+        get_deadline: Duration,
     ) -> Self {
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let table = Self {
             config,
             source,
             storage,
-            cache,
+            cache: cache.with_fetch_deadline(get_deadline),
             local,
             hedge,
             current: ArcSwapOption::empty(),
@@ -682,7 +689,8 @@ mod tests {
     }
 
     /// A table following `fixture`'s main branch under `config`, with no
-    /// local directory and the default refresh deadline, in `Loading`.
+    /// local directory and the default refresh and get deadlines, in
+    /// `Loading`.
     async fn table_over(fixture: &Fixture, config: TableConfig) -> Table {
         table_within(fixture, config, ServerConfig::default().refresh_deadline).await
     }
@@ -702,6 +710,7 @@ mod tests {
             cache().await,
             None,
             refresh_deadline,
+            ServerConfig::default().get_deadline,
         )
     }
 

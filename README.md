@@ -179,7 +179,9 @@ The server and storage sections also bound how long work may run, so a
 wedged object store or catalog fails requests fast instead of piling them
 up. Under `server`: `get_deadline = "5s"` and `multi_get_deadline = "15s"`
 cap a `Get` and a whole `MultiGet` (a shorter deadline the client sends
-wins, and expiry is `DEADLINE_EXCEEDED`); `max_in_flight = 1024` requests
+wins, and expiry is `DEADLINE_EXCEEDED`), and `get_deadline` also caps
+every page GET a lookup makes, in a `MultiGet` too, so a GET to a store
+that has stopped answering is cancelled rather than left running; `max_in_flight = 1024` requests
 may run at once, and one more is refused at once with `RESOURCE_EXHAUSTED`;
 `max_multi_get_keys = 1000` keys may be in one `MultiGet`, and more is
 `INVALID_ARGUMENT`; `refresh_deadline = "5m"` caps a table's first load or

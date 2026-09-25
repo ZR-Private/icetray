@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use foyer::{
@@ -68,6 +69,20 @@ pub enum CacheError {
     /// onto that fetch receives the same failure, so it is shared.
     #[error("fetch failed: {0}")]
     Fetch(Arc<Error>),
+    /// The fetch the cache ran for the caller did not finish within the
+    /// fetch deadline of the handle that ran it, so the fetch was dropped,
+    /// and an S3 GET it had open was cancelled with it. Every waiter
+    /// coalesced onto that fetch receives this, and nothing is cached for
+    /// the page.
+    #[error("fetch of {path} at offset {offset} did not finish within {after:?}")]
+    FetchDeadline {
+        /// The data file's location.
+        path: String,
+        /// The page's byte offset in the file.
+        offset: u64,
+        /// The deadline that passed.
+        after: Duration,
+    },
     /// The cache itself failed: the disk level could not be opened or read,
     /// or foyer refused an operation. foyer's error is kept whole, since it
     /// is `std::error::Error + Send + Sync` and carries its kind for a
@@ -166,12 +181,20 @@ impl Code for PageValue {
     }
 }
 
-/// The caller's fetch failed. It travels through foyer as the source of
-/// foyer's own error, so that every coalesced waiter recovers the one
-/// `Arc<Error>` and the failure is never flattened to text.
+/// Why a fetch the cache ran produced no page. It travels through foyer as
+/// the source of foyer's own error, so that every coalesced waiter recovers
+/// it whole, the one `Arc<Error>` of a failure included, and it is never
+/// flattened to text.
 #[derive(Clone, Debug, thiserror::Error)]
-#[error(transparent)]
-struct FetchFailed(Arc<Error>);
+enum FetchFailed {
+    /// The caller's fetch future failed.
+    #[error(transparent)]
+    Failed(Arc<Error>),
+    /// The fetch ran past the deadline of the handle that ran it and was
+    /// dropped.
+    #[error("fetch of {} at offset {} did not finish within {after:?}", .page.0, .page.1)]
+    Deadline { page: PageKey, after: Duration },
+}
 
 /// The cache's levels. Both are one type to the rest of the crate; which
 /// one runs is decided once, by whether a local directory is configured
@@ -211,12 +234,16 @@ fn origin_of(source: Source) -> PageOrigin {
 }
 
 /// The shared value-page cache. Clones share one cache and one set of
-/// counters: every table of a process holds a clone of the same cache.
+/// counters: every table of a process holds a clone of the same cache. A
+/// clone may carry a fetch deadline of its own (`with_fetch_deadline`),
+/// which bounds the fetches that clone runs.
 #[derive(Clone, Debug)]
 pub struct PageCache {
     tier: Arc<Tier>,
     hits: Arc<AtomicU64>,
     fetches: Arc<AtomicU64>,
+    /// How long a fetch this handle runs may take; `None` is no bound.
+    fetch_deadline: Option<Duration>,
 }
 
 impl PageCache {
@@ -248,7 +275,20 @@ impl PageCache {
             tier: Arc::new(tier),
             hits: Arc::default(),
             fetches: Arc::default(),
+            fetch_deadline: None,
         })
+    }
+
+    /// This handle on the same cache and counters, its fetches ending at
+    /// `deadline` from their start: past it the fetch future is dropped,
+    /// cancelling an S3 GET it has open, and every caller waiting on it receives
+    /// `CacheError::FetchDeadline`. A `Table` holds its cache this way,
+    /// bounded by `server.get_deadline`.
+    pub(crate) fn with_fetch_deadline(self, deadline: Duration) -> Self {
+        Self {
+            fetch_deadline: Some(deadline),
+            ..self
+        }
     }
 
     /// The page at `key` and where it came from: from memory, from the disk
@@ -260,6 +300,11 @@ impl PageCache {
     /// fetch (RFD 017: the directory is disposable). A failure of the fetch
     /// future reaches every waiting caller as `CacheError::Fetch` and leaves
     /// nothing cached; a failure of the cache itself is `CacheError::Backend`.
+    /// foyer runs the fetch on a task of its own, so a caller that stops
+    /// waiting does not end it; on a handle with a fetch deadline the fetch
+    /// ends at that deadline from its start, its future dropped, and every
+    /// waiting caller receives `CacheError::FetchDeadline` with nothing
+    /// cached. The disk level's read is not bounded by it.
     /// The origin is what the `result` label of a lookup is decided by, per
     /// call rather than by differencing the process-wide counters, which
     /// concurrent lookups would confuse.
@@ -273,7 +318,11 @@ impl PageCache {
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
         let key = PageKey(key.0, key.1);
-        let fetches = Arc::clone(&self.fetches);
+        let run = Run {
+            page: key.clone(),
+            fetches: Arc::clone(&self.fetches),
+            deadline: self.fetch_deadline,
+        };
         // One call to foyer and not a `get` first: foyer's `get` reports a
         // disk level that fails to read as an error while its `get_or_fetch`
         // moves on to the fetch, which is what a disposable directory calls
@@ -282,14 +331,14 @@ impl PageCache {
         let (served, stats) = match self.tier.as_ref() {
             Tier::Memory(cache) => (
                 cache
-                    .get_or_fetch(&key, || run_fetch(fetch(), fetches))
+                    .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 None,
             ),
             Tier::Hybrid { cache, stats } => (
                 cache
-                    .get_or_fetch(&key, || run_fetch(fetch(), fetches))
+                    .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 Some(stats.as_ref()),
@@ -343,7 +392,7 @@ impl PageCache {
     /// alike and names no leader, so several lookups served by one read
     /// each count a hit and a local read, as each would under
     /// `DiskChunks::page`; GETs, by contrast, are counted per fetch run.
-    /// From a fetch: nothing here, since `run_fetch` counted the one run for
+    /// From a fetch: nothing here, since `Run::fetch` counted the one run for
     /// every lookup it served.
     fn record(&self, source: Source, stats: Option<&IoStats>, page: &Bytes) {
         match source {
@@ -410,28 +459,51 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
     value.0.len() + ENTRY_OVERHEAD_BYTES
 }
 
-/// Runs a caller's fetch once foyer has decided the page must come from
-/// outside, counting the run as it starts so that a fetch that fails still
-/// counts.
-async fn run_fetch<Fut>(
-    fut: Fut,
+/// What one caller's fetch runs with, should foyer run it: the page it is
+/// for, the counter it counts in, and the deadline of the handle it came
+/// through.
+struct Run {
+    page: PageKey,
     fetches: Arc<AtomicU64>,
-) -> std::result::Result<PageValue, FetchFailed>
-where
-    Fut: Future<Output = Result<Bytes>>,
-{
-    fetches.fetch_add(1, Ordering::Relaxed);
-    metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL).increment(1);
-    fut.await
-        .map(PageValue)
-        .map_err(|error| FetchFailed(Arc::new(error)))
+    deadline: Option<Duration>,
 }
 
-/// A foyer failure as the crate's error: the caller's own fetch failure when
-/// that is what foyer carries, otherwise the backend's.
+impl Run {
+    /// Runs a caller's fetch once foyer has decided the page must come from
+    /// outside, counting the run as it starts so that a fetch that fails
+    /// still counts. With a deadline, `fut` is dropped when it passes, and
+    /// the run fails as `FetchFailed::Deadline`.
+    async fn fetch<Fut>(self, fut: Fut) -> std::result::Result<PageValue, FetchFailed>
+    where
+        Fut: Future<Output = Result<Bytes>>,
+    {
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL).increment(1);
+        let fetched = match self.deadline {
+            None => fut.await,
+            Some(after) => tokio::time::timeout(after, fut).await.map_err(|_elapsed| {
+                FetchFailed::Deadline {
+                    page: self.page,
+                    after,
+                }
+            })?,
+        };
+        fetched
+            .map(PageValue)
+            .map_err(|error| FetchFailed::Failed(Arc::new(error)))
+    }
+}
+
+/// A foyer failure as the crate's error: the caller's own fetch failure or
+/// its deadline when that is what foyer carries, otherwise the backend's.
 fn cache_error(error: foyer::Error) -> Error {
     match error.downcast_ref::<FetchFailed>() {
-        Some(failed) => Error::Cache(CacheError::Fetch(Arc::clone(&failed.0))),
+        Some(FetchFailed::Failed(failed)) => Error::Cache(CacheError::Fetch(Arc::clone(failed))),
+        Some(FetchFailed::Deadline { page, after }) => Error::Cache(CacheError::FetchDeadline {
+            path: page.0.to_string(),
+            offset: page.1,
+            after: *after,
+        }),
         None => backend(error),
     }
 }
@@ -446,6 +518,7 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::FileExt;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
 
     use futures::future::{join, join_all};
     use tokio::sync::Notify;
@@ -481,6 +554,12 @@ mod tests {
     const PAGE: &[u8] = b"page-bytes";
     /// The second test page's bytes, a different length from `PAGE`.
     const OTHER_PAGE: &[u8] = b"other-page-bytes";
+    /// The fetch deadline the deadline test bounds its handle by: short, so
+    /// the stalled fetch ends quickly.
+    const FETCH_DEADLINE: Duration = Duration::from_millis(50);
+    /// How long the deadline test lets its callers wait before it fails:
+    /// far past `FETCH_DEADLINE`, so only a fetch that runs on reaches it.
+    const FETCH_GUARD: Duration = Duration::from_secs(10);
     /// Offsets tried to find one whose key shares a shard with an anchor's;
     /// with foyer's shard count in the single digits, the first few suffice.
     const SHARD_SEARCH_OFFSETS: u64 = 1024;
@@ -538,6 +617,31 @@ mod tests {
             Err(Error::NotReady {
                 table: TABLE.to_string(),
             })
+        }
+    }
+
+    /// A fetch whose future counts its run and never answers, as a GET to a
+    /// store that has stopped answering; `dropped` is set when the future is
+    /// dropped.
+    fn stalled(
+        runs: &Arc<AtomicU64>,
+        dropped: &Arc<AtomicBool>,
+    ) -> impl Future<Output = Result<Bytes>> + Send + 'static {
+        let runs = Arc::clone(runs);
+        let probe = DropProbe(Arc::clone(dropped));
+        async move {
+            let _probe = probe;
+            runs.fetch_add(1, Ordering::Relaxed);
+            std::future::pending().await
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
         }
     }
 
@@ -768,6 +872,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
+        assert_eq!(cache.fetches(), 2);
+    }
+
+    /// A fetch that outlasts its handle's deadline is dropped at it, and
+    /// every coalesced waiter receives the typed deadline error for the
+    /// page; nothing is cached, so the next caller runs a fetch of its own.
+    #[tokio::test]
+    async fn test_get_or_fetch_ends_a_fetch_at_its_deadline_for_every_waiter() {
+        let cache = PageCache::new(ROOMY_BYTES, None)
+            .await
+            .unwrap()
+            .with_fetch_deadline(FETCH_DEADLINE);
+        let runs = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Notify::new());
+        let started = tokio::time::Instant::now();
+        let answers = tokio::time::timeout(
+            FETCH_GUARD,
+            race(&cache, FIRST_OFFSET, &gate, || stalled(&runs, &dropped)),
+        )
+        .await
+        .expect("the fetch ends at its deadline, before the guard");
+        assert!(started.elapsed() >= FETCH_DEADLINE);
+        assert_eq!(answers.len(), CONCURRENT);
+        for answer in answers {
+            let Err(Error::Cache(CacheError::FetchDeadline {
+                path,
+                offset,
+                after,
+            })) = answer
+            else {
+                panic!("every waiter receives the deadline: {answer:?}");
+            };
+            assert_eq!((path.as_str(), offset), (FILE_ID, FIRST_OFFSET));
+            assert_eq!(after, FETCH_DEADLINE);
+        }
+        assert!(dropped.load(Ordering::Relaxed), "the fetch was dropped");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.fetches(), 1);
+
+        let (page, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .await
+            .unwrap();
+        assert_eq!(&page[..], PAGE);
+        assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(cache.fetches(), 2);
     }
 

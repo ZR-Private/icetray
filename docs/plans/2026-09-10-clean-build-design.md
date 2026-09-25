@@ -200,7 +200,8 @@ impl Config {
 /// (default 5 s) and `multi_get_deadline` (15 s, flat) against the client's own shorter
 /// deadline, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
 /// (1000), `drain_deadline` (20 s); and the background path's `refresh_deadline` (5 min) on a
-/// first load or refresh, which `open_with` hands `Table::new`. Every duration is a friendly duration; each is above zero, as are
+/// first load or refresh. `open_with` hands `Table::new` both `refresh_deadline` and
+/// `get_deadline`, the bound on every lookup's page fetch. Every duration is a friendly duration; each is above zero, as are
 /// the two limits (`ConfigViolation::*Zero`).
 pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub refresh_deadline: Duration, pub drain_deadline: Duration }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
@@ -582,14 +583,18 @@ pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_o
 // cache
 /// `Backend` keeps foyer's error whole: it is `std::error::Error + Send + Sync`
 /// and carries its kind, so a caller matches on it rather than on text.
-pub enum CacheError { Fetch(Arc<Error>), Backend(#[from] foyer::Error) }
+/// `FetchDeadline` is a fetch that ran past its handle's fetch deadline and was dropped,
+/// which every coalesced waiter receives, with nothing cached.
+pub enum CacheError { Fetch(Arc<Error>), FetchDeadline { path: String, offset: u64, after: Duration }, Backend(#[from] foyer::Error) }
 /// Where one call's page came from, returned beside the page by `PageCache::get_or_fetch`
 /// and `FileHandle::read_page`. `Fetched` for a fetch the caller ran or joined, since it
 /// waited on the GET; `Cached` for memory or the disk level, which cost none. Re-exported
 /// from `lib.rs`.
 pub enum PageOrigin { Fetched, Cached }
 /// Clone: clones share one cache and one pair of counters, so every table
-/// holds a clone of the process's one cache.
+/// holds a clone of the process's one cache. A clone may carry a fetch deadline
+/// (in-crate `with_fetch_deadline(self, Duration) -> Self`, which `Table::new` applies);
+/// `new` builds one without.
 pub struct PageCache;
 impl PageCache {
     /// `disk` is the local level of RFD 017: a page evicted from memory is
@@ -601,6 +606,9 @@ impl PageCache {
     /// The page at `key` and where it came from: memory, the disk level, or `fetch`.
     /// Concurrent callers for one key share one fetch and one disk read. The origin decides
     /// a lookup's `result` label per call, never by differencing the process-wide counters.
+    /// foyer runs the fetch on its own task, so a caller that stops waiting does not end it;
+    /// on a handle with a fetch deadline the fetch future is dropped at that deadline from its
+    /// start, which cancels its request, and every waiter gets `CacheError::FetchDeadline`.
     pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
     where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
     /// `fetches` counts fetch futures run, after coalescing: concurrent misses
@@ -712,8 +720,10 @@ impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Sets `table_state` for the state.
     /// Every `load` and `refresh` runs under `refresh_deadline` once it holds the load lock;
     /// past it the work is dropped, which releases the lock, and the call is
-    /// `Error::RefreshDeadline`, degrading the table as any failure does.
-    pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>, refresh_deadline: Duration) -> Self;
+    /// `Error::RefreshDeadline`, degrading the table as any failure does. The table holds
+    /// `cache` bounded by `get_deadline`: every page fetch a lookup runs ends at it from the
+    /// fetch's start (RFD 013), in a `multi_get` too; load reads bypass the cache.
+    pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>, refresh_deadline: Duration, get_deadline: Duration) -> Self;
     /// First load. `Err` leaves the table `Degraded` with no generation and is not counted
     /// under `refresh_errors_total`: a first-load failure is the caller's to report (RFD 005).
     /// On a serving table, a full re-resolve and reload reusing every unchanged file.
@@ -1016,14 +1026,20 @@ and the drain, without end.
 `MultiGet`, and `TableInfo` over the opened tables. A wire key is read under
 the served generation's key type (`key_from_wire`, a fault is
 `WireKeyFault`, `INVALID_ARGUMENT`); core's errors become status codes by
-variant (`status_from`); the service's own bounds are `CallFault`, one code
+variant (`status_from`, where a page fetch past its deadline,
+`CacheError::FetchDeadline`, is `DEADLINE_EXCEEDED` like the call's own
+deadline); the service's own bounds are `CallFault`, one code
 per variant. `Get` runs under `server.get_deadline` and `MultiGet` under
 `server.multi_get_deadline`, or the client's `grpc-timeout` when shorter
 (read through `time::grpc_timeout`); past it the lookup future is dropped
 and the call is `DEADLINE_EXCEEDED` (`CallFault::DeadlineExceeded`). A page
-fetch the lookup started runs on inside the page cache, which spawns it,
-under the S3 client's own bounds, and its page is cached for the next
-caller. The deadline counts from the arrival `StampArrival` records, an
+fetch the lookup started runs on its own task inside the page cache, and
+ends at `server.get_deadline` from its own start, which the table's cache
+handle carries: its GET, and a hedge beside it, is dropped, which cancels
+the request, and nothing is cached. In
+a `MultiGet` the page fetches have that deadline too, so over a store that
+has stopped answering a batch ends at the `Get` deadline when that comes
+before its own. The deadline counts from the arrival `StampArrival` records, an
 interceptor installed as a server layer: tonic starts its own
 `grpc-timeout` timer, which answers `CANCELLED`, after the layers inside it
 are called and polls the handler before that timer, so the handler's
@@ -1115,7 +1131,8 @@ acceptance tests share, each declared once: `NAMESPACE`, `IDS_4K`, `IDS_2K`,
 `NEWEST_SAMPLE`), `s3` (`S3Fixture`, whose `storage_config` is
 hedge-disabled, whose `file_io_props` is a `HashMap`, and whose `hold`
 stalls every request until `release`, with `held` counting the requests
-that arrived while held), `sim`
+that arrived while held and `waiting` those still open, which a client
+that gives one up and closes its connection leaves), `sim`
 (`serve_s3`, `serve_s3_with`, `SlowEvery`, `sim_s3_store`, `SIM_S3_PORT`),
 `verify` (`Served` with `load` and `current`; `build`, `serve_over`,
 `serve`, `serve_catalog`, `serve_catalog_with`; `expected_cold_gets`,

@@ -95,6 +95,7 @@ pub async fn build(
         cache.clone(),
         local,
         ServerConfig::default().refresh_deadline,
+        ServerConfig::default().get_deadline,
     );
     Ok(Served {
         storage,

@@ -115,9 +115,11 @@ const DISPATCH_DELAY: Duration = Duration::from_millis(20);
 /// held store ends quickly.
 const SHORT_DEADLINE: Duration = Duration::from_millis(300);
 
-/// The `MultiGet` deadline the deadline tests configure: longer than the
-/// `Get` deadline, so each call is seen to run under its own.
-const SHORT_BATCH_DEADLINE: Duration = SHORT_DEADLINE.saturating_mul(2);
+/// The `Get` deadline of the test that sets its `MultiGet` deadline to
+/// `SHORT_DEADLINE`: longer, since a page fetch ends at the `Get` deadline,
+/// so a `MultiGet` over a held store is seen to end at its own only when
+/// its own comes first.
+const LONGER_DEADLINE: Duration = SHORT_DEADLINE.saturating_mul(2);
 
 /// A client deadline shorter than every deadline the server is configured
 /// with in the test that sends it.
@@ -896,16 +898,16 @@ async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestRe
 }
 
 /// Over a store that has stopped answering, a `Get` ends at the configured
-/// `get_deadline` and a `MultiGet` at `multi_get_deadline`, each with
-/// `DEADLINE_EXCEEDED`, instead of waiting on the store.
+/// `get_deadline` and a `MultiGet` at a shorter `multi_get_deadline`, each
+/// with `DEADLINE_EXCEEDED`, instead of waiting on the store.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_and_multi_get_end_at_their_deadlines_over_a_held_store() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::start_with(
         vec![FixtureSpec::small(TABLE, KeyType::Long)],
         async |setup| {
-            setup.config.server.get_deadline = SHORT_DEADLINE;
-            setup.config.server.multi_get_deadline = SHORT_BATCH_DEADLINE;
+            setup.config.server.get_deadline = LONGER_DEADLINE;
+            setup.config.server.multi_get_deadline = SHORT_DEADLINE;
             Ok(())
         },
     )
@@ -919,17 +921,67 @@ async fn test_get_and_multi_get_end_at_their_deadlines_over_a_held_store() -> Te
         timed(stack.get(TABLE, Some(wire_key(&keys[0])))),
     )
     .await?;
-    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
+    assert_ended_at(outcome, elapsed, LONGER_DEADLINE, Code::DeadlineExceeded);
 
     let (outcome, elapsed) =
         tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.multi_get(TABLE, &keys[1..]))).await?;
-    assert_ended_at(
-        outcome,
-        elapsed,
-        SHORT_BATCH_DEADLINE,
-        Code::DeadlineExceeded,
-    );
+    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
     assert!(stack.s3.held() > 0, "the calls reached the held store");
+    Ok(())
+}
+
+/// A `Get` past its deadline takes its page fetch with it: over a held
+/// store the call ends `DEADLINE_EXCEEDED` at `get_deadline`, and the GET
+/// behind it is given up within `DEADLINE_MARGIN` of that instead of
+/// waiting on the store under the S3 client's own bounds. A `MultiGet`'s
+/// page fetches have the same deadline, so under a longer
+/// `multi_get_deadline` the batch ends at `get_deadline` too. Nothing from
+/// an abandoned fetch is cached: once the store answers again, the same key
+/// runs a fetch of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_get_past_its_deadline_ends_its_page_fetch() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.get_deadline = SHORT_DEADLINE;
+            Ok(())
+        },
+    )
+    .await?;
+    assert!(ServerConfig::default().multi_get_deadline > SHORT_DEADLINE + DEADLINE_MARGIN);
+    stack.serving.ready().await;
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
+    let cache = stack.serving.opened().cache.clone();
+    let fetched = cache.fetches();
+    stack.s3.hold();
+
+    let (outcome, elapsed) = tokio::time::timeout(
+        SHUTDOWN_WAIT,
+        timed(stack.get(TABLE, Some(wire_key(&keys[0])))),
+    )
+    .await?;
+    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
+    assert_eq!(stack.s3.held(), 1, "the call reached the held store");
+    assert_eq!(cache.fetches(), fetched + 1);
+    tokio::time::sleep(DEADLINE_MARGIN).await;
+    assert_eq!(stack.s3.waiting(), 0, "the page GET ended with the call");
+
+    let (outcome, elapsed) =
+        tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.multi_get(TABLE, &keys[1..]))).await?;
+    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
+    tokio::time::sleep(DEADLINE_MARGIN).await;
+    assert_eq!(stack.s3.waiting(), 0, "the batch's page GETs ended with it");
+
+    stack.s3.release();
+    let fetched = cache.fetches();
+    let response = stack.get(TABLE, Some(wire_key(&keys[0]))).await?;
+    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    assert_eq!(
+        cache.fetches(),
+        fetched + 1,
+        "the abandoned fetch cached nothing"
+    );
     Ok(())
 }
 

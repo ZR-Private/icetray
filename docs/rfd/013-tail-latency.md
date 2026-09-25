@@ -51,15 +51,19 @@ stops answering is bounded instead, on two paths that share one S3 client
 per bucket. The live path, a gRPC request, fails fast. A `Get` has 5
 seconds and a `MultiGet` 15 seconds whatever its size, a shorter deadline
 the client sends wins, and expiry is `DEADLINE_EXCEEDED`, which drops the
-lookup; a page GET the lookup started runs on inside the page cache, which
-spawns it, under the S3 client's bounds below, and fills the cache for the
-next caller. At most 1024 requests run at once, and one more is refused
+lookup. A page fetch the lookup started runs on its own task inside the
+page cache, so dropping the lookup does not end it; the fetch has the `Get`
+deadline from its own start instead, and at it the GET is dropped, which
+cancels the request, every lookup waiting on the fetch fails, and nothing is
+cached. A `MultiGet`'s page fetches have the same 5 seconds, so over a
+store that has stopped answering a batch fails at 5 seconds, not 15. At most 1024 requests run at once, and one more is refused
 with `RESOURCE_EXHAUSTED` rather than queued; a `MultiGet` carries at most
 1000 keys and runs 32 of its lookups at a time. A live lookup expects well
 under 200 ms, so 5 seconds is already a failure, and the refusals keep a
 wedged store from piling up requests until the process runs out of memory.
-The cap counts requests, not GETs: the page GETs of requests past their
-deadline can outlast them, each for no longer than the S3 client's bounds. The background path, loads and refreshes, is patient
+The cap counts requests, not GETs: a page GET can outlast the request that
+started it, by at most one `Get` deadline, since the request was open when
+the fetch began and the fetch ends 5 seconds after that. The background path, loads and refreshes, is patient
 but bounded: a catalog call has 30 seconds, and a first load or a refresh
 5 minutes, after which it fails, the table is degraded, and the next poll
 tries again, so no load holds its table's lock longer than that. Both

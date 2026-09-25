@@ -107,6 +107,7 @@ pub async fn open_with(
             cache.clone(),
             local.clone(),
             config.server.refresh_deadline,
+            config.server.get_deadline,
         )));
     }
     let complete = tables.len() == config.tables.len();

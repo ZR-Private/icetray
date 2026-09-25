@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{Error, Key, KeyType, Opened, Table, Value, approx, time};
+use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Value, approx, time};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
@@ -237,17 +237,22 @@ impl Deadline {
 }
 
 /// Core's error as a status (RFD 010): a key of the wrong type is
-/// `INVALID_ARGUMENT`; a read the caller can retry (no generation yet, an
-/// object-store, cache, or local-directory failure, a catalog or load that
-/// did not answer in time) is `UNAVAILABLE`; every other failure is
-/// `INTERNAL`. The message is the error's `Display`.
+/// `INVALID_ARGUMENT`; a page fetch that ran past `server.get_deadline` is
+/// `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a `Get`'s
+/// deadline and its fetch's pass moments apart, and the call answers one
+/// code whichever passes first; a read the caller can
+/// retry (no generation yet, an object-store, cache, or local-directory
+/// failure, a catalog or load that did not answer in time) is
+/// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
+/// error's `Display`.
 pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {
         Error::KeyType { .. } => Status::invalid_argument(message),
+        Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }
         | Error::ObjectStore(_)
-        | Error::Cache(_)
+        | Error::Cache(CacheError::Fetch(_) | CacheError::Backend(_))
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
         | Error::RefreshDeadline { .. } => Status::unavailable(message),
@@ -389,9 +394,7 @@ mod tests {
 
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
-    use icetray_core::{
-        CacheError, FileFault, FindingCode, LocalFault, RefusalReason, Storage, TableFault,
-    };
+    use icetray_core::{FileFault, FindingCode, LocalFault, RefusalReason, Storage, TableFault};
     use tonic::Code;
 
     use super::*;
@@ -582,6 +585,14 @@ mod tests {
                     table: TABLE.to_string(),
                 }))),
                 Code::Unavailable,
+            ),
+            (
+                Error::Cache(CacheError::FetchDeadline {
+                    path: "mem://f0.parquet".to_string(),
+                    offset: 0,
+                    after: SAMPLE_DEADLINE,
+                }),
+                Code::DeadlineExceeded,
             ),
             (
                 Error::Local {
