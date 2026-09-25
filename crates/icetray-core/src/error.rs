@@ -304,11 +304,11 @@ pub enum RefusalReason {
         key: Key,
     },
     /// A key of a bucketed data file hashes to another bucket than the one
-    /// its manifest entry records (RFD 007). Routing sends a key only to the
-    /// files of its own bucket, so such a key would answer `Absent` though
-    /// present. The load hashes each file's fences and its first and last
-    /// key (`Generation::load`); the doctor hashes every key
-    /// (`Generation::verify_buckets`).
+    /// its manifest entry records (RFD 007). Routing sends a key to no
+    /// bucketed file outside the bucket it hashes to, so such a key would
+    /// answer `Absent` though present. The load hashes each file's fences
+    /// and its first and last key (`Generation::load`); the doctor hashes
+    /// every key (`Generation::verify_buckets`).
     KeyOutsideBucket {
         /// The data file's location.
         path: String,

@@ -559,9 +559,9 @@ fn check_budget<'a>(
 
 /// `RefusalReason::KeyOutsideBucket` under `table` for the first of `keys`
 /// that hashes to another bucket under `entry`'s bucketing than the one
-/// `entry` records; `Ok` for an unbucketed entry. Routing sends a key only
-/// to the files of the bucket it hashes to, so a key held elsewhere would
-/// answer `Absent` though present (RFD 007).
+/// `entry` records; `Ok` for an unbucketed entry. Routing sends a key to
+/// no bucketed file outside the bucket it hashes to, so a key held in one
+/// would answer `Absent` though present (RFD 007).
 fn refuse_outside_bucket<K: Borrow<Key>>(
     table: &str,
     entry: &DataFileEntry,

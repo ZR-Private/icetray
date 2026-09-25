@@ -987,7 +987,8 @@ unsorted), key outside bucket (a fence or the first or last key of a
 bucketed file hashes to another bucket than its manifest entry records;
 one hash per key page at load, and every key in the doctor, which reports
 it as a `refused` line with the refusal exit code), key type mismatch,
-key type unsupported (the key column's Iceberg type is none of long, string, binary, fixed, or uuid), value type
+key type unsupported (the key column's Iceberg type is none of long,
+string, binary, fixed, or uuid), value type
 unsupported (the value column must be Iceberg binary, fixed, or string,
 served as opaque bytes), delete files, key too long, and the two residency
 refusals of RFD 017: over budget, no bloom filter. Disk residency with no
@@ -1191,8 +1192,8 @@ as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
 (`table`, `reason` as the `ErrorKind`'s name, `message`). The doctor opens
 every table with `strict` off. Exit codes: 0 for a run that did what was
 asked; 1 for a load or read error, a table the doctor could not load or
-refused (which dominates 2), a configuration file that cannot be read or parsed or breaks
-one of its rules (a bad log field mapping among them), a
+refused (which dominates 2), a configuration file that cannot be read or
+parsed or breaks one of its rules (a bad log field mapping among them), a
 first-load failure, a bind failure, or a drain that passed its deadline;
 2 when the doctor found a cost
 finding (RFD 016); 64 (`sysexits.h`'s `EX_USAGE`) when the command line or

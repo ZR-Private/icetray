@@ -103,11 +103,11 @@ overlapping files within a bucket each carry a measured penalty in extra
 GETs per hit, key bytes decoded per lookup, or files probed per lookup. A
 priced table is refused when its `strict` setting is on, which is the
 default, and served with its penalty reported when it is off. Everything
-else (truncated bounds, oversized value pages, value pages above the 64 MiB
-a lookup reads, long keys, oversized files,
-a truncated column index, too many files per bucket, a bloom filter that
-is absent or badly sized) is advice, which names the writer property to
-change and never affects whether a table serves.
+else (truncated bounds, oversized value pages, value pages above the
+64 MiB ceiling past which a lookup into them is refused, long keys,
+oversized files, a truncated column index, too many files per bucket, a
+bloom filter that is absent or badly sized) is advice, which names the
+writer property to change and never affects whether a table serves.
 
 `icetray doctor` is the check. The tiers are RFD 002 (the contract), RFD
 007 (the tiers and their penalties), and RFD 016 (what the doctor checks
@@ -252,10 +252,10 @@ owner chooses a tier from one run.
 Exit codes: 0 when the run did what was asked (for the doctor, no cost
 finding; advice does not change the code); 2 when the doctor found a cost
 finding, which a build pipeline gates on; 1 for a load or read error, a
-table the doctor could not load or refused (which dominates 2), a configuration that
-cannot be read or parsed or breaks one of its rules (a bad log field
-mapping among them), or a listener that would not bind; 64 when the
-command line could not be used: neither or both of `--config` and
+table the doctor could not load or refused (which dominates 2), a
+configuration that cannot be read or parsed or breaks one of its rules (a
+bad log field mapping among them), or a listener that would not bind; 64
+when the command line could not be used: neither or both of `--config` and
 `--location`, a location flag with `--config`, a `--residency` other than
 `full` or `bloom`, no table matched, `--table` required, or a key that does
 not parse. The

@@ -37,7 +37,7 @@ async fn load_all(opened: &Opened) -> Vec<(&Arc<Table>, icetray_core::Result<()>
 /// `files`, its data files. A table that cannot be loaded is a `refused`
 /// line, and so is one the load admits but whose full bucket check
 /// (`Generation::verify_buckets`, which decodes and hashes every key and
-/// which the doctor alone runs) finds a key outside its file's recorded
+/// which no load or refresh runs) finds a key outside its file's recorded
 /// bucket or cannot finish: that table would answer a present key absent,
 /// so it is a refusal, not a cost or advice (RFD 007). Every table is
 /// opened with `strict` off, so a table `strict` would refuse for cost is
