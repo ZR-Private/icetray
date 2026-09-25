@@ -125,6 +125,13 @@ pub enum CallFault {
         /// The deadline that passed.
         after: Duration,
     },
+    /// Every in-flight slot was taken when the call arrived, so it was
+    /// refused rather than queued. `RESOURCE_EXHAUSTED` on the wire.
+    #[error("{limit} calls are already in flight")]
+    Overloaded {
+        /// `server.max_in_flight`.
+        limit: usize,
+    },
 }
 
 /// Why `serve` ended other than by a drain.

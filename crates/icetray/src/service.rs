@@ -3,7 +3,9 @@
 //! read under the table's key type, and core's errors mapped to status codes
 //! by variant. Every call is counted under `requests_total`. `Get` and
 //! `MultiGet` run under their deadlines (RFD 013): the server's for the
-//! method, or the client's `grpc-timeout` when that is shorter.
+//! method, or the client's `grpc-timeout` when that is shorter; together
+//! they hold at most `server.max_in_flight` slots, and a call that finds
+//! none is refused at once.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -19,6 +21,7 @@ use icetray_proto::v1::{
     GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
 };
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tokio::time::Instant;
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
@@ -31,28 +34,50 @@ use crate::telemetry::{self, Call};
 const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
 
 /// The served tables by name and the bounds each call runs under. Clone:
-/// tonic hands one clone to every connection, and they share the tables.
+/// tonic hands one clone to every connection, and they share the tables
+/// and the in-flight slots.
 #[derive(Clone)]
 pub struct Service {
     tables: Arc<HashMap<String, Arc<Table>>>,
     get_deadline: Duration,
     multi_get_deadline: Duration,
+    /// `Get` and `MultiGet` together; nothing closes it.
+    in_flight: Arc<Semaphore>,
+    /// The slots `in_flight` was built with, for the refusal.
+    max_in_flight: usize,
 }
 
 impl Service {
     /// The service over every table `opened` holds, by configured name,
-    /// under `server`'s request bounds.
+    /// under `server`'s request bounds. `max_in_flight` is held to tokio's
+    /// `Semaphore::MAX_PERMITS`, which is far above any count of calls one
+    /// process can hold open.
     pub fn new(opened: &Opened, server: &ServerConfig) -> Self {
         let tables = opened
             .tables
             .iter()
             .map(|table| (table.name().to_string(), Arc::clone(table)))
             .collect();
+        let max_in_flight = server.max_in_flight.min(Semaphore::MAX_PERMITS);
         Self {
             tables: Arc::new(tables),
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
+            in_flight: Arc::new(Semaphore::new(max_in_flight)),
+            max_in_flight,
         }
+    }
+
+    /// A slot for one call, held until the call ends, its deadline
+    /// included; with none free the call is refused at once, never queued.
+    fn admit(&self) -> Result<SemaphorePermit<'_>, CallFault> {
+        self.in_flight.try_acquire().map_err(|error| match error {
+            // `Closed` is unreachable, since nothing closes the
+            // semaphore; were it closed, no call could be admitted.
+            TryAcquireError::NoPermits | TryAcquireError::Closed => CallFault::Overloaded {
+                limit: self.max_in_flight,
+            },
+        })
     }
 
     /// The table served under `name`; a name not served is `NOT_FOUND`.
@@ -139,6 +164,7 @@ impl From<CallFault> for Status {
         let message = fault.to_string();
         match fault {
             CallFault::DeadlineExceeded { .. } => Self::deadline_exceeded(message),
+            CallFault::Overloaded { .. } => Self::resource_exhausted(message),
         }
     }
 }
@@ -305,6 +331,7 @@ impl Service {
 impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         telemetry::count(Call::Get);
+        let _slot = self.admit()?;
         let deadline = Deadline::of(&request, self.get_deadline);
         deadline.run(self.lookup(request.into_inner())).await
     }
@@ -314,6 +341,7 @@ impl Icetray for Service {
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
         telemetry::count(Call::MultiGet);
+        let _slot = self.admit()?;
         let deadline = Deadline::of(&request, self.multi_get_deadline);
         deadline.run(self.lookup_batch(request.into_inner())).await
     }
@@ -475,14 +503,25 @@ mod tests {
     /// A deadline for the sample fault.
     const SAMPLE_DEADLINE: Duration = Duration::from_millis(250);
 
+    /// A limit for the sample faults.
+    const SAMPLE_LIMIT: usize = 8;
+
     #[test]
     fn test_from_call_fault_code_per_variant() {
-        let cases = [(
-            CallFault::DeadlineExceeded {
-                after: SAMPLE_DEADLINE,
-            },
-            Code::DeadlineExceeded,
-        )];
+        let cases = [
+            (
+                CallFault::DeadlineExceeded {
+                    after: SAMPLE_DEADLINE,
+                },
+                Code::DeadlineExceeded,
+            ),
+            (
+                CallFault::Overloaded {
+                    limit: SAMPLE_LIMIT,
+                },
+                Code::ResourceExhausted,
+            ),
+        ];
         for (fault, code) in cases {
             assert_eq!(Status::from(fault).code(), code);
         }

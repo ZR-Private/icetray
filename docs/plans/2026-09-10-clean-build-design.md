@@ -1023,7 +1023,13 @@ interceptor installed as a server layer: tonic starts its own
 `grpc-timeout` timer, which answers `CANCELLED`, after the layers inside it
 are called and polls the handler before that timer, so the handler's
 `DEADLINE_EXCEEDED` is the server's answer. A tonic client runs the same
-timer on its own side and reports `CANCELLED` first.
+timer on its own side and reports `CANCELLED` first. `Get` and `MultiGet`
+share one semaphore of `server.max_in_flight` permits (held to tokio's
+`Semaphore::MAX_PERMITS`); each call takes one with `try_acquire` as it
+starts and holds it until the call ends, so a call past its deadline
+gives it back when it is dropped. A call that finds none free is
+`RESOURCE_EXHAUSTED` at once (`CallFault::Overloaded`), never queued.
+`TableInfo` takes no permit.
 
 **One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
 the target vocabulary after the subcommand: `--config <file>` or

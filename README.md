@@ -283,7 +283,10 @@ serve is `NOT_FOUND`, and a miss is a normal answer, never an error. A
 `Get` or `MultiGet` still running at its deadline (`server.get_deadline` or
 `server.multi_get_deadline`, or the client's own when that is shorter) is
 `DEADLINE_EXCEEDED`. A tonic client times its own deadline too and reports
-its expiry as `CANCELLED` from its side of the call.
+its expiry as `CANCELLED` from its side of the call. `Get` and `MultiGet`
+share `server.max_in_flight` slots, each held until its call ends; a call
+that finds none free is refused at once with `RESOURCE_EXHAUSTED` rather
+than queued. `TableInfo` takes no slot.
 
 The listener speaks plaintext gRPC and terminates no TLS. icetray expects a
 private network or a service mesh that encrypts traffic and authenticates

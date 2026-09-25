@@ -127,6 +127,14 @@ const CLIENT_DEADLINE: Duration = Duration::from_millis(200);
 /// wake-up and one loopback round trip, with room for a loaded machine.
 const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
+/// The in-flight cap the admission tests configure: two, so one `Get` and
+/// one `MultiGet` fill it.
+const IN_FLIGHT_CAP: usize = 2;
+
+/// How soon a refused call is answered: one loopback round trip, far
+/// inside `SHORT_DEADLINE`, so the refusal is seen not to wait for a slot.
+const REFUSED_WITHIN: Duration = Duration::from_millis(100);
+
 /// The `metrics` recorder is process-global, so `requests_total` is one
 /// counter for every test in this binary. Every test that issues an RPC
 /// holds this lock, so the counting test's deltas are exact.
@@ -955,5 +963,106 @@ async fn test_a_shorter_client_deadline_wins() -> TestResult {
     let (outcome, elapsed) =
         tokio::time::timeout(SHUTDOWN_WAIT, timed(service.multi_get(batch))).await?;
     assert_ended_at(outcome, elapsed, CLIENT_DEADLINE, Code::DeadlineExceeded);
+    Ok(())
+}
+
+/// With every slot taken by calls held on a stalled store, one more `Get`
+/// or `MultiGet` is refused at once with `RESOURCE_EXHAUSTED` rather than
+/// queued; the held calls end at their deadline and give their slots back,
+/// so the next call is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.max_in_flight = IN_FLIGHT_CAP;
+            setup.config.server.get_deadline = SHORT_DEADLINE;
+            setup.config.server.multi_get_deadline = SHORT_DEADLINE;
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
+    stack.s3.hold();
+
+    let mut client = stack.client.clone();
+    let held_get = tokio::spawn({
+        let request = GetRequest {
+            table: TABLE.to_string(),
+            key: Some(wire_key(&keys[0])),
+        };
+        async move { client.get(request).await.map(|_| ()) }
+    });
+    let mut client = stack.client.clone();
+    let held_batch = tokio::spawn({
+        let request = MultiGetRequest {
+            table: TABLE.to_string(),
+            keys: vec![wire_key(&keys[1])],
+        };
+        async move { client.multi_get(request).await.map(|_| ()) }
+    });
+    poll_until(SHUTDOWN_WAIT, "both calls reaching the store", async || {
+        Ok((stack.s3.held() == IN_FLIGHT_CAP).then_some(()))
+    })
+    .await?;
+
+    let (outcome, elapsed) = timed(stack.get(TABLE, Some(wire_key(&keys[2])))).await;
+    assert_eq!(code_of(outcome), Code::ResourceExhausted);
+    assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
+    let (outcome, elapsed) = timed(stack.multi_get(TABLE, &keys[2..])).await;
+    assert_eq!(code_of(outcome), Code::ResourceExhausted);
+    assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
+    assert_eq!(
+        stack.s3.held(),
+        IN_FLIGHT_CAP,
+        "a refused call reads nothing"
+    );
+
+    for held in [held_get, held_batch] {
+        let outcome = tokio::time::timeout(SHUTDOWN_WAIT, held).await??;
+        assert_eq!(code_of(outcome), Code::DeadlineExceeded);
+    }
+    stack.s3.release();
+    let response = stack.get(TABLE, Some(wire_key(&keys[2]))).await?;
+    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    Ok(())
+}
+
+/// A call that ends at its client's deadline gives its slot back then, not
+/// at the server's longer deadline: with one slot, a second call made just
+/// after the first ended reaches the store instead of being refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.max_in_flight = 1;
+            Ok(())
+        },
+    )
+    .await?;
+    assert!(ServerConfig::default().get_deadline > CLIENT_DEADLINE + DEADLINE_MARGIN);
+    stack.serving.ready().await;
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
+    stack.s3.hold();
+
+    for (sent, key) in keys[..2].iter().enumerate() {
+        let mut get = tonic::Request::new(GetRequest {
+            table: TABLE.to_string(),
+            key: Some(wire_key(key)),
+        });
+        get.set_timeout(CLIENT_DEADLINE);
+        let (outcome, elapsed) =
+            tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.client.get(get))).await?;
+        assert_ne!(code_of(outcome), Code::ResourceExhausted, "call {sent}");
+        assert!(elapsed < CLIENT_DEADLINE + DEADLINE_MARGIN, "call {sent}");
+        assert_eq!(stack.s3.held(), sent + 1, "call {sent} reached the store");
+        // The server's own timer on the client's deadline fires a loopback
+        // hop after the client's; the slot is back by the next poll step.
+        tokio::time::sleep(common::POLL_STEP).await;
+    }
     Ok(())
 }
