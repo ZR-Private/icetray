@@ -651,9 +651,6 @@ mod tests {
     /// The name of a second, strict table in the metrics tests, beside the
     /// fixture's `TABLE`.
     const STRICT_TABLE: &str = "strict";
-    /// How long the gauged store holds each GET in the fan-out test, so
-    /// the lookups a batch runs together overlap on the store.
-    const FAN_OUT_HOLD: Duration = Duration::from_millis(20);
     /// The refresh deadline of the tests that stall a load: long enough
     /// for the one-file fixture's first load, short enough to keep the test
     /// quick.
@@ -939,7 +936,7 @@ mod tests {
         fixture
             .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
             .await;
-        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new()), FAN_OUT_HOLD));
+        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
         fixture
             .storage
             .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
@@ -949,7 +946,10 @@ mod tests {
         };
         let table = table_over(&fixture, config).await;
         table.load().await.unwrap();
-        gauged.reset();
+        // A batch that never has the bound's lookups in flight at once
+        // never passes the gate: its page fetches end at the get deadline
+        // and the call fails.
+        gauged.fill_to(MULTI_GET_FAN_OUT);
         let answered = table.multi_get(&keys).await.unwrap();
         let expected: Vec<Value> = all.iter().map(|key| present(*key)).collect();
         assert_eq!(answered.values, expected);

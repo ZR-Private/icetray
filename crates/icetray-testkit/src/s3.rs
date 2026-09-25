@@ -288,11 +288,25 @@ mod tests {
     /// The object's bytes.
     const BODY: &[u8] = b"held";
 
-    /// How long the hold test waits to see a held read not answered.
-    const HELD_WAIT: Duration = Duration::from_millis(300);
+    /// How often a test reads the gate's counts while it waits on them.
+    const POLL_STEP: Duration = Duration::from_millis(10);
 
-    /// How long a released read may take before the test fails.
-    const RELEASED_WAIT: Duration = Duration::from_secs(10);
+    /// How long a test waits for a read to be answered, or for a count to
+    /// reach what it expects, before it fails.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Polls `count` every `POLL_STEP` until it is `expected`, and fails the
+    /// test naming `what` once `WAIT` has passed.
+    async fn wait_for_count(what: &str, expected: usize, count: impl Fn() -> usize) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while count() != expected {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not reach {expected} within {WAIT:?}"
+            );
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_hold_stalls_reads_until_release() {
@@ -311,13 +325,12 @@ mod tests {
             let uri = uri.clone();
             async move { storage.read_all(&uri).await }
         });
-        tokio::time::sleep(HELD_WAIT).await;
+        wait_for_count("the waiting reads", 1, || s3.waiting()).await;
         assert!(!read.is_finished(), "a held read is not answered");
         assert_eq!(s3.held(), 1);
-        assert_eq!(s3.waiting(), 1);
 
         s3.release();
-        let body = tokio::time::timeout(RELEASED_WAIT, read)
+        let body = tokio::time::timeout(WAIT, read)
             .await
             .unwrap()
             .unwrap()
@@ -345,12 +358,10 @@ mod tests {
             let uri = uri.clone();
             async move { storage.read_all(&uri).await }
         });
-        tokio::time::sleep(HELD_WAIT).await;
-        assert_eq!(s3.waiting(), 1, "the read is held");
+        wait_for_count("the waiting reads", 1, || s3.waiting()).await;
 
         read.abort();
-        tokio::time::sleep(HELD_WAIT).await;
-        assert_eq!(s3.waiting(), 0, "the dropped read no longer waits");
+        wait_for_count("the waiting reads after the drop", 0, || s3.waiting()).await;
         assert_eq!(s3.held(), 1);
     }
 

@@ -69,12 +69,17 @@ const REFRESH_POLLS: u32 = 10;
 /// How long a refresh test waits for the table to advance.
 const REFRESH_WAIT: Duration = TEST_POLL_INTERVAL.saturating_mul(REFRESH_POLLS);
 
-/// When the first-load test checks health during the grace.
-const HALF_GRACE: Duration = Duration::from_millis(150);
+/// How long the first-load test holds that the failed run stays up once
+/// the failure is confirmed.
+const STAYS_UP_FOR: Duration = Duration::from_millis(100);
 
-/// The grace a failed first load stays on the health service in the test:
-/// twice the check point, so the check falls halfway through.
-const FAILURE_GRACE: Duration = HALF_GRACE.saturating_mul(2);
+/// How many `STAYS_UP_FOR` intervals the failed first load's grace spans
+/// in the test: the one checked, and the rest as room for the poll that
+/// confirms the failure and for a loaded machine.
+const GRACE_INTERVALS: u32 = 5;
+
+/// The grace a failed first load stays on the health service in the test.
+const FAILURE_GRACE: Duration = STAYS_UP_FOR.saturating_mul(GRACE_INTERVALS);
 
 /// How many `SAMPLE` ids the cold-cost test looks up; they share no page,
 /// so the oracle prices them at one GET each.
@@ -93,22 +98,11 @@ const APPENDED_IDS: u64 = 16;
 /// wrote, so the new files overlap nothing.
 const NEW_IDS: std::ops::Range<u64> = SMALL_IDS.end..SMALL_IDS.end + APPENDED_IDS;
 
-/// The ids of the fixture the health test loads: five times the small
-/// fixture, so the load comfortably outlasts the first health round trip
-/// and the readiness probe.
-const HEALTH_RACE_IDS: std::ops::Range<u64> = 0..100_000;
-
 /// The file prefix of the refresh test's append.
 const APPEND_PREFIX: &str = "build2";
 
 /// The scheme every S3 location under the fixture bucket carries.
 const S3_SCHEME: &str = "s3://";
-
-/// How long the drain test lets a spawned request reach the connection
-/// before it asks for the drain: the client's h2 refuses to open a stream
-/// once any GOAWAY has arrived, so a request must be on the wire, or
-/// already answered, before the server starts closing.
-const DISPATCH_DELAY: Duration = Duration::from_millis(20);
 
 /// The `Get` deadline the deadline tests configure: short, so a call over a
 /// held store ends quickly.
@@ -402,11 +396,14 @@ fn object_file(s3: &S3Fixture, location: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_health_is_not_serving_until_every_table_serves() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let spec = FixtureSpec {
-        ids: HEALTH_RACE_IDS,
-        ..FixtureSpec::small(TABLE, KeyType::Long)
-    };
-    let mut stack = Stack::start(vec![spec]).await?;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.hold_store = true;
+            Ok(())
+        },
+    )
+    .await?;
     assert_eq!(
         stack.health_status(OVERALL_SERVICE).await?,
         ServingStatus::NotServing,
@@ -416,6 +413,7 @@ async fn test_health_is_not_serving_until_every_table_serves() -> TestResult {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body, NOT_READY_BODY);
 
+    stack.s3.release();
     stack.serving.ready().await;
     assert_eq!(
         stack.health_status(OVERALL_SERVICE).await?,
@@ -781,15 +779,16 @@ fn labelled_with(exposition: &str, label: &str) -> usize {
         .count()
 }
 
-/// A `Get` issued before `shutdown` and awaited after it completes, and the
-/// drain ends `Ok`. The cold `Get` over loopback S3 is answered within the
-/// dispatch delay; a call still open when the drain deadline passes is
-/// `test_drain_stops_waiting_at_its_deadline`.
+/// A `Get` in flight when `shutdown` is asked for is answered, and the
+/// drain ends `Ok`. The store is held until the call has reached it, so the
+/// call is open on the server when the drain starts; a call still open when
+/// the drain deadline passes is `test_drain_stops_waiting_at_its_deadline`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shutdown_drains_and_returns_ok() -> TestResult {
     let _serial = SERIAL.lock().await;
     let stack = Stack::ready_small().await?;
     let key = stack.fixtures[0].key(SAMPLE[0]);
+    stack.s3.hold();
     let mut client = stack.client.clone();
     let in_flight = tokio::spawn(async move {
         client
@@ -799,8 +798,12 @@ async fn test_shutdown_drains_and_returns_ok() -> TestResult {
             })
             .await
     });
-    tokio::time::sleep(DISPATCH_DELAY).await;
+    poll_until(SHUTDOWN_WAIT, "the call reaching the store", async || {
+        Ok((stack.s3.held() == 1).then_some(()))
+    })
+    .await?;
     stack.serving.shutdown();
+    stack.s3.release();
     let response = in_flight.await??.into_inner();
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
     tokio::time::timeout(SHUTDOWN_WAIT, stack.serving.join()).await??;
@@ -865,6 +868,12 @@ async fn test_failed_start_ends_health_watches_so_the_run_ends() -> TestResult {
     Ok(())
 }
 
+/// A first load that fails leaves the run up through the grace with the
+/// failure on the health service, then ends it with `FirstLoad`. The check
+/// starts once the table is `Degraded`, which the load sets in the poll
+/// that ends the loads and starts the grace, and holds that the run stays
+/// up for `STAYS_UP_FOR`: an interval, since "stays up" is the claim, and
+/// short, a fifth of the grace, so the rest is room for the poll's delay.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -880,12 +889,18 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
         },
     )
     .await?;
+    let table = Arc::clone(&stack.serving.opened().tables[0]);
+    poll_until(REFRESH_WAIT, "the first load failing", async || {
+        Ok(matches!(table.state(), TableState::Degraded { .. }).then_some(()))
+    })
+    .await?;
 
-    assert_eq!(
-        stack.health_status(OVERALL_SERVICE).await?,
-        ServingStatus::NotServing
+    assert!(
+        tokio::time::timeout(STAYS_UP_FOR, stack.serving.stopped())
+            .await
+            .is_err(),
+        "the run stays up through the grace"
     );
-    tokio::time::sleep(HALF_GRACE).await;
     assert_eq!(
         stack.health_status(OVERALL_SERVICE).await?,
         ServingStatus::NotServing,
@@ -1067,14 +1082,22 @@ async fn test_a_get_past_its_deadline_ends_its_page_fetch() -> TestResult {
     assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
     assert_eq!(stack.s3.held(), 1, "the call reached the held store");
     assert_eq!(cache.fetches(), fetched + 1);
-    tokio::time::sleep(DEADLINE_MARGIN).await;
-    assert_eq!(stack.s3.waiting(), 0, "the page GET ended with the call");
+    poll_until(
+        DEADLINE_MARGIN,
+        "the page GET ending with the call",
+        async || Ok((stack.s3.waiting() == 0).then_some(())),
+    )
+    .await?;
 
     let (outcome, elapsed) =
         tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.multi_get(TABLE, &keys[1..]))).await?;
     assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
-    tokio::time::sleep(DEADLINE_MARGIN).await;
-    assert_eq!(stack.s3.waiting(), 0, "the batch's page GETs ended with it");
+    poll_until(
+        DEADLINE_MARGIN,
+        "the batch's page GETs ending with it",
+        async || Ok((stack.s3.waiting() == 0).then_some(())),
+    )
+    .await?;
 
     stack.s3.release();
     let fetched = cache.fetches();
@@ -1185,8 +1208,15 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
         assert!(elapsed < CLIENT_DEADLINE + DEADLINE_MARGIN, "call {sent}");
         assert_eq!(stack.s3.held(), sent + 1, "call {sent} reached the store");
         // The server's own timer on the client's deadline fires a loopback
-        // hop after the client's; the slot is back by the next poll step.
-        tokio::time::sleep(common::POLL_STEP).await;
+        // hop after the client's. It drops the call, and the slot and the
+        // page GET with it, so once the store sees the GET given up, the
+        // slot is back.
+        poll_until(
+            SHUTDOWN_WAIT,
+            "the call's page GET ending with it",
+            async || Ok((stack.s3.waiting() == 0).then_some(())),
+        )
+        .await?;
     }
     Ok(())
 }

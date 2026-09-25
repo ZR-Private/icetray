@@ -819,6 +819,7 @@ pub(crate) mod testing {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
+    use tokio::sync::watch;
 
     use super::{HedgeWindow, Storage};
     use crate::config::StorageConfig;
@@ -876,37 +877,48 @@ pub(crate) mod testing {
         }
     }
 
-    /// A store over `inner` that holds every GET for `hold` before passing
-    /// it on, and counts the GETs in flight at once and the most there have
-    /// been since the last `reset`, so a test can see how many reads a
-    /// caller runs together.
+    /// A store over `inner` that counts the GETs in flight at once and the
+    /// most there have been since the last `fill_to`, so a test can see how
+    /// many reads a caller runs together. After `fill_to(n)` every GET
+    /// waits until `n` GETs are in flight at once, and from then on every
+    /// GET passes: a caller that runs `n` reads together is seen to on any
+    /// machine, however slow, and one that runs fewer never gets past.
     #[derive(Debug)]
     pub(crate) struct Gauged {
         inner: Arc<dyn ObjectStore>,
-        hold: Duration,
         in_flight: AtomicUsize,
         high_water: AtomicUsize,
+        /// How many GETs must be in flight at once before the gate opens.
+        fill: AtomicUsize,
+        /// Whether GETs pass: false from `fill_to` until `fill` GETs are in
+        /// flight together.
+        open: watch::Sender<bool>,
     }
 
     impl Gauged {
-        pub(crate) fn new(inner: Arc<dyn ObjectStore>, hold: Duration) -> Self {
+        /// A store over `inner` whose GETs pass until `fill_to` is called.
+        pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
             Self {
                 inner,
-                hold,
                 in_flight: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
+                fill: AtomicUsize::new(0),
+                open: watch::Sender::new(true),
             }
         }
 
-        /// The most GETs in flight at once since the last `reset`.
+        /// The most GETs in flight at once since the last `fill_to`.
         pub(crate) fn high_water(&self) -> usize {
             self.high_water.load(Ordering::SeqCst)
         }
 
-        /// Starts the high-water mark again from the GETs in flight now.
-        pub(crate) fn reset(&self) {
+        /// Starts the high-water mark again from the GETs in flight now and
+        /// holds every GET until `fill` of them are in flight at once.
+        pub(crate) fn fill_to(&self, fill: usize) {
             self.high_water
                 .store(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.fill.store(fill, Ordering::SeqCst);
+            self.open.send_replace(false);
         }
     }
 
@@ -963,7 +975,14 @@ pub(crate) mod testing {
             Box::pin(async move {
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.high_water.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(self.hold).await;
+                if now >= self.fill.load(Ordering::SeqCst) {
+                    self.open.send_replace(true);
+                }
+                self.open
+                    .subscribe()
+                    .wait_for(|open| *open)
+                    .await
+                    .expect("the store holds the sender");
                 let answer = self.inner.get_opts(location, options).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 answer
