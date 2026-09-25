@@ -217,7 +217,9 @@ One table can be opened without a file. `--location` takes a table root or
 a metadata file and opens it under the name `table`, with `--key-column`
 (default `key`), `--value-column` (default `value`), `--ref` (default
 `main`), and `--residency` (default `full`); `--rewrite FROM=TO` applies a
-prefix rewrite under either target and may be repeated. A located table is
+prefix rewrite under either target and may be repeated. A command-line rule
+takes precedence over the file's for the same prefix, and is checked with
+the file's, so an empty `FROM` exits 1 as it does in a file. A located table is
 never strict, so the doctor reports what `strict` would refuse.
 
 ```sh

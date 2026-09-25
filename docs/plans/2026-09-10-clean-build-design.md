@@ -186,8 +186,12 @@ impl Config {
     /// TOML or JSON, decided by content (a leading `{` is JSON).
     pub fn parse(text: &str) -> Result<Self>;
     pub fn from_path(path: &std::path::Path) -> Result<Self>;
-    /// Every rule `parse` checks, applied to a configuration built in code (the
-    /// command line's `--location` table); the first broken rule is `ConfigError::Invalid`.
+    /// `from_path` without `validated`: the file must parse, and the rules wait for the caller,
+    /// which adds settings of its own first (the command line's `--rewrite` rules, ahead of the file's).
+    pub fn from_path_unvalidated(path: &std::path::Path) -> Result<Self>;
+    /// Every rule `parse` checks, applied to a configuration built or completed in code (the
+    /// command line's `--location` table, or a file with the `--rewrite` rules added); the first
+    /// broken rule is `ConfigError::Invalid`.
     pub fn validated(self) -> Result<Self>;
 }
 /// `metrics_listen` is required (default 127.0.0.1:9433) and serves `/metrics`
@@ -1067,7 +1071,11 @@ the target vocabulary after the subcommand: `--config <file>` or
 `ICETRAY_CONFIG` names, read by `Target::config` rather than by clap, since
 clap cannot tell an environment value from a flag and would report every
 `--location` run under an exported variable as a conflict; no flag and no
-variable is a usage error), `--rewrite FROM=TO` under either, and four
+variable is a usage error), `--rewrite FROM=TO` under either (split at the
+first `=`, a text with none being a usage error; the rules go ahead of the
+file's, so storage's first match makes a command-line rule take precedence
+for the same prefix, and are validated with them, so an empty `FROM` is
+`ConfigViolation::EmptyRewritePrefix`, exit 1, as in a file), and four
 location-only flags (`--key-column`, `--value-column`, `--ref`,
 `--residency`) that require `--location` and conflict with `--config`,
 both, since clap waives a `requires` whose argument conflicts with a

@@ -514,6 +514,53 @@ async fn test_a_bad_log_field_mapping_exits_1() -> TestResult {
     Ok(())
 }
 
+/// A `--rewrite` rule for a prefix the file also maps is tried first, so it
+/// wins: the file's rule alone sends every read to a directory that does not
+/// exist, and the command line's rule for the same prefix keeps the reads
+/// where the table is.
+#[tokio::test]
+async fn test_a_command_line_rewrite_takes_precedence_over_the_file_s() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture =
+        local_fixture(dir.path(), FixtureSpec::small("kv_rewrite", KeyType::Long)).await?;
+    let warehouse = format!("file://{}/", dir.path().display());
+    let moved = format!("file://{}/", dir.path().join("moved").display());
+    let text = format!(
+        "[[storage.rewrite]]\nfrom = \"{warehouse}\"\nto = \"{moved}\"\n\n{}",
+        toml_table(TABLE_A, &fixture)
+    );
+    let config = write_file(dir.path(), "rewrite.toml", &text)?;
+
+    let file_rule_only = run(&["info", "--config", &config], &[]);
+    assert_exit(&file_rule_only, EXIT_FAILURE);
+
+    let identity = format!("{warehouse}={warehouse}");
+    let overridden = run(&["info", "--config", &config, "--rewrite", &identity], &[]);
+    assert_exit(&overridden, EXIT_OK);
+    assert_eq!(lines(&overridden.stdout)[0]["table"], TABLE_A);
+    Ok(())
+}
+
+/// An empty `--rewrite` prefix is the same violation as an empty `from` in
+/// the file, refused before anything is opened with exit 1.
+#[tokio::test]
+async fn test_an_empty_rewrite_prefix_exits_1() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_empty", KeyType::Long)).await?;
+    let output = run(
+        &[
+            &["info"][..],
+            &location(&fixture),
+            &["--rewrite", "=file:///elsewhere/"],
+        ]
+        .concat(),
+        &[],
+    );
+    assert_exit(&output, EXIT_FAILURE);
+    assert!(output.stdout.is_empty(), "{}", stderr(&output));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     let dir = tempfile::tempdir()?;

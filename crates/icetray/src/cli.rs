@@ -115,7 +115,8 @@ pub struct Target {
     /// file, under the name `table`; `ICETRAY_CONFIG` is ignored.
     #[arg(long, conflicts_with = "config")]
     pub location: Option<String>,
-    /// A location prefix rewrite FROM=TO applied before any read; repeatable.
+    /// A location prefix rewrite FROM=TO applied before any read; repeatable,
+    /// and ahead of the file's rules, so it wins for the same prefix.
     #[arg(long, value_parser = parse_rewrite)]
     pub rewrite: Vec<RewriteRule>,
     /// The key column of the located table (default: key).
@@ -133,21 +134,16 @@ pub struct Target {
     pub residency: Option<Residency>,
 }
 
-/// A `--rewrite` rule from `FROM=TO`, split at the first `=`. An empty
-/// `FROM` is refused here, the one guard for a rule typed on the command
-/// line: `Config::parse` refuses the same in a file, and the rules a target
-/// appends never pass through it.
+/// A `--rewrite` rule from `FROM=TO`, split at the first `=`. The rule's
+/// content is checked with the rest of the configuration by
+/// `Target::config`, so an empty `FROM` is the same violation here as in a
+/// file.
 fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
     let (from, to) =
         text.split_once(REWRITE_SEPARATOR)
             .ok_or_else(|| RewriteTextFault::NoSeparator {
                 text: text.to_string(),
             })?;
-    if from.is_empty() {
-        return Err(RewriteTextFault::EmptyPrefix {
-            text: text.to_string(),
-        });
-    }
     Ok(RewriteRule {
         from: from.to_string(),
         to: to.to_string(),
@@ -159,11 +155,14 @@ impl Target {
     /// by content, RFD 011), named by `--config` or, with no target flag,
     /// by `ICETRAY_CONFIG`; or one table synthesized from the location with
     /// server and storage defaults, never strict, since the one-shots exist
-    /// to report what `strict` would refuse, and held to every rule
-    /// `Config::parse` checks, so `--residency disk` with no local directory
-    /// fails here as the same violation in a file does. The `--rewrite`
-    /// rules are appended to `storage.rewrite` in every case. No flag and
-    /// no variable is `NoTarget`.
+    /// to report what `strict` would refuse. The `--rewrite` rules go ahead
+    /// of the file's in `storage.rewrite`, and storage applies the first rule
+    /// that matches, so a command-line rule takes precedence over the file's
+    /// for the same prefix. Only then is the whole validated, so the
+    /// command-line rules and a located table are held to every rule
+    /// `Config::parse` checks: `--residency disk` with no local directory,
+    /// or an empty `--rewrite` prefix, is the same violation a file would
+    /// be. No flag and no variable is `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
         self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
     }
@@ -172,13 +171,14 @@ impl Target {
     /// process environment.
     fn config_with_env(&self, env_path: Option<PathBuf>) -> Result<Config, CliError> {
         let mut config = match (&self.config, &self.location, env_path) {
-            (Some(path), _, _) => Config::from_path(path)?,
-            (None, Some(location), _) => self.location_config(location.clone()).validated()?,
-            (None, None, Some(path)) => Config::from_path(&path)?,
+            (Some(path), _, _) => Config::from_path_unvalidated(path)?,
+            (None, Some(location), _) => self.location_config(location.clone()),
+            (None, None, Some(path)) => Config::from_path_unvalidated(&path)?,
             (None, None, None) => return Err(CliError::NoTarget),
         };
-        config.storage.rewrite.extend(self.rewrite.iter().cloned());
-        Ok(config)
+        let from_file = std::mem::take(&mut config.storage.rewrite);
+        config.storage.rewrite = self.rewrite.iter().cloned().chain(from_file).collect();
+        Ok(config.validated()?)
     }
 
     /// The configuration of one table at `location` under this target's
@@ -438,13 +438,45 @@ value_column = "value"
     }
 
     #[test]
-    fn test_parse_rewrite_refuses_an_empty_prefix() {
-        let text = format!("={REWRITE_TO}");
-        assert_eq!(
-            parse_rewrite(&text),
-            Err(RewriteTextFault::EmptyPrefix { text: text.clone() })
+    fn test_config_puts_command_line_rewrites_ahead_of_the_file_s() {
+        let file_to = "s3://from-the-file/";
+        let text = format!(
+            "{TOML_ONE_TABLE}\n[[storage.rewrite]]\nfrom = \"{REWRITE_FROM}\"\nto = \"{file_to}\"\n"
         );
-        let error = parse(&["info", "--location", LOCATION, "--rewrite", &text]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{error}");
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        let rewrite = format!("{REWRITE_FROM}={REWRITE_TO}");
+        let path = file.path().to_str().unwrap();
+        let cli = parse(&["info", "--config", path, "--rewrite", &rewrite]).unwrap();
+        let config = target(cli).config().unwrap();
+        assert_eq!(
+            config.storage.rewrite,
+            vec![
+                RewriteRule {
+                    from: REWRITE_FROM.to_string(),
+                    to: REWRITE_TO.to_string(),
+                },
+                RewriteRule {
+                    from: REWRITE_FROM.to_string(),
+                    to: file_to.to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_config_refuses_an_empty_rewrite_prefix_as_the_file_does() {
+        let text = format!("={REWRITE_TO}");
+        let cli = parse(&["info", "--location", LOCATION, "--rewrite", &text]).unwrap();
+        let error = target(cli).config().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CliError::Core(icetray_core::Error::Config(ConfigError::Invalid(
+                    ConfigViolation::EmptyRewritePrefix
+                )))
+            ),
+            "{error:?}"
+        );
     }
 }

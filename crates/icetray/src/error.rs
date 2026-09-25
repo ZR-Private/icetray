@@ -74,18 +74,13 @@ pub enum KeyTextFault {
 
 /// Why `--rewrite` text is not a rule. clap reports it as a value
 /// validation failure, so the run ends with `EXIT_USAGE` before anything is
-/// opened; the messages carry the text as given.
+/// opened; the messages carry the text as given. A rule that has the shape
+/// but breaks a configuration rule is refused with the configuration.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RewriteTextFault {
     /// No `=` separates `FROM` from `TO`.
     #[error("rewrite {text} is not FROM=TO")]
     NoSeparator {
-        /// The text as given.
-        text: String,
-    },
-    /// `FROM` is empty, and an empty prefix would rewrite every location.
-    #[error("rewrite {text} has an empty FROM, which would rewrite every location")]
-    EmptyPrefix {
         /// The text as given.
         text: String,
     },

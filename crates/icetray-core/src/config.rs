@@ -282,8 +282,9 @@ pub enum ConfigViolation {
         /// The field later in `StandardField::ALL`.
         second: StandardField,
     },
-    /// A rewrite rule whose `from` is empty: every location starts with the
-    /// empty prefix, so the rule would rewrite all of them.
+    /// A rewrite rule, from the file or the command line, whose `from` is
+    /// empty: every location starts with the empty prefix, so the rule would
+    /// rewrite all of them.
     #[error("a rewrite rule has an empty from prefix")]
     EmptyRewritePrefix,
     /// A location, after rewriting, whose `scheme://authority/` prefix names
@@ -334,12 +335,16 @@ impl Config {
     /// is JSON. The result is validated once, so the two syntaxes cannot
     /// disagree on what is accepted.
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Self = if text.trim_start().starts_with(JSON_OPENING) {
-            serde_json::from_str(text).map_err(ConfigError::Json)?
+        Self::from_text(text)?.validated()
+    }
+
+    /// The text as either syntax reads it, not yet validated.
+    fn from_text(text: &str) -> Result<Self> {
+        if text.trim_start().starts_with(JSON_OPENING) {
+            Ok(serde_json::from_str(text).map_err(ConfigError::Json)?)
         } else {
-            toml::from_str(text).map_err(ConfigError::Toml)?
-        };
-        config.validated()
+            Ok(toml::from_str(text).map_err(ConfigError::Toml)?)
+        }
     }
 
     /// The configuration, checked against every rule `parse` checks, so a
@@ -353,8 +358,16 @@ impl Config {
     /// Reads the file, then `parse`s it; a file that cannot be read is
     /// `ConfigError::Read`.
     pub fn from_path(path: &Path) -> Result<Self> {
+        Self::from_path_unvalidated(path)?.validated()
+    }
+
+    /// `from_path` without `validated`, for a caller that adds settings of
+    /// its own before it validates the whole: the command line puts its
+    /// `--rewrite` rules ahead of the file's. The file must still parse; a
+    /// key the schema does not know fails here as it does in `from_path`.
+    pub fn from_path_unvalidated(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
-        Self::parse(&text)
+        Self::from_text(&text)
     }
 }
 
@@ -1660,6 +1673,33 @@ locaton = "typo"
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(toml_full().as_bytes()).unwrap();
         assert_eq!(Config::from_path(file.path()).unwrap(), full_config());
+    }
+
+    #[test]
+    fn test_from_path_unvalidated_parses_and_leaves_the_rules_to_validated() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let unnamed = TOML_MINIMAL.replace("name = \"kv\"", "name = \"\"");
+        file.write_all(unnamed.as_bytes()).unwrap();
+        let parsed = Config::from_path_unvalidated(file.path()).unwrap();
+        assert!(parsed.tables[0].name.is_empty());
+        let refused = parsed.validated();
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Config(ConfigError::Invalid(
+                    ConfigViolation::EmptyTableName
+                )))
+            ),
+            "{refused:?}"
+        );
+        let mut typo = tempfile::NamedTempFile::new().unwrap();
+        typo.write_all(format!("{TOML_MINIMAL}\n[server]\nlisten_addr = \"x\"\n").as_bytes())
+            .unwrap();
+        let unknown = Config::from_path_unvalidated(typo.path());
+        assert!(
+            matches!(unknown, Err(Error::Config(ConfigError::Toml(_)))),
+            "{unknown:?}"
+        );
     }
 
     #[test]
