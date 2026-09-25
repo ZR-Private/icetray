@@ -286,7 +286,8 @@ serve is `NOT_FOUND`, and a miss is a normal answer, never an error. A
 its expiry as `CANCELLED` from its side of the call. `Get` and `MultiGet`
 share `server.max_in_flight` slots, each held until its call ends; a call
 that finds none free is refused at once with `RESOURCE_EXHAUSTED` rather
-than queued. `TableInfo` takes no slot.
+than queued. `TableInfo` takes no slot. A `MultiGet` of more than
+`server.max_multi_get_keys` keys is `INVALID_ARGUMENT` before any lookup.
 
 The listener speaks plaintext gRPC and terminates no TLS. icetray expects a
 private network or a service mesh that encrypts traffic and authenticates

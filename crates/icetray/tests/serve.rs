@@ -1066,3 +1066,35 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
     }
     Ok(())
 }
+
+/// A `MultiGet` of `max_multi_get_keys` keys is answered; one more key is
+/// `INVALID_ARGUMENT` before any lookup, so it issues no GET.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_get_over_max_keys_is_invalid_argument_before_any_lookup() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(TABLE, KeyType::Long)],
+        async |setup| {
+            setup.config.server.max_multi_get_keys = BATCH_IDS;
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let keys = stack.fixtures[0].keys_at(&SAMPLE[..=BATCH_IDS]);
+
+    let before = stack.stats.gets();
+    assert_eq!(
+        code_of(stack.multi_get(TABLE, &keys).await),
+        Code::InvalidArgument
+    );
+    assert_eq!(stack.stats.gets(), before, "a refused batch issues no GET");
+
+    let at_limit = &keys[..BATCH_IDS];
+    let response = stack.multi_get(TABLE, at_limit).await?;
+    assert_eq!(response.results.len(), BATCH_IDS);
+    for hit in &response.results {
+        assert_eq!(hit.presence, i32::from(v1::Presence::Present));
+    }
+    Ok(())
+}

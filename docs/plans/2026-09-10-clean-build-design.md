@@ -1029,7 +1029,9 @@ share one semaphore of `server.max_in_flight` permits (held to tokio's
 starts and holds it until the call ends, so a call past its deadline
 gives it back when it is dropped. A call that finds none free is
 `RESOURCE_EXHAUSTED` at once (`CallFault::Overloaded`), never queued.
-`TableInfo` takes no permit.
+`TableInfo` takes no permit. A `MultiGet` of more than
+`server.max_multi_get_keys` keys is `INVALID_ARGUMENT`
+(`CallFault::TooManyKeys`) before it takes a permit or looks anything up.
 
 **One-shot subcommands.** `doctor`, `get <key>...`, and `info` each take
 the target vocabulary after the subcommand: `--config <file>` or

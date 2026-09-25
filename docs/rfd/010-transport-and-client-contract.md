@@ -1,5 +1,8 @@
 # Transport and client contract
 
+> Updated 2026-09-24: a MultiGet carries at most `server.max_multi_get_keys`
+> keys, 1000 by default. See RFD 013.
+
 ## Problem
 
 icetray answers get-by-key lookups to programs, and those programs will be
@@ -77,9 +80,12 @@ subcommands of RFD 012 (Deployment contract) and reads their JSON.
 Because every answer names its snapshot, a caller can tell when two answers
 straddle a generation swap, and a MultiGet batch never does.
 
-Behavior under concurrent load, MultiGet fan-out included, was not measured
+A MultiGet carries at most `server.max_multi_get_keys` keys, 1000 by
+default, and a larger batch is `INVALID_ARGUMENT` before any lookup, so the
+lookups one call asks for are bounded (RFD 013 (Tail latency)). Behavior under concurrent load, MultiGet fan-out included, was
+not measured
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
-so whether the contract needs a batch-size cap is not yet known.
+so the 1000 is a single-pod guess, to be revisited with measurement.
 
 A whole-batch failure discards the keys that were answered, which costs the
 fan-out pattern in archetype A a second round of GETs for keys it already

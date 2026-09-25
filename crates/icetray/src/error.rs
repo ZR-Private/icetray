@@ -132,6 +132,15 @@ pub enum CallFault {
         /// `server.max_in_flight`.
         limit: usize,
     },
+    /// A `MultiGet` carried more keys than one batch may, refused before
+    /// any lookup. The caller's fault, so `INVALID_ARGUMENT` on the wire.
+    #[error("a MultiGet carries at most {limit} keys, got {keys}")]
+    TooManyKeys {
+        /// The keys the batch carried.
+        keys: usize,
+        /// `server.max_multi_get_keys`.
+        limit: usize,
+    },
 }
 
 /// Why `serve` ended other than by a drain.

@@ -5,7 +5,8 @@
 //! `MultiGet` run under their deadlines (RFD 013): the server's for the
 //! method, or the client's `grpc-timeout` when that is shorter; together
 //! they hold at most `server.max_in_flight` slots, and a call that finds
-//! none is refused at once.
+//! none is refused at once. A `MultiGet` carries at most
+//! `server.max_multi_get_keys` keys.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,6 +46,8 @@ pub struct Service {
     in_flight: Arc<Semaphore>,
     /// The slots `in_flight` was built with, for the refusal.
     max_in_flight: usize,
+    /// The most keys one `MultiGet` may carry.
+    max_multi_get_keys: usize,
 }
 
 impl Service {
@@ -65,6 +68,7 @@ impl Service {
             multi_get_deadline: server.multi_get_deadline,
             in_flight: Arc::new(Semaphore::new(max_in_flight)),
             max_in_flight,
+            max_multi_get_keys: server.max_multi_get_keys,
         }
     }
 
@@ -165,6 +169,7 @@ impl From<CallFault> for Status {
         match fault {
             CallFault::DeadlineExceeded { .. } => Self::deadline_exceeded(message),
             CallFault::Overloaded { .. } => Self::resource_exhausted(message),
+            CallFault::TooManyKeys { .. } => Self::invalid_argument(message),
         }
     }
 }
@@ -341,6 +346,14 @@ impl Icetray for Service {
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
         telemetry::count(Call::MultiGet);
+        let keys = request.get_ref().keys.len();
+        if keys > self.max_multi_get_keys {
+            return Err(CallFault::TooManyKeys {
+                keys,
+                limit: self.max_multi_get_keys,
+            }
+            .into());
+        }
         let _slot = self.admit()?;
         let deadline = Deadline::of(&request, self.multi_get_deadline);
         deadline.run(self.lookup_batch(request.into_inner())).await
@@ -520,6 +533,13 @@ mod tests {
                     limit: SAMPLE_LIMIT,
                 },
                 Code::ResourceExhausted,
+            ),
+            (
+                CallFault::TooManyKeys {
+                    keys: SAMPLE_LIMIT + 1,
+                    limit: SAMPLE_LIMIT,
+                },
+                Code::InvalidArgument,
             ),
         ];
         for (fault, code) in cases {
