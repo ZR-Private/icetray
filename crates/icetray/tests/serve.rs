@@ -461,7 +461,11 @@ async fn test_get_costs_one_get_cold_and_none_warm_or_absent() -> TestResult {
     for key in &keys {
         let response = stack.get(TABLE, Some(wire_key(key))).await?;
         assert_eq!(response.presence, i32::from(v1::Presence::Present), "{key}");
-        assert_eq!(Some(response.value), stack.fixtures[0].value(key), "{key}");
+        assert_eq!(
+            Some(response.value.to_vec()),
+            stack.fixtures[0].value(key),
+            "{key}"
+        );
         assert_eq!(response.snapshot_id, generation.snapshot_id.0);
     }
     assert_eq!(
@@ -509,7 +513,10 @@ async fn test_get_serves_a_null_value_as_present_with_null() -> TestResult {
 
     let present = stack.get(TABLE, Some(wire_key(&present_key))).await?;
     assert_eq!(present.presence, i32::from(v1::Presence::Present));
-    assert_eq!(Some(present.value), stack.fixtures[0].value(&present_key));
+    assert_eq!(
+        Some(present.value.to_vec()),
+        stack.fixtures[0].value(&present_key)
+    );
 
     let absent = stack
         .get(
@@ -541,7 +548,7 @@ async fn test_multi_get_answers_in_order_from_one_snapshot() -> TestResult {
     for (key, hit) in present.iter().zip(&response.results) {
         assert_eq!(hit.presence, i32::from(v1::Presence::Present), "{key}");
         assert_eq!(
-            Some(hit.value.clone()),
+            Some(hit.value.to_vec()),
             stack.fixtures[0].value(key),
             "{key}"
         );
@@ -591,7 +598,10 @@ async fn test_get_maps_a_missing_or_mismatched_key_to_invalid_argument() -> Test
     assert_eq!(bytes.len(), UUID_BYTES);
     let response = stack.get(UUID_TABLE, Some(wire_key(&uuid_key))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
-    assert_eq!(Some(response.value), stack.fixtures[1].value(&uuid_key));
+    assert_eq!(
+        Some(response.value.to_vec()),
+        stack.fixtures[1].value(&uuid_key)
+    );
     Ok(())
 }
 
@@ -725,7 +735,10 @@ async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult
     let new_key = stack.fixtures[0].key(NEW_IDS.start);
     let response = stack.get(TABLE, Some(wire_key(&new_key))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
-    assert_eq!(Some(response.value), stack.fixtures[0].value(&new_key));
+    assert_eq!(
+        Some(response.value.to_vec()),
+        stack.fixtures[0].value(&new_key)
+    );
     assert_eq!(response.snapshot_id, advanced.snapshot_id);
 
     let (status, scrape) = stack.http_get(METRICS_PATH).await?;

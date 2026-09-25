@@ -774,9 +774,10 @@ impl FileIndex {
     /// holding it through `cache` (one GET cold, none warm) and, when the
     /// value column chunk has a dictionary page, that page too (the one
     /// extra GET RFD 007 prices), then exactly one row decoded. `Some`
-    /// carries the bytes unchanged; `None` is a null value, distinct from an
-    /// absent key. The origin is the value page's: `Fetched` for the GET of
-    /// a cold hit, `Cached` for a warm one; the dictionary page, when there
+    /// carries the bytes unchanged, a slice of the fetched page where
+    /// parquet decoded them in place and a copy otherwise (`value_bytes`);
+    /// `None` is a null value, distinct from an absent key. The origin is
+    /// the value page's: `Fetched` for the GET of a cold hit, `Cached` for a warm one; the dictionary page, when there
     /// is one, does not decide it. A row outside every page of its row group
     /// is `FileFault::PageOutOfRange`. The headers of the value page and of
     /// its dictionary page are read from the fetched bytes before parquet
@@ -797,10 +798,14 @@ impl FileIndex {
             .await?;
         check_value_page_headers(chunk, self.value_shape, page, &segments)?;
         let value = match self.value_shape {
-            ValueShape::Variable => read_one::<ByteArrayType>(chunk, row.row, segments)?
-                .map(|value| Bytes::copy_from_slice(value.data())),
-            ValueShape::Fixed => read_one::<FixedLenByteArrayType>(chunk, row.row, segments)?
-                .map(|value| Bytes::copy_from_slice(value.data())),
+            ValueShape::Variable => {
+                read_one::<ByteArrayType>(chunk, row.row, Arc::clone(&segments))?
+                    .map(|value| value_bytes(&segments, value.data()))
+            }
+            ValueShape::Fixed => {
+                read_one::<FixedLenByteArrayType>(chunk, row.row, Arc::clone(&segments))?
+                    .map(|value| value_bytes(&segments, value.data()))
+            }
         };
         Ok((value, origin))
     }
@@ -1172,6 +1177,31 @@ impl<'a> ColumnChunk<'a> {
     }
 }
 
+/// A decoded value as `Bytes`: a slice of the fetched page in `segments`
+/// when parquet decoded it in place there, as it does from an uncompressed
+/// page, so the value shares the page's buffer and holds it only while the
+/// value is referenced; otherwise a copy, since a value decoded from a
+/// compressed page lies in the buffer parquet decompressed into, which its
+/// `ByteArray` does not hand out.
+fn value_bytes(segments: &Segments, value: &[u8]) -> Bytes {
+    segments
+        .parts()
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .find(|bytes| lies_within(bytes, value))
+        .map_or_else(
+            || Bytes::copy_from_slice(value),
+            |bytes| bytes.slice_ref(value),
+        )
+}
+
+/// Whether `inner` is a subslice of `outer`'s memory.
+fn lies_within(outer: &[u8], inner: &[u8]) -> bool {
+    let outer = outer.as_ptr_range();
+    let inner = inner.as_ptr_range();
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
 /// The identity a chunk file is named by and checked against, for a handle
 /// whose footer has been loaded.
 pub(crate) fn identity_of(handle: &FileHandle) -> DataFileIdentity {
@@ -1272,6 +1302,7 @@ mod tests {
     };
     use crate::storage::IoStats;
 
+    use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::{EnabledStatistics, WriterVersion};
 
     /// Row groups in the fixtures that route across truncated or absent
@@ -1346,6 +1377,50 @@ mod tests {
                 metadata: Arc::new(metadata),
                 ..self
             }
+        }
+    }
+
+    /// Whether `value` lies in the memory of one of the bytes `segments`
+    /// holds.
+    fn shares_a_buffer(segments: &Segments, value: &Bytes) -> bool {
+        segments
+            .parts()
+            .iter()
+            .any(|(_, bytes)| lies_within(bytes, value))
+    }
+
+    /// A value read from an uncompressed value page is a slice of the page
+    /// the cache holds, not a copy; one read from a zstd page, the
+    /// contract's codec, is a copy out of the buffer parquet decompressed
+    /// into, and shares no fetched page.
+    #[tokio::test]
+    async fn test_read_value_shares_the_buffer_of_an_uncompressed_page() {
+        for (compression, shared) in [
+            (Compression::UNCOMPRESSED, true),
+            (Compression::ZSTD(ZstdLevel::default()), false),
+        ] {
+            let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+            fixture.layout.compression = compression;
+            let opened = store(&fixture).await;
+            let index = opened.index(KeyType::Long).await;
+            let cache = cache().await;
+            let at = page_rows() + 1;
+            let row = index
+                .find(&key_for(at, KeyType::Long), Some(&cache))
+                .await
+                .unwrap()
+                .unwrap();
+            let (value, _) = index.read_value(row, Some(&cache)).await.unwrap();
+            let value = value.unwrap();
+            assert_eq!(value, value_for(at).as_slice());
+            let chunk = index.value_column().group(row.row_group);
+            let page = index.value_page(row).unwrap();
+            let (cached, origin) = index
+                .fetch_pages(chunk, page, PageSource::Store(Some(&cache)))
+                .await
+                .unwrap();
+            assert_eq!(origin, PageOrigin::Cached);
+            assert_eq!(shares_a_buffer(&cached, &value), shared, "{compression}");
         }
     }
 

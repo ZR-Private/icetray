@@ -137,6 +137,7 @@ pub(super) struct Layout {
     pub(super) bloom: Bloom,
     pub(super) offset_index: bool,
     pub(super) writer_version: WriterVersion,
+    pub(super) compression: Compression,
 }
 
 impl Layout {
@@ -152,6 +153,7 @@ impl Layout {
             bloom: Bloom::Sized,
             offset_index: true,
             writer_version: WriterVersion::PARQUET_1_0,
+            compression: Compression::ZSTD(ZstdLevel::default()),
         }
     }
 
@@ -167,7 +169,7 @@ impl Layout {
             .set_statistics_enabled(self.statistics)
             .set_column_index_truncate_length(self.truncate)
             .set_statistics_truncate_length(self.truncate)
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_compression(self.compression)
             .set_bloom_filter_enabled(false)
             .set_offset_index_disabled(!self.offset_index)
             .set_writer_version(self.writer_version);

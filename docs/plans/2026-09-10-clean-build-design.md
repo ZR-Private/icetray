@@ -614,7 +614,9 @@ impl FileIndex {
     pub(crate) async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>>;
     /// The value at `row` and its value page's origin, through `fetch_pages`, which returns
     /// the page's own origin and not the dictionary page's: `Fetched` for a cold hit, `Cached`
-    /// for a warm one. `None` is a null value, distinct from an absent key. `find` discards
+    /// for a warm one. `None` is a null value, distinct from an absent key. `Some` is a slice
+    /// of the fetched page where parquet decoded the value in place (an uncompressed page),
+    /// a copy out of parquet's decompressed buffer otherwise. `find` discards
     /// the key page's origin. The value page's header, and its dictionary page's, are read
     /// from the fetched bytes and refused as `MalformedPageHeader` or `PageHeaderOverBound`
     /// before parquet decodes them.
@@ -1024,6 +1026,10 @@ message TableInfoRequest { string table = 1; }
 enum KeyType { KEY_TYPE_UNSPECIFIED = 0; KEY_TYPE_LONG = 1; KEY_TYPE_STRING = 2; KEY_TYPE_BINARY = 3; KEY_TYPE_UUID = 4; }
 message TableInfoResponse { string table = 1; int64 snapshot_id = 2; uint32 buckets = 3; uint64 data_files = 4; uint64 records = 5; KeyType key_type = 6; uint64 index_bytes = 7; }
 ```
+
+`build.rs` generates `GetResponse.value` and `Hit.value` as `bytes::Bytes`,
+so the service moves a lookup's `Value::Present` bytes into the message
+without copying them; every other `bytes` field is a `Vec<u8>`.
 
 The one message icetray persists for itself, the header of a chunk file, is
 not in this crate. It is a prost message declared in `icetray-core::local`

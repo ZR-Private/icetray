@@ -11,6 +11,7 @@ use icetray_proto::v1::{
     GetRequest, GetResponse, Hit, Key, KeyType, MultiGetRequest, MultiGetResponse, Presence,
     TableInfoRequest, TableInfoResponse, key,
 };
+use prost::bytes::Bytes;
 use prost::{Message, UnknownEnumValue};
 
 /// The name the fixture table is served under.
@@ -155,7 +156,7 @@ fn test_round_trip_get_response_every_presence() {
     for &(presence, _) in PRESENCE_NUMBERS {
         let response = GetResponse {
             presence: i32::from(presence),
-            value: VALUE.to_vec(),
+            value: Bytes::from_static(VALUE),
             snapshot_id: SNAPSHOT_ID,
         };
         assert_round_trips(&response);
@@ -176,7 +177,7 @@ fn test_round_trip_hit_every_presence() {
     for &(presence, _) in PRESENCE_NUMBERS {
         let hit = Hit {
             presence: i32::from(presence),
-            value: VALUE.to_vec(),
+            value: Bytes::from_static(VALUE),
         };
         assert_round_trips(&hit);
         assert_eq!(round_trip(&hit).presence(), presence);
@@ -189,7 +190,7 @@ fn test_round_trip_multi_get_response_every_presence() {
         .iter()
         .map(|&(presence, _)| Hit {
             presence: i32::from(presence),
-            value: VALUE.to_vec(),
+            value: Bytes::from_static(VALUE),
         })
         .collect();
     let response = MultiGetResponse {

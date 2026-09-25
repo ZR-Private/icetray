@@ -13,6 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Value, approx};
@@ -216,12 +217,13 @@ pub fn status_from(error: &Error) -> Status {
 }
 
 /// A lookup's outcome on the wire: the presence and the value bytes, empty
-/// for a null or absent key.
-pub fn presence(value: Value) -> (v1::Presence, Vec<u8>) {
+/// for a null or absent key. A present value's bytes are the lookup's own,
+/// moved into the message, not copied.
+pub fn presence(value: Value) -> (v1::Presence, Bytes) {
     match value {
-        Value::Present(bytes) => (v1::Presence::Present, bytes.to_vec()),
-        Value::Null => (v1::Presence::Null, Vec::new()),
-        Value::Absent => (v1::Presence::Absent, Vec::new()),
+        Value::Present(bytes) => (v1::Presence::Present, bytes),
+        Value::Null => (v1::Presence::Null, Bytes::new()),
+        Value::Absent => (v1::Presence::Absent, Bytes::new()),
     }
 }
 
@@ -645,12 +647,18 @@ mod tests {
     #[test]
     fn test_presence_per_value() {
         let bytes = Bytes::from_static(STR_VALUE.as_bytes());
+        let (present, wire) = presence(Value::Present(bytes.clone()));
+        assert_eq!((present, &wire), (v1::Presence::Present, &bytes));
         assert_eq!(
-            presence(Value::Present(bytes.clone())),
-            (v1::Presence::Present, bytes.to_vec())
+            wire.as_ptr(),
+            bytes.as_ptr(),
+            "the message carries the lookup's bytes, not a copy"
         );
-        assert_eq!(presence(Value::Null), (v1::Presence::Null, Vec::new()));
-        assert_eq!(presence(Value::Absent), (v1::Presence::Absent, Vec::new()));
+        assert_eq!(presence(Value::Null), (v1::Presence::Null, Bytes::new()));
+        assert_eq!(
+            presence(Value::Absent),
+            (v1::Presence::Absent, Bytes::new())
+        );
     }
 
     #[test]
