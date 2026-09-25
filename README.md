@@ -415,11 +415,11 @@ serves, of the doctor's `predicted` bytes for each table's tier
 for a table a refresh can rewrite wholesale, since the new generation loads
 beside the serving one; plus `server.page_cache_bytes`; plus a margin of a
 quarter of that total for the process itself, requests in flight, and a
-load's transient chunks. Load refuses a key page header that declares more
-than its page can hold, before parquet allocates for it, but a footer that
-claims billions of rows, a value page decoded at lookup, and the lengths
-inside a delta-encoded page still size buffers from the file, and there the
-limit is what stops the process. A file that trips it takes down every
+load's transient chunks. Load refuses a key page header, and a lookup a
+value page header, that declares more than its page can hold or than a 64
+MiB ceiling that does not rest on the footer, before parquet allocates for
+it, but the lengths inside a delta-encoded page still size buffers from the
+file, and there the limit is what stops the process. A file that trips it takes down every
 replica that loads it, since they all load the same snapshot and restart
 into the same file; that is why the cases the checks know are refused
 instead, which on a refresh keeps the last good generation serving.

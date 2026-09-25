@@ -1,4 +1,5 @@
-//! The page headers of a key column chunk, read ahead of parquet's page
+//! The page headers of a key column chunk at load, and of the value page
+//! and value dictionary page a lookup fetches, read ahead of parquet's page
 //! reader and bounded by what their pages can hold (RFD 004). Parquet sizes
 //! buffers from two header numbers as it reads a page, before any check on
 //! the page it hands out can run: a page's uncompressed size, which it
@@ -8,7 +9,8 @@
 //! data page header's two level lengths as `i32`s, which two lengths near
 //! `i32::MAX` overflow. Every replica loads the same snapshot, so such a
 //! file would take down each one that loads it; a typed refusal on a
-//! refresh keeps the generation before it serving instead.
+//! refresh keeps the generation before it serving instead, and at lookup
+//! answers that one lookup with the fault.
 //!
 //! The reader here decodes the Thrift compact encoding of parquet's
 //! `PageHeader` as parquet 58 reads it (`PageHeader::read_thrift_without_stats`,
@@ -29,7 +31,7 @@ use parquet::basic::PageType;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::file::reader::ChunkReader;
 
-use super::{ColumnChunk, FileFault, KeyShape, file_fault, row_index};
+use super::{ColumnChunk, FileFault, KeyShape, ValueShape, file_fault, row_index};
 use crate::approx;
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::Result;
@@ -67,49 +69,94 @@ pub(super) const PAGE_ENCODING_ALLOWANCE_BYTES: u64 = 64 * 1024;
 /// contract page. The span-derived bounds follow the footer's row counts,
 /// which a footer can inflate; this one does not, so it caps the page
 /// buffer parquet reserves from a key page header, and with
-/// `most_key_entries` the entries it sizes a key dictionary by.
+/// `Entry::most_in` the entries it sizes a key dictionary by.
 pub(super) const MOST_KEY_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most uncompressed bytes a value page (data, v2 data, or dictionary)
+/// a lookup reads may declare. The contract bounds a value page at
+/// `VALUE_PAGE_BYTES`, 64 KiB, and a lookup answers one value, or a
+/// multi-get's values, in one gRPC message. tonic 0.14.6 decodes a
+/// received message of at most 4 MiB unless told otherwise
+/// (`DEFAULT_MAX_RECV_MESSAGE_SIZE`); the server sets neither that nor
+/// the send limit, whose default is `usize::MAX`, so it sends a value of
+/// any size, and a client on tonic's defaults refuses a message over 4
+/// MiB. 64 MiB is sixteen times that, and does not rest on the footer, so
+/// it caps the page buffer parquet reserves from a value page header and,
+/// with `Entry::most_in`, the entries it sizes a value dictionary by. A
+/// value in a page over it is not served, over gRPC or by a one-shot,
+/// though the value itself may be small: a page bounded by rows alone
+/// passes the ceiling at a thousand values of 128 KiB.
+pub(super) const MOST_VALUE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The bytes a `BYTE_ARRAY` value's `PLAIN` length prefix takes, the
-/// fewest a dictionary entry of a byte array key takes: an empty key is
-/// its prefix alone.
+/// fewest a dictionary entry of a byte array takes: an empty value is its
+/// prefix alone.
 const BYTE_ARRAY_LENGTH_PREFIX_BYTES: u64 = approx::count(size_of::<u32>());
 
-/// The fewest bytes one entry of a `PLAIN` dictionary of a key column of
-/// `shape` takes, `width` being the column's `FIXED_LEN_BYTE_ARRAY` width:
-/// an `INT64` is 8 bytes, a byte array its length prefix, a fixed-width
-/// value its width. `inspect` refuses a key width of 0 and parquet's
-/// schema reader a negative one; either counts as 0 here, and
-/// `most_key_entries` then rests on the bytes an entry is held in.
-pub(super) fn fewest_entry_bytes(shape: KeyShape, width: i32) -> u64 {
-    match shape {
-        KeyShape::Long => approx::count(size_of::<i64>()),
-        KeyShape::Str | KeyShape::Bin => BYTE_ARRAY_LENGTH_PREFIX_BYTES,
-        KeyShape::FixedBin | KeyShape::Uuid => u64::try_from(width).unwrap_or(0),
+/// How one dictionary entry of a key or value column is encoded and held,
+/// by the column's physical type.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Entry {
+    /// `INT64`.
+    Int64,
+    /// `BYTE_ARRAY`.
+    ByteArray,
+    /// `FIXED_LEN_BYTE_ARRAY` of the width the column's descriptor gives.
+    FixedLen(i32),
+}
+
+impl Entry {
+    /// The entry of a key column of `shape` and descriptor width `width`.
+    pub(super) fn of_key(shape: KeyShape, width: i32) -> Self {
+        match shape {
+            KeyShape::Long => Self::Int64,
+            KeyShape::Str | KeyShape::Bin => Self::ByteArray,
+            KeyShape::FixedBin | KeyShape::Uuid => Self::FixedLen(width),
+        }
     }
-}
 
-/// The bytes parquet holds one decoded dictionary entry of a key column of
-/// `shape` in. `DictDecoder::set_dict` (parquet 58.4.0,
-/// `encodings/decoding.rs`) resizes its `Vec<T::T>` to the dictionary
-/// page's value count before it decodes an entry, so each entry takes the
-/// physical type's value: an `i64`, or a `ByteArray` or
-/// `FixedLenByteArray`, a handle onto the page buffer.
-fn held_entry_bytes(shape: KeyShape) -> u64 {
-    approx::count(match shape {
-        KeyShape::Long => size_of::<i64>(),
-        KeyShape::Str | KeyShape::Bin => size_of::<ByteArray>(),
-        KeyShape::FixedBin | KeyShape::Uuid => size_of::<FixedLenByteArray>(),
-    })
-}
+    /// The entry of a value column of `shape` and descriptor width `width`.
+    pub(super) fn of_value(shape: ValueShape, width: i32) -> Self {
+        match shape {
+            ValueShape::Variable => Self::ByteArray,
+            ValueShape::Fixed => Self::FixedLen(width),
+        }
+    }
 
-/// The most entries a dictionary page of a key column of `shape` and
-/// `FIXED_LEN_BYTE_ARRAY` width `width` may count: as many as
-/// `MOST_KEY_PAGE_BYTES` holds at the larger of an entry's fewest encoded
-/// bytes and the bytes parquet holds it in, so the dictionary fits the
-/// ceiling on the wire and in memory.
-pub(super) fn most_key_entries(shape: KeyShape, width: i32) -> u64 {
-    MOST_KEY_PAGE_BYTES / fewest_entry_bytes(shape, width).max(held_entry_bytes(shape))
+    /// The fewest bytes the entry takes in a `PLAIN` dictionary: an `INT64`
+    /// is 8 bytes, a byte array its length prefix, a fixed-width value its
+    /// width. `inspect` refuses a key width of 0 and parquet's schema
+    /// reader a negative width; either counts as 0 here, and `most_in` then
+    /// rests on the bytes the entry is held in.
+    pub(super) fn fewest_bytes(self) -> u64 {
+        match self {
+            Self::Int64 => approx::count(size_of::<i64>()),
+            Self::ByteArray => BYTE_ARRAY_LENGTH_PREFIX_BYTES,
+            Self::FixedLen(width) => u64::try_from(width).unwrap_or(0),
+        }
+    }
+
+    /// The bytes parquet holds the entry in once decoded.
+    /// `DictDecoder::set_dict` (parquet 58.4.0, `encodings/decoding.rs`)
+    /// resizes its `Vec<T::T>` to the dictionary page's value count before
+    /// it decodes an entry, so each entry takes the physical type's value:
+    /// an `i64`, or a `ByteArray` or `FixedLenByteArray`, a handle onto the
+    /// page buffer.
+    pub(super) fn held_bytes(self) -> u64 {
+        approx::count(match self {
+            Self::Int64 => size_of::<i64>(),
+            Self::ByteArray => size_of::<ByteArray>(),
+            Self::FixedLen(_) => size_of::<FixedLenByteArray>(),
+        })
+    }
+
+    /// The most entries a dictionary page may count under a page ceiling
+    /// of `page_bytes`: as many as it holds at the larger of `fewest_bytes`
+    /// and `held_bytes`, so the dictionary fits the ceiling on the wire and
+    /// in memory.
+    pub(super) fn most_in(self, page_bytes: u64) -> u64 {
+        page_bytes / self.fewest_bytes().max(self.held_bytes())
+    }
 }
 
 /// The deepest parquet's compact reader skips nested structs and lists
@@ -738,8 +785,8 @@ fn sent_as(field: i16, wire: WireType, expected: WireType) -> Parsed<()> {
 ///   dictionary holds each distinct value once, and its uncompressed size
 ///   above that count times `MOST_BYTES_PER_VALUE`, plus the allowance;
 /// - any key page's uncompressed size above `MOST_KEY_PAGE_BYTES`, and a
-///   dictionary page's value count above `most_key_entries`, the entries
-///   that ceiling holds at the larger of an entry's fewest encoded bytes
+///   dictionary page's value count above `Entry::most_in` that ceiling,
+///   the entries it holds at the larger of an entry's fewest encoded bytes
 ///   and the bytes parquet holds a decoded entry in;
 /// - a compressed size that runs past the page's place in the chunk;
 /// - level lengths of a `data_page_header_v2` whose sum is above the
@@ -761,36 +808,91 @@ fn sent_as(field: i16, wire: WireType, expected: WireType) -> Parsed<()> {
 /// A key dictionary at the entry bound takes at most the ceiling in the
 /// entries parquet resizes its dictionary to, whatever its key's type.
 /// `inspect` refuses a `FIXED_LEN_BYTE_ARRAY` key of width 0, whose
-/// entries encode to no bytes. The value counts inside a page body (a delta encoding's lengths) are parquet's to read
-/// and are not checked here.
+/// entries encode to no bytes. The value counts inside a page body (a
+/// delta encoding's lengths) are parquet's to read and are not checked
+/// here.
 pub(super) fn check_page_headers(
     chunk: ColumnChunk<'_>,
     shape: KeyShape,
     segments: &Segments,
 ) -> Result<()> {
-    let most_entries = most_key_entries(shape, chunk.column.descriptor().type_length());
+    let entry = Entry::of_key(shape, chunk.column.descriptor().type_length());
+    let bounds = Bounds {
+        page_bytes: MOST_KEY_PAGE_BYTES,
+        value_bytes: Some(MOST_BYTES_PER_VALUE),
+        entries: entry.most_in(MOST_KEY_PAGE_BYTES),
+    };
     if let Some(range) = chunk.dictionary_range() {
-        check_page(chunk, ChunkPage::Dictionary, range, most_entries, segments)?;
+        check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
     }
     for page in 0..chunk.page_locations().len() {
         check_page(
             chunk,
             ChunkPage::Data(page),
             chunk.page_range(page),
-            most_entries,
+            bounds,
             segments,
         )?;
     }
     Ok(())
 }
 
-/// One page of `check_page_headers`, at `range` of the file; a dictionary
-/// page may count at most `most_entries` entries.
+/// Refuses, before parquet's page reader sees them, the headers of data
+/// page `page` of the value column chunk `chunk` and of the chunk's
+/// dictionary page when it has one, both in `segments`, as
+/// `check_page_headers` refuses a key page's, with `MOST_VALUE_PAGE_BYTES`
+/// as the ceiling: a header that does not decode as parquet reads it, an
+/// uncompressed size above the ceiling, a dictionary counting more values
+/// than the row group has rows or than `Entry::most_in` the ceiling, a
+/// compressed size past the page's place in the chunk, and v2 level
+/// lengths whose sum is above the page's uncompressed size. The contract
+/// does not cap a value's length, so no bound follows a page's rows. The
+/// headers are read from the bytes the lookup fetched, with no copy.
+pub(super) fn check_value_page_headers(
+    chunk: ColumnChunk<'_>,
+    shape: ValueShape,
+    page: usize,
+    segments: &Segments,
+) -> Result<()> {
+    let entry = Entry::of_value(shape, chunk.column.descriptor().type_length());
+    let bounds = Bounds {
+        page_bytes: MOST_VALUE_PAGE_BYTES,
+        value_bytes: None,
+        entries: entry.most_in(MOST_VALUE_PAGE_BYTES),
+    };
+    if let Some(range) = chunk.dictionary_range() {
+        check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
+    }
+    check_page(
+        chunk,
+        ChunkPage::Data(page),
+        chunk.page_range(page),
+        bounds,
+        segments,
+    )
+}
+
+/// What the page headers of one column chunk may declare.
+#[derive(Clone, Copy)]
+struct Bounds {
+    /// The most uncompressed bytes a page of the chunk may declare.
+    page_bytes: u64,
+    /// The most bytes one value takes in a page body, which bounds a page
+    /// by the values it holds: `MOST_BYTES_PER_VALUE` for a key column.
+    /// `None` for a value column, whose values the contract does not cap.
+    value_bytes: Option<u64>,
+    /// The most entries a dictionary page may count, beside the row
+    /// group's rows.
+    entries: u64,
+}
+
+/// One page of `check_page_headers` or `check_value_page_headers`, at
+/// `range` of the file, held to `bounds`.
 fn check_page(
     chunk: ColumnChunk<'_>,
     page: ChunkPage,
     range: Range<u64>,
-    most_entries: u64,
+    bounds: Bounds,
     segments: &Segments,
 ) -> Result<()> {
     let row_group = chunk.row_group();
@@ -822,7 +924,7 @@ fn check_page(
         (ChunkPage::Dictionary, PageBody::Dictionary { num_values }) => {
             let declared = u64::from(num_values);
             let rows = approx::count(row_index(chunk.rows()));
-            let allowed = rows.min(most_entries);
+            let allowed = rows.min(bounds.entries);
             if declared > allowed {
                 return Err(over(HeaderField::NumValues, declared, allowed));
             }
@@ -842,10 +944,12 @@ fn check_page(
             )));
         }
     };
-    let allowed = values
-        .saturating_mul(MOST_BYTES_PER_VALUE)
-        .saturating_add(PAGE_ENCODING_ALLOWANCE_BYTES)
-        .min(MOST_KEY_PAGE_BYTES);
+    let allowed = bounds.value_bytes.map_or(bounds.page_bytes, |bytes| {
+        values
+            .saturating_mul(bytes)
+            .saturating_add(PAGE_ENCODING_ALLOWANCE_BYTES)
+            .min(bounds.page_bytes)
+    });
     let uncompressed = u64::from(header.uncompressed_page_size);
     if uncompressed > allowed {
         return Err(over(
@@ -1041,41 +1145,57 @@ mod tests {
 
     /// A dictionary entry takes at least an `INT64`'s 8 bytes, a byte
     /// array's length prefix, or a fixed-width column's width, and parquet
-    /// holds it in an `i64`, a `ByteArray`, or a `FixedLenByteArray`; a
-    /// key dictionary at the entry bound fits the ceiling both ways, and
-    /// one entry more does not.
+    /// holds it in an `i64`, a `ByteArray`, or a `FixedLenByteArray`; a key
+    /// or value dictionary at the entry bound fits its ceiling both ways,
+    /// and one entry more does not.
     #[test]
-    fn test_most_key_entries_fit_the_ceiling_encoded_and_in_memory() {
+    fn test_most_in_fits_the_ceiling_encoded_and_in_memory() {
         let uuid = i32::try_from(UUID_BYTES).unwrap();
         let widest = i32::try_from(MAX_KEY_BYTES).unwrap();
+        let fixed = size_of::<FixedLenByteArray>();
         let cases = [
-            (KeyShape::Long, 0, size_of::<i64>(), size_of::<i64>()),
-            (KeyShape::Str, 0, size_of::<u32>(), size_of::<ByteArray>()),
-            (KeyShape::Bin, 0, size_of::<u32>(), size_of::<ByteArray>()),
             (
-                KeyShape::Uuid,
-                uuid,
-                UUID_BYTES,
-                size_of::<FixedLenByteArray>(),
+                Entry::of_key(KeyShape::Long, 0),
+                size_of::<i64>(),
+                size_of::<i64>(),
             ),
             (
-                KeyShape::FixedBin,
-                widest,
+                Entry::of_key(KeyShape::Str, 0),
+                size_of::<u32>(),
+                size_of::<ByteArray>(),
+            ),
+            (
+                Entry::of_key(KeyShape::Bin, 0),
+                size_of::<u32>(),
+                size_of::<ByteArray>(),
+            ),
+            (Entry::of_key(KeyShape::Uuid, uuid), UUID_BYTES, fixed),
+            (
+                Entry::of_key(KeyShape::FixedBin, widest),
                 MAX_KEY_BYTES,
-                size_of::<FixedLenByteArray>(),
+                fixed,
             ),
-            (KeyShape::FixedBin, 0, 0, size_of::<FixedLenByteArray>()),
+            (Entry::of_key(KeyShape::FixedBin, 0), 0, fixed),
+            (
+                Entry::of_value(ValueShape::Variable, 0),
+                size_of::<u32>(),
+                size_of::<ByteArray>(),
+            ),
+            (
+                Entry::of_value(ValueShape::Fixed, widest),
+                MAX_KEY_BYTES,
+                fixed,
+            ),
         ];
-        for (shape, width, encoded, held) in cases {
-            let (encoded, held) = (approx::count(encoded), approx::count(held));
-            assert_eq!(fewest_entry_bytes(shape, width), encoded, "{shape:?}");
-            assert_eq!(held_entry_bytes(shape), held, "{shape:?}");
-            let most = most_key_entries(shape, width);
-            assert!(most * encoded.max(held) <= MOST_KEY_PAGE_BYTES, "{shape:?}");
-            assert!(
-                (most + 1) * encoded.max(held) > MOST_KEY_PAGE_BYTES,
-                "{shape:?}"
-            );
+        for ceiling in [MOST_KEY_PAGE_BYTES, MOST_VALUE_PAGE_BYTES] {
+            for (entry, encoded, held) in cases {
+                let (encoded, held) = (approx::count(encoded), approx::count(held));
+                assert_eq!(entry.fewest_bytes(), encoded, "{entry:?}");
+                assert_eq!(entry.held_bytes(), held, "{entry:?}");
+                let most = entry.most_in(ceiling);
+                assert!(most * encoded.max(held) <= ceiling, "{entry:?}");
+                assert!((most + 1) * encoded.max(held) > ceiling, "{entry:?}");
+            }
         }
     }
 

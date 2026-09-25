@@ -502,11 +502,13 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// them), a key or value page holding other rows than its offset index gives
 /// it. `UnplaceableBloomFilter` is a filter the footer places nowhere the
 /// file holds, its end past the file's last byte included.
-/// `MalformedPageHeader` and `PageHeaderOverBound` are a key page header,
-/// read ahead of parquet with the index's own compact-thrift reader, that
+/// `MalformedPageHeader` and `PageHeaderOverBound` are a key page header at
+/// load, or a value page or value dictionary page header at lookup, read
+/// ahead of parquet with the index's own compact-thrift reader, that
 /// parquet would not read to the same numbers or that declares more than
-/// its page can hold: an uncompressed size above its rows times the key
-/// cap and an encoding allowance or above the 64 MiB key page ceiling, a
+/// its page can hold: for a key page an uncompressed size above its rows
+/// times the key cap and an encoding allowance or above the 64 MiB key page
+/// ceiling, for a value page one above the 64 MiB value page ceiling, a
 /// dictionary of more values than its row group's rows or than the ceiling
 /// holds at the larger of its type's smallest encoded entry and the entry
 /// parquet decodes into, a compressed size past its place in
@@ -519,7 +521,7 @@ pub enum ChunkPage { Dictionary, Data(usize) }
 /// The `PageHeader` fields a page-header fault names; `LevelsByteLength` is
 /// the sum of a v2 header's two level lengths.
 pub enum HeaderField { PageType, UncompressedPageSize, CompressedPageSize, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, NumValues, DefinitionLevelsByteLength, RepetitionLevelsByteLength, LevelsByteLength }
-/// Why a key page header is not one parquet reads to the pre-scan's numbers:
+/// Why a key or value page header is not one parquet reads to the pre-scan's numbers:
 /// truncated, a varint past 64 bits or an integer past its field's width, a
 /// field id overflow, an unknown wire type, a field parquet reads sent as
 /// another wire type, a set, map, or boolean list parquet cannot skip in
@@ -582,7 +584,9 @@ impl FileIndex {
     /// The value at `row` and its value page's origin, through `fetch_pages`, which returns
     /// the page's own origin and not the dictionary page's: `Fetched` for a cold hit, `Cached`
     /// for a warm one. `None` is a null value, distinct from an absent key. `find` discards
-    /// the key page's origin.
+    /// the key page's origin. The value page's header, and its dictionary page's, are read
+    /// from the fetched bytes and refused as `MalformedPageHeader` or `PageHeaderOverBound`
+    /// before parquet decodes them.
     pub async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
     pub fn resident_bytes(&self) -> usize;
     pub fn max_key_bytes(&self) -> usize;

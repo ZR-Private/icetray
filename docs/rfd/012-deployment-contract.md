@@ -120,9 +120,10 @@ serving one), plus the page cache's memory budget, plus a margin of a
 quarter of that total for the process, requests in flight, and a load's
 transient chunks. The limit is the backstop for allocations the load checks
 do not cover, not a substitute for them: RFD 004 (Resident key-chunk index)
-refuses a key page header that declares more than its page can hold, but a
-footer that claims billions of rows, a value page decoded at lookup, and
-the lengths inside a delta-encoded page still size buffers from the file. A
+refuses a key page header at load, and a value page header at lookup, that
+declares more than its page can hold or than a 64 MiB ceiling that does not
+rest on the footer, but the lengths inside a delta-encoded page still size
+buffers from the file. A
 file that trips the limit takes down every replica that loads it, because
 all of them load the same snapshot and restart into the same file; a limit
 alone would turn one bad file into a fleet-wide crash loop, which is why the

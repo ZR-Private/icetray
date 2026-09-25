@@ -39,6 +39,7 @@ use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one};
 pub use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
+use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, PageHeaderFault, WireType};
 
 /// A row's position in a file: its row group and its row within that group.
@@ -92,7 +93,8 @@ pub enum FileFault {
         /// The page, counted among the column's data pages in the row group.
         page: usize,
     },
-    /// A key page's header does not decode as the compact-thrift
+    /// A key page's header, or that of a value page or value dictionary
+    /// page a lookup fetched, does not decode as the compact-thrift
     /// `PageHeader` parquet reads it as, or is not a header of the page its
     /// place in the chunk holds; checked before parquet reads it (RFD 004).
     #[error("the header of {page} of row group {row_group} does not decode: {fault}")]
@@ -104,16 +106,18 @@ pub enum FileFault {
         /// What is wrong with its header.
         fault: PageHeaderFault,
     },
-    /// A key page's header declares more than its page can hold: an
-    /// uncompressed size above what its rows could encode to at the key
-    /// cap or above the key page ceiling of 64 MiB, a dictionary of more
-    /// values than the row group has rows or than the ceiling holds at the
-    /// larger of the fewest bytes an entry encodes to and the bytes parquet
-    /// holds a decoded entry in, a compressed size past the page's place
-    /// in the chunk, or v2 level lengths whose sum is above the uncompressed
-    /// size. Parquet sizes a buffer by the first two before it reads a byte
-    /// of the page, and adds the level lengths as `i32`s, so the header is
-    /// refused before parquet reads it (RFD 004).
+    /// A page's header declares more than its page can hold: for a key
+    /// page, an uncompressed size above what its rows could encode to at
+    /// the key cap or above the key page ceiling of 64 MiB; for a value
+    /// page or value dictionary page a lookup fetched, an uncompressed size
+    /// above the value page ceiling of 64 MiB; for either, a dictionary of
+    /// more values than the row group has rows or than the ceiling holds at
+    /// the larger of the fewest bytes an entry encodes to and the bytes
+    /// parquet holds a decoded entry in, a compressed size past the page's
+    /// place in the chunk, or v2 level lengths whose sum is above the
+    /// uncompressed size. Parquet sizes a buffer by the first two before it
+    /// reads a byte of the page, and adds the level lengths as `i32`s, so
+    /// the header is refused before parquet reads it (RFD 004).
     #[error(
         "{page} of row group {row_group} declares {field} {declared}, above the {allowed} it can hold"
     )]
@@ -726,7 +730,12 @@ impl FileIndex {
     /// absent key. The origin is the value page's: `Fetched` for the GET of
     /// a cold hit, `Cached` for a warm one; the dictionary page, when there
     /// is one, does not decide it. A row outside every page of its row group
-    /// is `FileFault::PageOutOfRange`.
+    /// is `FileFault::PageOutOfRange`. The headers of the value page and of
+    /// its dictionary page are read from the fetched bytes before parquet
+    /// decodes them, and one that parquet would not read to the same
+    /// numbers or that declares more than its page can hold is
+    /// `FileFault::MalformedPageHeader` or `FileFault::PageHeaderOverBound`
+    /// (`check_value_page_headers`).
     pub async fn read_value(
         &self,
         row: RowRef,
@@ -737,6 +746,7 @@ impl FileIndex {
         let (segments, origin) = self
             .fetch_pages(chunk, page, PageSource::Store(cache))
             .await?;
+        check_value_page_headers(chunk, self.value_shape, page, &segments)?;
         let value = match self.value_shape {
             ValueShape::Variable => read_one::<ByteArrayType>(chunk, row.row, segments)?
                 .map(|value| Bytes::copy_from_slice(value.data())),
@@ -1175,15 +1185,17 @@ mod tests {
     use crate::approx::count;
     use crate::contract::PAGE_ROWS;
     use crate::generation::testing::{self, Dictionary, KeyColumn, cache, column_of, page_rows};
+    use crate::index::page_header::{MOST_VALUE_PAGE_BYTES, PageBody, PageHeader};
     use crate::index::testing::{
-        BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, PAGES_PER_GROUP, ROW_GROUPS,
-        SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows, fault_of, group_rows, key_for,
-        location, pages_of, predicted_of, row_of, stepped, store, value_for, value_of_len,
-        with_pages,
+        BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened,
+        PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows,
+        fault_of, group_rows, header_at, key_for, location, moved_by_header, pages_of,
+        predicted_of, row_of, stepped, store, store_file, value_for, value_of_len, with_group_rows,
+        with_header_claims, with_pages,
     };
     use crate::storage::IoStats;
 
-    use parquet::file::properties::EnabledStatistics;
+    use parquet::file::properties::{EnabledStatistics, WriterVersion};
 
     /// Row groups in the fixtures that route across truncated or absent
     /// statistics, so an earlier row group's bound covers later ones.
@@ -2132,6 +2144,221 @@ mod tests {
                 assert_eq!(page.get(0), keys.get(page_rows()));
             }
             assert_eq!(decoded, rows);
+        }
+    }
+
+    impl FileIndex {
+        /// This index reading its pages from `handle`'s file over
+        /// `metadata`, so a lookup meets page bytes the index was not built
+        /// from.
+        fn with_file(self, handle: Arc<FileHandle>, metadata: ParquetMetaData) -> Self {
+            Self {
+                handle,
+                ..self.with_metadata(metadata)
+            }
+        }
+    }
+
+    /// `index`, built over `opened`'s file with footer `kept`, reading
+    /// from a copy of the file in which the header of `page` of row group
+    /// 0's value chunk claims each of `claims`, and over `kept` moved to
+    /// match, its row group 0 claiming `group_rows` rows when that is
+    /// `Some`. What lies past row group 0's value chunk in the file is not
+    /// where that footer places it.
+    async fn with_value_header(
+        index: FileIndex,
+        opened: &Opened,
+        kept: &ParquetMetaData,
+        page: ChunkPage,
+        claims: &[(HeaderField, i32)],
+        group_rows: Option<i64>,
+    ) -> FileIndex {
+        let value_leaf = index.value_leaf();
+        let (chunk_start, _) = kept.row_group(0).column(value_leaf).byte_range();
+        let at = approx::length(chunk_start) + header_at(kept, value_leaf, page);
+        let patched = with_header_claims(&opened.file, at, claims);
+        let grown = i64::try_from(patched.len() - opened.file.len()).unwrap();
+        let moved = moved_by_header(kept, value_leaf, page, grown);
+        let metadata = match group_rows {
+            Some(rows) => with_group_rows(&moved, 0, rows),
+            None => moved,
+        };
+        let reopened = store_file(Bytes::from(patched)).await;
+        index.with_file(Arc::clone(&reopened.handle), metadata)
+    }
+
+    /// The header of `page` of row group 0's value chunk in `opened`'s file.
+    fn value_header(index: &FileIndex, opened: &Opened, page: ChunkPage) -> PageHeader {
+        let value_leaf = index.value_leaf();
+        let metadata = index.metadata();
+        let (chunk_start, _) = metadata.row_group(0).column(value_leaf).byte_range();
+        let at = approx::length(chunk_start) + header_at(metadata, value_leaf, page);
+        PageHeader::read(&opened.file[at..]).unwrap()
+    }
+
+    /// The fault `FileFault::PageHeaderOverBound` names for row group 0.
+    fn over_bound(page: ChunkPage, field: HeaderField, declared: u64, allowed: u64) -> FileFault {
+        FileFault::PageHeaderOverBound {
+            row_group: 0,
+            page,
+            field,
+            declared,
+            allowed,
+        }
+    }
+
+    /// A value page a lookup fetches whose header declares more than
+    /// `MOST_VALUE_PAGE_BYTES` uncompressed, a compressed size past its
+    /// place in the offset index, or v2 level lengths past its
+    /// uncompressed size is refused as a file fault before parquet reads
+    /// it: parquet would reserve the declared size, and add the level
+    /// lengths as `i32`s. The same header rewritten to the numbers it held
+    /// serves the value.
+    #[tokio::test]
+    async fn test_read_value_refuses_a_value_page_header_over_its_bounds() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+        let opened = store(&fixture).await;
+        let page_at = 1;
+        let page = ChunkPage::Data(page_at);
+        let row = page_rows() * page_at;
+        let at = row_of(row, group_rows());
+        let index = opened.index(KeyType::Long).await;
+        let written = value_header(&index, &opened, page);
+        assert!(
+            matches!(written.body, PageBody::DataV2 { .. }),
+            "{:?}",
+            written.body
+        );
+        let uncompressed = i32::try_from(written.uncompressed_page_size).unwrap();
+        let compressed = i32::try_from(written.compressed_page_size).unwrap();
+        let over_ceiling = i32::try_from(MOST_VALUE_PAGE_BYTES + 1).unwrap();
+        let ceiling = |declared: i32| {
+            over_bound(
+                page,
+                HeaderField::UncompressedPageSize,
+                u64::from(declared.unsigned_abs()),
+                MOST_VALUE_PAGE_BYTES,
+            )
+        };
+        let cases = [
+            (
+                vec![
+                    (HeaderField::UncompressedPageSize, uncompressed),
+                    (HeaderField::CompressedPageSize, compressed),
+                ],
+                None,
+            ),
+            (
+                vec![(HeaderField::UncompressedPageSize, over_ceiling)],
+                Some(ceiling(over_ceiling)),
+            ),
+            (
+                vec![(HeaderField::UncompressedPageSize, i32::MAX)],
+                Some(ceiling(i32::MAX)),
+            ),
+            (
+                vec![(HeaderField::CompressedPageSize, compressed + 1)],
+                Some(over_bound(
+                    page,
+                    HeaderField::CompressedPageSize,
+                    u64::from((compressed + 1).unsigned_abs()),
+                    u64::from(compressed.unsigned_abs()),
+                )),
+            ),
+            (
+                vec![
+                    (HeaderField::DefinitionLevelsByteLength, i32::MAX),
+                    (HeaderField::RepetitionLevelsByteLength, i32::MAX),
+                ],
+                Some(over_bound(
+                    page,
+                    HeaderField::LevelsByteLength,
+                    u64::from(i32::MAX.unsigned_abs()) + u64::from(i32::MAX.unsigned_abs()),
+                    u64::from(uncompressed.unsigned_abs()),
+                )),
+            ),
+        ];
+        let kept = (**index.metadata()).clone();
+        let mut index = index;
+        for (claims, refused) in cases {
+            index = with_value_header(index, &opened, &kept, page, &claims, None).await;
+            let read = index.read_value(at, None).await;
+            match refused {
+                None => assert_eq!(
+                    read.unwrap().0.as_deref(),
+                    Some(value_for(row).as_slice()),
+                    "{claims:?} as written"
+                ),
+                Some(fault) => assert_eq!(fault_of(read), fault, "{claims:?}"),
+            }
+        }
+    }
+
+    /// A value column's dictionary page a lookup fetches whose header
+    /// counts more entries than its row group has rows, or than
+    /// `MOST_VALUE_PAGE_BYTES` holds at the bytes parquet keeps a decoded
+    /// byte array in when the footer claims more rows than that, is refused
+    /// before parquet sizes the dictionary by the count; one declaring more
+    /// than the ceiling uncompressed is refused as well. The count as
+    /// written serves the value.
+    #[tokio::test]
+    async fn test_read_value_refuses_a_value_dictionary_over_its_bounds() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.dictionary = Dictionary::Value;
+        let opened = store(&fixture).await;
+        let index = opened.index(KeyType::Long).await;
+        let page = ChunkPage::Dictionary;
+        let PageBody::Dictionary { num_values } = value_header(&index, &opened, page).body else {
+            panic!("the value chunk starts with its dictionary page");
+        };
+        let written = i32::try_from(num_values).unwrap();
+        let rows = count(group_rows());
+        let row = 0;
+        let at = row_of(row, group_rows());
+        let rows_claim = i32::try_from(rows).unwrap();
+        let held = MOST_VALUE_PAGE_BYTES / count(size_of::<ByteArray>());
+        let held_claim = i32::try_from(held + 1).unwrap();
+        let over_ceiling = i32::try_from(MOST_VALUE_PAGE_BYTES + 1).unwrap();
+        let cases = [
+            (HeaderField::NumValues, written, None, None),
+            (
+                HeaderField::NumValues,
+                rows_claim + 1,
+                None,
+                Some((rows_claim + 1, rows)),
+            ),
+            (
+                HeaderField::UncompressedPageSize,
+                over_ceiling,
+                None,
+                Some((over_ceiling, MOST_VALUE_PAGE_BYTES)),
+            ),
+            (
+                HeaderField::NumValues,
+                held_claim,
+                Some(INFLATED_GROUP_ROWS),
+                Some((held_claim, held)),
+            ),
+        ];
+        let kept = (**index.metadata()).clone();
+        let mut index = index;
+        for (field, claimed, group_rows, refused) in cases {
+            let claims = [(field, claimed)];
+            index = with_value_header(index, &opened, &kept, page, &claims, group_rows).await;
+            let read = index.read_value(at, None).await;
+            match refused {
+                None => assert_eq!(
+                    read.unwrap().0.as_deref(),
+                    Some(value_for(row).as_slice()),
+                    "{field} {claimed} as written"
+                ),
+                Some((declared, allowed)) => assert_eq!(
+                    fault_of(read),
+                    over_bound(page, field, u64::from(declared.unsigned_abs()), allowed),
+                    "{field} {claimed}"
+                ),
+            }
         }
     }
 

@@ -91,8 +91,8 @@ so long keys push a table toward another residency (RFD 017) and the cap in
 RFD 008.
 
 Parquet sizes buffers from numbers in a page's header before the index can
-check the page: it reserves the page's declared uncompressed size, up to
-2 GiB, and sizes a dictionary by its declared value count. Every replica
+check the page: it reserves the page's declared uncompressed size, up to 2
+GiB, and sizes a dictionary by its declared value count. Every replica
 loads the same snapshot, so a file that lies in either would make each one
 that loads it allocate what it claims. Load therefore reads the header of
 every key page ahead of parquet, with a reader of its own for the Thrift
@@ -100,33 +100,46 @@ compact encoding that refuses any header parquet would read to other
 numbers, and refuses as a file fault a data page declaring more
 uncompressed bytes than its rows could encode to with every key at the cap
 of RFD 008 (Keys), a dictionary of more values than its row group has rows
-or of more bytes than those values at the cap, a compressed size past
-the page's place in the offset index, and a v2 data page whose level
-lengths are negative or add up past its uncompressed size, which parquet
-adds as 32-bit integers that two lengths near the maximum overflow. Those
-bounds rest on the footer's row counts, so a footer claiming billions of
-rows widens them; a ceiling that does not rest on the footer closes that
-for key pages. No key page, data or dictionary, may declare more than 64
-MiB uncompressed, sixteen times the contract's largest key page of 1,000
-keys at the cap (about 4 MiB) and far above the 1 MiB pages writers aim
-for; and no key dictionary may count more entries than 64 MiB holds at the
-larger of the fewest bytes an entry of its type encodes to (8 for a long,
-the 4-byte length of a byte array, a fixed-width column's width) and the
-bytes parquet holds a decoded entry in (8 for a long, 32 for a byte array
-or fixed-width handle in parquet 58), so a key dictionary fits the
-ceiling in memory as well as on the wire. A key stored as a fixed-width
-column of width 0 holds one distinct value, so it cannot key a table, and
+or of more bytes than those values at the cap, a compressed size past the
+page's place in the offset index, and a v2 data page whose level lengths
+are negative or add up past its uncompressed size, which parquet adds as
+32-bit integers that two lengths near the maximum overflow. Those bounds
+rest on the footer's row counts, so a footer claiming billions of rows
+widens them; a ceiling that does not rest on the footer closes that for key
+pages. No key page, data or dictionary, may declare more than 64 MiB
+uncompressed, sixteen times the contract's largest key page of 1,000 keys
+at the cap (about 4 MiB) and far above the 1 MiB pages writers aim for; and
+no key dictionary may count more entries than 64 MiB holds at the larger of
+the fewest bytes an entry of its type encodes to (8 for a long, the 4-byte
+length of a byte array, a fixed-width column's width) and the bytes parquet
+holds a decoded entry in (8 for a long, 32 for a byte array or fixed-width
+handle in parquet 58), so a key dictionary fits the ceiling in memory as
+well as on the wire. A key stored as a fixed-width column of width 0 holds
+one distinct value, so it cannot key a table of more than one row, and
 parquet's fixed-width decoder asserts a width above 0; the footer check
-refuses it as a key type mismatch before any page is read. On a refresh the refusal leaves the
-previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
-run far past the cap can meet this refusal before the key-length one. What
-the pre-scan does not cover: value pages and a value
-column's dictionary, read at lookup, are not pre-scanned; and the value
-counts inside a page body, the lengths a delta-length or delta byte-array
-page carries, stay unchecked. Parquet's decoder reads those; Iceberg's
-default writer uses v1 pages, which do not carry them for key columns. A
-memory limit on the process is the backstop for what the checks do not
-cover (RFD 012 (Deployment contract)).
+refuses it as a key type mismatch before any page is read. On a refresh the
+refusal leaves the previous generation serving (RFD 005 (Generations and
+refresh)). A file whose keys run far past the cap can meet this refusal
+before the key-length one. A lookup reads the headers of the value page it
+fetched, and of the value column's dictionary page when there is one, from
+those same bytes before parquet decodes them, and refuses as a file fault
+the same faults under a 64 MiB value page ceiling: a header parquet would
+read to other numbers, an uncompressed size above the ceiling, a dictionary
+of more values than its row group has rows or than the ceiling holds at the
+larger of an entry's encoded and in-memory size, a compressed size past the
+page's place, and v2 level lengths past the page's size. The contract caps
+no value's length, so no bound follows a value page's rows. The ceiling is
+sixteen times the 4 MiB message a gRPC client on tonic's defaults accepts,
+and far above the 64 KiB value pages of the contract (RFD 002 (Serving
+layout contract)); a page of large values bounded by rows alone, which the
+doctor advises against, can pass it (a thousand values of 128 KiB is 125
+MiB), and a lookup into such a page is refused though each value would fit
+a message. What the pre-scan does not cover: the value counts inside a page
+body, the lengths a delta-length or delta byte-array page carries, stay
+unchecked. Parquet's decoder reads those; Iceberg's default writer uses v1
+pages, which do not carry them for key columns. A memory limit on the
+process is the backstop for what the checks do not cover (RFD 012
+(Deployment contract)).
 
 One question stays open. Decoded key arrays as an opt-in: under a per-table
 memory budget they remove the per-lookup decode for tables that can afford

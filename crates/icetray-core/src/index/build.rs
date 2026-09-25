@@ -494,15 +494,15 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// sized them. The page reader reserves a page's uncompressed size from its
 /// header when it decodes the page (a Snappy chunk zero-fills it), and a
 /// dictionary page's value count, from its header, sizes the dictionary it
-/// decodes into; `verify` reads the header of every key page ahead of the
-/// page reader and refuses one that declares more than its page can hold
-/// (`check_page_headers`) before the row group's first decode. A value
-/// page and a value column's dictionary page, decoded here at lookup, are
-/// not read ahead, so their headers' sizes, at most `i32::MAX` bytes, and
-/// the dictionary's value count are used as declared, and a v2 value
-/// page's level lengths reach parquet's `i32` add unchecked. A
-/// delta-length or delta byte-array page sizes its lengths by the count in
-/// its encoded data, which no check reads.
+/// decodes into. The callers read those headers ahead of the page reader
+/// and refuse one that declares more than its page can hold: `verify`
+/// every key page's before the row group's first decode
+/// (`check_page_headers`), and `FileIndex::read_value` the value page's
+/// and its dictionary page's before `read_one` (`check_value_page_headers`).
+/// A key page decoded at lookup is one `verify` checked at load, read from
+/// the resident chunks, the chunk file, or, in the Bloom tier, the data
+/// file again. A delta-length or delta byte-array page sizes its lengths
+/// by the count in its encoded data, which no check reads.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -562,7 +562,9 @@ fn read_column<T: ParquetDataType>(
 }
 
 /// Exactly row `row` of the value column chunk `chunk` from `segments`:
-/// `Some` with the value, `None` for a null.
+/// `Some` with the value, `None` for a null. The caller has checked the
+/// headers of the value page and of the chunk's dictionary page in
+/// `segments` (`check_value_page_headers`); `read_column` says why.
 pub(super) fn read_one<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     row: i64,
@@ -582,16 +584,14 @@ mod tests {
     use crate::generation::testing::Dictionary;
     use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
     use crate::index::page_header::{
-        COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
-        DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, MOST_BYTES_PER_VALUE,
-        MOST_KEY_PAGE_BYTES, NIBBLE_BITS, NIBBLE_MASK, NUM_VALUES_FIELD,
-        PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD,
-        TYPE_FIELD, UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
+        MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK, PAGE_ENCODING_ALLOWANCE_BYTES,
+        PageBody, PageHeader,
     };
     use crate::index::testing::{
-        FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
-        group_rows, key_for, location, longs, pages_of, predicted_of, row_of, stepped, store,
-        store_file, with_column_chunk, with_group_rows, with_pages,
+        FEW_ROWS, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows,
+        fault_of, group_rows, header_at, key_for, location, longs, moved_by_header, pages_of,
+        predicted_of, row_of, stepped, store, store_file, with_column_chunk, with_group_rows,
+        with_header_claims, with_pages,
     };
     use crate::index::{
         ChunkPage, Column, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef, WireType,
@@ -855,116 +855,6 @@ mod tests {
         );
     }
 
-    /// The byte range of `field`'s varint in a page header in compact
-    /// thrift, as parquet writes a data or dictionary page's header: `i32`
-    /// fields, then the page-specific struct, whose fields up to the
-    /// levels of a v2 header are `i32`s. `field` is one of the header's
-    /// `i32` fields or one of the page-specific struct's.
-    fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
-        let varint_end = |from: usize| {
-            from + header[from..]
-                .iter()
-                .position(|byte| byte & VARINT_CONTINUES == 0)
-                .unwrap()
-                + 1
-        };
-        let (top, nested) = match field {
-            HeaderField::PageType => (Some(TYPE_FIELD), None),
-            HeaderField::UncompressedPageSize => (Some(UNCOMPRESSED_PAGE_SIZE_FIELD), None),
-            HeaderField::CompressedPageSize => (Some(COMPRESSED_PAGE_SIZE_FIELD), None),
-            HeaderField::NumValues => (None, Some(NUM_VALUES_FIELD)),
-            HeaderField::DefinitionLevelsByteLength => {
-                (None, Some(DEFINITION_LEVELS_BYTE_LENGTH_FIELD))
-            }
-            HeaderField::RepetitionLevelsByteLength => {
-                (None, Some(REPETITION_LEVELS_BYTE_LENGTH_FIELD))
-            }
-            HeaderField::DataPageHeader
-            | HeaderField::DataPageHeaderV2
-            | HeaderField::DictionaryPageHeader => panic!("{field} is a struct, not a varint"),
-            HeaderField::LevelsByteLength => panic!("{field} is a sum, not a varint"),
-        };
-        let mut at = 0;
-        let mut id = 0;
-        loop {
-            let byte = header[at];
-            id += i16::from(byte >> NIBBLE_BITS);
-            at += 1;
-            let code = byte & NIBBLE_MASK;
-            if code == WireType::I32.code() {
-                let end = varint_end(at);
-                if top == Some(id) {
-                    return at..end;
-                }
-                at = end;
-            } else if code == WireType::Struct.code()
-                && let Some(wanted) = nested
-            {
-                assert!(
-                    [
-                        DATA_PAGE_HEADER_FIELD,
-                        DICTIONARY_PAGE_HEADER_FIELD,
-                        DATA_PAGE_HEADER_V2_FIELD
-                    ]
-                    .contains(&id),
-                    "field {id} is not a page-specific header"
-                );
-                let mut inner = 0;
-                loop {
-                    let byte = header[at];
-                    inner += i16::from(byte >> NIBBLE_BITS);
-                    at += 1;
-                    assert_eq!(
-                        byte & NIBBLE_MASK,
-                        WireType::I32.code(),
-                        "field {inner} of the page-specific header is not an i32"
-                    );
-                    let end = varint_end(at);
-                    if inner == wanted {
-                        return at..end;
-                    }
-                    at = end;
-                }
-            } else {
-                panic!("field {id} has type {code}, not in a page header as parquet writes it");
-            }
-        }
-    }
-
-    /// The most bytes a varint of an `i32` takes: seven bits per byte.
-    const I32_VARINT_BYTES: usize = 5;
-
-    /// `value` as compact thrift reads an `i32`: zigzag, then a varint,
-    /// padded with continuation bytes to `I32_VARINT_BYTES`, so every value
-    /// moves the pages after it by the same bytes and the value the header
-    /// held already proves the move right.
-    fn zigzag_varint(value: i32) -> Vec<u8> {
-        let mut rest = ((value << 1) ^ (value >> (i32::BITS - 1))).cast_unsigned();
-        (0..I32_VARINT_BYTES)
-            .map(|at| {
-                let low = u8::try_from(rest & u32::from(!VARINT_CONTINUES)).unwrap();
-                rest >>= u8::BITS - 1;
-                if at + 1 == I32_VARINT_BYTES {
-                    low
-                } else {
-                    low | VARINT_CONTINUES
-                }
-            })
-            .collect()
-    }
-
-    /// Where the header of `page` of row group 0's key chunk starts, as an
-    /// offset into the chunk's bytes.
-    fn header_at(metadata: &ParquetMetaData, key_leaf: usize, page: ChunkPage) -> usize {
-        let pages = pages_of(metadata, key_leaf);
-        let (chunk_start, _) = metadata.row_group(0).column(key_leaf).byte_range();
-        let start = match page {
-            ChunkPage::Dictionary => chunk_start,
-            ChunkPage::Data(at) => u64::try_from(pages[at].offset).unwrap(),
-        };
-        approx::length(start - chunk_start)
-    }
-
     /// The header of `page` of row group 0's key chunk, as read ahead of
     /// parquet.
     fn header_of(
@@ -1008,36 +898,11 @@ mod tests {
         let ranges = key_chunk_ranges(loaded, key_leaf, opened.handle.size());
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let (range, bytes) = &parts[0];
-        let header_at = header_at(loaded, key_leaf, page);
-        let mut patched = bytes.to_vec();
-        for (field, claimed) in claims {
-            let varint = header_varint(&patched[header_at..], *field);
-            let varint = header_at + varint.start..header_at + varint.end;
-            patched.splice(varint, zigzag_varint(*claimed));
-        }
+        let patched = with_header_claims(bytes, header_at(loaded, key_leaf, page), claims);
         let grown = i64::try_from(patched.len() - bytes.len()).unwrap();
         let start = range.start;
         parts[0] = (start..start + count(patched.len()), Bytes::from(patched));
-        let mut pages = pages_of(loaded, key_leaf);
-        let moved = match page {
-            ChunkPage::Dictionary => 0,
-            ChunkPage::Data(at) => {
-                pages[at].compressed_page_size += i32::try_from(grown).unwrap();
-                at + 1
-            }
-        };
-        for page in &mut pages[moved..] {
-            page.offset += grown;
-        }
-        let chunk = loaded.row_group(0).column(key_leaf);
-        let (chunk_len, first_data_page) = (chunk.compressed_size(), chunk.data_page_offset());
-        let metadata = with_column_chunk(&with_pages(loaded, key_leaf, pages), 0, key_leaf, |c| {
-            let c = c.set_total_compressed_size(chunk_len + grown);
-            match page {
-                ChunkPage::Dictionary => c.set_data_page_offset(first_data_page + grown),
-                ChunkPage::Data(_) => c,
-            }
-        });
+        let metadata = moved_by_header(loaded, key_leaf, page, grown);
         (
             metadata,
             Arc::new(Segments::new(parts, opened.handle.size())),
@@ -1287,12 +1152,6 @@ mod tests {
             )
         );
     }
-
-    /// A row count a footer may claim for a row group of `PAGES_PER_GROUP`
-    /// pages: two to the thirty-first, which widens the last page's span,
-    /// and with it the span-derived bounds, past any page a header can
-    /// declare.
-    const INFLATED_GROUP_ROWS: i64 = 1 << 31;
 
     /// A key page declaring more than `MOST_KEY_PAGE_BYTES` uncompressed is
     /// refused even when the footer claims so many rows for its row group

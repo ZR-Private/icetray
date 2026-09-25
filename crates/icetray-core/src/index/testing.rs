@@ -1,6 +1,7 @@
 //! The synthetic data files the index tests are built over and the footer
 //! edits that make a file contradict itself; shared by every stage's tests.
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,14 +17,20 @@ use parquet::file::properties::{
     DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties, WriterVersion,
 };
 
-use crate::approx::count;
+use crate::approx::{self, count};
 use crate::config::{HedgeConfig, Residency};
 use crate::error::{Error, Result};
 use crate::generation::testing::{
     self, Bloom, Dictionary, KEY_STEP, KeyColumn, TABLE, column_of, key_array, key_data_type,
     page_rows, with_dictionary, with_key_bloom,
 };
-use crate::index::{FileFault, FileIndex, ResidentBytes, RowRef};
+use crate::index::page_header::{
+    COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
+    DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, NIBBLE_BITS, NIBBLE_MASK,
+    NUM_VALUES_FIELD, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD,
+    UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
+};
+use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, RowRef, WireType};
 use crate::key::testing::UUID_HALF_BYTES;
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::LocalDir;
@@ -48,6 +55,12 @@ pub(super) const BINARY_KEY_TAG: u8 = 0xff;
 const UUID_KEY_FILL: u8 = 0x0a;
 /// The width of the fixed-width binary keys: a `u64`.
 pub(super) const FIXED_KEY_BYTES: i32 = 8;
+/// A row count a footer may claim for a row group of `PAGES_PER_GROUP`
+/// pages: two to the thirty-first, which widens the last page's span,
+/// and with it the span-derived bounds, past any page a header can
+/// declare, and lets a dictionary count more entries than a page ceiling
+/// holds without passing the row group's rows.
+pub(super) const INFLATED_GROUP_ROWS: i64 = 1 << 31;
 /// Rows in the small fixtures whose keys are written by hand.
 pub(super) const FEW_ROWS: usize = 8;
 /// The write batch under a byte bound: the writer checks the bound
@@ -415,4 +428,162 @@ pub(super) fn longs(values: &[i64]) -> Vec<Option<Key>> {
 /// `predicted_resident_bytes` of a built index's own footer.
 pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(index.metadata(), index.key_leaf(), index.handle())
+}
+
+/// The byte range of `field`'s varint in a page header in compact
+/// thrift, as parquet writes a data or dictionary page's header: `i32`
+/// fields, then the page-specific struct, whose fields up to the
+/// levels of a v2 header are `i32`s. `field` is one of the header's
+/// `i32` fields or one of the page-specific struct's.
+fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
+    let varint_end = |from: usize| {
+        from + header[from..]
+            .iter()
+            .position(|byte| byte & VARINT_CONTINUES == 0)
+            .unwrap()
+            + 1
+    };
+    let (top, nested) = match field {
+        HeaderField::PageType => (Some(TYPE_FIELD), None),
+        HeaderField::UncompressedPageSize => (Some(UNCOMPRESSED_PAGE_SIZE_FIELD), None),
+        HeaderField::CompressedPageSize => (Some(COMPRESSED_PAGE_SIZE_FIELD), None),
+        HeaderField::NumValues => (None, Some(NUM_VALUES_FIELD)),
+        HeaderField::DefinitionLevelsByteLength => {
+            (None, Some(DEFINITION_LEVELS_BYTE_LENGTH_FIELD))
+        }
+        HeaderField::RepetitionLevelsByteLength => {
+            (None, Some(REPETITION_LEVELS_BYTE_LENGTH_FIELD))
+        }
+        HeaderField::DataPageHeader
+        | HeaderField::DataPageHeaderV2
+        | HeaderField::DictionaryPageHeader => panic!("{field} is a struct, not a varint"),
+        HeaderField::LevelsByteLength => panic!("{field} is a sum, not a varint"),
+    };
+    let mut at = 0;
+    let mut id = 0;
+    loop {
+        let byte = header[at];
+        id += i16::from(byte >> NIBBLE_BITS);
+        at += 1;
+        let code = byte & NIBBLE_MASK;
+        if code == WireType::I32.code() {
+            let end = varint_end(at);
+            if top == Some(id) {
+                return at..end;
+            }
+            at = end;
+        } else if code == WireType::Struct.code()
+            && let Some(wanted) = nested
+        {
+            assert!(
+                [
+                    DATA_PAGE_HEADER_FIELD,
+                    DICTIONARY_PAGE_HEADER_FIELD,
+                    DATA_PAGE_HEADER_V2_FIELD
+                ]
+                .contains(&id),
+                "field {id} is not a page-specific header"
+            );
+            let mut inner = 0;
+            loop {
+                let byte = header[at];
+                inner += i16::from(byte >> NIBBLE_BITS);
+                at += 1;
+                assert_eq!(
+                    byte & NIBBLE_MASK,
+                    WireType::I32.code(),
+                    "field {inner} of the page-specific header is not an i32"
+                );
+                let end = varint_end(at);
+                if inner == wanted {
+                    return at..end;
+                }
+                at = end;
+            }
+        } else {
+            panic!("field {id} has type {code}, not in a page header as parquet writes it");
+        }
+    }
+}
+
+/// The most bytes a varint of an `i32` takes: seven bits per byte.
+const I32_VARINT_BYTES: usize = 5;
+
+/// `value` as compact thrift reads an `i32`: zigzag, then a varint,
+/// padded with continuation bytes to `I32_VARINT_BYTES`, so every value
+/// moves the pages after it by the same bytes and the value the header
+/// held already proves the move right.
+fn zigzag_varint(value: i32) -> Vec<u8> {
+    let mut rest = ((value << 1) ^ (value >> (i32::BITS - 1))).cast_unsigned();
+    (0..I32_VARINT_BYTES)
+        .map(|at| {
+            let low = u8::try_from(rest & u32::from(!VARINT_CONTINUES)).unwrap();
+            rest >>= u8::BITS - 1;
+            if at + 1 == I32_VARINT_BYTES {
+                low
+            } else {
+                low | VARINT_CONTINUES
+            }
+        })
+        .collect()
+}
+
+/// Where the header of `page` of row group 0's `leaf` chunk starts, as an
+/// offset into the chunk's bytes.
+pub(super) fn header_at(metadata: &ParquetMetaData, leaf: usize, page: ChunkPage) -> usize {
+    let pages = pages_of(metadata, leaf);
+    let (chunk_start, _) = metadata.row_group(0).column(leaf).byte_range();
+    let start = match page {
+        ChunkPage::Dictionary => chunk_start,
+        ChunkPage::Data(at) => u64::try_from(pages[at].offset).unwrap(),
+    };
+    approx::length(start - chunk_start)
+}
+
+/// `bytes` with each of `claims`, a header field and what it claims,
+/// rewritten in turn in the page header at `header_at`, each varint padded
+/// to `I32_VARINT_BYTES`.
+pub(super) fn with_header_claims(
+    bytes: &[u8],
+    header_at: usize,
+    claims: &[(HeaderField, i32)],
+) -> Vec<u8> {
+    let mut patched = bytes.to_vec();
+    for (field, claimed) in claims {
+        let varint = header_varint(&patched[header_at..], *field);
+        let varint = header_at + varint.start..header_at + varint.end;
+        patched.splice(varint, zigzag_varint(*claimed));
+    }
+    patched
+}
+
+/// `loaded` with the header of `page` of row group 0's `leaf` chunk grown
+/// by `grown` bytes: the page, the chunk, and every later page of the
+/// chunk moved in the footer by it.
+pub(super) fn moved_by_header(
+    loaded: &ParquetMetaData,
+    leaf: usize,
+    page: ChunkPage,
+    grown: i64,
+) -> ParquetMetaData {
+    let mut pages = pages_of(loaded, leaf);
+    let moved = match page {
+        ChunkPage::Dictionary => 0,
+        ChunkPage::Data(at) => {
+            pages[at].compressed_page_size += i32::try_from(grown).unwrap();
+            at + 1
+        }
+    };
+    for page in &mut pages[moved..] {
+        page.offset += grown;
+    }
+    let chunk = loaded.row_group(0).column(leaf);
+    let (chunk_len, first_data_page) = (chunk.compressed_size(), chunk.data_page_offset());
+    with_column_chunk(&with_pages(loaded, leaf, pages), 0, leaf, |c| {
+        let c = c.set_total_compressed_size(chunk_len + grown);
+        match page {
+            ChunkPage::Dictionary => c.set_data_page_offset(first_data_page + grown),
+            ChunkPage::Data(_) => c,
+        }
+    })
 }
