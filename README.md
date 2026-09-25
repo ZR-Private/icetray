@@ -161,8 +161,9 @@ refused over, at the footer stage, before any key chunk is fetched.
 
 Every section defaults when absent, and a key the schema does not know is
 an error. The server defaults are `listen = "127.0.0.1:7433"`,
-`metrics_listen = "127.0.0.1:9433"`, `poll_interval = "10s"`, and
-`page_cache_bytes = 268435456` (256 MiB; a budget below 524800 bytes, one
+`metrics_listen = "127.0.0.1:9433"`, `poll_interval = "10s"` (at least
+`"1s"`, since a table's poll calls its catalog or reads its version hint,
+and at most `"24h"`), and `page_cache_bytes = 268435456` (256 MiB; a budget below 524800 bytes, one
 64 KiB value page and its 64-byte entry overhead for each of the cache's
 eight shards, is refused, since each shard would keep a page whatever its
 share and the budget would bound nothing). Under `storage`, `s3` holds
@@ -190,7 +191,8 @@ again; `drain_deadline = "20s"` is how long a shutdown waits for open
 requests. Under `storage`: `max_retries = 2` retries of a failed S3 request
 (zero tries once), `connect_timeout = "1s"` for an S3 connection, and
 `catalog_timeout = "30s"` for one catalog call. Each value above is the
-default; every duration and both limits must be above zero.
+default; every duration and both limits must be above zero, and
+`poll_interval` between one second and one day.
 
 With the file in hand:
 

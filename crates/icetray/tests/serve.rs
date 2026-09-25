@@ -844,7 +844,7 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
 /// A periodic task that panics ends the run with the task named, so the
 /// process exits non-zero instead of answering `/ready` 200 from tables
 /// nothing refreshes. A poll interval of zero is what `Config::parse`
-/// refuses as `PollIntervalZero`, and what tokio's interval refuses with a
+/// refuses as `PollIntervalTooShort`, and what tokio's interval refuses with a
 /// panic at the first tick of the refresh and sampler tasks; the
 /// configuration is built directly, so the panic is reached. Both tasks
 /// panic at once, and whichever the run joins first is the one named.

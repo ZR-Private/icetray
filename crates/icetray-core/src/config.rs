@@ -37,6 +37,20 @@ const DEFAULT_METRICS_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::
 /// committed snapshot is serving within one poll of its commit.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The shortest poll interval a configuration may name: one second. Each
+/// table polls on the interval, and a poll of a catalog table is a catalog
+/// call and a poll of a table root reads its version hint, so a shorter one
+/// is a busy loop against the catalog that no freshness need justifies.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The longest poll interval a configuration may name: one day. A table
+/// written once a day is still followed within a day of its commit, and the
+/// gauges sampled every interval are at most a day old. A day is also far
+/// inside what the runtime's `Instant` arithmetic holds, where the first
+/// tick is scheduled as now plus the interval and an interval as long as
+/// `Duration::MAX` overflows it.
+const MAX_POLL_INTERVAL: Duration = Duration::from_hours(24);
+
 /// The value-page cache budget when the file says nothing: 256 mebibytes,
 /// a few thousand pages at the layout's 64-kibibyte bound (RFD 002), enough
 /// for a warm working set on a small replica while leaving memory to the
@@ -211,10 +225,25 @@ pub enum ConfigViolation {
     /// The hedge window holds no samples, so it has no percentile.
     #[error("hedge window must hold at least one sample")]
     HedgeWindowEmpty,
-    /// A poll interval of zero: the poller would re-resolve without pause,
-    /// and the runtime's interval refuses a zero period.
-    #[error("poll_interval must be above zero")]
-    PollIntervalZero,
+    /// A poll interval below `MIN_POLL_INTERVAL`: each table's poll would
+    /// call the catalog or read its version hint in a busy loop, and at
+    /// zero the runtime's interval refuses the period.
+    #[error("poll_interval {interval:?} is below the minimum of {minimum:?}")]
+    PollIntervalTooShort {
+        /// The configured interval.
+        interval: Duration,
+        /// `MIN_POLL_INTERVAL`.
+        minimum: Duration,
+    },
+    /// A poll interval above `MAX_POLL_INTERVAL`, past which a table is not
+    /// followed and the first tick's `Instant` can overflow.
+    #[error("poll_interval {interval:?} is above the maximum of {maximum:?}")]
+    PollIntervalTooLong {
+        /// The configured interval.
+        interval: Duration,
+        /// `MAX_POLL_INTERVAL`.
+        maximum: Duration,
+    },
     /// A `Get` deadline of zero, which would fail every lookup unstarted.
     #[error("get_deadline must be above zero")]
     GetDeadlineZero,
@@ -374,15 +403,28 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     Ok(())
 }
 
-/// Every interval, deadline, timeout, and limit that a zero would turn into
-/// "refuse everything" or "never pause" is above zero. `max_retries` is
-/// not among them: zero retries is a request tried once.
+/// The poll interval is within `MIN_POLL_INTERVAL..=MAX_POLL_INTERVAL`,
+/// and every other deadline, timeout, and limit that a zero would turn into
+/// "refuse everything" is above zero. `max_retries` is not among them: zero
+/// retries is a request tried once.
 fn validate_bounds(
     server: &ServerConfig,
     storage: &StorageConfig,
 ) -> std::result::Result<(), ConfigViolation> {
+    let interval = server.poll_interval;
+    if interval < MIN_POLL_INTERVAL {
+        return Err(ConfigViolation::PollIntervalTooShort {
+            interval,
+            minimum: MIN_POLL_INTERVAL,
+        });
+    }
+    if interval > MAX_POLL_INTERVAL {
+        return Err(ConfigViolation::PollIntervalTooLong {
+            interval,
+            maximum: MAX_POLL_INTERVAL,
+        });
+    }
     let durations = [
-        (server.poll_interval, ConfigViolation::PollIntervalZero),
         (server.get_deadline, ConfigViolation::GetDeadlineZero),
         (
             server.multi_get_deadline,
@@ -439,8 +481,9 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
 /// and background paths (RFD 013). `metrics_listen` is always bound: it
 /// serves `/metrics` and `/ready`, and RFD 012 makes both part of the
 /// surface. Every duration is written as a friendly duration such as
-/// `"5s"`, and every one of them, `max_in_flight`, and
-/// `max_multi_get_keys` is above zero.
+/// `"5s"`. `Config::validated` holds `poll_interval` between one second
+/// and one day, and every other duration, `max_in_flight`, and
+/// `max_multi_get_keys` above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -449,7 +492,8 @@ pub struct ServerConfig {
     /// The `/metrics` and `/ready` listener.
     pub metrics_listen: SocketAddr,
     /// How often each table's ref is re-resolved (RFD 005); written as a
-    /// friendly duration such as `"10s"`.
+    /// friendly duration such as `"10s"`, from `MIN_POLL_INTERVAL` (one
+    /// second) to `MAX_POLL_INTERVAL` (one day).
     #[serde(with = "time::friendly_duration")]
     pub poll_interval: Duration,
     /// The value-page cache budget in bytes; at least one contract value
@@ -1296,10 +1340,61 @@ locaton = "typo"
         );
     }
 
+    /// The smallest step a friendly duration can take, so a bound plus or
+    /// minus it is the first interval past the bound.
+    const SMALLEST_STEP: Duration = Duration::from_nanos(1);
+
+    /// The violation `validated` finds in the minimal configuration with
+    /// `poll_interval` set, or `None` when it accepts it.
+    fn poll_interval_violation(interval: Duration) -> Option<ConfigViolation> {
+        let mut config = Config::parse(TOML_MINIMAL).unwrap();
+        config.server.poll_interval = interval;
+        match config.validated() {
+            Ok(_) => None,
+            Err(Error::Config(ConfigError::Invalid(violation))) => Some(violation),
+            Err(other) => panic!("expected a configuration violation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_parse_refuses_poll_interval_zero() {
         let text = format!("{TOML_MINIMAL}\n[server]\npoll_interval = \"0s\"\n");
-        assert_eq!(violation(&text), ConfigViolation::PollIntervalZero);
+        assert_eq!(
+            violation(&text),
+            ConfigViolation::PollIntervalTooShort {
+                interval: Duration::ZERO,
+                minimum: MIN_POLL_INTERVAL,
+            }
+        );
+    }
+
+    #[test]
+    fn test_validated_holds_poll_interval_between_its_bounds() {
+        let below = MIN_POLL_INTERVAL.checked_sub(SMALLEST_STEP).unwrap();
+        assert_eq!(
+            poll_interval_violation(below),
+            Some(ConfigViolation::PollIntervalTooShort {
+                interval: below,
+                minimum: MIN_POLL_INTERVAL,
+            })
+        );
+        assert_eq!(poll_interval_violation(MIN_POLL_INTERVAL), None);
+        assert_eq!(poll_interval_violation(MAX_POLL_INTERVAL), None);
+        let above = MAX_POLL_INTERVAL + SMALLEST_STEP;
+        assert_eq!(
+            poll_interval_violation(above),
+            Some(ConfigViolation::PollIntervalTooLong {
+                interval: above,
+                maximum: MAX_POLL_INTERVAL,
+            })
+        );
+        assert_eq!(
+            poll_interval_violation(Duration::MAX),
+            Some(ConfigViolation::PollIntervalTooLong {
+                interval: Duration::MAX,
+                maximum: MAX_POLL_INTERVAL,
+            })
+        );
     }
 
     #[test]
