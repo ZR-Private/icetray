@@ -170,12 +170,14 @@ fn key_shape(
 }
 
 /// How the value column decodes, or `FileFault::ValuePhysicalType` when it
-/// is not a byte array of either width.
+/// is not a byte array of either width, or `FileFault::ZeroWidthValue` for
+/// a `FIXED_LEN_BYTE_ARRAY` of width 0.
 fn value_shape(path: &str, descr: &ColumnDescriptor) -> Result<ValueShape> {
     let physical = descr.physical_type();
     match physical {
         PhysicalType::BYTE_ARRAY => Ok(ValueShape::Variable),
-        PhysicalType::FIXED_LEN_BYTE_ARRAY => Ok(ValueShape::Fixed),
+        PhysicalType::FIXED_LEN_BYTE_ARRAY if descr.type_length() > 0 => Ok(ValueShape::Fixed),
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => Err(file_fault(path, FileFault::ZeroWidthValue)),
         PhysicalType::BOOLEAN
         | PhysicalType::INT32
         | PhysicalType::INT64
@@ -656,6 +658,32 @@ mod tests {
             }
         );
         assert_eq!(opened.stats().gets(), 1, "faulted at the footer");
+    }
+
+    /// A value column stored as a `FIXED_LEN_BYTE_ARRAY` of width 0, on
+    /// which parquet's decoder asserts a width above zero when it decodes a
+    /// value, is a file fault at the footer in every tier, before any chunk
+    /// is read.
+    #[tokio::test]
+    async fn test_build_a_zero_width_fixed_value_column_is_a_file_fault() {
+        let zero_width = 0;
+        let mut fixture = Fixture::contract(KeyType::Long, FEW_ROWS);
+        fixture.value_column = ValueColumn::FixedBinary(zero_width);
+        fixture.values = vec![Some(Vec::new()); FEW_ROWS];
+        let opened = store(&fixture).await;
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                fault_of(opened.build_in(KeyType::Long, residency, dir.path()).await),
+                FileFault::ZeroWidthValue,
+                "{residency:?}"
+            );
+        }
+        assert_eq!(
+            opened.stats().gets(),
+            count(Residency::ALL.len()),
+            "faulted at the footer"
+        );
     }
 
     #[tokio::test]

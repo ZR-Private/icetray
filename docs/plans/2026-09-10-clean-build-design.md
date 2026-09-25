@@ -495,6 +495,8 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// `ValuePhysicalType`, a fault: `TableLayout::derive` admitted the column's
 /// Iceberg type from the schema, and a conformant writer stores binary, fixed,
 /// and string as byte arrays, so the file contradicts its schema.
+/// `ZeroWidthValue` is a FIXED_LEN_BYTE_ARRAY value column of width 0, on
+/// which parquet's decoder asserts a width above zero when it decodes a value.
 /// `InconsistentRowCounts`, `InconsistentOffsetIndex`, and `PageRowsMismatch`
 /// are a footer that the file contradicts: a negative count or row groups
 /// that do not sum to the file's, an offset index whose pages are not where
@@ -520,7 +522,7 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// hands file bytes to parquet: the footer load, a bloom filter's parse,
 /// and the decode of a column chunk's pages. It names the part and carries
 /// the panic's message for the log; nothing decides on the message.
-pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize }, DecoderPanicked { part: DecodedPart, message: String } }
+pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, ZeroWidthValue, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize }, DecoderPanicked { part: DecodedPart, message: String } }
 /// What parquet was decoding when it panicked: the footer, a row group's key
 /// bloom filter, or a column chunk's pages at the last page the column
 /// reader took (`None` before its first).
@@ -558,7 +560,8 @@ impl FileIndex {
     /// least one byte wide; a width of 0 holds one distinct value), keys
     /// over the cap, and in the Bloom tier a row group without a key bloom
     /// filter; a value column whose physical type is neither BYTE_ARRAY nor
-    /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`. The Disk tier
+    /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`, and one that is
+    /// a FIXED_LEN_BYTE_ARRAY of width 0 `FileFault::ZeroWidthValue`. The Disk tier
     /// with no local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`. Every tier
     /// streams the key chunks once for verification, checking every key page

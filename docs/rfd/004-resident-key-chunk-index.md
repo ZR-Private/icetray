@@ -117,7 +117,9 @@ handle in parquet 58), so a key dictionary fits the ceiling in memory as
 well as on the wire. A key stored as a fixed-width column of width 0 holds
 one distinct value, so it cannot key a table of more than one row, and
 parquet's fixed-width decoder asserts a width above 0; the footer check
-refuses it as a key type mismatch before any page is read. On a refresh the
+refuses it as a key type mismatch before any page is read. A value column
+of width 0 would meet that assertion at a lookup, so the footer check
+refuses it too, as a file fault. On a refresh the
 refusal leaves the previous generation serving (RFD 005 (Generations and
 refresh)). A file whose keys run far past the cap can meet this refusal
 before the key-length one. A lookup reads the headers of the value page it

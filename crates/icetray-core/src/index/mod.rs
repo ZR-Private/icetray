@@ -178,6 +178,11 @@ pub enum FileFault {
         /// The physical type the file stores the column as.
         got: PhysicalType,
     },
+    /// The value column is a `FIXED_LEN_BYTE_ARRAY` of width 0, which holds
+    /// no byte of any value and on which parquet's decoder asserts a width
+    /// above zero when it decodes a value, so a lookup would panic there.
+    #[error("value column is a FIXED_LEN_BYTE_ARRAY of width 0")]
+    ZeroWidthValue,
     /// Parquet panicked decoding part of the file. Parquet panics, in
     /// release builds too, on malformed input no check ahead of it reads:
     /// a byte-array page whose body holds fewer values than its header
@@ -549,7 +554,8 @@ impl FileIndex {
     /// `contract::MAX_KEY_BYTES`. A file that is malformed for serving is
     /// `Error::File`: a missing column, a value column that is neither
     /// `BYTE_ARRAY` nor `FIXED_LEN_BYTE_ARRAY` (the schema admitted its
-    /// Iceberg type, so the file contradicts it), no rows, row counts that
+    /// Iceberg type, so the file contradicts it) or is a
+    /// `FIXED_LEN_BYTE_ARRAY` of width 0, no rows, row counts that
     /// disagree, no offset index on either column or one that does not
     /// describe its pages, an unbounded or undecodable bloom filter, a
     /// string key that is not UTF-8, a key page header parquet would not
