@@ -508,7 +508,8 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// its page can hold: an uncompressed size above its rows times the key
 /// cap and an encoding allowance or above the 64 MiB key page ceiling, a
 /// dictionary of more values than its row group's rows or than the ceiling
-/// holds at its type's smallest entry, a compressed size past its place in
+/// holds at the larger of its type's smallest encoded entry and the entry
+/// parquet decodes into, a compressed size past its place in
 /// the offset index, v2 level lengths that are negative or whose sum, which
 /// parquet adds as `i32`s, is above the page's uncompressed size.
 pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }

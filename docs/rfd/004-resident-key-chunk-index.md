@@ -110,11 +110,11 @@ for key pages. No key page, data or dictionary, may declare more than 64
 MiB uncompressed, sixteen times the contract's largest key page of 1,000
 keys at the cap (about 4 MiB) and far above the 1 MiB pages writers aim
 for; and no key dictionary may count more entries than 64 MiB holds at the
-fewest bytes an entry of its type takes (8 for a long, the 4-byte length
-of a byte array, a fixed-width column's width). Parquet keeps each entry in
-8 bytes for a long and 32 for a byte array, so a dictionary at that count
-still takes up to 512 MiB, and a fixed-width key of width 0 is bounded
-only by its rows. On a refresh the refusal leaves the
+larger of the fewest bytes an entry of its type encodes to (8 for a long,
+the 4-byte length of a byte array, a fixed-width column's width) and the
+bytes parquet holds a decoded entry in (8 for a long, 32 for a byte array
+or fixed-width handle in parquet 58), so a key dictionary fits the
+ceiling in memory as well as on the wire. On a refresh the refusal leaves the
 previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
 run far past the cap can meet this refusal before the key-length one. What
 the pre-scan does not cover: value pages and a value

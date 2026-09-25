@@ -1364,6 +1364,41 @@ mod tests {
         );
     }
 
+    /// A byte-array key dictionary counting fewer entries than
+    /// `MOST_KEY_PAGE_BYTES` holds at the fewest bytes an entry encodes to,
+    /// but more than it holds at the bytes parquet keeps a decoded entry
+    /// in, is refused before parquet sizes the dictionary by the count.
+    #[tokio::test]
+    async fn test_verify_refuses_a_key_dictionary_over_the_ceiling_in_memory() {
+        let mut fixture = Fixture::contract(KeyType::String, contract_rows());
+        fixture.layout.dictionary = Dictionary::Key;
+        let opened = store(&fixture).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let page = ChunkPage::Dictionary;
+        let held = MOST_KEY_PAGE_BYTES / count(size_of::<ByteArray>());
+        let encoded = MOST_KEY_PAGE_BYTES / count(size_of::<u32>());
+        let claimed = i32::try_from(held + 1).unwrap();
+        assert!(
+            u64::try_from(claimed).unwrap() <= encoded,
+            "the encoded bound alone admits the claim"
+        );
+        let (patched, chunks) = with_first_group_header(
+            &opened,
+            &loaded,
+            key_leaf,
+            page,
+            HeaderField::NumValues,
+            claimed,
+        )
+        .await;
+        let metadata = with_group_rows(&patched, 0, INFLATED_GROUP_ROWS);
+        assert_eq!(
+            fault_of(verify_groups(&metadata, key_leaf, KeyShape::Str, &chunks)),
+            over_bound(page, HeaderField::NumValues, claimed, held)
+        );
+    }
+
     /// A key page whose header declares compressed bytes past its place in
     /// the offset index is refused.
     #[tokio::test]

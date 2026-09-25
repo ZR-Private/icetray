@@ -108,7 +108,8 @@ pub enum FileFault {
     /// uncompressed size above what its rows could encode to at the key
     /// cap or above the key page ceiling of 64 MiB, a dictionary of more
     /// values than the row group has rows or than the ceiling holds at the
-    /// fewest bytes an entry takes, a compressed size past the page's place
+    /// larger of the fewest bytes an entry encodes to and the bytes parquet
+    /// holds a decoded entry in, a compressed size past the page's place
     /// in the chunk, or v2 level lengths whose sum is above the uncompressed
     /// size. Parquet sizes a buffer by the first two before it reads a byte
     /// of the page, and adds the level lengths as `i32`s, so the header is
