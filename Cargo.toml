@@ -12,6 +12,15 @@ license = "MIT OR Apache-2.0"
 [profile.dev]
 debug = "line-tables-only"
 
+# Exists so profiles carry symbols: release code generation with full debug
+# info and nothing stripped, so a profile of the benchmark program or the
+# server names every function, inlined frames included. Build with
+# `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 # The whole lint policy (RFD 015). Every crate opts in with
 # `[lints] workspace = true`; the only allows outside this table are the two
 # scoped carve-outs RFD 015 names.
