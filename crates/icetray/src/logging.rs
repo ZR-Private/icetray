@@ -6,9 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::str::FromStr;
 
-use icetray_core::config::LogConfig;
+use icetray_core::config::{LogConfig, StandardField};
 use icetray_core::time;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
@@ -23,71 +22,12 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-use crate::error::CliError;
-
 /// The field `tracing` records an event's message under.
 const MESSAGE_FIELD: &str = "message";
 
-/// The standard fields of every event, each renamable through
-/// `LogConfig.fields`. `FromStr` reads the lowercase names the file uses,
-/// and `Display` prints them, which are also the default emitted names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StandardField {
-    /// When the event happened, RFC 3339 in UTC.
-    Time,
-    /// The event's level, lowercase.
-    Level,
-    /// The event's message.
-    Message,
-    /// The module the event came from.
-    Target,
-}
-
-impl StandardField {
-    /// Every standard field, for the parser.
-    const ALL: [Self; 4] = [Self::Time, Self::Level, Self::Message, Self::Target];
-
-    /// Every field's name, comma-separated, for the message that refuses a
-    /// key; rendered from `ALL` so the list cannot lag the enum.
-    pub(crate) fn names() -> String {
-        Self::ALL
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-impl fmt::Display for StandardField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Time => "time",
-            Self::Level => "level",
-            Self::Message => "message",
-            Self::Target => "target",
-        };
-        f.write_str(name)
-    }
-}
-
-impl FromStr for StandardField {
-    type Err = CliError;
-
-    /// Exactly the lowercase names `Display` prints; anything else is
-    /// `CliError::LogField`, so a misspelled key in the file is refused at
-    /// startup rather than silently ignored.
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|field| field.to_string() == text)
-            .ok_or_else(|| CliError::LogField {
-                name: text.to_string(),
-            })
-    }
-}
-
 /// The name each standard field is emitted under: the mapped name from
-/// `LogConfig.fields`, or the field's own name.
+/// `LogConfig.fields`, or the field's own name. The names are distinct for
+/// a configuration `Config::validated` accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldNames {
     time: String,
@@ -97,40 +37,14 @@ pub struct FieldNames {
 }
 
 impl FieldNames {
-    /// The names `config.fields` maps to, the defaults for the rest; a key
-    /// that names no standard field is `CliError::LogField`, and two fields
-    /// emitted under one name are `CliError::LogFieldCollision`, since a
-    /// line would silently lose one of them.
-    pub fn from_config(config: &LogConfig) -> Result<Self, CliError> {
-        let mut names = Self::default();
-        for (key, emitted) in &config.fields {
-            let slot = match key.parse::<StandardField>()? {
-                StandardField::Time => &mut names.time,
-                StandardField::Level => &mut names.level,
-                StandardField::Message => &mut names.message,
-                StandardField::Target => &mut names.target,
-            };
-            slot.clone_from(emitted);
-        }
-        let emitted = [&names.time, &names.level, &names.message, &names.target];
-        for (at, name) in emitted.iter().enumerate() {
-            if emitted[..at].contains(name) {
-                return Err(CliError::LogFieldCollision {
-                    name: (*name).clone(),
-                });
-            }
-        }
-        Ok(names)
-    }
-}
-
-impl Default for FieldNames {
-    fn default() -> Self {
+    /// The names `config` emits the standard fields under.
+    pub fn from_config(config: &LogConfig) -> Self {
+        let name = |field| config.emitted_name(field).to_string();
         Self {
-            time: StandardField::Time.to_string(),
-            level: StandardField::Level.to_string(),
-            message: StandardField::Message.to_string(),
-            target: StandardField::Target.to_string(),
+            time: name(StandardField::Time),
+            level: name(StandardField::Level),
+            message: name(StandardField::Message),
+            target: name(StandardField::Target),
         }
     }
 }
@@ -148,11 +62,11 @@ pub struct JsonEvents {
 
 impl JsonEvents {
     /// The formatter `config` describes.
-    pub fn new(config: &LogConfig) -> Result<Self, CliError> {
-        Ok(Self {
-            names: FieldNames::from_config(config)?,
+    pub fn new(config: &LogConfig) -> Self {
+        Self {
+            names: FieldNames::from_config(config),
             static_fields: config.static_fields.clone(),
-        })
+        }
     }
 }
 
@@ -303,12 +217,11 @@ pub enum LogSink {
 }
 
 /// Installs the process's subscriber: `RUST_LOG` when set and valid, else
-/// `default` as the level; JSON events through `JsonEvents` to `sink`. A
-/// `log.fields` key that names no standard field is `CliError::LogField`.
+/// `default` as the level; JSON events through `JsonEvents` to `sink`.
 /// A subscriber already installed keeps its place and is told so through
 /// itself; the binary installs once, so that is a test's situation.
-pub fn init(config: &LogConfig, sink: LogSink, default: Level) -> Result<(), CliError> {
-    let format = JsonEvents::new(config)?;
+pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
+    let format = JsonEvents::new(config);
     // intentional: an unset RUST_LOG, the common case, shares this Err with an
     // invalid one, and the default level applies to both.
     let filter =
@@ -327,7 +240,6 @@ pub fn init(config: &LogConfig, sink: LogSink, default: Level) -> Result<(), Cli
     {
         tracing::warn!(%error, "logging was already initialised; keeping the installed subscriber");
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -390,7 +302,7 @@ mod tests {
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
-                .event_format(JsonEvents::new(config).unwrap())
+                .event_format(JsonEvents::new(config))
                 .with_writer(buffer.clone()),
         );
         tracing::subscriber::with_default(subscriber, emit);
@@ -408,9 +320,9 @@ mod tests {
     fn renamed_config() -> LogConfig {
         LogConfig {
             fields: BTreeMap::from([
-                ("time".to_string(), "ts".to_string()),
-                ("level".to_string(), "lvl".to_string()),
-                ("message".to_string(), "msg".to_string()),
+                (StandardField::Time, "ts".to_string()),
+                (StandardField::Level, "lvl".to_string()),
+                (StandardField::Message, "msg".to_string()),
             ]),
             static_fields: BTreeMap::from([("service".to_string(), "icetray".to_string())]),
         }
@@ -424,21 +336,8 @@ mod tests {
     const RATIO: f64 = 0.5;
 
     #[test]
-    fn test_from_str_standard_field_round_trips_display() {
-        for field in StandardField::ALL {
-            assert_eq!(field.to_string().parse::<StandardField>().unwrap(), field);
-        }
-    }
-
-    #[test]
-    fn test_from_str_standard_field_refuses_another_word() {
-        let error = "severity".parse::<StandardField>().unwrap_err();
-        assert!(matches!(error, CliError::LogField { name } if name == "severity"));
-    }
-
-    #[test]
     fn test_from_config_maps_named_fields_and_defaults_the_rest() {
-        let names = FieldNames::from_config(&renamed_config()).unwrap();
+        let names = FieldNames::from_config(&renamed_config());
         assert_eq!(
             names,
             FieldNames {
@@ -449,45 +348,14 @@ mod tests {
             }
         );
         assert_eq!(
-            FieldNames::from_config(&LogConfig::default()).unwrap(),
-            FieldNames::default()
+            FieldNames::from_config(&LogConfig::default()),
+            FieldNames {
+                time: "time".to_string(),
+                level: "level".to_string(),
+                message: "message".to_string(),
+                target: "target".to_string(),
+            }
         );
-    }
-
-    #[test]
-    fn test_from_config_refuses_an_unknown_field() {
-        let config = LogConfig {
-            fields: BTreeMap::from([("severity".to_string(), "lvl".to_string())]),
-            static_fields: BTreeMap::new(),
-        };
-        assert!(matches!(
-            FieldNames::from_config(&config),
-            Err(CliError::LogField { name }) if name == "severity"
-        ));
-        assert!(JsonEvents::new(&config).is_err());
-    }
-
-    #[test]
-    fn test_from_config_refuses_two_fields_with_one_emitted_name() {
-        let onto_a_default = LogConfig {
-            fields: BTreeMap::from([("message".to_string(), "level".to_string())]),
-            static_fields: BTreeMap::new(),
-        };
-        assert!(matches!(
-            FieldNames::from_config(&onto_a_default),
-            Err(CliError::LogFieldCollision { name }) if name == "level"
-        ));
-        let two_onto_one = LogConfig {
-            fields: BTreeMap::from([
-                ("time".to_string(), "x".to_string()),
-                ("level".to_string(), "x".to_string()),
-            ]),
-            static_fields: BTreeMap::new(),
-        };
-        assert!(matches!(
-            FieldNames::from_config(&two_onto_one),
-            Err(CliError::LogFieldCollision { name }) if name == "x"
-        ));
     }
 
     #[test]

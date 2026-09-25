@@ -490,6 +490,30 @@ async fn test_location_is_held_to_the_configuration_rules_like_a_file() -> TestR
     Ok(())
 }
 
+/// A log field mapping the configuration refuses, a key that names no
+/// standard field or two standard fields under one name, is a configuration
+/// mistake like any other: refused before anything is opened, exit 1.
+#[tokio::test]
+async fn test_a_bad_log_field_mapping_exits_1() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_log", KeyType::Long)).await?;
+    let mappings = [
+        ("unknown.toml", "timestamp = \"ts\"\n"),
+        ("collision.toml", "time = \"x\"\nlevel = \"x\"\n"),
+    ];
+    for (name, fields) in mappings {
+        let text = format!(
+            "[server.log.fields]\n{fields}\n{}",
+            toml_table(TABLE_A, &fixture)
+        );
+        let config = write_file(dir.path(), name, &text)?;
+        let output = run(&["info", "--config", &config], &[]);
+        assert_exit(&output, EXIT_FAILURE);
+        assert!(output.stdout.is_empty(), "{name}: {}", stderr(&output));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     let dir = tempfile::tempdir()?;

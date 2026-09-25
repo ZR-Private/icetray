@@ -19,7 +19,6 @@ use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, KeyType};
 
 use crate::cli::ENV_CONFIG;
-use crate::logging::StandardField;
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
 
@@ -27,9 +26,10 @@ use crate::service::WireVariant;
 /// answered, the daemon drained.
 pub const EXIT_OK: u8 = 0;
 
-/// The run failed: a load or read error, a table the doctor could not load,
-/// a first-load failure, a listener that would not bind, a drain that
-/// passed its deadline.
+/// The run failed: a configuration that cannot be read, parsed, or
+/// validated, a load or read error, a table the doctor could not load, a
+/// first-load failure, a listener that would not bind, a drain that passed
+/// its deadline.
 pub const EXIT_FAILURE: u8 = 1;
 
 /// The doctor found a cost finding (RFD 016): the table serves, at a price a
@@ -38,9 +38,8 @@ pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
 /// target, no table matched, a table name required, a key that does not
-/// parse, an unknown log field or two under one name. `sysexits.h`'s `EX_USAGE`,
-/// chosen so that 2 means one thing; clap's default usage code of 2 is never
-/// used.
+/// parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
+/// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
 
 /// Why command-line text is not a key of the table's type. The messages
@@ -232,22 +231,6 @@ pub enum CliError {
     /// Command-line text that is not a key of the table's type.
     #[error(transparent)]
     Key(#[from] KeyTextFault),
-    /// A key of `log.fields` that names no standard field.
-    #[error(
-        "log field {name} is not a standard field; expected one of {}",
-        StandardField::names()
-    )]
-    LogField {
-        /// The key as configured.
-        name: String,
-    },
-    /// Two standard fields of `log.fields` would be emitted under one name,
-    /// so every line would lose one of them.
-    #[error("log field name {name} is emitted for two standard fields; each needs its own")]
-    LogFieldCollision {
-        /// The emitted name both fields map to.
-        name: String,
-    },
     /// Writing a line failed for a reason other than a closed pipe.
     #[error("cannot write output: {0}")]
     Io(#[from] std::io::Error),
@@ -279,9 +262,7 @@ impl CliError {
             Self::NoTarget
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
-            | Self::Key(_)
-            | Self::LogField { .. }
-            | Self::LogFieldCollision { .. } => EXIT_USAGE,
+            | Self::Key(_) => EXIT_USAGE,
             Self::BrokenPipe => EXIT_OK,
         };
         ExitCode::from(code)
@@ -341,12 +322,6 @@ mod tests {
             CliError::Key(KeyTextFault::NotALong {
                 text: "abc".to_string(),
             }),
-            CliError::LogField {
-                name: "severity".to_string(),
-            },
-            CliError::LogFieldCollision {
-                name: "level".to_string(),
-            },
         ];
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_USAGE), "{error}");

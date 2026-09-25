@@ -205,15 +205,24 @@ impl Config {
 /// the two limits (`ConfigViolation::*Zero`).
 pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file; from 1 s to 24 h */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub refresh_deadline: Duration, pub drain_deadline: Duration }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
-/// standard fields and `static_fields` are added to every event.
-pub struct LogConfig { pub fields: BTreeMap<String, String>, pub static_fields: BTreeMap<String, String> }
+/// standard fields and `static_fields` are added to every event. A `fields` key naming no
+/// standard field fails the parse (serde's own error, `ConfigError::Toml` or `Json`);
+/// `Config::validated` refuses two standard fields emitted under one name
+/// (`ConfigViolation::LogFieldCollision`, the first pair in `StandardField::ALL` order).
+pub struct LogConfig { pub fields: BTreeMap<StandardField, String>, pub static_fields: BTreeMap<String, String> }
+/// The mapped name, or the field's own; the binary's formatter and the collision check both read it.
+impl LogConfig { pub fn emitted_name(&self, field: StandardField) -> &str; }
+/// The standard fields of every log event (RFD 012). Display and serde give the file's lowercase
+/// name (`time`, `level`, `message`, `target`), which is also the default emitted name.
+pub enum StandardField { Time, Level, Message, Target }
+impl StandardField { pub(crate) const ALL: [Self; 4]; pub const fn name(self) -> &'static str; }
 pub struct HedgeConfig { pub enabled: bool, pub percentile: f64, pub window: usize, pub max_rate: f64 }
 pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, pub access_key_id: Option<String>, pub secret_access_key: Option<String>, pub allow_http: bool, pub path_style: bool }
 pub struct RewriteRule { pub from: String, pub to: String }
 pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_json::Error), Invalid(ConfigViolation) }
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
 /// `UnknownResidency` is raised by `Residency`'s `FromStr`, the command line's parser for the setting.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalTooShort { interval: Duration, minimum: Duration }, PollIntervalTooLong { interval: Duration, maximum: Duration }, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalTooShort { interval: Duration, minimum: Duration }, PollIntervalTooLong { interval: Duration, maximum: Duration }, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, LogFieldCollision { name: String, first: StandardField, second: StandardField }, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
@@ -1004,8 +1013,8 @@ the standard fields under the names `LogConfig.fields` maps them to, every
 line carrying the message key (empty for an event without one), and unique
 keys, an event's own field winning over a standard one and never displaced
 by a static field; a `log.fields` key naming no standard field, or two
-standard fields mapped to one emitted name, is refused at startup with exit
-64. Prometheus histograms use the prototype's buckets (100 µs to 2 s); the
+standard fields mapped to one emitted name, is refused with the rest of the
+configuration (RFD 011), exit 1. Prometheus histograms use the prototype's buckets (100 µs to 2 s); the
 recorder installs once per process and every later caller gets the same
 handle. SIGTERM or SIGINT drains in-flight requests, flushes the page
 cache's disk level (RFD 017), and exits 0. The drain waits at most
@@ -1087,13 +1096,13 @@ as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
 (`table`, `reason` as the `ErrorKind`'s name, `message`). The doctor opens
 every table with `strict` off. Exit codes: 0 for a run that did what was
 asked; 1 for a load or read error, a table the doctor could not load (which
-dominates 2), a configuration file that cannot be read or parsed, a
+dominates 2), a configuration file that cannot be read or parsed or breaks
+one of its rules (a bad log field mapping among them), a
 first-load failure, a bind failure, or a drain that passed its deadline;
 2 when the doctor found a cost
 finding (RFD 016); 64 (`sysexits.h`'s `EX_USAGE`) when the command line or
 the target could not be used, including clap's own errors, no target, no
-table matched, a table name required, a key that does not parse, and a bad log
-field mapping, so clap's default exit code 2 is never used and 2 means one
+table matched, a table name required, and a key that does not parse, so clap's default exit code 2 is never used and 2 means one
 thing. A reader that closes stdout ends the run with exit 0 and nothing
 more printed. The one-shots log to stderr at `warn`, since their stdout is
 data.

@@ -113,8 +113,7 @@ fn report(error: &CliError) -> ExitCode {
 /// used is reported with its exit code.
 fn prepare(target: &Target) -> Result<Config, ExitCode> {
     let config = target.config().map_err(|error| report(&error))?;
-    logging::init(&config.server.log, LogSink::Stderr, Level::WARN)
-        .map_err(|error| report(&error))?;
+    logging::init(&config.server.log, LogSink::Stderr, Level::WARN);
     Ok(config)
 }
 
@@ -140,9 +139,7 @@ async fn serve(path: &Path) -> ExitCode {
         Ok(config) => config,
         Err(error) => return report(&CliError::Core(error)),
     };
-    if let Err(error) = logging::init(&config.server.log, LogSink::Stdout, Level::INFO) {
-        return report(&error);
-    }
+    logging::init(&config.server.log, LogSink::Stdout, Level::INFO);
     if let Err(error) = tikv_jemalloc_ctl::background_thread::write(true) {
         // Background purging is a Linux feature of jemalloc; elsewhere freed
         // memory returns to the operating system on the allocator's own

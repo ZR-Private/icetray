@@ -271,6 +271,17 @@ pub enum ConfigViolation {
     /// unstarted.
     #[error("catalog_timeout must be above zero")]
     CatalogTimeoutZero,
+    /// Two standard log fields emitted under one name, so every line would
+    /// lose one of them (RFD 012).
+    #[error("log fields {first} and {second} are both emitted as {name}; each needs its own name")]
+    LogFieldCollision {
+        /// The emitted name both fields map to.
+        name: String,
+        /// The field earlier in `StandardField::ALL`.
+        first: StandardField,
+        /// The field later in `StandardField::ALL`.
+        second: StandardField,
+    },
     /// A rewrite rule whose `from` is empty: every location starts with the
     /// empty prefix, so the rule would rewrite all of them.
     #[error("a rewrite rule has an empty from prefix")]
@@ -351,6 +362,7 @@ impl Config {
 fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_bounds(&config.server, &config.storage)?;
     validate_hedge(&config.storage.hedge)?;
+    validate_log(&config.server.log)?;
     if config
         .storage
         .rewrite
@@ -457,6 +469,25 @@ fn validate_bounds(
     }
 }
 
+/// Each standard field is emitted under a name of its own; the first pair
+/// in `StandardField::ALL` order that shares one is the violation.
+fn validate_log(log: &LogConfig) -> std::result::Result<(), ConfigViolation> {
+    for (at, &second) in StandardField::ALL.iter().enumerate() {
+        let name = log.emitted_name(second);
+        if let Some(&first) = StandardField::ALL[..at]
+            .iter()
+            .find(|&&earlier| log.emitted_name(earlier) == name)
+        {
+            return Err(ConfigViolation::LogFieldCollision {
+                name: name.to_string(),
+                first,
+                second,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The hedge settings are checked whether or not hedging is enabled, so a
 /// mistyped value is caught before the day it is switched on.
 fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolation> {
@@ -547,15 +578,68 @@ impl Default for ServerConfig {
     }
 }
 
-/// Logs are JSON only (RFD 012). `fields` renames the standard field names
-/// and `static_fields` are added to every event; both are empty by default.
+/// Logs are JSON only (RFD 012). `fields` renames the standard fields and
+/// `static_fields` are added to every event; both are empty by default. A
+/// key of `fields` that names no standard field fails the parse, and
+/// `Config::validated` refuses two standard fields emitted under one name
+/// (`ConfigViolation::LogFieldCollision`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LogConfig {
-    /// Standard field name to the name it is emitted under.
-    pub fields: BTreeMap<String, String>,
+    /// Standard field to the name it is emitted under.
+    pub fields: BTreeMap<StandardField, String>,
     /// Field name to a constant value added to every event.
     pub static_fields: BTreeMap<String, String>,
+}
+
+impl LogConfig {
+    /// The name `field` is emitted under: the name `fields` maps it to, or
+    /// its own.
+    pub fn emitted_name(&self, field: StandardField) -> &str {
+        self.fields
+            .get(&field)
+            .map_or_else(|| field.name(), String::as_str)
+    }
+}
+
+/// The standard fields of every log event (RFD 012), each renamable through
+/// `LogConfig.fields`. Display and serde give the lowercase name the file
+/// uses, which is also the name a field is emitted under by default.
+// The serde names and Display are the same strings;
+// `test_serialize_standard_field_matches_display` holds them together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StandardField {
+    /// When the event happened, RFC 3339 in UTC.
+    Time,
+    /// The event's level, lowercase.
+    Level,
+    /// The event's message.
+    Message,
+    /// The module the event came from.
+    Target,
+}
+
+impl StandardField {
+    /// Every standard field, for the collision check and the tests that run
+    /// a case per field.
+    pub(crate) const ALL: [Self; 4] = [Self::Time, Self::Level, Self::Message, Self::Target];
+
+    /// The field's lowercase name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Level => "level",
+            Self::Message => "message",
+            Self::Target => "target",
+        }
+    }
+}
+
+impl fmt::Display for StandardField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Hedging of lookup GETs (RFD 013). The delay is `percentile` of the last
@@ -888,7 +972,7 @@ refresh_deadline = "10m"
 drain_deadline = "25s"
 
 [server.log.fields]
-timestamp = "ts"
+time = "ts"
 level = "severity"
 
 [server.log.static_fields]
@@ -967,7 +1051,7 @@ table = "profiles"
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
                 "log": {
-                    "fields": {"timestamp": "ts", "level": "severity"},
+                    "fields": {"time": "ts", "level": "severity"},
                     "static_fields": {"service": "icetray"}
                 }
             },
@@ -1051,8 +1135,8 @@ value_column = "value"
                 page_cache_bytes: FIXTURE_PAGE_CACHE_BYTES,
                 log: LogConfig {
                     fields: BTreeMap::from([
-                        ("timestamp".to_string(), "ts".to_string()),
-                        ("level".to_string(), "severity".to_string()),
+                        (StandardField::Time, "ts".to_string()),
+                        (StandardField::Level, "severity".to_string()),
                     ]),
                     static_fields: BTreeMap::from([("service".to_string(), "icetray".to_string())]),
                 },
@@ -1214,6 +1298,58 @@ locaton = "typo"
 "#,
         );
         assert!(matches!(source, Err(Error::Config(ConfigError::Toml(_)))));
+    }
+
+    #[test]
+    fn test_parse_rejects_a_log_field_that_names_no_standard_field() {
+        let toml = Config::parse(&format!(
+            "{TOML_MINIMAL}\n[server.log.fields]\ntimestamp = \"ts\"\n"
+        ));
+        assert!(
+            matches!(toml, Err(Error::Config(ConfigError::Toml(_)))),
+            "{toml:?}"
+        );
+        let json = Config::parse(r#"{"server": {"log": {"fields": {"timestamp": "ts"}}}}"#);
+        assert!(
+            matches!(json, Err(Error::Config(ConfigError::Json(_)))),
+            "{json:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_two_log_fields_under_one_name() {
+        let onto_a_default = format!("{TOML_MINIMAL}\n[server.log.fields]\nmessage = \"level\"\n");
+        assert_eq!(
+            violation(&onto_a_default),
+            ConfigViolation::LogFieldCollision {
+                name: "level".to_string(),
+                first: StandardField::Level,
+                second: StandardField::Message,
+            }
+        );
+        let two_onto_one =
+            format!("{TOML_MINIMAL}\n[server.log.fields]\ntime = \"x\"\ntarget = \"x\"\n");
+        assert_eq!(
+            violation(&two_onto_one),
+            ConfigViolation::LogFieldCollision {
+                name: "x".to_string(),
+                first: StandardField::Time,
+                second: StandardField::Target,
+            }
+        );
+        let swapped = format!(
+            "{TOML_MINIMAL}\n[server.log.fields]\nlevel = \"message\"\nmessage = \"level\"\n"
+        );
+        assert!(Config::parse(&swapped).is_ok());
+    }
+
+    #[test]
+    fn test_emitted_name_is_the_mapped_name_or_the_field_s_own() {
+        let log = full_config().server.log;
+        assert_eq!(log.emitted_name(StandardField::Time), "ts");
+        assert_eq!(log.emitted_name(StandardField::Level), "severity");
+        assert_eq!(log.emitted_name(StandardField::Message), "message");
+        assert_eq!(log.emitted_name(StandardField::Target), "target");
     }
 
     #[test]
@@ -1563,6 +1699,16 @@ locaton = "typo"
             assert_eq!(json, format!("\"{residency}\""));
             let back: Residency = serde_json::from_str(&json).unwrap();
             assert_eq!(back, residency);
+        }
+    }
+
+    #[test]
+    fn test_serialize_standard_field_matches_display() {
+        for field in StandardField::ALL {
+            let json = serde_json::to_string(&field).unwrap();
+            assert_eq!(json, format!("\"{field}\""));
+            let back: StandardField = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, field);
         }
     }
 

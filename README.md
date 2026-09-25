@@ -244,11 +244,12 @@ owner chooses a tier from one run.
 Exit codes: 0 when the run did what was asked (for the doctor, no cost
 finding; advice does not change the code); 2 when the doctor found a cost
 finding, which a build pipeline gates on; 1 for a load or read error, a
-table the doctor could not load (which dominates 2), a configuration file
-that cannot be read or parsed, or a listener that would not bind; 64 when
-the command line could not be used: neither or both of `--config` and
+table the doctor could not load (which dominates 2), a configuration that
+cannot be read or parsed or breaks one of its rules (a bad log field
+mapping among them), or a listener that would not bind; 64 when the
+command line could not be used: neither or both of `--config` and
 `--location`, a location flag with `--config`, no table matched, `--table`
-required, a key that does not parse, or a bad log field mapping. The
+required, or a key that does not parse. The
 one-shots log to stderr at `warn`, since their stdout is data.
 
 ## Serving
@@ -337,7 +338,8 @@ service = "icetray"
 ```
 
 A key of `fields` that names no standard field, or two standard fields
-mapped to one name, is refused at startup with exit 64.
+emitted under one name, is refused with the rest of the configuration,
+before anything is opened, with exit 1.
 
 `storage.local.dir` names an optional local directory. It holds two things:
 the chunk files of tables with `residency = "disk"`, which keep each data
