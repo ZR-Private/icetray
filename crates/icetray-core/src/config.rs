@@ -76,7 +76,8 @@ const DEFAULT_HEDGE_MAX_RATE: f64 = 0.05;
 /// How long a `Get` may run when the file says nothing: five seconds. A
 /// live lookup answers well under 200 ms, so a lookup still running at five
 /// seconds is waiting on a wedged store, and failing it frees the caller
-/// to fall back. A shorter deadline the client sends wins.
+/// to fall back. A client's own shorter deadline is the gRPC layer's to
+/// enforce, not this one's.
 const DEFAULT_GET_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How long a `MultiGet` may run when the file says nothing: fifteen
@@ -458,12 +459,14 @@ pub struct ServerConfig {
     pub page_cache_bytes: usize,
     /// Log field renames and additions.
     pub log: LogConfig,
-    /// How long a `Get` may run before it is `DEADLINE_EXCEEDED`; a shorter
-    /// deadline the client sends wins.
+    /// How long a `Get` may run before it is `DEADLINE_EXCEEDED`, and how
+    /// long each page fetch of a lookup may run. A client's own deadline is
+    /// enforced by the gRPC layer and reported as the client's.
     #[serde(with = "time::friendly_duration")]
     pub get_deadline: Duration,
     /// How long a `MultiGet` may run before it is `DEADLINE_EXCEEDED`,
-    /// whatever its size; a shorter deadline the client sends wins.
+    /// whatever its size. A client's own deadline is enforced by the gRPC
+    /// layer and reported as the client's.
     #[serde(with = "time::friendly_duration")]
     pub multi_get_deadline: Duration,
     /// Requests, `Get` and `MultiGet` together, in flight at once; one more

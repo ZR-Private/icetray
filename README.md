@@ -178,8 +178,8 @@ under Serving. Locations may be `s3://`, `s3a://`, or `file://`.
 The server and storage sections also bound how long work may run, so a
 wedged object store or catalog fails requests fast instead of piling them
 up. Under `server`: `get_deadline = "5s"` and `multi_get_deadline = "15s"`
-cap a `Get` and a whole `MultiGet` (a shorter deadline the client sends
-wins, and expiry is `DEADLINE_EXCEEDED`), and `get_deadline` also caps
+cap a `Get` and a whole `MultiGet` (expiry is `DEADLINE_EXCEEDED`; a
+client's own deadline is enforced by the gRPC layer), and `get_deadline` also caps
 every page GET a lookup makes, in a `MultiGet` too, so a GET to a store
 that has stopped answering is cancelled rather than left running; `max_in_flight = 1024` requests
 may run at once, and one more is refused at once with `RESOURCE_EXHAUSTED`;
@@ -286,9 +286,10 @@ on the key type to choose the key variant. A key is a oneof of `long`,
 wrong variant is an `INVALID_ARGUMENT` error, a table the server does not
 serve is `NOT_FOUND`, and a miss is a normal answer, never an error. A
 `Get` or `MultiGet` still running at its deadline (`server.get_deadline` or
-`server.multi_get_deadline`, or the client's own when that is shorter) is
-`DEADLINE_EXCEEDED`. A tonic client times its own deadline too and reports
-its expiry as `CANCELLED` from its side of the call. `Get` and `MultiGet`
+`server.multi_get_deadline`) is `DEADLINE_EXCEEDED`. A deadline the client
+sends is enforced by the gRPC layer: the client's library ends the call at
+it and reports the expiry as its own (a tonic client reports `CANCELLED`),
+and the server drops the call then, freeing its slot. `Get` and `MultiGet`
 share `server.max_in_flight` slots, each held until its call ends; a call
 that finds none free is refused at once with `RESOURCE_EXHAUSTED` rather
 than queued. `TableInfo` takes no slot. A `MultiGet` of more than

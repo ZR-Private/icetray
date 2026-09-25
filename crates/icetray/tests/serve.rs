@@ -11,14 +11,13 @@ use std::time::Duration;
 use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
-use icetray::service::Service;
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
-use icetray_proto::v1::icetray_server::{Icetray as _, SERVICE_NAME};
+use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
     self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
@@ -985,42 +984,6 @@ async fn test_a_get_past_its_deadline_ends_its_page_fetch() -> TestResult {
     Ok(())
 }
 
-/// A client deadline shorter than the server's is the one a call runs
-/// under, and its expiry is `DEADLINE_EXCEEDED` too. The service is called
-/// directly with the `grpc-timeout` header a client sends: a tonic client
-/// runs its own timer on that header and reports its expiry as `CANCELLED`
-/// before the server's answer arrives, so over a channel the server's code
-/// is not what the caller sees.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_a_shorter_client_deadline_wins() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    let stack = Stack::ready_small().await?;
-    let server = ServerConfig::default();
-    assert!(server.get_deadline > CLIENT_DEADLINE + DEADLINE_MARGIN);
-    assert!(server.multi_get_deadline > CLIENT_DEADLINE + DEADLINE_MARGIN);
-    let service = Service::new(stack.serving.opened(), &server);
-    let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
-    stack.s3.hold();
-
-    let mut get = tonic::Request::new(GetRequest {
-        table: TABLE.to_string(),
-        key: Some(wire_key(&keys[0])),
-    });
-    get.set_timeout(CLIENT_DEADLINE);
-    let (outcome, elapsed) = tokio::time::timeout(SHUTDOWN_WAIT, timed(service.get(get))).await?;
-    assert_ended_at(outcome, elapsed, CLIENT_DEADLINE, Code::DeadlineExceeded);
-
-    let mut batch = tonic::Request::new(MultiGetRequest {
-        table: TABLE.to_string(),
-        keys: keys[1..].iter().map(wire_key).collect(),
-    });
-    batch.set_timeout(CLIENT_DEADLINE);
-    let (outcome, elapsed) =
-        tokio::time::timeout(SHUTDOWN_WAIT, timed(service.multi_get(batch))).await?;
-    assert_ended_at(outcome, elapsed, CLIENT_DEADLINE, Code::DeadlineExceeded);
-    Ok(())
-}
-
 /// With every slot taken by calls held on a stalled store, one more `Get`
 /// or `MultiGet` is refused at once with `RESOURCE_EXHAUSTED` rather than
 /// queued; the held calls end at their deadline and give their slots back,
@@ -1086,8 +1049,10 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
 }
 
 /// A call that ends at its client's deadline gives its slot back then, not
-/// at the server's longer deadline: with one slot, a second call made just
-/// after the first ended reaches the store instead of being refused.
+/// at the server's longer deadline: tonic's server layer drops the call at
+/// the client's `grpc-timeout`, and the client reports the expiry as its
+/// own, `CANCELLED`. With one slot, a second call made just after the first
+/// ended reaches the store instead of being refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -1112,7 +1077,7 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
         get.set_timeout(CLIENT_DEADLINE);
         let (outcome, elapsed) =
             tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.client.get(get))).await?;
-        assert_ne!(code_of(outcome), Code::ResourceExhausted, "call {sent}");
+        assert_eq!(code_of(outcome), Code::Cancelled, "call {sent}");
         assert!(elapsed < CLIENT_DEADLINE + DEADLINE_MARGIN, "call {sent}");
         assert_eq!(stack.s3.held(), sent + 1, "call {sent} reached the store");
         // The server's own timer on the client's deadline fires a loopback

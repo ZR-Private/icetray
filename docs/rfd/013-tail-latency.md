@@ -49,9 +49,11 @@ generation is built, are bulk work nobody waits on, and are never hedged.
 A hedge cuts the tail of a store that answers; a store or catalog that
 stops answering is bounded instead, on two paths that share one S3 client
 per bucket. The live path, a gRPC request, fails fast. A `Get` has 5
-seconds and a `MultiGet` 15 seconds whatever its size, a shorter deadline
-the client sends wins, and expiry is `DEADLINE_EXCEEDED`, which drops the
-lookup. A page fetch the lookup started runs on its own task inside the
+seconds and a `MultiGet` 15 seconds whatever its size, and expiry is
+`DEADLINE_EXCEEDED`, which drops the lookup. A deadline the client sends is
+enforced by the gRPC layer, not by icetray: the client's library ends the
+call at it and reports the expiry as the client's own, and tonic's server
+drops the call at the same deadline, which frees its slot. A page fetch the lookup started runs on its own task inside the
 page cache, so dropping the lookup does not end it; the fetch has the `Get`
 deadline from its own start instead, and at it the GET is dropped, which
 cancels the request, every lookup waiting on the fetch fails, and nothing is

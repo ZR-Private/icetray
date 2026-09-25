@@ -25,7 +25,6 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
-use tonic::service::InterceptorLayer;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic_health::ServingStatus;
@@ -33,7 +32,7 @@ use tonic_health::server::HealthReporter;
 
 use crate::error::ServeError;
 use crate::listen::serve_http;
-use crate::service::{Service, StampArrival};
+use crate::service::Service;
 use crate::telemetry;
 
 /// How long a first-load failure stays visible on the health service before
@@ -152,7 +151,6 @@ impl Serving {
 
         let grpc = tokio::spawn(
             Server::builder()
-                .layer(InterceptorLayer::new(StampArrival))
                 .add_service(health_service)
                 .add_service(IcetrayServer::new(service))
                 .serve_with_incoming_shutdown(

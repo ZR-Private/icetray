@@ -42,7 +42,7 @@ redefine.
 | `error` | the one `Error` enum and `Result` | |
 | `snapshot` | `SnapshotId`, the newtype for an Iceberg snapshot id; it has no order and is a metric label, never a gauge value | 015 |
 | `approx` | integer-to-float conversion (`ratio`, `gauge`, `gauge_len`), the conversions between an in-memory `usize` and a `u64` total (`count` widens, `length` narrows; both exact, since a compile-time assertion admits only 64-bit targets), and a footer number as a measurement (`measured`, in-crate); the only `cast_precision_loss` allow | 015 |
-| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), a `grpc-timeout` header becomes a `Duration` (`grpc_timeout`), and an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
+| `time` | typed time conversions: the one place a Duration or timestamp becomes a number or a string (`seconds`, `micros`, `age_seconds`, `log_timestamp`), the wall clock is read (`now`), an epoch millisecond becomes a `jiff::Timestamp` (`timestamp_from_millis`, in-crate; out of jiff's range is `TableFault::SnapshotTimestampOutOfRange`), and a `Duration` is added to an epoch millisecond (`millis_after`, for a fixture writer stamping a commit after the metadata's last update); CONTRIBUTING Constants | |
 | `metric` | the metric and label names of section 7 as constants, and the label-value enums `ReadKind` and `LookupResult`; the one home for those names | 012 |
 | `key` | `Key`, `KeyType`, key ordering (numeric for long, bytewise for string and binary), key/statistics comparison | 008 |
 | `bucket` | the Iceberg bucket transform (murmur3 over the key's bytes) | 008 |
@@ -197,8 +197,8 @@ impl Config {
 /// budget per shard and a shard keeps its latest page whatever its share, so less bounds nothing);
 /// `Config::parse` refuses less as `PageCacheTooSmall`, as it refuses a disk level below one block.
 /// The live-path bounds (RFD 013) the binary's service and shutdown read: `get_deadline`
-/// (default 5 s) and `multi_get_deadline` (15 s, flat) against the client's own shorter
-/// deadline, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
+/// (default 5 s) and `multi_get_deadline` (15 s, flat), a client's own deadline being the
+/// gRPC layer's, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
 /// (1000), `drain_deadline` (20 s); and the background path's `refresh_deadline` (5 min) on a
 /// first load or refresh. `open_with` hands `Table::new` both `refresh_deadline` and
 /// `get_deadline`, the bound on every lookup's page fetch. Every duration is a friendly duration; each is above zero, as are
@@ -836,10 +836,6 @@ pub fn log_timestamp(at: jiff::Timestamp) -> String;
 /// requires. No serving path writes a commit; public because the testkit is another crate. Whole
 /// milliseconds of `step`; saturates at `i64::MAX`, outside what `timestamp_from_millis` admits.
 pub fn millis_after(base: i64, step: Duration) -> i64;
-/// A `grpc-timeout` header's text (one to eight ASCII digits, then `H`, `M`, `S`, `m`, `u`, or `n`)
-/// as the deadline a client sent; `None` for anything else, which the service treats as no client
-/// deadline, as tonic does.
-pub fn grpc_timeout(text: &str) -> Option<Duration>;
 /// In-crate: an Iceberg snapshot's epoch millisecond as a timestamp; out of jiff's range is `Err`,
 /// which `Generation::load` reports as `TableFault::SnapshotTimestampOutOfRange`.
 pub(crate) fn timestamp_from_millis(millis: i64) -> Result<jiff::Timestamp, jiff::Error>;
@@ -1030,21 +1026,20 @@ variant (`status_from`, where a page fetch past its deadline,
 `CacheError::FetchDeadline`, is `DEADLINE_EXCEEDED` like the call's own
 deadline); the service's own bounds are `CallFault`, one code
 per variant. `Get` runs under `server.get_deadline` and `MultiGet` under
-`server.multi_get_deadline`, or the client's `grpc-timeout` when shorter
-(read through `time::grpc_timeout`); past it the lookup future is dropped
-and the call is `DEADLINE_EXCEEDED` (`CallFault::DeadlineExceeded`). A page
+`server.multi_get_deadline`; past it the lookup future is dropped and the
+call is `DEADLINE_EXCEEDED` (`CallFault::DeadlineExceeded`). A page
 fetch the lookup started runs on its own task inside the page cache, and
 ends at `server.get_deadline` from its own start, which the table's cache
 handle carries: its GET, and a hedge beside it, is dropped, which cancels
 the request, and nothing is cached. In
 a `MultiGet` the page fetches have that deadline too, so over a store that
 has stopped answering a batch ends at the `Get` deadline when that comes
-before its own. The deadline counts from the arrival `StampArrival` records, an
-interceptor installed as a server layer: tonic starts its own
-`grpc-timeout` timer, which answers `CANCELLED`, after the layers inside it
-are called and polls the handler before that timer, so the handler's
-`DEADLINE_EXCEEDED` is the server's answer. A tonic client runs the same
-timer on its own side and reports `CANCELLED` first. `Get` and `MultiGet`
+before its own. A client's own deadline is the gRPC layer's and the service
+reads no `grpc-timeout`: tonic's server wraps every service in a layer that
+drops the call at the client's deadline, which frees its permit, and answers
+`CANCELLED`, while the client's library ends the call on its own side at the
+same deadline and reports the expiry as its own (a tonic client, `CANCELLED`).
+`Get` and `MultiGet`
 share one semaphore of `server.max_in_flight` permits (held to tokio's
 `Semaphore::MAX_PERMITS`); each call takes one with `try_acquire` as it
 starts and holds it until the call ends, so a call past its deadline

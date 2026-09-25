@@ -2,8 +2,8 @@
 //! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
 //! read under the table's key type, and core's errors mapped to status codes
 //! by variant. Every call is counted under `requests_total`. `Get` and
-//! `MultiGet` run under their deadlines (RFD 013): the server's for the
-//! method, or the client's `grpc-timeout` when that is shorter; together
+//! `MultiGet` run under the server's deadline for the method (RFD 013); a
+//! client's own deadline is tonic's, which drops the call at it. Together
 //! they hold at most `server.max_in_flight` slots, and a call that finds
 //! none is refused at once. A `MultiGet` carries at most
 //! `server.max_multi_get_keys` keys.
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Value, approx, time};
+use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Value, approx};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
@@ -23,16 +23,10 @@ use icetray_proto::v1::{
     TableInfoResponse,
 };
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
-use tokio::time::Instant;
-use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
 use crate::error::{CallFault, WireKeyFault};
 use crate::telemetry::{self, Call};
-
-/// The header a client's deadline arrives in, by the gRPC over HTTP/2
-/// protocol. tonic leaves it in the request's metadata.
-const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
 
 /// The served tables by name and the bounds each call runs under. Clone:
 /// tonic hands one clone to every connection, and they share the tables
@@ -174,66 +168,17 @@ impl From<CallFault> for Status {
     }
 }
 
-/// When a call reached the server, stamped by `StampArrival` into the
-/// request's extensions.
-#[derive(Clone, Copy, Debug)]
-struct Arrival(Instant);
-
-/// The interceptor that stamps every call's `Arrival`, installed as a
-/// server layer. tonic runs its own timer on a client's `grpc-timeout`,
-/// which answers `CANCELLED`; it starts that timer after calling the layers
-/// inside it and polls the handler before the timer, so a deadline counted
-/// from this stamp passes no later than tonic's, and the handler's
-/// `DEADLINE_EXCEEDED` is what the server answers.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StampArrival;
-
-impl Interceptor for StampArrival {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        request.extensions_mut().insert(Arrival(Instant::now()));
-        Ok(request)
-    }
-}
-
-/// The deadline a call runs under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Deadline {
-    /// When the call started counting.
-    from: Instant,
-    /// How long it may run.
+/// Runs `work` under the server's deadline `after`; past it, `work` is
+/// dropped and the call is `DEADLINE_EXCEEDED`. A client's `grpc-timeout`
+/// is not read here: tonic's server layer drops the call at it, and the
+/// client's library reports that expiry as its own.
+async fn within<T>(
     after: Duration,
-}
-
-impl Deadline {
-    /// `request`'s deadline: `server`, or the client's `grpc-timeout` when
-    /// that is shorter, counted from the call's `Arrival`, or from now for a
-    /// call that did not pass `StampArrival`. A header that does not parse
-    /// is no client deadline, as tonic's own reading of it is.
-    fn of<T>(request: &Request<T>, server: Duration) -> Self {
-        let from = request
-            .extensions()
-            .get::<Arrival>()
-            .map_or_else(Instant::now, |arrival| arrival.0);
-        let client = request
-            .metadata()
-            .get(GRPC_TIMEOUT_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(time::grpc_timeout);
-        let after = client.map_or(server, |client| client.min(server));
-        Self { from, after }
-    }
-
-    /// Runs `work` until the deadline; past it, `work` is dropped and the
-    /// call is `DEADLINE_EXCEEDED`. A deadline past the clock's range
-    /// cannot pass, so `work` then runs unbounded.
-    async fn run<T>(self, work: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
-        let Some(at) = self.from.checked_add(self.after) else {
-            return work.await;
-        };
-        tokio::time::timeout_at(at, work)
-            .await
-            .map_err(|_elapsed| CallFault::DeadlineExceeded { after: self.after })?
-    }
+    work: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::time::timeout(after, work)
+        .await
+        .map_err(|_elapsed| CallFault::DeadlineExceeded { after })?
 }
 
 /// Core's error as a status (RFD 010): a key of the wrong type is
@@ -342,8 +287,7 @@ impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         telemetry::count(Call::Get);
         let _slot = self.admit()?;
-        let deadline = Deadline::of(&request, self.get_deadline);
-        deadline.run(self.lookup(request.into_inner())).await
+        within(self.get_deadline, self.lookup(request.into_inner())).await
     }
 
     async fn multi_get(
@@ -360,8 +304,11 @@ impl Icetray for Service {
             .into());
         }
         let _slot = self.admit()?;
-        let deadline = Deadline::of(&request, self.multi_get_deadline);
-        deadline.run(self.lookup_batch(request.into_inner())).await
+        within(
+            self.multi_get_deadline,
+            self.lookup_batch(request.into_inner()),
+        )
+        .await
     }
 
     async fn table_info(

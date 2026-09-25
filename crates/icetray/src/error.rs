@@ -119,8 +119,8 @@ pub enum WireKeyFault {
 /// than on its lookup's outcome. Each variant has its own status code.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CallFault {
-    /// The call ran past its deadline: the server's for the method, or the
-    /// client's when that was shorter. `DEADLINE_EXCEEDED` on the wire.
+    /// The call ran past the server's deadline for the method.
+    /// `DEADLINE_EXCEEDED` on the wire.
     #[error("the call did not finish within {after:?}")]
     DeadlineExceeded {
         /// The deadline that passed.
