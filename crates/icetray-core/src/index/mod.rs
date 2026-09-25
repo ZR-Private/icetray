@@ -409,7 +409,7 @@ enum KeyShape {
     Str,
     /// `BYTE_ARRAY` holding opaque bytes.
     Bin,
-    /// `FIXED_LEN_BYTE_ARRAY` holding opaque bytes.
+    /// `FIXED_LEN_BYTE_ARRAY` of at least one byte holding opaque bytes.
     FixedBin,
     /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`.
     Uuid,
@@ -482,8 +482,8 @@ impl FileIndex {
     /// streams the key column chunks once for verification in every tier.
     /// Refuses, typed under `Error::Refused` for `table`: a key column
     /// whose physical type does not match `key_type` (`Binary` accepts
-    /// `BYTE_ARRAY` and `FIXED_LEN_BYTE_ARRAY`, `Uuid` a
-    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), in the Bloom tier a row
+    /// `BYTE_ARRAY` and a `FIXED_LEN_BYTE_ARRAY` at least one byte wide,
+    /// `Uuid` a `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`), in the Bloom tier a row
     /// group without a key bloom filter, then, once the chunks are decoded, a null key, a
     /// key below the one before it or a row group starting below the
     /// previous one's last key, a key repeated, and a key over

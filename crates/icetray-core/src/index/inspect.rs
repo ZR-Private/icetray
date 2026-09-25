@@ -122,7 +122,11 @@ fn leaf(path: &str, schema: &SchemaDescriptor, name: &str) -> Result<usize> {
 }
 
 /// How the key column decodes, or `RefusalReason::KeyTypeMismatch` when its
-/// physical type is not the one `key_type` maps to.
+/// physical type is not the one `key_type` maps to: a uuid is a
+/// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`, and a binary key's
+/// `FIXED_LEN_BYTE_ARRAY` is at least one byte wide. A width of 0 holds
+/// one distinct value, so it cannot key a table of more than one row, and
+/// parquet's fixed-width decoder asserts a width above 0.
 fn key_shape(
     table: &str,
     path: &str,
@@ -130,12 +134,16 @@ fn key_shape(
     descr: &ColumnDescriptor,
 ) -> Result<KeyShape> {
     let physical = descr.physical_type();
-    let uuid_width = usize::try_from(descr.type_length()).is_ok_and(|len| len == UUID_BYTES);
+    let width = usize::try_from(descr.type_length());
+    let uuid_width = width.is_ok_and(|len| len == UUID_BYTES);
+    let keying_width = width.is_ok_and(|len| len > 0);
     let shape = match (key_type, physical) {
         (KeyType::Long, PhysicalType::INT64) => Some(KeyShape::Long),
         (KeyType::String, PhysicalType::BYTE_ARRAY) => Some(KeyShape::Str),
         (KeyType::Binary, PhysicalType::BYTE_ARRAY) => Some(KeyShape::Bin),
-        (KeyType::Binary, PhysicalType::FIXED_LEN_BYTE_ARRAY) => Some(KeyShape::FixedBin),
+        (KeyType::Binary, PhysicalType::FIXED_LEN_BYTE_ARRAY) if keying_width => {
+            Some(KeyShape::FixedBin)
+        }
         (KeyType::Uuid, PhysicalType::FIXED_LEN_BYTE_ARRAY) if uuid_width => Some(KeyShape::Uuid),
         (
             KeyType::Long | KeyType::String | KeyType::Binary | KeyType::Uuid,
@@ -605,6 +613,35 @@ mod tests {
             );
             assert_eq!(opened.stats().gets(), 1, "refused at the footer");
         }
+    }
+
+    /// A binary key stored as a `FIXED_LEN_BYTE_ARRAY` of width 0 holds one
+    /// distinct value, the empty key, so it cannot key a table of more than
+    /// one row, and is refused at the footer as a type mismatch even when
+    /// the file holds that one row.
+    #[tokio::test]
+    async fn test_build_refuses_a_zero_width_fixed_key_column() {
+        let zero_width = 0;
+        let opened = store(&Fixture::with_keys(
+            KeyColumn::FixedBinary(zero_width),
+            vec![Some(Key::Bytes(Vec::new()))],
+        ))
+        .await;
+        for residency in Residency::ALL {
+            assert_eq!(
+                refusal_of(opened.build(KeyType::Binary, residency, None).await),
+                RefusalReason::KeyTypeMismatch {
+                    path: location(),
+                    expected: KeyType::Binary,
+                    got: PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                }
+            );
+        }
+        assert_eq!(
+            opened.stats().gets(),
+            count(Residency::ALL.len()),
+            "refused at the footer"
+        );
     }
 
     #[tokio::test]

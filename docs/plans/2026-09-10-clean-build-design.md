@@ -542,7 +542,8 @@ pub struct FileIndex;
 impl FileIndex {
     /// Refuses (typed, under `table`) an unsorted key column, a null key, a
     /// key repeated within the file, a key physical type that does not match
-    /// `key_type` (Binary accepts BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY), keys
+    /// `key_type` (Binary accepts BYTE_ARRAY and a FIXED_LEN_BYTE_ARRAY at
+    /// least one byte wide; a width of 0 holds one distinct value), keys
     /// over the cap, and in the Bloom tier a row group without a key bloom
     /// filter; a value column whose physical type is neither BYTE_ARRAY nor
     /// FIXED_LEN_BYTE_ARRAY is `FileFault::ValuePhysicalType`. The Disk tier

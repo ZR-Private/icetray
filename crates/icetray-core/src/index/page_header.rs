@@ -78,8 +78,9 @@ const BYTE_ARRAY_LENGTH_PREFIX_BYTES: u64 = approx::count(size_of::<u32>());
 /// The fewest bytes one entry of a `PLAIN` dictionary of a key column of
 /// `shape` takes, `width` being the column's `FIXED_LEN_BYTE_ARRAY` width:
 /// an `INT64` is 8 bytes, a byte array its length prefix, a fixed-width
-/// value its width, 0 for a width of 0 (parquet's schema reader refuses a
-/// negative one).
+/// value its width. `inspect` refuses a key width of 0 and parquet's
+/// schema reader a negative one; either counts as 0 here, and
+/// `most_key_entries` then rests on the bytes an entry is held in.
 pub(super) fn fewest_entry_bytes(shape: KeyShape, width: i32) -> u64 {
     match shape {
         KeyShape::Long => approx::count(size_of::<i64>()),
@@ -758,10 +759,9 @@ fn sent_as(field: i16, wire: WireType, expected: WireType) -> Parsed<()> {
 /// footer that claims a row group of billions of rows widens its last
 /// page's span bound with it; the ceiling does not move with the footer.
 /// A key dictionary at the entry bound takes at most the ceiling in the
-/// entries parquet resizes its dictionary to, whatever its key's type. A
-/// `FIXED_LEN_BYTE_ARRAY` key of width 0 encodes its entries in no bytes,
-/// so its entry bound is the one the ceiling holds in memory. The value counts
-/// inside a page body (a delta encoding's lengths) are parquet's to read
+/// entries parquet resizes its dictionary to, whatever its key's type.
+/// `inspect` refuses a `FIXED_LEN_BYTE_ARRAY` key of width 0, whose
+/// entries encode to no bytes. The value counts inside a page body (a delta encoding's lengths) are parquet's to read
 /// and are not checked here.
 pub(super) fn check_page_headers(
     chunk: ColumnChunk<'_>,

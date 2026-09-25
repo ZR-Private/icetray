@@ -295,7 +295,10 @@ pub enum RefusalReason {
         /// The repeated key.
         key: Key,
     },
-    /// The key column's physical type is not the one its Iceberg type maps to.
+    /// The key column's physical type is not the one its Iceberg type maps
+    /// to, or is a `FIXED_LEN_BYTE_ARRAY` of a width that cannot hold it: a
+    /// uuid's other than `UUID_BYTES`, a binary key's of 0, which holds one
+    /// distinct value.
     KeyTypeMismatch {
         /// The data file's location.
         path: String,

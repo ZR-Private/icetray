@@ -114,7 +114,10 @@ larger of the fewest bytes an entry of its type encodes to (8 for a long,
 the 4-byte length of a byte array, a fixed-width column's width) and the
 bytes parquet holds a decoded entry in (8 for a long, 32 for a byte array
 or fixed-width handle in parquet 58), so a key dictionary fits the
-ceiling in memory as well as on the wire. On a refresh the refusal leaves the
+ceiling in memory as well as on the wire. A key stored as a fixed-width
+column of width 0 holds one distinct value, so it cannot key a table, and
+parquet's fixed-width decoder asserts a width above 0; the footer check
+refuses it as a key type mismatch before any page is read. On a refresh the refusal leaves the
 previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
 run far past the cap can meet this refusal before the key-length one. What
 the pre-scan does not cover: value pages and a value
