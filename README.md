@@ -436,7 +436,13 @@ checked against that file's identity, and is rebuilt on demand; a replica
 that restarts with its volume reuses every chunk file whose data file is
 still referenced and deletes the rest. The volume needs capacity and
 nothing else: nobody backs it up or shares it between replicas, and losing
-it costs one cold load.
+it costs one cold load. Each disk-tier data file keeps one chunk file open
+for the life of its generation, and a refresh that rewrites a table
+holds the old and the new generation's at once, so set the descriptor limit
+(`ulimit -n`, or the container runtime's `nofile`) to at least twice the
+number of disk-tier data files the replica serves, plus a headroom of 1,024
+for sockets, the page cache's disk level, and the one chunk file retention
+opens at a time.
 
 ## Building and testing
 

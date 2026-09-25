@@ -102,6 +102,12 @@ them.
 A replica wanting the disk tier runs on hardware with local solid-state
 storage or a local volume; the state on it is disposable.
 
+The disk tier holds one open file descriptor per data file for the life of
+its generation, twice that while a refresh that rewrote the table loads beside
+the serving generation, so a deployment sizes its descriptor limit to at
+least twice its disk-tier file count plus a headroom of 1,024 for sockets, the
+page cache's disk level, and the one chunk file retention opens at a time.
+
 Load peaks differ by tier. The disk tier holds one overlap group's chunks
 at a time, since a group is verified by reading pages back from the chunk
 files and its chunks are dropped before the next group's are read. The
