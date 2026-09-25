@@ -205,7 +205,9 @@ icetray get --config icetray.toml --table kv 42
 
 `doctor` prints one `doctor` line per table with the summary, one `finding`
 line per cost or advice finding, and with `--files` one `file` line per data
-file; a table it could not load is one `refused` line. `info` prints one
+file; a table it could not load is one `refused` line, and so is one whose
+keys it finds outside their file's recorded bucket (the load hashes each
+file's page-boundary keys, the doctor every key). `info` prints one
 `table` line per served table. `get` prints one `get` line per key; `--table`
 is required when more than one table is configured. Keys are typed as
 icetray prints them: a long as its digits, a string as its text, a binary
@@ -249,7 +251,7 @@ owner chooses a tier from one run.
 Exit codes: 0 when the run did what was asked (for the doctor, no cost
 finding; advice does not change the code); 2 when the doctor found a cost
 finding, which a build pipeline gates on; 1 for a load or read error, a
-table the doctor could not load (which dominates 2), a configuration that
+table the doctor could not load or refused (which dominates 2), a configuration that
 cannot be read or parsed or breaks one of its rules (a bad log field
 mapping among them), or a listener that would not bind; 64 when the
 command line could not be used: neither or both of `--config` and

@@ -37,7 +37,9 @@ const IDS_50K: [u64; 5] = [0, 1, 12_345, 24_999, 49_999];
 const FLIP: u8 = 0xff;
 
 /// A golden table opened and loaded through `icetray_core::open` under the
-/// default storage settings.
+/// default storage settings, every key of it checked against its file's
+/// recorded bucket (`Generation::verify_buckets`), which a table a real
+/// writer bucketed passes.
 struct Golden {
     storage: Arc<Storage>,
     table: Arc<Table>,
@@ -57,6 +59,7 @@ async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
     let opened = open(&golden::config(&warehouse, table, strict), None).await?;
     let table = Arc::clone(&opened.tables[0]);
     table.load().await?;
+    table.serving()?.verify_buckets().await?;
     Ok(Golden {
         storage: opened.storage,
         table,

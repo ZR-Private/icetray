@@ -34,11 +34,16 @@ async fn load_all(opened: &Opened) -> Vec<(&Arc<Table>, icetray_core::Result<()>
 }
 
 /// `doctor`: one `doctor` line per table with its findings and, with
-/// `files`, its data files; a table that cannot be loaded is a `refused`
-/// line. Every table is opened with `strict` off, so a table `strict` would
-/// refuse for cost is reported rather than refused (RFD 016). The exit code
-/// is `EXIT_FAILURE` when any table was refused, else `EXIT_INEFFICIENT`
-/// when any serves at a cost, else `EXIT_OK`.
+/// `files`, its data files. A table that cannot be loaded is a `refused`
+/// line, and so is one the load admits but whose full bucket check
+/// (`Generation::verify_buckets`, which decodes and hashes every key and
+/// which the doctor alone runs) finds a key outside its file's recorded
+/// bucket or cannot finish: that table would answer a present key absent,
+/// so it is a refusal, not a cost or advice (RFD 007). Every table is
+/// opened with `strict` off, so a table `strict` would refuse for cost is
+/// reported rather than refused (RFD 016). The exit code is `EXIT_FAILURE`
+/// when any table was refused, else `EXIT_INEFFICIENT` when any serves at
+/// a cost, else `EXIT_OK`.
 pub async fn doctor(
     config: &Config,
     only: Option<&str>,
@@ -55,6 +60,11 @@ pub async fn doctor(
         match outcome {
             Ok(()) => {
                 let generation = table.serving()?;
+                if let Err(error) = generation.verify_buckets().await {
+                    emit(&RefusedLine::new(table.name(), &error))?;
+                    refused = true;
+                    continue;
+                }
                 let report = diagnose(&generation);
                 emit(&SummaryLine::new(Kind::Doctor, &report.summary))?;
                 for finding in &report.findings {

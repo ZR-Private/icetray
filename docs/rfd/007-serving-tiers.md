@@ -61,7 +61,8 @@ Placements settled elsewhere:
   file whose keys change bucket between two fences, which a writer that
   partitions by bucket does not produce; hashing every key at every load
   would cost tens of nanoseconds per row, seconds to minutes on a large
-  table.
+  table, so the doctor hashes every key and refuses such a file under the
+  same reason (RFD 016).
 - A value column that is not binary, fixed, or string is refused because
   the wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)), so a typed column has no defined encoding and any answer

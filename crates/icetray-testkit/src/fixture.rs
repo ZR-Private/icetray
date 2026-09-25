@@ -86,6 +86,15 @@ pub const IDS_4K: Range<u64> = 0..4_000;
 /// file, the smallest fixture with more than one file.
 pub const IDS_2K: Range<u64> = 0..2_000;
 
+/// Ids above `IDS_2K` a test draws the keys of a raw file from when it
+/// records them under a bucket of its choosing
+/// (`Fixture::raw_file_in_bucket`): none is one `IDS_2K` wrote, and each of
+/// two buckets gets dozens.
+pub const STRAY_IDS: Range<u64> = IDS_2K.end..IDS_2K.end + STRAY_ID_COUNT;
+
+/// How many ids `STRAY_IDS` spans.
+const STRAY_ID_COUNT: u64 = 100;
+
 /// Ids sampled on an `IDS_4K` fixture: both ends and the middle, so the
 /// sample reaches every bucket's file.
 pub const SAMPLE_4K: [u64; 5] = [0, 1, 1_234, 2_999, 3_999];

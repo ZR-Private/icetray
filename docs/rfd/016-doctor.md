@@ -48,7 +48,17 @@ bytes computed from footers alone, so an owner chooses a tier (RFD 017
 
 The command exits 0 for a table with no cost finding (advice does not change
 the code), 2 when a cost finding is present, and a different non-zero code
-with the refusal reason when the table cannot be served. At load the same
+with the refusal reason when the table cannot be served.
+
+The doctor alone checks every key's bucket. After the load it decodes every
+key of every bucketed file, hashes it under the file's own bucketing, and
+refuses the table under RFD 007's `key_outside_bucket` when a key falls
+outside the bucket the file's manifest entry records, with the refusal's
+line and exit code: such a key answers absent though present, so it is a
+refusal and neither a cost nor advice. The load hashes only each file's
+fences and first and last key (RFD 007), since hashing every row would add
+tens of nanoseconds per key to every load; the doctor runs before a table
+ships and can take that time. At load the same
 findings decide the tier, honor `strict`, and are reported under the names
 RFD 007 fixes. The command is a subcommand of the serving binary (RFD 012
 (Deployment contract)).
@@ -94,7 +104,7 @@ beside it, and makes a wrong threshold wrong everywhere at once.
 
 The doctor needs a full load today, because sort order, key length, and
 duplicate keys across overlapping files are read from the decoded key
-chunks. Open question, listed as unverified
+chunks, and its bucket check decodes every key again. Open question, listed as unverified
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)):
 a metadata-only mode that reads footers and manifests only. For it: on a
 very large table a full load is a heavy way to answer a layout question, and

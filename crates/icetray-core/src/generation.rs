@@ -113,7 +113,8 @@ impl Generation {
     /// same concurrency, refusing a bucketed file whose fences or first or
     /// last key hash to another bucket than its manifest entry records
     /// (`RefusalReason::KeyOutsideBucket`; a reused file was checked when
-    /// it was built), and assembles the generation: files sorted, overlap
+    /// it was built, and every key is `verify_buckets`'s to check), and
+    /// assembles the generation: files sorted, overlap
     /// groups found, and every group that gained a file merged to refuse a
     /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
     /// `previous`. A snapshot timestamp jiff cannot represent is
@@ -253,6 +254,36 @@ impl Generation {
     /// zero's number.
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize> {
         &self.overlapping
+    }
+
+    /// The doctor's full bucket check (RFD 016): decodes every key of every
+    /// bucketed file and refuses the first that hashes to another bucket
+    /// than its file's manifest entry records, as
+    /// `RefusalReason::KeyOutsideBucket`; an unbucketed file has no bucket
+    /// to check. The load hashes each file's fences and its first and last
+    /// key alone, which refuses a file recorded under the wrong bucket but
+    /// serves one whose keys change bucket between two fences; this check
+    /// refuses both, at the price of decoding and hashing every key. The
+    /// chunks come as `FileIndex::key_chunks_for_verification` hands them
+    /// out (Full: resident, Disk: one local read per row group, Bloom: one
+    /// GET per row group), `LOAD_CONCURRENCY` files at a time, and are
+    /// decoded one key page at a time. The doctor calls it after a load; no
+    /// load or refresh does.
+    pub async fn verify_buckets(&self) -> Result<()> {
+        let table = self.table.as_str();
+        stream::iter(
+            self.files
+                .iter()
+                .filter(|file| file.entry.bucketing.is_some())
+                .cloned(),
+        )
+        .map(|file| async move {
+            let chunks = file.index.key_chunks_for_verification().await?;
+            index::off_worker(|| refuse_any_key_outside_bucket(table, &file, &chunks))
+        })
+        .buffered(LOAD_CONCURRENCY)
+        .try_collect::<()>()
+        .await
     }
 
     /// Overlap groups this load merged to prove key uniqueness: the groups
@@ -566,11 +597,25 @@ fn refuse_outside_bucket<K: Borrow<Key>>(
 /// whose keys change bucket between two fences, which a writer that
 /// partitions by bucket does not produce. Hashing every key would add a
 /// murmur3 hash per row to every load, tens of nanoseconds each, which is
-/// seconds to minutes on a table of billions of rows.
+/// seconds to minutes on a table of billions of rows, so that check is the
+/// doctor's (`Generation::verify_buckets`).
 fn refuse_fences_outside_bucket(table: &str, file: &LoadedFile) -> Result<()> {
     let (first, last) = file.index.key_range();
     let fences = file.index.fences().iter().flatten();
     refuse_outside_bucket(table, &file.entry, fences.chain([first, last]))
+}
+
+/// The doctor's per-file bucket check: `refuse_outside_bucket` over every
+/// key of `file`, decoded from `chunks` one key page at a time.
+fn refuse_any_key_outside_bucket(table: &str, file: &LoadedFile, chunks: &Segments) -> Result<()> {
+    let index = &file.index;
+    for row_group in 0..index.metadata().num_row_groups() {
+        for page in 0..index.page_count(row_group) {
+            let keys = index.decode_keys(row_group, Some(page), chunks)?;
+            refuse_outside_bucket(table, &file.entry, (0..keys.len()).map(|at| keys.get(at)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether the exact key ranges of two files intersect.
@@ -2900,6 +2945,84 @@ mod tests {
                 "{residency}"
             );
         }
+    }
+
+    /// One key of `COMPUTED` among `RECORDED`'s, neither a fence nor the
+    /// file's first or last key: the load, which hashes only those, serves
+    /// the file and answers that key `Absent` though the file holds it, and
+    /// `verify_buckets`, which hashes every key, refuses it in every tier.
+    #[tokio::test]
+    async fn test_verify_buckets_refuses_a_key_the_load_does_not_hash() {
+        let all = keys_from(0, E2E_KEYS);
+        let recorded = keys_in_bucket(&all, bucketing(TWO), RECORDED);
+        let (first, last) = (recorded[0], recorded[recorded.len() - 1]);
+        let stray = keys_in_bucket(&all, bucketing(TWO), COMPUTED)
+            .into_iter()
+            .find(|key| first < *key && *key < last)
+            .unwrap();
+        let mut keys = recorded.clone();
+        keys.push(stray);
+        keys.sort_unstable();
+        let table = one_file_under(&keys).await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        for residency in Residency::ALL {
+            let config = table.config(residency, None);
+            let generation = table.load(&config, Some(&local), None).await.unwrap();
+            assert_eq!(
+                generation.files[0].index.fences(),
+                [vec![Key::Long(first)]],
+                "one key page, so the stray key is no fence"
+            );
+            assert_eq!(
+                generation
+                    .lookup(&Key::Long(stray), &cache().await)
+                    .await
+                    .unwrap()
+                    .0,
+                Value::Absent,
+                "{residency}: routed to the bucket it hashes to, which holds no file"
+            );
+            assert_eq!(
+                refusal_of(generation.verify_buckets().await),
+                RefusalReason::KeyOutsideBucket {
+                    path: table.path_of("f"),
+                    key: Key::Long(stray),
+                    recorded: RECORDED,
+                    computed: COMPUTED,
+                },
+                "{residency}"
+            );
+        }
+    }
+
+    /// A correctly bucketed table and an unbucketed one pass the full check.
+    #[tokio::test]
+    async fn test_verify_buckets_passes_bucketed_and_unbucketed_files() {
+        let (bucketed, _) = two_bucket_table().await;
+        let config = bucketed.config(Residency::Full, None);
+        let generation = bucketed.load(&config, None, None).await.unwrap();
+        generation.verify_buckets().await.unwrap();
+
+        let mut unbucketed = Table::new(KeyType::Long, crate::manifest::testing::unpartitioned());
+        let keys = keys_from(0, E2E_KEYS);
+        unbucketed
+            .add_file(FileSpec {
+                name: "f",
+                keys: &long_keys(&keys),
+                values: values_of(&keys),
+                partition: Partition::None,
+                bounds: Bounds::Exact,
+                layout: WriterLayout::contract(),
+            })
+            .await;
+        unbucketed
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let config = unbucketed.config(Residency::Full, None);
+        let generation = unbucketed.load(&config, None, None).await.unwrap();
+        assert_eq!(generation.files[0].entry.bucketing, None);
+        generation.verify_buckets().await.unwrap();
     }
 
     #[test]

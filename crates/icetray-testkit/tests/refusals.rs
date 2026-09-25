@@ -19,8 +19,8 @@ use icetray_core::{
     Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState, bucket,
 };
 use icetray_testkit::fixture::{
-    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, TINY_BUDGET, TWO_BUCKETS,
-    local_catalog, position_delete_file, write_table_of_types,
+    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, STRAY_IDS, TINY_BUDGET,
+    TWO_BUCKETS, local_catalog, position_delete_file, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
@@ -53,12 +53,6 @@ const OVER_CAP_PAD: usize = MAX_KEY_BYTES;
 
 /// Rows of the over-cap fixture: few, each a few kibibytes, in one bucket.
 const OVER_CAP_IDS: Range<u64> = 0..300;
-
-/// Ids the misplaced-bucket fixture draws its raw file's keys from: above
-/// the fixture's own `IDS_2K`, so no key is written twice, and enough that
-/// each of two buckets gets dozens.
-const STRAY_IDS: Range<u64> = IDS_2K.end..IDS_2K.end + STRAY_ID_COUNT;
-const STRAY_ID_COUNT: u64 = 100;
 
 /// A table whose first load was refused: the reason, and the storage left
 /// behind for the GET assertions.

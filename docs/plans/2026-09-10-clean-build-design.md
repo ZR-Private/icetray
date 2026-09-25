@@ -130,7 +130,8 @@ pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Confi
 /// for a duplicate within one file, the later file of a bucket otherwise.
 /// `KeyOutsideBucket` names a bucketed file, the first key found hashing to
 /// another bucket than its manifest entry records, and both buckets; the load
-/// hashes each new file's fences and first and last key.
+/// hashes each new file's fences and first and last key, the doctor every key
+/// (`Generation::verify_buckets`).
 /// `ValueTypeUnsupported` is raised from the snapshot's schema by
 /// `TableLayout::derive`, so it names no file and carries the Iceberg type's
 /// `Display` (the type does not implement `Hash`); a data file whose physical
@@ -739,6 +740,12 @@ impl Generation {
     /// different bucketings that share a number share one entry.
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize>;
     pub fn overlap_groups_verified(&self) -> usize;
+    /// The doctor's full bucket check (RFD 016): every key of every bucketed
+    /// file decoded one key page at a time from `key_chunks_for_verification`,
+    /// `LOAD_CONCURRENCY` files at a time, and hashed under the file's own
+    /// bucketing; the first outside the recorded bucket is
+    /// `RefusalReason::KeyOutsideBucket`. No load or refresh calls it.
+    pub async fn verify_buckets(&self) -> Result<()>;
     /// One lookup and its `result` label: `Miss` for `Absent`; for a present key `ColdHit` when
     /// its value page was `Fetched` and `WarmHit` when `Cached`. Only the value page decides
     /// it, never a key-page GET in the Bloom tier or a chunk-file read in the Disk tier.
@@ -973,8 +980,9 @@ across two), null keys, duplicate keys (a key equal to the one before it
 within a file, or shared by two files of a bucket; never reported as
 unsorted), key outside bucket (a fence or the first or last key of a
 bucketed file hashes to another bucket than its manifest entry records;
-one hash per key page at load), key type mismatch, key type unsupported (the key column's Iceberg
-type is none of long, string, binary, fixed, or uuid), value type
+one hash per key page at load, and every key in the doctor, which reports
+it as a `refused` line with the refusal exit code), key type mismatch,
+key type unsupported (the key column's Iceberg type is none of long, string, binary, fixed, or uuid), value type
 unsupported (the value column must be Iceberg binary, fixed, or string,
 served as opaque bytes), delete files, key too long, and the two residency
 refusals of RFD 017: over budget, no bloom filter. Disk residency with no
@@ -1173,11 +1181,12 @@ and `FileReport`, the `file` lines only under `doctor --files`; a `get`
 line carries the key, `presence`
 (`present`/`null`/`absent`), the value as standard base64 and, when UTF-8,
 as text, `value_bytes`, `snapshot_id`, the GETs the lookup issued, and
-`elapsed_micros`; a table the doctor could not load is one `refused` line
+`elapsed_micros`; a table the doctor could not load, or whose
+`Generation::verify_buckets` failed after the load, is one `refused` line
 (`table`, `reason` as the `ErrorKind`'s name, `message`). The doctor opens
 every table with `strict` off. Exit codes: 0 for a run that did what was
-asked; 1 for a load or read error, a table the doctor could not load (which
-dominates 2), a configuration file that cannot be read or parsed or breaks
+asked; 1 for a load or read error, a table the doctor could not load or
+refused (which dominates 2), a configuration file that cannot be read or parsed or breaks
 one of its rules (a bad log field mapping among them), a
 first-load failure, a bind failure, or a drain that passed its deadline;
 2 when the doctor found a cost

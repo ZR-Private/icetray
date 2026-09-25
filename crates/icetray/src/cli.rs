@@ -66,7 +66,7 @@ pub enum Command {
     },
     /// Diagnose tables: serviceability, cost findings with their penalties,
     /// and advice. Exits 2 when a table serves at a cost, 1 when one cannot
-    /// be loaded.
+    /// be loaded or is refused.
     Doctor {
         /// Where the tables come from.
         #[command(flatten)]

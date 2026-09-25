@@ -16,9 +16,10 @@ use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
 use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
-use icetray_core::{Key, KeyType, SnapshotId, TableState};
+use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
 use icetray_testkit::fixture::{
-    IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, UNPARTITIONED_FILE_BYTES,
+    IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS, TWO_BUCKETS,
+    UNPARTITIONED_FILE_BYTES,
 };
 use icetray_testkit::layout::Layout;
 use icetray_testkit::verify::series_value;
@@ -264,6 +265,60 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
     assert_eq!(report[0]["reason"], "unsorted");
     assert!(report[0]["message"].is_string());
+    Ok(())
+}
+
+/// A raw file of bucket-1 keys with one bucket-0 key between its first
+/// and last, recorded under bucket 1, beside a fixture of two buckets: the
+/// stray key is no fence, so the load serves the table and `get` answers
+/// that key absent, and the doctor's full bucket check refuses the table.
+#[tokio::test]
+async fn test_doctor_refuses_a_key_outside_its_bucket_that_the_load_serves() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let catalog = memory_catalog_local(dir.path()).await?;
+    let spec = FixtureSpec {
+        ids: IDS_2K,
+        buckets: TWO_BUCKETS,
+        ..FixtureSpec::small("kv_stray", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let (recorded, hashed) = (1, 0);
+    let buckets: Vec<(u64, u32)> = STRAY_IDS
+        .map(|id| (id, bucket(&fixture.key(id), TWO_BUCKETS)))
+        .collect();
+    let mut ids: Vec<u64> = buckets
+        .iter()
+        .filter(|(_, at)| *at == recorded)
+        .map(|(id, _)| *id)
+        .collect();
+    let (first, last) = (ids[0], ids[ids.len() - 1]);
+    let stray = buckets
+        .iter()
+        .find(|(id, at)| *at == hashed && first < *id && *id < last)
+        .map(|(id, _)| *id)
+        .expect("a bucket-0 id between the first and last bucket-1 id");
+    ids.push(stray);
+    ids.sort_unstable();
+    let raw = fixture.raw_file_in_bucket("stray.parquet", &ids, i32::try_from(recorded)?)?;
+    fixture.append_raw(catalog.as_ref(), raw).await?;
+    let Key::Long(stray_key) = fixture.key(stray) else {
+        panic!("a long-keyed fixture");
+    };
+
+    let get = run(
+        &[&["get"][..], &location(&fixture), &[&stray_key.to_string()]].concat(),
+        &[],
+    );
+    assert_exit(&get, EXIT_OK);
+    assert_eq!(lines(&get.stdout)[0]["presence"], "absent");
+
+    let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    let report = lines(&output.stdout);
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0]["kind"], "refused");
+    assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(report[0]["reason"], "key_outside_bucket");
     Ok(())
 }
 
