@@ -401,6 +401,22 @@ The gRPC port is plaintext and unauthenticated. Run it on a private network
 or behind a mesh or sidecar; there is no mode in which the port is safe to
 expose directly.
 
+Run each replica under a container memory limit, the backstop for what
+load's checks do not cover. Size it as the sum, over the tables the replica
+serves, of the doctor's `predicted` bytes for each table's tier
+(`predicted.full`, `predicted.disk_memory`, or `predicted.bloom`), doubled
+for a table a refresh can rewrite wholesale, since the new generation loads
+beside the serving one; plus `server.page_cache_bytes`; plus a margin of a
+quarter of that total for the process itself, requests in flight, and a
+load's transient chunks. Load refuses a key page header that declares more
+than its page can hold, before parquet allocates for it, but a footer that
+claims billions of rows, a value page decoded at lookup, and the lengths
+inside a delta-encoded page still size buffers from the file, and there the
+limit is what stops the process. A file that trips it takes down every
+replica that loads it, since they all load the same snapshot and restart
+into the same file; that is why the cases the checks know are refused
+instead, which on a refresh keeps the last good generation serving.
+
 A local volume is optional. Mount one to run disk-residency tables or to
 keep a disk level of the page cache across restarts. Everything in it is a
 copy of bytes in object storage, named by the data file it came from and

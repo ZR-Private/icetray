@@ -110,6 +110,22 @@ tool that prints JSON.
 A deployment without a mesh needs a sidecar or a private network; there is
 no mode in which the port is safe to expose directly.
 
+A replica runs under a memory limit set by its deployer, sized from the
+doctor's predicted resident bytes for each table's tier (doubled for a table
+a refresh can rewrite wholesale, since the new generation loads beside the
+serving one), plus the page cache's memory budget, plus a margin of a
+quarter of that total for the process, requests in flight, and a load's
+transient chunks. The limit is the backstop for allocations the load checks
+do not cover, not a substitute for them: RFD 004 (Resident key-chunk index)
+refuses a key page header that declares more than its page can hold, but a
+footer that claims billions of rows, a value page decoded at lookup, and
+the lengths inside a delta-encoded page still size buffers from the file. A
+file that trips the limit takes down every replica that loads it, because
+all of them load the same snapshot and restart into the same file; a limit
+alone would turn one bad file into a fleet-wide crash loop, which is why the
+cases the checks know are refused instead and, on a refresh, the last good
+generation keeps serving.
+
 Conveniences a given platform expects (its metric naming, its secret
 injection, any log structure beyond renamed fields) are the wrapper's
 job, and the wrapper is not in this repository. The surface is therefore

@@ -109,7 +109,9 @@ a footer claiming billions of rows widens them; value pages and a value
 column's dictionary, read at lookup, are not pre-scanned; and the value
 counts inside a page body, the lengths a delta-length or delta byte-array
 page carries, stay unchecked. Parquet's decoder reads those; Iceberg's
-default writer uses v1 pages, which do not carry them for key columns.
+default writer uses v1 pages, which do not carry them for key columns. A
+memory limit on the process is the backstop for what the checks do not
+cover (RFD 012 (Deployment contract)).
 
 One question stays open. Decoded key arrays as an opt-in: under a per-table
 memory budget they remove the per-lookup decode for tables that can afford
