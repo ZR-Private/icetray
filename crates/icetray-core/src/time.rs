@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 /// A duration as a float of seconds, the unit a Prometheus histogram takes
 /// and the unit its bucket bounds are declared in. The one place a
 /// `Duration` becomes a bare number for a metric.
-pub fn seconds(duration: Duration) -> f64 {
+pub(crate) fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
 
@@ -31,7 +31,7 @@ pub fn now() -> jiff::Timestamp {
 /// the credential cache compares and offsets it with `SystemTime`'s own
 /// methods rather than converting a value that can fall outside `jiff`'s
 /// range. Every other caller uses `now`.
-pub fn system_now() -> SystemTime {
+pub(crate) fn system_now() -> SystemTime {
     SystemTime::now()
 }
 
@@ -46,7 +46,7 @@ pub fn age_seconds(since: jiff::Timestamp) -> f64 {
 /// A wall-clock timestamp as seconds since the Unix epoch, with the
 /// fraction: the `generation_swapped_at_seconds` gauge, the unit Prometheus
 /// reads a time in. The one place a timestamp becomes epoch seconds.
-pub fn unix_seconds(at: jiff::Timestamp) -> f64 {
+pub(crate) fn unix_seconds(at: jiff::Timestamp) -> f64 {
     at.as_duration().as_secs_f64()
 }
 

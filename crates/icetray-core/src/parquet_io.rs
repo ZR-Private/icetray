@@ -43,7 +43,7 @@ const FOOTER_PREFETCH_BYTES: usize = 512 * 1024;
 /// table's hedge window for the reads a client waits on (RFD 013). Opening
 /// issues no request: the size comes from the manifest, never from a HEAD.
 #[derive(Debug)]
-pub struct FileHandle {
+pub(crate) struct FileHandle {
     /// The location as the manifest recorded it, before any rewriting.
     pub location: String,
     located: Located,
@@ -63,7 +63,7 @@ impl FileHandle {
     /// lookup reads this handle issues are hedged against that table's own
     /// latencies and never another's. Fails only when no store serves the
     /// location.
-    pub fn open(
+    pub(crate) fn open(
         storage: Arc<Storage>,
         location: &str,
         size: u64,
@@ -82,37 +82,32 @@ impl FileHandle {
     }
 
     /// The file's size in bytes, as the manifest recorded it.
-    pub fn size(&self) -> u64 {
+    pub(crate) fn size(&self) -> u64 {
         self.size
-    }
-
-    /// The storage this handle reads through, whose counters price its reads.
-    pub fn storage(&self) -> &Arc<Storage> {
-        &self.storage
     }
 
     /// `local::digest` of the file's footer, the thrift metadata and the
     /// eight trailing bytes: the `footer_digest` of a `DataFileIdentity`
     /// (RFD 017). `Some` once `load_metadata` has returned, computed from the
     /// tail the metadata reader fetched, so it costs no request of its own.
-    pub fn footer_digest(&self) -> Option<[u8; DIGEST_BYTES]> {
+    pub(crate) fn footer_digest(&self) -> Option<[u8; DIGEST_BYTES]> {
         self.footer_digest.get().copied()
     }
 
     /// One byte range on the load path: one load GET, never hedged.
-    pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+    pub(crate) async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
         self.storage.read_range(&self.located, range).await
     }
 
     /// Several byte ranges on the load path in one call to the store: one
     /// load GET per range, never hedged.
-    pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+    pub(crate) async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         self.storage.read_ranges(&self.located, ranges).await
     }
 
     /// One byte range on the lookup path: one lookup GET, hedged against
     /// the handle's table window and recorded into it (RFD 013).
-    pub async fn read_range_hedged(&self, range: Range<u64>) -> Result<Bytes> {
+    pub(crate) async fn read_range_hedged(&self, range: Range<u64>) -> Result<Bytes> {
         self.storage
             .read_range_hedged(&self.located, range, &self.hedge)
             .await
@@ -124,7 +119,7 @@ impl FileHandle {
     /// entry however it is reached, and concurrent lookups for one page
     /// share one fetch. That fetch, and every read without a cache, is one
     /// hedged lookup GET, so a read without a cache is always `Fetched`.
-    pub async fn read_page(
+    pub(crate) async fn read_page(
         self: &Arc<Self>,
         range: Range<u64>,
         cache: Option<&PageCache>,
@@ -155,7 +150,7 @@ impl FileHandle {
     /// comes back as the storage error it was, and a panic inside parquet's
     /// decode of the footer as `FileFault::DecoderPanicked`. On return
     /// `footer_digest` is set.
-    pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>> {
+    pub(crate) async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>> {
         self.load_metadata_prefetching(FOOTER_PREFETCH_BYTES).await
     }
 
@@ -294,10 +289,10 @@ fn reclaim(error: ParquetError) -> Error {
 
 /// Why a `Segments` refused a read (RFD 006): the byte was not in a held
 /// range, or the read started inside one and ran past its end. Carried
-/// inside `ParquetError::External`; `Segments::fault` gets it back out, so
-/// a test asserts the variant and never message text.
+/// inside `ParquetError::External`, where a test downcasts it back out, so
+/// it asserts the variant and never message text.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SegmentsFault {
+pub(crate) enum SegmentsFault {
     /// No held range contains the byte.
     #[error("byte {offset} is not resident")]
     NotResident {
@@ -323,7 +318,7 @@ pub enum SegmentsFault {
 /// touch the network fails loudly instead of quietly costing a GET (RFD
 /// 006).
 #[derive(Clone, Debug)]
-pub struct Segments {
+pub(crate) struct Segments {
     parts: Vec<(Range<u64>, Bytes)>,
     file_size: u64,
 }
@@ -332,7 +327,7 @@ impl Segments {
     /// Holds `parts` of a file `file_size` bytes long. Each part's bytes
     /// are exactly its range's length; a part that is not is a caller's
     /// fault, checked in debug builds.
-    pub fn new(mut parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self {
+    pub(crate) fn new(mut parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self {
         debug_assert!(
             parts
                 .iter()
@@ -347,22 +342,6 @@ impl Segments {
     /// from them once they are verified.
     pub(crate) fn parts(&self) -> &[(Range<u64>, Bytes)] {
         &self.parts
-    }
-
-    /// Bytes held, summed over the parts.
-    pub fn resident_len(&self) -> usize {
-        self.parts.iter().map(|(_, bytes)| bytes.len()).sum()
-    }
-
-    /// The `SegmentsFault` a parquet error carries, when it is one: a
-    /// reader that decoded over a `Segments` and failed learns whether it
-    /// asked for a byte it was never given.
-    pub fn fault(error: &ParquetError) -> Option<&SegmentsFault> {
-        if let ParquetError::External(source) = error {
-            source.downcast_ref::<SegmentsFault>()
-        } else {
-            None
-        }
     }
 
     /// The held range containing `start`, its bytes, and the offset of
@@ -435,6 +414,15 @@ mod tests {
     use crate::config::HedgeConfig;
     use crate::generation::testing::{cache, page_rows};
     use crate::storage::testing::{MEM_PREFIX, MemStore};
+
+    /// The `SegmentsFault` a parquet error carries, when it is one.
+    fn fault(error: &ParquetError) -> Option<&SegmentsFault> {
+        if let ParquetError::External(source) = error {
+            source.downcast_ref::<SegmentsFault>()
+        } else {
+            None
+        }
+    }
 
     /// The fixture file's key under the prefix.
     const FILE_KEY: &str = "db/t/data/f0.parquet";
@@ -604,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_metadata_costs_one_get_and_carries_both_indexes() {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         assert!(handle.size() > prefetch_bytes());
         assert_eq!(handle.size(), approx::count(file.len()));
 
@@ -621,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_metadata_costs_two_gets_when_the_indexes_start_before_the_tail() {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         // The footer and the thrift metadata fit exactly; the page indexes
         // before them do not.
         let footer_and_metadata = FOOTER_SIZE + metadata_len(&file);
@@ -638,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_metadata_costs_three_gets_when_the_metadata_does_not_fit() {
         let (handle, _, _) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
 
         // A prefetch of the footer's eight bytes alone: the thrift metadata
         // costs a second GET and, with nothing left over, the indexes a
@@ -708,17 +696,17 @@ mod tests {
         assert_eq!(metadata.num_row_groups(), ROW_GROUPS);
         assert!(metadata.offset_index().is_none());
         assert!(metadata.column_index().is_none());
-        assert_eq!(handle.storage().stats().gets(), 1);
+        assert_eq!(handle.storage.stats().gets(), 1);
         assert!(handle.footer_digest().is_some());
     }
 
     #[tokio::test]
     async fn test_load_metadata_fetch_failure_is_the_storage_error() {
         let (handle, window, _) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         let missing = Arc::new(
             FileHandle::open(
-                Arc::clone(handle.storage()),
+                Arc::clone(&handle.storage),
                 &format!("{MEM_PREFIX}{MISSING_KEY}"),
                 handle.size(),
                 window,
@@ -737,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_page_through_cache_costs_one_get_cold_and_none_warm() {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         let metadata = handle.load_metadata().await.unwrap();
         let range = first_value_page(&metadata);
         let cache = cache().await;
@@ -762,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_page_coalesces_concurrent_lookups_for_one_page() {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         let metadata = handle.load_metadata().await.unwrap();
         let range = first_value_page(&metadata);
         let cache = cache().await;
@@ -784,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_page_without_cache_costs_one_get_each_time() {
         let (handle, _, file) = open_fixture(&HedgeConfig::default()).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         let metadata = handle.load_metadata().await.unwrap();
         let range = first_value_page(&metadata);
         let before = stats.gets();
@@ -803,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_range_and_read_ranges_never_move_the_hedge_window() {
         let (handle, window, file) = open_fixture(&hedge_config(1)).await;
-        let stats = handle.storage().stats();
+        let stats = handle.storage.stats();
         let metadata = handle.load_metadata().await.unwrap();
         assert_eq!(window.delay(), None);
         let range = first_value_page(&metadata);
@@ -841,7 +829,11 @@ mod tests {
         let segments = segments();
         assert_eq!(segments.len(), SEGMENTS_FILE_SIZE);
         assert_eq!(
-            segments.resident_len(),
+            segments
+                .parts()
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .sum::<usize>(),
             range_len(&FIRST_HELD) + range_len(&SECOND_HELD)
         );
         assert_eq!(
@@ -868,19 +860,19 @@ mod tests {
         let segments = segments();
         let error = segments.get_bytes(GAP_OFFSET, 1).unwrap_err();
         assert_eq!(
-            Segments::fault(&error),
+            fault(&error),
             Some(&SegmentsFault::NotResident { offset: GAP_OFFSET })
         );
         let error = segments.get_read(FIRST_HELD.end).unwrap_err();
         assert_eq!(
-            Segments::fault(&error),
+            fault(&error),
             Some(&SegmentsFault::NotResident {
                 offset: FIRST_HELD.end
             })
         );
         let error = segments.get_bytes(0, 1).unwrap_err();
         assert_eq!(
-            Segments::fault(&error),
+            fault(&error),
             Some(&SegmentsFault::NotResident { offset: 0 })
         );
     }
@@ -892,7 +884,7 @@ mod tests {
             .get_bytes(STRADDLING.start, range_len(&STRADDLING))
             .unwrap_err();
         assert_eq!(
-            Segments::fault(&error),
+            fault(&error),
             Some(&SegmentsFault::CrossesResidentRange {
                 start: STRADDLING.start,
                 end: STRADDLING.end,
@@ -906,7 +898,7 @@ mod tests {
             .get_bytes(FIRST_HELD.start, usize::MAX)
             .unwrap_err();
         assert_eq!(
-            Segments::fault(&error),
+            fault(&error),
             Some(&SegmentsFault::CrossesResidentRange {
                 start: FIRST_HELD.start,
                 end: u64::MAX,
@@ -919,6 +911,6 @@ mod tests {
     #[test]
     fn test_fault_is_none_for_a_foreign_parquet_error() {
         let error = ParquetError::EOF(String::new());
-        assert_eq!(Segments::fault(&error), None);
+        assert_eq!(fault(&error), None);
     }
 }

@@ -61,7 +61,7 @@ impl DiskChunks {
     /// positioned, runs on the blocking pool so no worker stalls on disk,
     /// and counts as one local read of the range's length (RFD 017), counted
     /// before it is issued as GETs are.
-    pub async fn page(&self, range: Range<u64>) -> Result<Bytes> {
+    pub(crate) async fn page(&self, range: Range<u64>) -> Result<Bytes> {
         let Range { start, end } = range;
         let (file_offset, len) = self.shared.locate(start, end).ok_or_else(|| {
             self.shared
@@ -81,7 +81,7 @@ impl DiskChunks {
     /// serve it: what the index checks before it skips a chunk fetch on a
     /// reused file, since the identity does not say which column's chunks
     /// the file holds.
-    pub fn holds(&self, range: &Range<u64>) -> bool {
+    pub(crate) fn holds(&self, range: &Range<u64>) -> bool {
         self.shared.locate(range.start, range.end).is_some()
     }
 }
@@ -135,12 +135,12 @@ pub struct DiskLevel {
 impl DiskLevel {
     /// The directory the level lives in; it exists once `LocalDir::open`
     /// has returned.
-    pub fn dir(&self) -> &Path {
+    pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
 
     /// The bytes the level may occupy; above zero, or there is no level.
-    pub fn capacity_bytes(&self) -> u64 {
+    pub(crate) fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
 

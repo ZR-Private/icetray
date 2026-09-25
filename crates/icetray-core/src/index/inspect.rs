@@ -27,7 +27,7 @@ use crate::parquet_io::FileHandle;
 /// fetched yet. `build` is the chunk stage; between the two a caller holds
 /// the budget check of RFD 017.
 #[derive(Debug)]
-pub struct Inspected {
+pub(crate) struct Inspected {
     pub(super) table: String,
     pub(super) handle: Arc<FileHandle>,
     pub(super) metadata: Arc<ParquetMetaData>,
@@ -37,13 +37,8 @@ pub struct Inspected {
 
 impl Inspected {
     /// Every tier's resident bytes for the file, from its footer alone.
-    pub fn predicted(&self) -> &ResidentBytes {
+    pub(crate) fn predicted(&self) -> &ResidentBytes {
         &self.predicted
-    }
-
-    /// The file the footer belongs to.
-    pub fn handle(&self) -> &Arc<FileHandle> {
-        &self.handle
     }
 
     /// The bytes a Disk-tier `build` would add to `local`'s `index/`: zero
@@ -58,7 +53,7 @@ impl Inspected {
     /// for them twice (RFD 017). Reads the chunk file's header and no key
     /// chunk; a chunk file that fails a check counts as absent, as
     /// `LocalDir::chunks_for` treats it.
-    pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
+    pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
         let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
         Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
             Some(_) => 0,
@@ -1068,7 +1063,7 @@ mod tests {
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
         let inspected = inspect(&opened, KeyType::Long).await;
         assert_eq!(opened.stats().gets(), 1, "the footer alone");
-        assert!(Arc::ptr_eq(inspected.handle(), &opened.handle));
+        assert!(Arc::ptr_eq(&inspected.handle, &opened.handle));
         let predicted = *inspected.predicted();
         let index = inspected.build(Residency::Full, None).await.unwrap();
         assert_eq!(

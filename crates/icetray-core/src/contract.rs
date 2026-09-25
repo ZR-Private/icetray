@@ -28,7 +28,7 @@ pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
 /// The lower end of the data file size target, 32 mebibytes. Smaller files
 /// mean more files for the same bytes: more footer GETs at load and more
 /// index bytes per key (RFD 002).
-pub const TARGET_FILE_BYTES_MIN: u64 = 32 * 1024 * 1024;
+pub(crate) const TARGET_FILE_BYTES_MIN: u64 = 32 * 1024 * 1024;
 
 /// The upper end of the data file size target, 64 mebibytes. First-byte
 /// latency of a range GET rises with object size, and this is the largest

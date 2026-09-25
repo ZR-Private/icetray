@@ -38,7 +38,11 @@ impl Inspected {
     /// loader re-checks, since a configuration built in code may skip
     /// `Config::validated`; it is raised here as the same
     /// `ConfigViolation`, before any chunk is fetched.
-    pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex> {
+    pub(crate) async fn build(
+        self,
+        residency: Residency,
+        local: Option<&LocalDir>,
+    ) -> Result<FileIndex> {
         let Self {
             table,
             handle,
@@ -1556,12 +1560,12 @@ mod tests {
             before + count(ROW_GROUPS),
             "the chunks are fetched again"
         );
+        let held = |segments: &Segments| -> usize {
+            segments.parts().iter().map(|(_, bytes)| bytes.len()).sum()
+        };
         assert_eq!(
-            chunks.resident_len(),
-            full.key_chunks_for_verification()
-                .await
-                .unwrap()
-                .resident_len()
+            held(&chunks),
+            held(&full.key_chunks_for_verification().await.unwrap())
         );
         assert_eq!(
             stats.gets(),

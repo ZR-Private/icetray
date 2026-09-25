@@ -640,7 +640,7 @@ impl StandardField {
     pub(crate) const ALL: [Self; 4] = [Self::Time, Self::Level, Self::Message, Self::Target];
 
     /// The field's lowercase name.
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Time => "time",
             Self::Level => "level",

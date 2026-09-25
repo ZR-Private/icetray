@@ -10,26 +10,26 @@ use std::fmt;
 /// gRPC calls received, by `call`.
 pub const REQUESTS_TOTAL: &str = "icetray_requests_total";
 /// Object-store GETs issued, by `kind`; a hedge is a GET and counts here too.
-pub const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
+pub(crate) const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
 /// Bytes requested across those GETs, by `kind`.
-pub const OBJECT_BYTES_TOTAL: &str = "icetray_object_bytes_total";
+pub(crate) const OBJECT_BYTES_TOTAL: &str = "icetray_object_bytes_total";
 /// Reads served from the local directory (RFD 017).
-pub const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
+pub(crate) const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
 /// Bytes of those local reads.
-pub const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
+pub(crate) const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
 /// Second requests issued because a lookup GET was slow (RFD 013).
-pub const HEDGES_TOTAL: &str = "icetray_hedges_total";
+pub(crate) const HEDGES_TOTAL: &str = "icetray_hedges_total";
 /// Value pages served from the page cache without a fetch.
-pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
+pub(crate) const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Value-page fetches the page cache ran, after coalescing.
-pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
+pub(crate) const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Lookups answered, by `table` and `result`.
-pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
+pub(crate) const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Refreshes that failed and left the previous generation serving, by
 /// `table` and `reason`.
-pub const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
+pub(crate) const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
 /// Generations swapped in, by `table`.
-pub const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
+pub(crate) const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
 
 /// Lookup latency in seconds, by `table` and `result`.
 pub const LOOKUP_SECONDS: &str = "icetray_lookup_seconds";
@@ -38,13 +38,13 @@ pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
 
 /// The resident index's live bytes, by `table`: what a residency tier sheds,
 /// which process memory does not show on every platform.
-pub const INDEX_BYTES: &str = "icetray_index_bytes";
+pub(crate) const INDEX_BYTES: &str = "icetray_index_bytes";
 /// The process's resident set size.
 pub const PROCESS_RSS_BYTES: &str = "icetray_process_rss_bytes";
 /// Bytes the page cache holds.
-pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
+pub(crate) const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and `code`.
-pub const FINDINGS: &str = "icetray_findings";
+pub(crate) const FINDINGS: &str = "icetray_findings";
 /// Seconds from the served snapshot's timestamp to now, by `table`.
 pub const GENERATION_AGE_SECONDS: &str = "icetray_generation_age_seconds";
 /// The serving snapshot's sequence number, by `table`: one series per
@@ -59,16 +59,16 @@ pub const TABLE_STATE: &str = "icetray_table_state";
 /// The `call` label: the RPC, from the RPC enum's `Display`.
 pub const LABEL_CALL: &str = "call";
 /// The `kind` label: the read path, from `ReadKind`.
-pub const LABEL_KIND: &str = "kind";
+pub(crate) const LABEL_KIND: &str = "kind";
 /// The `table` label: the table's configured name.
 pub const LABEL_TABLE: &str = "table";
 /// The `result` label: the lookup outcome, from `LookupResult`.
-pub const LABEL_RESULT: &str = "result";
+pub(crate) const LABEL_RESULT: &str = "result";
 /// The `reason` label: why a refresh failed, from `ErrorKind`, which gives
 /// the refusal's own name for a refusal.
-pub const LABEL_REASON: &str = "reason";
+pub(crate) const LABEL_REASON: &str = "reason";
 /// The `code` label: the finding, from `FindingCode`.
-pub const LABEL_CODE: &str = "code";
+pub(crate) const LABEL_CODE: &str = "code";
 /// The `state` label: the table's lifecycle state, from `TableState`.
 pub const LABEL_STATE: &str = "state";
 
@@ -78,7 +78,7 @@ pub const LABEL_STATE: &str = "state";
 /// client waits on and are the only ones hedged (RFD 013). Display gives the
 /// label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReadKind {
+pub(crate) enum ReadKind {
     /// A read made while a generation is built.
     Load,
     /// A read made to answer a client's lookup.
@@ -98,7 +98,7 @@ impl fmt::Display for ReadKind {
 /// The three outcomes of a lookup as the `result` metric label sees them.
 /// Display gives the `snake_case` label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LookupResult {
+pub(crate) enum LookupResult {
     /// The key was present and its value page was fetched.
     ColdHit,
     /// The key was present and its value page was already cached.

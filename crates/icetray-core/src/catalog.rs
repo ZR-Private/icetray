@@ -142,7 +142,7 @@ pub enum TableFault {
 /// The current metadata and the location it was read from; the location is
 /// what a later poll compares against.
 #[derive(Clone, Debug)]
-pub struct Resolved {
+pub(crate) struct Resolved {
     /// The parsed metadata.
     pub metadata: Arc<TableMetadata>,
     /// The metadata file's location.
@@ -152,7 +152,7 @@ pub struct Resolved {
 impl Resolved {
     /// The snapshot the branch or tag `ref_name` points at; a ref the
     /// metadata does not have is `TableFault::RefNotFound` under `table`.
-    pub fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>> {
+    pub(crate) fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>> {
         self.metadata
             .snapshot_for_ref(ref_name)
             .cloned()
@@ -228,7 +228,7 @@ impl TableSource {
     /// The current metadata. A static root costs two reads, the version
     /// hint and the metadata file; a static metadata file one; a catalog
     /// source one table load from the catalog and no object-storage read.
-    pub async fn resolve(&self, storage: &Storage) -> Result<Resolved> {
+    pub(crate) async fn resolve(&self, storage: &Storage) -> Result<Resolved> {
         Ok(self
             .resolve_if_changed(storage, None)
             .await?
@@ -242,7 +242,7 @@ impl TableSource {
     /// client parses either way, within `Storage::catalog_timeout`. A
     /// static source that names a metadata file directly reads nothing and
     /// never advances.
-    pub async fn resolve_if_changed(
+    pub(crate) async fn resolve_if_changed(
         &self,
         storage: &Storage,
         known: Option<&str>,

@@ -248,11 +248,6 @@ impl Table {
         &self.config.name
     }
 
-    /// The table's configuration.
-    pub fn config(&self) -> &TableConfig {
-        &self.config
-    }
-
     /// The lifecycle state now.
     pub fn state(&self) -> TableState {
         self.state
@@ -1012,7 +1007,7 @@ mod tests {
         };
         let fixture = one_file_fixture(cost).await;
         let strict = table_over(&fixture, fixture.config(Residency::Full, None)).await;
-        assert!(strict.config().strict);
+        assert!(strict.config.strict);
         let error = strict.load().await.unwrap_err();
         let Error::Inefficient { findings, .. } = error else {
             panic!("expected Inefficient, got {error:?}");

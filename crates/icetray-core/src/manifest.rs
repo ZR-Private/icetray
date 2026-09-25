@@ -47,7 +47,7 @@ pub struct Bucketing {
 
 impl Bucketing {
     /// The bucket `key` falls in under this transform.
-    pub fn bucket_of(&self, key: &Key) -> u32 {
+    pub(crate) fn bucket_of(self, key: &Key) -> u32 {
         bucket::bucket(key, self.count)
     }
 }
@@ -87,7 +87,7 @@ impl TableLayout {
     /// `TableFault::SchemaMissing`. Bucketing comes from `md`'s default
     /// partition spec, since a snapshot records no spec of its own; a
     /// bucket count of zero there is `TableFault::ZeroBuckets`.
-    pub fn derive(
+    pub(crate) fn derive(
         table: &str,
         md: &TableMetadata,
         snapshot: &Snapshot,
@@ -258,7 +258,7 @@ pub struct DataFileEntry {
 /// manifest's lower and upper bounds for the key field through
 /// `Key::from_datum`. The result is ordered by (bucketing, bucket, `key_min`
 /// with `None` first, path), the same for the same manifests in any order.
-pub async fn list_data_files(
+pub(crate) async fn list_data_files(
     table: &str,
     md: &TableMetadata,
     snapshot: &Snapshot,

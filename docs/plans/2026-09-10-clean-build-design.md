@@ -35,7 +35,12 @@ server (`tests/serve.rs`) and the built binary over local fixtures
 ## 2. `icetray-core` module map and owners
 
 Modules in dependency order. "Owns" is the concept no other module may
-redefine.
+redefine. `approx`, `catalog`, `check`, `config`, `contract`, `generation`,
+`key`, `metric`, `open`, and `time` are public namespaces, which other crates
+name by path (`icetray_core::config::TableConfig`). `bucket`, `cache`,
+`error`, `index`, `local`, `manifest`, `parquet_io`, `snapshot`, `storage`,
+and `table` are private: what other crates use of them is reached through
+the re-exports at the crate root (`icetray_core::FileIndex`).
 
 | module | owns | RFD |
 |---|---|---|
@@ -69,15 +74,18 @@ doctor without inverting the dependency direction.
 ## 3. Frozen public signatures (`icetray-core`)
 
 These are the seams other crates and parallel workers build against. Bodies
-and private items are free, and a `pub` item only its own crate calls is not
-listed; changing a signature below means updating this document first.
+and private items are free; an item marked `pub(crate)` is a seam between
+core's own modules, and no other crate reaches it. Each block is headed by the
+module that defines it; a type from a private module (section 2) is named
+through its root re-export. Changing a signature below means updating this
+document first.
 
 ```rust
 // error
-// Core's `Error` carries iceberg, parquet, and object_store errors as variants, and `Resolved`
-// exposes iceberg's `TableMetadata`, because core has no consumer outside this workspace, which
-// versions its crates together, and the binary matches only on the variants; a consumer of core
-// outside the workspace is what changes that, and library types then come off the public surface.
+// Core's `Error` carries iceberg, parquet, and object_store errors as variants because core has
+// no consumer outside this workspace, which versions its crates together, and the binary matches
+// only on the variants; a consumer of core outside the workspace is what changes that, and
+// library types then come off the public surface.
 pub enum Error {
     Iceberg(#[from] iceberg::Error),
     Parquet(#[from] parquet::errors::ParquetError),
@@ -148,7 +156,7 @@ pub struct SequenceNumber(pub i64);
 
 // metric
 /// Metric label values for lookups.
-pub enum LookupResult { ColdHit, WarmHit, Miss }
+pub(crate) enum LookupResult { ColdHit, WarmHit, Miss }
 
 // key
 /// The width of an Iceberg uuid and of the FIXED_LEN_BYTE_ARRAY Parquet stores it in.
@@ -178,7 +186,7 @@ impl KeyType {
 pub enum Key { Long(i64), Str(String), Bytes(Vec<u8>), Uuid([u8; UUID_BYTES]) }
 impl Key {
     pub fn key_type(&self) -> KeyType;
-    pub fn from_datum(datum: &iceberg::spec::Datum) -> Option<Self>;
+    pub(crate) fn from_datum(datum: &iceberg::spec::Datum) -> Option<Self>;
     /// The bytes the bucket transform and byte-wise comparisons see.
     pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]>;
     /// A statistic that cannot be read never excludes.
@@ -231,7 +239,7 @@ impl LogConfig { pub fn emitted_name(&self, field: StandardField) -> &str; }
 /// The standard fields of every log event (RFD 012). Display and serde give the file's lowercase
 /// name (`time`, `level`, `message`, `target`), which is also the default emitted name.
 pub enum StandardField { Time, Level, Message, Target }
-impl StandardField { pub(crate) const ALL: [Self; 4]; pub const fn name(self) -> &'static str; }
+impl StandardField { pub(crate) const ALL: [Self; 4]; pub(crate) const fn name(self) -> &'static str; }
 pub struct HedgeConfig { pub enabled: bool, pub percentile: f64, pub window: usize, pub max_rate: f64 }
 pub struct S3Config { pub endpoint: Option<String>, pub region: Option<String>, pub access_key_id: Option<String>, pub secret_access_key: Option<String>, pub allow_http: bool, pub path_style: bool }
 pub struct RewriteRule { pub from: String, pub to: String }
@@ -272,14 +280,14 @@ pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64
 impl IoStats { pub fn gets(&self) -> u64; pub fn bytes(&self) -> u64; pub fn hedges(&self) -> u64; pub fn local_reads(&self) -> u64; pub fn local_bytes(&self) -> u64; }
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`;
 /// the hedge delay is its configured percentile, capped by the hedge rate.
-pub struct HedgeWindow;
-impl HedgeWindow { pub fn new(config: &HedgeConfig) -> Self; pub fn delay(&self) -> Option<Duration>; pub fn record(&self, elapsed: Duration, hedged: bool); }
+pub(crate) struct HedgeWindow;
+impl HedgeWindow { pub(crate) fn new(config: &HedgeConfig) -> Self; pub(crate) fn delay(&self) -> Option<Duration>; pub(crate) fn record(&self, elapsed: Duration, hedged: bool); }
 
 // local
 /// The width of the digest a chunk file is named by and a footer is
 /// identified by: SHA-256, which `digest` computes; the one home of the algorithm.
-pub const DIGEST_BYTES: usize = 32;
-pub fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES];
+pub(crate) const DIGEST_BYTES: usize = 32;
+pub(crate) fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES];
 /// Why the local directory failed; closed. `Io` is the operation's error, the
 /// rest are the format's boundaries and the blocking pool's.
 pub enum LocalFault { Io(std::io::Error), RangeNotResident { start: u64, end: u64 }, ChunkLengthMismatch { start: u64, end: u64, len: u64 }, ChunkOverlap { start: u64, end: u64 }, HeaderTooLarge { len: usize }, Join(tokio::task::JoinError) }
@@ -291,16 +299,16 @@ impl LocalDir {
     /// Writes verified key chunks, collected and sorted by data offset because the
     /// header names every span before the first payload byte; returns the handle
     /// the index keeps.
-    pub fn write_chunks(&self, identity: &DataFileIdentity, chunks: impl Iterator<Item = (Range<u64>, Bytes)>) -> Result<DiskChunks>;
+    pub(crate) fn write_chunks(&self, identity: &DataFileIdentity, chunks: impl Iterator<Item = (Range<u64>, Bytes)>) -> Result<DiskChunks>;
     /// Deletes chunk files no current generation references. `live` is the union
     /// over every table sharing the directory.
-    pub fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64>;
+    pub(crate) fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64>;
     /// The bytes every file under `index/` occupies, and the bound from
     /// `LocalConfig::index_budget_bytes`; a crate-internal `reserve` checks
     /// them with every outstanding reservation and holds a load's bytes
     /// until it has written (RFD 017).
     pub fn index_bytes_in_use(&self) -> Result<u64>;
-    pub fn index_budget(&self) -> Option<u64>;
+    pub(crate) fn index_budget(&self) -> Option<u64>;
     /// `None` when `page_cache_disk_bytes` is zero; otherwise a level of at
     /// least one block, which `Config::parse` has checked.
     pub fn page_cache_level(&self) -> Option<DiskLevel>;
@@ -309,9 +317,9 @@ impl LocalDir {
 /// wraps the bytes a page read returns in a `Segments`.
 pub struct DiskChunks;
 impl DiskChunks {
-    pub async fn page(&self, range: Range<u64>) -> Result<Bytes>;
+    pub(crate) async fn page(&self, range: Range<u64>) -> Result<Bytes>;
     /// Whether one stored chunk holds the whole range; checked before a reused file skips the chunk fetch.
-    pub fn holds(&self, range: &Range<u64>) -> bool;
+    pub(crate) fn holds(&self, range: &Range<u64>) -> bool;
 }
 /// What a chunk file is named by and validated against; written into its
 /// header inside the RFD 011 envelope as a `ChunkFileHeader` message.
@@ -325,29 +333,29 @@ pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest
 /// from it is charged to as one local read, the same counter `LocalDir`
 /// charges chunk reads to (RFD 003).
 pub struct DiskLevel;
-impl DiskLevel { pub fn dir(&self) -> &Path; pub fn capacity_bytes(&self) -> u64; }
-pub struct Located { pub store: Arc<dyn ObjectStore>, pub path: object_store::path::Path }
+impl DiskLevel { pub(crate) fn dir(&self) -> &Path; pub(crate) fn capacity_bytes(&self) -> u64; }
+pub(crate) struct Located { pub store: Arc<dyn ObjectStore>, pub path: object_store::path::Path }
 pub struct Storage;
 impl Storage {
     pub fn new(config: StorageConfig) -> Self;
-    pub async fn with_sdk_defaults(config: StorageConfig) -> Self;
+    pub(crate) async fn with_sdk_defaults(config: StorageConfig) -> Self;
     pub fn register(&self, prefix: impl Into<String>, store: Arc<dyn ObjectStore>);
     pub fn stats(&self) -> Arc<IoStats>;
     /// The hedge settings this storage runs under; `Table::new` builds the table's
     /// `HedgeWindow` from it, so the frozen `Table::new` takes no `HedgeConfig`.
-    pub fn hedge_config(&self) -> &HedgeConfig;
+    pub(crate) fn hedge_config(&self) -> &HedgeConfig;
     /// `storage.catalog_timeout`, which bounds each catalog call `TableSource` makes; the
     /// catalog client never reads through `Storage`, but every resolve has one in hand.
-    pub fn catalog_timeout(&self) -> Duration;
+    pub(crate) fn catalog_timeout(&self) -> Duration;
     /// Rewrite rules first, then the store for the `scheme://authority/` prefix;
     /// no store is `ConfigViolation::NoStoreForLocation`, a relative path
     /// `ConfigViolation::LocationNotAbsolute`. `file:///path`, the authority-less
     /// `file:/path` a Hadoop catalog records, and a bare absolute path all name the
     /// local filesystem store.
-    pub fn locate(&self, location: &str) -> Result<Located>;
+    pub(crate) fn locate(&self, location: &str) -> Result<Located>;
     pub async fn read_all(&self, location: &str) -> Result<Bytes>;
     /// Load path: never hedged.
-    pub async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes>;
+    pub(crate) async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes>;
     /// Lookup path: hedged per `HedgeConfig` against the table's own latency
     /// window, since file size sets first-byte latency per table (RFD 013).
     /// Reads are timed on tokio's clock (`tokio::time::Instant`), which a paused
@@ -355,8 +363,8 @@ impl Storage {
     /// the timer that consults it agree; the wall clock would feed the window real
     /// durations under a virtual timer and make the hedge count in simulation an
     /// artifact of machine load. Outside a paused runtime it is the same monotonic clock.
-    pub async fn read_range_hedged(&self, l: &Located, range: Range<u64>, window: &HedgeWindow) -> Result<Bytes>;
-    pub async fn read_ranges(&self, l: &Located, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
+    pub(crate) async fn read_range_hedged(&self, l: &Located, range: Range<u64>, window: &HedgeWindow) -> Result<Bytes>;
+    pub(crate) async fn read_ranges(&self, l: &Located, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
 }
 
 // catalog
@@ -370,10 +378,10 @@ impl Storage {
 /// past the spec's count, which no key hashes to. `SnapshotTimestampOutOfRange` is a
 /// snapshot timestamp jiff cannot represent, raised by `Generation::load` before any read.
 pub enum TableFault { RefNotFound { ref_name: String }, SchemaMissing { schema_id: i32 }, SpecMissing { spec_id: i32 }, ColumnMissing { column: String }, ZeroBuckets { spec_id: i32 }, BucketValueMissing { path: String, spec_id: i32 }, BucketValueOutOfRange { path: String, spec_id: i32, bucket: u32, count: u32 }, VersionHintEmpty { root: String }, VersionHintMalformed { root: String, hint: String }, MetadataLocationUnknown, SnapshotTimestampOutOfRange { snapshot_id: SnapshotId } }
-pub struct Resolved { pub metadata: Arc<TableMetadata>, pub location: String }
+pub(crate) struct Resolved { pub metadata: Arc<TableMetadata>, pub location: String }
 impl Resolved {
     /// A ref the metadata lacks is `TableFault::RefNotFound` under `table`.
-    pub fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>>;
+    pub(crate) fn snapshot_for_ref(&self, table: &str, ref_name: &str) -> Result<Arc<Snapshot>>;
 }
 pub enum TableSource { Static { location: String }, Catalog { catalog: Arc<dyn Catalog>, ident: TableIdent } }
 impl TableSource {
@@ -392,14 +400,14 @@ impl TableSource {
     /// `VersionHintEmpty`, more than one token or not UTF-8 is
     /// `VersionHintMalformed`). A catalog record without a metadata location
     /// is `MetadataLocationUnknown`.
-    pub async fn resolve(&self, storage: &Storage) -> Result<Resolved>;
+    pub(crate) async fn resolve(&self, storage: &Storage) -> Result<Resolved>;
     /// One small read when nothing moved: the version hint of a static root,
     /// parsing no metadata, or one table load from the catalog, whose metadata
     /// the client parses either way; a pinned metadata file reads nothing. With
     /// no `known` location nothing is unchanged, which is how `resolve` reads.
     /// A catalog load runs under `tokio::time::timeout` of `storage.catalog_timeout()`
     /// and past it is `Error::CatalogTimeout`.
-    pub async fn resolve_if_changed(&self, storage: &Storage, known: Option<&str>) -> Result<Option<Resolved>>;
+    pub(crate) async fn resolve_if_changed(&self, storage: &Storage, known: Option<&str>) -> Result<Option<Resolved>>;
 }
 /// The metadata file a bare `version` names under `root`: `metadata/v<version>.metadata.json`,
 /// the Hadoop catalog's layout. A writer publishing a snapshot by hand (the testkit's
@@ -416,7 +424,7 @@ pub fn hint_location(root: &str) -> String;
 /// Files of one snapshot carry different bucketings after a spec evolution,
 /// and a key's bucket differs under each. Ord, so it keys routes and orders files.
 pub struct Bucketing { pub count: u32, pub source_field_id: i32 }
-impl Bucketing { pub fn bucket_of(&self, key: &Key) -> u32; }
+impl Bucketing { pub(crate) fn bucket_of(self, key: &Key) -> u32; }
 /// `bucketing` is the default spec's, the one new files are written under,
 /// which `TableInfo` and the doctor report; each data file routes by its own
 /// manifest's spec (`DataFileEntry::bucketing`).
@@ -431,7 +439,7 @@ impl TableLayout {
     /// fixed, or string is `ValueTypeUnsupported`. The bucketing is the first
     /// field of the default spec, in spec order, that buckets the key; a
     /// count of zero there is `TableFault::ZeroBuckets`.
-    pub fn derive(table: &str, md: &TableMetadata, snapshot: &Snapshot, key_column: &str, value_column: &str) -> Result<Self>;
+    pub(crate) fn derive(table: &str, md: &TableMetadata, snapshot: &Snapshot, key_column: &str, value_column: &str) -> Result<Self>;
 }
 /// `bucketing` is the transform of the file's own manifest's spec, `None`
 /// when that spec has no bucket on the key, and `bucket` is then `0`, the one
@@ -447,52 +455,49 @@ pub struct DataFileEntry { pub path: String, pub bucket: u32, pub bucketing: Opt
 /// one at or past the spec's count `TableFault::BucketValueOutOfRange`.
 /// Ordered by (bucketing, bucket, `key_min` with `None` first, path), the same
 /// for the same manifests in any order.
-pub async fn list_data_files(table: &str, md: &TableMetadata, snapshot: &Snapshot, layout: &TableLayout, storage: &Storage) -> Result<Vec<DataFileEntry>>;
+pub(crate) async fn list_data_files(table: &str, md: &TableMetadata, snapshot: &Snapshot, layout: &TableLayout, storage: &Storage) -> Result<Vec<DataFileEntry>>;
 
 // parquet_io
-pub struct FileHandle { pub location: String }
+pub(crate) struct FileHandle { pub location: String }
 impl FileHandle {
     /// `size` is the manifest's, so opening issues no request. `hedge` is the
     /// owning table's window (RFD 013): lookup reads are hedged against it and
     /// recorded into it, load reads never touch it.
-    pub fn open(storage: Arc<Storage>, location: &str, size: u64, hedge: Arc<HedgeWindow>) -> Result<Self>;
-    pub fn size(&self) -> u64;
-    pub fn storage(&self) -> &Arc<Storage>;
+    pub(crate) fn open(storage: Arc<Storage>, location: &str, size: u64, hedge: Arc<HedgeWindow>) -> Result<Self>;
+    pub(crate) fn size(&self) -> u64;
     /// `local::digest` of the footer (the thrift metadata and the eight
     /// trailing bytes), the `footer_digest` of a `DataFileIdentity`; `Some`
     /// once `load_metadata` has returned, computed from the bytes that load
     /// fetched, so it costs no request of its own.
-    pub fn footer_digest(&self) -> Option<[u8; local::DIGEST_BYTES]>;
+    pub(crate) fn footer_digest(&self) -> Option<[u8; local::DIGEST_BYTES]>;
     /// Load path, never hedged: one load GET per range.
-    pub async fn read_range(&self, range: Range<u64>) -> Result<Bytes>;
-    pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
+    pub(crate) async fn read_range(&self, range: Range<u64>) -> Result<Bytes>;
+    pub(crate) async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
     /// Lookup path: one lookup GET, hedged against the table's window.
-    pub async fn read_range_hedged(&self, range: Range<u64>) -> Result<Bytes>;
+    pub(crate) async fn read_range_hedged(&self, range: Range<u64>) -> Result<Bytes>;
     /// The footer and both page indexes behind a tail prefetch: one load GET
     /// when the tail fits it, one more when the indexes start before the
     /// prefetched tail, two more when the thrift metadata itself does not fit.
     /// The page indexes are read when the file has them; a file without them
     /// loads with neither and `index` refuses it as `FileFault::MissingPageIndex`.
     /// A failed fetch comes back as the storage error it was, not as a parquet error.
-    pub async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
+    pub(crate) async fn load_metadata(self: &Arc<Self>) -> Result<Arc<ParquetMetaData>>;
     /// One page on the lookup path and where it came from: through `cache` when given,
     /// keyed by file id and `range.start`, so concurrent lookups for one page share one
     /// fetch; that fetch, and every read without a cache, is one hedged lookup GET, so a
     /// read without a cache is always `Fetched`.
-    pub async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<(Bytes, PageOrigin)>;
+    pub(crate) async fn read_page(self: &Arc<Self>, range: Range<u64>, cache: Option<&PageCache>) -> Result<(Bytes, PageOrigin)>;
 }
 /// Why a `Segments` refused a read; carried inside `ParquetError::External`.
-pub enum SegmentsFault { NotResident { offset: u64 }, CrossesResidentRange { start: u64, end: u64, held_start: u64, held_end: u64 } }
-pub struct Segments;
+pub(crate) enum SegmentsFault { NotResident { offset: u64 }, CrossesResidentRange { start: u64, end: u64, held_start: u64, held_end: u64 } }
+pub(crate) struct Segments;
 impl Segments {
-    pub fn new(parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self; pub fn resident_len(&self) -> usize;
-    /// The `SegmentsFault` a parquet error carries, when it is one, so a caller matches the variant.
-    pub fn fault(error: &ParquetError) -> Option<&SegmentsFault>;
+    pub(crate) fn new(parts: Vec<(Range<u64>, Bytes)>, file_size: u64) -> Self;
 }
 impl parquet::file::reader::ChunkReader for Segments { /* errors, typed as SegmentsFault, on non-resident bytes */ }
 
 // index (MAX_KEY_BYTES comes from `contract`)
-pub struct RowRef { pub row_group: usize, pub row: i64 }
+pub(crate) struct RowRef { pub row_group: usize, pub row: i64 }
 /// What makes a data file unservable beyond the contract refusals; closed set.
 /// A key physical type that does not match is a refusal (`KeyTypeMismatch`),
 /// never a fault. A value column stored as anything but a byte array is
@@ -579,13 +584,14 @@ impl FileIndex {
     /// and skips the chunk fetch), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are
     /// taken; it is never part of the resident set. `build` is `inspect`
-    /// followed by `Inspected::build`.
-    pub async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
+    /// followed by `Inspected::build`; only tests call it (`#[cfg(test)]`),
+    /// since the loader runs the two stages apart around its budget check.
+    pub(crate) async fn build(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType, residency: Residency, local: Option<&LocalDir>) -> Result<Self>;
     /// The footer stage of `build` on its own: one GET, every footer check,
     /// the footer trimmed to what the index keeps, and the prediction, so
     /// `generation` checks every file against a budget before any key chunk
     /// is fetched (RFD 017).
-    pub async fn inspect(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType) -> Result<Inspected>;
+    pub(crate) async fn inspect(table: &str, handle: Arc<FileHandle>, key_column: &str, value_column: &str, key_type: KeyType) -> Result<Inspected>;
     /// Every tier's resident bytes for the file `handle` opens, from the
     /// footer alone, the same from the footer as loaded and as kept: no other
     /// column's column index is counted either way, so the budget check at
@@ -594,62 +600,62 @@ impl FileIndex {
     /// past it makes `bloom` `None` (a Bloom build refuses it); the totals
     /// saturate. `disk_bytes` is the chunk file for the handle's identity,
     /// header and key chunks, so the handle has loaded its footer.
-    pub fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, handle: &FileHandle) -> ResidentBytes;
+    pub(crate) fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, handle: &FileHandle) -> ResidentBytes;
     pub fn key_range(&self) -> (&Key, &Key);
-    pub fn may_contain(&self, key: &Key) -> bool;
+    pub(crate) fn may_contain(&self, key: &Key) -> bool;
     /// Exact position. Full: decodes one resident key page, no I/O. Disk:
     /// one local read of that page. Bloom: filter check in memory, then on
     /// a positive one key-page GET through the cache. Row-group choice uses
     /// the exact fences, never statistics.
-    pub async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>>;
+    pub(crate) async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>>;
     /// The value at `row` and its value page's origin, through `fetch_pages`, which returns
     /// the page's own origin and not the dictionary page's: `Fetched` for a cold hit, `Cached`
     /// for a warm one. `None` is a null value, distinct from an absent key. `find` discards
     /// the key page's origin. The value page's header, and its dictionary page's, are read
     /// from the fetched bytes and refused as `MalformedPageHeader` or `PageHeaderOverBound`
     /// before parquet decodes them.
-    pub async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
-    pub fn resident_bytes(&self) -> usize;
-    pub fn max_key_bytes(&self) -> usize;
+    pub(crate) async fn read_value(&self, row: RowRef, cache: Option<&PageCache>) -> Result<(Option<Bytes>, PageOrigin)>;
+    pub(crate) fn resident_bytes(&self) -> usize;
+    pub(crate) fn max_key_bytes(&self) -> usize;
     pub fn metadata(&self) -> &Arc<ParquetMetaData>;
     /// The page a key would decode and the value page it would fetch, for
     /// tests and the doctor; `None` when `find` would decode nothing (a key
     /// outside the range, between two row groups, or ruled out by the Bloom
     /// tier's filter), so `Generation::plan` predicts the key-page GET from it.
     pub fn page_of(&self, key: &Key) -> Option<PageRef>;
-    /// For `generation` and `check`, in-crate: the tier built, the file, its
-    /// row count, the key and value leaves, the fences per row group, the key
-    /// pages of a row group and the rows one of them holds.
-    pub fn residency(&self) -> Residency; pub fn handle(&self) -> &Arc<FileHandle>; pub fn rows(&self) -> i64; pub fn key_leaf(&self) -> usize; pub fn value_leaf(&self) -> usize; pub fn fences(&self) -> &[Vec<Key>]; pub fn page_count(&self, row_group: usize) -> usize; pub fn page_rows(&self, row_group: usize, page: usize) -> Range<i64>;
+    /// The key and value leaves, for the testkit's oracles; and in-crate, for
+    /// `generation` and `check`: the tier built, the file, its row count, the
+    /// fences per row group, and the key pages of a row group.
+    pub fn key_leaf(&self) -> usize; pub fn value_leaf(&self) -> usize;
+    pub(crate) fn residency(&self) -> Residency; pub(crate) fn handle(&self) -> &Arc<FileHandle>; pub(crate) fn rows(&self) -> i64; pub(crate) fn fences(&self) -> &[Vec<Key>]; pub(crate) fn page_count(&self, row_group: usize) -> usize;
     /// The key column of a row group, or one page of it, decoded from `chunks` with no I/O; for the overlap check.
-    pub fn decode_keys(&self, row_group: usize, page: Option<usize>, chunks: &Segments) -> Result<Keys>;
+    pub(crate) fn decode_keys(&self, row_group: usize, page: Option<usize>, chunks: &Segments) -> Result<Keys>;
     /// The key chunks for the overlap check: Full hands out the resident
     /// chunks at no cost, Disk reads them back as one counted local read per
     /// row group and no GET, Bloom fetches them again as one counted load GET
     /// per row group.
-    pub async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>>;
+    pub(crate) async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>>;
 }
 /// A data file past the footer stage: its footer checked and trimmed, its
 /// resident bytes predicted, and no key chunk fetched yet.
-pub struct Inspected;
+pub(crate) struct Inspected;
 impl Inspected {
-    pub fn predicted(&self) -> &ResidentBytes;
-    pub fn handle(&self) -> &Arc<FileHandle>;
+    pub(crate) fn predicted(&self) -> &ResidentBytes;
     /// What a Disk-tier `build` would add to `local`'s `index/`: zero when a
     /// chunk file with the file's identity already holds every key chunk, so
     /// a restart is not charged for what is on disk, else the chunk file it
     /// would write, header and key chunks (`predicted().disk_bytes`), the
     /// bytes `LocalDir::index_bytes_in_use` then counts for it. Reads the
     /// chunk file's header and no chunk.
-    pub fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
+    pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
     /// The chunk stage of `FileIndex::build`.
-    pub async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex>;
+    pub(crate) async fn build(self, residency: Residency, local: Option<&LocalDir>) -> Result<FileIndex>;
 }
 /// A decoded run of keys in file order, one arm per key type over the values
 /// parquet decoded, searched and compared in the served order; an in-crate
 /// helper, not re-exported from `lib.rs`.
-pub enum Keys { Long(Vec<i64>), Str(Vec<ByteArray>), Bin(Vec<ByteArray>), Uuid(Vec<[u8; UUID_BYTES]>) }
-impl Keys { pub fn key_type(&self) -> KeyType; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; pub fn get(&self, at: usize) -> Key; pub fn binary_search(&self, key: &Key) -> Result<usize, usize>; pub fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering; pub fn max_len(&self) -> usize; pub fn is_strictly_increasing(&self) -> bool; pub fn first_not_increasing(&self) -> Option<(usize, Ordering)>; }
+pub(crate) enum Keys { Long(Vec<i64>), Str(Vec<ByteArray>), Bin(Vec<ByteArray>), Uuid(Vec<[u8; UUID_BYTES]>) }
+impl Keys { pub(crate) fn len(&self) -> usize; pub(crate) fn is_empty(&self) -> bool; pub(crate) fn get(&self, at: usize) -> Key; pub(crate) fn binary_search(&self, key: &Key) -> Result<usize, usize>; pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering; pub(crate) fn max_len(&self) -> usize; pub(crate) fn first_not_increasing(&self) -> Option<(usize, Ordering)>; }
 /// `value_page_offset` is `Some` in the Full tier for a present key, where
 /// the key page is resident and decodes without I/O; `None` for an absent
 /// key and in the Disk and Bloom tiers, where naming the value page would
@@ -664,9 +670,8 @@ pub struct PageRef { pub row_group: usize, pub key_page: usize, pub value_page_o
 pub enum CacheError { Fetch(Arc<Error>), FetchDeadline { path: String, offset: u64, after: Duration }, Backend(#[from] foyer::Error) }
 /// Where one call's page came from, returned beside the page by `PageCache::get_or_fetch`
 /// and `FileHandle::read_page`. `Fetched` for a fetch the caller ran or joined, since it
-/// waited on the GET; `Cached` for memory or the disk level, which cost none. Re-exported
-/// from `lib.rs`.
-pub enum PageOrigin { Fetched, Cached }
+/// waited on the GET; `Cached` for memory or the disk level, which cost none.
+pub(crate) enum PageOrigin { Fetched, Cached }
 /// Clone: clones share one cache and one pair of counters, so every table
 /// holds a clone of the process's one cache. A clone may carry a fetch deadline
 /// (in-crate `with_fetch_deadline(self, Duration) -> Self`, which `Table::new` applies);
@@ -685,7 +690,7 @@ impl PageCache {
     /// foyer runs the fetch on its own task, so a caller that stops waiting does not end it;
     /// on a handle with a fetch deadline the fetch future is dropped at that deadline from its
     /// start, which cancels its request, and every waiter gets `CacheError::FetchDeadline`.
-    pub async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
+    pub(crate) async fn get_or_fetch<F, Fut>(&self, key: (Arc<str>, u64), fetch: F) -> Result<(Bytes, PageOrigin)>
     where F: FnOnce() -> Fut, Fut: Future<Output = Result<Bytes>> + Send + 'static;
     /// `fetches` counts fetch futures run, after coalescing: concurrent misses
     /// on one key run one and count one. `hits` counts lookups served without
@@ -693,7 +698,7 @@ impl PageCache {
     /// lookups coalesced onto one disk read each count a hit and a local read,
     /// as each would under `DiskChunks::page`, since foyer names no leader
     /// among them; a lookup coalesced onto another's fetch counts under neither.
-    pub fn hits(&self) -> u64; pub fn fetches(&self) -> u64; pub fn usage(&self) -> usize;
+    pub fn hits(&self) -> u64; pub fn fetches(&self) -> u64; pub(crate) fn usage(&self) -> usize;
     /// Flushes the disk level and closes it; `serve` calls it while draining
     /// (RFD 012), so what memory still held reaches disk before the process
     /// exits. A memory-only cache returns `Ok` and does nothing.
@@ -730,7 +735,7 @@ impl Generation {
     /// once and not the table's (RFD 017).
     /// `hedge` is the table's hedge window, handed to every FileHandle it opens.
     /// The table's name is `config.name`; `load` takes no second copy of it.
-    pub async fn load(config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
+    pub(crate) async fn load(config: &TableConfig, resolved: &Resolved, snapshot: &Snapshot, storage: &Arc<Storage>, hedge: Arc<HedgeWindow>, local: Option<&LocalDir>, previous: Option<&Generation>) -> Result<Self>;
     /// The files that may hold `key`, in file order: under every bucketing
     /// the files carry, the files of the bucket the key falls in under it,
     /// and every file without a bucketing, narrowed to those whose exact key
@@ -822,7 +827,6 @@ impl Table {
     /// and counts `refresh_errors_total{table, reason}` with `reason` the `ErrorKind`'s Display.
     pub async fn refresh(&self) -> Result<bool>;
     pub fn name(&self) -> &str;
-    pub fn config(&self) -> &TableConfig;
     pub fn state(&self) -> TableState;
     pub fn current(&self) -> Option<Arc<Generation>>;
     /// `current`, or `Error::NotReady`: the one refusal for a table with no generation to
@@ -863,7 +867,7 @@ pub enum FindingCode { DictionaryEncodedValue, LargeKeyPages, NoBucketPartition,
 impl FindingCode {
     /// Every code in finding-table order, for the `findings` gauge, which `table` sets for every
     /// code on every admitted generation, zero for the absent ones; a test proves it complete.
-    pub const ALL: [FindingCode; 14];
+    pub(crate) const ALL: [FindingCode; 14];
 }
 /// Writer properties the doctor names; Display gives the property string.
 /// The per-column ones (`MetricsColumn`, `BloomFilterEnabled`,
@@ -875,7 +879,7 @@ pub enum WriterProperty { EnableDictionary, ColumnIndexTruncateLength, PageRowLi
 pub struct Finding { tier: Tier, code: FindingCode, message: String, file: Option<String>, penalty: Option<Penalty>, property: Option<WriterProperty> }
 impl Finding {
     pub fn advice(code: FindingCode, file: Option<&str>, message: String, property: Option<WriterProperty>) -> Self;
-    pub fn tier(&self) -> Tier; pub fn code(&self) -> FindingCode; pub fn message(&self) -> &str;
+    pub fn tier(&self) -> Tier; pub fn code(&self) -> FindingCode; pub(crate) fn message(&self) -> &str;
     pub fn file(&self) -> Option<&str>; pub fn penalty(&self) -> Option<Penalty>; pub fn property(&self) -> Option<WriterProperty>;
 }
 pub struct FileReport {
@@ -889,12 +893,12 @@ pub struct TableSummary { pub table: String, pub snapshot_id: SnapshotId, pub se
 pub struct TableReport { pub summary: TableSummary, pub findings: Vec<Finding>, pub files: Vec<FileReport> }
 pub fn diagnose(g: &Generation) -> TableReport;
 /// The thresholds, in one place, each with the analysis section that set it.
-pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16; pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES /* 1 MiB: where a page's transfer reaches the order of a round trip; the cost below it is linear and small */; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; pub use crate::index::MOST_VALUE_PAGE_BYTES /* re-exported, not redeclared: the lookup's value page ceiling is the trigger of `value_pages_over_ceiling` */; }
+pub mod thresholds { pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS; pub(crate) const VALUE_PAGE_ADVICE_FACTOR: u64 = 16; pub(crate) const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES /* 1 MiB: where a page's transfer reaches the order of a round trip; the cost below it is linear and small */; pub const FILE_BYTES_ADVICE: u64 = 2 * contract::TARGET_FILE_BYTES_MAX; pub const FILES_PER_BUCKET_FACTOR: u64 = 2; pub const BLOOM_BYTES_PER_KEY_ADVICE: f64 = 4.0; pub const BLOOM_BITS_PER_KEY_MIN: f64 = 8.0; pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5; pub use crate::index::MOST_VALUE_PAGE_BYTES /* re-exported, not redeclared: the lookup's value page ceiling is the trigger of `value_pages_over_ceiling` */; }
 
 // contract (the layout's numbers; every other crate imports these, none redeclares them)
 pub const PAGE_ROWS: i64 = 1_000;
 pub const VALUE_PAGE_BYTES: u64 = 64 * 1024;
-pub const TARGET_FILE_BYTES_MIN: u64 = 32 * 1024 * 1024;
+pub(crate) const TARGET_FILE_BYTES_MIN: u64 = 32 * 1024 * 1024;
 pub const TARGET_FILE_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const MAX_KEY_BYTES: usize = 4_096;
 pub const KEY_BYTES_ADVICE: usize = 128;
@@ -903,20 +907,20 @@ pub const PAGE_CACHE_DISK_BLOCK_BYTES: u64 = 64 * VALUE_PAGE_BYTES;
 
 // time (the one place a Duration or a timestamp becomes a number or text, and the wall clock is read)
 /// A duration in seconds: the histogram unit, and the unit the latency buckets are declared in.
-pub fn seconds(duration: Duration) -> f64;
+pub(crate) fn seconds(duration: Duration) -> f64;
 /// Whole microseconds, the `get` line's `elapsed_micros`; saturates at `u64::MAX`.
 pub fn micros(elapsed: Duration) -> u64;
 /// The wall clock now; a caller that needs a timestamp never names the clock (the binary has no `jiff`).
 pub fn now() -> jiff::Timestamp;
 /// The wall clock as a `SystemTime`, for the one boundary that speaks it: the AWS SDK's credential
 /// expiry, which the credential cache compares with `SystemTime`'s own methods. Every other caller uses `now`.
-pub fn system_now() -> SystemTime;
+pub(crate) fn system_now() -> SystemTime;
 /// Seconds from `since` to now, the `generation_age_seconds` gauge; a `since` in the future gives a
 /// negative age, kept as measured.
 pub fn age_seconds(since: jiff::Timestamp) -> f64;
 /// Seconds since the Unix epoch with the fraction, the `generation_swapped_at_seconds` gauge; the one
 /// place a timestamp becomes epoch seconds.
-pub fn unix_seconds(at: jiff::Timestamp) -> f64;
+pub(crate) fn unix_seconds(at: jiff::Timestamp) -> f64;
 /// RFC 3339 in UTC with a `Z` offset through jiff's printer, the fraction of a second only when it is
 /// non-zero; the one place a timestamp becomes log text.
 pub fn log_timestamp(at: jiff::Timestamp) -> String;

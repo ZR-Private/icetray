@@ -119,7 +119,7 @@ impl Generation {
     /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
     /// `previous`. A snapshot timestamp jiff cannot represent is
     /// `TableFault::SnapshotTimestampOutOfRange`, raised before any read.
-    pub async fn load(
+    pub(crate) async fn load(
         config: &TableConfig,
         resolved: &Resolved,
         snapshot: &Snapshot,

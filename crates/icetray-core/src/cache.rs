@@ -218,7 +218,7 @@ enum Level {
 /// that joined another caller's fetch counts as `Fetched`, since it waited
 /// on the GET; a page from the disk level is `Cached`, since it cost no GET.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PageOrigin {
+pub(crate) enum PageOrigin {
     /// The page came from the caller's fetch, run or joined.
     Fetched,
     /// The page was in memory or on the disk level.
@@ -308,7 +308,7 @@ impl PageCache {
     /// The origin is what the `result` label of a lookup is decided by, per
     /// call rather than by differencing the process-wide counters, which
     /// concurrent lookups would confuse.
-    pub async fn get_or_fetch<F, Fut>(
+    pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: (Arc<str>, u64),
         fetch: F,
@@ -365,7 +365,7 @@ impl PageCache {
 
     /// Bytes charged against the memory budget: each page in memory at its
     /// length plus the per-entry overhead. The disk level is not counted.
-    pub fn usage(&self) -> usize {
+    pub(crate) fn usage(&self) -> usize {
         match self.level.as_ref() {
             Level::Memory(cache) => cache.usage(),
             Level::Hybrid { cache, .. } => cache.memory().usage(),

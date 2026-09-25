@@ -51,11 +51,12 @@ pub mod thresholds {
     /// contract's byte bound of RFD 002 is the recipe for those, and
     /// `FileReport::avg_value_bytes` beside `avg_value_page_bytes` shows an
     /// owner how many values a hit fetches for the one it wanted.
-    pub const VALUE_PAGE_BYTES_ADVICE: u64 = VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES;
+    pub(crate) const VALUE_PAGE_BYTES_ADVICE: u64 =
+        VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES;
 
     /// How many contract value pages the advice threshold spans: sixteen,
     /// which makes it 1 MiB.
-    pub const VALUE_PAGE_ADVICE_FACTOR: u64 = 16;
+    pub(crate) const VALUE_PAGE_ADVICE_FACTOR: u64 = 16;
 
     /// Mean uncompressed value page bytes above which
     /// `value_pages_over_ceiling` is advice: the lookup's own ceiling on a
@@ -239,7 +240,7 @@ impl FindingCode {
     /// admitted generation, so a code the generation does not raise reads
     /// zero. Complete: a successor match over every variant, which a new
     /// variant fails to compile, is compared to this list in tests.
-    pub const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
@@ -424,7 +425,7 @@ impl Finding {
 
     /// The numbers behind the finding and the fix, for a person; nothing
     /// decides on it.
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
     }
 

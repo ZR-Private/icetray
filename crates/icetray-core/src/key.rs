@@ -141,7 +141,7 @@ impl Key {
     /// literal, or a uuid literal as its sixteen big-endian bytes. Any other
     /// literal is `None`. The datum's type was already admitted by
     /// `KeyType::from_iceberg` when the table's layout was derived.
-    pub fn from_datum(datum: &Datum) -> Option<Self> {
+    pub(crate) fn from_datum(datum: &Datum) -> Option<Self> {
         match datum.literal() {
             PrimitiveLiteral::Long(value) => Some(Self::Long(*value)),
             PrimitiveLiteral::String(text) => Some(Self::Str(text.clone())),

@@ -50,13 +50,13 @@ const CACHE_DIR: &str = "cache";
 const TEMP_EXTENSION: &str = "tmp";
 /// The width of the digest a chunk file is named by and a footer is
 /// identified by: the width of SHA-256, which `digest` computes.
-pub const DIGEST_BYTES: usize = 32;
+pub(crate) const DIGEST_BYTES: usize = 32;
 
 /// The digest the chunk file format uses, of a data file's footer for its
 /// identity and of its path for the file name: SHA-256. The one place the
 /// algorithm is named, so the loader that digests a footer and this module
 /// that checks it agree.
-pub fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES] {
+pub(crate) fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES] {
     Sha256::digest(bytes).into()
 }
 
@@ -202,7 +202,7 @@ impl LocalDir {
     /// power loss is not promised, since the directory is disposable and a
     /// lost rename costs one re-fetch. Every chunk's bytes must be its
     /// range's length and no two chunks may overlap.
-    pub fn write_chunks(
+    pub(crate) fn write_chunks(
         &self,
         identity: &DataFileIdentity,
         chunks: impl Iterator<Item = (Range<u64>, Bytes)>,
@@ -237,7 +237,7 @@ impl LocalDir {
     /// progress reference; the caller that owns all the tables builds it. A
     /// file that is gone by the time it is reached was freed by someone else
     /// and counts nothing.
-    pub fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64> {
+    pub(crate) fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64> {
         let mut freed = 0;
         for (path, metadata) in self.index_files()? {
             if self.keeps(&path, live)? {
@@ -306,7 +306,7 @@ impl LocalDir {
 
     /// The bytes chunk files may occupy across every table, from
     /// `LocalConfig::index_budget_bytes`; `None` is unbounded.
-    pub fn index_budget(&self) -> Option<u64> {
+    pub(crate) fn index_budget(&self) -> Option<u64> {
         self.index_budget
     }
 

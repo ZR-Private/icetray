@@ -35,17 +35,17 @@ use crate::cache::{PageCache, PageOrigin};
 use crate::config::Residency;
 use crate::error::{Error, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
-use crate::local::{DataFileIdentity, DiskChunks, LocalDir};
+use crate::local::{DataFileIdentity, DiskChunks};
 use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one};
-pub use inspect::Inspected;
+pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
 
 /// A row's position in a file: its row group and its row within that group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RowRef {
+pub(crate) struct RowRef {
     /// The row group holding the row.
     pub row_group: usize,
     /// The row's index within the row group.
@@ -327,7 +327,7 @@ pub struct PageRef {
 /// allocation per key. Order and search compare the served order of
 /// `Key`: longs numerically, everything else as unsigned bytes.
 #[derive(Clone, Debug)]
-pub enum Keys {
+pub(crate) enum Keys {
     /// Long keys.
     Long(Vec<i64>),
     /// String keys as their UTF-8 bytes. `verify` checks every value of the
@@ -343,18 +343,8 @@ pub enum Keys {
 }
 
 impl Keys {
-    /// The key type of the run.
-    pub fn key_type(&self) -> KeyType {
-        match self {
-            Self::Long(_) => KeyType::Long,
-            Self::Str(_) => KeyType::String,
-            Self::Bin(_) => KeyType::Binary,
-            Self::Uuid(_) => KeyType::Uuid,
-        }
-    }
-
     /// The number of keys.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Long(run) => run.len(),
             Self::Str(run) | Self::Bin(run) => run.len(),
@@ -363,12 +353,12 @@ impl Keys {
     }
 
     /// Whether the run holds no key.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// The key at `at`, which is below `len`.
-    pub fn get(&self, at: usize) -> Key {
+    pub(crate) fn get(&self, at: usize) -> Key {
         match self {
             Self::Long(run) => Key::Long(run[at]),
             Self::Str(run) => {
@@ -384,7 +374,7 @@ impl Keys {
     /// The position of `key`, or where it would be inserted, over a run in
     /// served order. A key of another type than the run's is at position
     /// zero and absent: keys of different types never share a table.
-    pub fn binary_search(&self, key: &Key) -> std::result::Result<usize, usize> {
+    pub(crate) fn binary_search(&self, key: &Key) -> std::result::Result<usize, usize> {
         match (self, key) {
             (Self::Long(run), Key::Long(wanted)) => run.binary_search(wanted),
             (Self::Str(run), Key::Str(wanted)) => {
@@ -405,7 +395,7 @@ impl Keys {
     /// served order. Runs of different types never meet within one table;
     /// when they do, the order is `Key`'s derived order across variants,
     /// which is total and carries no meaning.
-    pub fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
+    pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
         match (self, other) {
             (Self::Long(mine), Self::Long(theirs)) => mine[at].cmp(&theirs[other_at]),
             (Self::Str(mine) | Self::Bin(mine), Self::Str(theirs) | Self::Bin(theirs)) => {
@@ -421,7 +411,7 @@ impl Keys {
 
     /// The length in bytes of the longest key: eight for longs, sixteen for
     /// uuids, the longest value otherwise, and zero for an empty run.
-    pub fn max_len(&self) -> usize {
+    pub(crate) fn max_len(&self) -> usize {
         match self {
             Self::Long(run) => {
                 if run.is_empty() {
@@ -441,16 +431,10 @@ impl Keys {
         }
     }
 
-    /// Whether every key is above the one before it: sorted and without a
-    /// duplicate.
-    pub fn is_strictly_increasing(&self) -> bool {
-        self.first_not_increasing().is_none()
-    }
-
     /// The position of the first key that is not above the one before it,
     /// with how it compares to that key: `Equal` for a duplicate, `Less`
     /// for a key out of order. `None` for a strictly increasing run.
-    pub fn first_not_increasing(&self) -> Option<(usize, Ordering)> {
+    pub(crate) fn first_not_increasing(&self) -> Option<(usize, Ordering)> {
         let at = match self {
             Self::Long(run) => run.windows(2).position(|pair| pair[0] >= pair[1]),
             Self::Str(run) | Self::Bin(run) => run
@@ -577,14 +561,18 @@ impl FileIndex {
     /// column's offset index, and the fences; the column index of every
     /// column but the key, the value column's above all, is never resident
     /// (RFD 017).
-    pub async fn build(
+    ///
+    /// Only tests call this: the loader runs `inspect` and
+    /// `Inspected::build` apart, so its budget check sits between them.
+    #[cfg(test)]
+    pub(crate) async fn build(
         table: &str,
         handle: Arc<FileHandle>,
         key_column: &str,
         value_column: &str,
         key_type: KeyType,
         residency: Residency,
-        local: Option<&LocalDir>,
+        local: Option<&crate::local::LocalDir>,
     ) -> Result<Self> {
         Self::inspect(table, handle, key_column, value_column, key_type)
             .await?
@@ -597,7 +585,7 @@ impl FileIndex {
     /// chunk is fetched (RFD 017): loads the footer (one GET), makes every
     /// footer check `build` documents, trims the footer to what the index
     /// keeps, and computes the prediction. Nothing past the footer is read.
-    pub async fn inspect(
+    pub(crate) async fn inspect(
         table: &str,
         handle: Arc<FileHandle>,
         key_column: &str,
@@ -650,7 +638,7 @@ impl FileIndex {
     /// encoded bytes per value, and for `FIXED_LEN_BYTE_ARRAY` keys the
     /// column's width, which over-counts a uuid key, held inline, by
     /// `UUID_BYTES` per page. `resident_bytes` shares the definitions.
-    pub fn predicted_resident_bytes(
+    pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
         handle: &FileHandle,
@@ -659,7 +647,7 @@ impl FileIndex {
     }
 
     /// The tier the index was built in.
-    pub fn residency(&self) -> Residency {
+    pub(crate) fn residency(&self) -> Residency {
         match self.keys {
             KeyResidency::Chunks(_) => Residency::Full,
             KeyResidency::Disk(_) => Residency::Disk,
@@ -668,7 +656,7 @@ impl FileIndex {
     }
 
     /// The file the index describes.
-    pub fn handle(&self) -> &Arc<FileHandle> {
+    pub(crate) fn handle(&self) -> &Arc<FileHandle> {
         &self.handle
     }
 
@@ -679,7 +667,7 @@ impl FileIndex {
     }
 
     /// Rows in the file; above zero.
-    pub fn rows(&self) -> i64 {
+    pub(crate) fn rows(&self) -> i64 {
         self.rows
     }
 
@@ -695,24 +683,18 @@ impl FileIndex {
 
     /// The first key of every key page, per row group; a row group without
     /// rows has no fences.
-    pub fn fences(&self) -> &[Vec<Key>] {
+    pub(crate) fn fences(&self) -> &[Vec<Key>] {
         &self.fences
     }
 
     /// Key pages in `row_group`, which is below the footer's row group count.
-    pub fn page_count(&self, row_group: usize) -> usize {
+    pub(crate) fn page_count(&self, row_group: usize) -> usize {
         self.fences[row_group].len()
-    }
-
-    /// The rows key page `page` of `row_group` holds, within the row group;
-    /// `page` is below `page_count(row_group)`.
-    pub fn page_rows(&self, row_group: usize, page: usize) -> Range<i64> {
-        self.key_column().group(row_group).page_rows(page)
     }
 
     /// The length in bytes of the file's longest key; at most
     /// `contract::MAX_KEY_BYTES`.
-    pub fn max_key_bytes(&self) -> usize {
+    pub(crate) fn max_key_bytes(&self) -> usize {
         self.max_key_bytes
     }
 
@@ -723,7 +705,7 @@ impl FileIndex {
     }
 
     /// Whether `key` lies within the file's exact key range.
-    pub fn may_contain(&self, key: &Key) -> bool {
+    pub(crate) fn may_contain(&self, key: &Key) -> bool {
         let (first, last) = self.key_range();
         first <= key && key <= last
     }
@@ -732,7 +714,7 @@ impl FileIndex {
     /// kept, the tier's structure (chunks, filters, or nothing for Disk),
     /// and the fences, under the definitions of `predicted_resident_bytes`
     /// with the fences exact.
-    pub fn resident_bytes(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.key_leaf,
@@ -756,7 +738,11 @@ impl FileIndex {
     /// `cache`, one GET, so a false positive costs exactly that (and a
     /// dictionary-encoded key column its dictionary page besides). A key
     /// outside the file's range costs nothing in every tier.
-    pub async fn find(&self, key: &Key, cache: Option<&PageCache>) -> Result<Option<RowRef>> {
+    pub(crate) async fn find(
+        &self,
+        key: &Key,
+        cache: Option<&PageCache>,
+    ) -> Result<Option<RowRef>> {
         let Some((row_group, page)) = self.locate(key) else {
             return Ok(None);
         };
@@ -799,7 +785,7 @@ impl FileIndex {
     /// `FileFault::MalformedPageHeader` or `FileFault::PageHeaderOverBound`
     /// (`check_value_page_headers`). A page parquet panics decoding is
     /// `FileFault::DecoderPanicked`.
-    pub async fn read_value(
+    pub(crate) async fn read_value(
         &self,
         row: RowRef,
         cache: Option<&PageCache>,
@@ -851,7 +837,7 @@ impl FileIndex {
     /// it; no I/O, and a byte not in `chunks` is a `Segments` fault inside
     /// `Error::Parquet`. `row_group` is below the footer's row group count
     /// and `page` below `page_count(row_group)`.
-    pub fn decode_keys(
+    pub(crate) fn decode_keys(
         &self,
         row_group: usize,
         page: Option<usize>,
@@ -872,7 +858,7 @@ impl FileIndex {
     /// reads every chunk back from the chunk file, one counted local read
     /// per row group and no GET; Bloom holds no key bytes and fetches them
     /// again from storage, one counted load GET per row group.
-    pub async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>> {
+    pub(crate) async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>> {
         match &self.keys {
             KeyResidency::Chunks(chunks) => Ok(Arc::clone(chunks)),
             KeyResidency::Disk(disk) => {
@@ -1428,7 +1414,10 @@ mod tests {
                     index.fences()[row_group][0],
                     key_for(row_group * group_rows(), key_type)
                 );
-                assert_eq!(index.page_rows(row_group, 1), PAGE_ROWS..PAGE_ROWS * 2);
+                assert_eq!(
+                    index.key_column().group(row_group).page_rows(1),
+                    PAGE_ROWS..PAGE_ROWS * 2
+                );
             }
             assert_eq!(
                 index.key_range(),
@@ -2147,7 +2136,9 @@ mod tests {
             assert_eq!(page.row_group, row.row_group);
             assert!(
                 index
-                    .page_rows(page.row_group, page.key_page)
+                    .key_column()
+                    .group(page.row_group)
+                    .page_rows(page.key_page)
                     .contains(&row.row)
             );
             let value_pages = offset_index[row.row_group][index.value_leaf()].page_locations();
@@ -2220,9 +2211,9 @@ mod tests {
             let mut decoded = 0;
             for row_group in 0..ROW_GROUPS {
                 let keys = index.decode_keys(row_group, None, &chunks).unwrap();
-                assert_eq!(keys.key_type(), KeyType::Uuid);
+                assert!(matches!(keys, Keys::Uuid(_)));
                 assert_eq!(keys.len(), group_rows());
-                assert!(keys.is_strictly_increasing());
+                assert_eq!(keys.first_not_increasing(), None);
                 for at in 0..keys.len() {
                     assert_eq!(
                         keys.get(at),
@@ -2540,7 +2531,7 @@ mod tests {
         for run in &runs {
             assert_eq!(run.len(), 3);
             assert!(!run.is_empty());
-            assert!(run.is_strictly_increasing());
+            assert_eq!(run.first_not_increasing(), None);
             for at in 0..run.len() {
                 assert_eq!(run.binary_search(&run.get(at)), Ok(at));
                 assert_eq!(run.cmp_at(at, run, at), std::cmp::Ordering::Equal);
@@ -2548,7 +2539,7 @@ mod tests {
             assert_eq!(run.cmp_at(0, run, 2), std::cmp::Ordering::Less);
             assert_eq!(run.binary_search(&absent_after(&run.get(0))), Err(1));
             for other in &runs {
-                if other.key_type() != run.key_type() {
+                if std::mem::discriminant(other) != std::mem::discriminant(run) {
                     assert_eq!(run.binary_search(&other.get(1)), Err(0));
                 }
             }
@@ -2558,8 +2549,12 @@ mod tests {
         assert_eq!(runs[2].max_len(), 2);
         assert_eq!(runs[3].max_len(), UUID_BYTES);
         assert_eq!(Keys::Long(Vec::new()).max_len(), 0);
-        assert!(!Keys::Long(vec![1, 1]).is_strictly_increasing());
-        assert!(!Keys::Str(vec![text("b"), text("a")]).is_strictly_increasing());
+        assert!(Keys::Long(vec![1, 1]).first_not_increasing().is_some());
+        assert!(
+            Keys::Str(vec![text("b"), text("a")])
+                .first_not_increasing()
+                .is_some()
+        );
         assert_eq!(
             Keys::Long(vec![1, 2, 2, 3]).first_not_increasing(),
             Some((2, std::cmp::Ordering::Equal))

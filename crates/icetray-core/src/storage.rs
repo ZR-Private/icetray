@@ -190,7 +190,7 @@ impl IoStats {
 /// nothing downstream reads it, and a `Located` is only ever handed back to
 /// the `Storage` that produced it.
 #[derive(Clone, Debug)]
-pub struct Located {
+pub(crate) struct Located {
     /// The store that holds the object.
     pub store: Arc<dyn ObjectStore>,
     /// The object's path within that store.
@@ -264,7 +264,7 @@ impl Storage {
     /// credential chain loaded once: profiles, SSO, `credential_process`,
     /// web identity, and instance metadata. Configured static keys still win
     /// for every S3 store.
-    pub async fn with_sdk_defaults(config: StorageConfig) -> Self {
+    pub(crate) async fn with_sdk_defaults(config: StorageConfig) -> Self {
         let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
@@ -292,7 +292,7 @@ impl Storage {
     /// The hedge settings this storage runs under, so a `Table` builds its
     /// `HedgeWindow` from the same configuration its reads are hedged by
     /// (RFD 013).
-    pub fn hedge_config(&self) -> &HedgeConfig {
+    pub(crate) fn hedge_config(&self) -> &HedgeConfig {
         &self.config.hedge
     }
 
@@ -301,7 +301,7 @@ impl Storage {
     /// this storage, but its bound is storage configuration beside the S3
     /// client's, and every `TableSource` resolves with a `Storage` in hand
     /// (RFD 013).
-    pub fn catalog_timeout(&self) -> Duration {
+    pub(crate) fn catalog_timeout(&self) -> Duration {
         self.config.catalog_timeout
     }
 
@@ -314,7 +314,7 @@ impl Storage {
     /// is a rewrite rule or a registered store:
     /// `ConfigViolation::NoStoreForLocation`, or
     /// `ConfigViolation::LocationNotAbsolute` for a relative path.
-    pub fn locate(&self, location: &str) -> Result<Located> {
+    pub(crate) fn locate(&self, location: &str) -> Result<Located> {
         let location = self.rewrite(location);
         let (prefix, rest) = split_location(&location)?;
         let store = self.store_for(&prefix, &location)?;
@@ -335,7 +335,7 @@ impl Storage {
 
     /// Reads one byte range on the load path. One load GET, never hedged:
     /// footers and key chunks are bulk work nobody waits on (RFD 013).
-    pub async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes> {
+    pub(crate) async fn read_range(&self, l: &Located, range: Range<u64>) -> Result<Bytes> {
         self.stats.record_get(ReadKind::Load, range_len(&range));
         observed(ReadKind::Load, l.store.get_range(&l.path, range)).await
     }
@@ -347,7 +347,7 @@ impl Storage {
     /// answer wins. Every attempt, hedged or not, is recorded into the
     /// window with its elapsed time, so the ceiling counts every hedge
     /// spent. One lookup GET, plus one more when a hedge is issued.
-    pub async fn read_range_hedged(
+    pub(crate) async fn read_range_hedged(
         &self,
         l: &Located,
         range: Range<u64>,
@@ -367,7 +367,11 @@ impl Storage {
     /// One load GET per range: the store may coalesce neighbouring ranges on
     /// the wire, and RFD 003 states its promises in logical GETs, for which
     /// this count is exact.
-    pub async fn read_ranges(&self, l: &Located, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+    pub(crate) async fn read_ranges(
+        &self,
+        l: &Located,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Bytes>> {
         for range in ranges {
             self.stats.record_get(ReadKind::Load, range_len(range));
         }
@@ -618,7 +622,7 @@ struct Sample {
 /// `config` has passed `Config::parse`'s validation: `window` is at least
 /// one, `percentile` is in `(0, 1]`, and `max_rate` in `[0, 1]`.
 #[derive(Debug)]
-pub struct HedgeWindow {
+pub(crate) struct HedgeWindow {
     config: HedgeConfig,
     samples: Mutex<VecDeque<Sample>>,
 }
@@ -627,7 +631,7 @@ impl HedgeWindow {
     /// An empty window; `delay` gives nothing until `window` samples are in.
     /// The ring grows as samples arrive and never past `window`, so a large
     /// configured window costs nothing until it is used.
-    pub fn new(config: &HedgeConfig) -> Self {
+    pub(crate) fn new(config: &HedgeConfig) -> Self {
         Self {
             config: config.clone(),
             samples: Mutex::new(VecDeque::new()),
@@ -642,7 +646,7 @@ impl HedgeWindow {
     /// issued). Otherwise the nearest-rank percentile of the window's
     /// elapsed times: the value at 1-based rank `ceil(percentile * window)`
     /// in the sorted samples.
-    pub fn delay(&self) -> Option<Duration> {
+    pub(crate) fn delay(&self) -> Option<Duration> {
         if !self.config.enabled {
             return None;
         }
@@ -663,7 +667,7 @@ impl HedgeWindow {
 
     /// Records one lookup GET: how long it took and whether a hedge was
     /// issued for it. The oldest sample leaves once the window is full.
-    pub fn record(&self, elapsed: Duration, hedged: bool) {
+    pub(crate) fn record(&self, elapsed: Duration, hedged: bool) {
         let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         if samples.len() >= self.config.window {
             samples.pop_front();
