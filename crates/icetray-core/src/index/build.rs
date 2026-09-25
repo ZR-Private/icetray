@@ -499,9 +499,10 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// (`check_page_headers`) before the row group's first decode. A value
 /// page and a value column's dictionary page, decoded here at lookup, are
 /// not read ahead, so their headers' sizes, at most `i32::MAX` bytes, and
-/// the dictionary's value count are used as declared. A delta-length or
-/// delta byte-array page sizes its lengths by the count in its encoded
-/// data, which no check reads.
+/// the dictionary's value count are used as declared, and a v2 value
+/// page's level lengths reach parquet's `i32` add unchecked. A
+/// delta-length or delta byte-array page sizes its lengths by the count in
+/// its encoded data, which no check reads.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -582,9 +583,10 @@ mod tests {
     use crate::generation::testing::{self, KeyColumn, TABLE, cache, page_rows, refusal_of};
     use crate::index::page_header::{
         COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
-        DICTIONARY_PAGE_HEADER_FIELD, MOST_BYTES_PER_VALUE, NIBBLE_BITS, NIBBLE_MASK,
-        NUM_VALUES_FIELD, PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader, TYPE_FIELD,
-        UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
+        DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, MOST_BYTES_PER_VALUE,
+        NIBBLE_BITS, NIBBLE_MASK, NUM_VALUES_FIELD, PAGE_ENCODING_ALLOWANCE_BYTES, PageBody,
+        PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD, UNCOMPRESSED_PAGE_SIZE_FIELD,
+        VARINT_CONTINUES,
     };
     use crate::index::testing::{
         FEW_ROWS, Fixture, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows, fault_of,
@@ -596,6 +598,7 @@ mod tests {
     };
     use crate::key::KeyType;
     use parquet::basic::PageType;
+    use parquet::file::properties::WriterVersion;
 
     /// Rows per row group in the hand-written fixtures with two row groups.
     const TINY_GROUP_ROWS: usize = 2;
@@ -854,9 +857,9 @@ mod tests {
 
     /// The byte range of `field`'s varint in a page header in compact
     /// thrift, as parquet writes a data or dictionary page's header: `i32`
-    /// fields, then the page-specific struct, whose first field is
-    /// `num_values`. `field` is one of the header's `i32` fields or
-    /// `NumValues`.
+    /// fields, then the page-specific struct, whose fields up to the
+    /// levels of a v2 header are `i32`s. `field` is one of the header's
+    /// `i32` fields or one of the page-specific struct's.
     fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
         let varint_end = |from: usize| {
             from + header[from..]
@@ -865,14 +868,21 @@ mod tests {
                 .unwrap()
                 + 1
         };
-        let wanted = match field {
-            HeaderField::PageType => Some(TYPE_FIELD),
-            HeaderField::UncompressedPageSize => Some(UNCOMPRESSED_PAGE_SIZE_FIELD),
-            HeaderField::CompressedPageSize => Some(COMPRESSED_PAGE_SIZE_FIELD),
-            HeaderField::NumValues => None,
+        let (top, nested) = match field {
+            HeaderField::PageType => (Some(TYPE_FIELD), None),
+            HeaderField::UncompressedPageSize => (Some(UNCOMPRESSED_PAGE_SIZE_FIELD), None),
+            HeaderField::CompressedPageSize => (Some(COMPRESSED_PAGE_SIZE_FIELD), None),
+            HeaderField::NumValues => (None, Some(NUM_VALUES_FIELD)),
+            HeaderField::DefinitionLevelsByteLength => {
+                (None, Some(DEFINITION_LEVELS_BYTE_LENGTH_FIELD))
+            }
+            HeaderField::RepetitionLevelsByteLength => {
+                (None, Some(REPETITION_LEVELS_BYTE_LENGTH_FIELD))
+            }
             HeaderField::DataPageHeader
             | HeaderField::DataPageHeaderV2
             | HeaderField::DictionaryPageHeader => panic!("{field} is a struct, not a varint"),
+            HeaderField::LevelsByteLength => panic!("{field} is a sum, not a varint"),
         };
         let mut at = 0;
         let mut id = 0;
@@ -883,11 +893,13 @@ mod tests {
             let code = byte & NIBBLE_MASK;
             if code == WireType::I32.code() {
                 let end = varint_end(at);
-                if wanted == Some(id) {
+                if top == Some(id) {
                     return at..end;
                 }
                 at = end;
-            } else if code == WireType::Struct.code() && wanted.is_none() {
+            } else if code == WireType::Struct.code()
+                && let Some(wanted) = nested
+            {
                 assert!(
                     [
                         DATA_PAGE_HEADER_FIELD,
@@ -897,13 +909,22 @@ mod tests {
                     .contains(&id),
                     "field {id} is not a page-specific header"
                 );
-                let num_values = u8::try_from(NUM_VALUES_FIELD).unwrap();
-                assert_eq!(
-                    header[at],
-                    (num_values << NIBBLE_BITS) | WireType::I32.code(),
-                    "num_values is the struct's first field"
-                );
-                return at + 1..varint_end(at + 1);
+                let mut inner = 0;
+                loop {
+                    let byte = header[at];
+                    inner += i16::from(byte >> NIBBLE_BITS);
+                    at += 1;
+                    assert_eq!(
+                        byte & NIBBLE_MASK,
+                        WireType::I32.code(),
+                        "field {inner} of the page-specific header is not an i32"
+                    );
+                    let end = varint_end(at);
+                    if inner == wanted {
+                        return at..end;
+                    }
+                    at = end;
+                }
             } else {
                 panic!("field {id} has type {code}, not in a page header as parquet writes it");
             }
@@ -972,20 +993,31 @@ mod tests {
         field: HeaderField,
         claimed: i32,
     ) -> (ParquetMetaData, Arc<Segments>) {
+        with_first_group_headers(opened, loaded, key_leaf, page, &[(field, claimed)]).await
+    }
+
+    /// `with_first_group_header` with each of `claims`, a field and what it
+    /// claims, rewritten in turn.
+    async fn with_first_group_headers(
+        opened: &Opened,
+        loaded: &ParquetMetaData,
+        key_leaf: usize,
+        page: ChunkPage,
+        claims: &[(HeaderField, i32)],
+    ) -> (ParquetMetaData, Arc<Segments>) {
         let ranges = key_chunk_ranges(loaded, key_leaf, opened.handle.size());
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let (range, bytes) = &parts[0];
         let header_at = header_at(loaded, key_leaf, page);
-        let varint = header_varint(&bytes[header_at..], field);
-        let varint = header_at + varint.start..header_at + varint.end;
-        let written = zigzag_varint(claimed);
-        let grown = written.len() - varint.len();
-        let mut patched = bytes[..varint.start].to_vec();
-        patched.extend_from_slice(&written);
-        patched.extend_from_slice(&bytes[varint.end..]);
+        let mut patched = bytes.to_vec();
+        for (field, claimed) in claims {
+            let varint = header_varint(&patched[header_at..], *field);
+            let varint = header_at + varint.start..header_at + varint.end;
+            patched.splice(varint, zigzag_varint(*claimed));
+        }
+        let grown = i64::try_from(patched.len() - bytes.len()).unwrap();
         let start = range.start;
         parts[0] = (start..start + count(patched.len()), Bytes::from(patched));
-        let grown = i64::try_from(grown).unwrap();
         let mut pages = pages_of(loaded, key_leaf);
         let moved = match page {
             ChunkPage::Dictionary => 0,
@@ -1290,6 +1322,71 @@ mod tests {
                     claimed,
                     u64::try_from(written).unwrap()
                 )
+            );
+        }
+    }
+
+    /// A v2 key page whose level lengths are negative, or add up past its
+    /// uncompressed size, is refused before parquet reads the page, which
+    /// adds the two as `i32`s: two near `i32::MAX` overflow the add. The
+    /// file as written, a v2 file, loads.
+    #[tokio::test]
+    async fn test_verify_refuses_a_v2_key_page_whose_level_lengths_overflow_its_size() {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+        let opened = store(&fixture).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let key_leaf = 0;
+        let chunks = key_chunks(&opened, &loaded, key_leaf).await;
+        let page = ChunkPage::Data(0);
+        let written = header_of(&loaded, key_leaf, &chunks, page);
+        assert!(
+            matches!(written.body, PageBody::DataV2 { .. }),
+            "{:?} is not a v2 page",
+            written.body
+        );
+        assert_eq!(
+            verify_groups(&loaded, key_leaf, KeyShape::Long, &chunks).unwrap(),
+            ROW_GROUPS,
+            "the file as written"
+        );
+        let near_max = i32::MAX;
+        let (metadata, chunks) = with_first_group_headers(
+            &opened,
+            &loaded,
+            key_leaf,
+            page,
+            &[
+                (HeaderField::DefinitionLevelsByteLength, near_max),
+                (HeaderField::RepetitionLevelsByteLength, near_max),
+            ],
+        )
+        .await;
+        let near_max = u64::try_from(near_max).unwrap();
+        assert_eq!(
+            fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+            FileFault::PageHeaderOverBound {
+                row_group: 0,
+                page,
+                field: HeaderField::LevelsByteLength,
+                declared: near_max + near_max,
+                allowed: u64::from(written.uncompressed_page_size),
+            }
+        );
+        for field in [
+            HeaderField::DefinitionLevelsByteLength,
+            HeaderField::RepetitionLevelsByteLength,
+        ] {
+            let (metadata, chunks) =
+                with_first_group_header(&opened, &loaded, key_leaf, page, field, -1).await;
+            assert_eq!(
+                fault_of(verify_groups(&metadata, key_leaf, KeyShape::Long, &chunks)),
+                FileFault::MalformedPageHeader {
+                    row_group: 0,
+                    page,
+                    fault: PageHeaderFault::Negative(field),
+                },
+                "{field}"
             );
         }
     }

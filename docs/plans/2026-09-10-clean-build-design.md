@@ -496,13 +496,16 @@ pub struct RowRef { pub row_group: usize, pub row: i64 }
 /// parquet would not read to the same numbers or that declares more than
 /// its page can hold: an uncompressed size above its rows times the key
 /// cap and an encoding allowance, a dictionary of more values than its row
-/// group's rows, a compressed size past its place in the offset index.
+/// group's rows, a compressed size past its place in the offset index, v2
+/// level lengths that are negative or whose sum, which parquet adds as
+/// `i32`s, is above the page's uncompressed size.
 pub enum FileFault { MissingColumn(String), ValuePhysicalType { got: parquet::basic::Type }, MissingPageIndex, NoRows, InconsistentRowCounts, InconsistentOffsetIndex { row_group: usize }, PageRowsMismatch { row_group: usize, page: usize }, MalformedPageHeader { row_group: usize, page: ChunkPage, fault: PageHeaderFault }, PageHeaderOverBound { row_group: usize, page: ChunkPage, field: HeaderField, declared: u64, allowed: u64 }, PageOutOfRange { row: i64, row_group: usize }, CorruptBloomFilter { row_group: usize }, UnplaceableBloomFilter { row_group: usize }, KeyNotUtf8 { row_group: usize } }
 /// A page of a column chunk as a fault names it: the dictionary page, or a
 /// data page by its position in the offset index.
 pub enum ChunkPage { Dictionary, Data(usize) }
-/// The `PageHeader` fields a page-header fault names.
-pub enum HeaderField { PageType, UncompressedPageSize, CompressedPageSize, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, NumValues }
+/// The `PageHeader` fields a page-header fault names; `LevelsByteLength` is
+/// the sum of a v2 header's two level lengths.
+pub enum HeaderField { PageType, UncompressedPageSize, CompressedPageSize, DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, NumValues, DefinitionLevelsByteLength, RepetitionLevelsByteLength, LevelsByteLength }
 /// Why a key page header is not one parquet reads to the pre-scan's numbers:
 /// truncated, a varint past 64 bits or an integer past its field's width, a
 /// field id overflow, an unknown wire type, a field parquet reads sent as

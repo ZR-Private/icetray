@@ -13,7 +13,7 @@ use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{ColumnChunkMetaDataBuilder, ParquetMetaData};
 use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 use parquet::file::properties::{
-    DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties,
+    DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties, WriterVersion,
 };
 
 use crate::approx::count;
@@ -121,6 +121,7 @@ pub(super) struct Layout {
     pub(super) truncate: Option<usize>,
     pub(super) bloom: Bloom,
     pub(super) offset_index: bool,
+    pub(super) writer_version: WriterVersion,
 }
 
 impl Layout {
@@ -135,6 +136,7 @@ impl Layout {
             truncate: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             bloom: Bloom::Sized,
             offset_index: true,
+            writer_version: WriterVersion::PARQUET_1_0,
         }
     }
 
@@ -152,7 +154,8 @@ impl Layout {
             .set_statistics_truncate_length(self.truncate)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_bloom_filter_enabled(false)
-            .set_offset_index_disabled(!self.offset_index);
+            .set_offset_index_disabled(!self.offset_index)
+            .set_writer_version(self.writer_version);
         let builder = with_dictionary(builder, self.dictionary);
         with_key_bloom(builder, self.bloom, count(self.row_group_rows)).build()
     }

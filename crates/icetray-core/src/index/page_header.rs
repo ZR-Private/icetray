@@ -1,13 +1,14 @@
 //! The page headers of a key column chunk, read ahead of parquet's page
 //! reader and bounded by what their pages can hold (RFD 004). Parquet sizes
 //! buffers from two header numbers as it reads a page, before any check on
-//! the page it hands out can run: a page's
-//! uncompressed size, which it reserves and decompresses into, and a
-//! dictionary page's value count, which sizes the dictionary it decodes
-//! into. A header that lies about either makes the process allocate what it
-//! claims. Every replica loads the same snapshot, so such a file would take
-//! down each one that loads it; a typed refusal on a refresh keeps the
-//! generation before it serving instead.
+//! the page it hands out can run: a page's uncompressed size, which it
+//! reserves and decompresses into, and a dictionary page's value count,
+//! which sizes the dictionary it decodes into. A header that lies about
+//! either makes the process allocate what it claims. Parquet also adds a v2
+//! data page header's two level lengths as `i32`s, which two lengths near
+//! `i32::MAX` overflow. Every replica loads the same snapshot, so such a
+//! file would take down each one that loads it; a typed refusal on a
+//! refresh keeps the generation before it serving instead.
 //!
 //! The reader here decodes the Thrift compact encoding of parquet's
 //! `PageHeader` as parquet 58 reads it (`PageHeader::read_thrift_without_stats`,
@@ -97,6 +98,10 @@ pub(super) const DATA_PAGE_HEADER_V2_FIELD: i16 = 8;
 /// `num_values`, the first field of each of the three page-specific
 /// headers.
 pub(super) const NUM_VALUES_FIELD: i16 = 1;
+/// `DataPageHeaderV2.definition_levels_byte_length`.
+pub(super) const DEFINITION_LEVELS_BYTE_LENGTH_FIELD: i16 = 5;
+/// `DataPageHeaderV2.repetition_levels_byte_length`.
+pub(super) const REPETITION_LEVELS_BYTE_LENGTH_FIELD: i16 = 6;
 
 /// How parquet reads a field of a page-specific header: as an `i32`
 /// varint, or as a boolean carried in the field header itself.
@@ -213,6 +218,14 @@ pub enum HeaderField {
     /// `num_values` of the page-specific header; a dictionary page's sizes
     /// the dictionary parquet decodes into.
     NumValues,
+    /// `definition_levels_byte_length` of a `data_page_header_v2`.
+    DefinitionLevelsByteLength,
+    /// `repetition_levels_byte_length` of a `data_page_header_v2`.
+    RepetitionLevelsByteLength,
+    /// The sum of a `data_page_header_v2`'s two level lengths: the bytes at
+    /// the start of the page body that parquet copies uncompressed, which
+    /// it adds as `i32`s before it compares them with the uncompressed size.
+    LevelsByteLength,
 }
 
 impl fmt::Display for HeaderField {
@@ -225,6 +238,11 @@ impl fmt::Display for HeaderField {
             Self::DataPageHeaderV2 => "data_page_header_v2",
             Self::DictionaryPageHeader => "dictionary_page_header",
             Self::NumValues => "num_values",
+            Self::DefinitionLevelsByteLength => "definition_levels_byte_length",
+            Self::RepetitionLevelsByteLength => "repetition_levels_byte_length",
+            Self::LevelsByteLength => {
+                "definition_levels_byte_length + repetition_levels_byte_length"
+            }
         })
     }
 }
@@ -330,6 +348,10 @@ pub(super) struct PageHeader {
     pub(super) body: PageBody,
     pub(super) uncompressed_page_size: u32,
     pub(super) compressed_page_size: u32,
+    /// The sum of the level lengths of a `data_page_header_v2`, when the
+    /// header carries one, whatever its page type: parquet adds the two
+    /// as `i32`s on any page that carries the struct.
+    pub(super) levels_byte_length: Option<u64>,
     /// The header's own bytes: the page body starts here.
     pub(super) header_len: usize,
 }
@@ -391,14 +413,35 @@ impl PageHeader {
             body,
             uncompressed_page_size: non_negative(uncompressed, HeaderField::UncompressedPageSize)?,
             compressed_page_size: non_negative(compressed, HeaderField::CompressedPageSize)?,
+            levels_byte_length: data_v2.map(PageSpecific::levels_byte_length).transpose()?,
             header_len: input.at,
         })
     }
 }
 
-/// A page-specific header as read: its `num_values`, when it has one.
+/// A page-specific header as read: its `num_values` and, in a v2 data
+/// page header, its level lengths, each when it has one.
+#[derive(Clone, Copy)]
 struct PageSpecific {
     num_values: Option<i32>,
+    definition_levels_byte_length: Option<i32>,
+    repetition_levels_byte_length: Option<i32>,
+}
+
+impl PageSpecific {
+    /// The sum of a v2 data page header's level lengths, each of which
+    /// parquet requires and refuses when negative.
+    fn levels_byte_length(self) -> std::result::Result<u64, PageHeaderFault> {
+        let definition = non_negative(
+            self.definition_levels_byte_length,
+            HeaderField::DefinitionLevelsByteLength,
+        )?;
+        let repetition = non_negative(
+            self.repetition_levels_byte_length,
+            HeaderField::RepetitionLevelsByteLength,
+        )?;
+        Ok(u64::from(definition) + u64::from(repetition))
+    }
 }
 
 /// The value count of page-specific header `field`, `header` as read:
@@ -502,8 +545,9 @@ impl Compact<'_> {
 
     /// Page-specific header `id`, sent as `wire`: a struct whose fields
     /// `fields` lists, by id from `NUM_VALUES_FIELD`, parquet reads as
-    /// their scalar type, and whose other fields it skips. Its `num_values` when it has one; parquet keeps the last
-    /// of repeated fields, and so does this.
+    /// their scalar type, and whose other fields it skips. Its `num_values`
+    /// and level lengths when it has them; parquet keeps the last of
+    /// repeated fields, and so does this.
     fn page_specific(
         &mut self,
         id: i16,
@@ -511,7 +555,11 @@ impl Compact<'_> {
         fields: &[Scalar],
     ) -> Parsed<PageSpecific> {
         sent_as(id, wire, WireType::Struct)?;
-        let mut num_values = None;
+        let mut read = PageSpecific {
+            num_values: None,
+            definition_levels_byte_length: None,
+            repetition_levels_byte_length: None,
+        };
         let mut last = 0;
         while let Some((wire, id)) = self.field_begin(last)? {
             let scalar = id
@@ -520,9 +568,18 @@ impl Compact<'_> {
                 .and_then(|at| fields.get(at));
             match scalar {
                 Some(Scalar::I32) => {
-                    let value = self.i32_field(id, wire)?;
-                    if id == NUM_VALUES_FIELD {
-                        num_values = Some(value);
+                    let value = Some(self.i32_field(id, wire)?);
+                    // Of the three headers' `fields`, only a v2 data page
+                    // header's reach the level lengths' ids.
+                    match id {
+                        NUM_VALUES_FIELD => read.num_values = value,
+                        DEFINITION_LEVELS_BYTE_LENGTH_FIELD => {
+                            read.definition_levels_byte_length = value;
+                        }
+                        REPETITION_LEVELS_BYTE_LENGTH_FIELD => {
+                            read.repetition_levels_byte_length = value;
+                        }
+                        _ => {}
                     }
                 }
                 Some(Scalar::Bool) => {
@@ -534,7 +591,7 @@ impl Compact<'_> {
             }
             last = id;
         }
-        Ok(PageSpecific { num_values })
+        Ok(read)
     }
 
     /// Skips a value of `wire` as parquet's `skip_till_depth` does, `depth`
@@ -626,7 +683,12 @@ fn sent_as(field: i16, wire: WireType, expected: WireType) -> Parsed<()> {
 /// - a dictionary page's value count above the row group's rows, since a
 ///   dictionary holds each distinct value once, and its uncompressed size
 ///   above that count times `MOST_BYTES_PER_VALUE`, plus the allowance;
-/// - a compressed size that runs past the page's place in the chunk.
+/// - a compressed size that runs past the page's place in the chunk;
+/// - level lengths of a `data_page_header_v2` whose sum is above the
+///   page's uncompressed size. Parquet adds the two as `i32`s before it
+///   compares them with that size, and two that pass it overflow the add,
+///   which panics where overflow checks are on; a sum within an
+///   uncompressed size, itself at most `i32::MAX`, cannot overflow.
 ///
 /// A page whose keys are at most the cap stays within these, since the
 /// allowances cover what an encoding adds to them. A page of keys far
@@ -710,9 +772,18 @@ fn check_page(
     let allowed = values
         .saturating_mul(MOST_BYTES_PER_VALUE)
         .saturating_add(PAGE_ENCODING_ALLOWANCE_BYTES);
-    let declared = u64::from(header.uncompressed_page_size);
-    if declared > allowed {
-        return Err(over(HeaderField::UncompressedPageSize, declared, allowed));
+    let uncompressed = u64::from(header.uncompressed_page_size);
+    if uncompressed > allowed {
+        return Err(over(
+            HeaderField::UncompressedPageSize,
+            uncompressed,
+            allowed,
+        ));
+    }
+    if let Some(levels) = header.levels_byte_length
+        && levels > uncompressed
+    {
+        return Err(over(HeaderField::LevelsByteLength, levels, uncompressed));
     }
     let room = approx::count(bytes.len() - header.header_len);
     let declared = u64::from(header.compressed_page_size);
@@ -731,7 +802,7 @@ mod tests {
     use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, Encoding, ZstdLevel};
-    use parquet::column::page::PageReader;
+    use parquet::column::page::{Page, PageReader};
     use parquet::file::metadata::{ColumnChunkMetaData, PageIndexPolicy, ParquetMetaDataReader};
     use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
     use parquet::file::serialized_reader::SerializedPageReader;
@@ -806,15 +877,17 @@ mod tests {
     /// reader walking the same chunk by the same headers: the same page
     /// type and value count, an uncompressed size that is the length of
     /// the page parquet decoded, a header and compressed size that step to
-    /// the next page where parquet's offset index says it starts, and sums
-    /// that are the chunk's sizes in the footer. The pages compared.
-    fn assert_read_as_parquet_reads(file: &Bytes) -> usize {
+    /// the next page where parquet's offset index says it starts, level
+    /// lengths that add to what parquet read from a v2 page, and sums that
+    /// are the chunk's sizes in the footer. The pages compared, and the v2
+    /// pages among them whose levels take bytes.
+    fn assert_read_as_parquet_reads(file: &Bytes) -> (usize, usize) {
         let metadata = ParquetMetaDataReader::new()
             .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(file)
             .unwrap();
         let offset_index = metadata.offset_index().unwrap();
-        let mut compared = 0;
+        let (mut compared, mut with_levels) = (0, 0);
         for (row_group, group) in metadata.row_groups().iter().enumerate() {
             for (leaf, chunk) in group.columns().iter().enumerate() {
                 let rows = row_index(group.num_rows());
@@ -829,6 +902,20 @@ mod tests {
                     let header = PageHeader::read(&file[at..end]).unwrap();
                     assert_eq!(header.body.page_type(), page.page_type());
                     assert_eq!(num_values_of(header.body), page.num_values());
+                    let levels = match &page {
+                        Page::DataPageV2 {
+                            def_levels_byte_len,
+                            rep_levels_byte_len,
+                            ..
+                        } => {
+                            Some(u64::from(*def_levels_byte_len) + u64::from(*rep_levels_byte_len))
+                        }
+                        Page::DataPage { .. } | Page::DictionaryPage { .. } => None,
+                    };
+                    assert_eq!(header.levels_byte_length, levels);
+                    if levels.is_some_and(|levels| levels > 0) {
+                        with_levels += 1;
+                    }
                     assert_eq!(
                         approx::length(header.uncompressed_page_size),
                         page.buffer().len()
@@ -860,7 +947,7 @@ mod tests {
                 );
             }
         }
-        compared
+        (compared, with_levels)
     }
 
     #[test]
@@ -889,13 +976,16 @@ mod tests {
             delta(every()),
         ];
         let columns = 3;
+        let mut with_levels = 0;
         for (file, properties) in files.into_iter().enumerate() {
-            let compared = assert_read_as_parquet_reads(&written(properties));
+            let (compared, levels) = assert_read_as_parquet_reads(&written(properties));
             assert!(
                 compared >= columns * ROW_GROUPS * PAGES_PER_GROUP,
                 "file {file}: {compared} pages"
             );
+            with_levels += levels;
         }
+        assert!(with_levels > 0, "no v2 page carried levels");
     }
 
     /// Compact thrift written by hand, for headers parquet's writer does
@@ -1416,6 +1506,21 @@ mod tests {
         assert_eq!(
             PageHeader::read(&header(size, -1, &[], &[])),
             Err(PageHeaderFault::Negative(HeaderField::CompressedPageSize))
+        );
+        let v2_without_levels = Thrift::new()
+            .i32(TYPE_FIELD, PageType::DATA_PAGE_V2 as i32)
+            .i32(UNCOMPRESSED_PAGE_SIZE_FIELD, size)
+            .i32(COMPRESSED_PAGE_SIZE_FIELD, size)
+            .begin(DATA_PAGE_HEADER_V2_FIELD)
+            .i32(NUM_VALUES_FIELD, 1)
+            .end()
+            .byte(STOP)
+            .take();
+        assert_eq!(
+            PageHeader::read(&v2_without_levels),
+            Err(PageHeaderFault::Missing(
+                HeaderField::DefinitionLevelsByteLength
+            ))
         );
         let past_known = PageType::DATA_PAGE_V2 as i32 + 1;
         let unknown = Thrift::new()

@@ -100,8 +100,10 @@ compact encoding that refuses any header parquet would read to other
 numbers, and refuses as a file fault a data page declaring more
 uncompressed bytes than its rows could encode to with every key at the cap
 of RFD 008 (Keys), a dictionary of more values than its row group has rows
-or of more bytes than those values at the cap, and a compressed size past
-the page's place in the offset index. On a refresh the refusal leaves the
+or of more bytes than those values at the cap, a compressed size past
+the page's place in the offset index, and a v2 data page whose level
+lengths are negative or add up past its uncompressed size, which parquet
+adds as 32-bit integers that two lengths near the maximum overflow. On a refresh the refusal leaves the
 previous generation serving (RFD 005 (Generations and refresh)). A file whose keys
 run far past the cap can meet this refusal before the key-length one. What
 the pre-scan does not cover: its bounds rest on the footer's row counts, so
