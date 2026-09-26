@@ -9,22 +9,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use parquet::bloom_filter::Sbbf;
-use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::column::reader::ColumnReaderImpl;
 use parquet::data_type::{
     ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArrayType, Int64Type,
 };
-use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::serialized_reader::SerializedPageReader;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
+use super::pages::{ChunkPages, PageTally};
 use super::{
-    ChunkPage, Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected,
-    KeyResidency, KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
+    Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
+    KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
 };
-use crate::approx;
 use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
@@ -99,102 +96,6 @@ impl Inspected {
             max_key_bytes: verified.max_key_bytes,
             rows,
         })
-    }
-}
-
-/// A page reader that checks the value count in the header of every data
-/// page before the column reader sees it, and records it, so that what a
-/// decode produced can be checked against the rows the offset index gives
-/// those pages. The column reader takes the header's count as the values
-/// the page holds, so a data page claiming more values than the offset
-/// index gives it rows (`check_pages_read` requires one value per row of
-/// every page read, nulls included) is refused here, before the reader
-/// holds it, and recorded as refused. The dictionary page is handed through unchecked and uncounted; the pages
-/// the column reader skips from their locations are never read and never
-/// seen.
-struct CountedPages {
-    inner: SerializedPageReader<Segments>,
-    /// The rows the offset index gives each of the chunk's data pages, in
-    /// page order: the pages the inner reader hands out or skips, one for
-    /// one, since it reads by those locations.
-    page_rows: Vec<usize>,
-    /// The position among the chunk's data pages of the next data page
-    /// handed out or skipped.
-    next_page: usize,
-    tally: Arc<Mutex<PageTally>>,
-}
-
-/// What a `CountedPages` saw, shared with the `read_column` call that reads
-/// through it, since the column reader owns the page reader.
-#[derive(Default)]
-struct PageTally {
-    /// The header value count of every data page handed to the column
-    /// reader, in order.
-    seen: Vec<usize>,
-    /// The data page refused for a header that claims more values than its
-    /// rows; the reader's error then stands for this refusal.
-    refused: Option<usize>,
-    /// The last page handed to the column reader, dictionary or data: the
-    /// page a panic in parquet's decoding is reported at.
-    taken: Option<ChunkPage>,
-}
-
-impl Iterator for CountedPages {
-    type Item = parquet::errors::Result<Page>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.get_next_page().transpose()
-    }
-}
-
-impl PageReader for CountedPages {
-    fn get_next_page(&mut self) -> parquet::errors::Result<Option<Page>> {
-        let page = self.inner.get_next_page()?;
-        match &page {
-            Some(Page::DataPage { num_values, .. } | Page::DataPageV2 { num_values, .. }) => {
-                let values = approx::length(*num_values);
-                let at = self.next_page;
-                self.next_page += 1;
-                let rows = self.page_rows[at];
-                let mut tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
-                if values > rows {
-                    tally.refused = Some(at);
-                    return Err(ParquetError::General(format!(
-                        "data page {at} claims {values} values for {rows} rows"
-                    )));
-                }
-                tally.seen.push(values);
-                tally.taken = Some(ChunkPage::Data(at));
-            }
-            Some(Page::DictionaryPage { .. }) => {
-                self.tally
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .taken = Some(ChunkPage::Dictionary);
-            }
-            None => {}
-        }
-        Ok(page)
-    }
-
-    fn peek_next_page(&mut self) -> parquet::errors::Result<Option<PageMetadata>> {
-        self.inner.peek_next_page()
-    }
-
-    fn skip_next_page(&mut self) -> parquet::errors::Result<()> {
-        let data_page = self
-            .inner
-            .peek_next_page()?
-            .is_some_and(|page| !page.is_dict);
-        self.inner.skip_next_page()?;
-        if data_page {
-            self.next_page += 1;
-        }
-        Ok(())
-    }
-
-    fn at_record_boundary(&mut self) -> parquet::errors::Result<bool> {
-        self.inner.at_record_boundary()
     }
 }
 
@@ -542,9 +443,10 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 
 /// `take` records of `chunk` after skipping `skip`, decoded from
 /// `segments`, which hold at least the pages those rows are in and the
-/// chunk's dictionary page when it has one. Whole pages before the rows
-/// wanted are skipped from their locations without a read; the dictionary
-/// page is read on the way, as the reader requires. Definition levels are
+/// chunk's dictionary page when it has one. Only those pages are read,
+/// the dictionary page first, as the reader requires (`ChunkPages`), and
+/// the column reader skips the rows before `skip` within the first of
+/// them; no page before it is read or walked past. Definition levels are
 /// consumed when the column is nullable, and a null yields no value, so
 /// fewer values than `take` may come back. On `Ok` exactly `take` records
 /// were decoded, from exactly the pages the offset index names for them,
@@ -585,7 +487,7 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// byte-array page holding fewer values than its header counts, a
 /// dictionary page among them, and others. The decode runs under
 /// `catch_unwind`, so a panic is `FileFault::DecoderPanicked` at the last
-/// page the column reader took, and ends this load or lookup rather than
+/// page the page reader took up, and ends this load or lookup rather than
 /// the task running it.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
@@ -624,17 +526,10 @@ fn decode_records<T: ParquetDataType>(
 ) -> Result<(Vec<T::T>, parquet::errors::Result<usize>)> {
     let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
-    let pages = CountedPages {
-        inner: chunk.page_reader(segments)?,
-        page_rows: (0..chunk.page_locations().len())
-            .map(|page| {
-                let rows = chunk.page_rows(page);
-                row_index(rows.end - rows.start)
-            })
-            .collect(),
-        next_page: 0,
-        tally: Arc::clone(tally),
-    };
+    let pages = ChunkPages::new(chunk, skip..skip + take, segments, Arc::clone(tally))?;
+    let skip = skip.checked_sub(pages.first_row()).expect(
+        "the first page read is the one holding row `skip`, and inspect checked that a chunk's first page starts at row zero",
+    );
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
     let batch_records = row_index(DECODE_BATCH_RECORDS);
     let mut values = Vec::new();

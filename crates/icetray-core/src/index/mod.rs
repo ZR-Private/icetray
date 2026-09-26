@@ -11,6 +11,7 @@
 mod build;
 mod inspect;
 mod page_header;
+mod pages;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -26,7 +27,6 @@ use parquet::bloom_filter::Sbbf;
 use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType};
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::offset_index::PageLocation;
-use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::schema::types::ColumnDescPtr;
 
 use crate::approx;
@@ -213,8 +213,8 @@ pub enum DecodedPart {
     Pages {
         /// The row group holding the chunk.
         row_group: usize,
-        /// The last page parquet's page reader handed the column reader
-        /// before the panic; `None` when it had handed out none.
+        /// The last page the page reader took up for the column reader
+        /// before the panic; `None` when it had taken up none.
         page: Option<ChunkPage>,
     },
 }
@@ -1100,20 +1100,6 @@ impl<'a> ColumnChunk<'a> {
         start..end
     }
 
-    /// A page reader over `segments` for the column chunk, positioned at its
-    /// start and given every page location, so skipping a page reads no
-    /// byte of it.
-    fn page_reader(&self, segments: Arc<Segments>) -> Result<SerializedPageReader<Segments>> {
-        let locations = self.page_locations().to_vec();
-        let total_rows = row_index(self.rows());
-        Ok(SerializedPageReader::new(
-            segments,
-            self.metadata(),
-            total_rows,
-            Some(locations),
-        )?)
-    }
-
     /// The page holding row `row`, which is inside the row group; the last
     /// page for a row at or past its end.
     fn page_holding(&self, row: usize) -> usize {
@@ -1128,13 +1114,13 @@ impl<'a> ColumnChunk<'a> {
     /// the offset index names for rows `rows`, each holding the rows the
     /// index gives it: `seen` is the value count in the header of every
     /// data page the reader read, in order, starting at the page holding
-    /// the first row (the pages before it were skipped from their
-    /// locations, unread), and `decoded` is how many rows it produced, or
-    /// the error the decode ended in. No rows wanted means no page read. A
-    /// disagreement is `FileFault::PageRowsMismatch` naming the first page
-    /// that does not fit. The header counts are checked before a decode
-    /// error is returned, so a page that ran out of values short of the
-    /// count its header claims is refused as the mismatch it is.
+    /// the first row (no page before it is read), and `decoded` is how many
+    /// rows it produced, or the error the decode ended in. No rows wanted
+    /// means no page read. A disagreement is `FileFault::PageRowsMismatch`
+    /// naming the first page that does not fit. The header counts are
+    /// checked before a decode error is returned, so a page that ran out
+    /// of values short of the count its header claims is refused as the
+    /// mismatch it is.
     fn check_pages_read(
         &self,
         rows: Range<usize>,
