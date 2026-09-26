@@ -11,9 +11,11 @@ use bytes::Bytes;
 use parquet::bloom_filter::Sbbf;
 use parquet::column::reader::ColumnReaderImpl;
 use parquet::data_type::{
-    ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArrayType, Int64Type,
+    ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArray,
+    FixedLenByteArrayType, Int64Type,
 };
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::page_index::offset_index::PageLocation;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
@@ -290,6 +292,8 @@ struct Verified {
 /// against the rows its offset index gives it on the way. Records
 /// the exact first and last key of the file and of every row group, the
 /// longest key, and the fences. Nothing here consults column statistics.
+/// A row group's keys are checked a decode batch at a time (`RunCheck`),
+/// so at most one batch of them is held however long the row group is.
 fn verify(
     table: &str,
     column: &Column<'_>,
@@ -305,26 +309,26 @@ fn verify(
         let chunk = column.group(row_group);
         let rows = chunk.rows();
         check_page_headers(chunk, shape, chunks)?;
-        let keys = decode_run(chunk, shape, 0..rows, Arc::clone(chunks))?;
-        if keys.len() < row_index(rows) {
+        let mut run = RunCheck::new(chunk);
+        check_run(chunk, shape, rows, Arc::clone(chunks), &mut run)?;
+        if run.values < row_index(rows) {
             let reason = RefusalReason::NullKeys {
                 path: path.to_string(),
                 row_group,
             };
             return Err(Error::refused(table, reason));
         }
-        check_utf8(chunk, &keys)?;
-        longest = longest.max(keys.max_len());
-        if keys.is_empty() {
+        if run.not_utf8 {
+            return Err(not_utf8(chunk));
+        }
+        if let Some((order, key)) = run.disorder {
+            return Err(Error::refused(table, not_above_previous(chunk, order, key)));
+        }
+        longest = longest.max(run.longest);
+        let Some((first, last)) = run.first.zip(run.last) else {
             fences.push(Vec::new());
             continue;
-        }
-        if let Some((at, order)) = keys.first_not_increasing() {
-            let reason = not_above_previous(chunk, order, keys.get(at));
-            return Err(Error::refused(table, reason));
-        }
-        let first = keys.get(0);
-        let last = keys.get(keys.len() - 1);
+        };
         if let Some(previous) = groups.last() {
             let order = first.cmp(&previous.last);
             if order != Ordering::Greater {
@@ -334,13 +338,7 @@ fn verify(
                 ));
             }
         }
-        fences.push(
-            chunk
-                .page_locations()
-                .iter()
-                .map(|location| keys.get(row_index(location.first_row_index)))
-                .collect(),
-        );
+        fences.push(run.fences);
         groups.push(GroupRange {
             row_group,
             first,
@@ -363,6 +361,151 @@ fn verify(
         groups,
         max_key_bytes: longest,
     })
+}
+
+/// What `verify` learns of one row group's keys, batch by batch as they are
+/// decoded, so that no row group's keys are held at once: the keys
+/// decoded, the longest, the first and last, the key at each page's first
+/// row (the fences), whether every string key is UTF-8, and the first key
+/// not above the one before it. Nothing is decided here; `verify` applies
+/// what was found once the whole row group has decoded, in the order it
+/// checks a row group in, so a decode failure anywhere in it stands before
+/// a null, a null before a key that is not UTF-8, and that before a key
+/// out of order. Once a batch holds a string that is not UTF-8, later
+/// batches are only counted, since `Keys::get` builds a string key from
+/// UTF-8 alone.
+struct RunCheck<'a> {
+    values: usize,
+    longest: usize,
+    first: Option<Key>,
+    last: Option<Key>,
+    fences: Vec<Key>,
+    /// The first rows of the pages whose key is a fence, in order, and how
+    /// many of them have been taken.
+    fence_rows: &'a [PageLocation],
+    fences_taken: usize,
+    not_utf8: bool,
+    /// The first key not above the one before it, and how it compares.
+    disorder: Option<(Ordering, Key)>,
+}
+
+impl<'a> RunCheck<'a> {
+    fn new(chunk: ColumnChunk<'a>) -> Self {
+        let fence_rows = chunk.page_locations();
+        Self {
+            values: 0,
+            longest: 0,
+            first: None,
+            last: None,
+            fences: Vec::with_capacity(fence_rows.len()),
+            fence_rows,
+            fences_taken: 0,
+            not_utf8: false,
+            disorder: None,
+        }
+    }
+
+    /// The next batch of the row group's keys, in file order.
+    fn visit(&mut self, keys: &Keys) {
+        let base = self.values;
+        self.values += keys.len();
+        if self.not_utf8 || keys.is_empty() {
+            return;
+        }
+        if !keys_are_utf8(keys) {
+            self.not_utf8 = true;
+            return;
+        }
+        if self.disorder.is_some() {
+            return;
+        }
+        self.longest = self.longest.max(keys.max_len());
+        let head = keys.get(0);
+        if let Some(previous) = &self.last {
+            let order = head.cmp(previous);
+            if order != Ordering::Greater {
+                self.disorder = Some((order, head));
+                return;
+            }
+        }
+        if let Some((at, order)) = keys.first_not_increasing() {
+            self.disorder = Some((order, keys.get(at)));
+            return;
+        }
+        while let Some(location) = self.fence_rows.get(self.fences_taken) {
+            let row = row_index(location.first_row_index);
+            if row >= self.values {
+                break;
+            }
+            self.fences.push(keys.get(row - base));
+            self.fences_taken += 1;
+        }
+        self.last = Some(keys.get(keys.len() - 1));
+        self.first.get_or_insert(head);
+    }
+}
+
+/// Every key of row group `chunk`, `rows` of them, decoded from `chunks`
+/// a batch at a time (`read_column_batches`) and handed to `run`. Each
+/// batch's buffer is handed back to the decoder for the next, so a row
+/// group's keys cost one batch's buffer rather than one buffer for all of
+/// them.
+fn check_run(
+    chunk: ColumnChunk<'_>,
+    shape: KeyShape,
+    rows: i64,
+    chunks: Arc<Segments>,
+    run: &mut RunCheck<'_>,
+) -> Result<()> {
+    let take = row_index(rows);
+    match shape {
+        KeyShape::Long => read_column_batches::<Int64Type>(chunk, chunks, 0, take, &mut |batch| {
+            let keys = Keys::Long(std::mem::take(batch));
+            run.visit(&keys);
+            *batch = keys.into_longs();
+        }),
+        KeyShape::Str => {
+            read_column_batches::<ByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
+                let keys = Keys::Str(std::mem::take(batch));
+                run.visit(&keys);
+                *batch = keys.into_byte_arrays();
+            })
+        }
+        KeyShape::Bin => {
+            read_column_batches::<ByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
+                let keys = Keys::Bin(std::mem::take(batch));
+                run.visit(&keys);
+                *batch = keys.into_byte_arrays();
+            })
+        }
+        KeyShape::FixedBin => {
+            read_column_batches::<FixedLenByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
+                run.visit(&Keys::Bin(fixed_as_binary(std::mem::take(batch))));
+            })
+        }
+        KeyShape::Uuid => {
+            read_column_batches::<FixedLenByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
+                run.visit(&Keys::Uuid(fixed_as_uuids(batch)));
+            })
+        }
+    }
+}
+
+/// `FIXED_LEN_BYTE_ARRAY` values as the binary keys they are.
+fn fixed_as_binary(values: Vec<FixedLenByteArray>) -> Vec<ByteArray> {
+    values.into_iter().map(ByteArray::from).collect()
+}
+
+/// `FIXED_LEN_BYTE_ARRAY` values of a uuid column as uuid keys.
+fn fixed_as_uuids(values: &[FixedLenByteArray]) -> Vec<[u8; UUID_BYTES]> {
+    values
+        .iter()
+        .map(|value| {
+            <[u8; UUID_BYTES]>::try_from(value.data()).expect(
+                "a FIXED_LEN_BYTE_ARRAY value is its column's width, checked at build to be UUID_BYTES",
+            )
+        })
+        .collect()
 }
 
 /// The refusal for `key`, which is not above the key before it in `chunk`:
@@ -395,41 +538,48 @@ pub(super) fn decode_run(
         KeyShape::Long => Keys::Long(read_column::<Int64Type>(chunk, chunks, skip, take)?),
         KeyShape::Str => Keys::Str(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
         KeyShape::Bin => Keys::Bin(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
-        KeyShape::FixedBin => Keys::Bin(
-            read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?
-                .into_iter()
-                .map(ByteArray::from)
-                .collect(),
-        ),
-        KeyShape::Uuid => Keys::Uuid(
-            read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?
-                .iter()
-                .map(|value| {
-                    <[u8; UUID_BYTES]>::try_from(value.data()).expect(
-                        "a FIXED_LEN_BYTE_ARRAY value is its column's width, checked at build to be UUID_BYTES",
-                    )
-                })
-                .collect(),
-        ),
+        KeyShape::FixedBin => Keys::Bin(fixed_as_binary(read_column::<FixedLenByteArrayType>(
+            chunk, chunks, skip, take,
+        )?)),
+        KeyShape::Uuid => Keys::Uuid(fixed_as_uuids(&read_column::<FixedLenByteArrayType>(
+            chunk, chunks, skip, take,
+        )?)),
     })
 }
 
 /// Every value of a `Keys::Str` run is UTF-8, or the file is
 /// `FileFault::KeyNotUtf8`; the other arms hold what their bytes are.
 pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
-    if let Keys::Str(run) = keys
-        && run
-            .iter()
-            .any(|value| std::str::from_utf8(value.data()).is_err())
-    {
-        return Err(file_fault(
-            chunk.column.path,
-            FileFault::KeyNotUtf8 {
-                row_group: chunk.row_group(),
-            },
-        ));
+    if keys_are_utf8(keys) {
+        Ok(())
+    } else {
+        Err(not_utf8(chunk))
     }
-    Ok(())
+}
+
+/// `FileFault::KeyNotUtf8` for the row group `chunk`.
+fn not_utf8(chunk: ColumnChunk<'_>) -> Error {
+    file_fault(
+        chunk.column.path,
+        FileFault::KeyNotUtf8 {
+            row_group: chunk.row_group(),
+        },
+    )
+}
+
+/// Whether every value of a `Keys::Str` run is UTF-8; true for the other
+/// arms. A value is first checked to be ASCII, which the standard library
+/// does a word at a time inline, and only a value that is not goes through
+/// the full validator. Joining a batch's values into one buffer and
+/// validating that once costs as much in the copy as it saves in the
+/// validator for keys of a few dozen bytes (measured on the benchmark's
+/// string table).
+fn keys_are_utf8(keys: &Keys) -> bool {
+    let Keys::Str(run) = keys else {
+        return true;
+    };
+    run.iter()
+        .all(|value| value.data().is_ascii() || std::str::from_utf8(value.data()).is_ok())
 }
 
 /// The most records one `read_records` call asks the column reader for:
@@ -496,14 +646,38 @@ fn read_column<T: ParquetDataType>(
     skip: usize,
     take: usize,
 ) -> Result<Vec<T::T>> {
+    let mut values = Vec::new();
+    read_column_batches::<T>(chunk, segments, skip, take, &mut |batch| {
+        values.append(batch);
+    })?;
+    Ok(values)
+}
+
+/// `read_column`, with each batch of at most `DECODE_BATCH_RECORDS` records
+/// handed to `sink` as it is decoded instead of gathered: the values of a
+/// batch, in file order, in a buffer the sink may read or take. What the
+/// sink leaves in the buffer is cleared before the next batch is decoded
+/// into it, so a sink that hands a buffer back lets every batch reuse it.
+/// The sink runs inside the decode's `catch_unwind`; everything
+/// `read_column` checks once the decode ends is checked after the last
+/// batch, so a sink sees batches of a decode that may still fail.
+fn read_column_batches<T: ParquetDataType>(
+    chunk: ColumnChunk<'_>,
+    segments: Arc<Segments>,
+    skip: usize,
+    take: usize,
+    sink: &mut dyn FnMut(&mut Vec<T::T>),
+) -> Result<()> {
     let tally = Arc::new(Mutex::new(PageTally::default()));
     // Unwind-safe: the page reader, the column reader, and the buffers are
     // built inside `decode` and dropped with a panic; the footer `chunk`
     // borrows is only read, the tally `decode` shares holds each page's
-    // record whole, written under its lock, and the thread's zstd context
-    // starts each page afresh.
-    let decode = AssertUnwindSafe(|| decode_records::<T>(chunk, segments, skip, take, &tally));
-    let (values, decoded) = unless_panicked(chunk.column.path, decode, || DecodedPart::Pages {
+    // record whole, written under its lock, the thread's zstd context
+    // starts each page afresh, and what the sink gathered is dropped with
+    // the error a panic becomes.
+    let decode =
+        AssertUnwindSafe(|| decode_records::<T>(chunk, segments, skip, take, &tally, sink));
+    let decoded = unless_panicked(chunk.column.path, decode, || DecodedPart::Pages {
         row_group: chunk.row_group(),
         page: tally.lock().unwrap_or_else(PoisonError::into_inner).taken,
     })??;
@@ -511,21 +685,21 @@ fn read_column<T: ParquetDataType>(
     if let Some(page) = tally.refused {
         return Err(chunk.page_rows_mismatch(page));
     }
-    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)?;
-    Ok(values)
+    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)
 }
 
-/// The decode `read_column` runs under `catch_unwind`: the values of
-/// `take` records after skipping `skip`, and how many records the column
-/// reader produced or the error it ended in, with what the page reader
-/// saw recorded in `tally`.
+/// The decode `read_column_batches` runs under `catch_unwind`: `take`
+/// records after skipping `skip`, each batch handed to `sink`, and how many
+/// records the column reader produced or the error it ended in, with what
+/// the page reader saw recorded in `tally`.
 fn decode_records<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
     skip: usize,
     take: usize,
     tally: &Arc<Mutex<PageTally>>,
-) -> Result<(Vec<T::T>, parquet::errors::Result<usize>)> {
+    sink: &mut dyn FnMut(&mut Vec<T::T>),
+) -> Result<parquet::errors::Result<usize>> {
     let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
     let pages = ChunkPages::new(chunk, skip..skip + take, segments, Arc::clone(tally))?;
@@ -534,7 +708,6 @@ fn decode_records<T: ParquetDataType>(
     );
     let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
     let batch_records = row_index(DECODE_BATCH_RECORDS);
-    let mut values = Vec::new();
     let mut batch = Vec::new();
     let mut def_levels = Vec::new();
     let mut decode = || -> parquet::errors::Result<usize> {
@@ -553,7 +726,7 @@ fn decode_records<T: ParquetDataType>(
                 None,
                 &mut batch,
             )?;
-            values.append(&mut batch);
+            sink(&mut batch);
             if read == 0 {
                 break;
             }
@@ -561,8 +734,7 @@ fn decode_records<T: ParquetDataType>(
         }
         Ok(records)
     };
-    let decoded = decode();
-    Ok((values, decoded))
+    Ok(decode())
 }
 
 /// Exactly row `row` of the value column chunk `chunk` from `segments`:
@@ -776,6 +948,78 @@ mod tests {
             fault_of(opened.build(KeyType::String, Residency::Full, None).await),
             FileFault::KeyNotUtf8 { row_group: 0 }
         );
+    }
+
+    /// A row group longer than one decode batch (`DECODE_BATCH_RECORDS`)
+    /// is checked across the batches it decodes in: a clean one records
+    /// every page's first key as a fence wherever its batch begins, a
+    /// duplicate whose copies end one batch and begin the next is refused,
+    /// and a key that is not UTF-8 in the second batch is found.
+    #[tokio::test]
+    async fn test_verify_checks_a_row_group_across_its_decode_batches() {
+        let batch = row_index(DECODE_BATCH_RECORDS);
+        let rows = 2 * batch;
+        let one_group = |mut fixture: Fixture| {
+            fixture.layout.row_group_rows = rows;
+            fixture
+        };
+        let clean = store(&one_group(Fixture::contract(KeyType::Long, rows))).await;
+        let fences: Vec<Key> = (0..rows)
+            .step_by(page_rows())
+            .map(|i| key_for(i, KeyType::Long))
+            .collect();
+        assert_eq!(clean.index(KeyType::Long).await.fences, [fences]);
+
+        let mut keys: Vec<Option<Key>> =
+            (0..rows).map(|i| Some(key_for(i, KeyType::Long))).collect();
+        keys[batch] = keys[batch - 1].clone();
+        let straddling = store(&one_group(Fixture::with_keys(KeyColumn::Int64, keys))).await;
+        assert_eq!(
+            refusal_of(straddling.build(KeyType::Long, Residency::Full, None).await),
+            RefusalReason::DuplicateKeys {
+                path: location(),
+                key: key_for(batch - 1, KeyType::Long),
+            }
+        );
+
+        let not_utf8_at = batch + 1;
+        let strings: Vec<Option<Key>> = (0..rows)
+            .map(|i| {
+                let mut bytes = key_for(i, KeyType::String).as_bytes().to_vec();
+                if i == not_utf8_at {
+                    // Above the key itself and below the next: order holds.
+                    bytes.push(u8::MAX);
+                }
+                Some(Key::Bytes(bytes))
+            })
+            .collect();
+        let late = store(&one_group(Fixture::with_keys(KeyColumn::Binary, strings))).await;
+        assert_eq!(
+            fault_of(late.build(KeyType::String, Residency::Full, None).await),
+            FileFault::KeyNotUtf8 { row_group: 0 }
+        );
+    }
+
+    /// ASCII values pass on the fast check, a value with a multi-byte
+    /// character passes the full validator, and half of one character is
+    /// refused, alone or after ASCII values.
+    #[test]
+    fn test_keys_are_utf8_takes_ascii_and_multibyte_and_refuses_a_cut_character() {
+        let text = |values: &[&[u8]]| {
+            Keys::Str(
+                values
+                    .iter()
+                    .map(|value| ByteArray::from(value.to_vec()))
+                    .collect(),
+            )
+        };
+        let e_acute = "\u{e9}".as_bytes();
+        assert!(keys_are_utf8(&text(&[b"a", e_acute, b"b"])));
+        assert!(!keys_are_utf8(&text(&[&e_acute[..1], &e_acute[1..]])));
+        assert!(!keys_are_utf8(&text(&[b"a", &e_acute[..1]])));
+        assert!(keys_are_utf8(&Keys::Bin(vec![ByteArray::from(vec![
+            u8::MAX
+        ])])));
     }
 
     /// A footer that claims more rows for a row group than any page could

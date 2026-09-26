@@ -430,6 +430,24 @@ impl Keys {
         }
     }
 
+    /// A `Long` run's values, for the buffer they were decoded into to be
+    /// reused; empty for another arm.
+    pub(crate) fn into_longs(self) -> Vec<i64> {
+        match self {
+            Self::Long(run) => run,
+            Self::Str(_) | Self::Bin(_) | Self::Uuid(_) => Vec::new(),
+        }
+    }
+
+    /// A `Str` or `Bin` run's values, for the buffer they were decoded
+    /// into to be reused; empty for another arm.
+    pub(crate) fn into_byte_arrays(self) -> Vec<ByteArray> {
+        match self {
+            Self::Str(run) | Self::Bin(run) => run,
+            Self::Long(_) | Self::Uuid(_) => Vec::new(),
+        }
+    }
+
     /// The position of the first key that is not above the one before it,
     /// with how it compares to that key: `Equal` for a duplicate, `Less`
     /// for a key out of order. `None` for a strictly increasing run.

@@ -606,8 +606,10 @@ impl FileIndex {
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`. Every tier
     /// streams the key chunks once for verification, checking every key page
     /// header against what its page can hold before parquet reads it, and
-    /// every key page against its offset index; the verification runs on the
-    /// blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
+    /// every key page against its offset index; a row group's keys are checked a
+    /// decode batch (`DECODE_BATCH_RECORDS`) at a time into one reused buffer, so at
+    /// most one batch is held however long the row group, with a string key checked as ASCII before the full UTF-8 validator; the
+    /// verification runs on the blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
     /// them through `LocalDir`, also on the blocking pool (or reuses a chunk file with matching identity
     /// and skips the chunk fetch), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are
@@ -686,7 +688,7 @@ impl Inspected {
 /// parquet decoded, searched and compared in the served order; an in-crate
 /// helper, not re-exported from `lib.rs`.
 pub(crate) enum Keys { Long(Vec<i64>), Str(Vec<ByteArray>), Bin(Vec<ByteArray>), Uuid(Vec<[u8; UUID_BYTES]>) }
-impl Keys { pub(crate) fn len(&self) -> usize; pub(crate) fn is_empty(&self) -> bool; pub(crate) fn get(&self, at: usize) -> Key; pub(crate) fn binary_search(&self, key: &Key) -> Result<usize, usize>; pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering; pub(crate) fn max_len(&self) -> usize; pub(crate) fn first_not_increasing(&self) -> Option<(usize, Ordering)>; }
+impl Keys { pub(crate) fn len(&self) -> usize; pub(crate) fn is_empty(&self) -> bool; pub(crate) fn get(&self, at: usize) -> Key; pub(crate) fn binary_search(&self, key: &Key) -> Result<usize, usize>; pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering; pub(crate) fn max_len(&self) -> usize; pub(crate) fn first_not_increasing(&self) -> Option<(usize, Ordering)>; pub(crate) fn into_longs(self) -> Vec<i64>; pub(crate) fn into_byte_arrays(self) -> Vec<ByteArray>; }
 /// `value_page_offset` is `Some` in the Full tier for a present key, where
 /// the key page is resident and decodes without I/O; `None` for an absent
 /// key and in the Disk and Bloom tiers, where naming the value page would
