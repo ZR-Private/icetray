@@ -1302,15 +1302,18 @@ specification the writer refuses; `Precondition { OracleNotFull,
 CacheNotCold, GoldenUnset, RestUriUnset }` for a helper called in a state
 it cannot measure; `required_var`, the one place a gate's variable is
 read), `keys` (`key_at`, `key_at_padded`, `absent_key_from`,
-`absent_key_near`, `far_key`, `value_for`, `value_for_len`; `KEY_STEP`,
-`VALUE_BYTES`, `STRING_KEY_FIXED_BYTES`; keys of all four types, uuid as
-sixteen bytes with the big-endian value in the tail, and values a function
-of the key), `layout` (`Layout` with `page_rows`, `page_bytes`,
+`absent_key_near`, `far_key`, `value_for`, `value_for_len`,
+`text_value_for_len`, `value_of_kind` over `ValueKind { Random, Text }`;
+`KEY_STEP`, `VALUE_BYTES`, `STRING_KEY_FIXED_BYTES`; keys of all four
+types, uuid as sixteen bytes with the big-endian value in the tail, and
+values a function of the key: random bytes by default, or JSON-like text
+records with repeated field names and a skewed vocabulary, which zstd
+compresses), `layout` (`Layout` with `page_rows`, `page_bytes`,
 `Dictionary`, `column_index_truncate`, `Statistics`, `Bloom`,
 `row_group_rows`, `target_file_bytes`, and `Layout::contract()` built from
 `contract`'s constants; `KEY_BLOOM_FPP`, `OVERSIZED_FPP`, `UNDERSIZED_FPP`,
 `KEY_COLUMN`, `VALUE_COLUMN`), `fixture` (`FixtureSpec` with `small` and
-`interleaved`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
+`interleaved`, its values' kind in `value_kind`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
 `keys_at`, and the sources `catalog_source`, `root_source`,
 `pinned_source`, and `raw_file_in_bucket`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
 `write_table_of_types`, `position_delete_file`, `memory_catalog_local`,

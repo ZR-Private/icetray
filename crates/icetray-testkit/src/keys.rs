@@ -3,6 +3,8 @@
 //! and a value that is a function of its key, so any answer is checkable
 //! without a stored oracle.
 
+use std::fmt::Write as _;
+
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{Key, KeyType};
 
@@ -204,19 +206,129 @@ pub fn value_for(key: &Key) -> Vec<u8> {
 /// keys, and incompressible, so a fixture of `n` rows occupies about
 /// `n * len` bytes on disk after zstd.
 pub fn value_for_len(key: &Key, len: usize) -> Vec<u8> {
-    let seed = match key {
-        Key::Long(value) => u64::from_ne_bytes(value.to_ne_bytes()),
-        Key::Str(_) | Key::Bytes(_) | Key::Uuid(_) => fnv1a(&key.as_bytes()),
-    };
-    let mut state = seed.wrapping_mul(SEED_MULTIPLIER) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << XORSHIFT_FIRST_LEFT;
-            state ^= state >> XORSHIFT_RIGHT;
-            state ^= state << XORSHIFT_SECOND_LEFT;
-            state.to_le_bytes()[0]
-        })
-        .collect()
+    let mut stream = Stream::from_key(key);
+    (0..len).map(|_| stream.next().to_le_bytes()[0]).collect()
+}
+
+/// What a fixture's values are made of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ValueKind {
+    /// `value_for_len`: pseudo-random bytes, which zstd does not shrink.
+    #[default]
+    Random,
+    /// `text_value_for_len`: JSON-like records whose field names repeat on
+    /// every row and whose words come from a small vocabulary drawn with a
+    /// skew, beside numbers that vary per row, so a page of them compresses
+    /// as structured records do.
+    Text,
+}
+
+/// The `len`-byte value of `kind` stored for `key`.
+pub fn value_of_kind(key: &Key, len: usize, kind: ValueKind) -> Vec<u8> {
+    match kind {
+        ValueKind::Random => value_for_len(key, len),
+        ValueKind::Text => text_value_for_len(key, len),
+    }
+}
+
+/// The word-valued fields of a text value, in the order they are written,
+/// repeated from the first when a value is long enough to need more.
+const TEXT_FIELDS: [&str; 6] = ["status", "region", "plan", "device", "locale", "segment"];
+
+/// The words a text value's fields take, drawn with a skew toward the
+/// front (`TextStream::word`), as a categorical field's values are.
+const TEXT_WORDS: [&str; 16] = [
+    "active",
+    "us-east-1",
+    "pro",
+    "ios",
+    "en-US",
+    "returning",
+    "pending",
+    "eu-west-1",
+    "free",
+    "android",
+    "de-DE",
+    "new",
+    "closed",
+    "ap-south-1",
+    "team",
+    "web",
+];
+
+/// The earliest timestamp a text value carries, in epoch seconds
+/// (September 2025).
+const TEXT_TS_BASE: u64 = 1_757_000_000;
+
+/// The span a text value's timestamp falls in after `TEXT_TS_BASE`: a year
+/// of seconds.
+const TEXT_TS_SPAN: u64 = 365 * 24 * 60 * 60;
+
+/// Scores in a text value run below this.
+const TEXT_SCORE_LIMIT: u64 = 1_000;
+
+/// The `len`-byte text value stored for `key` in a table of text values: a
+/// JSON-like record of a 32-bit id, a timestamp within a year, and a score,
+/// then word fields from `TEXT_FIELDS`, each a word of `TEXT_WORDS`, until
+/// the record reaches `len` bytes, where it is cut and closed with a brace.
+/// Drawn from the key's xorshift stream, so it is deterministic and
+/// distinct for neighboring keys.
+pub fn text_value_for_len(key: &Key, len: usize) -> Vec<u8> {
+    let mut stream = Stream::from_key(key);
+    let id = stream.next() & u64::from(u32::MAX);
+    let ts = TEXT_TS_BASE + stream.next() % TEXT_TS_SPAN;
+    let score = stream.next() % TEXT_SCORE_LIMIT;
+    let mut text = format!("{{\"id\":{id},\"ts\":{ts},\"score\":{score}");
+    for field in TEXT_FIELDS.iter().cycle() {
+        if text.len() >= len {
+            break;
+        }
+        let word = stream.word();
+        write!(text, ",\"{field}\":\"{word}\"").expect("writing to a String does not fail");
+    }
+    let mut bytes = text.into_bytes();
+    bytes.truncate(len.saturating_sub(1));
+    if len > 0 {
+        bytes.push(b'}');
+    }
+    bytes
+}
+
+/// A key's xorshift64 stream: seeded from the key (a long's bits, or FNV-1a
+/// over the key's bytes) spread by `SEED_MULTIPLIER`.
+struct Stream {
+    state: u64,
+}
+
+impl Stream {
+    fn from_key(key: &Key) -> Self {
+        let seed = match key {
+            Key::Long(value) => u64::from_ne_bytes(value.to_ne_bytes()),
+            Key::Str(_) | Key::Bytes(_) | Key::Uuid(_) => fnv1a(&key.as_bytes()),
+        };
+        Self {
+            state: seed.wrapping_mul(SEED_MULTIPLIER) | 1,
+        }
+    }
+
+    /// The next state of the stream.
+    fn next(&mut self) -> u64 {
+        self.state ^= self.state << XORSHIFT_FIRST_LEFT;
+        self.state ^= self.state >> XORSHIFT_RIGHT;
+        self.state ^= self.state << XORSHIFT_SECOND_LEFT;
+        self.state
+    }
+
+    /// A word of `TEXT_WORDS`: the lesser of two uniform draws, so the word
+    /// at index `i` of `n` comes up with probability `(2(n - i) - 1) / n²`,
+    /// from about one in eight for the first to one in 256 for the last.
+    fn word(&mut self) -> &'static str {
+        let words = u64::try_from(TEXT_WORDS.len()).expect("a handful of words");
+        let draw = self.next();
+        let first = draw % words;
+        let second = (draw >> u32::BITS) % words;
+        TEXT_WORDS[usize::try_from(first.min(second)).expect("an index below the word count")]
+    }
 }
 
 /// FNV-1a over `bytes`.
@@ -344,6 +456,34 @@ mod tests {
                 assert_ne!(value, value_for(&absent_key_from(&key)));
             }
         }
+    }
+
+    #[test]
+    fn test_text_value_has_the_length_and_is_deterministic_and_distinct_for_neighbors() {
+        for key_type in [KeyType::Long, KeyType::String] {
+            for id in SAMPLE_IDS {
+                let key = key_at(id, key_type);
+                let value = text_value_for_len(&key, VALUE_BYTES);
+                assert_eq!(value.len(), VALUE_BYTES);
+                assert_eq!(value, text_value_for_len(&key, VALUE_BYTES));
+                assert_ne!(
+                    value,
+                    text_value_for_len(&key_at(id + 1, key_type), VALUE_BYTES)
+                );
+                assert!(value.starts_with(b"{\"id\":"), "{value:?}");
+                assert_eq!(value.last(), Some(&b'}'));
+            }
+        }
+        let key = key_at(SAMPLE_IDS[5], KeyType::Long);
+        assert_eq!(
+            value_of_kind(&key, VALUE_BYTES, ValueKind::Text),
+            text_value_for_len(&key, VALUE_BYTES)
+        );
+        assert_eq!(
+            value_of_kind(&key, VALUE_BYTES, ValueKind::Random),
+            value_for(&key)
+        );
+        assert!(text_value_for_len(&key, 0).is_empty());
     }
 
     #[test]

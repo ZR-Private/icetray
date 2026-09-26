@@ -51,7 +51,8 @@ use tempfile::TempDir;
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{
-    STRING_KEY_FIXED_BYTES, VALUE_BYTES, absent_key_from, id_of, key_at_padded, value_for_len,
+    STRING_KEY_FIXED_BYTES, VALUE_BYTES, ValueKind, absent_key_from, id_of, key_at_padded,
+    value_of_kind,
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::s3::S3Fixture;
@@ -259,6 +260,8 @@ pub struct FixtureSpec {
     pub key_pad: usize,
     /// Bytes per value.
     pub value_bytes: usize,
+    /// What the values are made of.
+    pub value_kind: ValueKind,
     /// Which ids get a null value.
     pub nulls: Nulls,
     /// The Parquet layout every data file is written in.
@@ -286,7 +289,8 @@ pub enum Nulls {
 
 impl FixtureSpec {
     /// The small fixture: `SMALL_IDS` in `SMALL_BUCKETS`, every id, ascending,
-    /// no padding, `VALUE_BYTES` per value, no nulls, the contract layout.
+    /// no padding, `VALUE_BYTES` random bytes per value, no nulls, the
+    /// contract layout.
     /// Every other shape is a struct update on it.
     pub fn small(name: &str, key_type: KeyType) -> Self {
         Self {
@@ -298,6 +302,7 @@ impl FixtureSpec {
             order: Order::Ascending,
             key_pad: 0,
             value_bytes: VALUE_BYTES,
+            value_kind: ValueKind::Random,
             nulls: Nulls::None,
             layout: Layout::contract(),
         }
@@ -475,10 +480,10 @@ impl Fixture {
     }
 
     /// The value stored for `key`: `None` for an id `Nulls` names, else the
-    /// `value_bytes` bytes derived from the key.
+    /// `value_bytes` bytes of `value_kind` derived from the key.
     pub fn value(&self, key: &Key) -> Option<Vec<u8>> {
         let null = id_of(key, self.spec.key_pad).is_some_and(|id| self.spec.is_null(id));
-        (!null).then(|| value_for_len(key, self.spec.value_bytes))
+        (!null).then(|| value_of_kind(key, self.spec.value_bytes, self.spec.value_kind))
     }
 
     /// The lookup outcome for a key this fixture holds: `Present` with its
@@ -1030,7 +1035,9 @@ fn batch(
     let values: BinaryArray = ids
         .iter()
         .zip(keys)
-        .map(|(&id, key)| (!spec.is_null(id)).then(|| value_for_len(key, spec.value_bytes)))
+        .map(|(&id, key)| {
+            (!spec.is_null(id)).then(|| value_of_kind(key, spec.value_bytes, spec.value_kind))
+        })
         .collect();
     let value: ArrayRef = Arc::new(values);
     let columns = vec![

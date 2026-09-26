@@ -20,7 +20,8 @@ pub use fixture::{
 /// caller without an `iceberg` dependency can hold it.
 pub use iceberg::memory::MemoryCatalog;
 pub use keys::{
-    absent_key_from, absent_key_near, far_key, key_at, key_at_padded, value_for, value_for_len,
+    ValueKind, absent_key_from, absent_key_near, far_key, key_at, key_at_padded,
+    text_value_for_len, value_for, value_for_len, value_of_kind,
 };
 pub use layout::{Bloom, Dictionary, Layout, Statistics};
 pub use s3::S3Fixture;

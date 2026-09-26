@@ -2,16 +2,18 @@
 //! and load paths measured over contract-shaped tables on the local
 //! filesystem, so every number is icetray's own CPU and allocation cost with
 //! no object-store latency in it. It writes a long-key and a string-key
-//! table of `ROWS` rows each through the fixture writer (once, then reused
-//! from `--data-dir`), serves them through `Table` over `Storage`'s
+//! table of `ROWS` rows each, once with random values and once with text
+//! values (`Values`), through the fixture writer (once, then reused from
+//! `--data-dir`), reports how far zstd compressed each table's key and
+//! value columns, serves them through `Table` over `Storage`'s
 //! `file://` store in every residency tier, and reports latency
 //! percentiles, throughput, and allocations per operation, plus the wall
 //! time, CPU time, allocations, and peak resident set of a load and a
 //! refresh. Results print as a table and are written as JSON under
 //! `--out-dir`. Run with
 //! `cargo run -p icetray-testkit --example bench --release -- --help`; a
-//! profile of one scenario narrows `--scenario`, `--tier`, `--table`, and
-//! `--mode`, and lengthens `--duration`.
+//! profile of one scenario narrows `--scenario`, `--tier`, `--table`,
+//! `--values`, and `--mode`, and lengthens `--duration`.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::error::Error;
@@ -37,7 +39,8 @@ use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
 use icetray_testkit::keys::{STRING_KEY_FIXED_BYTES, VALUE_BYTES};
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
-use icetray_testkit::{FixtureSpec, absent_key_from, key_at, write_fixture};
+use icetray_testkit::{FixtureSpec, ValueKind, absent_key_from, key_at, write_fixture};
+use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde_json::{Value as Json, json};
@@ -185,10 +188,10 @@ enum Scenario {
     Load,
     /// A refresh onto an appended snapshot, and an unchanged poll.
     Refresh,
-    /// Both tables served in one process: `--tasks` tasks of warm hits on
-    /// the long table beside one task looping a `MultiGet` of 1,000 warm
-    /// hits on the string table. Serves both tables whatever `--table`
-    /// selects.
+    /// Two tables served in one process: `--tasks` tasks of warm hits on
+    /// the long table of random values beside one task looping a
+    /// `MultiGet` of 1,000 warm hits on the string table of random values.
+    /// Serves those two whatever `--table` and `--values` select.
     TwoTable,
 }
 
@@ -246,11 +249,41 @@ impl Tier {
     }
 }
 
-/// One of the two benchmark tables.
+/// The key column of a benchmark table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum TableName {
     Long,
     String,
+}
+
+/// What a benchmark table's values are made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Values {
+    /// Pseudo-random bytes, which zstd does not shrink: a value page's
+    /// decompression is near its cheapest.
+    Random,
+    /// JSON-like records with repeated field names and a skewed vocabulary
+    /// (`text_value_for_len`), which zstd compresses as structured values
+    /// compress.
+    Text,
+}
+
+impl Values {
+    const ALL: [Self; 2] = [Self::Random, Self::Text];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Text => "text",
+        }
+    }
+
+    fn kind(self) -> ValueKind {
+        match self {
+            Self::Random => ValueKind::Random,
+            Self::Text => ValueKind::Text,
+        }
+    }
 }
 
 /// How many tasks drive the lookups.
@@ -284,9 +317,12 @@ struct Cli {
     /// Residency tiers to run them in.
     #[arg(long, value_enum, value_delimiter = ',')]
     tier: Vec<Tier>,
-    /// Tables to run them over.
+    /// Tables to run them over, by key column.
     #[arg(long, value_enum, value_delimiter = ',')]
     table: Vec<TableName>,
+    /// Tables to run them over, by values.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    values: Vec<Values>,
     /// Single-task latency, multi-task throughput, or both.
     #[arg(long, value_enum, value_delimiter = ',')]
     mode: Vec<Mode>,
@@ -340,27 +376,46 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// The scheme the fixture writer's local catalog records locations under.
 const FILE_URI: &str = "file://";
 
-/// A benchmark table as written: its name, key type, and the bytes a row
-/// holds before compression, from which the bucket count follows.
-#[derive(Clone, Copy, Debug)]
+/// A benchmark table as written: its key column, key type, the bytes a
+/// row holds before compression, from which the bucket count follows, and
+/// what its values are made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TableShape {
     name: TableName,
     key_type: KeyType,
     key_bytes: usize,
+    values: Values,
 }
 
-const SHAPES: [TableShape; 2] = [
+const SHAPES: [TableShape; 4] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
         key_bytes: size_of::<i64>(),
+        values: Values::Random,
     },
     TableShape {
         name: TableName::String,
         key_type: KeyType::String,
         key_bytes: STRING_KEY_FIXED_BYTES,
+        values: Values::Random,
+    },
+    TableShape {
+        name: TableName::Long,
+        key_type: KeyType::Long,
+        key_bytes: size_of::<i64>(),
+        values: Values::Text,
+    },
+    TableShape {
+        name: TableName::String,
+        key_type: KeyType::String,
+        key_bytes: STRING_KEY_FIXED_BYTES,
+        values: Values::Text,
     },
 ];
+
+/// What a text table's name adds to its key column's.
+const TEXT_TABLE_SUFFIX: &str = "_text";
 
 impl TableName {
     fn as_str(self) -> &'static str {
@@ -372,10 +427,21 @@ impl TableName {
 }
 
 impl TableShape {
+    /// The table's name in the catalog and in the results: the key
+    /// column's, with `TEXT_TABLE_SUFFIX` for text values.
+    fn table_name(self) -> String {
+        match self.values {
+            Values::Random => self.name.as_str().to_string(),
+            Values::Text => format!("{}{TEXT_TABLE_SUFFIX}", self.name.as_str()),
+        }
+    }
+
     /// One file per bucket at the contract's upper file size: the raw row
-    /// bytes over `TARGET_FILE_BYTES_MAX`, rounded up. Values are random
-    /// bytes, which zstd does not shrink, so the written files come close
-    /// to the raw size, inside the contract's 32 to 64 MiB.
+    /// bytes over `TARGET_FILE_BYTES_MAX`, rounded up. Random values do not
+    /// shrink under zstd, so those files come close to the raw size, inside
+    /// the contract's 32 to 64 MiB. A text table keeps the bucket count of
+    /// the random table with its key column, so the two differ in their
+    /// values alone; its files come out smaller by the values' compression.
     fn buckets(self) -> u32 {
         let row_bytes = approx::count(self.key_bytes + VALUE_BYTES);
         u32::try_from((ROWS * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX))
@@ -395,7 +461,8 @@ struct Prepared {
 impl Prepared {
     fn to_json(&self) -> Json {
         json!({
-            "name": self.shape.name.as_str(),
+            "name": self.shape.table_name(),
+            "values": self.shape.values.as_str(),
             "buckets": self.shape.buckets(),
             "root": self.root,
             "first": self.first,
@@ -422,7 +489,8 @@ async fn prepare(dir: &Path, rewrite: bool) -> BenchResult<Vec<Prepared>> {
         let spec = FixtureSpec {
             buckets: shape.buckets(),
             ids: 0..ROWS,
-            ..FixtureSpec::small(shape.name.as_str(), shape.key_type)
+            value_kind: shape.values.kind(),
+            ..FixtureSpec::small(&shape.table_name(), shape.key_type)
         };
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
         let first = fixture.metadata_location().to_string();
@@ -435,7 +503,7 @@ async fn prepare(dir: &Path, rewrite: bool) -> BenchResult<Vec<Prepared>> {
             .await?;
         eprintln!(
             "wrote {} ({ROWS} rows, {} buckets, then {APPENDED_ROWS} more): {:.1?}",
-            shape.name.as_str(),
+            shape.table_name(),
             shape.buckets(),
             started.elapsed()
         );
@@ -481,7 +549,8 @@ fn read_manifest(dir: &Path) -> BenchResult<Option<Vec<Prepared>>> {
         else {
             return Ok(None);
         };
-        if table["name"].as_str() != Some(shape.name.as_str())
+        if table["name"].as_str() != Some(shape.table_name().as_str())
+            || table["values"].as_str() != Some(shape.values.as_str())
             || table["buckets"].as_u64() != Some(u64::from(shape.buckets()))
         {
             return Ok(None);
@@ -514,6 +583,89 @@ fn prime_os_cache(dir: &Path) -> BenchResult<u64> {
     }
     Ok(read)
 }
+
+/// Bytes of one column across a table's data files, as their footers
+/// record them: compressed on disk, and before compression.
+#[derive(Clone, Copy, Debug, Default)]
+struct ColumnBytes {
+    compressed: u64,
+    uncompressed: u64,
+}
+
+impl ColumnBytes {
+    /// Uncompressed over compressed bytes: what zstd achieved.
+    fn ratio(self) -> f64 {
+        approx::ratio(self.uncompressed, self.compressed)
+    }
+
+    fn to_json(self) -> Json {
+        json!({
+            "compressed_bytes": self.compressed,
+            "uncompressed_bytes": self.uncompressed,
+            "ratio": self.ratio(),
+        })
+    }
+}
+
+/// The key and value columns' bytes over every data file of `prepared`
+/// (both builds), summed from the files' footers.
+fn column_bytes(prepared: &Prepared) -> BenchResult<(ColumnBytes, ColumnBytes)> {
+    let (mut key, mut value) = (ColumnBytes::default(), ColumnBytes::default());
+    let mut pending = vec![local_path(&prepared.root)?];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path
+                .extension()
+                .is_none_or(|extension| extension != PARQUET_EXTENSION)
+            {
+                continue;
+            }
+            let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
+            for group in reader.metadata().row_groups() {
+                for column in group.columns() {
+                    let sum = match column.column_descr().name() {
+                        KEY_COLUMN => &mut key,
+                        VALUE_COLUMN => &mut value,
+                        _ => continue,
+                    };
+                    sum.compressed += u64::try_from(column.compressed_size())?;
+                    sum.uncompressed += u64::try_from(column.uncompressed_size())?;
+                }
+            }
+        }
+    }
+    Ok((key, value))
+}
+
+/// Every table's key and value column bytes (`column_bytes`), printed and
+/// as the report's JSON.
+fn compression(prepared: &[Prepared]) -> BenchResult<Vec<Json>> {
+    let mut report = Vec::with_capacity(prepared.len());
+    for table in prepared {
+        let (key, value) = column_bytes(table)?;
+        eprintln!(
+            "{}: key column compresses {:.2}x, value column {:.2}x ({:.1} MiB on disk)",
+            table.shape.table_name(),
+            key.ratio(),
+            value.ratio(),
+            mib(key.compressed + value.compressed)
+        );
+        report.push(json!({
+            "table": table.shape.table_name(),
+            "key": key.to_json(),
+            "value": value.to_json(),
+        }));
+    }
+    Ok(report)
+}
+
+/// The extension of a data file.
+const PARQUET_EXTENSION: &str = "parquet";
 
 /// A location the local catalog recorded, as the path it names.
 fn local_path(location: &str) -> BenchResult<PathBuf> {
@@ -613,7 +765,7 @@ async fn table_over(
     handles: TableHandles,
 ) -> BenchResult<Table> {
     let config = TableConfig {
-        name: prepared.shape.name.as_str().to_string(),
+        name: prepared.shape.table_name(),
         source: source.clone(),
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
@@ -846,7 +998,7 @@ impl Counters {
 #[derive(Clone, Copy, Debug)]
 struct RunLabel {
     scenario: Scenario,
-    table: TableName,
+    table: TableShape,
     tier: Tier,
     mode: Mode,
     tasks: usize,
@@ -903,7 +1055,8 @@ impl Measured {
         let counters = self.counters;
         json!({
             "scenario": self.label.scenario.name(),
-            "table": self.label.table.as_str(),
+            "table": self.label.table.name.as_str(),
+            "values": self.label.table.values.as_str(),
             "tier": format!("{:?}", self.label.tier).to_lowercase(),
             "mode": self.label.mode.name(),
             "tasks": self.label.tasks,
@@ -1028,7 +1181,7 @@ async fn lookups(
             };
             let label = RunLabel {
                 scenario,
-                table: shape.name,
+                table: shape,
                 tier,
                 mode,
                 tasks,
@@ -1111,8 +1264,8 @@ async fn two_tables(
     let find = |name: TableName| {
         prepared
             .iter()
-            .find(|table| table.shape.name == name)
-            .ok_or_else(|| format!("no {} table was prepared", name.as_str()))
+            .find(|table| table.shape.name == name && table.shape.values == Values::Random)
+            .ok_or_else(|| format!("no {} table of random values", name.as_str()))
     };
     let (long, string) = (find(TableName::Long)?, find(TableName::String)?);
     let (tables, _dir) = serve_together(&[long, string], tier).await?;
@@ -1157,7 +1310,7 @@ async fn two_tables(
     };
     let rows = vec![
         Measured {
-            label: label(TableName::String, Mode::Single, one),
+            label: label(string.shape, Mode::Single, one),
             ops: batch_ops,
             keys_per_op: BATCH_1000,
             elapsed,
@@ -1165,7 +1318,7 @@ async fn two_tables(
             counters: Counters::default(),
         },
         Measured {
-            label: label(TableName::Long, Mode::Multi, tasks),
+            label: label(long.shape, Mode::Multi, tasks),
             ops: hit_ops,
             keys_per_op: 1,
             elapsed,
@@ -1257,7 +1410,7 @@ fn cpu_time(value: libc::timeval) -> Duration {
 /// One measured load or refresh.
 struct Loaded {
     what: &'static str,
-    table: TableName,
+    table: TableShape,
     tier: Tier,
     round: u32,
     wall: Duration,
@@ -1277,7 +1430,8 @@ impl Loaded {
         let micros = |duration: Duration| duration.div_duration_f64(MICROSECOND);
         json!({
             "what": self.what,
-            "table": self.table.as_str(),
+            "table": self.table.name.as_str(),
+            "values": self.table.values.as_str(),
             "tier": format!("{:?}", self.tier).to_lowercase(),
             "round": self.round,
             "wall_us": micros(self.wall),
@@ -1301,7 +1455,7 @@ impl Loaded {
 async fn timed<F: Future<Output = BenchResult<()>>>(
     served: &Served,
     what: &'static str,
-    (table, tier, round): (TableName, Tier, u32),
+    (table, tier, round): (TableShape, Tier, u32),
     work: F,
 ) -> BenchResult<Loaded> {
     let rss_before = resident_bytes();
@@ -1339,7 +1493,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
 async fn loads(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<Vec<Loaded>> {
     let mut results = Vec::new();
     for round in 0..rounds {
-        let key = (prepared.shape.name, tier, round);
+        let key = (prepared.shape, tier, round);
         let served = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), None).await?;
         let run = timed(&served, "load", key, async {
             Ok(served.table.load().await?)
@@ -1372,7 +1526,7 @@ async fn refreshes(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<
     };
     let mut results = Vec::new();
     for round in 0..rounds {
-        let key = (prepared.shape.name, tier, round);
+        let key = (prepared.shape, tier, round);
         std::fs::write(&hint, &prepared.first)?;
         let served = serve(prepared, tier, WARM_CACHE_BYTES, source.clone(), None).await?;
         served.table.load().await?;
@@ -1415,7 +1569,7 @@ fn mib(bytes: u64) -> f64 {
 /// The column headings of the lookup table.
 fn header() -> String {
     format!(
-        "{:<15} {:<7} {:<6} {:<7} {:>5} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8}",
+        "{:<15} {:<11} {:<6} {:<7} {:>5} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8}",
         "scenario",
         "table",
         "tier",
@@ -1436,9 +1590,9 @@ fn header() -> String {
 fn row(run: &Measured) -> String {
     let counters = run.counters;
     format!(
-        "{:<15} {:<7} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3}",
+        "{:<15} {:<11} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3}",
         run.label.scenario.name(),
-        run.label.table.as_str(),
+        run.label.table.table_name(),
         format!("{:?}", run.label.tier).to_lowercase(),
         run.label.mode.name(),
         run.label.tasks,
@@ -1456,7 +1610,7 @@ fn row(run: &Measured) -> String {
 
 fn load_header() -> String {
     format!(
-        "{:<26} {:<7} {:<6} {:>5} {:>10} {:>10} {:>11} {:>10} {:>10} {:>9} {:>6} {:>10}",
+        "{:<26} {:<11} {:<6} {:>5} {:>10} {:>10} {:>11} {:>10} {:>10} {:>9} {:>6} {:>10}",
         "what",
         "table",
         "tier",
@@ -1474,9 +1628,9 @@ fn load_header() -> String {
 
 fn load_row(run: &Loaded) -> String {
     format!(
-        "{:<26} {:<7} {:<6} {:>5} {:>10.1?} {:>10.1?} {:>11} {:>10.1} {:>10.1} {:>9} {:>6} {:>10.1}",
+        "{:<26} {:<11} {:<6} {:>5} {:>10.1?} {:>10.1?} {:>11} {:>10.1} {:>10.1} {:>9} {:>6} {:>10.1}",
         run.what,
-        run.table.as_str(),
+        run.table.table_name(),
         format!("{:?}", run.tier).to_lowercase(),
         run.round,
         run.wall,
@@ -1575,11 +1729,12 @@ async fn main() -> BenchResult<()> {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
     let prepared = prepare(&cli.data_dir, cli.rewrite).await?;
+    let compression = compression(&prepared)?;
     if cli.prepare {
         for table in &prepared {
             println!(
                 "{}\t{:?}\t{ROWS}\t{}",
-                table.shape.name.as_str(),
+                table.shape.table_name(),
                 table.shape.key_type,
                 table.first
             );
@@ -1611,6 +1766,7 @@ async fn main() -> BenchResult<()> {
     let tables: Vec<&Prepared> = prepared
         .iter()
         .filter(|table| cli.table.is_empty() || cli.table.contains(&table.shape.name))
+        .filter(|table| or_all(&cli.values, &Values::ALL).contains(&table.shape.values))
         .collect();
     let machine = machine(tasks, !cli.no_metrics);
     eprintln!("{machine}");
@@ -1658,6 +1814,7 @@ async fn main() -> BenchResult<()> {
             "warmup_seconds": cli.warmup,
             "duration_seconds": cli.duration,
             "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
+            "compression": compression,
         },
         "lookups": measured.iter().map(Measured::to_json).collect::<Vec<_>>(),
         "loads": loaded.iter().map(Loaded::to_json).collect::<Vec<_>>(),
