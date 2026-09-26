@@ -182,10 +182,15 @@ enum Scenario {
     Load,
     /// A refresh onto an appended snapshot, and an unchanged poll.
     Refresh,
+    /// Both tables served in one process: `--tasks` tasks of warm hits on
+    /// the long table beside one task looping a `MultiGet` of 1,000 warm
+    /// hits on the string table. Serves both tables whatever `--table`
+    /// selects.
+    TwoTable,
 }
 
 impl Scenario {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -193,6 +198,7 @@ impl Scenario {
         Self::MultiGet1000,
         Self::Load,
         Self::Refresh,
+        Self::TwoTable,
     ];
 
     const LOOKUPS: [Self; 5] = [
@@ -212,6 +218,7 @@ impl Scenario {
             Self::MultiGet1000 => "multi-get-1000",
             Self::Load => "load",
             Self::Refresh => "refresh",
+            Self::TwoTable => "two-table",
         }
     }
 }
@@ -548,7 +555,27 @@ async fn serve(
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
     let storage = Arc::new(Storage::new(StorageConfig::default()));
-    let (local, dir) = match tier {
+    let (local, dir) = local_for(tier, &storage, reuse)?;
+    let cache = PageCache::new(cache_bytes, None).await?;
+    let table = table_over(prepared, tier, source, &storage, &cache, local).await?;
+    Ok(Served {
+        table: Arc::new(table),
+        storage,
+        cache,
+        _local: dir,
+    })
+}
+
+/// Under the Disk tier, a local directory over `storage` with no
+/// page-cache disk level, in `reuse` when given or a fresh temporary
+/// directory, and the directory, which must live as long as the tables
+/// served over it; nothing under the other tiers.
+fn local_for(
+    tier: Tier,
+    storage: &Storage,
+    reuse: Option<TempDir>,
+) -> BenchResult<(Option<Arc<LocalDir>>, Option<TempDir>)> {
+    match tier {
         Tier::Disk => {
             let dir = match reuse {
                 Some(dir) => dir,
@@ -559,14 +586,25 @@ async fn serve(
                 index_budget_bytes: None,
                 page_cache_disk_bytes: 0,
             };
-            (
+            Ok((
                 Some(Arc::new(LocalDir::open(&config, storage.stats())?)),
                 Some(dir),
-            )
+            ))
         }
-        Tier::Full | Tier::Bloom => (None, None),
-    };
-    let cache = PageCache::new(cache_bytes, None).await?;
+        Tier::Full | Tier::Bloom => Ok((None, None)),
+    }
+}
+
+/// `prepared` as a `Table` in `tier` from `source`, strict, over the given
+/// storage, cache, and local directory, with the default deadlines.
+async fn table_over(
+    prepared: &Prepared,
+    tier: Tier,
+    source: SourceConfig,
+    storage: &Arc<Storage>,
+    cache: &PageCache,
+    local: Option<Arc<LocalDir>>,
+) -> BenchResult<Table> {
     let config = TableConfig {
         name: prepared.shape.name.as_str().to_string(),
         source: source.clone(),
@@ -578,21 +616,15 @@ async fn serve(
         resident_budget_bytes: None,
     };
     let server = ServerConfig::default();
-    let table = Table::new(
+    Ok(Table::new(
         config,
         TableSource::from_config(&source).await?,
-        Arc::clone(&storage),
+        Arc::clone(storage),
         cache.clone(),
         local,
         server.refresh_deadline,
         server.get_deadline,
-    );
-    Ok(Served {
-        table: Arc::new(table),
-        storage,
-        cache,
-        _local: dir,
-    })
+    ))
 }
 
 /// The first build's metadata file, which never advances.
@@ -672,13 +704,25 @@ impl Op {
     }
 }
 
+/// Whether a task loop gives its worker up between operations.
+#[derive(Clone, Copy, Debug)]
+enum Pace {
+    /// One operation straight after the other. A warm lookup never waits,
+    /// so the loop holds its worker until the run ends.
+    Straight,
+    /// A yield to the scheduler after each operation, untimed, as a
+    /// server's requests end their tasks: other tasks queued on the worker
+    /// run between operations.
+    Yielding,
+}
+
 /// One task's share of a run: operations `task`, `task + tasks`, ... until
 /// `until`, each timed into `samples` when it is given.
 async fn task_loop(
     table: Arc<Table>,
     op: Op,
-    task: usize,
-    tasks: usize,
+    (task, tasks): (usize, usize),
+    pace: Pace,
     until: Instant,
     mut samples: Option<Vec<Duration>>,
 ) -> BenchResult<(usize, Vec<Duration>)> {
@@ -690,8 +734,37 @@ async fn task_loop(
             samples.push(started.elapsed());
         }
         done += 1;
+        if let Pace::Yielding = pace {
+            tokio::task::yield_now().await;
+        }
     }
     Ok((done, samples.unwrap_or_default()))
+}
+
+/// The task loops of a run, as they are spawned.
+type Loops = Vec<tokio::task::JoinHandle<BenchResult<(usize, Vec<Duration>)>>>;
+
+/// `tasks` task loops of `op` over `table` at `pace` until `until`, each
+/// reserving `reserve` samples when recording, spawned and not yet joined.
+fn spawn_loops(
+    table: &Arc<Table>,
+    (op, pace): (&Op, Pace),
+    tasks: usize,
+    until: Instant,
+    reserve: Option<usize>,
+) -> Loops {
+    (0..tasks)
+        .map(|task| {
+            tokio::spawn(task_loop(
+                Arc::clone(table),
+                op.clone(),
+                (task, tasks),
+                pace,
+                until,
+                reserve.map(Vec::with_capacity),
+            ))
+        })
+        .collect()
 }
 
 /// `tasks` task loops for `length`, each reserving `reserve` samples when
@@ -703,24 +776,20 @@ async fn spawn_run(
     length: Duration,
     reserve: Option<usize>,
 ) -> BenchResult<(usize, Vec<Duration>)> {
-    let buffers: Vec<Option<Vec<Duration>>> = (0..tasks)
-        .map(|_| reserve.map(Vec::with_capacity))
-        .collect();
     let until = Instant::now() + length;
-    let handles: Vec<_> = buffers
-        .into_iter()
-        .enumerate()
-        .map(|(task, samples)| {
-            tokio::spawn(task_loop(
-                Arc::clone(&served.table),
-                op.clone(),
-                task,
-                tasks,
-                until,
-                samples,
-            ))
-        })
-        .collect();
+    join_loops(spawn_loops(
+        &served.table,
+        (op, Pace::Straight),
+        tasks,
+        until,
+        reserve,
+    ))
+    .await
+}
+
+/// Waits for every loop of `handles`; the operations they did and their
+/// samples, merged.
+async fn join_loops(handles: Loops) -> BenchResult<(usize, Vec<Duration>)> {
     let mut done = 0;
     let mut samples = Vec::new();
     for handle in handles {
@@ -890,9 +959,9 @@ async fn measure(
 /// Asks every page of the table once, `PRIME_STRIDE` ids apart, so the
 /// warm cache holds every value page (and under Bloom every key page)
 /// before a warm run starts.
-async fn prime_cache(served: &Served, shape: TableShape) -> BenchResult<()> {
+async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
     for id in (0..ROWS).step_by(approx::length(PRIME_STRIDE)) {
-        served.table.get(&key_at(id, shape.key_type)).await?;
+        table.get(&key_at(id, shape.key_type)).await?;
     }
     Ok(())
 }
@@ -922,7 +991,7 @@ async fn lookups(
     let warm = if warm_needed {
         let served = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), None).await?;
         served.table.load().await?;
-        prime_cache(&served, shape).await?;
+        prime_cache(&served.table, shape).await?;
         Some(served)
     } else {
         None
@@ -942,7 +1011,7 @@ async fn lookups(
             Scenario::Miss => (&warm, get(&misses, false)),
             Scenario::MultiGet100 => (&warm, multi(&hits, BATCH_100)),
             Scenario::MultiGet1000 => (&warm, multi(&hits, BATCH_1000)),
-            Scenario::Load | Scenario::Refresh => continue,
+            Scenario::Load | Scenario::Refresh | Scenario::TwoTable => continue,
         };
         let served = served
             .as_ref()
@@ -991,6 +1060,113 @@ fn multi(keys: &Arc<Vec<Key>>, batch: usize) -> Op {
         keys: Arc::clone(keys),
         batch,
     }
+}
+
+/// Both tables in `tier` over one storage, one `WARM_CACHE_BYTES` page
+/// cache, and under Disk one local directory, as one process serving both
+/// opens them; loaded, each primed as the warm scenarios are. The tables
+/// come in `prepared`'s order, beside the directory, which must outlive
+/// them.
+async fn serve_together(
+    prepared: &[&Prepared],
+    tier: Tier,
+) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
+    let storage = Arc::new(Storage::new(StorageConfig::default()));
+    let (local, dir) = local_for(tier, &storage, None)?;
+    let cache = PageCache::new(WARM_CACHE_BYTES, None).await?;
+    let mut tables = Vec::with_capacity(prepared.len());
+    for table in prepared {
+        let served =
+            table_over(table, tier, pinned(table), &storage, &cache, local.clone()).await?;
+        served.load().await?;
+        prime_cache(&served, table.shape).await?;
+        tables.push(Arc::new(served));
+    }
+    Ok((tables, dir))
+}
+
+/// The two-table scenario in `tier`: `settings.tasks` loops of warm hits on
+/// the long table beside one loop of `MultiGet` 1,000 warm hits on the
+/// string table, run together for the warm-up and then for the measured
+/// window. Every loop yields between operations (`Pace::Yielding`): the hit
+/// loops would otherwise hold every worker, and the batch and its runs
+/// would wait for the window to end. One row per table. Neither row carries counters: both tables'
+/// operations run in one window over one storage and one cache, so no
+/// count belongs to either row alone.
+async fn two_tables(
+    prepared: &[Prepared],
+    tier: Tier,
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let find = |name: TableName| {
+        prepared
+            .iter()
+            .find(|table| table.shape.name == name)
+            .ok_or_else(|| format!("no {} table was prepared", name.as_str()))
+    };
+    let (long, string) = (find(TableName::Long)?, find(TableName::String)?);
+    let (tables, _dir) = serve_together(&[long, string], tier).await?;
+    let (long_table, string_table) = (&tables[0], &tables[1]);
+    let hit_op = get(&key_pools(long.shape).0, true);
+    let batch_op = multi(&key_pools(string.shape).0, BATCH_1000);
+    let hits = (&hit_op, Pace::Yielding);
+    let batches = (&batch_op, Pace::Yielding);
+    let tasks = settings.tasks;
+    let one = 1;
+
+    let until = Instant::now() + settings.warmup;
+    let hit_loops = spawn_loops(long_table, hits, tasks, until, None);
+    let batch_loops = spawn_loops(string_table, batches, one, until, None);
+    let (warm_hits, _) = join_loops(hit_loops).await?;
+    let (warm_batches, _) = join_loops(batch_loops).await?;
+
+    let windows = approx::length(settings.windows);
+    let reserve = |ops: usize, tasks: usize| Some((ops / tasks + 1) * windows * SAMPLE_HEADROOM);
+    let started = Instant::now();
+    let until = started + settings.duration;
+    let hit_loops = spawn_loops(long_table, hits, tasks, until, reserve(warm_hits, tasks));
+    let batch_loops = spawn_loops(
+        string_table,
+        batches,
+        one,
+        until,
+        reserve(warm_batches, one),
+    );
+    let (hit_ops, mut hit_samples) = join_loops(hit_loops).await?;
+    let (batch_ops, mut batch_samples) = join_loops(batch_loops).await?;
+    let elapsed = started.elapsed();
+    hit_samples.sort_unstable();
+    batch_samples.sort_unstable();
+
+    let label = |table, mode, tasks| RunLabel {
+        scenario: Scenario::TwoTable,
+        table,
+        tier,
+        mode,
+        tasks,
+    };
+    let rows = vec![
+        Measured {
+            label: label(TableName::String, Mode::Single, one),
+            ops: batch_ops,
+            keys_per_op: BATCH_1000,
+            elapsed,
+            sorted: batch_samples,
+            counters: Counters::default(),
+        },
+        Measured {
+            label: label(TableName::Long, Mode::Multi, tasks),
+            ops: hit_ops,
+            keys_per_op: 1,
+            elapsed,
+            sorted: hit_samples,
+            counters: Counters::default(),
+        },
+    ];
+    for run in &rows {
+        eprintln!("{}", row(run));
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,6 +1618,11 @@ async fn main() -> BenchResult<()> {
             if scenarios.contains(&Scenario::Refresh) {
                 loaded.extend(refreshes(table, tier, cli.load_rounds).await?);
             }
+        }
+    }
+    if scenarios.contains(&Scenario::TwoTable) {
+        for &tier in &tiers {
+            measured.extend(two_tables(&prepared, tier, &settings).await?);
         }
     }
     println!("{machine}");
