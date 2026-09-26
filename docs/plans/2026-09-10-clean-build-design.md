@@ -622,7 +622,7 @@ impl FileIndex {
     /// the page's own origin and not the dictionary page's: `Fetched` for a cold hit, `Cached`
     /// for a warm one. `None` is a null value, distinct from an absent key. `Some` is a slice
     /// of the fetched page where parquet decoded the value in place (an uncompressed page),
-    /// a copy out of parquet's decompressed buffer otherwise. `find` discards
+    /// a copy out of the decompressed page otherwise. `find` discards
     /// the key page's origin. The value page's header, and its dictionary page's, are read
     /// from the fetched bytes and refused as `MalformedPageHeader` or `PageHeaderOverBound`
     /// before parquet decodes them.

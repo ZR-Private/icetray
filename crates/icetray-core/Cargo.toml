@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 arrow = { workspace = true }

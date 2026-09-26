@@ -15,20 +15,26 @@
 //! The reader here decodes the Thrift compact encoding of parquet's
 //! `PageHeader` as parquet 58 reads it (`PageHeader::read_thrift_without_stats`,
 //! the path `SerializedPageReader` takes with the default reader properties),
-//! keeps the sizes and the value count, and consumes every other field as
-//! parquet does: a field parquet reads, as the type it reads it as, and
-//! any other skipped by its wire type. Where parquet would read a field differently from its
-//! wire type, or skip one without consuming its bytes, the reader refuses
-//! rather than guess, so a header it accepts is one parquet reads to the
-//! same numbers. It allocates nothing: every count it reads bounds a loop
-//! over input it has, never a buffer.
+//! keeps the sizes and every field of the page-specific header parquet
+//! reads, and consumes every other field as parquet does: a field parquet
+//! reads, as the type it reads it as, and any other skipped by its wire
+//! type. Where parquet would read a field differently from its wire type,
+//! or skip one without consuming its bytes, the reader refuses rather than
+//! guess, so a header it accepts is one parquet reads to the same numbers.
+//! It allocates nothing: every count it reads bounds a loop over input it
+//! has, never a buffer. The pages of a zstd or uncompressed chunk reach
+//! parquet's column reader built from this reading (`PageHeader::page`),
+//! so parquet reads none of their headers.
 
 use std::fmt;
 use std::mem::size_of;
 use std::ops::Range;
 
-use parquet::basic::PageType;
+use bytes::Bytes;
+use parquet::basic::{Encoding, PageType};
+use parquet::column::page::Page;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
+use parquet::errors::ParquetError;
 use parquet::file::reader::ChunkReader;
 
 use super::{ColumnChunk, FileFault, KeyShape, ValueShape, file_fault, row_index};
@@ -199,6 +205,18 @@ pub(super) const DATA_PAGE_HEADER_V2_FIELD: i16 = 8;
 /// `num_values`, the first field of each of the three page-specific
 /// headers.
 pub(super) const NUM_VALUES_FIELD: i16 = 1;
+/// `DataPageHeader.encoding` and `DictionaryPageHeader.encoding`.
+const ENCODING_FIELD: i16 = 2;
+/// `DataPageHeader.definition_level_encoding`.
+const DEFINITION_LEVEL_ENCODING_FIELD: i16 = 3;
+/// `DataPageHeader.repetition_level_encoding`.
+const REPETITION_LEVEL_ENCODING_FIELD: i16 = 4;
+/// `DataPageHeaderV2.num_nulls`.
+const NUM_NULLS_FIELD: i16 = 2;
+/// `DataPageHeaderV2.num_rows`.
+const NUM_ROWS_FIELD: i16 = 3;
+/// `DataPageHeaderV2.encoding`.
+const V2_ENCODING_FIELD: i16 = 4;
 /// `DataPageHeaderV2.definition_levels_byte_length`.
 pub(super) const DEFINITION_LEVELS_BYTE_LENGTH_FIELD: i16 = 5;
 /// `DataPageHeaderV2.repetition_levels_byte_length`.
@@ -234,6 +252,10 @@ const DATA_PAGE_HEADER_V2_FIELDS: &[Scalar] = &[
 /// The fields parquet reads from `DictionaryPageHeader`, by field id from
 /// 1: `num_values`, `encoding`, and `is_sorted`.
 const DICTIONARY_PAGE_HEADER_FIELDS: &[Scalar] = &[Scalar::I32, Scalar::I32, Scalar::Bool];
+
+/// The most fields parquet reads from one page-specific header: those of
+/// `DataPageHeaderV2`, the longest of the three.
+const MOST_PAGE_SPECIFIC_FIELDS: usize = DATA_PAGE_HEADER_V2_FIELDS.len();
 
 /// The Thrift compact protocol's wire types, each with the code a field
 /// header or a list header carries for it.
@@ -442,8 +464,8 @@ impl PageBody {
     }
 }
 
-/// The numbers of a page header parquet sizes buffers by, and the bytes
-/// the header takes.
+/// The numbers of a page header parquet sizes buffers by, what else of it
+/// parquet's page reader keeps, and the bytes the header takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PageHeader {
     pub(super) body: PageBody,
@@ -451,8 +473,17 @@ pub(super) struct PageHeader {
     pub(super) compressed_page_size: u32,
     /// The sum of the level lengths of a `data_page_header_v2`, when the
     /// header carries one, whatever its page type: parquet adds the two
-    /// as `i32`s on any page that carries the struct.
+    /// as `i32`s on any page that carries the struct, and copies that many
+    /// bytes at the start of the body uncompressed.
     pub(super) levels_byte_length: Option<u64>,
+    /// Whether the body after those levels is compressed: `is_compressed`
+    /// of a `data_page_header_v2` when the header carries one, whatever
+    /// its page type, true when that field is absent, and true for a
+    /// header without the struct, as parquet decides it.
+    pub(super) body_compressed: bool,
+    /// The page-specific header of the page's type; `None` for an index
+    /// page.
+    specific: Option<PageSpecific>,
     /// The header's own bytes: the page body starts here.
     pub(super) header_len: usize,
 }
@@ -494,54 +525,156 @@ impl PageHeader {
             last = id;
         }
         let page_type = page_type.ok_or(PageHeaderFault::Missing(HeaderField::PageType))?;
-        let body = match PageType::VARIANTS
+        let (body, specific) = match PageType::VARIANTS
             .iter()
             .find(|known| **known as i32 == page_type)
             .ok_or(PageHeaderFault::UnknownPageType(page_type))?
         {
-            PageType::DATA_PAGE => PageBody::Data {
-                num_values: num_values(data, HeaderField::DataPageHeader)?,
-            },
-            PageType::DATA_PAGE_V2 => PageBody::DataV2 {
-                num_values: num_values(data_v2, HeaderField::DataPageHeaderV2)?,
-            },
-            PageType::DICTIONARY_PAGE => PageBody::Dictionary {
-                num_values: num_values(dictionary, HeaderField::DictionaryPageHeader)?,
-            },
-            PageType::INDEX_PAGE => PageBody::Index,
+            PageType::DATA_PAGE => (
+                PageBody::Data {
+                    num_values: num_values(data, HeaderField::DataPageHeader)?,
+                },
+                data,
+            ),
+            PageType::DATA_PAGE_V2 => (
+                PageBody::DataV2 {
+                    num_values: num_values(data_v2, HeaderField::DataPageHeaderV2)?,
+                },
+                data_v2,
+            ),
+            PageType::DICTIONARY_PAGE => (
+                PageBody::Dictionary {
+                    num_values: num_values(dictionary, HeaderField::DictionaryPageHeader)?,
+                },
+                dictionary,
+            ),
+            PageType::INDEX_PAGE => (PageBody::Index, None),
         };
         Ok(Self {
             body,
             uncompressed_page_size: non_negative(uncompressed, HeaderField::UncompressedPageSize)?,
             compressed_page_size: non_negative(compressed, HeaderField::CompressedPageSize)?,
             levels_byte_length: data_v2.map(PageSpecific::levels_byte_length).transpose()?,
+            body_compressed: data_v2.and_then(|v2| v2.flag).unwrap_or(true),
+            specific,
             header_len: input.at,
+        })
+    }
+
+    /// The page parquet's page reader makes of this header and `buf`, the
+    /// page's body once decompressed: what parquet 58.4.0's `decode_page`
+    /// (`file/serialized_reader.rs`) builds from the header it reads, with
+    /// no page statistics, which the reader's default properties do not
+    /// read. Where parquet's header read fails for a field the page needs
+    /// (an encoding that is missing or not one it knows, a v2 header's
+    /// missing or negative null or row count), this fails too, and an
+    /// index page is refused as parquet's decode refuses one.
+    pub(super) fn page(&self, buf: Bytes) -> parquet::errors::Result<Page> {
+        let specific = |field| {
+            self.specific.ok_or_else(|| {
+                ParquetError::General(format!("{field} is missing from the page header"))
+            })
+        };
+        Ok(match self.body {
+            PageBody::Data { num_values } => {
+                let header = specific(HeaderField::DataPageHeader)?;
+                Page::DataPage {
+                    buf,
+                    num_values,
+                    encoding: header.encoding(ENCODING_FIELD)?,
+                    def_level_encoding: header.encoding(DEFINITION_LEVEL_ENCODING_FIELD)?,
+                    rep_level_encoding: header.encoding(REPETITION_LEVEL_ENCODING_FIELD)?,
+                    statistics: None,
+                }
+            }
+            PageBody::DataV2 { num_values } => {
+                let header = specific(HeaderField::DataPageHeaderV2)?;
+                Page::DataPageV2 {
+                    buf,
+                    num_values,
+                    encoding: header.encoding(V2_ENCODING_FIELD)?,
+                    num_nulls: header.count(NUM_NULLS_FIELD)?,
+                    num_rows: header.count(NUM_ROWS_FIELD)?,
+                    def_levels_byte_len: header.count(DEFINITION_LEVELS_BYTE_LENGTH_FIELD)?,
+                    rep_levels_byte_len: header.count(REPETITION_LEVELS_BYTE_LENGTH_FIELD)?,
+                    is_compressed: self.body_compressed,
+                    statistics: None,
+                }
+            }
+            PageBody::Dictionary { num_values } => {
+                let header = specific(HeaderField::DictionaryPageHeader)?;
+                Page::DictionaryPage {
+                    buf,
+                    num_values,
+                    encoding: header.encoding(ENCODING_FIELD)?,
+                    is_sorted: header.flag.unwrap_or(false),
+                }
+            }
+            PageBody::Index => {
+                return Err(ParquetError::General(format!(
+                    "page type {} is not supported",
+                    PageType::INDEX_PAGE
+                )));
+            }
         })
     }
 }
 
-/// A page-specific header as read: its `num_values` and, in a v2 data
-/// page header, its level lengths, each when it has one.
-#[derive(Clone, Copy)]
+/// A page-specific header as read: every field parquet reads from it, as
+/// the type parquet reads it as, keeping the last of repeated fields as
+/// parquet does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PageSpecific {
-    num_values: Option<i32>,
-    definition_levels_byte_length: Option<i32>,
-    repetition_levels_byte_length: Option<i32>,
+    /// The fields read as `i32`, an encoding's code among them, by field id
+    /// from `NUM_VALUES_FIELD`.
+    ints: [Option<i32>; MOST_PAGE_SPECIFIC_FIELDS],
+    /// The boolean field, when sent: `is_compressed` of a v2 data page
+    /// header or `is_sorted` of a dictionary page header.
+    flag: Option<bool>,
 }
 
 impl PageSpecific {
+    /// The `i32` field `id`, when sent.
+    fn int(self, id: i16) -> Option<i32> {
+        let at = usize::try_from(id - NUM_VALUES_FIELD).ok()?;
+        self.ints.get(at).copied().flatten()
+    }
+
     /// The sum of a v2 data page header's level lengths, each of which
     /// parquet requires and refuses when negative.
     fn levels_byte_length(self) -> std::result::Result<u64, PageHeaderFault> {
         let definition = non_negative(
-            self.definition_levels_byte_length,
+            self.int(DEFINITION_LEVELS_BYTE_LENGTH_FIELD),
             HeaderField::DefinitionLevelsByteLength,
         )?;
         let repetition = non_negative(
-            self.repetition_levels_byte_length,
+            self.int(REPETITION_LEVELS_BYTE_LENGTH_FIELD),
             HeaderField::RepetitionLevelsByteLength,
         )?;
         Ok(u64::from(definition) + u64::from(repetition))
+    }
+
+    /// The encoding field `id`, which parquet requires and reads as one of
+    /// the encodings it knows.
+    fn encoding(self, id: i16) -> parquet::errors::Result<Encoding> {
+        let code = self.int(id).ok_or_else(|| {
+            ParquetError::General(format!("required encoding field {id} is missing"))
+        })?;
+        Encoding::VARIANTS
+            .iter()
+            .copied()
+            .find(|known| *known as i32 == code)
+            .ok_or_else(|| ParquetError::General(format!("unexpected encoding {code}")))
+    }
+
+    /// The count field `id`, which parquet requires and refuses when
+    /// negative.
+    fn count(self, id: i16) -> parquet::errors::Result<u32> {
+        let value = self
+            .int(id)
+            .ok_or_else(|| ParquetError::General(format!("required field {id} is missing")))?;
+        u32::try_from(value)
+            .map_err(|_| ParquetError::General(format!("field {id} is negative: {value}")))
     }
 }
 
@@ -552,7 +685,7 @@ fn num_values(
     field: HeaderField,
 ) -> std::result::Result<u32, PageHeaderFault> {
     let header = header.ok_or(PageHeaderFault::Missing(field))?;
-    non_negative(header.num_values, HeaderField::NumValues)
+    non_negative(header.int(NUM_VALUES_FIELD), HeaderField::NumValues)
 }
 
 fn non_negative(
@@ -646,9 +779,9 @@ impl Compact<'_> {
 
     /// Page-specific header `id`, sent as `wire`: a struct whose fields
     /// `fields` lists, by id from `NUM_VALUES_FIELD`, parquet reads as
-    /// their scalar type, and whose other fields it skips. Its `num_values`
-    /// and level lengths when it has them; parquet keeps the last of
-    /// repeated fields, and so does this.
+    /// their scalar type, and whose other fields it skips. Every field of
+    /// `fields` it has, as read; parquet keeps the last of repeated fields,
+    /// and so does this.
     fn page_specific(
         &mut self,
         id: i16,
@@ -657,36 +790,33 @@ impl Compact<'_> {
     ) -> Parsed<PageSpecific> {
         sent_as(id, wire, WireType::Struct)?;
         let mut read = PageSpecific {
-            num_values: None,
-            definition_levels_byte_length: None,
-            repetition_levels_byte_length: None,
+            ints: [None; MOST_PAGE_SPECIFIC_FIELDS],
+            flag: None,
         };
         let mut last = 0;
         while let Some((wire, id)) = self.field_begin(last)? {
-            let scalar = id
+            let at = id
                 .checked_sub(NUM_VALUES_FIELD)
-                .and_then(|at| usize::try_from(at).ok())
-                .and_then(|at| fields.get(at));
-            match scalar {
-                Some(Scalar::I32) => {
-                    let value = Some(self.i32_field(id, wire)?);
-                    // Of the three headers' `fields`, only a v2 data page
-                    // header's reach the level lengths' ids.
-                    match id {
-                        NUM_VALUES_FIELD => read.num_values = value,
-                        DEFINITION_LEVELS_BYTE_LENGTH_FIELD => {
-                            read.definition_levels_byte_length = value;
+                .and_then(|at| usize::try_from(at).ok());
+            match at.and_then(|at| Some((at, fields.get(at)?))) {
+                Some((at, Scalar::I32)) => read.ints[at] = Some(self.i32_field(id, wire)?),
+                Some((_, Scalar::Bool)) => {
+                    read.flag = Some(match wire {
+                        WireType::BoolTrue => true,
+                        WireType::BoolFalse => false,
+                        WireType::Byte
+                        | WireType::I16
+                        | WireType::I32
+                        | WireType::I64
+                        | WireType::Double
+                        | WireType::Binary
+                        | WireType::List
+                        | WireType::Set
+                        | WireType::Map
+                        | WireType::Struct => {
+                            return Err(PageHeaderFault::WireTypeMismatch { field: id, wire });
                         }
-                        REPETITION_LEVELS_BYTE_LENGTH_FIELD => {
-                            read.repetition_levels_byte_length = value;
-                        }
-                        _ => {}
-                    }
-                }
-                Some(Scalar::Bool) => {
-                    if !matches!(wire, WireType::BoolTrue | WireType::BoolFalse) {
-                        return Err(PageHeaderFault::WireTypeMismatch { field: id, wire });
-                    }
+                    });
                 }
                 None => self.skip(wire, SKIP_DEPTH)?,
             }
@@ -1052,11 +1182,94 @@ mod tests {
         }
     }
 
+    /// What parquet's column reader takes from a page besides its buffer:
+    /// every field of a `Page` but the page statistics, which neither
+    /// parquet's reader with its default properties nor `PageHeader::page`
+    /// reads, and whose absence both pages are checked for.
+    #[derive(Debug, PartialEq)]
+    enum PageFields {
+        Data {
+            num_values: u32,
+            encoding: Encoding,
+            def_level_encoding: Encoding,
+            rep_level_encoding: Encoding,
+        },
+        DataV2 {
+            num_values: u32,
+            encoding: Encoding,
+            num_nulls: u32,
+            num_rows: u32,
+            def_levels_byte_len: u32,
+            rep_levels_byte_len: u32,
+            is_compressed: bool,
+        },
+        Dictionary {
+            num_values: u32,
+            encoding: Encoding,
+            is_sorted: bool,
+        },
+    }
+
+    fn fields_of(page: &Page) -> PageFields {
+        match page {
+            Page::DataPage {
+                num_values,
+                encoding,
+                def_level_encoding,
+                rep_level_encoding,
+                statistics,
+                ..
+            } => {
+                assert!(statistics.is_none());
+                PageFields::Data {
+                    num_values: *num_values,
+                    encoding: *encoding,
+                    def_level_encoding: *def_level_encoding,
+                    rep_level_encoding: *rep_level_encoding,
+                }
+            }
+            Page::DataPageV2 {
+                num_values,
+                encoding,
+                num_nulls,
+                num_rows,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                is_compressed,
+                statistics,
+                ..
+            } => {
+                assert!(statistics.is_none());
+                PageFields::DataV2 {
+                    num_values: *num_values,
+                    encoding: *encoding,
+                    num_nulls: *num_nulls,
+                    num_rows: *num_rows,
+                    def_levels_byte_len: *def_levels_byte_len,
+                    rep_levels_byte_len: *rep_levels_byte_len,
+                    is_compressed: *is_compressed,
+                }
+            }
+            Page::DictionaryPage {
+                num_values,
+                encoding,
+                is_sorted,
+                ..
+            } => PageFields::Dictionary {
+                num_values: *num_values,
+                encoding: *encoding,
+                is_sorted: *is_sorted,
+            },
+        }
+    }
+
     /// Every page of every column chunk of `file`, read here from the
     /// chunk's bytes one header after another, against parquet's page
-    /// reader walking the same chunk by the same headers: the same page
-    /// type and value count, an uncompressed size that is the length of
-    /// the page parquet decoded, a header and compressed size that step to
+    /// reader walking the same chunk by the same headers: the page fields
+    /// the column reader receives (`PageHeader::page` over the buffer
+    /// parquet decoded), the same page type and value count, an
+    /// uncompressed size that is the length of the page parquet decoded,
+    /// a header and compressed size that step to
     /// the next page where parquet's offset index says it starts, level
     /// lengths that add to what parquet read from a v2 page, and sums that
     /// are the chunk's sizes in the footer. The pages compared, and the v2
@@ -1080,6 +1293,8 @@ mod tests {
                 let (mut compressed, mut uncompressed) = (0, 0);
                 while let Some(page) = parquet.get_next_page().unwrap() {
                     let header = PageHeader::read(&file[at..end]).unwrap();
+                    let ours = header.page(page.buffer().clone()).unwrap();
+                    assert_eq!(fields_of(&ours), fields_of(&page));
                     assert_eq!(header.body.page_type(), page.page_type());
                     assert_eq!(num_values_of(header.body), page.num_values());
                     let levels = match &page {

@@ -469,12 +469,13 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// on the way disagrees with the offset index and `Error::Parquet`
 /// otherwise, or, for a byte-array page, in a panic inside parquet.
 ///
-/// Three allocations happen inside parquet before this function sees what
-/// sized them. The page reader reserves a page's uncompressed size from its
-/// header when it decodes the page (a Snappy chunk zero-fills it), and a
-/// dictionary page's value count, from its header, sizes the dictionary it
-/// decodes into. The callers read those headers ahead of the page reader
-/// and refuse one that declares more than its page can hold: `verify`
+/// Three allocations happen before this function sees what sized them.
+/// A page's uncompressed size, from its header, is reserved when the page
+/// is decompressed, by `ChunkPages` for a zstd page and by parquet's page
+/// reader for another codec (a Snappy chunk zero-fills it), and a
+/// dictionary page's value count, from its header, sizes the dictionary
+/// parquet decodes into. The callers read those headers ahead of the page
+/// reader and refuse one that declares more than its page can hold: `verify`
 /// every key page's before the row group's first decode
 /// (`check_page_headers`), and `FileIndex::read_value` the value page's
 /// and its dictionary page's before `read_one` (`check_value_page_headers`).
@@ -485,10 +486,10 @@ const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 ///
 /// Parquet panics on some page bodies the headers do not reveal: a
 /// byte-array page holding fewer values than its header counts, a
-/// dictionary page among them, and others. The decode runs under
-/// `catch_unwind`, so a panic is `FileFault::DecoderPanicked` at the last
-/// page the page reader took up, and ends this load or lookup rather than
-/// the task running it.
+/// dictionary page among them, and others. The decode, decompression
+/// included, runs under `catch_unwind`, so a panic is
+/// `FileFault::DecoderPanicked` at the last page the page reader took up,
+/// and ends this load or lookup rather than the task running it.
 fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -498,8 +499,9 @@ fn read_column<T: ParquetDataType>(
     let tally = Arc::new(Mutex::new(PageTally::default()));
     // Unwind-safe: the page reader, the column reader, and the buffers are
     // built inside `decode` and dropped with a panic; the footer `chunk`
-    // borrows is only read, and the tally `decode` shares holds each
-    // page's record whole, written under its lock.
+    // borrows is only read, the tally `decode` shares holds each page's
+    // record whole, written under its lock, and the thread's zstd context
+    // starts each page afresh.
     let decode = AssertUnwindSafe(|| decode_records::<T>(chunk, segments, skip, take, &tally));
     let (values, decoded) = unless_panicked(chunk.column.path, decode, || DecodedPart::Pages {
         row_group: chunk.row_group(),

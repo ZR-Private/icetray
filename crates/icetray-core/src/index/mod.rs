@@ -1166,8 +1166,9 @@ impl<'a> ColumnChunk<'a> {
 /// when parquet decoded it in place there, as it does from an uncompressed
 /// page, so the value shares the page's buffer and holds it only while the
 /// value is referenced; otherwise a copy, since a value decoded from a
-/// compressed page lies in the buffer parquet decompressed into, which its
-/// `ByteArray` does not hand out.
+/// compressed page lies in the buffer the page was decompressed into, and a
+/// slice of it would hold the whole decompressed page for as long as the
+/// value is referenced.
 fn value_bytes(segments: &Segments, value: &[u8]) -> Bytes {
     segments
         .parts()
@@ -1365,8 +1366,8 @@ mod tests {
 
     /// A value read from an uncompressed value page is a slice of the page
     /// the cache holds, not a copy; one read from a zstd page, the
-    /// contract's codec, is a copy out of the buffer parquet decompressed
-    /// into, and shares no fetched page.
+    /// contract's codec, is a copy out of the buffer the page was
+    /// decompressed into, and shares no fetched page.
     #[tokio::test]
     async fn test_read_value_shares_the_buffer_of_an_uncompressed_page() {
         for (compression, shared) in [
