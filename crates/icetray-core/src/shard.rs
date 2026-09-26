@@ -6,17 +6,23 @@
 use std::num::NonZero;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// The shard count for state that every worker thread writes: the worker
-/// threads of the tokio runtime the caller runs on, or the machine's
-/// available parallelism when called outside a runtime (or 1 when the
-/// platform does not report it), rounded up to a power of two so that a
-/// thread's `slot` masks into it.
+/// The threads that run lookups: the worker threads of the tokio runtime
+/// the caller runs on, or the machine's available parallelism when called
+/// outside a runtime (or 1 when the platform does not report it). At least
+/// one.
+pub(crate) fn workers() -> usize {
+    tokio::runtime::Handle::try_current()
+        .map_or_else(
+            |_outside| std::thread::available_parallelism().map_or(1, NonZero::get),
+            |runtime| runtime.metrics().num_workers(),
+        )
+        .max(1)
+}
+
+/// The shard count for state that every worker thread writes: `workers()`
+/// rounded up to a power of two, so that a thread's `slot` masks into it.
 pub(crate) fn count() -> usize {
-    let threads = tokio::runtime::Handle::try_current().map_or_else(
-        |_outside| std::thread::available_parallelism().map_or(1, NonZero::get),
-        |runtime| runtime.metrics().num_workers(),
-    );
-    threads.max(1).next_power_of_two()
+    workers().next_power_of_two()
 }
 
 /// The next slot a thread draws on its first `slot` call.
@@ -46,14 +52,15 @@ mod tests {
 
     #[test]
     fn test_count_follows_the_runtime_workers_rounded_up() {
-        let workers = 3;
+        let threads = 3;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
+            .worker_threads(threads)
             .build()
             .unwrap();
+        assert_eq!(runtime.block_on(async { workers() }), threads);
         assert_eq!(
             runtime.block_on(async { count() }),
-            workers.next_power_of_two()
+            threads.next_power_of_two()
         );
         let single = tokio::runtime::Builder::new_current_thread()
             .build()

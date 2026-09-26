@@ -17,7 +17,8 @@ use arc_swap::ArcSwapOption;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use metrics::{Counter, Histogram};
-use tokio::sync::MutexGuard;
+use tokio::sync::{MutexGuard, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::approx;
 use crate::cache::PageCache;
@@ -34,13 +35,22 @@ use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
-/// The lookups of one `multi_get` in flight at once: 32. A lookup waits on
-/// one GET at a time, and at most one hedge beside it, so a batch holds at
-/// most twice this many GETs open on the store however many keys it
-/// carries, rather than one per key. A full batch of cold hits takes about
-/// thirty GET round trips, inside the `MultiGet` deadline at the latency a
-/// live lookup expects, well under 200 ms each (RFD 013).
+/// The lookups of one `multi_get` in flight at once: 32, across every task
+/// the batch runs on, each lookup holding one of the batch's permits while
+/// it runs. A lookup waits on one GET at a time, and at most one hedge
+/// beside it, so a batch holds at most twice this many GETs open on the
+/// store however many keys it carries, rather than one per key. A full
+/// batch of cold hits takes about thirty GET round trips, inside the
+/// `MultiGet` deadline at the latency a live lookup expects, well under
+/// 200 ms each (RFD 013).
 const MULTI_GET_FAN_OUT: usize = 32;
+
+/// The fewest keys one task of a `multi_get` is given: 8. A warm hit's
+/// decode is on the order of ten microseconds, so a task of eight keys
+/// holds about a hundred microseconds of work, far more than spawning it
+/// costs, and a batch of a hundred keys still spreads over a dozen
+/// workers.
+const MULTI_GET_TASK_KEYS_MIN: usize = 8;
 
 /// Where a table is in its lifecycle. Display gives the `state` metric
 /// label: the variant's name alone, `loading`, `serving`, or `degraded`.
@@ -128,9 +138,6 @@ pub struct Table {
     config: TableConfig,
     source: TableSource,
     storage: Arc<Storage>,
-    /// The process's page cache, through a handle whose fetches end at the
-    /// table's `get_deadline`.
-    cache: PageCache,
     local: Option<Arc<LocalDir>>,
     hedge: Arc<HedgeWindow>,
     /// The serving generation. A `get` borrows it through one `load` guard
@@ -154,7 +161,58 @@ pub struct Table {
     /// How long one `load` or `refresh` may hold `serial` doing its work,
     /// from `server.refresh_deadline`.
     refresh_deadline: Duration,
-    lookups: LookupMetrics,
+    lookups: Arc<Lookups>,
+}
+
+/// What a lookup needs beside its generation: the table's page cache
+/// handle and lookup metrics. Behind an `Arc`, so the tasks a `multi_get`
+/// spawns hold it for as long as they run.
+struct Lookups {
+    /// The process's page cache, through a handle whose fetches end at the
+    /// table's `get_deadline`.
+    cache: PageCache,
+    metrics: LookupMetrics,
+}
+
+impl Lookups {
+    /// One lookup through `generation`, timed and counted under its result;
+    /// the one path `get` and `multi_get` share.
+    async fn one(&self, generation: &Generation, key: &Key) -> Result<Value> {
+        let started = Instant::now();
+        let (value, result) = generation.lookup(key, &self.cache).await?;
+        self.metrics.record(result, started.elapsed());
+        Ok(value)
+    }
+
+    /// `keys` looked up through `generation` and answered in their order.
+    /// Each lookup runs holding a permit of `fan_out`, the batch's bound,
+    /// so the batch's tasks together run at most `MULTI_GET_FAN_OUT` at
+    /// once; this task waits on at most that many permits itself. The
+    /// first failure ends the run.
+    async fn run(
+        &self,
+        generation: &Generation,
+        keys: &[Key],
+        fan_out: &Semaphore,
+    ) -> Result<Vec<Value>> {
+        // The lookups are built before the stream, unpolled, so no closure
+        // taking a key by reference lives in the returned future; one would
+        // make it unprovably `Send`, and the gRPC service needs it `Send`.
+        let lookups: Vec<_> = keys
+            .iter()
+            .map(|key| async move {
+                let _permit = fan_out
+                    .acquire()
+                    .await
+                    .expect("a batch's semaphore is never closed");
+                self.one(generation, key).await
+            })
+            .collect();
+        stream::iter(lookups)
+            .buffered(MULTI_GET_FAN_OUT)
+            .try_collect()
+            .await
+    }
 }
 
 /// A table's lookup metric handles, one pair per `LookupResult` under the
@@ -281,12 +339,14 @@ impl Table {
         get_deadline: Duration,
     ) -> Self {
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
-        let lookups = LookupMetrics::new(&config.name);
+        let lookups = Arc::new(Lookups {
+            cache: cache.with_fetch_deadline(get_deadline),
+            metrics: LookupMetrics::new(&config.name),
+        });
         let table = Self {
             config,
             source,
             storage,
-            cache: cache.with_fetch_deadline(get_deadline),
             local,
             hedge,
             current: ArcSwapOption::empty(),
@@ -395,7 +455,7 @@ impl Table {
         let current = self.current.load();
         let generation = current.as_deref().ok_or_else(|| self.not_ready())?;
         self.check_key_type(generation, key)?;
-        let value = self.lookup(generation, key).await?;
+        let value = self.lookups.one(generation, key).await?;
         Ok(Lookup {
             value,
             snapshot_id: generation.snapshot_id,
@@ -407,34 +467,70 @@ impl Table {
     /// so a scrape calls this first to read every lookup counted before it;
     /// the binary's `/metrics` does, and a dropped table does it last.
     pub fn publish_lookup_counts(&self) {
-        self.lookups.publish();
+        self.lookups.metrics.publish();
     }
 
     /// Several lookups against one generation, answered in key order. Every
     /// key's type is checked before any read, so a mismatch anywhere fails
-    /// the whole call and issues nothing; the lookups then run concurrently,
-    /// `MULTI_GET_FAN_OUT` at a time, and any failure fails the whole call
-    /// (RFD 010).
+    /// the whole call and issues nothing; any failure fails the whole call
+    /// (RFD 010). The keys are split, in order, into up to one run per
+    /// worker thread (`shard::workers`) of at least
+    /// `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a batch's
+    /// decodes run on several cores; a batch that makes one run is looked
+    /// up here, unspawned. The runs share one bound of `MULTI_GET_FAN_OUT`
+    /// lookups in flight. Dropping the returned future, as a deadline does,
+    /// aborts the runs still going. A run's panic is resumed here; a run
+    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup> {
         let generation = self.serving()?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
-        // The lookups are built before the stream, unpolled, so no closure
-        // taking a key by reference lives in the returned future; one would
-        // make it unprovably `Send`, and the gRPC service needs it `Send`.
-        let lookups: Vec<_> = keys
-            .iter()
-            .map(|key| self.lookup(&generation, key))
-            .collect();
-        let values = stream::iter(lookups)
-            .buffered(MULTI_GET_FAN_OUT)
-            .try_collect()
-            .await?;
+        let fan_out = Arc::new(Semaphore::new(MULTI_GET_FAN_OUT));
+        let runs = shard::workers().min(keys.len().div_ceil(MULTI_GET_TASK_KEYS_MIN));
+        let values = if runs <= 1 {
+            self.lookups.run(&generation, keys, &fan_out).await?
+        } else {
+            self.run_spawned(&generation, keys, runs, &fan_out).await?
+        };
         Ok(MultiLookup {
             values,
             snapshot_id: generation.snapshot_id,
         })
+    }
+
+    /// `keys` split in order into `runs` runs of nearly equal length, each
+    /// run spawned on its own task over owned copies of its keys, and the
+    /// answers put back in key order. The tasks live in a `JoinSet`, so
+    /// returning early on a failure, or being dropped, aborts the rest.
+    async fn run_spawned(
+        &self,
+        generation: &Arc<Generation>,
+        keys: &[Key],
+        runs: usize,
+        fan_out: &Arc<Semaphore>,
+    ) -> Result<Vec<Value>> {
+        let per_run = keys.len().div_ceil(runs);
+        let mut tasks = JoinSet::new();
+        for (index, part) in keys.chunks(per_run).enumerate() {
+            let lookups = Arc::clone(&self.lookups);
+            let generation = Arc::clone(generation);
+            let fan_out = Arc::clone(fan_out);
+            let part = part.to_vec();
+            tasks.spawn(async move { (index, lookups.run(&generation, &part, &fan_out).await) });
+        }
+        let mut answered: Vec<Vec<Value>> = vec![Vec::new(); tasks.len()];
+        while let Some(joined) = tasks.join_next().await {
+            let (index, values) = joined.map_err(|error| match error.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(canceled) => Error::LookupCanceled {
+                    table: self.config.name.clone(),
+                    source: canceled,
+                },
+            })?;
+            answered[index] = values?;
+        }
+        Ok(answered.into_iter().flatten().collect())
     }
 
     /// Holds the table's load and refresh lock, so no load is in flight
@@ -682,15 +778,6 @@ impl Table {
                 got,
             })
         }
-    }
-
-    /// One lookup through `generation`, timed and counted under its result;
-    /// the one path `get` and `multi_get` share.
-    async fn lookup(&self, generation: &Generation, key: &Key) -> Result<Value> {
-        let started = Instant::now();
-        let (value, result) = generation.lookup(key, &self.cache).await?;
-        self.lookups.record(result, started.elapsed());
-        Ok(value)
     }
 }
 
@@ -1035,6 +1122,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_get_runs_at_most_the_fan_out_bound_at_once_in_key_order() {
+        fills_the_fan_out_bound_in_key_order().await;
+    }
+
+    /// On several workers the batch is split over spawned runs, and the
+    /// runs together hold the one bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_on_several_workers_runs_at_most_the_fan_out_bound_in_key_order() {
+        assert!(
+            shard::workers() > 1,
+            "the batch is split only over several workers"
+        );
+        fills_the_fan_out_bound_in_key_order().await;
+    }
+
+    /// A batch of cold hits, each on a page of its own, reaches exactly
+    /// `MULTI_GET_FAN_OUT` GETs in flight at once and answers in key order.
+    async fn fills_the_fan_out_bound_in_key_order() {
         let batches_of_the_bound = 3;
         let key_count = i64::try_from(MULTI_GET_FAN_OUT * batches_of_the_bound).unwrap();
         let all = keys_from(0, key_count);

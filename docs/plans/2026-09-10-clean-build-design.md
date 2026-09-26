@@ -122,6 +122,10 @@ pub enum Error {
     /// or the group's first file in file order. A panic in it is resumed on the caller
     /// instead. `UNAVAILABLE` at the service.
     VerifyCanceled { path: String, source: tokio::task::JoinError },
+    /// A task a `multi_get` spawned for a run of its keys was canceled as the runtime it ran
+    /// on shut down. A panic in it is resumed on the caller instead. `UNAVAILABLE` at the
+    /// service.
+    LookupCanceled { table: String, source: tokio::task::JoinError },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
@@ -132,10 +136,10 @@ impl Error {
 /// label of `refresh_errors_total`: the refusal's own name for `Refused`, `inefficient` for
 /// the strict gate, and the variant's snake_case name for the rest (`iceberg`, `parquet`,
 /// `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
-/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`, `verify_canceled`). Also what `TableState::Degraded` carries as its reason:
+/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`). Also what `TableState::Degraded` carries as its reason:
 /// `Error` is not `Clone`, so the failure goes to the caller and its kind to the state.
 /// Re-exported from `lib.rs`.
-pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline, VerifyCanceled }
+pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline, VerifyCanceled, LookupCanceled }
 
 /// Named refusals (RFD 007). Display gives the snake_case name used in logs;
 /// the fields name the file, row group, type, key, or bytes a reader has to
@@ -855,10 +859,17 @@ impl Table {
     /// `lookups_total{table, result}`.
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
     /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
-    /// the whole call and issues nothing); the lookups run concurrently against that one
-    /// generation, a private `MULTI_GET_FAN_OUT` (32) at a time through `buffered`, so the
-    /// values come back in key order and one batch runs at most that many lookups at once; each
-    /// is counted as `get` counts; any `Err` fails the whole call (RFD 010).
+    /// the whole call and issues nothing); the keys are split in order into up to one run per
+    /// worker thread (`shard::workers`) of at least a private `MULTI_GET_TASK_KEYS_MIN` (8)
+    /// keys, each run spawned on a task of a `JoinSet` over owned copies of its keys, the
+    /// generation's `Arc`, and the table's shared lookup state, so one batch decodes on several
+    /// cores; a batch of one run is looked up inline. Every lookup of the batch, in whichever
+    /// run, holds one permit of a per-batch semaphore of a private `MULTI_GET_FAN_OUT` (32)
+    /// while it runs, so one batch runs at most that many lookups, and twice that many GETs,
+    /// at once; each run is `buffered` and the runs' answers are put back in key order. Each
+    /// lookup is counted as `get` counts; any `Err` fails the whole call (RFD 010), and
+    /// returning or being dropped (a deadline) aborts the runs still going. A run's panic is
+    /// resumed on the caller; a run canceled by a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup>;
     /// Moves the lookups counted on the per-thread shards (`shard::count()` of them, one per
     /// worker when the workers are the threads that count) into `lookups_total`, each shard

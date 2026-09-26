@@ -129,6 +129,16 @@ pub enum Error {
         /// The canceled task's outcome.
         source: tokio::task::JoinError,
     },
+    /// A task of a `multi_get` was canceled before it answered its keys:
+    /// the runtime it was spawned on shut down under it. A panic in that
+    /// task is resumed on the caller instead, never turned into an error.
+    #[error("a lookup task of table {table} was canceled: {source}")]
+    LookupCanceled {
+        /// The table's configured name.
+        table: String,
+        /// The canceled task's outcome.
+        source: tokio::task::JoinError,
+    },
 }
 
 impl Error {
@@ -177,6 +187,7 @@ impl Error {
             Self::CatalogTimeout { .. } => ErrorKind::CatalogTimeout,
             Self::RefreshDeadline { .. } => ErrorKind::RefreshDeadline,
             Self::VerifyCanceled { .. } => ErrorKind::VerifyCanceled,
+            Self::LookupCanceled { .. } => ErrorKind::LookupCanceled,
         }
     }
 }
@@ -222,6 +233,8 @@ pub enum ErrorKind {
     RefreshDeadline,
     /// `Error::VerifyCanceled`.
     VerifyCanceled,
+    /// `Error::LookupCanceled`.
+    LookupCanceled,
 }
 
 impl fmt::Display for ErrorKind {
@@ -244,6 +257,7 @@ impl fmt::Display for ErrorKind {
             Self::CatalogTimeout => "catalog_timeout",
             Self::RefreshDeadline => "refresh_deadline",
             Self::VerifyCanceled => "verify_canceled",
+            Self::LookupCanceled => "lookup_canceled",
         };
         f.write_str(name)
     }

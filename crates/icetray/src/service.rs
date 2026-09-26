@@ -189,7 +189,8 @@ async fn within<T>(
 /// code whichever passes first; a read the caller can
 /// retry (no generation yet, an object-store, cache, or local-directory
 /// failure, a catalog or load that did not answer in time, a load's key
-/// verification canceled as the runtime shut down) is
+/// verification or a batch's lookup task canceled as the runtime shut
+/// down) is
 /// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
 /// error's `Display`.
 pub fn status_from(error: &Error) -> Status {
@@ -203,7 +204,8 @@ pub fn status_from(error: &Error) -> Status {
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
         | Error::RefreshDeadline { .. }
-        | Error::VerifyCanceled { .. } => Status::unavailable(message),
+        | Error::VerifyCanceled { .. }
+        | Error::LookupCanceled { .. } => Status::unavailable(message),
         Error::Iceberg(_)
         | Error::Parquet(_)
         | Error::ObjectStorePath(_)
@@ -602,9 +604,25 @@ mod tests {
                 },
                 Code::Unavailable,
             ),
+        ]
+        .into_iter()
+        .chain(canceled_cases())
+        .collect()
+    }
+
+    /// The variants a canceled task ends in, beside their code.
+    fn canceled_cases() -> [(Error, Code); 2] {
+        [
             (
                 Error::VerifyCanceled {
                     path: "mem://f0.parquet".to_string(),
+                    source: canceled_task(),
+                },
+                Code::Unavailable,
+            ),
+            (
+                Error::LookupCanceled {
+                    table: TABLE.to_string(),
                     source: canceled_task(),
                 },
                 Code::Unavailable,
