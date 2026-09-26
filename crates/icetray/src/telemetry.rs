@@ -79,12 +79,14 @@ pub fn count(call: Call) {
 }
 
 /// The exposition a scrape of `/metrics` returns, with every table's lookup
-/// counts published first (`Table::publish_lookup_counts`), so the scrape
-/// reads every lookup answered before it.
+/// counts (`Table::publish_lookup_counts`) and the page cache's hit counts
+/// (`PageCache::publish_hit_counts`) published first, so the scrape reads
+/// every lookup answered and every page hit before it.
 pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
     for table in &opened.tables {
         table.publish_lookup_counts();
     }
+    opened.cache.publish_hit_counts();
     handle.render()
 }
 

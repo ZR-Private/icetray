@@ -732,6 +732,13 @@ impl PageCache {
     /// as each would under `DiskChunks::page`, since foyer names no leader
     /// among them; a lookup coalesced onto another's fetch counts under neither.
     pub fn hits(&self) -> u64; pub fn fetches(&self) -> u64; pub(crate) fn usage(&self) -> usize;
+    /// A hit is counted on the calling thread's shard (`shard::Sharded`), each shard's count
+    /// only growing, and `hits` sums them. This moves into `page_cache_hits_total` the rise of
+    /// that sum since the last call, through a handle registered once in `new` (a
+    /// `fetch_max` on the sum last given, so two calls at once give each hit once between
+    /// them). The binary's `/metrics` calls it before rendering (`telemetry::render`), and the
+    /// last clone of the cache dropped calls it last, so a scrape reads every hit before it.
+    pub fn publish_hit_counts(&self);
     /// Flushes the disk level and closes it; `serve` calls it while draining
     /// (RFD 012), so what memory still held reaches disk before the process
     /// exits. A memory-only cache returns `Ok` and does nothing.
@@ -1506,13 +1513,17 @@ Ownership: `table` emits `lookups_total`, `lookup_seconds`,
 the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
 series. The per-lookup and per-GET series are recorded through handles
 registered once (a table's per `LookupResult` in `Table::new`, storage's per
-`ReadKind` when its `IoStats` is built) with the recorder current then, so
+`ReadKind` when its `IoStats` is built, the page cache's hits in
+`PageCache::new`) with the recorder current then, so
 the binary installs its recorder before it opens the tables. A lookup's
 count goes to its thread's shard of the table's counts rather than to the
 shared series, and reaches `lookups_total` when `/metrics` renders
 (`telemetry::render` calls `Table::publish_lookup_counts` for every table
-first) or the table drops; `lookup_seconds` is recorded per lookup as it
-ends. The binary samples `generation_age_seconds` (from
+first) or the table drops; a page-cache hit likewise goes to its thread's
+shard and reaches `page_cache_hits_total` through
+`PageCache::publish_hit_counts`, which `telemetry::render` also calls
+first, or the cache's last clone drops; `lookup_seconds` is recorded per
+lookup as it ends. The binary samples `generation_age_seconds` (from
 `Generation::snapshot_timestamp` against now) and `process_rss_bytes` once
 after the first loads and then every `poll_interval`, running the
 recorder's upkeep with each sample, and counts `requests_total`. `icetray_findings{table,code}` describes the serving

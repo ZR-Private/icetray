@@ -695,6 +695,18 @@ async fn test_requests_total_counts_every_call() -> TestResult {
         approx::gauge(COUNTED_GETS + 1).to_bits(),
         "every lookup answered before the scrape is in it: {looked_up}"
     );
+    // On the Full tier each lookup takes its value page from the page
+    // cache once, a hit or a fetch.
+    let pages_served = |exposition: &str| {
+        series_sum(exposition, metric::PAGE_CACHE_HITS_TOTAL, &[])
+            + series_sum(exposition, metric::PAGE_CACHE_FETCHES_TOTAL, &[])
+    };
+    let served = pages_served(&after) - pages_served(&before);
+    assert_eq!(
+        served.to_bits(),
+        approx::gauge(COUNTED_GETS + 1).to_bits(),
+        "every page hit before the scrape is in it: {served}"
+    );
     let rss = series_value(&after, metric::PROCESS_RSS_BYTES, &[])
         .expect("the sampler ran after the first loads");
     assert!(rss > 0.0, "a running process holds memory: {rss}");

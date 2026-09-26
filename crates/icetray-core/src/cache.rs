@@ -5,6 +5,7 @@
 //! evicted from memory is written there, served back with a local read and
 //! no GET, and recovered when the next process opens the same directory.
 
+use std::fmt;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
@@ -17,6 +18,7 @@ use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, Code, DeviceBuilder as _, ErrorKind, FsDeviceBuilder,
     HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, Source,
 };
+use metrics::Counter;
 
 use crate::approx;
 use crate::config::ConfigViolation;
@@ -24,7 +26,7 @@ use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::error::{Error, Result};
 use crate::local::DiskLevel;
 use crate::metric;
-use crate::shard;
+use crate::shard::{self, Sharded};
 use crate::storage::IoStats;
 
 /// The name foyer files its own log lines under. Its metrics stay on its
@@ -265,7 +267,7 @@ fn origin_of(source: Source) -> PageOrigin {
 #[derive(Clone, Debug)]
 pub struct PageCache {
     level: Arc<Level>,
-    hits: Arc<AtomicU64>,
+    hits: Arc<Hits>,
     fetches: Arc<AtomicU64>,
     /// How long a fetch this handle runs may take; `None` is no bound.
     fetch_deadline: Option<Duration>,
@@ -299,7 +301,7 @@ impl PageCache {
         };
         Ok(Self {
             level: Arc::new(level),
-            hits: Arc::default(),
+            hits: Arc::new(Hits::new()),
             fetches: Arc::default(),
             fetch_deadline: None,
         })
@@ -380,7 +382,16 @@ impl PageCache {
     /// lookups coalesced onto one disk read each count one; a lookup that
     /// joined another's fetch counts under neither `hits` nor `fetches`.
     pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
+        self.hits.counted()
+    }
+
+    /// Moves the hits counted since the last call into
+    /// `page_cache_hits_total`. A hit is counted on its thread's shard, not
+    /// on the shared series, so a scrape calls this first to read every hit
+    /// counted before it; the binary's `/metrics` does, and the last clone
+    /// of a cache dropped does it last.
+    pub fn publish_hit_counts(&self) {
+        self.hits.publish();
     }
 
     /// Fetch futures run, after coalescing: concurrent misses on one key run
@@ -435,14 +446,73 @@ impl PageCache {
 
     /// One page served without a fetch.
     fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(metric::PAGE_CACHE_HITS_TOTAL).increment(1);
+        self.hits.shards.mine().fetch_add(1, Ordering::Relaxed);
     }
 
     /// One page fetched and inserted: the one event that raises the memory
     /// budget's usage, so the gauge is set here and not on every lookup.
     fn record_insert(&self) {
         metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
+    }
+}
+
+/// A cache's hits, counted on the calling thread's shard so concurrent hits
+/// on different workers write different lines, and published into
+/// `page_cache_hits_total` through a handle registered once in
+/// `PageCache::new`, with the recorder current then, so a hit looks up no
+/// series.
+struct Hits {
+    /// Each shard's hits since the cache opened; they only grow.
+    shards: Sharded<AtomicU64>,
+    /// The shards' sum as of the last `publish`, what the counter has been
+    /// given so far.
+    published: AtomicU64,
+    total: Counter,
+}
+
+impl Hits {
+    fn new() -> Self {
+        Self {
+            shards: Sharded::new(),
+            published: AtomicU64::new(0),
+            total: metrics::counter!(metric::PAGE_CACHE_HITS_TOTAL),
+        }
+    }
+
+    /// The hits counted so far, summed over the shards.
+    fn counted(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Adds to the counter what the shards have counted beyond what it was
+    /// given. `published` only rises, by `fetch_max`, and the counter is
+    /// given the rise alone, so two publishes at once give it each hit
+    /// once between them.
+    fn publish(&self) {
+        let counted = self.counted();
+        let given = self.published.fetch_max(counted, Ordering::Relaxed);
+        if counted > given {
+            self.total.increment(counted - given);
+        }
+    }
+}
+
+impl Drop for Hits {
+    /// Publishes the hits counted since the last `publish`, so a cache
+    /// dropped between scrapes loses none of its counts.
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
+impl fmt::Debug for Hits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hits")
+            .field("counted", &self.counted())
+            .finish_non_exhaustive()
     }
 }
 
@@ -547,6 +617,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use futures::future::{join, join_all};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tokio::sync::Notify;
 
     use super::*;
@@ -844,6 +915,74 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(single.block_on(async { check_capacity(below) }), Ok(()));
+    }
+
+    /// Hits spread over a multi-thread runtime's workers reach
+    /// `page_cache_hits_total` at `publish_hit_counts`, each once, and the
+    /// last clone of the cache dropped publishes the rest, while `hits`
+    /// reads each as it is counted. A snapshot of the debugging recorder
+    /// takes the counter's value and resets it, so each snapshot reads what
+    /// was published since the one before.
+    #[test]
+    fn test_publish_hit_counts_moves_every_thread_count_once() {
+        let workers = 4;
+        let hits_per_task = 8;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        let published = || {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == metric::PAGE_CACHE_HITS_TOTAL)
+                .map_or(0, |(.., value)| match value {
+                    DebugValue::Counter(value) => value,
+                    other @ (DebugValue::Gauge(_) | DebugValue::Histogram(_)) => {
+                        panic!("hits are a counter, got {other:?}")
+                    }
+                })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+                let runs = Arc::new(AtomicU64::new(0));
+                cache
+                    .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+                    .await
+                    .unwrap();
+                let tasks: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let cache = cache.clone();
+                        tokio::spawn(async move {
+                            for _ in 0..hits_per_task {
+                                cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                let hit = count(workers * hits_per_task);
+                assert_eq!(cache.hits(), hit);
+                assert_eq!(published(), 0, "counted on the shards until published");
+                cache.publish_hit_counts();
+                assert_eq!(published(), hit);
+                cache.publish_hit_counts();
+                assert_eq!(published(), 0, "nothing is published twice");
+                cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+                let clone = cache.clone();
+                drop(cache);
+                assert_eq!(published(), 0, "a clone still holds the counts");
+                drop(clone);
+                assert_eq!(published(), 1, "the last clone dropped publishes the rest");
+            });
+        });
     }
 
     #[tokio::test]

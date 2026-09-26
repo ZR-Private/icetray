@@ -20,9 +20,9 @@ pub(crate) const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
 /// Second requests issued because a lookup GET was slow (RFD 013).
 pub(crate) const HEDGES_TOTAL: &str = "icetray_hedges_total";
 /// Value pages served from the page cache without a fetch.
-pub(crate) const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
+pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Value-page fetches the page cache ran, after coalescing.
-pub(crate) const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
+pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Refreshes that failed and left the previous generation serving, by
