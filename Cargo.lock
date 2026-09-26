@@ -2614,6 +2614,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "jiff",
+ "libc",
  "metrics",
  "metrics-util",
  "murmur3",

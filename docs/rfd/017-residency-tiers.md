@@ -1,5 +1,9 @@
 # Residency tiers
 
+> Updated 2026-09-26: on Linux a disk-tier page read that the operating
+> system's page cache serves without blocking runs on the worker; a read
+> that would block still runs on the blocking pool.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs, per key,
@@ -61,7 +65,13 @@ replica that restarts reuses every chunk file already on its disk without
 fetching the chunks again, and a generation that drops a file deletes its
 chunk file. Pages are read from the chunk files with explicit positioned
 reads, counted in the accounting of RFD 003 (One storage stack) beside GETs;
-the operating system's page cache is not the memory knob.
+the operating system's page cache is not the memory knob. No async worker
+waits for data from the disk: a read the operating system's page cache can
+serve without blocking may run on the worker that asks for it, and a read
+that would block runs on the blocking pool. On Linux a read is first tried
+on the worker with `RWF_NOWAIT` and goes to the blocking pool when the page
+cache cannot return all of it; on other systems it goes to the blocking
+pool.
 
 The local directory is optional and disposable; everything in it is rebuilt
 from object storage, so it needs capacity and nothing else, and how a
@@ -101,6 +111,18 @@ them.
 
 A replica wanting the disk tier runs on hardware with local solid-state
 storage or a local volume; the state on it is disposable.
+
+A disk-tier read on the worker needs a filesystem that serves `RWF_NOWAIT`
+reads. ext4 does and overlayfs, a container's own writable layer, does not
+(both checked on Linux 6.8), and kernels before 4.14 do not support the
+flag; on those every read takes the blocking pool's handoff, which is most of
+what the disk tier costs over the full tier
+([performance sweep, the disk tier on Linux](../analysis/2026-09-26-performance-sweep.md#the-disk-tier-on-linux)).
+So the local directory belongs on a mounted volume, not in the container's
+filesystem. A read the page cache serves can still wait on the file's
+access-time update, which under `relatime` comes on the first read after
+the file is written and at most once a day after that; a directory mounted
+`noatime` makes none.
 
 The disk tier holds one open file descriptor per data file for the life of
 its generation, twice that while a refresh that rewrote the table loads beside

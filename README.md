@@ -371,8 +371,12 @@ both sets, and a table rewritten wholesale wants a budget of about twice
 its steady footprint. The steady footprint is the doctor's
 `predicted.disk_bytes`: each chunk file's header and key chunks, the bytes
 the budget is charged. A disk-tier lookup costs one local read and, on a
-hit, one GET; a `bloom` table keeps the key column's bloom filters in
-memory instead, needs no disk, and pays two GETs per hit and a GET per miss
+hit, one GET. On Linux, put the directory on a mounted volume with a
+filesystem such as ext4, not in a container's overlay filesystem: a local
+read the operating system's page cache holds then runs on the worker
+thread answering the request instead of handing off to another thread,
+which overlayfs does not allow.
+A `bloom` table keeps the key column's bloom filters in memory instead, needs no disk, and pays two GETs per hit and a GET per miss
 at the filter's false-positive rate. `disk` residency without a local
 directory is a configuration error, and `bloom` on a table whose files
 carry no key bloom filter is a refusal at load.

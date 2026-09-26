@@ -59,9 +59,16 @@ impl DiskChunks {
     /// The bytes of `range` of the data file, from the one stored chunk
     /// that holds the whole range; a range no chunk holds whole is
     /// `LocalFault::RangeNotResident` and costs nothing. The read is
-    /// positioned, runs on the blocking pool so no worker stalls on disk,
-    /// and counts as one local read of the range's length (RFD 017), counted
-    /// before it is issued as GETs are.
+    /// positioned and counts as one local read of the range's length
+    /// (RFD 017), counted before it is issued as GETs are, wherever it runs.
+    ///
+    /// No worker waits for data from the disk (RFD 017): a read the
+    /// operating system's page cache can serve without blocking may run on
+    /// the calling worker, and a read that would block runs on the blocking
+    /// pool. On Linux the read is first tried on the worker with
+    /// `RWF_NOWAIT` (`ChunkFile::read_cached`), and goes to the blocking
+    /// pool when that attempt does not return the whole range; on other
+    /// systems it goes to the blocking pool.
     pub(crate) async fn page(&self, range: Range<u64>) -> Result<Bytes> {
         let Range { start, end } = range;
         let (file_offset, len) = self.shared.locate(start, end).ok_or_else(|| {
@@ -69,6 +76,10 @@ impl DiskChunks {
                 .error(LocalFault::RangeNotResident { start, end })
         })?;
         self.shared.stats.record_local_read(len);
+        #[cfg(target_os = "linux")]
+        if let Some(bytes) = self.shared.read_cached(file_offset, len) {
+            return Ok(bytes);
+        }
         let shared = Arc::clone(&self.shared);
         on_blocking_pool(move || shared.read_at(file_offset, len))
             .await
@@ -110,6 +121,51 @@ impl ChunkFile {
             .read_exact_at(&mut buf, offset)
             .map_err(|error| self.error(LocalFault::Io(error)))?;
         Ok(Bytes::from(buf))
+    }
+
+    /// `len` bytes at `offset` of the chunk file when the operating
+    /// system's page cache holds all of them, read without blocking by
+    /// `preadv2` with `RWF_NOWAIT`, so the calling worker can run it.
+    /// `None` when it cannot: the kernel returns `EAGAIN` when the range's
+    /// first page is not cached, fewer bytes than asked when a later one is
+    /// not, and `EOPNOTSUPP` when the kernel (before 4.14) or the file's
+    /// filesystem (overlayfs, as of Linux 6.8) does not support the flag.
+    /// A `None` is left to `read_at` on the blocking pool, which meets and
+    /// reports a real I/O error itself.
+    ///
+    /// A cached read can still update the file's access time, which a
+    /// journaling filesystem may write through its journal and wait on;
+    /// under `relatime` the kernel does so on the first read after the file
+    /// is written and then at most once a day, and on a directory mounted
+    /// `noatime` not at all.
+    #[cfg(target_os = "linux")]
+    fn read_cached(&self, offset: u64, len: u64) -> Option<Bytes> {
+        use std::os::fd::AsRawFd as _;
+        /// One buffer takes the whole range.
+        const BUFFERS: libc::c_int = 1;
+        let offset = libc::off_t::try_from(offset).ok()?;
+        let mut buf = vec![0u8; approx::length(len)];
+        let target = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: `target` describes `buf`: a live allocation of
+        // `iov_len` initialized bytes, which nothing else borrows or moves
+        // until the call returns, and `preadv2` writes at most `iov_len`
+        // bytes into it. `BUFFERS` counts the one `iovec` passed. The
+        // descriptor is `self.file`'s, which the `&self` borrow keeps open
+        // for the call. An unsupported flag is `EOPNOTSUPP`, not undefined
+        // behavior.
+        let read = unsafe {
+            libc::preadv2(
+                self.file.as_raw_fd(),
+                &raw const target,
+                BUFFERS,
+                offset,
+                libc::RWF_NOWAIT,
+            )
+        };
+        (usize::try_from(read).ok()? == buf.len()).then(|| Bytes::from(buf))
     }
 
     /// `fault` at this chunk file's path.
@@ -270,6 +326,70 @@ mod tests {
             assert!(!disk.holds(&range), "{range:?}");
         }
         assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// Drops the chunk file's pages from the operating system's page cache,
+    /// written back first so that none is dirty and each can be dropped.
+    #[cfg(target_os = "linux")]
+    fn evict(path: &std::path::Path) {
+        use std::os::fd::AsRawFd as _;
+        let file = File::open(path).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: `posix_fadvise` takes no pointer; the descriptor is
+        // `file`'s, open for the call. Offset 0 and length 0 cover the file.
+        let advised =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(advised, 0, "posix_fadvise failed");
+    }
+
+    /// A page the operating system's page cache holds (the chunk file was
+    /// just written) is read on the worker, to the bytes the blocking-pool
+    /// read returns, and `page` counts it as one read. The temporary
+    /// directory must be on a filesystem that serves `RWF_NOWAIT` reads
+    /// (ext4, xfs, btrfs), not overlayfs: set `TMPDIR` inside a container.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_page_reads_a_cached_page_on_the_worker_to_the_pool_read_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, stats) = open(dir.path());
+        let disk = write(&local);
+        for range in [FIRST_RANGE, SECOND_RANGE, INNER_RANGE] {
+            let (offset, len) = disk.shared.locate(range.start, range.end).unwrap();
+            let inline = disk.shared.read_cached(offset, len).expect(
+                "a just-written page was not served without blocking: is the temporary \
+                 directory on overlayfs or another filesystem without RWF_NOWAIT reads?",
+            );
+            let pooled = disk.shared.read_at(offset, len).unwrap();
+            assert_eq!(inline, pooled, "{range:?}");
+        }
+        let first = disk.page(FIRST_RANGE).await.unwrap();
+        assert_eq!(&first[..], FIRST_BYTES);
+        assert_eq!(stats.local_reads(), 1);
+        assert_eq!(stats.local_bytes(), range_len(&FIRST_RANGE));
+    }
+
+    /// A page dropped from the operating system's page cache is one the
+    /// inline attempt cannot serve (`EAGAIN`), and `page` reads it on the
+    /// blocking pool instead, to the right bytes, counted as one read.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_page_reads_an_uncached_page_on_the_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, stats) = open(dir.path());
+        let disk = write(&local);
+        evict(&crate::local::testing::chunk_file(&local));
+        let (offset, len) = disk
+            .shared
+            .locate(FIRST_RANGE.start, FIRST_RANGE.end)
+            .unwrap();
+        assert!(
+            disk.shared.read_cached(offset, len).is_none(),
+            "an evicted page was served without blocking: is the temporary directory on tmpfs?"
+        );
+        let first = disk.page(FIRST_RANGE).await.unwrap();
+        assert_eq!(&first[..], FIRST_BYTES);
+        assert_eq!(stats.local_reads(), 1);
+        assert_eq!(stats.local_bytes(), range_len(&FIRST_RANGE));
     }
 
     #[test]
