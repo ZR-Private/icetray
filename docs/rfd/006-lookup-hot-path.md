@@ -91,3 +91,30 @@ pages, and whether hot pages repeat enough to pay for it depends on the
 page cache's hit-rate curve under a skewed key distribution, which has not
 been measured
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)).
+
+The performance sweep measured what that level would act on
+([performance sweep, decompression](../analysis/2026-09-26-performance-sweep.md#decompression-the-open-question)).
+On the long-key table in the Full tier, zstd is 61.5% of a warm hit with
+values it stores as they are (random bytes, ratio 1.00) and 92.4% with
+JSON-like values it compresses 4.38 times, and 84% of a miss with either,
+since a miss decompresses only the key page. The value page's share is
+about 2.3 µs of a 12.8 µs warm hit with the random values and about 60 µs
+of 71.2 µs with the text ones. Estimated from those figures, not measured:
+the level would take a text-valued warm hit to about 11 µs, some six times
+the throughput per core, and a random-valued one to about 10.5 µs, and
+would save nothing on a miss or on a cold hit's GET. What it costs is the
+ratio: nothing for random values, and for the text values 4.38 times the
+memory per page (the fixture's value pages are 45.7 MiB compressed and 200
+MiB decompressed), so the same budget holds 4.4 times fewer pages. A page
+the smaller cache loses comes back as a cold hit, one S3 GET of about 25 to
+30 ms at the in-region median
+([S3 range GET latency](../analysis/2026-09-10-s3-range-get-latency.md)),
+which is what some 400 to 500 text-valued warm hits would save, so the
+level pays only while it turns fewer than about 0.2% of lookups into extra
+cold hits. A small decompressed level in front of the compressed cache, for
+the hottest pages alone, is one arrangement the sweep named and did not
+build. The question stays open on the hit-rate curve: a production
+replica's `icetray_page_cache_hits_total` and
+`icetray_page_cache_fetches_total` give its hit rate at the budget it runs,
+and the same counters on a replica whose budget is divided by its tables'
+value compression ratio give the rate the level would leave it.

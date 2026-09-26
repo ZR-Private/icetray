@@ -153,3 +153,24 @@ One question stays open. Decoded key arrays as an opt-in: under a per-table
 memory budget they remove the per-lookup decode for tables that can afford
 the memory; withholding them keeps one code path and one memory model until
 a workload shows the decode is what it waits on.
+
+The performance sweep measured what that decode costs
+([performance sweep, decompression](../analysis/2026-09-26-performance-sweep.md#decompression-the-open-question)).
+In the Full tier a miss decodes one key page and nothing else: 6.5 µs on
+the long-key table, 84% of it zstd, against 0.2 µs for a Bloom-tier miss,
+which decodes nothing. The key page costs a warm hit about the same, 6.4 µs
+of 12.8 µs with random values and 6.7 µs of 71.2 µs with values that
+compress 4.38 times. Estimated from those figures, not measured: decoded
+keys would take a miss to under a microsecond and save about 6.4 µs of
+every warm hit and of every key of a MultiGet, which is half of a
+random-valued warm hit and a tenth of a text-valued one. What they cost is
+each key's uncompressed size, near the key column's compression ratio times
+the resident index: on the sweep's two million keys, about 15.4 MiB for the
+long keys and 48 MiB for the 21-byte string keys, against a Full index of
+2.49 and 5.18 MiB, so 6 and 9 times the index. At 8 bytes a key, three
+billion 64-bit keys take about 22 GiB decoded. The question stays open on
+the workload: a production table's `icetray_lookups_total` by result gives
+its share of misses, `icetray_lookup_seconds` for misses gives the decode's
+latency there, since a Full-tier miss is little else, and
+`icetray_index_bytes` gives each table's index, the memory that multiple
+applies to.
