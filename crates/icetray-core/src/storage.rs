@@ -673,20 +673,50 @@ struct Sample {
     hedged: bool,
 }
 
+/// How much of a full hedge window turns over between two computations of
+/// its percentile: a sixteenth. Computing it copies and sorts the window,
+/// so it runs once every `window / HEDGE_RECOMPUTE_SHARE` lookup GETs
+/// (every sixteenth at the default window of 256, and every GET for a
+/// window under thirty-two) rather than on every one. The delay a GET is
+/// given then comes from a window that shares at least fifteen sixteenths
+/// of its samples with the current one.
+const HEDGE_RECOMPUTE_SHARE: usize = 16;
+
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`
 /// because a table's data file size sets its first-byte latency (RFD 013).
 /// The hedge delay is the configured percentile of the last `window`
-/// samples, and no delay is given while one more hedge would put the
-/// window's share of hedged samples above the ceiling. The share counts
-/// recorded attempts: a hedge still in flight is not in the window, so when
-/// a stall catches several lookups at once each may hedge before any is
-/// recorded, and the share can overshoot the ceiling until they are.
-/// `config` has passed `Config::parse`'s validation: `window` is at least
-/// one, `percentile` is in `(0, 1]`, and `max_rate` in `[0, 1]`.
+/// samples, computed when the window fills and then again each time
+/// `HEDGE_RECOMPUTE_SHARE`'s share of it has turned over, and no delay is
+/// given while one more hedge would put the window's share of hedged
+/// samples above the ceiling; that share is kept exact per sample. The
+/// share counts recorded attempts: a hedge still in flight is not in the
+/// window, so when a stall catches several lookups at once each may hedge
+/// before any is recorded, and the share can overshoot the ceiling until
+/// they are. `config` has passed `Config::parse`'s validation: `window` is
+/// at least one, `percentile` is in `(0, 1]`, and `max_rate` in `[0, 1]`.
 #[derive(Debug)]
 pub(crate) struct HedgeWindow {
     config: HedgeConfig,
-    samples: Mutex<VecDeque<Sample>>,
+    /// Samples between two computations of the percentile: at least one.
+    recompute_every: usize,
+    samples: Mutex<Samples>,
+}
+
+/// What a `HedgeWindow` holds under its lock.
+#[derive(Debug, Default)]
+struct Samples {
+    /// The last `window` samples, oldest first.
+    ring: VecDeque<Sample>,
+    /// How many of `ring` were hedged.
+    hedged: usize,
+    /// Samples recorded since `percentile` was computed.
+    since_computed: usize,
+    /// The percentile of `ring` when it was last computed; `None` until the
+    /// window first fills.
+    percentile: Option<Duration>,
+    /// The elapsed times the percentile is computed over, kept between
+    /// computations so each reuses its buffer.
+    sorted: Vec<Duration>,
 }
 
 impl HedgeWindow {
@@ -696,7 +726,8 @@ impl HedgeWindow {
     pub(crate) fn new(config: &HedgeConfig) -> Self {
         Self {
             config: config.clone(),
-            samples: Mutex::new(VecDeque::new()),
+            recompute_every: (config.window / HEDGE_RECOMPUTE_SHARE).max(1),
+            samples: Mutex::new(Samples::default()),
         }
     }
 
@@ -705,36 +736,56 @@ impl HedgeWindow {
     /// configured window is the sample requirement), or one more hedged
     /// sample would put the share of hedged samples in the window above
     /// `max_rate` (RFD 013: while hedges would exceed the ceiling, none is
-    /// issued). Otherwise the nearest-rank percentile of the window's
-    /// elapsed times: the value at 1-based rank `ceil(percentile * window)`
-    /// in the sorted samples.
+    /// issued). Otherwise the window's nearest-rank percentile as last
+    /// computed (`record` says when): the value at 1-based rank
+    /// `ceil(percentile * window)` in the sorted samples.
     pub(crate) fn delay(&self) -> Option<Duration> {
         if !self.config.enabled {
             return None;
         }
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-        if samples.len() < self.config.window {
+        if samples.ring.len() < self.config.window {
             return None;
         }
-        let hedged = approx::count(samples.iter().filter(|sample| sample.hedged).count());
-        let share_with_one_more = approx::ratio(hedged + 1, approx::count(samples.len()));
+        let share_with_one_more = approx::ratio(
+            approx::count(samples.hedged + 1),
+            approx::count(samples.ring.len()),
+        );
         if share_with_one_more > self.config.max_rate {
             return None;
         }
-        let mut sorted: Vec<Duration> = samples.iter().map(|sample| sample.elapsed).collect();
-        drop(samples);
-        sorted.sort_unstable();
-        nearest_rank(&sorted, self.config.percentile)
+        samples.percentile
     }
 
     /// Records one lookup GET: how long it took and whether a hedge was
-    /// issued for it. The oldest sample leaves once the window is full.
+    /// issued for it. The oldest sample leaves once the window is full. The
+    /// percentile is computed when the window fills and again once
+    /// `recompute_every` samples have arrived since it last was.
     pub(crate) fn record(&self, elapsed: Duration, hedged: bool) {
-        let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-        if samples.len() >= self.config.window {
-            samples.pop_front();
+        let mut guard = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        let samples = &mut *guard;
+        if samples.ring.len() >= self.config.window
+            && let Some(oldest) = samples.ring.pop_front()
+            && oldest.hedged
+        {
+            samples.hedged -= 1;
         }
-        samples.push_back(Sample { elapsed, hedged });
+        samples.ring.push_back(Sample { elapsed, hedged });
+        if hedged {
+            samples.hedged += 1;
+        }
+        samples.since_computed += 1;
+        let full = samples.ring.len() >= self.config.window;
+        let due = samples.percentile.is_none() || samples.since_computed >= self.recompute_every;
+        if full && due {
+            samples.sorted.clear();
+            samples
+                .sorted
+                .extend(samples.ring.iter().map(|sample| sample.elapsed));
+            samples.sorted.sort_unstable();
+            samples.percentile = nearest_rank(&samples.sorted, self.config.percentile);
+            samples.since_computed = 0;
+        }
     }
 }
 
@@ -2182,6 +2233,36 @@ mod tests {
             window.delay(),
             Some(SAMPLE_20MS),
             "the first sample, hedged and the smallest, has left the window"
+        );
+    }
+
+    /// For a window of thirty-two or more, the percentile is computed again
+    /// only once a sixteenth of the window has turned over: a slow sample moves
+    /// the delay at the second sample after the last computation, not at
+    /// the first. The ceiling stays exact on every sample.
+    #[test]
+    fn test_delay_is_recomputed_once_a_share_of_the_window_turns_over() {
+        let turned_over_per_computation = 2;
+        let window = HEDGE_RECOMPUTE_SHARE * turned_over_per_computation;
+        let config = hedge_config(TOP, window, HALF);
+        let full = vec![(SAMPLE_10MS, false); window];
+        let hedges = window_with(&config, &full);
+        assert_eq!(hedges.delay(), Some(SAMPLE_10MS));
+        hedges.record(SAMPLE_40MS, false);
+        assert_eq!(
+            hedges.delay(),
+            Some(SAMPLE_10MS),
+            "one sample of two since the last computation"
+        );
+        hedges.record(SAMPLE_40MS, false);
+        assert_eq!(hedges.delay(), Some(SAMPLE_40MS));
+        for _ in 0..window / 2 {
+            hedges.record(SAMPLE_40MS, true);
+        }
+        assert_eq!(
+            hedges.delay(),
+            None,
+            "half the window hedged: one more would pass the ceiling at once"
         );
     }
 

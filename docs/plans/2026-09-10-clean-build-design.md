@@ -300,6 +300,10 @@ pub struct IoStats { /* gets, bytes, hedges, local_reads, local_bytes: AtomicU64
 impl IoStats { pub fn gets(&self) -> u64; pub fn bytes(&self) -> u64; pub fn hedges(&self) -> u64; pub fn local_reads(&self) -> u64; pub fn local_bytes(&self) -> u64; }
 /// A sliding window of recent lookup-GET latencies, owned by one `Table`;
 /// the hedge delay is its configured percentile, capped by the hedge rate.
+/// The percentile is computed (a copy and a sort of the window) when the
+/// window fills and again every `window / HEDGE_RECOMPUTE_SHARE` samples
+/// (16; every sample below a window of 32), not on every GET; the hedged
+/// count behind the ceiling is kept exact per sample.
 pub(crate) struct HedgeWindow;
 impl HedgeWindow { pub(crate) fn new(config: &HedgeConfig) -> Self; pub(crate) fn delay(&self) -> Option<Duration>; pub(crate) fn record(&self, elapsed: Duration, hedged: bool); }
 
