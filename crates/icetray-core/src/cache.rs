@@ -19,10 +19,12 @@ use foyer::{
 };
 
 use crate::approx;
+use crate::config::ConfigViolation;
 use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::error::{Error, Result};
 use crate::local::DiskLevel;
 use crate::metric;
+use crate::shard;
 use crate::storage::IoStats;
 
 /// The name foyer files its own log lines under. Its metrics stay on its
@@ -36,23 +38,46 @@ const CACHE_NAME: &str = "icetray_pages";
 /// page of the file through the `Arc` and are not charged per entry.
 const ENTRY_OVERHEAD_BYTES: usize = 64;
 
-/// Shards of the memory level. foyer splits the memory budget evenly across
-/// its shards and evicts within each, so a page is held only beside the
-/// pages of its own shard, in that shard's share. Eight is foyer's default,
-/// enough to spread concurrent lookups over separate locks; it is pinned
-/// here so that `min_memory_bytes` is computed from the count the cache
-/// uses.
-pub(crate) const MEMORY_SHARDS: usize = 8;
+/// The shards of the memory level: `shard::count()`, the runtime's worker
+/// threads rounded up to a power of two. foyer splits the memory budget
+/// evenly across its shards and evicts within each, so a page is held only
+/// beside the pages of its own shard, in that shard's share; and a hit
+/// takes its shard's lock exclusively, so fewer shards than workers makes
+/// concurrent hits wait on each other. `min_memory_bytes` is computed from
+/// the same count.
+fn memory_shards() -> usize {
+    shard::count()
+}
 
-/// The smallest memory budget the page cache is given: one contract value
-/// page (`contract::VALUE_PAGE_BYTES`) weighed with its entry overhead, for
-/// each of `MEMORY_SHARDS`. Below it a shard's share cannot hold one such
-/// page, and foyer keeps the shard's latest page alone whatever its share,
-/// so the cache would hold a page per shard however small the budget and
-/// the configured bytes would bound nothing. `Config::parse` refuses less
-/// as `ConfigViolation::PageCacheTooSmall`.
-pub(crate) fn min_memory_bytes() -> u64 {
-    approx::count(MEMORY_SHARDS) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
+/// The smallest memory budget a page cache of `shards` shards is given:
+/// one contract value page (`contract::VALUE_PAGE_BYTES`) weighed with its
+/// entry overhead, for each shard. Below it a shard's share cannot hold one
+/// such page, and foyer keeps the shard's latest page alone whatever its
+/// share, so the cache would hold a page per shard however small the budget
+/// and the configured bytes would bound nothing. `Config::parse` refuses
+/// less than one shard's minimum, which no machine goes below, and
+/// `check_capacity` refuses less than the minimum of the shards the cache
+/// will have on the runtime it opens on.
+pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
+    approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
+}
+
+/// `ConfigViolation::PageCacheTooSmall` for a budget of `capacity_bytes`
+/// below `min_memory_bytes` of the shards a cache opened on the caller's
+/// runtime has; `open_with` calls it before it opens the cache, since the
+/// worker count is not known when the configuration is parsed.
+pub(crate) fn check_capacity(capacity_bytes: usize) -> std::result::Result<(), ConfigViolation> {
+    let shards = memory_shards();
+    let minimum = min_memory_bytes(shards);
+    let bytes = approx::count(capacity_bytes);
+    if bytes < minimum {
+        return Err(ConfigViolation::PageCacheTooSmall {
+            bytes,
+            minimum,
+            shards,
+        });
+    }
+    Ok(())
 }
 
 /// The width of the length prefix on an encoded file id: a `u32`, since a
@@ -249,8 +274,9 @@ pub struct PageCache {
 impl PageCache {
     /// Opens a cache holding at most `capacity_bytes` of pages in memory,
     /// each weighed as its bytes plus a fixed per-entry overhead, split
-    /// evenly over `MEMORY_SHARDS`; `Config::parse` admits no budget below
-    /// `min_memory_bytes`. `disk` is
+    /// evenly over `memory_shards()`; `open_with` checks the budget against
+    /// `min_memory_bytes` of that count first (`check_capacity`), and a
+    /// smaller budget given here directly is taken as it is. `disk` is
     /// the local level of RFD 017: a page evicted from memory is written
     /// there, served back with a local read and no GET, and recovered when
     /// a new cache opens over the same directory, so it survives a restart.
@@ -262,7 +288,7 @@ impl PageCache {
             None => Level::Memory(
                 CacheBuilder::new(capacity_bytes)
                     .with_name(CACHE_NAME)
-                    .with_shards(MEMORY_SHARDS)
+                    .with_shards(memory_shards())
                     .with_weighter(weigh)
                     .build(),
             ),
@@ -441,7 +467,7 @@ async fn open_hybrid(
         .with_name(CACHE_NAME)
         .with_policy(HybridCachePolicy::WriteOnEviction)
         .memory(capacity_bytes)
-        .with_shards(MEMORY_SHARDS)
+        .with_shards(memory_shards())
         .with_weighter(weigh)
         .storage()
         .with_engine_config(
@@ -788,6 +814,36 @@ mod tests {
             assert_eq!(encoded.len(), value.estimated_size());
             assert_eq!(PageValue::decode(&mut encoded.as_slice()).unwrap().0, page);
         }
+    }
+
+    /// The minimum follows the shards a cache opened on the caller's
+    /// runtime has: one per worker, rounded up to a power of two.
+    #[test]
+    fn test_check_capacity_refuses_less_than_a_page_per_runtime_shard() {
+        let workers: usize = 3;
+        let shards = workers.next_power_of_two();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .build()
+            .unwrap();
+        let minimum = min_memory_bytes(shards);
+        let below = approx::length(minimum - 1);
+        assert_eq!(
+            runtime.block_on(async { check_capacity(below) }),
+            Err(ConfigViolation::PageCacheTooSmall {
+                bytes: minimum - 1,
+                minimum,
+                shards,
+            })
+        );
+        assert_eq!(
+            runtime.block_on(async { check_capacity(approx::length(minimum)) }),
+            Ok(())
+        );
+        let single = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(single.block_on(async { check_capacity(below) }), Ok(()));
     }
 
     #[tokio::test]

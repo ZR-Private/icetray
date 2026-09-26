@@ -57,6 +57,12 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_hours(24);
 /// resident index. A replica that serves more raises it in the file.
 const DEFAULT_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
+/// The page cache shards `Config::parse` checks `page_cache_bytes` against:
+/// one, the fewest a cache has on any machine, since the worker count that
+/// sets the real number is not known until the cache opens on a runtime
+/// (`cache::check_capacity`).
+const PARSE_CACHE_SHARDS: usize = 1;
+
 /// `strict` when a table says nothing: on. A table that serves at a cost is
 /// refused until its owner turns strict off with one line (RFD 007).
 const DEFAULT_STRICT: bool = true;
@@ -188,14 +194,21 @@ pub enum ConfigViolation {
     /// The memory budget of the page cache cannot hold one value page in
     /// every shard of its memory level, so the cache would keep a page per
     /// shard however small the budget, and the budget would bound nothing
-    /// (`cache::min_memory_bytes`).
-    #[error("page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes")]
+    /// (`cache::min_memory_bytes`). `Config::parse` checks the budget
+    /// against one shard, the least any cache has; opening the cache
+    /// checks it against the shards it has on the runtime it opens on, one
+    /// per worker thread rounded up to a power of two.
+    #[error(
+        "page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
+    )]
     PageCacheTooSmall {
         /// The configured budget.
         bytes: u64,
         /// The smallest budget that holds a value page in every shard: one
         /// contract value page with its entry overhead per shard.
         minimum: u64,
+        /// The shards the minimum is for.
+        shards: usize,
     },
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
@@ -390,11 +403,12 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     {
         return Err(ConfigViolation::IncompleteStaticKeys);
     }
-    let minimum = min_memory_bytes();
+    let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
     if approx::count(config.server.page_cache_bytes) < minimum {
         return Err(ConfigViolation::PageCacheTooSmall {
             bytes: approx::count(config.server.page_cache_bytes),
             minimum,
+            shards: PARSE_CACHE_SHARDS,
         });
     }
     if let Some(local) = &config.storage.local
@@ -543,8 +557,10 @@ pub struct ServerConfig {
     pub poll_interval: Duration,
     /// The value-page cache budget in bytes; at least one contract value
     /// page with its entry overhead per shard of the cache's memory level
-    /// (`cache::min_memory_bytes`), or the budget would bound
-    /// nothing.
+    /// (`cache::min_memory_bytes`), or the budget would bound nothing. The
+    /// shards are one per worker thread rounded up to a power of two, so
+    /// parsing checks one shard's minimum and opening the cache checks the
+    /// rest.
     pub page_cache_bytes: usize,
     /// Log field renames and additions.
     pub log: LogConfig,
@@ -1441,11 +1457,15 @@ locaton = "typo"
                 TOML_MINIMAL.trim_start()
             )
         };
-        let minimum = min_memory_bytes();
+        let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
         for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
             assert_eq!(
                 violation(&with_budget(bytes)),
-                ConfigViolation::PageCacheTooSmall { bytes, minimum },
+                ConfigViolation::PageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards: PARSE_CACHE_SHARDS
+                },
                 "{bytes} bytes"
             );
         }

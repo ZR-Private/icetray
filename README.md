@@ -165,10 +165,14 @@ Every section defaults when absent, and a key the schema does not know is
 an error. The server defaults are `listen = "127.0.0.1:7433"`,
 `metrics_listen = "127.0.0.1:9433"`, `poll_interval = "10s"` (at least
 `"1s"`, since a table's poll calls its catalog or reads its version hint,
-and at most `"24h"`), and `page_cache_bytes = 268435456` (256 MiB; a budget below 524800 bytes, one
-64 KiB value page and its 64-byte entry overhead for each of the cache's
-eight shards, is refused, since each shard would keep a page whatever its
-share and the budget would bound nothing). Under `storage`, `s3` holds
+and at most `"24h"`), and `page_cache_bytes = 268435456` (256 MiB). The cache's memory has one shard
+per tokio worker thread (one per core unless `TOKIO_WORKER_THREADS` says
+otherwise), rounded up to a power of two, and a budget below one 64 KiB
+value page and its 64-byte entry overhead per shard is refused, since each
+shard would keep a page whatever its share and the budget would bound
+nothing: parsing refuses less than one shard's 65600 bytes, and opening the
+cache refuses less than the shards' total (1049600 bytes for the 16 shards
+of an 11-core machine), before any table loads, with exit code 1. Under `storage`, `s3` holds
 explicit client settings (`endpoint`, `region`, `access_key_id` and
 `secret_access_key` as a pair, `allow_http`, `path_style`) and is omitted to
 use the AWS default credential chain; `rewrite` is a list of `{from, to}`

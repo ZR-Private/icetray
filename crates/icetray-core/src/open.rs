@@ -6,10 +6,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::cache::PageCache;
+use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
-use crate::config::Config;
-use crate::error::Result;
+use crate::config::{Config, ConfigError};
+use crate::error::{Error, Result};
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::storage::Storage;
 use crate::table::Table;
@@ -95,12 +95,18 @@ pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened> {
 /// `open` over a storage the caller built, for the testkit and embedders:
 /// a test constructs one with `Storage::new` and never touches the SDK
 /// chain, and registers its own stores on it. The binary's subcommands
-/// use `open`; the daemon's in-process tests start it over this.
+/// use `open`; the daemon's in-process tests start it over this. Before
+/// anything is opened, `page_cache_bytes` is checked against the minimum
+/// of the shards the cache has on the calling runtime, which parsing could
+/// not know: less is `Error::Config` with
+/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`).
 pub async fn open_with(
     config: &Config,
     only: Option<&str>,
     storage: Arc<Storage>,
 ) -> Result<Opened> {
+    cache::check_capacity(config.server.page_cache_bytes)
+        .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
     let local = match &config.storage.local {
         Some(local) => Some(Arc::new(LocalDir::open(local, storage.stats())?)),
         None => None,
@@ -142,7 +148,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::config::{LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig};
+    use crate::approx;
+    use crate::config::{
+        ConfigViolation, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
+    };
     use crate::generation::testing::{
         FIRST_SNAPSHOT, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TWO, Table as Fixture,
         two_bucket_table,
@@ -221,6 +230,39 @@ mod tests {
         assert!(Arc::ptr_eq(&opened.storage, &storage));
         assert!(opened.local.is_none());
         assert_eq!(storage.stats().gets(), 0);
+    }
+
+    /// A budget `Config::parse` admits, one shard's minimum, is refused
+    /// on a runtime of two workers, whose cache has two shards, before any
+    /// table is opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_with_refuses_a_page_cache_below_the_runtime_shards_minimum() {
+        let workers = 2;
+        let fixture = two_file_fixture().await;
+        let one_shard = cache::min_memory_bytes(1);
+        let two_shards = cache::min_memory_bytes(workers);
+        let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
+        config.server.page_cache_bytes = approx::length(one_shard);
+        let error = open_with(&config, None, storage_for(&config))
+            .await
+            .err()
+            .expect("a budget below two shards' minimum");
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::PageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards,
+                })) if bytes == one_shard && minimum == two_shards && shards == workers
+            ),
+            "{error}"
+        );
+        config.server.page_cache_bytes = approx::length(two_shards);
+        let opened = open_with(&config, None, storage_for(&config))
+            .await
+            .unwrap();
+        assert_eq!(names(&opened), [FIRST_TABLE]);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
+use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
 use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
 use icetray_testkit::fixture::{
@@ -676,6 +677,38 @@ async fn test_serve_exits_1_when_its_listener_is_taken() -> TestResult {
     let path = write_file(dir.path(), "serve.json", &config.to_string())?;
     let output = run(&["serve", "--config", &path], &[]);
     assert_exit(&output, EXIT_FAILURE);
+    Ok(())
+}
+
+/// The variable tokio's multi-thread runtime reads its worker count from.
+const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
+
+/// A page cache budget the file admits, which holds a value page for one
+/// shard of the cache but not for the two a two-worker runtime gives it, is
+/// refused as the daemon opens the cache, and the failure reaches exit 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_exits_1_when_the_page_cache_is_below_its_shards_minimum() -> TestResult {
+    let workers = 2;
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_cache", KeyType::Long)).await?;
+    let mut config: Json = serde_json::from_str(&json_config(TABLE_A, &fixture))?;
+    let one_shard_not_two = VALUE_PAGE_BYTES * workers;
+    config["server"]["page_cache_bytes"] = Json::from(one_shard_not_two);
+    let path = write_file(dir.path(), "serve.json", &config.to_string())?;
+    // Spawned and waited on within a bound rather than run to its end, so
+    // a daemon that wrongly starts serving fails the test instead of
+    // holding it open.
+    let mut daemon = Daemon(
+        Command::new(BIN)
+            .args(["serve", "--config", &path])
+            .env_remove(ENV_CONFIG)
+            .env(TOKIO_WORKER_THREADS, workers.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let status = wait_within(&mut daemon.0, READY_WAIT).await?;
+    assert_eq!(status.code(), Some(i32::from(EXIT_FAILURE)));
     Ok(())
 }
 

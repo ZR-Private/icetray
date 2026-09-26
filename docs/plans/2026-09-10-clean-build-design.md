@@ -224,10 +224,17 @@ impl Config {
 }
 /// `metrics_listen` is required (default 127.0.0.1:9433) and serves `/metrics`
 /// and `/ready`; RFD 012 makes both part of the surface.
-/// `page_cache_bytes`: at least `cache::min_memory_bytes()`, one `contract::VALUE_PAGE_BYTES`
-/// page with its entry overhead for each of the cache's pinned `MEMORY_SHARDS` (foyer splits the
-/// budget per shard and a shard keeps its latest page whatever its share, so less bounds nothing);
-/// `Config::parse` refuses less as `PageCacheTooSmall`, as it refuses a disk level below one block.
+/// `page_cache_bytes`: at least `cache::min_memory_bytes(shards)`, one `contract::VALUE_PAGE_BYTES`
+/// page with its entry overhead for each shard of the cache's memory level, which has
+/// `shard::count()` shards, the runtime's worker threads rounded up to a power of two (foyer
+/// splits the budget per shard and a shard keeps its latest page whatever its share, so less
+/// bounds nothing; a hit takes its shard's lock exclusively, so fewer shards than workers makes
+/// hits wait on each other). The worker count is unknown when the file is parsed: `Config::parse`
+/// refuses less than one shard's minimum (`PARSE_CACHE_SHARDS`, 1) as
+/// `PageCacheTooSmall { bytes, minimum, shards }`, as it refuses a disk level below one block, and
+/// `open_with` refuses less than the runtime's shards' minimum with the same variant
+/// (`cache::check_capacity`) before it opens anything, which `serve` ends with exit 1.
+/// `PageCache::new` itself takes any budget, so tests can build one that evicts at once.
 /// The live-path bounds (RFD 013) the binary's service and shutdown read: `get_deadline`
 /// (default 5 s) and `multi_get_deadline` (15 s, flat), a client's own deadline being the
 /// gRPC layer's, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
@@ -255,7 +262,7 @@ pub enum ConfigError { Read(std::io::Error), Toml(toml::de::Error), Json(serde_j
 /// The two location variants are raised by `Storage::locate`, after rewriting, not by `Config::parse`.
 /// `UnknownResidency` is raised by `Residency`'s `FromStr`, which the command line reads the names it
 /// offers back through; clap refuses any other text before it gets there.
-pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64 }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalTooShort { interval: Duration, minimum: Duration }, PollIntervalTooLong { interval: Duration, maximum: Duration }, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, LogFieldCollision { name: String, first: StandardField, second: StandardField }, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
+pub enum ConfigViolation { EmptyTableName, DuplicateTableName(String), IncompleteStaticKeys, BudgetWithoutResidency, DiskResidencyWithoutLocalDir, PageCacheTooSmall { bytes: u64, minimum: u64, shards: usize }, PageCacheDiskTooSmall { bytes: u64, minimum: u64 }, HedgePercentileOutOfRange { percentile: f64 }, HedgeMaxRateOutOfRange { max_rate: f64 }, HedgeWindowEmpty, PollIntervalTooShort { interval: Duration, minimum: Duration }, PollIntervalTooLong { interval: Duration, maximum: Duration }, GetDeadlineZero, MultiGetDeadlineZero, MaxInFlightZero, MaxMultiGetKeysZero, RefreshDeadlineZero, DrainDeadlineZero, ConnectTimeoutZero, CatalogTimeoutZero, LogFieldCollision { name: String, first: StandardField, second: StandardField }, EmptyRewritePrefix, NoStoreForLocation { location: String }, LocationNotAbsolute { location: String }, UnknownResidency { text: String } }
 pub struct TableConfig { pub name: String, pub source: SourceConfig, pub r#ref: String, pub key_column: String, pub value_column: String, pub strict: bool /* default true */, pub residency: Residency /* default Full */, pub resident_budget_bytes: Option<u64> }
 /// Where a table keeps its key chunks (RFD 017), ranked by lookup speed. Never chosen automatically.
 /// Display gives the file's lowercase name, for the doctor's output and metric labels.
