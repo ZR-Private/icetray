@@ -310,6 +310,23 @@ batched submission, are against RFD 017's "runs on the blocking pool so no
 worker stalls on disk". That is a decision these numbers inform and do not
 make. A bare-metal Linux run is the measurement that would.
 
+The decision followed these numbers. On Linux, a disk-tier page read is now
+tried on the worker with `preadv2` and `RWF_NOWAIT`, and goes to the
+blocking pool only when the page cache cannot serve it without blocking,
+which keeps RFD 017's rule that no worker waits for data from the disk. With
+the directory on ext4 in the same VM, the Disk tier now costs about what the
+Full tier does:
+
+| scenario, long table | Disk/Full p50, before | after | Disk p50, 1 task, after |
+|---|--:|--:|--:|
+| warm hit | 4.03 | 1.06 | 14.7 µs |
+| cold hit | 1.31 | 1.02 | 124.7 µs |
+| miss | 7.47 | 1.05 | 6.8 µs |
+
+On overlayfs, which refuses the non-blocking read, nothing moves: every
+read falls back, at a cost of about a microsecond for the refused attempt.
+The local directory belongs on a mounted volume, as the README says.
+
 ## Decompression: the open question
 
 Two deferred decisions bear on decompression. RFD 006 left open a
