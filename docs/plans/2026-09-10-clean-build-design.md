@@ -865,7 +865,8 @@ impl Table {
     /// `current`, or `Error::NotReady`: the one refusal for a table with no generation to
     /// answer from, which `get`, the gRPC service, and the one-shot subcommands all raise.
     pub fn serving(&self) -> Result<Arc<Generation>>;
-    /// `Error::NotReady` with no generation; `Error::KeyType` before any read. One
+    /// `Error::NotReady` with no generation; `Error::KeyType` before any read. Counted
+    /// among the table's calls in flight while it runs (see `multi_get`). One
     /// `load` guard on `current` held for the lookup's length (no reference-count write on
     /// the shared generation; a guard held across the lookup's awaits is correct wherever
     /// the task resumes, and a load on a thread whose fast slots are all held costs about what
@@ -875,11 +876,16 @@ impl Table {
     /// `lookups_total{table, result}`.
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
     /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
-    /// the whole call and issues nothing); the keys are split in order into up to one run per
-    /// worker thread (`shard::workers`) of at least a private `MULTI_GET_TASK_KEYS_MIN` (8)
+    /// the whole call and issues nothing). The table counts its `get` and `multi_get` calls in
+    /// flight on per-thread shards (`shard::Sharded`, a call adding one to its thread's shard
+    /// and taking it back from that shard as it ends). While the shards sum to fewer calls than
+    /// worker threads (`shard::workers`), this one included, the keys are split in order into
+    /// up to one run per worker thread of at least a private `MULTI_GET_TASK_KEYS_MIN` (8)
     /// keys, each run spawned on a task of a `JoinSet` over owned copies of its keys, the
     /// generation's `Arc`, and the table's shared lookup state, so one batch decodes on several
-    /// cores; a batch of one run is looked up inline. Every lookup of the batch, in whichever
+    /// cores; otherwise, and for a batch of one run, it is looked up inline. The count is the
+    /// table's own, not the process's: calls to other tables do not hold a batch back from
+    /// splitting. Every lookup of the batch, in whichever
     /// run, holds one permit of a per-batch semaphore of a private `MULTI_GET_FAN_OUT` (32)
     /// while it runs, so one batch runs at most that many lookups, and twice that many GETs,
     /// at once; each run is `buffered` and the runs' answers are put back in key order. Each

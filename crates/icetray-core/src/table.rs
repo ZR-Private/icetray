@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::Key;
 use crate::local::LocalDir;
 use crate::metric::{self, LookupResult};
-use crate::shard;
+use crate::shard::{self, Sharded};
 use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
@@ -165,16 +165,62 @@ pub struct Table {
 }
 
 /// What a lookup needs beside its generation: the table's page cache
-/// handle and lookup metrics. Behind an `Arc`, so the tasks a `multi_get`
-/// spawns hold it for as long as they run.
+/// handle, its lookup metrics, and its calls in flight. Behind an `Arc`, so
+/// the tasks a `multi_get` spawns hold it for as long as they run.
 struct Lookups {
     /// The process's page cache, through a handle whose fetches end at the
     /// table's `get_deadline`.
     cache: PageCache,
     metrics: LookupMetrics,
+    /// The table's `get` and `multi_get` calls in flight, sharded as the
+    /// lookup counts are, so a call does not write a line every other
+    /// worker writes too: a call adds one to its thread's shard as it
+    /// starts and takes it back from that same shard as it ends, so the
+    /// shards sum to the calls in flight.
+    in_flight: Sharded<AtomicUsize>,
+}
+
+/// One call counted in `Lookups::in_flight` while held, on the shard it
+/// was counted on; dropped as the call returns or is dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Lookups {
+    /// Counts one call in flight until the returned guard drops.
+    fn enter(&self) -> InFlight<'_> {
+        let shard = self.in_flight.mine();
+        shard.fetch_add(1, Ordering::Relaxed);
+        InFlight(shard)
+    }
+
+    /// The runs a batch of `keys` keys is split into: up to one per worker
+    /// thread (`shard::workers`), each of at least `MULTI_GET_TASK_KEYS_MIN`
+    /// keys, while the table has fewer calls in flight than worker threads,
+    /// the batch's own included; one run otherwise. A split batch waits on
+    /// its slowest run, and on busy workers its runs queue behind other
+    /// calls' work, so splitting pays while some workers would sit idle and
+    /// costs once they are all busy. The count is summed over the shards
+    /// without synchronization: a load signal, which may lag a call
+    /// starting or ending as it is read.
+    fn runs(&self, keys: usize) -> usize {
+        let workers = shard::workers();
+        let in_flight: usize = self
+            .in_flight
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .sum();
+        if in_flight < workers {
+            workers.min(keys.div_ceil(MULTI_GET_TASK_KEYS_MIN))
+        } else {
+            1
+        }
+    }
+
     /// One lookup through `generation`, timed and counted under its result;
     /// the one path `get` and `multi_get` share.
     async fn one(&self, generation: &Generation, key: &Key) -> Result<Value> {
@@ -226,10 +272,9 @@ struct LookupMetrics {
     cold_hit: ResultMetrics,
     warm_hit: ResultMetrics,
     miss: ResultMetrics,
-    /// `shard::count()` shards, one per worker thread when the workers are
-    /// the threads that count; a thread writes the one its `shard::slot()`
-    /// masks to.
-    counts: Box<[CountShard]>,
+    /// One shard per worker thread when the workers are the threads that
+    /// count.
+    counts: Sharded<Counts>,
 }
 
 /// `lookups_total` and `lookup_seconds` of one table and result.
@@ -239,17 +284,14 @@ struct ResultMetrics {
 }
 
 /// One shard of a table's lookup counts, not yet published, per result.
-/// Aligned to 128 bytes, the cache line of the Apple M-series cores and
-/// twice that of x86, so two shards never share a line on either.
-#[repr(align(128))]
 #[derive(Default)]
-struct CountShard {
+struct Counts {
     cold_hit: AtomicU64,
     warm_hit: AtomicU64,
     miss: AtomicU64,
 }
 
-impl CountShard {
+impl Counts {
     fn of(&self, result: LookupResult) -> &AtomicU64 {
         match result {
             LookupResult::ColdHit => &self.cold_hit,
@@ -277,7 +319,7 @@ impl LookupMetrics {
             cold_hit: of(LookupResult::ColdHit),
             warm_hit: of(LookupResult::WarmHit),
             miss: of(LookupResult::Miss),
-            counts: (0..shard::count()).map(|_| CountShard::default()).collect(),
+            counts: Sharded::new(),
         }
     }
 
@@ -291,8 +333,10 @@ impl LookupMetrics {
 
     /// One lookup of `result` that took `elapsed`.
     fn record(&self, result: LookupResult, elapsed: Duration) {
-        let shard = &self.counts[shard::slot() & (self.counts.len() - 1)];
-        shard.of(result).fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .mine()
+            .of(result)
+            .fetch_add(1, Ordering::Relaxed);
         self.of(result).seconds.record(time::seconds(elapsed));
     }
 
@@ -342,6 +386,7 @@ impl Table {
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
             metrics: LookupMetrics::new(&config.name),
+            in_flight: Sharded::new(),
         });
         let table = Self {
             config,
@@ -447,6 +492,7 @@ impl Table {
     /// generation; `Error::KeyType` for a key of another type than the
     /// table's, before any read.
     pub async fn get(&self, key: &Key) -> Result<Lookup> {
+        let _in_flight = self.lookups.enter();
         // A guard held across the lookup's awaits stays correct wherever
         // the task resumes. While held it occupies one of the loading
         // thread's few fast slots (arc-swap's debts), and a load on a
@@ -473,21 +519,26 @@ impl Table {
     /// Several lookups against one generation, answered in key order. Every
     /// key's type is checked before any read, so a mismatch anywhere fails
     /// the whole call and issues nothing; any failure fails the whole call
-    /// (RFD 010). The keys are split, in order, into up to one run per
-    /// worker thread (`shard::workers`) of at least
-    /// `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a batch's
-    /// decodes run on several cores; a batch that makes one run is looked
-    /// up here, unspawned. The runs share one bound of `MULTI_GET_FAN_OUT`
-    /// lookups in flight. Dropping the returned future, as a deadline does,
+    /// (RFD 010). While the table has fewer `get` and `multi_get` calls in
+    /// flight than worker threads, this one included, the keys are split,
+    /// in order, into up to one run per worker thread (`shard::workers`) of
+    /// at least `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a
+    /// batch's decodes run on several cores (`Lookups::runs`). A batch that
+    /// makes one run, as a batch does once the table has that many calls in
+    /// flight, is looked up here, unspawned. The count is the table's own:
+    /// calls to other tables of the process do not hold a batch back from
+    /// splitting. The runs share one bound of `MULTI_GET_FAN_OUT` lookups
+    /// in flight. Dropping the returned future, as a deadline does,
     /// aborts the runs still going. A run's panic is resumed here; a run
     /// canceled under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup> {
+        let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
         let fan_out = Arc::new(Semaphore::new(MULTI_GET_FAN_OUT));
-        let runs = shard::workers().min(keys.len().div_ceil(MULTI_GET_TASK_KEYS_MIN));
+        let runs = self.lookups.runs(keys.len());
         let values = if runs <= 1 {
             self.lookups.run(&generation, keys, &fan_out).await?
         } else {
@@ -1136,16 +1187,13 @@ mod tests {
         fills_the_fan_out_bound_in_key_order().await;
     }
 
-    /// A batch of cold hits, each on a page of its own, reaches exactly
-    /// `MULTI_GET_FAN_OUT` GETs in flight at once and answers in key order.
-    async fn fills_the_fan_out_bound_in_key_order() {
-        let batches_of_the_bound = 3;
-        let key_count = i64::try_from(MULTI_GET_FAN_OUT * batches_of_the_bound).unwrap();
-        let all = keys_from(0, key_count);
+    /// A loaded table of `key_count` keys, one row per page, so every key
+    /// is a cold hit on a page of its own and costs a GET no other key
+    /// shares; its keys; and the gauge its storage reads through.
+    async fn one_row_per_page(key_count: usize) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
+        let all = keys_from(0, i64::try_from(key_count).unwrap());
         let keys = long_keys(&all);
         let mut fixture = Fixture::bucketed(1);
-        // One row per page, so every key is a cold hit on a page of its own
-        // and costs a GET no other key shares.
         fixture
             .add_file(FileSpec {
                 name: "f",
@@ -1172,6 +1220,16 @@ mod tests {
         };
         let table = table_over(&fixture, config).await;
         table.load().await.unwrap();
+        (table, fixture, all, gauged)
+    }
+
+    /// A batch of cold hits, each on a page of its own, reaches exactly
+    /// `MULTI_GET_FAN_OUT` GETs in flight at once and answers in key order.
+    async fn fills_the_fan_out_bound_in_key_order() {
+        let batches_of_the_bound = 3;
+        let (table, _fixture, all, gauged) =
+            one_row_per_page(MULTI_GET_FAN_OUT * batches_of_the_bound).await;
+        let keys = long_keys(&all);
         // A batch that never has the bound's lookups in flight at once
         // never passes the gate: its page fetches end at the get deadline
         // and the call fails.
@@ -1184,6 +1242,67 @@ mod tests {
             MULTI_GET_FAN_OUT,
             "the batch fills the bound and never passes it"
         );
+    }
+
+    /// Workers of the runtime the split tests run on: enough that a batch
+    /// splits into several runs, and that some calls in flight still leave
+    /// it room to.
+    const SPLIT_WORKERS: usize = 4;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_splits_while_fewer_calls_than_workers_are_in_flight() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let idle = 0;
+        assert_eq!(runs_spawned_beside(idle).await, SPLIT_WORKERS);
+        let others_leaving_room = SPLIT_WORKERS - 2;
+        assert_eq!(
+            runs_spawned_beside(others_leaving_room).await,
+            SPLIT_WORKERS,
+            "with the batch, one fewer call in flight than workers"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_runs_inline_once_as_many_calls_as_workers_are_in_flight() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        assert_eq!(runs_spawned_beside(others_filling_the_workers).await, 0);
+        let others_past_the_workers = SPLIT_WORKERS;
+        assert_eq!(runs_spawned_beside(others_past_the_workers).await, 0);
+    }
+
+    /// The runs a batch of `MULTI_GET_FAN_OUT` cold hits spawns while
+    /// `others` calls are counted in flight on its table, which the test
+    /// holds directly rather than running them. Read while the store holds
+    /// every GET of the batch: each spawned run holds the generation's
+    /// `Arc`, so the holders beyond the table's own, the batch's, and this
+    /// read's are the runs.
+    async fn runs_spawned_beside(others: usize) -> usize {
+        let holders_of_an_inline_batch = 3;
+        let (table, _fixture, all, gauged) = one_row_per_page(MULTI_GET_FAN_OUT).await;
+        let keys = long_keys(&all);
+        let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+        // The batch issues one GET per key and no hedge, since its table
+        // has recorded no lookup GET to take a delay from, so one more GET
+        // than it has keys is never reached and the store holds every one
+        // until the batch is dropped.
+        gauged.fill_to(MULTI_GET_FAN_OUT + 1);
+        let every_get_held = async {
+            // Before the fetches end at the get deadline, which would end
+            // the runs.
+            tokio::time::timeout(ServerConfig::default().get_deadline, async {
+                while gauged.high_water() < MULTI_GET_FAN_OUT {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every lookup of the batch reaches the store");
+            Arc::strong_count(&table.current().unwrap()) - holders_of_an_inline_batch
+        };
+        tokio::select! {
+            answered = table.multi_get(&keys) => panic!("the store holds every GET: {answered:?}"),
+            spawned = every_get_held => spawned,
+        }
     }
 
     #[tokio::test]

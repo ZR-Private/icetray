@@ -41,6 +41,42 @@ pub(crate) fn slot() -> usize {
     SLOT.with(|slot| *slot)
 }
 
+/// One `T` per shard, `count()` of them when built, each on a cache line of
+/// its own. `mine` is the calling thread's, the one its `slot()` masks to,
+/// so threads that drew distinct slots and write through `mine` write
+/// distinct lines. A reader visits them all (`iter`).
+pub(crate) struct Sharded<T> {
+    shards: Box<[Line<T>]>,
+}
+
+/// A shard's value, aligned to 128 bytes: the cache line of the Apple
+/// M-series cores and twice that of x86, so two shards share no line on
+/// either.
+#[repr(align(128))]
+#[derive(Default)]
+struct Line<T>(T);
+
+impl<T: Default> Sharded<T> {
+    /// `count()` shards, each `T::default()`.
+    pub(crate) fn new() -> Self {
+        Self {
+            shards: (0..count()).map(|_| Line::default()).collect(),
+        }
+    }
+}
+
+impl<T> Sharded<T> {
+    /// The calling thread's shard.
+    pub(crate) fn mine(&self) -> &T {
+        &self.shards[slot() & (self.shards.len() - 1)].0
+    }
+
+    /// Every shard, for a reader that sums or takes them.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.shards.iter().map(|line| &line.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +102,20 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(single.block_on(async { count() }), 1);
+    }
+
+    #[test]
+    fn test_sharded_mine_is_one_of_its_shards_and_stable_on_a_thread() {
+        let sharded: Sharded<AtomicUsize> = Sharded::new();
+        assert_eq!(sharded.iter().count(), count());
+        sharded.mine().fetch_add(1, Ordering::Relaxed);
+        sharded.mine().fetch_add(1, Ordering::Relaxed);
+        let written: Vec<usize> = sharded
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .filter(|&value| value > 0)
+            .collect();
+        assert_eq!(written, [2], "both writes reach one shard");
     }
 
     #[test]
