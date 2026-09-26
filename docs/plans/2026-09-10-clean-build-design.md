@@ -863,8 +863,14 @@ impl Table {
     pub fn state(&self) -> TableState;
     pub fn current(&self) -> Option<Arc<Generation>>;
     /// `current`, or `Error::NotReady`: the one refusal for a table with no generation to
-    /// answer from, which `get`, the gRPC service, and the one-shot subcommands all raise.
+    /// answer from, which `get`, `key_type`, the gRPC service, and the one-shot subcommands all
+    /// raise.
     pub fn serving(&self) -> Result<Arc<Generation>>;
+    /// The serving generation's key type, or `Error::NotReady`, through a `load` guard dropped
+    /// before it returns (no reference-count write on the shared generation): what the gRPC
+    /// `Get` and `MultiGet` handlers and the one-shot `get` read a key under before the lookup.
+    /// A swap onto another key type in between is refused by the lookup's own `Error::KeyType`.
+    pub fn key_type(&self) -> Result<KeyType>;
     /// `Error::NotReady` with no generation; `Error::KeyType` before any read. Counted
     /// among the table's calls in flight while it runs (see `multi_get`). One
     /// `load` guard on `current` held for the lookup's length (no reference-count write on
@@ -1186,7 +1192,8 @@ and the drain, without end.
 
 **The service.** `Service::new(&Opened, &ServerConfig)` serves `Get`,
 `MultiGet`, and `TableInfo` over the opened tables. A wire key is read under
-the served generation's key type (`key_from_wire`, a fault is
+the served generation's key type (`Table::key_type`, which clones no
+generation, then `key_from_wire`, a fault is
 `WireKeyFault`, `INVALID_ARGUMENT`); core's errors become status codes by
 variant (`status_from`, where a page fetch past its deadline,
 `CacheError::FetchDeadline`, is `DEADLINE_EXCEEDED` like the call's own

@@ -134,7 +134,7 @@ pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result
         }
     };
     table.load().await?;
-    let key_type = table.serving()?.layout.key_type;
+    let key_type = table.key_type()?;
     let parsed = keys
         .iter()
         .map(|text| key_text::parse(text, key_type))

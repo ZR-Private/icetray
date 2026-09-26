@@ -243,8 +243,8 @@ impl Service {
     /// `Get` inside its deadline.
     async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let table = self.table(&request.table)?;
-        let generation = table.serving().map_err(|error| status_from(&error))?;
-        let key = key_from_wire(request.key, generation.layout.key_type)?;
+        let key_type = table.key_type().map_err(|error| status_from(&error))?;
+        let key = key_from_wire(request.key, key_type)?;
         let lookup = table.get(&key).await.map_err(|error| status_from(&error))?;
         let (presence, value) = presence(lookup.value);
         Ok(Response::new(GetResponse {
@@ -260,11 +260,11 @@ impl Service {
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
         let table = self.table(&request.table)?;
-        let generation = table.serving().map_err(|error| status_from(&error))?;
+        let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let keys = request
             .keys
             .into_iter()
-            .map(|key| key_from_wire(Some(key), generation.layout.key_type))
+            .map(|key| key_from_wire(Some(key), key_type))
             .collect::<Result<Vec<Key>, WireKeyFault>>()?;
         let lookup = table
             .multi_get(&keys)

@@ -27,7 +27,7 @@ use crate::check::{self, Finding, FindingCode, Serviceability, Tier};
 use crate::config::TableConfig;
 use crate::error::{Error, ErrorKind, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
-use crate::key::Key;
+use crate::key::{Key, KeyType};
 use crate::local::LocalDir;
 use crate::metric::{self, LookupResult};
 use crate::shard::{self, Sharded};
@@ -482,10 +482,24 @@ impl Table {
     }
 
     /// `current`, or `Error::NotReady`: the one refusal for a table with no
-    /// generation to answer from, which `get`, the gRPC service, and the
-    /// one-shot subcommands all raise.
+    /// generation to answer from, which `get`, `key_type`, the gRPC
+    /// service, and the one-shot subcommands all raise.
     pub fn serving(&self) -> Result<Arc<Generation>> {
         self.current().ok_or_else(|| self.not_ready())
+    }
+
+    /// The serving generation's key type, or `Error::NotReady`: the type a
+    /// caller reads a key from the wire or the command line under before
+    /// `get` or `multi_get`. Read through a `load` guard dropped before it
+    /// returns, so it writes no reference count on the shared generation. A
+    /// swap onto a generation of another key type between this and the
+    /// lookup is refused by the lookup's own check, as `Error::KeyType`.
+    pub fn key_type(&self) -> Result<KeyType> {
+        self.current
+            .load()
+            .as_deref()
+            .map(|generation| generation.layout.key_type)
+            .ok_or_else(|| self.not_ready())
     }
 
     /// One lookup against the serving generation. `Error::NotReady` with no
@@ -1083,6 +1097,22 @@ mod tests {
         let error = table.get(&Key::Long(all[0])).await.unwrap_err();
         assert!(matches!(error, Error::NotReady { table: ref name } if name == TABLE));
         assert_eq!(fixture.gets(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_type_is_not_ready_before_load_then_the_generations() {
+        let (fixture, _) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        assert!(matches!(
+            table.key_type(),
+            Err(Error::NotReady { table: ref name }) if name == TABLE
+        ));
+        table.load().await.unwrap();
+        assert_eq!(table.key_type().unwrap(), KeyType::Long);
+        assert_eq!(
+            table.key_type().unwrap(),
+            table.current().unwrap().layout.key_type
+        );
     }
 
     #[tokio::test]
