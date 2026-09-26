@@ -197,9 +197,12 @@ pub enum Key { Long(i64), Str(String), Bytes(Vec<u8>), Uuid([u8; UUID_BYTES]) }
 impl Key {
     pub fn key_type(&self) -> KeyType;
     pub(crate) fn from_datum(datum: &iceberg::spec::Datum) -> Option<Self>;
-    /// The bytes the bucket transform and byte-wise comparisons see.
-    pub fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]>;
+    /// The bytes the bucket transform and byte-wise comparisons see, allocating nothing.
+    pub fn as_bytes(&self) -> KeyBytes<'_>;
 }
+/// Dereferences to `[u8]`: a long's eight little-endian bytes inline, or the key's own bytes
+/// borrowed, so a lookup's bucket and Bloom check allocate nothing for the key. Re-exported.
+pub enum KeyBytes<'a> { Long([u8; 8]), Borrowed(&'a [u8]) }
 impl std::fmt::Display for Key { /* the integer, a Debug-quoted string, 0x-prefixed hex, a hyphenated uuid */ }
 
 // bucket

@@ -44,7 +44,7 @@ pub use index::{
     ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, PageHeaderFault, PageRef,
     ResidentBytes, WireType,
 };
-pub use key::{Key, KeyType};
+pub use key::{Key, KeyBytes, KeyType};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Opened, open};

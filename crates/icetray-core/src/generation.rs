@@ -1300,7 +1300,7 @@ pub(crate) mod testing {
     pub(crate) fn key_array(column: KeyColumn, keys: &[Option<Key>]) -> ArrayRef {
         let raw = || {
             keys.iter()
-                .map(|key| key.as_ref().map(|key| key.as_bytes().into_owned()))
+                .map(|key| key.as_ref().map(|key| key.as_bytes().to_vec()))
         };
         match column {
             KeyColumn::Int64 => Arc::new(Int64Array::from(

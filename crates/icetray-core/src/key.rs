@@ -2,8 +2,8 @@
 //! compares them in. A composite key is the caller's encoding into one of
 //! them; icetray moves the bytes unchanged.
 
-use std::borrow::Cow;
 use std::fmt;
+use std::ops::Deref;
 
 use iceberg::spec::{Datum, PrimitiveLiteral, PrimitiveType, Type};
 
@@ -161,12 +161,35 @@ impl Key {
     /// long as its eight little-endian bytes, a string as its UTF-8, binary
     /// and uuid as their bytes. For every type but `Long` these are also the
     /// bytes the served order compares.
-    pub fn as_bytes(&self) -> Cow<'_, [u8]> {
+    pub fn as_bytes(&self) -> KeyBytes<'_> {
         match self {
-            Self::Long(value) => Cow::Owned(value.to_le_bytes().to_vec()),
-            Self::Str(text) => Cow::Borrowed(text.as_bytes()),
-            Self::Bytes(bytes) => Cow::Borrowed(bytes),
-            Self::Uuid(bytes) => Cow::Borrowed(bytes),
+            Self::Long(value) => KeyBytes::Long(value.to_le_bytes()),
+            Self::Str(text) => KeyBytes::Borrowed(text.as_bytes()),
+            Self::Bytes(bytes) => KeyBytes::Borrowed(bytes),
+            Self::Uuid(bytes) => KeyBytes::Borrowed(bytes),
+        }
+    }
+}
+
+/// A key's bytes as `Key::as_bytes` gives them, dereferencing to `[u8]`: a
+/// long's eight little-endian bytes held inline, or the bytes the key
+/// holds, borrowed. Neither allocates, so the bucket and the Bloom check of
+/// a lookup allocate nothing for its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyBytes<'a> {
+    /// A long key's eight little-endian bytes.
+    Long([u8; size_of::<i64>()]),
+    /// The bytes a string, binary, or uuid key holds.
+    Borrowed(&'a [u8]),
+}
+
+impl Deref for KeyBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Long(bytes) => bytes,
+            Self::Borrowed(bytes) => bytes,
         }
     }
 }
@@ -778,6 +801,10 @@ mod tests {
     fn test_as_bytes_per_type() {
         assert_eq!(&*Key::Long(1).as_bytes(), &[1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(&*Key::Long(-1).as_bytes(), &[u8::MAX; size_of::<i64>()]);
+        assert!(
+            matches!(Key::Long(1).as_bytes(), KeyBytes::Long(_)),
+            "a long's bytes are held inline, not allocated"
+        );
         assert_eq!(&*Key::Str("hé".into()).as_bytes(), "hé".as_bytes());
         assert_eq!(&*Key::Bytes(vec![0, HIGH_BIT]).as_bytes(), &[0, HIGH_BIT]);
         assert_eq!(&*Key::Uuid(SPEC_UUID).as_bytes(), &SPEC_UUID);
