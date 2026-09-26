@@ -20,6 +20,7 @@ mod manifest;
 pub mod metric;
 pub mod open;
 mod parquet_io;
+mod shard;
 mod snapshot;
 mod storage;
 mod table;

@@ -299,7 +299,26 @@ pub async fn verify_misses(served: &Served, fixture: &Fixture, ids: &[u64]) -> R
 /// conforming exposition does not hold, so a malformed value fails the test
 /// rather than reading as absent.
 pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
-    let (line, value) = exposition.lines().find_map(|line| {
+    matching_series(exposition, name, labels).next()
+}
+
+/// The sum of every series `name` whose labels include every pair in
+/// `labels`, as `series_value` matches them: a counter's total across the
+/// labels left out, such as `lookups_total` of one table over every
+/// `result`. Zero when none is exposed. Panics as `series_value` does.
+pub fn series_sum(exposition: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
+    // A fold from positive zero: `Sum` of no floats is negative zero.
+    matching_series(exposition, name, labels).fold(0.0, |sum, value| sum + value)
+}
+
+/// The values of the series `series_value` and `series_sum` match, in
+/// exposition order.
+fn matching_series<'a>(
+    exposition: &'a str,
+    name: &'a str,
+    labels: &'a [(&str, &str)],
+) -> impl Iterator<Item = f64> + 'a {
+    exposition.lines().filter_map(move |line| {
         let rest = line.strip_prefix(name)?;
         let (label_text, value) = match rest.strip_prefix('{') {
             Some(labeled) => labeled.split_once('}')?,
@@ -312,16 +331,15 @@ pub fn series_value(exposition: &str, name: &str, labels: &[(&str, &str)]) -> Op
                 Some((label, quoted.trim_matches('"')))
             })
             .collect();
-        labels
-            .iter()
-            .all(|pair| present.contains(pair))
-            .then_some((line, value))
-    })?;
-    let parsed = value
-        .split_whitespace()
-        .next()
-        .and_then(|sample| sample.parse().ok());
-    Some(parsed.unwrap_or_else(|| panic!("the sample value of `{line}` is not a float")))
+        if !labels.iter().all(|pair| present.contains(pair)) {
+            return None;
+        }
+        let parsed = value
+            .split_whitespace()
+            .next()
+            .and_then(|sample| sample.parse().ok());
+        Some(parsed.unwrap_or_else(|| panic!("the sample value of `{line}` is not a float")))
+    })
 }
 
 #[cfg(test)]
@@ -374,6 +392,24 @@ generation_age_seconds{{table=\"a\"}} {AGE}
             Some(SERVING)
         );
         assert_eq!(series_value(&scrape, "process_rss_bytes", &[]), Some(RSS));
+    }
+
+    #[test]
+    fn test_series_sum_adds_every_series_that_matches() {
+        let scrape = exposition();
+        assert_eq!(
+            series_sum(&scrape, "requests_total", &[]).to_bits(),
+            (GETS + MULTI_GETS).to_bits()
+        );
+        assert_eq!(
+            series_sum(&scrape, "requests_total", &[("call", "get")]).to_bits(),
+            GETS.to_bits()
+        );
+        assert_eq!(
+            series_sum(&scrape, "requests_total", &[("call", "table_info")]).to_bits(),
+            0.0_f64.to_bits(),
+            "nothing exposed sums to zero"
+        );
     }
 
     #[test]

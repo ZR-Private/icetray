@@ -846,8 +846,13 @@ impl Table {
     /// answer from, which `get`, the gRPC service, and the one-shot subcommands all raise.
     pub fn serving(&self) -> Result<Arc<Generation>>;
     /// `Error::NotReady` with no generation; `Error::KeyType` before any read. One
-    /// `load_full`, one lookup through `Generation::lookup`, timed and counted under
-    /// `lookups_total{table, result}` and `lookup_seconds{table, result}`.
+    /// `load` guard on `current` held for the lookup's length (no reference-count write on
+    /// the shared generation; a guard held across the lookup's awaits is correct wherever
+    /// the task resumes, and a load on a thread whose fast slots are all held costs about what
+    /// `load_full` does), one lookup through `Generation::lookup`, timed under
+    /// `lookup_seconds{table, result}` as it ends and counted on the calling thread's shard
+    /// of the table's lookup counts, which `publish_lookup_counts` moves into
+    /// `lookups_total{table, result}`.
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
     /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
     /// the whole call and issues nothing); the lookups run concurrently against that one
@@ -855,6 +860,12 @@ impl Table {
     /// values come back in key order and one batch runs at most that many lookups at once; each
     /// is counted as `get` counts; any `Err` fails the whole call (RFD 010).
     pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup>;
+    /// Moves the lookups counted on the per-thread shards (`shard::count()` of them, one per
+    /// worker when the workers are the threads that count) into `lookups_total`, each shard
+    /// taken with a swap to zero so no lookup is published twice. The binary's `/metrics`
+    /// calls it for every table before rendering (`telemetry::render`), and `Drop` calls it
+    /// last, so a scrape reads every lookup answered before it.
+    pub fn publish_lookup_counts(&self);
     /// Holds the table's load and refresh lock, for `Opened::retain`, which takes every
     /// table's in `tables` order; nothing else ever holds two.
     pub(crate) async fn serialized(&self) -> tokio::sync::MutexGuard<'_, ()>;
@@ -1082,8 +1093,9 @@ freed after a load (shed key chunks, dropped generations) returns to the
 operating system, with a `warn` log where the platform refuses (purging is
 jemalloc's Linux feature); memory metrics report the index's live bytes
 beside process RSS. `Serving::start` binds the gRPC listener and the metrics
-listener first (the metrics listener serves `/metrics` and `/ready` from
-one HTTP/1 accept loop, which only the shutdown ends: a failed `accept` is
+listener first (the metrics listener serves `/metrics`, through
+`telemetry::render` over the opened tables, and `/ready` from one HTTP/1
+accept loop, which only the shutdown ends: a failed `accept` is
 logged and retried), registers the gRPC health service with the overall
 server (`""`) and the `Icetray` service both `NOT_SERVING`, opens every
 table through `core::open` (nothing read yet), starts the gRPC and HTTP
@@ -1263,7 +1275,8 @@ that gives one up and closes its connection leaves), `sim`
 `expected_key_pages`, `predicted_probe`; `verify_hits`, `verify_hit_cost`,
 `verify_misses`; `storage_config_for_tests`, `series_value` (one series
 of a Prometheus text exposition by name and labels, as the `f64` the
-format carries, `None` only when the series is absent),
+format carries, `None` only when the series is absent), `series_sum` (the
+sum over every series that matches, zero when none does),
 `TEST_PAGE_CACHE_BYTES`, and the GET oracle's fixed counts
 `LOAD_METADATA_GETS`, `METADATA_FILE_GETS`, `LOAD_GETS_PER_FILE`,
 `HINT_POLL_GETS`), and
@@ -1454,7 +1467,12 @@ the page-cache bytes gauge; `storage` the GET, byte, hedge, and local-read
 series. The per-lookup and per-GET series are recorded through handles
 registered once (a table's per `LookupResult` in `Table::new`, storage's per
 `ReadKind` when its `IoStats` is built) with the recorder current then, so
-the binary installs its recorder before it opens the tables. The binary samples `generation_age_seconds` (from
+the binary installs its recorder before it opens the tables. A lookup's
+count goes to its thread's shard of the table's counts rather than to the
+shared series, and reaches `lookups_total` when `/metrics` renders
+(`telemetry::render` calls `Table::publish_lookup_counts` for every table
+first) or the table drops; `lookup_seconds` is recorded per lookup as it
+ends. The binary samples `generation_age_seconds` (from
 `Generation::snapshot_timestamp` against now) and `process_rss_bytes` once
 after the first loads and then every `poll_interval`, running the
 recorder's upkeep with each sample, and counts `requests_total`. `icetray_findings{table,code}` describes the serving

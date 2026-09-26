@@ -161,6 +161,7 @@ impl Serving {
         let http = tokio::spawn(serve_http(
             listeners.metrics,
             handle.clone(),
+            Arc::clone(&opened),
             ready.clone(),
             shutdown.subscribe(),
         ));

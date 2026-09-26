@@ -23,7 +23,7 @@ use icetray_proto::v1::{
     TableInfoResponse,
 };
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
-use icetray_testkit::verify::{expected_cold_gets, series_value};
+use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
     Fixture, FixtureSpec, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3, write_fixture,
 };
@@ -682,6 +682,19 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     assert_counted(&before, &after, telemetry::Call::Get, COUNTED_GETS);
     assert_counted(&before, &after, telemetry::Call::MultiGet, 1);
     assert_counted(&before, &after, telemetry::Call::TableInfo, 1);
+    let lookups = |exposition: &str| {
+        series_sum(
+            exposition,
+            metric::LOOKUPS_TOTAL,
+            &[(metric::LABEL_TABLE, TABLE)],
+        )
+    };
+    let looked_up = lookups(&after) - lookups(&before);
+    assert_eq!(
+        looked_up.to_bits(),
+        approx::gauge(COUNTED_GETS + 1).to_bits(),
+        "every lookup answered before the scrape is in it: {looked_up}"
+    );
     let rss = series_value(&after, metric::PROCESS_RSS_BYTES, &[])
         .expect("the sampler ran after the first loads");
     assert!(rss > 0.0, "a running process holds memory: {rss}");

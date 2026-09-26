@@ -24,7 +24,7 @@ pub(crate) const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Value-page fetches the page cache ran, after coalescing.
 pub(crate) const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Lookups answered, by `table` and `result`.
-pub(crate) const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
+pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Refreshes that failed and left the previous generation serving, by
 /// `table` and `reason`.
 pub(crate) const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
@@ -105,6 +105,11 @@ pub(crate) enum LookupResult {
     WarmHit,
     /// The key was absent.
     Miss,
+}
+
+impl LookupResult {
+    /// Every outcome, for the per-result series of a table.
+    pub(crate) const ALL: [Self; 3] = [Self::ColdHit, Self::WarmHit, Self::Miss];
 }
 
 impl fmt::Display for LookupResult {

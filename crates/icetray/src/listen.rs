@@ -5,6 +5,7 @@
 //! true (RFD 005: a later refresh failure keeps the previous generation).
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,10 +16,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use icetray_core::Opened;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+
+use crate::telemetry;
 
 /// The path the Prometheus exposition is served on.
 pub const METRICS_PATH: &str = "/metrics";
@@ -41,7 +45,8 @@ pub const NOT_READY_BODY: &str = "not ready";
 /// listener answering.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Serves `/metrics` and `/ready` on `listener` until `shutdown` becomes
+/// Serves `/metrics` (through `telemetry::render` over `opened`) and
+/// `/ready` on `listener` until `shutdown` becomes
 /// true, then aborts the open connections and returns. Only the shutdown
 /// ends the loop: an `accept` that fails (a connection aborted before it was
 /// accepted, a descriptor shortage) is logged and retried after
@@ -52,6 +57,7 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub async fn serve_http(
     listener: TcpListener,
     handle: PrometheusHandle,
+    opened: Arc<Opened>,
     ready: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -76,10 +82,13 @@ pub async fn serve_http(
             }
         }
         let handle = handle.clone();
+        let opened = Arc::clone(&opened);
         let ready = ready.clone();
         connections.spawn(async move {
             let service = service_fn(move |request| {
-                std::future::ready(Ok::<_, Infallible>(respond(&request, &handle, &ready)))
+                std::future::ready(Ok::<_, Infallible>(respond(
+                    &request, &handle, &opened, &ready,
+                )))
             });
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -98,13 +107,14 @@ pub async fn serve_http(
 fn respond(
     request: &Request<Incoming>,
     handle: &PrometheusHandle,
+    opened: &Opened,
     ready: &watch::Receiver<bool>,
 ) -> Response<Full<Bytes>> {
     let response = match request.uri().path() {
         METRICS_PATH => Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)
-            .body(Full::from(handle.render())),
+            .body(Full::from(telemetry::render(opened, handle))),
         READY_PATH => {
             let (status, body) = if *ready.borrow() {
                 (StatusCode::OK, READY_BODY)

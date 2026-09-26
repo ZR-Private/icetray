@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::Key;
 use crate::local::LocalDir;
 use crate::metric::{self, LookupResult};
+use crate::shard;
 use crate::snapshot::SnapshotId;
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
@@ -131,8 +133,10 @@ pub struct Table {
     cache: PageCache,
     local: Option<Arc<LocalDir>>,
     hedge: Arc<HedgeWindow>,
-    /// The serving generation; a lookup takes one `load_full` and uses that
-    /// generation for its whole duration.
+    /// The serving generation. A `get` borrows it through one `load` guard
+    /// for the lookup's whole duration, so the lookup neither touches the
+    /// generation's shared reference count nor sees a swap; a swap
+    /// meanwhile keeps the borrowed generation alive until the guard drops.
     current: ArcSwapOption<Generation>,
     /// Never held across an `await`.
     state: Mutex<TableState>,
@@ -156,17 +160,45 @@ pub struct Table {
 /// A table's lookup metric handles, one pair per `LookupResult` under the
 /// table's name, registered once in `Table::new` with the recorder current
 /// then, so a lookup clones no name, formats no label, and looks up no
-/// series.
+/// series. A lookup's count goes to its thread's shard of `counts` and
+/// reaches `lookups_total` at `publish`, which a scrape runs first and a
+/// dropped table runs last, so a scrape reads every lookup counted before
+/// it. The latency histogram is recorded per lookup, as it happens.
 struct LookupMetrics {
     cold_hit: ResultMetrics,
     warm_hit: ResultMetrics,
     miss: ResultMetrics,
+    /// `shard::count()` shards, one per worker thread when the workers are
+    /// the threads that count; a thread writes the one its `shard::slot()`
+    /// masks to.
+    counts: Box<[CountShard]>,
 }
 
 /// `lookups_total` and `lookup_seconds` of one table and result.
 struct ResultMetrics {
     total: Counter,
     seconds: Histogram,
+}
+
+/// One shard of a table's lookup counts, not yet published, per result.
+/// Aligned to 128 bytes, the cache line of the Apple M-series cores and
+/// twice that of x86, so two shards never share a line on either.
+#[repr(align(128))]
+#[derive(Default)]
+struct CountShard {
+    cold_hit: AtomicU64,
+    warm_hit: AtomicU64,
+    miss: AtomicU64,
+}
+
+impl CountShard {
+    fn of(&self, result: LookupResult) -> &AtomicU64 {
+        match result {
+            LookupResult::ColdHit => &self.cold_hit,
+            LookupResult::WarmHit => &self.warm_hit,
+            LookupResult::Miss => &self.miss,
+        }
+    }
 }
 
 impl LookupMetrics {
@@ -187,6 +219,7 @@ impl LookupMetrics {
             cold_hit: of(LookupResult::ColdHit),
             warm_hit: of(LookupResult::WarmHit),
             miss: of(LookupResult::Miss),
+            counts: (0..shard::count()).map(|_| CountShard::default()).collect(),
         }
     }
 
@@ -196,6 +229,37 @@ impl LookupMetrics {
             LookupResult::WarmHit => &self.warm_hit,
             LookupResult::Miss => &self.miss,
         }
+    }
+
+    /// One lookup of `result` that took `elapsed`.
+    fn record(&self, result: LookupResult, elapsed: Duration) {
+        let shard = &self.counts[shard::slot() & (self.counts.len() - 1)];
+        shard.of(result).fetch_add(1, Ordering::Relaxed);
+        self.of(result).seconds.record(time::seconds(elapsed));
+    }
+
+    /// Moves the counts every shard holds into `lookups_total`. Each shard's
+    /// count is taken with a swap to zero, so a lookup counted meanwhile is
+    /// published by this call or the next, and never twice.
+    fn publish(&self) {
+        for result in LookupResult::ALL {
+            let counted: u64 = self
+                .counts
+                .iter()
+                .map(|shard| shard.of(result).swap(0, Ordering::Relaxed))
+                .sum();
+            if counted > 0 {
+                self.of(result).total.increment(counted);
+            }
+        }
+    }
+}
+
+impl Drop for LookupMetrics {
+    /// Publishes the lookups counted since the last `publish`, so a table
+    /// dropped between scrapes loses none of its counts.
+    fn drop(&mut self) {
+        self.publish();
     }
 }
 
@@ -316,22 +380,34 @@ impl Table {
     /// generation to answer from, which `get`, the gRPC service, and the
     /// one-shot subcommands all raise.
     pub fn serving(&self) -> Result<Arc<Generation>> {
-        self.current().ok_or_else(|| Error::NotReady {
-            table: self.config.name.clone(),
-        })
+        self.current().ok_or_else(|| self.not_ready())
     }
 
     /// One lookup against the serving generation. `Error::NotReady` with no
     /// generation; `Error::KeyType` for a key of another type than the
     /// table's, before any read.
     pub async fn get(&self, key: &Key) -> Result<Lookup> {
-        let generation = self.serving()?;
-        self.check_key_type(&generation, key)?;
-        let value = self.lookup(&generation, key).await?;
+        // A guard held across the lookup's awaits stays correct wherever
+        // the task resumes. While held it occupies one of the loading
+        // thread's few fast slots (arc-swap's debts), and a load on a
+        // thread whose slots are all taken takes arc-swap's slower path,
+        // about what `load_full` costs.
+        let current = self.current.load();
+        let generation = current.as_deref().ok_or_else(|| self.not_ready())?;
+        self.check_key_type(generation, key)?;
+        let value = self.lookup(generation, key).await?;
         Ok(Lookup {
             value,
             snapshot_id: generation.snapshot_id,
         })
+    }
+
+    /// Moves the lookups counted since the last call into `lookups_total`.
+    /// A lookup is counted on its thread's shard, not on the shared series,
+    /// so a scrape calls this first to read every lookup counted before it;
+    /// the binary's `/metrics` does, and a dropped table does it last.
+    pub fn publish_lookup_counts(&self) {
+        self.lookups.publish();
     }
 
     /// Several lookups against one generation, answered in key order. Every
@@ -586,6 +662,13 @@ impl Table {
         }
     }
 
+    /// `Error::NotReady` for this table.
+    fn not_ready(&self) -> Error {
+        Error::NotReady {
+            table: self.config.name.clone(),
+        }
+    }
+
     /// `Error::KeyType` for a key of another type than the generation's.
     fn check_key_type(&self, generation: &Generation, key: &Key) -> Result<()> {
         let expected = generation.layout.key_type;
@@ -606,10 +689,7 @@ impl Table {
     async fn lookup(&self, generation: &Generation, key: &Key) -> Result<Value> {
         let started = Instant::now();
         let (value, result) = generation.lookup(key, &self.cache).await?;
-        let elapsed = started.elapsed();
-        let metrics = self.lookups.of(result);
-        metrics.total.increment(1);
-        metrics.seconds.record(time::seconds(elapsed));
+        self.lookups.record(result, started.elapsed());
         Ok(value)
     }
 }
@@ -1540,6 +1620,60 @@ mod tests {
             state(StateName::Loading).to_bits(),
             approx::gauge(0).to_bits()
         );
+    }
+
+    /// Lookups spread over a multi-thread runtime's workers reach
+    /// `lookups_total` at `publish_lookup_counts`, each once: a snapshot of
+    /// the debugging recorder takes the counter's value and resets it, so
+    /// each snapshot reads what was published since the one before.
+    #[test]
+    fn test_publish_lookup_counts_moves_every_task_count_once() {
+        let workers = 4;
+        let lookups_per_task = 8;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        let labels = [
+            table_label(),
+            (metric::LABEL_RESULT, LookupResult::Miss.to_string()),
+        ];
+        let published =
+            || Series(snapshotter.snapshot().into_vec()).counter(metric::LOOKUPS_TOTAL, &labels);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (fixture, all) = two_bucket_table().await;
+                let table =
+                    Arc::new(table_over(&fixture, fixture.config(Residency::Full, None)).await);
+                table.load().await.unwrap();
+                let absent = Key::Long(all[0] + 1);
+                let tasks: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let table = Arc::clone(&table);
+                        let absent = absent.clone();
+                        tokio::spawn(async move {
+                            for _ in 0..lookups_per_task {
+                                assert_eq!(table.get(&absent).await.unwrap().value, Value::Absent);
+                            }
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert_eq!(published(), 0, "counted on the shards until published");
+                table.publish_lookup_counts();
+                assert_eq!(published(), approx::count(workers * lookups_per_task));
+                table.publish_lookup_counts();
+                assert_eq!(published(), 0, "nothing is published twice");
+                table.get(&absent).await.unwrap();
+                drop(table);
+                assert_eq!(published(), 1, "a dropped table publishes what it counted");
+            });
+        });
     }
 
     /// A debugging recorder's snapshot of what `body` emitted, run on a

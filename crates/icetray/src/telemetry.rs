@@ -78,6 +78,16 @@ pub fn count(call: Call) {
     metrics::counter!(metric::REQUESTS_TOTAL, metric::LABEL_CALL => call.to_string()).increment(1);
 }
 
+/// The exposition a scrape of `/metrics` returns, with every table's lookup
+/// counts published first (`Table::publish_lookup_counts`), so the scrape
+/// reads every lookup answered before it.
+pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
+    for table in &opened.tables {
+        table.publish_lookup_counts();
+    }
+    handle.render()
+}
+
 /// Samples the gauges the binary owns: `generation_age_seconds` for every
 /// table serving a generation, from the snapshot's own timestamp against
 /// now, and `process_rss_bytes` when the platform reports a resident set
