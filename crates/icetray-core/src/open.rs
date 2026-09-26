@@ -1,5 +1,6 @@
 //! Opening every configured table (RFD 012): one storage, one page cache,
-//! the optional local directory, and every table in `Loading`, built the
+//! the optional local directory, one count of calls in flight, and every
+//! table in `Loading` over them, built the
 //! same way for the daemon and the one-shot subcommands, so a subcommand
 //! reads a table exactly as `serve` does. Loading is the caller's step.
 
@@ -12,7 +13,7 @@ use crate::config::{Config, ConfigError};
 use crate::error::{Error, Result};
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::storage::Storage;
-use crate::table::Table;
+use crate::table::{CallsInFlight, Table, TableHandles};
 
 /// Everything a process opened: the storage every read goes through, the
 /// one page cache every table shares, the local directory when configured,
@@ -82,8 +83,8 @@ impl Opened {
     }
 }
 
-/// Builds storage from the SDK's default chain, one cache, and every
-/// configured table in `Loading`; `only` narrows by name, and a name that
+/// Builds storage from the SDK's default chain, one cache, one count of
+/// calls in flight, and every configured table in `Loading` over them; `only` narrows by name, and a name that
 /// matches no table yields `Ok` with empty `tables`, whose message and exit
 /// code are the caller's. Nothing is read from any table: `open` issues no
 /// GET.
@@ -116,6 +117,12 @@ pub async fn open_with(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let handles = TableHandles {
+        storage: Arc::clone(&storage),
+        cache: cache.clone(),
+        local: local.clone(),
+        calls: CallsInFlight::new(),
+    };
     let mut tables = Vec::with_capacity(config.tables.len());
     for table in config
         .tables
@@ -126,9 +133,7 @@ pub async fn open_with(
         tables.push(Arc::new(Table::new(
             table.clone(),
             source,
-            Arc::clone(&storage),
-            cache.clone(),
-            local.clone(),
+            handles.clone(),
             config.server.refresh_deadline,
             config.server.get_deadline,
         )));
@@ -263,6 +268,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE]);
+    }
+
+    /// A call in flight on one table is counted where every other table
+    /// of the process reads it: `open_with` gives them one count.
+    #[tokio::test]
+    async fn test_open_with_gives_every_table_one_count_of_calls_in_flight() {
+        let first = two_file_fixture().await;
+        let second = two_file_fixture().await;
+        let config = config(vec![
+            named(FIRST_TABLE, &first, Residency::Full),
+            named(SECOND_TABLE, &second, Residency::Full),
+        ]);
+        let opened = open_with(&config, None, storage_for(&config))
+            .await
+            .unwrap();
+        let [first, second] = opened.tables.as_slice() else {
+            panic!("two tables open");
+        };
+        assert_eq!(second.calls_in_flight().sum(), 0);
+        let held = first.calls_in_flight().enter();
+        assert_eq!(second.calls_in_flight().sum(), 1);
+        drop(held);
+        assert_eq!(second.calls_in_flight().sum(), 0);
     }
 
     #[tokio::test]

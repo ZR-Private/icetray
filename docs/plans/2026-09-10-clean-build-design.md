@@ -369,7 +369,7 @@ impl Storage {
     pub fn register(&self, prefix: impl Into<String>, store: Arc<dyn ObjectStore>);
     pub fn stats(&self) -> Arc<IoStats>;
     /// The hedge settings this storage runs under; `Table::new` builds the table's
-    /// `HedgeWindow` from it, so the frozen `Table::new` takes no `HedgeConfig`.
+    /// `HedgeWindow` from it, so `Table::new` takes no `HedgeConfig`.
     pub(crate) fn hedge_config(&self) -> &HedgeConfig;
     /// `storage.catalog_timeout`, which bounds each catalog call `TableSource` makes; the
     /// catalog client never reads through `Storage`, but every resolve has one in hand.
@@ -828,6 +828,17 @@ pub struct MultiLookup { pub values: Vec<Value>, pub snapshot_id: SnapshotId }
 /// local-directory failure's variant); the failure itself went to the caller of `load` or
 /// `refresh`, which logs it, since `Error` is not `Clone`.
 pub enum TableState { Loading, Serving { snapshot_id: SnapshotId, since: Instant }, Degraded { serving: Option<SnapshotId>, reason: ErrorKind, since: Instant } }
+/// What a table is built over beside its configuration and source, shared with the other
+/// tables of the process: `open_with` builds one and hands every table a clone. Clone; clones
+/// share what they hold.
+pub struct TableHandles { pub storage: Arc<Storage>, pub cache: PageCache, pub local: Option<Arc<LocalDir>>, pub calls: CallsInFlight }
+/// The `get` and `multi_get` calls in flight on every table built over a clone of it, on
+/// per-thread shards (`shard::Sharded`): a call adds one to its thread's shard as it starts and
+/// takes it back from that shard as it ends. Clone (clones share the count) and Default.
+/// In-crate: `enter(&self)`, a guard counting one call until dropped, and `sum(&self)`, the
+/// shards summed with relaxed loads, a load signal that may lag a call starting or ending.
+pub struct CallsInFlight;
+impl CallsInFlight { pub fn new() -> Self; }
 /// Owns the table's `HedgeWindow`, built once in `new` from `Storage::hedge_config` and
 /// handed to every `Generation::load`, so one table's delay is set from its own reads and
 /// never another's (RFD 013). Send + Sync; Debug names the table and its state. Holds the
@@ -852,8 +863,9 @@ impl Table {
     /// past it the work is dropped, which releases the lock, and the call is
     /// `Error::RefreshDeadline`, degrading the table as any failure does. The table holds
     /// `cache` bounded by `get_deadline`: every page fetch a lookup runs ends at it from the
-    /// fetch's start (RFD 013), in a `multi_get` too; load reads bypass the cache.
-    pub fn new(config: TableConfig, source: TableSource, storage: Arc<Storage>, cache: PageCache, local: Option<Arc<LocalDir>>, refresh_deadline: Duration, get_deadline: Duration) -> Self;
+    /// fetch's start (RFD 013), in a `multi_get` too; load reads bypass the cache. Every `get`
+    /// and `multi_get` counts among `handles.calls` while it runs.
+    pub fn new(config: TableConfig, source: TableSource, handles: TableHandles, refresh_deadline: Duration, get_deadline: Duration) -> Self;
     /// First load. `Err` leaves the table `Degraded` with no generation and is not counted
     /// under `refresh_errors_total`: a first-load failure is the caller's to report (RFD 005).
     /// On a serving table, a full re-resolve and reload reusing every unchanged file.
@@ -879,7 +891,7 @@ impl Table {
     /// A swap onto another key type in between is refused by the lookup's own `Error::KeyType`.
     pub fn key_type(&self) -> Result<KeyType>;
     /// `Error::NotReady` with no generation; `Error::KeyType` before any read. Counted
-    /// among the table's calls in flight while it runs (see `multi_get`). One
+    /// among its handles' calls in flight while it runs (see `multi_get`). One
     /// `load` guard on `current` held for the lookup's length (no reference-count write on
     /// the shared generation; a guard held across the lookup's awaits is correct wherever
     /// the task resumes, and a load on a thread whose fast slots are all held costs about what
@@ -889,16 +901,15 @@ impl Table {
     /// `lookups_total{table, result}`.
     pub async fn get(&self, key: &Key) -> Result<Lookup>;
     /// One `load_full`; every key's type checked before any read (a mismatch anywhere fails
-    /// the whole call and issues nothing). The table counts its `get` and `multi_get` calls in
-    /// flight on per-thread shards (`shard::Sharded`, a call adding one to its thread's shard
-    /// and taking it back from that shard as it ends). While the shards sum to fewer calls than
-    /// worker threads (`shard::workers`), this one included, the keys are split in order into
+    /// the whole call and issues nothing). While the `CallsInFlight` of the table's handles sums
+    /// to fewer calls than worker threads (`shard::workers`), this one included, the keys are
+    /// split in order into
     /// up to one run per worker thread of at least a private `MULTI_GET_TASK_KEYS_MIN` (8)
     /// keys, each run spawned on a task of a `JoinSet` over owned copies of its keys, the
     /// generation's `Arc`, and the table's shared lookup state, so one batch decodes on several
-    /// cores; otherwise, and for a batch of one run, it is looked up inline. The count is the
-    /// table's own, not the process's: calls to other tables do not hold a batch back from
-    /// splitting. Every lookup of the batch, in whichever
+    /// cores; otherwise, and for a batch of one run, it is looked up inline. `open_with` gives
+    /// every table of the process one count, so calls to any of them count toward holding a
+    /// batch back from splitting: they all run on the same workers. Every lookup of the batch, in whichever
     /// run, holds one permit of a per-batch semaphore of a private `MULTI_GET_FAN_OUT` (32)
     /// while it runs, so one batch runs at most that many lookups, and twice that many GETs,
     /// at once; each run is `buffered` and the runs' answers are put back in key order. Each
@@ -1020,15 +1031,17 @@ impl Opened {
     /// early table can wait one deadline per slow table after it (RFD 017, Consequences).
     pub async fn retain(&self) -> Result<u64>;
 }
-/// Builds storage from the SDK chain, one cache, and every configured table
-/// in `Loading`; `only` narrows by name, and a name matching no table is `Ok` with empty
+/// Builds storage from the SDK chain, one cache, one `CallsInFlight`, and every configured
+/// table in `Loading` over them; `only` narrows by name, and a name matching no table is `Ok` with empty
 /// `tables`, whose message and exit code are the caller's. Issues no GET. Loading is the
-/// caller's step. `lib.rs` re-exports `Opened`, `open`, `Table`, `TableState`, `ErrorKind`.
+/// caller's step. `lib.rs` re-exports `Opened`, `open`, `Table`, `TableHandles`,
+/// `CallsInFlight`, `TableState`, `ErrorKind`.
 pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened>;
 /// The body of `open` over a storage the caller built, for the testkit and embedders: a test
 /// constructs one with `Storage::new`, registers its own stores on it, and never touches the
 /// SDK chain. `LocalDir::open` when configured, one `PageCache` with the directory's
-/// `page_cache_level`, one `Table` per configured name matching `only`. The binary uses `open`; the
+/// `page_cache_level`, one `CallsInFlight`, and one `Table` per configured name matching `only`,
+/// each over a clone of one `TableHandles` of those. The binary uses `open`; the
 /// disk-tier acceptance tests count `Opened::retain` over two tables through this.
 pub async fn open_with(config: &Config, only: Option<&str>, storage: Arc<Storage>) -> Result<Opened>;
 ```

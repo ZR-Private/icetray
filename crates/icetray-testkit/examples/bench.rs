@@ -29,7 +29,10 @@ use icetray_core::config::{
     LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
 use icetray_core::contract::TARGET_FILE_BYTES_MAX;
-use icetray_core::{Key, KeyType, LocalDir, PageCache, Storage, Table, TableSource, Value};
+use icetray_core::{
+    CallsInFlight, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles, TableSource,
+    Value,
+};
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
 use icetray_testkit::keys::{STRING_KEY_FIXED_BYTES, VALUE_BYTES};
@@ -557,7 +560,13 @@ async fn serve(
     let storage = Arc::new(Storage::new(StorageConfig::default()));
     let (local, dir) = local_for(tier, &storage, reuse)?;
     let cache = PageCache::new(cache_bytes, None).await?;
-    let table = table_over(prepared, tier, source, &storage, &cache, local).await?;
+    let handles = TableHandles {
+        storage: Arc::clone(&storage),
+        cache: cache.clone(),
+        local,
+        calls: CallsInFlight::new(),
+    };
+    let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
         table: Arc::new(table),
         storage,
@@ -595,15 +604,13 @@ fn local_for(
     }
 }
 
-/// `prepared` as a `Table` in `tier` from `source`, strict, over the given
-/// storage, cache, and local directory, with the default deadlines.
+/// `prepared` as a `Table` in `tier` from `source`, strict, over
+/// `handles`, with the default deadlines.
 async fn table_over(
     prepared: &Prepared,
     tier: Tier,
     source: SourceConfig,
-    storage: &Arc<Storage>,
-    cache: &PageCache,
-    local: Option<Arc<LocalDir>>,
+    handles: TableHandles,
 ) -> BenchResult<Table> {
     let config = TableConfig {
         name: prepared.shape.name.as_str().to_string(),
@@ -619,9 +626,7 @@ async fn table_over(
     Ok(Table::new(
         config,
         TableSource::from_config(&source).await?,
-        Arc::clone(storage),
-        cache.clone(),
-        local,
+        handles,
         server.refresh_deadline,
         server.get_deadline,
     ))
@@ -1063,8 +1068,9 @@ fn multi(keys: &Arc<Vec<Key>>, batch: usize) -> Op {
 }
 
 /// Both tables in `tier` over one storage, one `WARM_CACHE_BYTES` page
-/// cache, and under Disk one local directory, as one process serving both
-/// opens them; loaded, each primed as the warm scenarios are. The tables
+/// cache, under Disk one local directory, and one count of calls in
+/// flight, as `open_with` opens a process's tables; loaded, each primed as
+/// the warm scenarios are. The tables
 /// come in `prepared`'s order, beside the directory, which must outlive
 /// them.
 async fn serve_together(
@@ -1073,11 +1079,15 @@ async fn serve_together(
 ) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
     let storage = Arc::new(Storage::new(StorageConfig::default()));
     let (local, dir) = local_for(tier, &storage, None)?;
-    let cache = PageCache::new(WARM_CACHE_BYTES, None).await?;
+    let handles = TableHandles {
+        storage,
+        cache: PageCache::new(WARM_CACHE_BYTES, None).await?,
+        local,
+        calls: CallsInFlight::new(),
+    };
     let mut tables = Vec::with_capacity(prepared.len());
     for table in prepared {
-        let served =
-            table_over(table, tier, pinned(table), &storage, &cache, local.clone()).await?;
+        let served = table_over(table, tier, pinned(table), handles.clone()).await?;
         served.load().await?;
         prime_cache(&served, table.shape).await?;
         tables.push(Arc::new(served));

@@ -50,4 +50,4 @@ pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Opened, open};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, Storage};
-pub use table::{Table, TableState};
+pub use table::{CallsInFlight, Table, TableHandles, TableState};

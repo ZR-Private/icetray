@@ -129,6 +129,63 @@ impl fmt::Display for StateName {
     }
 }
 
+/// What a table is built over beside its configuration and source: the
+/// storage its reads go through, the page cache, the local directory (RFD
+/// 017) when one is configured, and the count of `get` and `multi_get`
+/// calls in flight. `open_with` builds one and hands every table it opens
+/// a clone, so a process's tables share one of each. Clones share what
+/// they hold.
+#[derive(Clone)]
+pub struct TableHandles {
+    /// The storage the table's reads go through.
+    pub storage: Arc<Storage>,
+    /// The page cache the table's lookups read pages through.
+    pub cache: PageCache,
+    /// The local directory, when `storage.local` is set.
+    pub local: Option<Arc<LocalDir>>,
+    /// The calls in flight on every table holding this count, which a
+    /// `multi_get` reads to decide whether to split.
+    pub calls: CallsInFlight,
+}
+
+/// The `get` and `multi_get` calls in flight on every table built over a
+/// clone of it, sharded as the lookup counts are, so a call does not write
+/// a line every other worker writes too: a call adds one to its thread's
+/// shard as it starts and takes it back from that same shard as it ends,
+/// so the shards sum to the calls in flight. Clones share the count.
+#[derive(Clone)]
+pub struct CallsInFlight(Arc<Sharded<AtomicUsize>>);
+
+impl CallsInFlight {
+    /// No calls, over one shard per worker thread of the calling runtime
+    /// (`shard::count`).
+    pub fn new() -> Self {
+        Self(Arc::new(Sharded::new()))
+    }
+
+    /// Counts one call in flight until the returned guard drops.
+    pub(crate) fn enter(&self) -> InFlight<'_> {
+        let shard = self.0.mine();
+        shard.fetch_add(1, Ordering::Relaxed);
+        InFlight(shard)
+    }
+
+    /// The calls in flight, summed over the shards without synchronization:
+    /// a load signal, which may lag a call starting or ending as it is read.
+    pub(crate) fn sum(&self) -> usize {
+        self.0
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+impl Default for CallsInFlight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One served table: its configuration and source, the generation it
 /// serves, and its lifecycle state. Owns the table's `HedgeWindow`, built
 /// from the storage's hedge settings and handed to every `Generation::load`,
@@ -165,24 +222,22 @@ pub struct Table {
 }
 
 /// What a lookup needs beside its generation: the table's page cache
-/// handle, its lookup metrics, and its calls in flight. Behind an `Arc`, so
-/// the tasks a `multi_get` spawns hold it for as long as they run.
+/// handle, its lookup metrics, and the calls in flight it counts among.
+/// Behind an `Arc`, so the tasks a `multi_get` spawns hold it for as long
+/// as they run.
 struct Lookups {
     /// The process's page cache, through a handle whose fetches end at the
     /// table's `get_deadline`.
     cache: PageCache,
     metrics: LookupMetrics,
-    /// The table's `get` and `multi_get` calls in flight, sharded as the
-    /// lookup counts are, so a call does not write a line every other
-    /// worker writes too: a call adds one to its thread's shard as it
-    /// starts and takes it back from that same shard as it ends, so the
-    /// shards sum to the calls in flight.
-    in_flight: Sharded<AtomicUsize>,
+    /// The calls in flight on every table sharing the table's handles, its
+    /// own among them.
+    in_flight: CallsInFlight,
 }
 
-/// One call counted in `Lookups::in_flight` while held, on the shard it
-/// was counted on; dropped as the call returns or is dropped.
-struct InFlight<'a>(&'a AtomicUsize);
+/// One call counted in a `CallsInFlight` while held, on the shard it was
+/// counted on; dropped as the call returns or is dropped.
+pub(crate) struct InFlight<'a>(&'a AtomicUsize);
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
@@ -193,28 +248,21 @@ impl Drop for InFlight<'_> {
 impl Lookups {
     /// Counts one call in flight until the returned guard drops.
     fn enter(&self) -> InFlight<'_> {
-        let shard = self.in_flight.mine();
-        shard.fetch_add(1, Ordering::Relaxed);
-        InFlight(shard)
+        self.in_flight.enter()
     }
 
     /// The runs a batch of `keys` keys is split into: up to one per worker
     /// thread (`shard::workers`), each of at least `MULTI_GET_TASK_KEYS_MIN`
-    /// keys, while the table has fewer calls in flight than worker threads,
-    /// the batch's own included; one run otherwise. A split batch waits on
-    /// its slowest run, and on busy workers its runs queue behind other
-    /// calls' work, so splitting pays while some workers would sit idle and
-    /// costs once they are all busy. The count is summed over the shards
-    /// without synchronization: a load signal, which may lag a call
-    /// starting or ending as it is read.
+    /// keys, while fewer calls than worker threads are in flight on the
+    /// tables sharing this one's count, the batch's own included; one run
+    /// otherwise. A split batch waits on its slowest run, and on busy
+    /// workers its runs queue behind other calls' work, so splitting pays
+    /// while some workers would sit idle and costs once they are all busy.
+    /// Calls to every table of the process run on the same workers, so
+    /// their count is the signal, not this table's alone.
     fn runs(&self, keys: usize) -> usize {
         let workers = shard::workers();
-        let in_flight: usize = self
-            .in_flight
-            .iter()
-            .map(|shard| shard.load(Ordering::Relaxed))
-            .sum();
-        if in_flight < workers {
+        if self.in_flight.sum() < workers {
             workers.min(keys.div_ceil(MULTI_GET_TASK_KEYS_MIN))
         } else {
             1
@@ -371,22 +419,28 @@ impl Table {
     /// lookup runs through `cache` ends at `get_deadline` from its start,
     /// failing as `CacheError::FetchDeadline` for every lookup waiting on
     /// it (RFD 013); load reads do not go through the cache and are not
-    /// bounded by it. The lookup metrics are registered here, with the
-    /// recorder current then: a process installs its recorder first.
+    /// bounded by it. Every `get` and `multi_get` counts among `handles`'
+    /// calls in flight while it runs. The lookup metrics are registered
+    /// here, with the recorder current then: a process installs its
+    /// recorder first.
     pub fn new(
         config: TableConfig,
         source: TableSource,
-        storage: Arc<Storage>,
-        cache: PageCache,
-        local: Option<Arc<LocalDir>>,
+        handles: TableHandles,
         refresh_deadline: Duration,
         get_deadline: Duration,
     ) -> Self {
+        let TableHandles {
+            storage,
+            cache,
+            local,
+            calls,
+        } = handles;
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
             metrics: LookupMetrics::new(&config.name),
-            in_flight: Sharded::new(),
+            in_flight: calls,
         });
         let table = Self {
             config,
@@ -530,18 +584,26 @@ impl Table {
         self.lookups.metrics.publish();
     }
 
+    /// The calls in flight this table counts among, for the tests of which
+    /// tables share one.
+    #[cfg(test)]
+    pub(crate) fn calls_in_flight(&self) -> &CallsInFlight {
+        &self.lookups.in_flight
+    }
+
     /// Several lookups against one generation, answered in key order. Every
     /// key's type is checked before any read, so a mismatch anywhere fails
     /// the whole call and issues nothing; any failure fails the whole call
-    /// (RFD 010). While the table has fewer `get` and `multi_get` calls in
-    /// flight than worker threads, this one included, the keys are split,
-    /// in order, into up to one run per worker thread (`shard::workers`) of
-    /// at least `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a
+    /// (RFD 010). While fewer `get` and `multi_get` calls than worker
+    /// threads are in flight on the tables sharing this one's
+    /// `TableHandles::calls`, this one included, the keys are split, in
+    /// order, into up to one run per worker thread (`shard::workers`) of at
+    /// least `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a
     /// batch's decodes run on several cores (`Lookups::runs`). A batch that
-    /// makes one run, as a batch does once the table has that many calls in
-    /// flight, is looked up here, unspawned. The count is the table's own:
-    /// calls to other tables of the process do not hold a batch back from
-    /// splitting. The runs share one bound of `MULTI_GET_FAN_OUT` lookups
+    /// makes one run, as a batch does once that many calls are in flight,
+    /// is looked up here, unspawned. `open_with` gives every table of a
+    /// process one count, so calls to any of them count toward holding a
+    /// batch back from splitting. The runs share one bound of `MULTI_GET_FAN_OUT` lookups
     /// in flight. Dropping the returned future, as a deadline does,
     /// aborts the runs still going. A run's panic is resumed here; a run
     /// canceled under a runtime shutdown is `Error::LookupCanceled`.
@@ -964,14 +1026,35 @@ mod tests {
         config: TableConfig,
         refresh_deadline: Duration,
     ) -> Table {
+        let handles = handles_over(fixture).await;
+        table_sharing(fixture, config, handles, refresh_deadline)
+    }
+
+    /// Handles over `fixture`'s storage, a fresh cache, no local directory,
+    /// and a count of calls in flight of their own.
+    async fn handles_over(fixture: &Fixture) -> TableHandles {
+        TableHandles {
+            storage: Arc::clone(&fixture.storage),
+            cache: cache().await,
+            local: None,
+            calls: CallsInFlight::new(),
+        }
+    }
+
+    /// A table following `fixture`'s main branch under `config`, built over
+    /// `handles`, which other tables may share, in `Loading`.
+    fn table_sharing(
+        fixture: &Fixture,
+        config: TableConfig,
+        handles: TableHandles,
+        refresh_deadline: Duration,
+    ) -> Table {
         Table::new(
             config,
             TableSource::Static {
                 location: fixture.root(),
             },
-            Arc::clone(&fixture.storage),
-            cache().await,
-            None,
+            handles,
             refresh_deadline,
             ServerConfig::default().get_deadline,
         )
@@ -1221,6 +1304,24 @@ mod tests {
     /// is a cold hit on a page of its own and costs a GET no other key
     /// shares; its keys; and the gauge its storage reads through.
     async fn one_row_per_page(key_count: usize) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
+        let (fixture, all, gauged) = one_row_per_page_fixture(key_count).await;
+        let table = table_over(&fixture, lenient(&fixture)).await;
+        table.load().await.unwrap();
+        (table, fixture, all, gauged)
+    }
+
+    /// `fixture`'s table with `strict` off, as the one-row-per-page tables
+    /// are served.
+    fn lenient(fixture: &Fixture) -> TableConfig {
+        TableConfig {
+            strict: false,
+            ..fixture.config(Residency::Full, None)
+        }
+    }
+
+    /// The fixture `one_row_per_page` serves, its keys, and the gauge its
+    /// storage reads through.
+    async fn one_row_per_page_fixture(key_count: usize) -> (Fixture, Vec<i64>, Arc<Gauged>) {
         let all = keys_from(0, i64::try_from(key_count).unwrap());
         let keys = long_keys(&all);
         let mut fixture = Fixture::bucketed(1);
@@ -1244,13 +1345,7 @@ mod tests {
         fixture
             .storage
             .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
-        let config = TableConfig {
-            strict: false,
-            ..fixture.config(Residency::Full, None)
-        };
-        let table = table_over(&fixture, config).await;
-        table.load().await.unwrap();
-        (table, fixture, all, gauged)
+        (fixture, all, gauged)
     }
 
     /// A batch of cold hits, each on a page of its own, reaches exactly
@@ -1279,6 +1374,9 @@ mod tests {
     /// it room to.
     const SPLIT_WORKERS: usize = 4;
 
+    /// The name of the second table over a fixture, beside `TABLE`.
+    const OTHER_TABLE: &str = "other";
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_multi_get_splits_while_fewer_calls_than_workers_are_in_flight() {
         assert_eq!(shard::workers(), SPLIT_WORKERS);
@@ -1299,6 +1397,91 @@ mod tests {
         assert_eq!(runs_spawned_beside(others_filling_the_workers).await, 0);
         let others_past_the_workers = SPLIT_WORKERS;
         assert_eq!(runs_spawned_beside(others_past_the_workers).await, 0);
+    }
+
+    /// Calls held in flight on one table hold a batch on another back from
+    /// splitting when the two share their handles, as `open_with`'s tables
+    /// do: every table's calls run on the same workers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_counts_the_calls_in_flight_on_every_table_sharing_its_handles() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let others_leaving_room = SPLIT_WORKERS - 2;
+        assert_eq!(
+            runs_spawned_beside_another_table(others_leaving_room).await,
+            SPLIT_WORKERS,
+            "with the batch, one fewer call in flight than workers"
+        );
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        assert_eq!(
+            runs_spawned_beside_another_table(others_filling_the_workers).await,
+            0
+        );
+    }
+
+    /// The runs a batch of `MULTI_GET_FAN_OUT` cold hits on one table
+    /// spawns while `others` cold-hit `get`s are in flight on another table
+    /// over the same handles and file, each on a page of its own. The store
+    /// holds every GET of both, so the `get`s stay in flight while the
+    /// batch starts; each spawned run holds the batch's generation's `Arc`,
+    /// so the holders beyond the batch table's own, the batch's, and this
+    /// read's are the runs.
+    async fn runs_spawned_beside_another_table(others: usize) -> usize {
+        let holders_of_an_inline_batch = 3;
+        let (fixture, all, gauged) = one_row_per_page_fixture(MULTI_GET_FAN_OUT + others).await;
+        let handles = handles_over(&fixture).await;
+        let refresh_deadline = ServerConfig::default().refresh_deadline;
+        let batch_table = table_sharing(
+            &fixture,
+            lenient(&fixture),
+            handles.clone(),
+            refresh_deadline,
+        );
+        let other = Arc::new(table_sharing(
+            &fixture,
+            TableConfig {
+                name: OTHER_TABLE.to_string(),
+                ..lenient(&fixture)
+            },
+            handles,
+            refresh_deadline,
+        ));
+        batch_table.load().await.unwrap();
+        other.load().await.unwrap();
+        let (batch, beside) = all.split_at(MULTI_GET_FAN_OUT);
+        let keys = long_keys(batch);
+        // One GET per key and no hedge, since neither table has recorded a
+        // lookup GET to take a delay from, so one more GET than both ask
+        // is never reached and the store holds every one until the test
+        // drops them.
+        gauged.fill_to(MULTI_GET_FAN_OUT + others + 1);
+        let mut held = JoinSet::new();
+        for key in long_keys(beside) {
+            let other = Arc::clone(&other);
+            held.spawn(async move { other.get(&key).await });
+        }
+        // Before the fetches end at the get deadline, which would end the
+        // calls.
+        let reach = |gets: usize| {
+            let gauged = Arc::clone(&gauged);
+            tokio::time::timeout(ServerConfig::default().get_deadline, async move {
+                while gauged.high_water() < gets {
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        reach(others)
+            .await
+            .expect("every get on the other table reaches the store");
+        let every_get_held = async {
+            reach(others + MULTI_GET_FAN_OUT)
+                .await
+                .expect("every lookup of the batch reaches the store");
+            Arc::strong_count(&batch_table.current().unwrap()) - holders_of_an_inline_batch
+        };
+        tokio::select! {
+            answered = batch_table.multi_get(&keys) => panic!("the store holds every GET: {answered:?}"),
+            spawned = every_get_held => spawned,
+        }
     }
 
     /// The runs a batch of `MULTI_GET_FAN_OUT` cold hits spawns while

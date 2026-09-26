@@ -11,7 +11,8 @@ use iceberg::Catalog;
 use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
-    Generation, Key, LocalDir, PageCache, Residency, Storage, Table, TableSource, Value,
+    CallsInFlight, Generation, Key, LocalDir, PageCache, Residency, Storage, Table, TableHandles,
+    TableSource, Value,
 };
 
 use crate::error::{Precondition, Result};
@@ -71,8 +72,8 @@ impl Served {
 }
 
 /// `config` from `source` over `storage`, not yet loaded: a `cache_bytes`
-/// page cache on `local`'s disk level when there is one, and the table in
-/// `Loading`. A test that asserts on a refused table's state or needs a
+/// page cache on `local`'s disk level when there is one, a count of calls
+/// in flight of its own, and the table in `Loading`. A test that asserts on a refused table's state or needs a
 /// cache of another size builds here and calls `Served::load` itself. The
 /// disk-tier tests build the storage first and open their `LocalDir` over
 /// its `stats`, so the same counters see the local reads.
@@ -88,12 +89,16 @@ pub async fn build(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let handles = TableHandles {
+        storage: Arc::clone(&storage),
+        cache: cache.clone(),
+        local,
+        calls: CallsInFlight::new(),
+    };
     let table = Table::new(
         config,
         source,
-        Arc::clone(&storage),
-        cache.clone(),
-        local,
+        handles,
         ServerConfig::default().refresh_deadline,
         ServerConfig::default().get_deadline,
     );
