@@ -1303,8 +1303,9 @@ data.
 failure source; `SpecFault { PadOnFixedWidthKey, CatalogBehind }` for a
 specification the writer refuses; `Precondition { OracleNotFull,
 CacheNotCold, GoldenUnset, RestUriUnset }` for a helper called in a state
-it cannot measure; `required_var`, the one place a gate's variable is
-read), `keys` (`key_at`, `key_at_padded`, `absent_key_from`,
+it cannot measure; `TruthFault { Json, Base64 }` for a truth-file line that
+cannot be read, naming the line; `required_var`, the one place a gate's
+variable is read), `keys` (`key_at`, `key_at_padded`, `absent_key_from`,
 `absent_key_near`, `far_key`, `value_for`, `value_for_len`,
 `text_value_for_len`, `value_of_kind` over `ValueKind { Random, Text }`;
 `KEY_STEP`, `VALUE_BYTES`, `STRING_KEY_FIXED_BYTES`; keys of all four
@@ -1348,7 +1349,11 @@ sum over every series that matches, zero when none does),
 `HINT_POLL_GETS`), and
 `golden` (`WAREHOUSE_VAR`, `warehouse`, `GoldenTable`, `table_config`,
 `config`, `long_key`, `string_key`, `permuted_key`, `value`,
-`wide_value`). The constants `PAGE_ROWS`, `VALUE_PAGE_BYTES`,
+`wide_value`), and `truth` (the truth file a check replays: JSON Lines of
+a string `key` and its expected `value_base64`, or `null` for a key that
+must be absent; `parse` into `Entry`, and `compare` of an expected value
+with an answer into `Outcome { Match, WrongValue, MissingValue,
+UnexpectedValue }`). The constants `PAGE_ROWS`, `VALUE_PAGE_BYTES`,
 `TARGET_FILE_BYTES_MAX`, `KEY_BYTES_ADVICE`, `MAX_KEY_BYTES`, and
 `PAGE_CACHE_DISK_BLOCK_BYTES` are imported from `contract` and never
 redeclared; the golden key derivations delegate to `keys`; a `usize`
@@ -1410,7 +1415,11 @@ hedge-disabled; only `tests/sim.rs` enables hedging.
 The acceptance suite is `tests/lookup.rs`, `lookup_s3.rs`, `refresh.rs`,
 `refusals.rs`, `findings.rs`, `residency_bloom.rs`, `residency_disk.rs`
 (P), `sim.rs` (S), `golden.rs` (G), and `rest_catalog.rs` (C); the scale
-probe is `examples/scale.rs`, a program run by hand and not a test. One fixture per `RefusalReason` variant: descending
+probe is `examples/scale.rs`, a program run by hand and not a test, and
+`examples/check.rs` replays a truth file against a running server over
+gRPC, `Get` or `MultiGet`, reporting every mismatch, the latency
+percentiles, and the object GETs per lookup its `/metrics` counted, and
+exits nonzero on any mismatch or failed call. One fixture per `RefusalReason` variant: descending
 order for `Unsorted`; a raw nullable key column for `NullKeys`; an
 overlapping append for `DuplicateKeys`; a raw file of bucket-0 keys
 recorded under bucket 1 (`Fixture::raw_file_in_bucket`) for

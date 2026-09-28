@@ -1,6 +1,7 @@
 //! Test infrastructure shared across the workspace: an in-process S3 server,
 //! the fixture writer, the deterministic simulation transport, shared
-//! assertions, and the golden-table locator (RFD 014).
+//! assertions, the golden-table locator (RFD 014), and the truth file a
+//! check replays against a running server.
 
 pub mod error;
 pub mod fixture;
@@ -9,6 +10,7 @@ pub mod keys;
 pub mod layout;
 pub mod s3;
 pub mod sim;
+pub mod truth;
 pub mod verify;
 
 pub use error::{Result, TestkitError};

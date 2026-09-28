@@ -1,8 +1,9 @@
 //! The one error type of the testkit: every library failure a fixture or
-//! an assertion can meet, one variant per source, plus the two faults this
-//! crate raises itself, a fixture specification the writer refuses and a
-//! helper called in a state it cannot measure. A test matches the variant;
-//! the message is for a person reading the failure.
+//! an assertion can meet, one variant per source, plus the three faults
+//! this crate raises itself: a fixture specification the writer refuses, a
+//! helper called in a state it cannot measure, and a truth-file line that
+//! cannot be read. A test matches the variant; the message is for a person
+//! reading the failure.
 
 use std::env::VarError;
 
@@ -10,6 +11,7 @@ use icetray_core::KeyType;
 use icetray_core::config::Residency;
 
 use crate::golden::WAREHOUSE_VAR;
+use crate::truth::TruthFault;
 
 /// The environment variable that names the REST catalog the container-gated
 /// test writes through (`dev/test-int.sh` exports it).
@@ -52,6 +54,9 @@ pub enum TestkitError {
     /// A helper called in a state it cannot measure.
     #[error("precondition: {0}")]
     Precondition(#[from] Precondition),
+    /// A truth-file line that cannot be read.
+    #[error("truth file: {0}")]
+    Truth(#[from] TruthFault),
 }
 
 impl From<s3s_fs::Error> for TestkitError {

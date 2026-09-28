@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+base64.workspace = true
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
@@ -23,6 +24,7 @@ parquet = { workspace = true }
 pin-project-lite = { workspace = true }
 s3s = { workspace = true }
 s3s-fs = { workspace = true }
+serde.workspace = true
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
@@ -40,7 +42,9 @@ clap.workspace = true
 # The container-gated catalog test writes its fixture through a REST catalog.
 iceberg-catalog-rest = { workspace = true }
 icetray = { path = "../icetray" }
+icetray-proto.workspace = true
 libc = "0.2.189"
 memory-stats.workspace = true
 rand.workspace = true
 tikv-jemallocator.workspace = true
+tonic.workspace = true
