@@ -202,9 +202,9 @@ flight has written chunk files its generation will reference once it
 swaps in, and a live set computed beside it would delete them. The cost is
 that a slow table holds the deletion up, and with it the next refresh of
 every table whose lock the deletion already holds. A refresh gives its
-lock up once the refresh deadline of RFD 013 (Tail latency) has passed,
-five minutes by default, so one slow table holds the others up at most
-that long; when several are slow, a table early in the order can wait one
+lock up once its deadline under RFD 013 (Tail latency) has passed, five
+minutes by default and thirty for a first load, so one slow table holds
+the others up at most that long; when several are slow, a table early in the order can wait one
 deadline for each slow table after it, since a table whose lock is not yet
 taken can start a refresh meanwhile. The cost is accepted: a live set
 computed without the locks could miss a load in flight, and taking them

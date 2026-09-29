@@ -779,6 +779,7 @@ async fn table_over(
         config,
         TableSource::from_config(&source).await?,
         handles,
+        server.load_deadline,
         server.refresh_deadline,
         server.get_deadline,
     ))

@@ -215,8 +215,12 @@ pub struct Table {
     /// Serializes `load` and `refresh`; `Opened::retain` takes every
     /// table's in turn, and nothing else ever takes two.
     serial: tokio::sync::Mutex<()>,
-    /// How long one `load` or `refresh` may hold `serial` doing its work,
-    /// from `server.refresh_deadline`.
+    /// How long a `load` or `refresh` with no generation serving, which
+    /// builds from nothing, may hold `serial` doing its work, from
+    /// `server.load_deadline`.
+    load_deadline: Duration,
+    /// How long a `load` or `refresh` over a serving generation may hold
+    /// `serial` doing its work, from `server.refresh_deadline`.
     refresh_deadline: Duration,
     lookups: Arc<Lookups>,
 }
@@ -415,7 +419,9 @@ impl Drop for LookupMetrics {
 
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Every `load`
-    /// and `refresh` runs within `refresh_deadline`. Every page fetch a
+    /// and `refresh` with no generation serving runs within
+    /// `load_deadline`, since it reads every file, and every one over a
+    /// serving generation within `refresh_deadline`. Every page fetch a
     /// lookup runs through `cache` ends at `get_deadline` from its start,
     /// failing as `CacheError::FetchDeadline` for every lookup waiting on
     /// it (RFD 013); load reads do not go through the cache and are not
@@ -427,6 +433,7 @@ impl Table {
         config: TableConfig,
         source: TableSource,
         handles: TableHandles,
+        load_deadline: Duration,
         refresh_deadline: Duration,
         get_deadline: Duration,
     ) -> Self {
@@ -452,6 +459,7 @@ impl Table {
             state: Mutex::new(TableState::Loading),
             known: Mutex::new(None),
             serial: tokio::sync::Mutex::new(()),
+            load_deadline,
             refresh_deadline,
             lookups,
         };
@@ -460,13 +468,14 @@ impl Table {
     }
 
     /// First load: resolves the source, builds the snapshot the ref names,
-    /// runs the doctor on it, and swaps it in, within the refresh deadline;
-    /// past it the load is dropped as `Error::RefreshDeadline`. `Err` leaves
+    /// runs the doctor on it, and swaps it in, within the load deadline;
+    /// past it the load is dropped as `Error::LoadDeadline`. `Err` leaves
     /// the table `Degraded` with no generation; a first-load failure is
     /// fatal to the process (RFD 005) and is the caller's to report, so it
     /// is not counted under `refresh_errors_total`. On a table that already
     /// serves, a full re-resolve and reload, reusing every file the new
-    /// snapshot still names by the same path and size.
+    /// snapshot still names by the same path and size, within the refresh
+    /// deadline.
     pub async fn load(&self) -> Result<()> {
         let _serialized = self.serial.lock().await;
         self.within_deadline(self.reload())
@@ -482,8 +491,10 @@ impl Table {
     /// the table `Degraded`, and counts one `refresh_errors_total` with the
     /// error's kind as its reason; `Ok(false)` after such a failure ends
     /// the `Degraded` state, since the table is in step with its ref again.
-    /// The poll runs within the refresh deadline; past it the poll is
-    /// dropped as `Error::RefreshDeadline`, a failure like any other.
+    /// The poll runs within the refresh deadline, or with no generation
+    /// serving within the load deadline; past it the poll is dropped as
+    /// `Error::RefreshDeadline` or `Error::LoadDeadline`, a failure like any
+    /// other.
     pub async fn refresh(&self) -> Result<bool> {
         let _serialized = self.serial.lock().await;
         let outcome = self
@@ -667,18 +678,29 @@ impl Table {
         self.serial.lock().await
     }
 
-    /// `work` within the refresh deadline, or `Error::RefreshDeadline` once
-    /// it passes. The work is dropped at the deadline, which cancels its
-    /// reads and releases what it reserved, so the caller returns, and
-    /// releases `serial`, once the deadline passes, and the next poll or
+    /// `work` within the deadline its build takes: with no generation
+    /// serving, a build from nothing, the load deadline, or
+    /// `Error::LoadDeadline` once it passes; over a serving generation,
+    /// which reuses every unchanged file, the refresh deadline, or
+    /// `Error::RefreshDeadline`. Called with `serial` held, so no other
+    /// build swaps a generation in between the choice and the work. The
+    /// work is dropped at the deadline, which cancels its reads and
+    /// releases what it reserved, so the caller returns, and releases
+    /// `serial`, once the deadline passes, and the next poll or
     /// `Opened::retain` can take it.
     async fn within_deadline<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
-        tokio::time::timeout(self.refresh_deadline, work)
-            .await
-            .map_err(|_elapsed| Error::RefreshDeadline {
-                table: self.config.name.clone(),
-                after: self.refresh_deadline,
-            })?
+        let table = self.config.name.clone();
+        if self.current().is_none() {
+            let after = self.load_deadline;
+            tokio::time::timeout(after, work)
+                .await
+                .map_err(|_elapsed| Error::LoadDeadline { table, after })?
+        } else {
+            let after = self.refresh_deadline;
+            tokio::time::timeout(after, work)
+                .await
+                .map_err(|_elapsed| Error::RefreshDeadline { table, after })?
+        }
     }
 
     /// Resolves the source and builds the snapshot the ref names over the
@@ -987,10 +1009,13 @@ mod tests {
     /// The name of a second, strict table in the metrics tests, beside the
     /// fixture's `TABLE`.
     const STRICT_TABLE: &str = "strict";
-    /// The refresh deadline of the tests that stall a load: long enough
-    /// for the one-file fixture's first load, short enough to keep the test
-    /// quick.
+    /// The refresh deadline of the tests that stall a refresh: short
+    /// enough to keep the test quick.
     const TEST_REFRESH_DEADLINE: Duration = Duration::from_secs(1);
+    /// The load deadline of the tests that stall a load: long enough for
+    /// the fixtures' first load, and other than `TEST_REFRESH_DEADLINE`,
+    /// so a test tells which deadline ended the work.
+    const TEST_LOAD_DEADLINE: Duration = Duration::from_secs(2);
 
     /// A one-bucket fixture with one file of `FILE_KEYS` keys laid out as
     /// `layout` says, committed as `FIRST_SNAPSHOT`.
@@ -1014,20 +1039,29 @@ mod tests {
     }
 
     /// A table following `fixture`'s main branch under `config`, with no
-    /// local directory and the default refresh and get deadlines, in
-    /// `Loading`.
+    /// local directory and the default load, refresh, and get deadlines,
+    /// in `Loading`.
     async fn table_over(fixture: &Fixture, config: TableConfig) -> Table {
-        table_within(fixture, config, ServerConfig::default().refresh_deadline).await
+        let defaults = ServerConfig::default();
+        table_within(
+            fixture,
+            config,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        )
+        .await
     }
 
-    /// `table_over` with `refresh_deadline` on every load and refresh.
+    /// `table_over` with `load_deadline` on every build from no generation
+    /// and `refresh_deadline` on every build over one.
     async fn table_within(
         fixture: &Fixture,
         config: TableConfig,
+        load_deadline: Duration,
         refresh_deadline: Duration,
     ) -> Table {
         let handles = handles_over(fixture).await;
-        table_sharing(fixture, config, handles, refresh_deadline)
+        table_sharing(fixture, config, handles, load_deadline, refresh_deadline)
     }
 
     /// Handles over `fixture`'s storage, a fresh cache, no local directory,
@@ -1047,6 +1081,7 @@ mod tests {
         fixture: &Fixture,
         config: TableConfig,
         handles: TableHandles,
+        load_deadline: Duration,
         refresh_deadline: Duration,
     ) -> Table {
         Table::new(
@@ -1055,6 +1090,7 @@ mod tests {
                 location: fixture.root(),
             },
             handles,
+            load_deadline,
             refresh_deadline,
             ServerConfig::default().get_deadline,
         )
@@ -1075,17 +1111,28 @@ mod tests {
         fixture.storage.register(FILE_PREFIX, Arc::new(stalled));
     }
 
-    /// Runs `work`, which a refresh deadline should end, under
-    /// `DEADLINE_GUARD`, and expects the deadline's error for `TABLE`.
-    async fn ends_at_deadline<T: fmt::Debug>(work: impl Future<Output = Result<T>>) {
+    /// Runs `work`, which a deadline should end, under `DEADLINE_GUARD`,
+    /// and expects the error of the deadline `kind` names, for `TABLE`,
+    /// after `deadline`.
+    async fn ends_at_deadline<T: fmt::Debug>(
+        work: impl Future<Output = Result<T>>,
+        kind: ErrorKind,
+        deadline: Duration,
+    ) {
         let outcome = tokio::time::timeout(DEADLINE_GUARD, work)
             .await
-            .expect("the work ends at its refresh deadline, before the guard");
-        let Err(Error::RefreshDeadline { table, after }) = outcome else {
-            panic!("expected a refresh deadline, got {outcome:?}");
+            .expect("the work ends at its deadline, before the guard");
+        let (table, after) = match outcome {
+            Err(Error::LoadDeadline { table, after }) if kind == ErrorKind::LoadDeadline => {
+                (table, after)
+            }
+            Err(Error::RefreshDeadline { table, after }) if kind == ErrorKind::RefreshDeadline => {
+                (table, after)
+            }
+            other => panic!("expected {kind:?}, got {other:?}"),
         };
         assert_eq!(table, TABLE);
-        assert_eq!(after, TEST_REFRESH_DEADLINE);
+        assert_eq!(after, deadline);
     }
 
     /// Appends to `fixture` one file `name` in bucket 0 whose keys lie above
@@ -1429,12 +1476,13 @@ mod tests {
         let holders_of_an_inline_batch = 3;
         let (fixture, all, gauged) = one_row_per_page_fixture(MULTI_GET_FAN_OUT + others).await;
         let handles = handles_over(&fixture).await;
-        let refresh_deadline = ServerConfig::default().refresh_deadline;
+        let defaults = ServerConfig::default();
         let batch_table = table_sharing(
             &fixture,
             lenient(&fixture),
             handles.clone(),
-            refresh_deadline,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
         );
         let other = Arc::new(table_sharing(
             &fixture,
@@ -1443,7 +1491,8 @@ mod tests {
                 ..lenient(&fixture)
             },
             handles,
-            refresh_deadline,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
         ));
         batch_table.load().await.unwrap();
         other.load().await.unwrap();
@@ -1598,21 +1647,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_fails_at_the_refresh_deadline_and_releases_the_lock() {
+    async fn test_load_fails_at_the_load_deadline_and_releases_the_lock() {
         let (fixture, _) = two_bucket_table().await;
         stall_reads(&fixture);
         let table = table_within(
             &fixture,
             fixture.config(Residency::Full, None),
+            TEST_LOAD_DEADLINE,
             TEST_REFRESH_DEADLINE,
         )
         .await;
-        ends_at_deadline(table.load()).await;
-        assert_eq!(degraded(&table), (None, ErrorKind::RefreshDeadline));
+        ends_at_deadline(table.load(), ErrorKind::LoadDeadline, TEST_LOAD_DEADLINE).await;
+        assert_eq!(degraded(&table), (None, ErrorKind::LoadDeadline));
         // The load dropped its lock with its work: the next poll takes the
-        // lock and runs to its own deadline.
-        ends_at_deadline(table.refresh()).await;
-        assert_eq!(degraded(&table), (None, ErrorKind::RefreshDeadline));
+        // lock and, with no generation serving, builds from nothing under
+        // the load deadline too.
+        ends_at_deadline(table.refresh(), ErrorKind::LoadDeadline, TEST_LOAD_DEADLINE).await;
+        assert_eq!(degraded(&table), (None, ErrorKind::LoadDeadline));
     }
 
     #[tokio::test]
@@ -1621,12 +1672,18 @@ mod tests {
         let table = table_within(
             &fixture,
             fixture.config(Residency::Full, None),
+            TEST_LOAD_DEADLINE,
             TEST_REFRESH_DEADLINE,
         )
         .await;
         table.load().await.unwrap();
         stall_reads(&fixture);
-        ends_at_deadline(table.refresh()).await;
+        ends_at_deadline(
+            table.refresh(),
+            ErrorKind::RefreshDeadline,
+            TEST_REFRESH_DEADLINE,
+        )
+        .await;
         let serving = Some(SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(degraded(&table), (serving, ErrorKind::RefreshDeadline));
         assert_eq!(
@@ -1634,7 +1691,12 @@ mod tests {
             present(all[0]),
             "the generation loaded before the stall keeps answering"
         );
-        ends_at_deadline(table.refresh()).await;
+        ends_at_deadline(
+            table.refresh(),
+            ErrorKind::RefreshDeadline,
+            TEST_REFRESH_DEADLINE,
+        )
+        .await;
         assert_eq!(degraded(&table), (serving, ErrorKind::RefreshDeadline));
     }
 

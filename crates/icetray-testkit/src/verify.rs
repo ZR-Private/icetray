@@ -95,12 +95,14 @@ pub async fn build(
         local,
         calls: CallsInFlight::new(),
     };
+    let server = ServerConfig::default();
     let table = Table::new(
         config,
         source,
         handles,
-        ServerConfig::default().refresh_deadline,
-        ServerConfig::default().get_deadline,
+        server.load_deadline,
+        server.refresh_deadline,
+        server.get_deadline,
     );
     Ok(Served {
         storage,

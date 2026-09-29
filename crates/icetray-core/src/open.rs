@@ -51,15 +51,17 @@ impl Opened {
     /// calls at once cannot each hold a lock the other waits for. The cost
     /// is that a slow table holds retention up, and with it the next load
     /// or refresh of every table whose lock is already held. A load or
-    /// refresh gives its lock up once the refresh deadline has passed since
-    /// it took it (`server.refresh_deadline`, five minutes by default), and
-    /// the lock is fair, so a request queued behind it comes next: each
-    /// lock is waited for at most one refresh deadline, and one slow table
-    /// holds the others up at most that long, plus the deletes. A table
+    /// refresh gives its lock up once its deadline has passed since it took
+    /// it: the load deadline for a build with no generation serving
+    /// (`server.load_deadline`, thirty minutes by default), the refresh
+    /// deadline otherwise (`server.refresh_deadline`, five minutes). The
+    /// lock is fair, so a request queued behind it comes next: each lock is
+    /// waited for at most one deadline, and one slow table holds the others
+    /// up at most that long, plus the deletes; while a table's first load
+    /// runs, that is its load deadline. A table
     /// whose lock is not yet taken can start a refresh while an earlier one
     /// is waited for, so when several tables are slow, a table early in
-    /// `tables` can be held up one refresh deadline for each slow table
-    /// after it.
+    /// `tables` can be held up one deadline for each slow table after it.
     pub async fn retain(&self) -> Result<u64> {
         let Some(local) = &self.local else {
             return Ok(0);
@@ -134,6 +136,7 @@ pub async fn open_with(
             table.clone(),
             source,
             handles.clone(),
+            config.server.load_deadline,
             config.server.refresh_deadline,
             config.server.get_deadline,
         )));

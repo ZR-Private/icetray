@@ -115,7 +115,10 @@ pub enum Error {
     /// A catalog call ran past `storage.catalog_timeout` (RFD 013); `table` is the
     /// catalog identifier, as for a fault raised while the source resolves.
     CatalogTimeout { table: String, after: Duration },
-    /// A first load or refresh ran past `server.refresh_deadline` and was dropped (RFD 013).
+    /// A build with no generation serving (a first load, or a retry after one failed)
+    /// ran past `server.load_deadline` and was dropped (RFD 013).
+    LoadDeadline { table: String, after: Duration },
+    /// A refresh over a serving generation ran past `server.refresh_deadline` and was dropped (RFD 013).
     RefreshDeadline { table: String, after: Duration },
     /// The blocking task verifying keys (a file's at load, an overlap group's merge, or a
     /// file's doctor bucket check) was canceled as the runtime shut down; `path` is the file,
@@ -136,7 +139,7 @@ impl Error {
 /// label of `refresh_errors_total`: the refusal's own name for `Refused`, `inefficient` for
 /// the strict gate, and the variant's snake_case name for the rest (`iceberg`, `parquet`,
 /// `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
-/// `file`, `not_ready`, `local`, `catalog_timeout`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`). Also what `TableState::Degraded` carries as its reason:
+/// `file`, `not_ready`, `local`, `catalog_timeout`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`). Also what `TableState::Degraded` carries as its reason:
 /// `Error` is not `Clone`, so the failure goes to the caller and its kind to the state.
 /// Re-exported from `lib.rs`.
 pub enum ErrorKind { Iceberg, Parquet, ObjectStore, ObjectStorePath, Json, Config, Cache, Refused(RefusalReason), Inefficient, KeyType, Table, File, NotReady, Local, CatalogTimeout, RefreshDeadline, VerifyCanceled, LookupCanceled }
@@ -241,11 +244,12 @@ impl Config {
 /// The live-path bounds (RFD 013) the binary's service and shutdown read: `get_deadline`
 /// (default 5 s) and `multi_get_deadline` (15 s, flat), a client's own deadline being the
 /// gRPC layer's, `max_in_flight` (1024) requests at once with no queue, `max_multi_get_keys`
-/// (1000), `drain_deadline` (20 s); and the background path's `refresh_deadline` (5 min) on a
-/// first load or refresh. `open_with` hands `Table::new` both `refresh_deadline` and
+/// (1000), `drain_deadline` (20 s); and the background path's `load_deadline` (30 min) on a
+/// build with no generation serving and `refresh_deadline` (5 min) on a refresh over one.
+/// `open_with` hands `Table::new` `load_deadline`, `refresh_deadline`, and
 /// `get_deadline`, the bound on every lookup's page fetch. Every duration is a friendly duration; each is above zero, as are
 /// the two limits (`ConfigViolation::*Zero`).
-pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file; from 1 s to 24 h */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub refresh_deadline: Duration, pub drain_deadline: Duration }
+pub struct ServerConfig { pub listen: SocketAddr, pub metrics_listen: SocketAddr, pub poll_interval: Duration /* "10s" in the file; from 1 s to 24 h */, pub page_cache_bytes: usize, pub log: LogConfig, pub get_deadline: Duration, pub multi_get_deadline: Duration, pub max_in_flight: usize, pub max_multi_get_keys: usize, pub load_deadline: Duration, pub refresh_deadline: Duration, pub drain_deadline: Duration }
 /// Logs are JSON only (RFD 012 rejected a text format); `fields` renames the
 /// standard fields and `static_fields` are added to every event. A `fields` key naming no
 /// standard field fails the parse (serde's own error, `ConfigError::Toml` or `Json`);
@@ -859,13 +863,14 @@ impl CallsInFlight { pub fn new() -> Self; }
 pub struct Table;
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Sets `table_state` for the state.
-    /// Every `load` and `refresh` runs under `refresh_deadline` once it holds the load lock;
-    /// past it the work is dropped, which releases the lock, and the call is
+    /// Every `load` and `refresh` runs, once it holds the load lock, under `load_deadline`
+    /// when no generation serves and `refresh_deadline` when one does; past it the work is
+    /// dropped, which releases the lock, and the call is `Error::LoadDeadline` or
     /// `Error::RefreshDeadline`, degrading the table as any failure does. The table holds
     /// `cache` bounded by `get_deadline`: every page fetch a lookup runs ends at it from the
     /// fetch's start (RFD 013), in a `multi_get` too; load reads bypass the cache. Every `get`
     /// and `multi_get` counts among `handles.calls` while it runs.
-    pub fn new(config: TableConfig, source: TableSource, handles: TableHandles, refresh_deadline: Duration, get_deadline: Duration) -> Self;
+    pub fn new(config: TableConfig, source: TableSource, handles: TableHandles, load_deadline: Duration, refresh_deadline: Duration, get_deadline: Duration) -> Self;
     /// First load. `Err` leaves the table `Degraded` with no generation and is not counted
     /// under `refresh_errors_total`: a first-load failure is the caller's to report (RFD 005).
     /// On a serving table, a full re-resolve and reload reusing every unchanged file.
@@ -1025,7 +1030,8 @@ impl Opened {
     /// union of every table's `Generation::identities`) is computed and applied. The one
     /// place chunk files are deleted: the serve loop calls it after every table's first
     /// `load` and after any `refresh` that returned `Ok(true)`; a one-shot subcommand may
-    /// call it before exit. Each lock is waited for at most one refresh deadline, since a
+    /// call it before exit. Each lock is waited for at most one deadline (the load deadline
+    /// while no generation serves, the refresh deadline otherwise), since a
     /// load or refresh gives its lock up by then and the lock is fair, so one slow table
     /// holds the others' next refresh up at most that long; with several slow tables, an
     /// early table can wait one deadline per slow table after it (RFD 017, Consequences).

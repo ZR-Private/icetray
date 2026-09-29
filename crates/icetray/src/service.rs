@@ -203,6 +203,7 @@ pub fn status_from(error: &Error) -> Status {
         | Error::Cache(CacheError::Fetch(_) | CacheError::Backend(_))
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
+        | Error::LoadDeadline { .. }
         | Error::RefreshDeadline { .. }
         | Error::VerifyCanceled { .. }
         | Error::LookupCanceled { .. } => Status::unavailable(message),
@@ -592,6 +593,13 @@ mod tests {
             ),
             (
                 Error::CatalogTimeout {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                Code::Unavailable,
+            ),
+            (
+                Error::LoadDeadline {
                     table: TABLE.to_string(),
                     after: Duration::ZERO,
                 },

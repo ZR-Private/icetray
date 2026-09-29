@@ -191,9 +191,10 @@ every page GET a lookup makes, in a `MultiGet` too, so a GET to a store
 that has stopped answering is canceled rather than left running; `max_in_flight = 1024` requests
 may run at once, and one more is refused at once with `RESOURCE_EXHAUSTED`;
 `max_multi_get_keys = 1000` keys may be in one `MultiGet`, and more is
-`INVALID_ARGUMENT`; `refresh_deadline = "5m"` caps a table's first load or
-one refresh, after which the table is degraded and the next poll tries
-again; `drain_deadline = "20s"` is how long a shutdown waits for open
+`INVALID_ARGUMENT`; `load_deadline = "30m"` caps a table's first load, or
+any build while no generation serves, and `refresh_deadline = "5m"` one
+refresh over a serving generation, after which the table is degraded and
+the next poll tries again; `drain_deadline = "20s"` is how long a shutdown waits for open
 requests. Under `storage`: `max_retries = 2` retries of a failed S3 request
 (zero tries once), `connect_timeout = "1s"` for an S3 connection, and
 `catalog_timeout = "30s"` for one catalog call. Each value above is the

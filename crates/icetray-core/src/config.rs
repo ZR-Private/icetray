@@ -120,10 +120,20 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// revisit with measurement (RFD 013).
 const DEFAULT_MAX_MULTI_GET_KEYS: usize = 1000;
 
-/// How long a first load or a refresh may run when the file says nothing:
-/// five minutes. A load reads every footer and key chunk of a snapshot, so
-/// it is patient, but bounded: it holds the table's load lock, which
-/// `Opened::retain` waits on for every table in turn.
+/// How long a build from no serving generation may run when the file says
+/// nothing: thirty minutes. Such a build, a first load or a retry after
+/// one failed, reads every file's footer and key chunks; a table of
+/// 1.2 billion rows in 32,768 files loaded in 221 s against real S3, so
+/// this admits tables several times that. It is bounded all the same: the
+/// build holds the table's load lock, which `Opened::retain` waits on for
+/// every table in turn.
+const DEFAULT_LOAD_DEADLINE: Duration = Duration::from_mins(30);
+
+/// How long a refresh over a serving generation may run when the file says
+/// nothing: five minutes. A refresh reuses every file the new snapshot
+/// still names and reads only the rest, so it is short, and it is bounded
+/// tighter than a first load for the same reason: it holds the table's
+/// load lock.
 const DEFAULT_REFRESH_DEADLINE: Duration = Duration::from_mins(5);
 
 /// How long a shutdown waits for open connections when the file says
@@ -269,7 +279,12 @@ pub enum ConfigViolation {
     /// No key may be in a `MultiGet`, so every batch would be refused.
     #[error("max_multi_get_keys must be above zero")]
     MaxMultiGetKeysZero,
-    /// A refresh deadline of zero, which would fail every load unstarted.
+    /// A load deadline of zero, which would fail every first load
+    /// unstarted.
+    #[error("load_deadline must be above zero")]
+    LoadDeadlineZero,
+    /// A refresh deadline of zero, which would fail every refresh
+    /// unstarted.
     #[error("refresh_deadline must be above zero")]
     RefreshDeadlineZero,
     /// A drain deadline of zero, which would cut every open request off at
@@ -470,6 +485,7 @@ fn validate_bounds(
             server.multi_get_deadline,
             ConfigViolation::MultiGetDeadlineZero,
         ),
+        (server.load_deadline, ConfigViolation::LoadDeadlineZero),
         (
             server.refresh_deadline,
             ConfigViolation::RefreshDeadlineZero,
@@ -580,8 +596,14 @@ pub struct ServerConfig {
     /// Keys one `MultiGet` may carry; more is `INVALID_ARGUMENT` before any
     /// lookup.
     pub max_multi_get_keys: usize,
-    /// How long a table's first load or one refresh may run before it fails
-    /// and the table is `Degraded`; the next poll tries again.
+    /// How long a build from no serving generation, a table's first load
+    /// or a retry after one failed, may run before it fails and the table
+    /// is `Degraded`; the next poll tries again.
+    #[serde(with = "time::friendly_duration")]
+    pub load_deadline: Duration,
+    /// How long one refresh over a serving generation may run before it
+    /// fails and the table is `Degraded`, the generation still serving; the
+    /// next poll tries again.
     #[serde(with = "time::friendly_duration")]
     pub refresh_deadline: Duration,
     /// How long a shutdown waits for open requests before it stops waiting,
@@ -602,6 +624,7 @@ impl Default for ServerConfig {
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             max_multi_get_keys: DEFAULT_MAX_MULTI_GET_KEYS,
+            load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
         }
@@ -972,6 +995,8 @@ mod tests {
     const FIXTURE_MAX_IN_FLIGHT: usize = 512;
     /// The `MultiGet` key limit the full fixture names.
     const FIXTURE_MAX_MULTI_GET_KEYS: usize = 500;
+    /// The load deadline the full fixture names, `"45m"`.
+    const FIXTURE_LOAD_DEADLINE: Duration = Duration::from_mins(45);
     /// The refresh deadline the full fixture names, `"10m"`.
     const FIXTURE_REFRESH_DEADLINE: Duration = Duration::from_mins(10);
     /// The drain deadline the full fixture names, `"25s"`.
@@ -1002,6 +1027,7 @@ get_deadline = "2s"
 multi_get_deadline = "8s"
 max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
 max_multi_get_keys = {FIXTURE_MAX_MULTI_GET_KEYS}
+load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
 
@@ -1082,6 +1108,7 @@ table = "profiles"
                 "multi_get_deadline": "8s",
                 "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
                 "max_multi_get_keys": FIXTURE_MAX_MULTI_GET_KEYS,
+                "load_deadline": "45m",
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
                 "log": {
@@ -1178,6 +1205,7 @@ value_column = "value"
                 multi_get_deadline: FIXTURE_MULTI_GET_DEADLINE,
                 max_in_flight: FIXTURE_MAX_IN_FLIGHT,
                 max_multi_get_keys: FIXTURE_MAX_MULTI_GET_KEYS,
+                load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
                 drain_deadline: FIXTURE_DRAIN_DEADLINE,
             },
@@ -1273,6 +1301,7 @@ value_column = "value"
         assert_eq!(config.server.multi_get_deadline, DEFAULT_MULTI_GET_DEADLINE);
         assert_eq!(config.server.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
         assert_eq!(config.server.max_multi_get_keys, DEFAULT_MAX_MULTI_GET_KEYS);
+        assert_eq!(config.server.load_deadline, DEFAULT_LOAD_DEADLINE);
         assert_eq!(config.server.refresh_deadline, DEFAULT_REFRESH_DEADLINE);
         assert_eq!(config.server.drain_deadline, DEFAULT_DRAIN_DEADLINE);
         assert_eq!(config.storage, StorageConfig::default());
@@ -1580,6 +1609,7 @@ locaton = "typo"
                 "multi_get_deadline",
                 ConfigViolation::MultiGetDeadlineZero,
             ),
+            ("server", "load_deadline", ConfigViolation::LoadDeadlineZero),
             (
                 "server",
                 "refresh_deadline",

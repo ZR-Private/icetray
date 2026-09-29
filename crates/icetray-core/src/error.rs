@@ -107,9 +107,19 @@ pub enum Error {
         /// The timeout that passed.
         after: Duration,
     },
-    /// A first load or a refresh did not finish within
+    /// A build from no serving generation, a first load or a retry after
+    /// one failed, did not finish within `server.load_deadline`, so it was
+    /// dropped and failed (RFD 013).
+    #[error("table {table} first load did not finish within {after:?} (load_deadline)")]
+    LoadDeadline {
+        /// The table's configured name.
+        table: String,
+        /// The deadline that passed.
+        after: Duration,
+    },
+    /// A refresh over a serving generation did not finish within
     /// `server.refresh_deadline`, so it was dropped and failed (RFD 013).
-    #[error("table {table} load did not finish within {after:?}")]
+    #[error("table {table} refresh did not finish within {after:?} (refresh_deadline)")]
     RefreshDeadline {
         /// The table's configured name.
         table: String,
@@ -185,6 +195,7 @@ impl Error {
             Self::NotReady { .. } => ErrorKind::NotReady,
             Self::Local { .. } => ErrorKind::Local,
             Self::CatalogTimeout { .. } => ErrorKind::CatalogTimeout,
+            Self::LoadDeadline { .. } => ErrorKind::LoadDeadline,
             Self::RefreshDeadline { .. } => ErrorKind::RefreshDeadline,
             Self::VerifyCanceled { .. } => ErrorKind::VerifyCanceled,
             Self::LookupCanceled { .. } => ErrorKind::LookupCanceled,
@@ -229,6 +240,8 @@ pub enum ErrorKind {
     Local,
     /// `Error::CatalogTimeout`.
     CatalogTimeout,
+    /// `Error::LoadDeadline`.
+    LoadDeadline,
     /// `Error::RefreshDeadline`.
     RefreshDeadline,
     /// `Error::VerifyCanceled`.
@@ -255,6 +268,7 @@ impl fmt::Display for ErrorKind {
             Self::NotReady => "not_ready",
             Self::Local => "local",
             Self::CatalogTimeout => "catalog_timeout",
+            Self::LoadDeadline => "load_deadline",
             Self::RefreshDeadline => "refresh_deadline",
             Self::VerifyCanceled => "verify_canceled",
             Self::LookupCanceled => "lookup_canceled",
@@ -620,6 +634,13 @@ mod tests {
                     after: Duration::ZERO,
                 },
                 "catalog_timeout",
+            ),
+            (
+                Error::LoadDeadline {
+                    table: TABLE.to_string(),
+                    after: Duration::ZERO,
+                },
+                "load_deadline",
             ),
             (
                 Error::RefreshDeadline {
