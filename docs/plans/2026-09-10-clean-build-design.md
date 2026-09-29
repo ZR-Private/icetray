@@ -612,7 +612,11 @@ impl FileIndex {
     /// header against what its page can hold before parquet reads it, and
     /// every key page against its offset index; a row group's keys are checked a
     /// decode batch (`DECODE_BATCH_RECORDS`) at a time into one reused buffer, so at
-    /// most one batch is held however long the row group, with a string key checked as ASCII before the full UTF-8 validator; the
+    /// most one batch is held however long the row group, with a string key checked as ASCII before the full UTF-8 validator;
+    /// a string or binary key chunk of `PLAIN` pages with no dictionary page, whose definition levels (if any) are one
+    /// run of present values, is read in place, each key a slice of its decompressed page (`index/plain.rs`), and any
+    /// other chunk, or one holding a page that reader does not read exactly, by parquet's column reader, which then
+    /// meets and reports every fault, so both reach the same keys, refusals, and faults; the
     /// verification runs on the blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
     /// them through `LocalDir`, also on the blocking pool (or reuses a chunk file with matching identity
     /// and skips the chunk fetch), Bloom keeps filters. The column index of

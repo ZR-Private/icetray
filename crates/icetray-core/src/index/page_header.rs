@@ -97,7 +97,7 @@ pub const MOST_VALUE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// The bytes a `BYTE_ARRAY` value's `PLAIN` length prefix takes, the
 /// fewest a dictionary entry of a byte array takes: an empty value is its
 /// prefix alone.
-const BYTE_ARRAY_LENGTH_PREFIX_BYTES: u64 = approx::count(size_of::<u32>());
+pub(super) const BYTE_ARRAY_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
 /// How one dictionary entry of a key or value column is encoded and held,
 /// by the column's physical type.
@@ -137,7 +137,7 @@ impl Entry {
     pub(super) fn fewest_bytes(self) -> u64 {
         match self {
             Self::Int64 => approx::count(size_of::<i64>()),
-            Self::ByteArray => BYTE_ARRAY_LENGTH_PREFIX_BYTES,
+            Self::ByteArray => approx::count(BYTE_ARRAY_LENGTH_PREFIX_BYTES),
             Self::FixedLen(width) => u64::try_from(width).unwrap_or(0),
         }
     }
@@ -694,6 +694,19 @@ fn non_negative(
 ) -> std::result::Result<u32, PageHeaderFault> {
     let value = value.ok_or(PageHeaderFault::Missing(field))?;
     u32::try_from(value).map_err(|_| PageHeaderFault::Negative(field))
+}
+
+/// The unsigned varint that is the whole of `bytes`, read as the compact
+/// protocol reads one (`Compact::varint`); the RLE/bit-packed hybrid
+/// encoding writes its run headers in the same form. `None` when the
+/// varint ends before `bytes` do, runs past them, or carries more than 64
+/// bits.
+pub(super) fn whole_varint(bytes: &[u8]) -> Option<u64> {
+    let mut input = Compact { bytes, at: 0 };
+    // intentional: the caller asks only whether the bytes are one varint,
+    // and a fault of any kind says they are not.
+    let value = input.varint().ok()?;
+    (input.at == bytes.len()).then_some(value)
 }
 
 /// Compact-protocol input over the bytes of one page.

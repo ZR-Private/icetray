@@ -20,6 +20,7 @@ use parquet::file::page_index::offset_index::PageLocation;
 use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
 use super::pages::{ChunkPages, PageTally};
+use super::plain::{self, ByteKeys};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
     KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
@@ -275,6 +276,7 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 }
 
 /// What verifying the key column establishes.
+#[derive(Debug, PartialEq)]
 struct Verified {
     fences: Vec<Vec<Key>>,
     groups: Vec<GroupRange>,
@@ -293,12 +295,29 @@ struct Verified {
 /// the exact first and last key of the file and of every row group, the
 /// longest key, and the fences. Nothing here consults column statistics.
 /// A row group's keys are checked a decode batch at a time (`RunCheck`),
-/// so at most one batch of them is held however long the row group is.
+/// so at most one batch of them is held however long the row group is. A
+/// string or binary key chunk of `PLAIN` pages without a dictionary is
+/// read in place (`plain::checked_run`), and any other chunk, or one of
+/// those holding a page it does not read exactly, by parquet's column
+/// reader (`check_run`); either way the keys and every refusal and fault
+/// are the column reader's.
 fn verify(
     table: &str,
     column: &Column<'_>,
     shape: KeyShape,
     chunks: &Arc<Segments>,
+) -> Result<Verified> {
+    verify_with(table, column, shape, chunks, KeyDecoder::Plain)
+}
+
+/// `verify`, each row group decoded by `decoder` where it can be
+/// (`check_run`).
+fn verify_with(
+    table: &str,
+    column: &Column<'_>,
+    shape: KeyShape,
+    chunks: &Arc<Segments>,
+    decoder: KeyDecoder,
 ) -> Result<Verified> {
     let path = column.path;
     let total = column.metadata.num_row_groups();
@@ -309,8 +328,7 @@ fn verify(
         let chunk = column.group(row_group);
         let rows = chunk.rows();
         check_page_headers(chunk, shape, chunks)?;
-        let mut run = RunCheck::new(chunk);
-        check_run(chunk, shape, rows, Arc::clone(chunks), &mut run)?;
+        let (run, _) = check_run(chunk, shape, Arc::clone(chunks), decoder)?;
         if run.values < row_index(rows) {
             let reason = RefusalReason::NullKeys {
                 path: path.to_string(),
@@ -363,6 +381,58 @@ fn verify(
     })
 }
 
+/// One decode batch of a row group's keys, in file order, as `RunCheck`
+/// reads it: values parquet's column reader decoded (`Keys`), or values
+/// sliced from a plain page in place (`plain::checked_run`).
+pub(super) trait KeyBatch {
+    /// The number of keys.
+    fn len(&self) -> usize;
+
+    /// Whether the batch holds no key.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether every key is UTF-8, in a column of strings; true in any
+    /// other.
+    fn is_utf8(&self) -> bool;
+
+    /// The length in bytes of the longest key; zero for an empty batch.
+    fn max_len(&self) -> usize;
+
+    /// The key at `at`, which is below `len`. A string key is built from
+    /// its bytes as UTF-8, so a batch of strings is read back only once
+    /// `is_utf8` holds for it.
+    fn key(&self, at: usize) -> Key;
+
+    /// The position of the first key not above the one before it, with how
+    /// it compares to that key: `Equal` for a duplicate, `Less` for a key
+    /// out of order. `None` for a strictly increasing batch.
+    fn first_not_increasing(&self) -> Option<(usize, Ordering)>;
+}
+
+impl KeyBatch for Keys {
+    fn len(&self) -> usize {
+        Keys::len(self)
+    }
+
+    fn is_utf8(&self) -> bool {
+        keys_are_utf8(self)
+    }
+
+    fn max_len(&self) -> usize {
+        Keys::max_len(self)
+    }
+
+    fn key(&self, at: usize) -> Key {
+        self.get(at)
+    }
+
+    fn first_not_increasing(&self) -> Option<(usize, Ordering)> {
+        Keys::first_not_increasing(self)
+    }
+}
+
 /// What `verify` learns of one row group's keys, batch by batch as they are
 /// decoded, so that no row group's keys are held at once: the keys
 /// decoded, the longest, the first and last, the key at each page's first
@@ -372,9 +442,10 @@ fn verify(
 /// checks a row group in, so a decode failure anywhere in it stands before
 /// a null, a null before a key that is not UTF-8, and that before a key
 /// out of order. Once a batch holds a string that is not UTF-8, later
-/// batches are only counted, since `Keys::get` builds a string key from
-/// UTF-8 alone.
-struct RunCheck<'a> {
+/// batches are only counted, since `KeyBatch::key` builds a string key
+/// from UTF-8 alone. What is found does not depend on where the batches
+/// begin and end, so the two decoders, whose batches differ, find the same.
+pub(super) struct RunCheck<'a> {
     values: usize,
     longest: usize,
     first: Option<Key>,
@@ -390,7 +461,7 @@ struct RunCheck<'a> {
 }
 
 impl<'a> RunCheck<'a> {
-    fn new(chunk: ColumnChunk<'a>) -> Self {
+    pub(super) fn new(chunk: ColumnChunk<'a>) -> Self {
         let fence_rows = chunk.page_locations();
         Self {
             values: 0,
@@ -406,13 +477,13 @@ impl<'a> RunCheck<'a> {
     }
 
     /// The next batch of the row group's keys, in file order.
-    fn visit(&mut self, keys: &Keys) {
+    pub(super) fn visit(&mut self, keys: &impl KeyBatch) {
         let base = self.values;
         self.values += keys.len();
         if self.not_utf8 || keys.is_empty() {
             return;
         }
-        if !keys_are_utf8(keys) {
+        if !keys.is_utf8() {
             self.not_utf8 = true;
             return;
         }
@@ -420,7 +491,7 @@ impl<'a> RunCheck<'a> {
             return;
         }
         self.longest = self.longest.max(keys.max_len());
-        let head = keys.get(0);
+        let head = keys.key(0);
         if let Some(previous) = &self.last {
             let order = head.cmp(previous);
             if order != Ordering::Greater {
@@ -429,7 +500,7 @@ impl<'a> RunCheck<'a> {
             }
         }
         if let Some((at, order)) = keys.first_not_increasing() {
-            self.disorder = Some((order, keys.get(at)));
+            self.disorder = Some((order, keys.key(at)));
             return;
         }
         while let Some(location) = self.fence_rows.get(self.fences_taken) {
@@ -437,27 +508,65 @@ impl<'a> RunCheck<'a> {
             if row >= self.values {
                 break;
             }
-            self.fences.push(keys.get(row - base));
+            self.fences.push(keys.key(row - base));
             self.fences_taken += 1;
         }
-        self.last = Some(keys.get(keys.len() - 1));
+        self.last = Some(keys.key(keys.len() - 1));
         self.first.get_or_insert(head);
     }
 }
 
-/// Every key of row group `chunk`, `rows` of them, decoded from `chunks`
-/// a batch at a time (`read_column_batches`) and handed to `run`. Each
-/// batch's buffer is handed back to the decoder for the next, so a row
-/// group's keys cost one batch's buffer rather than one buffer for all of
-/// them.
+/// Which decoder reads a row group's keys for `verify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyDecoder {
+    /// A string or binary key chunk of plain pages sliced in place
+    /// (`plain::checked_run`), where the chunk is one it reads; the column
+    /// reader otherwise.
+    Plain,
+    /// Parquet's column reader (`read_column_batches`).
+    ColumnReader,
+}
+
+/// Every key of row group `chunk` decoded from `chunks` and checked
+/// (`RunCheck`), with the decoder that read them: the plain reader when
+/// `decoder` asks for it and it reads the chunk, which it does exactly as
+/// the column reader would or not at all, and the column reader otherwise.
+/// A row group of plain pages that ends in any fault is read twice, the
+/// second time by the column reader, which reports the fault.
 fn check_run(
     chunk: ColumnChunk<'_>,
     shape: KeyShape,
-    rows: i64,
+    chunks: Arc<Segments>,
+    decoder: KeyDecoder,
+) -> Result<(RunCheck<'_>, KeyDecoder)> {
+    let byte_keys = match shape {
+        KeyShape::Str => Some(ByteKeys::Text),
+        KeyShape::Bin => Some(ByteKeys::Bytes),
+        KeyShape::Long | KeyShape::FixedBin | KeyShape::Uuid => None,
+    };
+    if decoder == KeyDecoder::Plain
+        && let Some(keys) = byte_keys
+        && let Some(run) = plain::checked_run(chunk, keys, Arc::clone(&chunks))
+    {
+        return Ok((run, KeyDecoder::Plain));
+    }
+    let mut run = RunCheck::new(chunk);
+    read_run(chunk, shape, chunks, &mut run)?;
+    Ok((run, KeyDecoder::ColumnReader))
+}
+
+/// Every key of row group `chunk` decoded from `chunks` by the column
+/// reader a batch at a time (`read_column_batches`) and handed to `run`.
+/// Each batch's buffer is handed back to the decoder for the next, so a
+/// row group's keys cost one batch's buffer rather than one buffer for all
+/// of them.
+fn read_run(
+    chunk: ColumnChunk<'_>,
+    shape: KeyShape,
     chunks: Arc<Segments>,
     run: &mut RunCheck<'_>,
 ) -> Result<()> {
-    let take = row_index(rows);
+    let take = row_index(chunk.rows());
     match shape {
         KeyShape::Long => read_column_batches::<Int64Type>(chunk, chunks, 0, take, &mut |batch| {
             let keys = Keys::Long(std::mem::take(batch));
@@ -578,8 +687,12 @@ fn keys_are_utf8(keys: &Keys) -> bool {
     let Keys::Str(run) = keys else {
         return true;
     };
-    run.iter()
-        .all(|value| value.data().is_ascii() || std::str::from_utf8(value.data()).is_ok())
+    run.iter().all(|value| is_utf8(value.data()))
+}
+
+/// Whether `value` is UTF-8, checked as ASCII first (`keys_are_utf8`).
+pub(super) fn is_utf8(value: &[u8]) -> bool {
+    value.is_ascii() || std::str::from_utf8(value).is_ok()
 }
 
 /// The most records one `read_records` call asks the column reader for:
@@ -589,7 +702,7 @@ fn keys_are_utf8(keys: &Keys) -> bool {
 /// buffers a call grows hold at most this many entries, under a mebibyte
 /// for any Parquet type, whatever a footer claims for a row group or a
 /// header for a page.
-const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
+pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 
 /// `take` records of `chunk` after skipping `skip`, decoded from
 /// `segments`, which hold at least the pages those rows are in and the
@@ -752,24 +865,28 @@ pub(super) fn read_one<T: ParquetDataType>(
 
 #[cfg(test)]
 mod tests {
-    use parquet::file::metadata::ParquetMetaDataReader;
+    use parquet::basic::{Compression, Encoding};
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+    use parquet::file::properties::EnabledStatistics;
 
     use super::*;
     use crate::approx::count;
     use crate::config::{ConfigError, ConfigViolation};
+    use crate::error::ErrorKind;
     use crate::generation::testing::Dictionary;
     use crate::generation::testing::{
         self, KeyColumn, TABLE, cache, column_of, page_rows, refusal_of,
     };
     use crate::index::page_header::{
-        MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK, PAGE_ENCODING_ALLOWANCE_BYTES,
-        PageBody, PageHeader,
+        BYTE_ARRAY_LENGTH_PREFIX_BYTES, MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK,
+        PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader,
     };
     use crate::index::testing::{
-        FEW_ROWS, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP, ROW_GROUPS, contract_rows,
-        fault_of, group_rows, header_at, key_for, location, longs, moved_by_header, pages_of,
-        predicted_of, row_of, stepped, store, store_file, with_column_chunk,
-        with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
+        FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP,
+        ROW_GROUPS, SMALL_BATCH, contract_rows, fault_of, group_rows, header_at, key_for, location,
+        longs, moved_by_header, pages_of, predicted_of, row_of, stepped, store, store_file,
+        with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
+        with_pages,
     };
     use crate::index::{
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
@@ -1937,5 +2054,569 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(opened.stats().gets(), 1, "no chunk fetched");
+    }
+
+    /// The fixture's key column.
+    const KEY_LEAF: usize = 0;
+
+    /// How a `verify` ended, as two decoders' ends are compared: what it
+    /// established, a refusal, a file fault, or the kind of any other error.
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Verified(Verified),
+        Refused(RefusalReason),
+        Fault(FileFault),
+        Other(ErrorKind),
+    }
+
+    fn outcome(result: Result<Verified>) -> Outcome {
+        match result {
+            Ok(verified) => Outcome::Verified(verified),
+            Err(Error::Refused { reason, .. }) => Outcome::Refused(reason),
+            Err(Error::File { fault, .. }) => Outcome::Fault(fault),
+            Err(error) => Outcome::Other(error.kind()),
+        }
+    }
+
+    /// The key column of `metadata` over `chunks` verified by each decoder:
+    /// the outcome, which the plain decoder reaches exactly as the column
+    /// reader does, and the decoder that read each row group when the
+    /// plain one is asked for. A row group whose decode fails was read by
+    /// the column reader, since the plain decoder hands every page it
+    /// cannot read exactly to it.
+    fn verify_by_both(
+        metadata: &ParquetMetaData,
+        shape: KeyShape,
+        chunks: &Arc<Segments>,
+    ) -> (Outcome, Vec<KeyDecoder>) {
+        let path = location();
+        let column = Column {
+            metadata,
+            leaf: KEY_LEAF,
+            path: &path,
+        };
+        let plain = outcome(verify_with(
+            TABLE,
+            &column,
+            shape,
+            chunks,
+            KeyDecoder::Plain,
+        ));
+        let reader = outcome(verify_with(
+            TABLE,
+            &column,
+            shape,
+            chunks,
+            KeyDecoder::ColumnReader,
+        ));
+        assert_eq!(plain, reader, "the plain decoder against the column reader");
+        let taken = (0..metadata.num_row_groups())
+            .map(|row_group| {
+                check_run(
+                    column.group(row_group),
+                    shape,
+                    Arc::clone(chunks),
+                    KeyDecoder::Plain,
+                )
+                .map_or(KeyDecoder::ColumnReader, |(_, decoder)| decoder)
+            })
+            .collect();
+        (plain, taken)
+    }
+
+    /// `verify_by_both` over the fixture file behind `opened`.
+    async fn verified_by_both(opened: &Opened, shape: KeyShape) -> (Outcome, Vec<KeyDecoder>) {
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let chunks = key_chunks(opened, &loaded, KEY_LEAF).await;
+        verify_by_both(&loaded, shape, &chunks)
+    }
+
+    /// `verified_by_both` of the string keys of `file`.
+    async fn file_by_both(file: Bytes) -> (Outcome, Vec<KeyDecoder>) {
+        verified_by_both(&store_file(file).await, KeyShape::Str).await
+    }
+
+    /// `verified_by_both` of `fixture` read as `shape`.
+    async fn fixture_by_both(fixture: &Fixture, shape: KeyShape) -> (Outcome, Vec<KeyDecoder>) {
+        verified_by_both(&store(fixture).await, shape).await
+    }
+
+    /// The plain decoder for every row group of the contract layout's
+    /// string and binary tables: a regression to the column reader is
+    /// caught here rather than in a profile.
+    #[tokio::test]
+    async fn test_check_run_reads_the_contract_string_and_binary_tables_plain() {
+        for (key_type, shape) in [
+            (KeyType::String, KeyShape::Str),
+            (KeyType::Binary, KeyShape::Bin),
+        ] {
+            let fixture = Fixture::contract(key_type, contract_rows());
+            let (outcome, taken) = fixture_by_both(&fixture, shape).await;
+            assert!(matches!(outcome, Outcome::Verified(_)), "{outcome:?}");
+            assert_eq!(taken, [KeyDecoder::Plain; ROW_GROUPS], "{key_type}");
+        }
+    }
+
+    /// A layout edit a fixture is written under, named for the messages,
+    /// and whether it leaves a string or binary key column one the plain
+    /// decoder reads: `PLAIN` pages and no dictionary.
+    type Edit = (&'static str, fn(&mut Fixture), bool);
+
+    /// The layouts the plain decoder is held to the column reader on: the
+    /// contract's, and every writer knob the index tests turn, alone and in
+    /// the combinations that change where the values start in a page. A v2
+    /// writer encodes byte arrays by deltas unless told `PLAIN`.
+    const EDITS: &[Edit] = &[
+        ("contract", |_| {}, true),
+        (
+            "one row group",
+            |fixture| fixture.layout.row_group_rows = contract_rows(),
+            true,
+        ),
+        (
+            "pages cut by bytes",
+            |fixture| {
+                fixture.layout.page_bytes = SMALL_PAGE_BYTES;
+                fixture.layout.write_batch = SMALL_BATCH;
+            },
+            true,
+        ),
+        (
+            "no statistics",
+            |fixture| fixture.layout.statistics = EnabledStatistics::None,
+            true,
+        ),
+        (
+            "dictionary",
+            |fixture| fixture.layout.dictionary = Dictionary::Key,
+            false,
+        ),
+        (
+            "dictionary, nullable, v2",
+            |fixture| {
+                fixture.layout.dictionary = Dictionary::Key;
+                fixture.nullable_key = true;
+                fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+            },
+            false,
+        ),
+        ("nullable", |fixture| fixture.nullable_key = true, true),
+        (
+            "v2",
+            |fixture| fixture.layout.writer_version = WriterVersion::PARQUET_2_0,
+            false,
+        ),
+        (
+            "v2 plain",
+            |fixture| {
+                fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+                fixture.layout.key_encoding = Some(Encoding::PLAIN);
+            },
+            true,
+        ),
+        (
+            "nullable, v2 plain",
+            |fixture| {
+                fixture.nullable_key = true;
+                fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+                fixture.layout.key_encoding = Some(Encoding::PLAIN);
+            },
+            true,
+        ),
+        (
+            "uncompressed",
+            |fixture| fixture.layout.compression = Compression::UNCOMPRESSED,
+            true,
+        ),
+        (
+            "uncompressed, nullable",
+            |fixture| {
+                fixture.layout.compression = Compression::UNCOMPRESSED;
+                fixture.nullable_key = true;
+            },
+            true,
+        ),
+        (
+            "uncompressed, nullable, v2 plain",
+            |fixture| {
+                fixture.layout.compression = Compression::UNCOMPRESSED;
+                fixture.nullable_key = true;
+                fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+                fixture.layout.key_encoding = Some(Encoding::PLAIN);
+            },
+            true,
+        ),
+        (
+            "snappy",
+            |fixture| fixture.layout.compression = Compression::SNAPPY,
+            true,
+        ),
+        (
+            "snappy, nullable, v2 plain",
+            |fixture| {
+                fixture.layout.compression = Compression::SNAPPY;
+                fixture.nullable_key = true;
+                fixture.layout.writer_version = WriterVersion::PARQUET_2_0;
+                fixture.layout.key_encoding = Some(Encoding::PLAIN);
+            },
+            true,
+        ),
+    ];
+
+    /// A page byte bound under a key page of the contract's rows of any
+    /// key type, so pages end by bytes at uneven row counts.
+    const SMALL_PAGE_BYTES: usize = 1024;
+
+    /// Every key type and every layout of `EDITS`: the plain decoder
+    /// reaches what the column reader reaches, and reads every row group of
+    /// a string or binary key column written without a dictionary.
+    #[tokio::test]
+    async fn test_verify_plain_decoder_matches_the_column_reader_on_every_fixture_shape() {
+        let fixed_keys: Vec<Option<Key>> = (0..contract_rows())
+            .map(|i| Some(Key::Bytes(count(stepped(i)).to_be_bytes().to_vec())))
+            .collect();
+        let fixtures: [(Fixture, KeyShape); 5] = [
+            (
+                Fixture::contract(KeyType::String, contract_rows()),
+                KeyShape::Str,
+            ),
+            (
+                Fixture::contract(KeyType::Binary, contract_rows()),
+                KeyShape::Bin,
+            ),
+            (
+                Fixture::contract(KeyType::Long, contract_rows()),
+                KeyShape::Long,
+            ),
+            (
+                Fixture::contract(KeyType::Uuid, contract_rows()),
+                KeyShape::Uuid,
+            ),
+            (
+                Fixture::with_keys(KeyColumn::FixedBinary(FIXED_KEY_BYTES), fixed_keys),
+                KeyShape::FixedBin,
+            ),
+        ];
+        let expected_compared = fixtures.len() * EDITS.len();
+        let mut compared = 0;
+        for (mut fixture, shape) in fixtures {
+            let as_written = fixture.layout;
+            for (label, edit, plain_pages) in EDITS {
+                fixture.layout = as_written;
+                fixture.nullable_key = false;
+                edit(&mut fixture);
+                let (outcome, taken) = fixture_by_both(&fixture, shape).await;
+                assert!(
+                    matches!(outcome, Outcome::Verified(_)),
+                    "{shape:?} {label}: {outcome:?}"
+                );
+                let expected = if *plain_pages && matches!(shape, KeyShape::Str | KeyShape::Bin) {
+                    KeyDecoder::Plain
+                } else {
+                    KeyDecoder::ColumnReader
+                };
+                assert!(
+                    taken.iter().all(|decoder| *decoder == expected),
+                    "{shape:?} {label}: {taken:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, expected_compared);
+    }
+
+    /// `FEW_ROWS` string keys from `key_for`, with `edit` applied.
+    fn few_strings(edit: impl FnOnce(&mut Vec<Option<Key>>)) -> Fixture {
+        let mut keys = (0..FEW_ROWS)
+            .map(|i| Some(key_for(i, KeyType::String)))
+            .collect();
+        edit(&mut keys);
+        Fixture::with_keys(KeyColumn::Utf8, keys)
+    }
+
+    /// The refusals a row group's keys draw are drawn through the plain
+    /// decoder as through the column reader: a null, which the plain
+    /// decoder leaves to the column reader since the page's levels are not
+    /// all present, and, read plain, a key that is not UTF-8, a key out of
+    /// order, a duplicate, and a key over the cap.
+    #[tokio::test]
+    async fn test_verify_plain_decoder_refuses_what_the_column_reader_refuses() {
+        let path = location();
+        let at = FEW_ROWS / 2;
+        let null = few_strings(|keys| keys[at] = None);
+        assert_eq!(
+            fixture_by_both(&null, KeyShape::Str).await,
+            (
+                Outcome::Refused(RefusalReason::NullKeys {
+                    path: path.clone(),
+                    row_group: 0
+                }),
+                vec![KeyDecoder::ColumnReader]
+            )
+        );
+
+        let not_utf8 = Fixture::with_keys(
+            KeyColumn::Binary,
+            (0..FEW_ROWS)
+                .map(|i| Some(key_for(i, KeyType::Binary)))
+                .collect(),
+        );
+        assert_eq!(
+            fixture_by_both(&not_utf8, KeyShape::Str).await,
+            (
+                Outcome::Fault(FileFault::KeyNotUtf8 { row_group: 0 }),
+                vec![KeyDecoder::Plain]
+            )
+        );
+
+        let unsorted = few_strings(|keys| keys.swap(at, at + 1));
+        assert_eq!(
+            fixture_by_both(&unsorted, KeyShape::Str).await,
+            (
+                Outcome::Refused(RefusalReason::Unsorted {
+                    path: path.clone(),
+                    row_group: 0
+                }),
+                vec![KeyDecoder::Plain]
+            )
+        );
+
+        let duplicate = few_strings(|keys| keys[at + 1] = keys[at].clone());
+        assert_eq!(
+            fixture_by_both(&duplicate, KeyShape::Str).await,
+            (
+                Outcome::Refused(RefusalReason::DuplicateKeys {
+                    path: path.clone(),
+                    key: key_for(at, KeyType::String)
+                }),
+                vec![KeyDecoder::Plain]
+            )
+        );
+
+        let over = Fixture::with_keys(KeyColumn::Utf8, keys_of_len(MAX_KEY_BYTES + 1));
+        assert_eq!(
+            fixture_by_both(&over, KeyShape::Str).await,
+            (
+                Outcome::Refused(RefusalReason::KeyTooLong {
+                    path,
+                    bytes: MAX_KEY_BYTES + 1
+                }),
+                vec![KeyDecoder::Plain]
+            )
+        );
+    }
+
+    /// A duplicate whose copies straddle a page boundary, a decode batch
+    /// (`DECODE_BATCH_RECORDS`) inside one page, or a row group boundary is
+    /// refused through the plain decoder, and so is a key that is not UTF-8
+    /// in a page's second batch; the same row groups without the defect
+    /// verify alike through both decoders, fences and all.
+    #[tokio::test]
+    async fn test_verify_plain_decoder_checks_across_pages_batches_and_row_groups() {
+        let batch = row_index(DECODE_BATCH_RECORDS);
+        let rows = 2 * batch;
+        let written_as = |column: KeyColumn, edit: &dyn Fn(&mut Vec<Option<Key>>)| {
+            let mut keys: Vec<Option<Key>> = (0..rows)
+                .map(|i| Some(key_for(i, KeyType::String)))
+                .collect();
+            edit(&mut keys);
+            let mut fixture = Fixture::with_keys(column, keys);
+            fixture.layout.row_group_rows = rows;
+            fixture
+        };
+        let strings = |edit: &dyn Fn(&mut Vec<Option<Key>>)| written_as(KeyColumn::Utf8, edit);
+        let one_page = |mut fixture: Fixture| {
+            fixture.layout.page_rows = rows;
+            fixture
+        };
+        let duplicate_at =
+            |at: usize| move |keys: &mut Vec<Option<Key>>| keys[at] = keys[at - 1].clone();
+        let refused_at = |at: usize| {
+            Outcome::Refused(RefusalReason::DuplicateKeys {
+                path: location(),
+                key: key_for(at - 1, KeyType::String),
+            })
+        };
+
+        let (clean, taken) = fixture_by_both(&strings(&|_| {}), KeyShape::Str).await;
+        let Outcome::Verified(clean) = clean else {
+            panic!("{clean:?}");
+        };
+        let fences: Vec<Key> = (0..rows)
+            .step_by(page_rows())
+            .map(|i| key_for(i, KeyType::String))
+            .collect();
+        assert_eq!(clean.fences, [fences]);
+        assert_eq!(taken, [KeyDecoder::Plain]);
+        let (clean, taken) = fixture_by_both(&one_page(strings(&|_| {})), KeyShape::Str).await;
+        let Outcome::Verified(clean) = clean else {
+            panic!("{clean:?}");
+        };
+        assert_eq!(clean.fences, [vec![key_for(0, KeyType::String)]]);
+        assert_eq!(taken, [KeyDecoder::Plain]);
+
+        let across_pages = strings(&duplicate_at(page_rows()));
+        assert_eq!(
+            fixture_by_both(&across_pages, KeyShape::Str).await,
+            (refused_at(page_rows()), vec![KeyDecoder::Plain])
+        );
+        let across_batches = one_page(strings(&duplicate_at(batch)));
+        assert_eq!(
+            fixture_by_both(&across_batches, KeyShape::Str).await,
+            (refused_at(batch), vec![KeyDecoder::Plain])
+        );
+        let not_utf8_at = batch + 1;
+        let late = one_page(written_as(KeyColumn::Binary, &|keys| {
+            let mut bytes = key_for(not_utf8_at, KeyType::String).as_bytes().to_vec();
+            // Above the key itself and below the next: order holds.
+            bytes.push(u8::MAX);
+            keys[not_utf8_at] = Some(Key::Bytes(bytes));
+        }));
+        assert_eq!(
+            fixture_by_both(&late, KeyShape::Str).await,
+            (
+                Outcome::Fault(FileFault::KeyNotUtf8 { row_group: 0 }),
+                vec![KeyDecoder::Plain]
+            )
+        );
+
+        let mut across_groups =
+            few_strings(|keys| keys[TINY_GROUP_ROWS] = keys[TINY_GROUP_ROWS - 1].clone());
+        across_groups.layout.row_group_rows = TINY_GROUP_ROWS;
+        let (outcome, taken) = fixture_by_both(&across_groups, KeyShape::Str).await;
+        assert_eq!(outcome, refused_at(TINY_GROUP_ROWS));
+        assert!(
+            taken.iter().all(|decoder| *decoder == KeyDecoder::Plain),
+            "{taken:?}"
+        );
+    }
+
+    /// A string key page whose rows contradict its offset index, however the
+    /// footer contradicts them, is left by the plain decoder to the column
+    /// reader, and refused as it refuses it.
+    #[tokio::test]
+    async fn test_verify_plain_decoder_leaves_a_page_its_offset_index_contradicts_to_the_column_reader()
+     {
+        let opened = store(&Fixture::contract(KeyType::String, contract_rows())).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let chunks = key_chunks(&opened, &loaded, KEY_LEAF).await;
+        let mismatch = |page| Outcome::Fault(FileFault::PageRowsMismatch { row_group: 0, page });
+
+        let short_group = with_group_rows(&loaded, 0, PAGE_ROWS + PAGE_ROWS / 2);
+        let (outcome, taken) = verify_by_both(&short_group, KeyShape::Str, &chunks);
+        assert_eq!(outcome, mismatch(1));
+        assert_eq!(taken[0], KeyDecoder::ColumnReader);
+
+        let mut shifted = pages_of(&loaded, KEY_LEAF);
+        shifted[1].first_row_index -= 1;
+        let shifted = with_pages(&loaded, KEY_LEAF, shifted);
+        let (outcome, taken) = verify_by_both(&shifted, KeyShape::Str, &chunks);
+        assert_eq!(outcome, mismatch(0));
+        assert_eq!(taken[0], KeyDecoder::ColumnReader);
+
+        let inflated = with_group_rows(&loaded, 0, UNALLOCATABLE_ROWS);
+        let (outcome, taken) = verify_by_both(&inflated, KeyShape::Str, &chunks);
+        assert_eq!(outcome, mismatch(PAGES_PER_GROUP - 1));
+        assert_eq!(taken[0], KeyDecoder::ColumnReader);
+    }
+
+    /// The offset, within `file`, of the length prefix of every value of
+    /// row group 0's first key page, a page stored uncompressed whose body
+    /// is its values alone, and the lengths those prefixes hold.
+    fn value_prefixes(file: &[u8], metadata: &ParquetMetaData) -> Vec<(usize, u32)> {
+        let page = &pages_of(metadata, KEY_LEAF)[0];
+        let start = usize::try_from(page.offset).unwrap();
+        let header = PageHeader::read(&file[start..]).unwrap();
+        let PageBody::Data { num_values } = header.body else {
+            panic!("{header:?} is not a v1 data page");
+        };
+        let mut at = start + header.header_len;
+        (0..num_values)
+            .map(|_| {
+                let len = u32::from_le_bytes(
+                    file[at..at + BYTE_ARRAY_LENGTH_PREFIX_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
+                let prefix = (at, len);
+                at += BYTE_ARRAY_LENGTH_PREFIX_BYTES + usize::try_from(len).unwrap();
+                prefix
+            })
+            .collect()
+    }
+
+    /// `file` with the length prefix at `at` holding `len`.
+    fn with_prefix(file: &Bytes, at: usize, len: u32) -> Bytes {
+        let mut patched = file.to_vec();
+        patched[at..at + BYTE_ARRAY_LENGTH_PREFIX_BYTES].copy_from_slice(&len.to_le_bytes());
+        Bytes::from(patched)
+    }
+
+    /// A page whose values do not fill its bytes exactly is left by the
+    /// plain decoder to the column reader, which decides it: a length
+    /// prefix running past the page's end is a parquet error,
+    /// a length prefix the page's end cuts short a panic, and a byte left
+    /// after the last value is read past, so the page verifies with the last
+    /// value it read.
+    #[tokio::test]
+    async fn test_verify_plain_decoder_leaves_a_page_it_cannot_read_exactly_to_the_column_reader() {
+        let mut fixture = few_strings(|keys| {
+            let Some(Key::Str(last)) = keys.last_mut().unwrap() else {
+                panic!("a string fixture holds string keys");
+            };
+            // Cut off by a prefix one byte shorter, the key is the one
+            // `key_for` gives, still above the key before it.
+            last.push('z');
+        });
+        fixture.layout.compression = Compression::UNCOMPRESSED;
+        let file = fixture.write();
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&file)
+            .unwrap();
+        let prefixes = value_prefixes(&file, &metadata);
+        let (last_at, last_len) = prefixes[FEW_ROWS - 1];
+        let (before_at, before_len) = prefixes[FEW_ROWS - 2];
+        let (outcome, taken) = file_by_both(file.clone()).await;
+        assert!(matches!(outcome, Outcome::Verified(_)), "{outcome:?}");
+        assert_eq!(taken, [KeyDecoder::Plain], "the file as written");
+
+        let past_end = with_prefix(&file, last_at, last_len + 1);
+        assert_eq!(
+            file_by_both(past_end).await,
+            (
+                Outcome::Other(ErrorKind::Parquet),
+                vec![KeyDecoder::ColumnReader]
+            )
+        );
+
+        // The value before the last grown over all but two bytes of the
+        // last value's prefix, which the page's end then cuts short.
+        let prefix_bytes_left = 2;
+        let grown =
+            u32::try_from(BYTE_ARRAY_LENGTH_PREFIX_BYTES).unwrap() + last_len - prefix_bytes_left;
+        let (outcome, taken) =
+            file_by_both(with_prefix(&file, before_at, before_len + grown)).await;
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Fault(FileFault::DecoderPanicked {
+                    part: DecodedPart::Pages {
+                        row_group: 0,
+                        page: Some(ChunkPage::Data(0))
+                    },
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(taken, [KeyDecoder::ColumnReader]);
+
+        let (outcome, taken) = file_by_both(with_prefix(&file, last_at, last_len - 1)).await;
+        let Outcome::Verified(verified) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(verified.key_range.1, key_for(FEW_ROWS - 1, KeyType::String));
+        assert_eq!(taken, [KeyDecoder::ColumnReader]);
     }
 }

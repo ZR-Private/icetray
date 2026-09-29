@@ -12,6 +12,7 @@ mod build;
 mod inspect;
 mod page_header;
 mod pages;
+mod plain;
 #[cfg(test)]
 pub(crate) mod testing;
 

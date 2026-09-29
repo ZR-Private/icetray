@@ -9,7 +9,7 @@ use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, Reco
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{
     ColumnChunkMetaDataBuilder, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader,
@@ -18,6 +18,7 @@ use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation}
 use parquet::file::properties::{
     DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH, EnabledStatistics, WriterProperties, WriterVersion,
 };
+use parquet::schema::types::ColumnPath;
 
 use crate::approx::{self, count};
 use crate::config::{HedgeConfig, Residency};
@@ -127,7 +128,7 @@ pub(super) enum ValueColumn {
 /// The writer's layout knobs; `contract` is RFD 002's shape.
 #[derive(Clone, Copy)]
 pub(super) struct Layout {
-    page_rows: usize,
+    pub(super) page_rows: usize,
     pub(super) row_group_rows: usize,
     pub(super) page_bytes: usize,
     pub(super) write_batch: usize,
@@ -138,6 +139,10 @@ pub(super) struct Layout {
     pub(super) offset_index: bool,
     pub(super) writer_version: WriterVersion,
     pub(super) compression: Compression,
+    /// The key column's encoding where no dictionary is written; the
+    /// writer's own choice for the writer version when `None` (`PLAIN` for
+    /// v1, a delta encoding of byte arrays for v2).
+    pub(super) key_encoding: Option<Encoding>,
 }
 
 impl Layout {
@@ -154,6 +159,7 @@ impl Layout {
             offset_index: true,
             writer_version: WriterVersion::PARQUET_1_0,
             compression: Compression::ZSTD(ZstdLevel::default()),
+            key_encoding: None,
         }
     }
 
@@ -173,6 +179,10 @@ impl Layout {
             .set_bloom_filter_enabled(false)
             .set_offset_index_disabled(!self.offset_index)
             .set_writer_version(self.writer_version);
+        let builder = match self.key_encoding {
+            Some(encoding) => builder.set_column_encoding(ColumnPath::from(KEY_COLUMN), encoding),
+            None => builder,
+        };
         let builder = with_dictionary(builder, self.dictionary);
         with_key_bloom(builder, self.bloom, count(self.row_group_rows)).build()
     }
@@ -180,9 +190,11 @@ impl Layout {
 
 /// One synthetic data file: what its columns hold and how the writer
 /// lays it out. A `None` key or value is a null, and makes its column
-/// nullable.
+/// nullable; `nullable_key` makes the key column nullable without one, as
+/// an Iceberg column not declared `NOT NULL` is.
 pub(super) struct Fixture {
     key_column: KeyColumn,
+    pub(super) nullable_key: bool,
     pub(super) value_column: ValueColumn,
     keys: Vec<Option<Key>>,
     pub(super) values: Vec<Option<Vec<u8>>>,
@@ -203,6 +215,7 @@ impl Fixture {
         let values = (0..keys.len()).map(|i| Some(value_for(i))).collect();
         Self {
             key_column,
+            nullable_key: false,
             value_column: ValueColumn::Binary,
             keys,
             values,
@@ -211,7 +224,7 @@ impl Fixture {
     }
 
     pub(super) fn write(&self) -> Bytes {
-        let key_nullable = self.keys.iter().any(Option::is_none);
+        let key_nullable = self.nullable_key || self.keys.iter().any(Option::is_none);
         let value_nullable = self.values.iter().any(Option::is_none);
         let schema = Arc::new(Schema::new(vec![
             Field::new(KEY_COLUMN, key_data_type(self.key_column), key_nullable),
