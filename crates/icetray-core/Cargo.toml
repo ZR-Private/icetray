@@ -41,4 +41,4 @@ tempfile = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.189"
+libc = { workspace = true }

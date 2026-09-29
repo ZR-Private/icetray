@@ -69,6 +69,7 @@ iceberg-catalog-rest = "0.10.1"
 # filesystem storage, and icetray itself reads every byte through object_store.
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3"] }
 jiff = { version = "0.2.37", features = ["serde"] }
+libc = "0.2.189"
 # The binary reads the process's resident set size for its memory gauge.
 memory-stats = "1.2.0"
 metrics = "0.24.6"

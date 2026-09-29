@@ -43,7 +43,7 @@ clap.workspace = true
 iceberg-catalog-rest = { workspace = true }
 icetray = { path = "../icetray" }
 icetray-proto.workspace = true
-libc = "0.2.189"
+libc.workspace = true
 memory-stats.workspace = true
 rand.workspace = true
 tikv-jemallocator.workspace = true
