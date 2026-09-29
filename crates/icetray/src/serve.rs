@@ -154,7 +154,7 @@ impl Serving {
                 .add_service(health_service)
                 .add_service(IcetrayServer::new(service))
                 .serve_with_incoming_shutdown(
-                    TcpIncoming::from(listeners.grpc),
+                    grpc_incoming(listeners.grpc),
                     stop(shutdown.subscribe()),
                 ),
         );
@@ -247,6 +247,15 @@ async fn bind(addr: SocketAddr) -> Result<TcpListener, ServeError> {
     TcpListener::bind(addr)
         .await
         .map_err(|source| ServeError::Bind { addr, source })
+}
+
+/// The gRPC listener as tonic serves it, with Nagle off on every accepted
+/// connection. The builder's `tcp_nodelay` applies only to a listener tonic
+/// binds itself; one bound here, before any table loads, carries the
+/// setting on the incoming or goes without it, and without it an answer
+/// larger than one segment waits out the client's delayed acknowledgment.
+fn grpc_incoming(listener: TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 /// The address `listener` bound, which differs from `addr` when `addr`'s
@@ -659,6 +668,29 @@ mod tests {
 
     /// A table name for the refresh task that never ends.
     const TABLE: &str = "kv";
+
+    /// Every connection the gRPC listener accepts has Nagle off: an answer
+    /// larger than one segment otherwise waits out the client's delayed
+    /// acknowledgment, about 40 ms on Linux, on every call.
+    #[tokio::test]
+    async fn test_grpc_connections_are_accepted_with_nodelay() {
+        use futures::StreamExt as _;
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("a loopback port binds");
+        let addr = listener.local_addr().expect("the bound address");
+        let mut incoming = grpc_incoming(listener);
+        let _client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the client connects");
+        let accepted = incoming
+            .next()
+            .await
+            .expect("the listener yields the connection")
+            .expect("the connection is accepted");
+        assert!(accepted.nodelay().expect("TCP_NODELAY reads back"));
+    }
 
     /// A task that has already panicked when the shutdown aborts the set is
     /// reported by name with its panic, not discarded with the aborted ones.
