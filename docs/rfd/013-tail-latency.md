@@ -9,7 +9,11 @@ A cold hit costs one GET, and the latency of that GET belongs to the
 object store. First-byte time for a range read varies with the size of the
 data file and carries a tail even at the file sizes RFD 002 (Serving
 layout contract) targets
-([range-GET latency analysis, what the evidence implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)).
+([range-GET latency analysis, what the evidence implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)),
+and it varies more with how recently the file was read: about 26 ms at the
+median in-region for a file read moments before, about 90 ms for one read
+hours before, and up to about 175 ms for one never read
+([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
 
 The tail matters because of where icetray sits. The workload it is built
 around puts it behind a small online store, answering the fall-through

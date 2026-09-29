@@ -106,12 +106,12 @@ would save nothing on a miss or on a cold hit's GET. What it costs is the
 ratio: nothing for random values, and for the text values 4.38 times the
 memory per page (the fixture's value pages are 45.7 MiB compressed and 200
 MiB decompressed), so the same budget holds 4.4 times fewer pages. A page
-the smaller cache loses comes back as a cold hit, one S3 GET of about 25 to
-30 ms at the in-region median
-([S3 range GET latency](../analysis/2026-09-10-s3-range-get-latency.md)),
-which is what some 400 to 500 text-valued warm hits would save, so the
-level pays only while it turns fewer than about 0.2% of lookups into extra
-cold hits. A small decompressed level in front of the compressed cache, for
+the smaller cache loses comes back as a cold hit, one S3 GET of about 90
+to 175 ms at the in-region median for a file not read recently
+([cold range-GET latency](../analysis/2026-09-29-cold-range-get-latency.md)),
+which is what some 1,500 to 2,900 text-valued warm hits would save at 60 µs
+each, so the level pays only while it turns fewer than about 0.03 to 0.07%
+of lookups into extra cold hits. A small decompressed level in front of the compressed cache, for
 the hottest pages alone, is one arrangement the sweep named and did not
 build. The question stays open on the hit-rate curve: a production
 replica's `icetray_page_cache_hits_total` and

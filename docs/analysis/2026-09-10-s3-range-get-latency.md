@@ -10,6 +10,14 @@ upload method is not what separates the size classes. What file size a
 serving table should target will be decided in RFD 002 (Serving layout
 contract), which will cite this document as its evidence.
 
+> Updated 2026-09-29: these are warm reads. The run visited eleven objects
+> round-robin, so every read came about eleven requests after the last read
+> of the same object. An object not read recently answers in about 90 ms at
+> the median, and one never read in 106 to 174 ms, with 64 MiB objects
+> already in the slow class; reads of one object back to back warm even a
+> 256 MiB object to 32 ms. See
+> [range-GET latency to an object not read recently](2026-09-29-cold-range-get-latency.md).
+
 ## Why it was measured
 
 Cold hits (a lookup that finds its key and fetches one Parquet page from S3)
