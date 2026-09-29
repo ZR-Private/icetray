@@ -27,9 +27,28 @@ use crate::local::{DataFileIdentity, LocalDir, Reservation};
 use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
 use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
+use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
+
+/// Files one load keeps in flight per worker thread. A load's time is its
+/// files' round trips over its concurrency until its CPU binds: an object
+/// not read in the last moments answers a range GET in 90 ms or more, and a
+/// file's decode, verification, and chunk-file write are CPU. Measured on a
+/// first load of 1.2 billion rows in 32,768 files against real S3, which
+/// took 335 to 380 CPU seconds at every concurrency: on four cores, 283 s
+/// at 64 files in flight, 171 s at 128, 128 s at 256, 104 s at 512 (by
+/// then about three and a half cores busy), and 101 s at 1,024; on two, 245
+/// s at 128 and 201 s at 512. The knee sits near 128 files per core.
+const LOAD_FILES_PER_WORKER: usize = 128;
+
+/// The most files one load keeps in flight on any machine. Past the knee
+/// more concurrency buys no time and holds more: each file in flight at the
+/// chunk stage holds its key chunks in memory and a blocking-pool task over
+/// them, and 1,024 in flight held about half a gigabyte more than 512 for
+/// three seconds less.
+const LOAD_FILES_MAX: usize = 1024;
 
 /// Files worked on at once while a generation loads: footers loaded at the
 /// footer stage, then chunks fetched and verified at the chunk stage, then
@@ -37,15 +56,13 @@ use crate::time;
 /// checked at once by the doctor's bucket check. Each file in flight is one
 /// GET or local read waiting, and at the chunk stage one file's key chunks
 /// in memory and at most one blocking-pool task over them at a time (its
-/// verification, then in the Disk tier its chunk file's write). A load's
-/// time is its files' round trips over this bound until the bytes bind: an
-/// object not read in the last moments answers a range GET in about 90 ms,
-/// so at sixteen a first load of 32,768 files took 835 s against real S3,
-/// at 64 took 289 s, and at 128 took 221 s, by then bound by its 64 GB, with
-/// resident memory unchanged. The bound also caps the files' chunks held
-/// before they are kept or dropped and the blocking-pool tasks over them,
-/// 128 of each. It is per load: tables loading at once each run their own.
-const LOAD_CONCURRENCY: usize = 128;
+/// verification, then in the Disk tier its chunk file's write).
+/// `LOAD_FILES_PER_WORKER` for each of the runtime's worker threads
+/// (`shard::workers`), at most `LOAD_FILES_MAX`. It is per load: tables
+/// loading at once each run their own.
+fn load_concurrency() -> usize {
+    (shard::workers() * LOAD_FILES_PER_WORKER).min(LOAD_FILES_MAX)
+}
 
 /// One data file with its manifest entry and its resident index.
 #[derive(Debug)]
@@ -110,7 +127,7 @@ impl Generation {
     /// `Arc`, RFD 005; a data file is immutable, so a path whose size
     /// changed is another file and its index would be stale), opens a
     /// `FileHandle` for every other file with the manifest's size and
-    /// `hedge`, inspects their footers `LOAD_CONCURRENCY` at a time,
+    /// `hedge`, inspects their footers `load_concurrency()` at a time,
     /// checks the budget `config` and `local` set before any chunk is
     /// fetched (Full: `config.resident_budget_bytes` against the reused
     /// files' resident bytes plus every new file's predicted full bytes;
@@ -290,9 +307,9 @@ impl Generation {
     /// refuses both, at the price of decoding and hashing every key. The
     /// chunks come as `FileIndex::key_chunks_for_verification` hands them
     /// out (Full: resident, Disk: one local read per row group, Bloom: one
-    /// GET per row group), `LOAD_CONCURRENCY` files at a time, and are
+    /// GET per row group), `load_concurrency()` files at a time, and are
     /// decoded one key page at a time, each file's check on the blocking
-    /// pool (`blocking::on_blocking_pool`), so up to `LOAD_CONCURRENCY` checks
+    /// pool (`blocking::on_blocking_pool`), so up to `load_concurrency()` checks
     /// run at once on their own threads. A canceled check is
     /// `Error::VerifyCanceled` for its file. The doctor calls it after a
     /// load; no load or refresh does.
@@ -314,7 +331,7 @@ impl Generation {
             .await
             .map_err(|canceled| Error::verify_canceled(&path, canceled))?
         })
-        .buffered(LOAD_CONCURRENCY)
+        .buffered(load_concurrency())
         .try_collect::<()>()
         .await
     }
@@ -489,7 +506,7 @@ fn reuse_or_open(
     Ok((reused, pending))
 }
 
-/// Inspects every pending file's footer under `layout`, `LOAD_CONCURRENCY`
+/// Inspects every pending file's footer under `layout`, `load_concurrency()`
 /// at a time; the first refusal or fault ends the load.
 async fn inspect_all(
     table: &str,
@@ -508,12 +525,12 @@ async fn inspect_all(
             .await?;
             Ok::<_, Error>((entry, inspected))
         })
-        .buffered(LOAD_CONCURRENCY)
+        .buffered(load_concurrency())
         .try_collect()
         .await
 }
 
-/// Builds every inspected file's index in `residency`, `LOAD_CONCURRENCY`
+/// Builds every inspected file's index in `residency`, `load_concurrency()`
 /// at a time, after the budget check admitted them all, and refuses a
 /// file whose fences or first or last key fall outside its recorded bucket
 /// (`refuse_fences_outside_bucket`). Every Disk-tier chunk file write holds
@@ -532,7 +549,7 @@ async fn build_all(
             refuse_fences_outside_bucket(table, &file)?;
             Ok::<_, Error>(Arc::new(file))
         })
-        .buffered(LOAD_CONCURRENCY)
+        .buffered(load_concurrency())
         .try_collect()
         .await
 }
@@ -819,7 +836,7 @@ struct GroupMember {
 }
 
 /// Every member of one `group` with its key chunks, in the group's order:
-/// what its merge decodes from, gathered `LOAD_CONCURRENCY` members at a
+/// what its merge decodes from, gathered `load_concurrency()` members at a
 /// time. Full hands out its resident chunks; Disk reads them back as local
 /// reads; Bloom fetches them again (RFD 017). The positions are streamed by
 /// value: a closure taking a reference and returning an `async` block makes
@@ -832,7 +849,7 @@ async fn gather_members(files: &[Arc<LoadedFile>], group: &[usize]) -> Result<Ve
             let chunks = file.index.key_chunks_for_verification().await?;
             Ok::<_, Error>(GroupMember { at, file, chunks })
         })
-        .buffered(LOAD_CONCURRENCY)
+        .buffered(load_concurrency())
         .try_collect()
         .await
 }
@@ -1702,6 +1719,21 @@ mod tests {
         values_of,
     };
     use super::*;
+
+    /// Two worker threads keep twice `LOAD_FILES_PER_WORKER` files in
+    /// flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_load_concurrency_scales_with_the_worker_threads() {
+        assert_eq!(load_concurrency(), 2 * LOAD_FILES_PER_WORKER);
+    }
+
+    /// More workers than `LOAD_FILES_MAX` over `LOAD_FILES_PER_WORKER` keep
+    /// `LOAD_FILES_MAX` in flight, not more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_load_concurrency_stops_at_its_ceiling() {
+        assert!(shard::workers() * LOAD_FILES_PER_WORKER > LOAD_FILES_MAX);
+        assert_eq!(load_concurrency(), LOAD_FILES_MAX);
+    }
     use crate::catalog::TableSource;
     use crate::config::HedgeConfig;
     use crate::key::KeyType;

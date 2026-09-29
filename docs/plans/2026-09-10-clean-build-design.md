@@ -795,7 +795,7 @@ impl Generation {
     pub fn overlap_groups_verified(&self) -> usize;
     /// The doctor's full bucket check (RFD 016): every key of every bucketed
     /// file decoded one key page at a time from `key_chunks_for_verification`,
-    /// `LOAD_CONCURRENCY` files at a time, each file's check on the blocking
+    /// `load_concurrency()` files at a time (128 per worker thread, at most 1,024), each file's check on the blocking
     /// pool, and hashed under the file's own bucketing; the first outside the recorded bucket is
     /// `RefusalReason::KeyOutsideBucket`. No load or refresh calls it.
     pub async fn verify_buckets(&self) -> Result<()>;

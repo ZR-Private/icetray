@@ -117,7 +117,7 @@ impl KeysToVerify {
     /// work that grows with the file, and inline it would hold the async
     /// worker that also answers lookups. The builds a load has in flight
     /// each wait on at most one verification, so a load runs at most
-    /// `LOAD_CONCURRENCY` of them at once, each on its own blocking-pool
+    /// `generation::load_concurrency()` of them at once, each on its own blocking-pool
     /// thread. A canceled task is `Error::VerifyCanceled` for the file.
     async fn verify(&self, chunks: &Arc<Segments>) -> Result<Verified> {
         let table = self.table.clone();
