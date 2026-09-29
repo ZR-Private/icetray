@@ -424,6 +424,12 @@ const SCATTERED_VALUE_BYTES: usize = 4_096;
 /// keeps each bucket in one file of `SCATTERED_ROWS_PER_FILE` rows.
 const SCATTERED_FILE_BYTES: usize = 256 * 1024 * 1024;
 
+/// The column-index truncation of the scattered table: 256 bytes, what the
+/// serving recipe sets (`parquet.columnindex.truncate.length`), so its
+/// value column's index holds a truncated minimum and maximum per page as a
+/// recipe-written file's does, not whole 4 KiB values.
+const SCATTERED_COLUMN_INDEX_TRUNCATE: usize = 256;
+
 /// The file prefix of the second build.
 const SECOND_BUILD_PREFIX: &str = "build2";
 
@@ -555,6 +561,7 @@ impl TableShape {
             TableName::Scattered => FileLayout {
                 page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
                 target_file_bytes: SCATTERED_FILE_BYTES,
+                column_index_truncate: Some(SCATTERED_COLUMN_INDEX_TRUNCATE),
                 ..FileLayout::contract()
             },
         }
