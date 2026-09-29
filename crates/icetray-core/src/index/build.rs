@@ -1,8 +1,10 @@
-//! The chunk stage of the index: the key column chunks fetched once, read
-//! back from a chunk file, or dropped for their filters, and every key of
-//! the file decoded and checked against the contract (RFD 007, RFD 017).
+//! The chunk stage of the index: the key column chunks fetched once, kept
+//! in a chunk file, or dropped for their filters, and every key of the file
+//! decoded and checked against the contract (RFD 007, RFD 017), unless a
+//! chunk file already holds what that check established.
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,6 +23,7 @@ use super::inspect::{bloom_ranges, key_chunk_ranges};
 use super::page_header::check_page_headers;
 use super::pages::{ChunkPages, PageTally};
 use super::plain::{self, ByteKeys};
+use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
     KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
@@ -29,8 +32,10 @@ use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
 use crate::error::{Error, RefusalReason, Result};
-use crate::key::{Key, UUID_BYTES};
-use crate::local::{DiskChunks, LocalDir, LocalFault, Reservation};
+use crate::key::{Key, KeyType, UUID_BYTES};
+use crate::local::{
+    ChunkFileLookup, DiskChunks, LocalDir, LocalFault, Rejection, Reservation, VerifiedUnder,
+};
 use crate::parquet_io::{FileHandle, Segments};
 
 impl Inspected {
@@ -48,20 +53,13 @@ impl Inspected {
         local: Option<&Arc<LocalDir>>,
         reservation: Option<&Arc<Reservation>>,
     ) -> Result<FileIndex> {
+        let to_verify = KeysToVerify::of(&self);
         let Self {
-            table,
             handle,
             metadata,
             layout,
-            predicted: _,
+            ..
         } = self;
-        let to_verify = KeysToVerify {
-            table,
-            handle: Arc::clone(&handle),
-            metadata: Arc::clone(&metadata),
-            leaf: layout.key_leaf,
-            shape: layout.key_shape,
-        };
         let ranges = key_chunk_ranges(&metadata, layout.key_leaf, handle.size());
         let (keys, verified) = match residency {
             Residency::Full => {
@@ -113,6 +111,17 @@ struct KeysToVerify {
 }
 
 impl KeysToVerify {
+    /// The key column of `inspected`.
+    fn of(inspected: &Inspected) -> Self {
+        Self {
+            table: inspected.table.clone(),
+            handle: Arc::clone(&inspected.handle),
+            metadata: Arc::clone(&inspected.metadata),
+            leaf: inspected.layout.key_leaf,
+            shape: inspected.layout.key_shape,
+        }
+    }
+
     /// `verify` of this column over `chunks`, run on the blocking pool
     /// (`on_blocking_pool`): decoding every key of a file is CPU-bound
     /// work that grows with the file, and inline it would hold the async
@@ -173,7 +182,8 @@ pub(super) async fn fetch_chunk_parts(
 }
 
 /// Every key column chunk read back from the disk tier's chunk file: one
-/// counted local read per row group, no GET.
+/// counted local read per row group, no GET. For the overlap check and the
+/// doctor, which decode every key; a build never reads chunks back.
 pub(super) async fn chunks_from_disk(
     disk: &DiskChunks,
     ranges: &[Range<u64>],
@@ -186,14 +196,17 @@ pub(super) async fn chunks_from_disk(
     Ok(Arc::new(Segments::new(parts, file_size)))
 }
 
-/// The disk tier's key chunks: a chunk file in `local` whose identity
-/// (path, size, footer digest) matches and holds every chunk range is read
-/// back and verified, no GET; otherwise the chunks are fetched, verified,
-/// and written, replacing any file at that name. The write runs on the
-/// blocking pool (`on_blocking_pool`) and holds `reservation` until it
-/// ends, so bytes it lands after its caller stopped waiting stay reserved
-/// until they are on disk. A canceled write is `Error::Local` on the chunk
-/// file's path with `LocalFault::Join`.
+/// The disk tier's key chunks. A chunk file in `local` that is reusable
+/// (`reusable_disk_chunks`) and whose payload checksum matches is trusted
+/// with the verification record it stores: no GET, no chunk read back, no
+/// key decoded (`trusted`). Any other file, or none, is fetched, verified,
+/// and written, replacing whatever is at that name; a file that was there
+/// is logged at info with why it was not reused. Nothing about a stale file
+/// fails the load. The write runs on the blocking pool (`on_blocking_pool`)
+/// and holds `reservation` until it ends, so bytes it lands after its
+/// caller stopped waiting stay reserved until they are on disk. A canceled
+/// write or checksum pass is `Error::Local` on the chunk file's path with
+/// `LocalFault::Join`.
 async fn disk_chunks(
     to_verify: &KeysToVerify,
     local: &Arc<LocalDir>,
@@ -201,40 +214,182 @@ async fn disk_chunks(
     ranges: &[Range<u64>],
 ) -> Result<(DiskChunks, Verified)> {
     let handle = &to_verify.handle;
-    if let Some(disk) = reusable_disk_chunks(handle, local, ranges)? {
-        let chunks = chunks_from_disk(&disk, ranges, handle.size()).await?;
-        let verified = to_verify.verify(&chunks).await?;
-        return Ok((disk, verified));
-    }
-    let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
     let identity = identity_of(handle);
     let path = local.chunk_path(&identity);
-    let (local, reservation) = (Arc::clone(local), reservation.cloned());
+    match reused(to_verify, local, ranges).await? {
+        Ok(reused) => return Ok(reused),
+        Err(None) => {}
+        Err(Some(stale)) => tracing::info!(
+            path = %path.display(),
+            data_file = %handle.location,
+            reason = %stale,
+            detail = ?stale,
+            "chunk file is stale; fetching its chunks to rewrite it"
+        ),
+    }
+    let under = verified_under(to_verify.shape.key_type());
+    let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
+    let verification = record::encode(&verified);
+    let (local, reservation, written_path) =
+        (Arc::clone(local), reservation.cloned(), path.clone());
     let disk = on_blocking_pool(move || {
-        let written = local.write_chunks(&identity, chunks.parts().iter().cloned());
+        let written = local.write_chunks(
+            &identity,
+            under,
+            &verification,
+            chunks.parts().iter().cloned(),
+        );
         drop(reservation);
         written
     })
     .await
     .map_err(|canceled| Error::Local {
-        path,
+        path: written_path,
         fault: LocalFault::Join(canceled),
     })??;
     Ok((disk, verified))
 }
 
-/// The chunk file in `local` a Disk-tier build reuses for `handle`'s file:
-/// one whose identity (path, size, footer digest) matches and which holds
-/// every one of `ranges`, the key column chunks. `None` when there is none,
-/// and the chunks are fetched and written instead.
+/// The chunk file in `local` for `to_verify`'s data file, whose key chunks
+/// are `ranges`, with what it stores of their verification, when a build
+/// may trust it: it is reusable by its header (`reusable_disk_chunks`) and
+/// by its payload (`trusted`). Otherwise why not, `None` for no file.
+async fn reused(
+    to_verify: &KeysToVerify,
+    local: &LocalDir,
+    ranges: &[Range<u64>],
+) -> Result<std::result::Result<(DiskChunks, Verified), Option<Stale>>> {
+    let handle = &to_verify.handle;
+    let under = verified_under(to_verify.shape.key_type());
+    Ok(match reusable_disk_chunks(handle, local, ranges, under)? {
+        OnDisk::Reusable(disk) => {
+            let path = local.chunk_path(&identity_of(handle));
+            trusted(to_verify, disk, &path).await?.map_err(Some)
+        }
+        OnDisk::Stale(stale) => Err(Some(stale)),
+        OnDisk::Absent => Err(None),
+    })
+}
+
+/// `disk` with the verification record it stores, once the payload
+/// checksum matches (`DiskChunks::checked_verification`, bounded by
+/// `record::most_bytes`) and the record describes the file the footer does
+/// (`record::decode`); otherwise why not. Runs on the blocking pool: the
+/// checksum pass reads the whole payload, a sequential local read far
+/// cheaper than decoding it.
+async fn trusted(
+    to_verify: &KeysToVerify,
+    disk: DiskChunks,
+    path: &std::path::Path,
+) -> Result<std::result::Result<(DiskChunks, Verified), Stale>> {
+    let handle = Arc::clone(&to_verify.handle);
+    let metadata = Arc::clone(&to_verify.metadata);
+    let (leaf, shape) = (to_verify.leaf, to_verify.shape);
+    on_blocking_pool(move || {
+        let column = Column {
+            metadata: &metadata,
+            leaf,
+            path: &handle.location,
+        };
+        let verification = match disk.checked_verification(record::most_bytes(&column))? {
+            Ok(verification) => verification,
+            Err(rejection) => return Ok(Err(Stale::Rejected(rejection))),
+        };
+        Ok(record::decode(&verification, &column, shape)
+            .map(|verified| (disk, verified))
+            .map_err(Stale::Record))
+    })
+    .await
+    .map_err(|canceled| Error::Local {
+        path: path.to_path_buf(),
+        fault: LocalFault::Join(canceled),
+    })?
+}
+
+/// What a Disk-tier build finds in `local` for a data file
+/// (`reusable_disk_chunks`).
+#[derive(Debug)]
+pub(super) enum OnDisk {
+    /// No chunk file.
+    Absent,
+    /// A chunk file the build does not reuse, and why.
+    Stale(Stale),
+    /// A chunk file whose header says it is the one the build would write;
+    /// its payload is still to be checked (`trusted`).
+    Reusable(DiskChunks),
+}
+
+/// Why a Disk-tier build does not reuse the chunk file under its data
+/// file's name and fetches, verifies, and rewrites it instead (RFD 017).
+/// Not an error: the load goes on as for a missing file. Display gives the
+/// `snake_case` name the info log carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stale {
+    /// The file failed a check of its envelope, header, identity, or
+    /// payload checksum.
+    Rejected(Rejection),
+    /// The file's keys were verified as another key type.
+    KeyType {
+        /// The key type the header carries.
+        stored: KeyType,
+    },
+    /// The file's keys were verified under other rules.
+    VerifierVersion {
+        /// The verifier version the header carries.
+        stored: u32,
+    },
+    /// The file does not store exactly the key column chunks the footer
+    /// names.
+    Chunks,
+    /// The verification record does not describe the file the footer does.
+    Record(RecordFault),
+}
+
+impl fmt::Display for Stale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(rejection) => rejection.fmt(f),
+            Self::KeyType { .. } => f.write_str("key_type_mismatch"),
+            Self::VerifierVersion { .. } => f.write_str("verifier_version_mismatch"),
+            Self::Chunks => f.write_str("chunks_mismatch"),
+            Self::Record(fault) => write!(f, "record_{fault}"),
+        }
+    }
+}
+
+/// The chunk file in `local` a Disk-tier build of `handle`'s file may
+/// reuse, from its envelope and header alone: one whose identity (path,
+/// size, footer digest) matches, whose keys were verified `under` the
+/// build's key type and verifier version, and which stores exactly
+/// `ranges`, the key column chunks. `Stale` with the first check a file
+/// there fails, `Absent` when there is none.
 pub(super) fn reusable_disk_chunks(
     handle: &FileHandle,
     local: &LocalDir,
     ranges: &[Range<u64>],
-) -> Result<Option<DiskChunks>> {
-    Ok(local
-        .chunks_for(&identity_of(handle))?
-        .filter(|disk| ranges.iter().all(|range| disk.holds(range))))
+    under: VerifiedUnder,
+) -> Result<OnDisk> {
+    let disk = match local.lookup(&identity_of(handle))? {
+        ChunkFileLookup::Absent => return Ok(OnDisk::Absent),
+        ChunkFileLookup::Rejected(rejection) => {
+            return Ok(OnDisk::Stale(Stale::Rejected(rejection)));
+        }
+        ChunkFileLookup::Found(disk) => disk,
+    };
+    let stored = disk.verified_under();
+    Ok(if stored.key_type != under.key_type {
+        OnDisk::Stale(Stale::KeyType {
+            stored: stored.key_type,
+        })
+    } else if stored.verifier_version != under.verifier_version {
+        OnDisk::Stale(Stale::VerifierVersion {
+            stored: stored.verifier_version,
+        })
+    } else if !disk.stores_exactly(ranges) {
+        OnDisk::Stale(Stale::Chunks)
+    } else {
+        OnDisk::Reusable(disk)
+    })
 }
 
 /// The key column's bloom filter of every row group, one `read_ranges` call
@@ -275,13 +430,30 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
         .collect()
 }
 
-/// What verifying the key column establishes.
+/// The version of the rules `verify` enforces, which a Disk-tier chunk
+/// file's verification record was computed under (RFD 017). Raise it with
+/// any change to what `verify` refuses or records: a check added, dropped,
+/// or loosened, `contract::MAX_KEY_BYTES`, how a fence is chosen. A record
+/// of any other version is stale and the file is verified again from
+/// object storage, so a result computed under other rules is never trusted.
+pub(super) const VERIFIER_VERSION: u32 = 1;
+
+/// The verification context of this build for keys of `key_type`.
+pub(super) fn verified_under(key_type: KeyType) -> VerifiedUnder {
+    VerifiedUnder {
+        key_type,
+        verifier_version: VERIFIER_VERSION,
+    }
+}
+
+/// What verifying the key column establishes, and what a Disk-tier chunk
+/// file stores of it (`record`).
 #[derive(Debug, PartialEq)]
-struct Verified {
-    fences: Vec<Vec<Key>>,
-    groups: Vec<GroupRange>,
-    key_range: (Key, Key),
-    max_key_bytes: usize,
+pub(super) struct Verified {
+    pub(super) fences: Vec<Vec<Key>>,
+    pub(super) groups: Vec<GroupRange>,
+    pub(super) key_range: (Key, Key),
+    pub(super) max_key_bytes: usize,
 }
 
 /// Decodes every key of every row group from `chunks` and checks what the
@@ -870,7 +1042,7 @@ mod tests {
     use parquet::file::properties::EnabledStatistics;
 
     use super::*;
-    use crate::approx::count;
+    use crate::approx::{self, count};
     use crate::config::{ConfigError, ConfigViolation};
     use crate::error::ErrorKind;
     use crate::generation::testing::Dictionary;
@@ -883,16 +1055,18 @@ mod tests {
     };
     use crate::index::testing::{
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP,
-        ROW_GROUPS, SMALL_BATCH, contract_rows, fault_of, group_rows, header_at, key_for, location,
-        longs, moved_by_header, pages_of, predicted_of, row_of, stepped, store, store_file,
-        with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
-        with_pages,
+        ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows, fault_of, group_rows, header_at,
+        key_for, location, longs, moved_by_header, pages_of, predicted_of, row_of, stepped, store,
+        store_file, with_column_chunk, with_dictionary_one_entry_short, with_group_rows,
+        with_header_claims, with_pages,
     };
     use crate::index::{
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
         WireType,
     };
     use crate::key::KeyType;
+    use crate::local::testing as local_testing;
+    use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
     use parquet::basic::PageType;
     use parquet::file::properties::WriterVersion;
 
@@ -1994,8 +2168,8 @@ mod tests {
         assert_eq!(restarted.stats().gets(), 1, "the footer only");
         assert_eq!(
             stats.local_reads(),
-            reads + count(ROW_GROUPS),
-            "the chunks come from the chunk file"
+            reads,
+            "no chunk is read back: the chunk file's verification record stands in for them"
         );
         assert_eq!(again.key_range(), index.key_range());
         assert_eq!(again.fences(), index.fences());
@@ -2035,6 +2209,341 @@ mod tests {
             "the chunk file now holds the other file's chunks"
         );
         assert_eq!(stats.local_reads(), reads);
+    }
+
+    /// Every how many keys of the contract fixture the stale-file tests
+    /// probe: a prime, so the sample falls at every offset within a page.
+    const PROBE_STRIDE: usize = 97;
+
+    /// Every `stride`th key of the contract fixture of `key_type`, the last
+    /// key, and the absent key just after each.
+    fn probes(key_type: KeyType, stride: usize) -> Vec<Key> {
+        (0..contract_rows())
+            .step_by(stride)
+            .chain([contract_rows() - 1])
+            .flat_map(|i| {
+                let key = key_for(i, key_type);
+                [absent_after(&key), key]
+            })
+            .collect()
+    }
+
+    /// Asserts that `index` holds the range, fences, and longest key
+    /// `oracle` does, and answers every `stride`th probe of `key_type` as
+    /// `oracle` does: the same row for a present key, none for an absent
+    /// one.
+    async fn assert_answers_as(
+        index: &FileIndex,
+        oracle: &FileIndex,
+        key_type: KeyType,
+        stride: usize,
+    ) {
+        assert_eq!(index.key_range(), oracle.key_range());
+        assert_eq!(index.fences(), oracle.fences());
+        assert_eq!(index.max_key_bytes(), oracle.max_key_bytes());
+        for key in probes(key_type, stride) {
+            assert_eq!(
+                index.find(&key, None).await.unwrap(),
+                oracle.find(&key, None).await.unwrap(),
+                "{key_type} {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disk_tier_reuse_decodes_no_key_page_and_answers_as_a_fresh_load() {
+        for key_type in KeyType::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let opened = store(&Fixture::contract(key_type, contract_rows())).await;
+            let local = testing::local_dir(dir.path(), opened.stats(), None);
+            opened
+                .build(key_type, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            let oracle = opened.index(key_type).await;
+
+            let reads = opened.stats().local_reads();
+            let restarted = store_file(opened.file.clone()).await;
+            let reused = restarted
+                .build(key_type, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            assert_eq!(restarted.stats().gets(), 1, "{key_type}: the footer only");
+            assert_eq!(
+                opened.stats().local_reads(),
+                reads,
+                "{key_type}: no chunk was read back to be decoded"
+            );
+            assert_answers_as(&reused, &oracle, key_type, 1).await;
+        }
+    }
+
+    /// The chunk file `local` holds for `opened`'s data file.
+    fn chunk_file_of(opened: &Opened, local: &LocalDir) -> std::path::PathBuf {
+        local.chunk_path(&identity_of(&opened.handle))
+    }
+
+    /// A Disk-tier build of the contract fixture of `key_type` in a fresh
+    /// local directory: the file, the directory, and its chunk file.
+    struct Written {
+        _dir: tempfile::TempDir,
+        opened: Opened,
+        local: Arc<LocalDir>,
+        path: std::path::PathBuf,
+    }
+
+    /// An edit a test makes to a written chunk file.
+    type ChunkFileEdit = fn(&Written);
+
+    async fn written(key_type: KeyType) -> Written {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = store(&Fixture::contract(key_type, contract_rows())).await;
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
+        opened
+            .build(key_type, Residency::Disk, Some(&local))
+            .await
+            .unwrap();
+        let path = chunk_file_of(&opened, &local);
+        Written {
+            _dir: dir,
+            opened,
+            local,
+            path,
+        }
+    }
+
+    impl Written {
+        /// A restarted Disk-tier build as `key_type`: a fresh handle over
+        /// the same bytes, and its GETs.
+        async fn restart(&self, key_type: KeyType) -> (FileIndex, u64) {
+            let restarted = store_file(self.opened.file.clone()).await;
+            let index = restarted
+                .build(key_type, Residency::Disk, Some(&self.local))
+                .await
+                .unwrap();
+            (index, restarted.stats().gets())
+        }
+
+        /// Why a restarted Disk-tier build as `key_type` would not trust
+        /// the chunk file, `None` for no file; panics when it would.
+        async fn stale(&self, key_type: KeyType) -> Option<Stale> {
+            let restarted = store_file(self.opened.file.clone()).await;
+            let inspected = FileIndex::inspect(
+                TABLE,
+                Arc::clone(&restarted.handle),
+                KEY_COLUMN,
+                VALUE_COLUMN,
+                key_type,
+            )
+            .await
+            .unwrap();
+            let ranges = key_chunk_ranges(
+                &inspected.metadata,
+                inspected.layout.key_leaf,
+                inspected.handle.size(),
+            );
+            let to_verify = KeysToVerify::of(&inspected);
+            reused(&to_verify, &self.local, &ranges)
+                .await
+                .unwrap()
+                .expect_err("the chunk file is trusted")
+        }
+
+        /// Asserts that a restart as `key_type` does not trust the chunk
+        /// file, for the reason `stale`: it fetches every chunk again,
+        /// answers as a fresh load, and rewrites the file, which the
+        /// restart after it trusts.
+        async fn assert_rebuilt_then_reused(
+            &self,
+            key_type: KeyType,
+            case: &str,
+            stale: Option<Stale>,
+        ) {
+            assert_eq!(self.stale(key_type).await, stale, "{case}");
+            let oracle = self.opened.index(key_type).await;
+            let (rebuilt, gets) = self.restart(key_type).await;
+            assert_eq!(
+                gets,
+                1 + count(ROW_GROUPS),
+                "{case}: footer, then every chunk"
+            );
+            assert_answers_as(&rebuilt, &oracle, key_type, PROBE_STRIDE).await;
+            let reads = self.opened.stats().local_reads();
+            let (reused, gets) = self.restart(key_type).await;
+            assert_eq!(gets, 1, "{case}: the rewritten file is reused");
+            assert_eq!(self.opened.stats().local_reads(), reads, "{case}");
+            assert_answers_as(&reused, &oracle, key_type, PROBE_STRIDE).await;
+        }
+    }
+
+    /// The bytes at the end of a torn chunk file that a crash left
+    /// unwritten: zeros, which a filesystem returns for blocks it allocated
+    /// and never wrote.
+    const UNWRITTEN_TAIL_BYTES: usize = 64;
+
+    /// Sets the length of the file at `path`.
+    fn set_len(path: &std::path::Path, len: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_disk_tier_rebuilds_every_stale_chunk_file_rather_than_failing() {
+        let key_type = KeyType::String;
+        let cases: [(&str, ChunkFileEdit, Stale); 8] = [
+            (
+                "payload byte flipped",
+                |written| {
+                    let len = std::fs::metadata(&written.path).unwrap().len();
+                    let last = std::fs::read(&written.path).unwrap()[approx::length(len - 1)];
+                    local_testing::overwrite(&written.path, len - 1, &[last ^ GARBAGE]);
+                },
+                Stale::Rejected(Rejection::ChecksumMismatch),
+            ),
+            (
+                "payload truncated",
+                |written| {
+                    let len = std::fs::metadata(&written.path).unwrap().len();
+                    set_len(&written.path, len - 1);
+                },
+                Stale::Rejected(Rejection::ShortPayload),
+            ),
+            (
+                "tail never written",
+                |written| {
+                    let len = std::fs::metadata(&written.path).unwrap().len();
+                    let unwritten = [0; UNWRITTEN_TAIL_BYTES];
+                    let at = len - count(unwritten.len());
+                    local_testing::overwrite(&written.path, at, &unwritten);
+                },
+                Stale::Rejected(Rejection::ChecksumMismatch),
+            ),
+            (
+                "previous format version",
+                |written| {
+                    local_testing::set_version_byte(&written.path, local_testing::PREVIOUS_VERSION);
+                },
+                Stale::Rejected(Rejection::UnsupportedVersion {
+                    version: local_testing::PREVIOUS_VERSION,
+                }),
+            ),
+            (
+                "verifier version bumped",
+                |written| {
+                    local_testing::set_verifier_version(&written.path, VERIFIER_VERSION + 1);
+                },
+                Stale::VerifierVersion {
+                    stored: VERIFIER_VERSION + 1,
+                },
+            ),
+            (
+                "header garbage",
+                |written| local_testing::fill_header(&written.path, GARBAGE),
+                Stale::Rejected(Rejection::UndecodableHeader),
+            ),
+            (
+                "record with a key over the longest",
+                |written| {
+                    local_testing::edit_verification(&written.path, |bytes| {
+                        *bytes = record::with_fences(bytes, |fences| {
+                            fences[0][0] = vec![b'u'; MAX_KEY_BYTES + 1];
+                        });
+                    });
+                },
+                Stale::Record(RecordFault::Key { row_group: 0 }),
+            ),
+            (
+                "record with a fence too many",
+                |written| {
+                    local_testing::edit_verification(&written.path, |bytes| {
+                        *bytes = record::with_fences(bytes, |fences| {
+                            let repeated = fences[0][0].clone();
+                            fences[0].push(repeated);
+                        });
+                    });
+                },
+                Stale::Record(RecordFault::Fences {
+                    row_group: 0,
+                    stored: PAGES_PER_GROUP + 1,
+                }),
+            ),
+        ];
+        for (case, edit, stale) in cases {
+            let written = written(key_type).await;
+            edit(&written);
+            written
+                .assert_rebuilt_then_reused(key_type, case, Some(stale))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disk_tier_rebuilds_a_chunk_file_whose_record_is_over_the_footer_bound() {
+        let key_type = KeyType::Long;
+        let written = written(key_type).await;
+        let most = record::most_bytes(&written.opened.index(key_type).await.key_column());
+        local_testing::edit_verification(&written.path, |bytes| {
+            bytes.resize(approx::length(most + 1), 0);
+        });
+        written
+            .assert_rebuilt_then_reused(
+                key_type,
+                "record over the bound",
+                Some(Stale::Rejected(Rejection::VerificationTooLarge {
+                    len: most + 1,
+                    most,
+                })),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_disk_tier_rebuilds_a_chunk_file_verified_as_another_key_type() {
+        let written = written(KeyType::String).await;
+        written
+            .assert_rebuilt_then_reused(
+                KeyType::Binary,
+                "string file read as binary",
+                Some(Stale::KeyType {
+                    stored: KeyType::String,
+                }),
+            )
+            .await;
+        written
+            .assert_rebuilt_then_reused(
+                KeyType::String,
+                "and back",
+                Some(Stale::KeyType {
+                    stored: KeyType::Binary,
+                }),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_disk_tier_serves_through_a_write_torn_before_its_rename() {
+        let key_type = KeyType::String;
+        let written = written(key_type).await;
+        let bytes = std::fs::read(&written.path).unwrap();
+        let leftover = local_testing::stale_temp(&written.path);
+        std::fs::write(&leftover, &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::remove_file(&written.path).unwrap();
+        written
+            .assert_rebuilt_then_reused(key_type, "temporary file left without its rename", None)
+            .await;
+        let identity = identity_of(&written.opened.handle);
+        assert_eq!(
+            written
+                .local
+                .retain(&std::collections::HashSet::from([identity]))
+                .unwrap(),
+            approx::count(bytes.len() / 2),
+            "the leftover is swept, the chunk file kept"
+        );
     }
 
     #[tokio::test]

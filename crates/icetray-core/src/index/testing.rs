@@ -107,6 +107,26 @@ pub(super) fn key_for(i: usize, key_type: KeyType) -> Key {
     }
 }
 
+/// The key just after `key` in served order, which no fixture holds:
+/// keys step by `KEY_STEP`, and strings and bytes are extended.
+pub(super) fn absent_after(key: &Key) -> Key {
+    match key {
+        Key::Long(value) => Key::Long(value + 1),
+        Key::Str(text) => Key::Str(format!("{text}x")),
+        Key::Bytes(bytes) => {
+            let mut longer = bytes.clone();
+            longer.push(0);
+            Key::Bytes(longer)
+        }
+        Key::Uuid(uuid) => {
+            let mut next = *uuid;
+            let low = u64::from_be_bytes(next[UUID_HALF_BYTES..].try_into().unwrap());
+            next[UUID_HALF_BYTES..].copy_from_slice(&(low + 1).to_be_bytes());
+            Key::Uuid(next)
+        }
+    }
+}
+
 /// `len` bytes that are a function of row `i`.
 pub(super) fn value_of_len(i: usize, len: usize) -> Vec<u8> {
     testing::value_of_len(i64::try_from(i).unwrap(), len)
@@ -444,7 +464,12 @@ pub(super) fn longs(values: &[i64]) -> Vec<Option<Key>> {
 
 /// `predicted_resident_bytes` of a built index's own footer.
 pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
-    FileIndex::predicted_resident_bytes(index.metadata(), index.key_leaf(), index.handle())
+    FileIndex::predicted_resident_bytes(
+        index.metadata(),
+        index.key_leaf(),
+        index.key_type(),
+        index.handle(),
+    )
 }
 
 /// The byte range of `field`'s varint in a page header in compact

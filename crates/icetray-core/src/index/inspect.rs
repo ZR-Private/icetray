@@ -11,9 +11,9 @@ use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
-use super::build::reusable_disk_chunks;
+use super::build::{OnDisk, reusable_disk_chunks, verified_under};
 use super::{
-    FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of,
+    FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of, record,
     saturating_sum, saturating_sum_all,
 };
 use crate::approx;
@@ -42,23 +42,28 @@ impl Inspected {
     }
 
     /// The bytes a Disk-tier `build` would add to `local`'s `index/`: zero
-    /// when a chunk file with this file's identity already holds every key
-    /// chunk, since `build` reuses it and writes nothing, otherwise the
-    /// chunk file `build` would write, its header and the key chunks
+    /// when a chunk file with this file's identity and verification context
+    /// already stores exactly the key chunks, since `build` reuses it and
+    /// writes nothing, otherwise the chunk file `build` would write
     /// (`predicted().disk_bytes`), which is what `LocalDir::index_bytes_in_use`
-    /// counts for the file once written, so the budget is checked in the
-    /// units it is measured in. The disk budget is checked against this
-    /// rather than against the prediction alone, so a restart over a
-    /// directory that already holds the table's chunk files is not charged
-    /// for them twice (RFD 017). Reads the chunk file's header and no key
-    /// chunk; a chunk file that fails a check counts as absent, as
-    /// `LocalDir::chunks_for` treats it.
+    /// counts for the file once written, its verification record estimated,
+    /// so the budget is checked in the units it is measured in. The disk
+    /// budget is checked against this rather than against the prediction
+    /// alone, so a restart over a directory that already holds the table's
+    /// chunk files is not charged for them twice (RFD 017). Reads the chunk
+    /// file's header and no payload byte; a chunk file that fails a check
+    /// counts as absent. A file that passes the header's checks but fails
+    /// its payload checksum at `build` counts zero here and is rewritten
+    /// there over itself, at about the size `index/` already counts for it.
     pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
         let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
-        Ok(match reusable_disk_chunks(&self.handle, local, &ranges)? {
-            Some(_) => 0,
-            None => self.predicted.disk_bytes,
-        })
+        let under = verified_under(self.layout.key_shape.key_type());
+        Ok(
+            match reusable_disk_chunks(&self.handle, local, &ranges, under)? {
+                OnDisk::Reusable(_) => 0,
+                OnDisk::Absent | OnDisk::Stale(_) => self.predicted.disk_bytes,
+            },
+        )
     }
 }
 
@@ -378,14 +383,17 @@ pub(super) struct ResidentSet {
 }
 
 impl ResidentSet {
-    /// From `metadata` of the file `handle` opens, with the fences exact
-    /// when `fences` is given and estimated from the footer otherwise. A
-    /// key chunk `chunk_range` cannot place counts as zero and is left out
-    /// of the chunk file, and the filters are `None` when any row group's
-    /// filter is one `filter_range` cannot place.
+    /// From `metadata` of the file `handle` opens, keyed by `key_type`, with
+    /// the fences exact when `fences` is given and estimated from the footer
+    /// otherwise. A key chunk `chunk_range` cannot place counts as zero and
+    /// is left out of the chunk file, whose verification record is
+    /// estimated from the footer (`record::estimated_len`), and the filters
+    /// are `None` when any row group's filter is one `filter_range` cannot
+    /// place.
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        key_type: KeyType,
         handle: &FileHandle,
         fences: Option<&[Vec<Key>]>,
     ) -> Self {
@@ -407,10 +415,20 @@ impl ResidentSet {
         let placed: Vec<Range<u64>> = key_columns()
             .filter_map(|column| chunk_range(column, file_size))
             .collect();
+        let record = record::estimated_len(
+            estimated_fence_keys(metadata, key_leaf)
+                .into_iter()
+                .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
+        );
         Self {
             footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
             key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
-            chunk_file: chunk_file_bytes(&identity_of(handle), &placed),
+            chunk_file: chunk_file_bytes(
+                &identity_of(handle),
+                verified_under(key_type),
+                &placed,
+                record,
+            ),
             fences: fences.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
                 exact_fence_bytes,
@@ -457,10 +475,33 @@ fn exact_fence_bytes(fences: &[Vec<Key>]) -> u64 {
 /// The fence array's bytes before the keys are decoded: one `Key` per key
 /// page from the offset index plus, per page, the heap a first key of the
 /// column's physical type would hold, as `predicted_resident_bytes`
-/// documents.
+/// documents: its encoded bytes (`estimated_fence_keys`), but none for a
+/// long, which a `Key` holds inline.
 fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
+    let inline = metadata
+        .file_metadata()
+        .schema_descr()
+        .column(key_leaf)
+        .physical_type()
+        == PhysicalType::INT64;
+    estimated_fence_keys(metadata, key_leaf).into_iter().fold(
+        0,
+        |total: u64, (pages, key_bytes)| {
+            let heap = if inline { 0 } else { key_bytes };
+            total
+                .saturating_add(approx::count(pages * size_of::<Key>()))
+                .saturating_add(heap)
+        },
+    )
+}
+
+/// Per row group, its key pages from the offset index and the bytes the
+/// first keys of those pages hold as encoded, before the keys are decoded:
+/// eight per page for a long, the column's width for a fixed-width key, and
+/// for a byte-array key the estimate `byte_array_fence_heap` makes.
+fn estimated_fence_keys(metadata: &ParquetMetaData, key_leaf: usize) -> Vec<(usize, u64)> {
     let descr = metadata.file_metadata().schema_descr().column(key_leaf);
-    let mut total: u64 = 0;
+    let mut groups = Vec::with_capacity(metadata.num_row_groups());
     for (row_group, group) in metadata.row_groups().iter().enumerate() {
         let pages = metadata
             .offset_index()
@@ -471,25 +512,23 @@ fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
             .column_index()
             .and_then(|index| index.get(row_group))
             .and_then(|columns| columns.get(key_leaf));
-        let heap = match descr.physical_type() {
+        let key_bytes = match descr.physical_type() {
             PhysicalType::BYTE_ARRAY => {
                 byte_array_fence_heap(column_index, group.column(key_leaf), pages)
             }
             PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                approx::count(pages) * approx::measured(descr.type_length())
+                approx::count(pages).saturating_mul(approx::measured(descr.type_length()))
             }
+            PhysicalType::INT64 => approx::count(pages * size_of::<i64>()),
             PhysicalType::BOOLEAN
             | PhysicalType::INT32
-            | PhysicalType::INT64
             | PhysicalType::INT96
             | PhysicalType::FLOAT
             | PhysicalType::DOUBLE => 0,
         };
-        total = total
-            .saturating_add(approx::count(pages * size_of::<Key>()))
-            .saturating_add(heap);
+        groups.push((pages, key_bytes));
     }
-    total
+    groups
 }
 
 /// The heap bytes the fences of one row group of a `BYTE_ARRAY` key column
@@ -744,7 +783,7 @@ mod tests {
             assert_eq!(fault_of(inspect(patched)), FileFault::InconsistentRowCounts);
         }
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, &opened.handle)
+            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, KeyType::Long, &opened.handle)
                 .bloom_bits_per_key,
             Some(0.0),
             "a negative row count estimates as no rows"
@@ -920,8 +959,12 @@ mod tests {
         assert!(loaded.memory_size() - kept.memory_size() >= value_pages * 2 * truncated);
         // The budget check at the footer stage holds the footer as loaded;
         // its prediction is the kept footer's, and what the index reports.
-        let from_loaded =
-            FileIndex::predicted_resident_bytes(&loaded, index.key_leaf(), &opened.handle);
+        let from_loaded = FileIndex::predicted_resident_bytes(
+            &loaded,
+            index.key_leaf(),
+            KeyType::Long,
+            &opened.handle,
+        );
         assert_eq!(from_loaded, predicted_of(&index));
         assert_eq!(from_loaded.full, count(index.resident_bytes()));
     }
@@ -933,14 +976,20 @@ mod tests {
         let index = opened.index(KeyType::Long).await;
         let key_leaf = index.key_leaf();
         let size = opened.handle.size();
-        let intact = FileIndex::predicted_resident_bytes(&loaded, key_leaf, &opened.handle);
+        let intact =
+            FileIndex::predicted_resident_bytes(&loaded, key_leaf, KeyType::Long, &opened.handle);
         let first_chunk = loaded.row_group(0).column(key_leaf).compressed_size();
         let unplaceable = [NEGATIVE_OFFSET, i64::try_from(size).unwrap(), i64::MAX / 2];
         for claimed in unplaceable {
             let patched = with_column_chunk(&loaded, 0, key_leaf, |chunk| {
                 chunk.set_total_compressed_size(claimed)
             });
-            let estimated = FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle);
+            let estimated = FileIndex::predicted_resident_bytes(
+                &patched,
+                key_leaf,
+                KeyType::Long,
+                &opened.handle,
+            );
             assert_eq!(
                 estimated.full,
                 intact.full - approx::measured(first_chunk),
@@ -1002,7 +1051,8 @@ mod tests {
         assert_eq!(path, location());
         assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle).bloom,
+            FileIndex::predicted_resident_bytes(&patched, key_leaf, KeyType::Long, &opened.handle)
+                .bloom,
             None
         );
         assert!(bloom_ranges(TABLE, &opened.handle, index.metadata(), key_leaf).is_ok());
@@ -1039,7 +1089,13 @@ mod tests {
                 FileFault::UnplaceableBloomFilter { row_group: 0 }
             );
             assert_eq!(
-                FileIndex::predicted_resident_bytes(&patched, key_leaf, &opened.handle).bloom,
+                FileIndex::predicted_resident_bytes(
+                    &patched,
+                    key_leaf,
+                    KeyType::Long,
+                    &opened.handle
+                )
+                .bloom,
                 None
             );
         }
@@ -1120,6 +1176,24 @@ mod tests {
             stale.predicted().disk_bytes
         );
         assert_eq!(other.stats().gets(), 1, "no chunk is read for the check");
+    }
+
+    #[tokio::test]
+    async fn test_predicted_disk_bytes_is_the_chunk_file_written_for_keys_of_one_width() {
+        // Every contract fixture's keys are of one width within the column
+        // index's truncation, so the record's estimate is exact.
+        for key_type in KeyType::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let opened = store(&Fixture::contract(key_type, contract_rows())).await;
+            let local = testing::local_dir(dir.path(), opened.stats(), None);
+            let inspected = inspect(&opened, key_type).await;
+            let predicted = inspected.predicted().disk_bytes;
+            inspected
+                .build(Residency::Disk, Some(&local), None)
+                .await
+                .unwrap();
+            assert_eq!(local.index_bytes_in_use().unwrap(), predicted, "{key_type}");
+        }
     }
 
     #[tokio::test]

@@ -669,7 +669,12 @@ fn by_bucket(facts: &[FileFacts]) -> Buckets<'_> {
 fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
     let index = &file.index;
     let metadata = index.metadata();
-    let predicted = FileIndex::predicted_resident_bytes(metadata, index.key_leaf(), index.handle());
+    let predicted = FileIndex::predicted_resident_bytes(
+        metadata,
+        index.key_leaf(),
+        index.key_type(),
+        index.handle(),
+    );
     let pages = page_facts(metadata, index.key_leaf(), index.value_leaf());
     let chunks = chunk_facts(metadata, index.key_leaf(), index.value_leaf());
     let mut dictionary_columns = Vec::new();
@@ -2341,6 +2346,7 @@ mod tests {
                     FileIndex::predicted_resident_bytes(
                         file.index.metadata(),
                         file.index.key_leaf(),
+                        file.index.key_type(),
                         file.index.handle(),
                     )
                 })

@@ -1,6 +1,14 @@
 //! The chunk file format (RFD 011, RFD 017): the envelope and header a
 //! chunk file carries, the checks a reader makes before trusting one, and
 //! the bytes a writer lays down. Nothing outside icetray reads a chunk file.
+//!
+//! After the envelope and the header comes the payload: the verification
+//! record, a message the index encodes and this module frames without
+//! reading, then the key chunks back to back. The header carries a crc32c of
+//! the whole payload, so a file whose payload was torn by a crash, cut
+//! short, or changed on disk fails the checksum and is rebuilt; every other
+//! header field is either compared with what the reader expects (identity,
+//! verification context, spans) or constrained by the file's length.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -12,9 +20,9 @@ use std::path::Path;
 use bytes::Bytes;
 use prost::Message as _;
 
-use super::{DIGEST_BYTES, DataFileIdentity, LocalFault, digest};
+use super::{DIGEST_BYTES, DataFileIdentity, LocalFault, VerifiedUnder, digest};
 use crate::approx;
-use crate::key::HEX_DIGITS_PER_BYTE;
+use crate::key::{HEX_DIGITS_PER_BYTE, KeyType};
 
 /// The first byte of a chunk file (RFD 011): identifies the file as an
 /// icetray chunk file before any of it is parsed. `0xC1` is never the first
@@ -23,12 +31,15 @@ use crate::key::HEX_DIGITS_PER_BYTE;
 pub(super) const CHUNK_FILE_MAGIC: u8 = 0xC1;
 /// The version byte of the chunk file format this build writes and the only
 /// one it reads (RFD 011). A build that changes the layout raises it and
-/// decides whether to convert or refuse older files.
-const CHUNK_FILE_VERSION: u8 = 1;
+/// decides whether to convert or refuse older files; a file of another
+/// version is stale and rebuilt from object storage, which is what the
+/// directory's disposability allows. Version 2 added the verification
+/// record and the payload checksum.
+pub(super) const CHUNK_FILE_VERSION: u8 = 2;
 /// Where the magic byte sits in a chunk file.
 pub(super) const MAGIC_OFFSET: u64 = 0;
 /// Where the version byte sits: right after the magic byte.
-const VERSION_OFFSET: u64 = MAGIC_OFFSET + 1;
+pub(super) const VERSION_OFFSET: u64 = MAGIC_OFFSET + 1;
 /// Where the length prefix of the encoded header sits: right after the
 /// version byte.
 pub(super) const LENGTH_OFFSET: u64 = VERSION_OFFSET + 1;
@@ -39,17 +50,20 @@ pub(super) const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 /// payload starts where the header ends.
 pub(super) const HEADER_OFFSET: u64 = LENGTH_OFFSET + approx::count(LENGTH_PREFIX_BYTES);
 /// The largest encoded header a chunk file may carry, written or read. A
-/// header is one data file path, one digest, and about twenty bytes per
-/// stored chunk, one per row group, so a mebibyte holds tens of thousands
-/// of row groups, more than any data file the layout targets has. The
+/// header is one data file path, one digest, a few fixed fields, and about
+/// twenty bytes per stored chunk, one per row group, so a mebibyte holds
+/// tens of thousands of row groups, more than any data file the layout
+/// targets has. The keys the index keeps are in the verification record,
+/// not here, so the header stays this small however long the keys. The
 /// reader checks the length prefix against this before it allocates, so a
 /// corrupt prefix cannot ask for gigabytes.
 pub(super) const MAX_HEADER_BYTES: usize = 1024 * 1024;
 /// The check a chunk file failed. Not an error: the file is foreign, stale,
-/// or incomplete, `chunks_for` treats it as absent, and `retain` deletes
-/// it. Display gives the `snake_case` name the warn log carries.
+/// incomplete, or torn; `chunks_for` treats it as absent, a Disk-tier build
+/// rebuilds it, and `retain` deletes one that fails a check of its envelope
+/// or header. Display gives the `snake_case` name the logs carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Rejection {
+pub(crate) enum Rejection {
     /// The first byte is not `CHUNK_FILE_MAGIC`: not an icetray chunk file.
     WrongMagic,
     /// Any version byte other than `CHUNK_FILE_VERSION`; this build reads
@@ -75,11 +89,20 @@ pub(super) enum Rejection {
         /// The digest's length in the header.
         len: usize,
     },
+    /// The header carries no payload checksum.
+    MissingChecksum,
+    /// The header's key type is none this build knows.
+    UnknownKeyType {
+        /// The value the header carries.
+        value: i32,
+    },
     /// The header's spans are not what a page read's binary search needs:
     /// one is empty, starts before the end of the one before it, or ends
-    /// past `u64::MAX`.
+    /// past `u64::MAX`; or the payload, the verification record and the
+    /// spans after it, ends past `u64::MAX`.
     SpanLayout,
-    /// The payload is shorter than the spans promise.
+    /// The payload is shorter than the verification record and the spans
+    /// promise.
     ShortPayload,
     /// The file goes on past the payload the spans promise: not a file this
     /// writer produced whole.
@@ -93,6 +116,17 @@ pub(super) enum Rejection {
     /// The file's name is not the digest of the header's path, so no lookup
     /// ever finds it.
     NameMismatch,
+    /// The verification record is longer than the reader's bound for the
+    /// data file it describes; checked before the record is read.
+    VerificationTooLarge {
+        /// The record's length in the header.
+        len: u64,
+        /// The most the reader accepts.
+        most: u64,
+    },
+    /// The payload's crc32c is not the one the header carries: the file was
+    /// torn by a crash, or changed after it was written.
+    ChecksumMismatch,
 }
 
 impl fmt::Display for Rejection {
@@ -104,6 +138,8 @@ impl fmt::Display for Rejection {
             Self::TruncatedHeader => "truncated_header",
             Self::UndecodableHeader => "undecodable_header",
             Self::DigestLength { .. } => "digest_length",
+            Self::MissingChecksum => "missing_checksum",
+            Self::UnknownKeyType { .. } => "unknown_key_type",
             Self::SpanLayout => "span_layout",
             Self::ShortPayload => "short_payload",
             Self::TrailingBytes => "trailing_bytes",
@@ -111,6 +147,8 @@ impl fmt::Display for Rejection {
             Self::SizeMismatch => "size_mismatch",
             Self::DigestMismatch => "digest_mismatch",
             Self::NameMismatch => "name_mismatch",
+            Self::VerificationTooLarge { .. } => "verification_too_large",
+            Self::ChecksumMismatch => "checksum_mismatch",
         };
         f.write_str(name)
     }
@@ -140,11 +178,14 @@ impl From<Rejection> for ParseFailure {
 }
 
 /// The header of a chunk file, inside the RFD 011 envelope: the identity of
-/// the data file whose key chunks the payload holds, and one span per chunk
-/// saying which bytes of that data file it is. The spans are what lets a
-/// restarted process serve pages without the Parquet footer. Nothing
-/// outside icetray reads a chunk file, so the message is declared here and
-/// not in the client contract. Field numbers are never reused.
+/// the data file whose key chunks the payload holds, one span per chunk
+/// saying which bytes of that data file it is, the length of the
+/// verification record before the chunks, what that record was computed
+/// under, and the payload's checksum. The spans are what lets a restarted
+/// process serve pages without the Parquet footer, and the record what lets
+/// it skip decoding them. Nothing outside icetray reads a chunk file, so
+/// the message is declared here and not in the client contract. Field
+/// numbers are never reused.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub(super) struct ChunkFileHeader {
     /// The data file's location as the manifest records it.
@@ -160,6 +201,62 @@ pub(super) struct ChunkFileHeader {
     /// data offset, and disjoint. A reader rejects any other layout.
     #[prost(message, repeated, tag = "4")]
     pub chunks: Vec<ChunkSpan>,
+    /// The verification record's length in bytes; it sits right after the
+    /// header, and the first chunk right after it.
+    #[prost(uint64, tag = "5")]
+    pub verification_length: u64,
+    /// crc32c of the payload, every byte after the header. Always present
+    /// in a file this build writes, and encoded at its fixed width whatever
+    /// its value, so a header's length does not depend on it.
+    #[prost(fixed32, optional, tag = "6")]
+    pub payload_crc32c: Option<u32>,
+    /// The key type the record was verified under.
+    #[prost(enumeration = "StoredKeyType", tag = "7")]
+    pub key_type: i32,
+    /// The rules the record was verified under (`index::VERIFIER_VERSION`).
+    #[prost(uint32, tag = "8")]
+    pub verifier_version: u32,
+}
+
+/// `KeyType` as the header stores it. Zero is no key type, so a header
+/// that omits the field is rejected rather than read as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub(super) enum StoredKeyType {
+    /// No key type: never written.
+    Unspecified = 0,
+    /// `KeyType::Long`.
+    Long = 1,
+    /// `KeyType::String`.
+    String = 2,
+    /// `KeyType::Binary`.
+    Binary = 3,
+    /// `KeyType::Uuid`.
+    Uuid = 4,
+}
+
+impl StoredKeyType {
+    /// How the header stores `key_type`.
+    fn of(key_type: KeyType) -> Self {
+        match key_type {
+            KeyType::Long => Self::Long,
+            KeyType::String => Self::String,
+            KeyType::Binary => Self::Binary,
+            KeyType::Uuid => Self::Uuid,
+        }
+    }
+
+    /// The key type a header's value names; `None` for zero or a value
+    /// this build does not know.
+    fn key_type(value: i32) -> Option<KeyType> {
+        match Self::try_from(value).ok()? {
+            Self::Unspecified => None,
+            Self::Long => Some(KeyType::Long),
+            Self::String => Some(KeyType::String),
+            Self::Binary => Some(KeyType::Binary),
+            Self::Uuid => Some(KeyType::Uuid),
+        }
+    }
 }
 
 /// One stored chunk: the byte range of the data file it holds. Its bytes
@@ -192,6 +289,62 @@ pub(super) struct ParsedChunkFile {
     pub(super) identity: DataFileIdentity,
     /// The spans in header order with their payload offsets.
     pub(super) spans: Vec<StoredSpan>,
+    /// What the verification record was computed under.
+    pub(super) under: VerifiedUnder,
+    /// Where the payload, and with it the verification record, starts.
+    pub(super) payload_offset: u64,
+    /// The verification record's length.
+    pub(super) verification_length: u64,
+    /// The payload's checksum as the header carries it.
+    pub(super) payload_crc32c: u32,
+    /// Where the payload ends, which is the file's length.
+    pub(super) end: u64,
+}
+
+impl ParsedChunkFile {
+    /// Everything a reader takes from `header`, whose payload starts at
+    /// `payload_offset`, once the header's own fields pass their checks:
+    /// the digest's width, the checksum's presence, a key type this build
+    /// knows, and spans laid out after the record within `u64`. The file's
+    /// length is the caller's to compare with `end`.
+    pub(super) fn from_header(
+        header: ChunkFileHeader,
+        payload_offset: u64,
+    ) -> std::result::Result<Self, Rejection> {
+        let footer_digest = <[u8; DIGEST_BYTES]>::try_from(header.footer_digest.as_slice())
+            .map_err(|_| Rejection::DigestLength {
+                len: header.footer_digest.len(),
+            })?;
+        let payload_crc32c = header.payload_crc32c.ok_or(Rejection::MissingChecksum)?;
+        let key_type =
+            StoredKeyType::key_type(header.key_type).ok_or(Rejection::UnknownKeyType {
+                value: header.key_type,
+            })?;
+        let chunks_offset = payload_offset
+            .checked_add(header.verification_length)
+            .ok_or(Rejection::SpanLayout)?;
+        let (spans, chunk_bytes) =
+            stored_spans(&header.chunks, chunks_offset).ok_or(Rejection::SpanLayout)?;
+        let end = chunks_offset
+            .checked_add(chunk_bytes)
+            .ok_or(Rejection::SpanLayout)?;
+        Ok(Self {
+            identity: DataFileIdentity {
+                path: header.data_file_path,
+                size: header.data_file_size,
+                footer_digest,
+            },
+            spans,
+            under: VerifiedUnder {
+                key_type,
+                verifier_version: header.verifier_version,
+            },
+            payload_offset,
+            verification_length: header.verification_length,
+            payload_crc32c,
+            end,
+        })
+    }
 }
 
 /// Reads the envelope and header of an open chunk file, then checks the
@@ -207,8 +360,10 @@ pub(super) fn validate(
 }
 
 /// Reads the envelope and header of an open chunk file and checks that the
-/// payload is as long as the spans promise. Needs no identity, so `retain`
-/// can read the one a file carries.
+/// payload is as long as the verification record and the spans promise.
+/// Needs no identity, so `retain` can read the one a file carries. Reads no
+/// payload byte: the checksum is checked by `DiskChunks::checked_verification`,
+/// when a reader is about to trust the record.
 pub(super) fn parse_chunk_file(file: &File) -> std::result::Result<ParsedChunkFile, ParseFailure> {
     let mut magic = [0u8; 1];
     read_header_bytes(file, &mut magic, MAGIC_OFFSET)?;
@@ -244,27 +399,12 @@ pub(super) fn parse_chunk_file(file: &File) -> std::result::Result<ParsedChunkFi
             return Err(Rejection::UndecodableHeader.into());
         }
     };
-    let footer_digest =
-        <[u8; DIGEST_BYTES]>::try_from(header.footer_digest.as_slice()).map_err(|_| {
-            Rejection::DigestLength {
-                len: header.footer_digest.len(),
-            }
-        })?;
-    let (spans, payload_bytes) =
-        stored_spans(&header.chunks, payload_offset).ok_or(Rejection::SpanLayout)?;
-    match file_len.cmp(&(payload_offset + payload_bytes)) {
-        std::cmp::Ordering::Less => return Err(Rejection::ShortPayload.into()),
-        std::cmp::Ordering::Greater => return Err(Rejection::TrailingBytes.into()),
-        std::cmp::Ordering::Equal => {}
+    let parsed = ParsedChunkFile::from_header(header, payload_offset)?;
+    match file_len.cmp(&parsed.end) {
+        std::cmp::Ordering::Less => Err(Rejection::ShortPayload.into()),
+        std::cmp::Ordering::Greater => Err(Rejection::TrailingBytes.into()),
+        std::cmp::Ordering::Equal => Ok(parsed),
     }
-    Ok(ParsedChunkFile {
-        identity: DataFileIdentity {
-            path: header.data_file_path,
-            size: header.data_file_size,
-            footer_digest,
-        },
-        spans,
-    })
 }
 
 /// A positioned read inside the envelope or header; a file that ends inside
@@ -284,15 +424,12 @@ fn read_header_bytes(
 }
 
 /// The spans with their offsets in the chunk file, laid out back to back
-/// from `payload_offset`, and the payload's total length. `None` when the
+/// from `chunks_offset`, and the chunks' total length. `None` when the
 /// spans are not what `ChunkFile::locate` needs, non-empty, ascending, and
 /// disjoint, or when they do not sum within `u64`, which no file can hold.
-pub(super) fn stored_spans(
-    chunks: &[ChunkSpan],
-    payload_offset: u64,
-) -> Option<(Vec<StoredSpan>, u64)> {
+fn stored_spans(chunks: &[ChunkSpan], chunks_offset: u64) -> Option<(Vec<StoredSpan>, u64)> {
     let mut spans = Vec::with_capacity(chunks.len());
-    let mut file_offset = payload_offset;
+    let mut file_offset = chunks_offset;
     let mut data_end = 0;
     for chunk in chunks {
         data_end = span_end(data_end, *chunk)?;
@@ -303,7 +440,7 @@ pub(super) fn stored_spans(
         });
         file_offset = file_offset.checked_add(chunk.length)?;
     }
-    Some((spans, file_offset - payload_offset))
+    Some((spans, file_offset - chunks_offset))
 }
 
 /// Where `span` ends in the data file, when it may follow spans ending at
@@ -335,15 +472,19 @@ fn check_identity(
     Ok(())
 }
 
-/// The header for `identity` over `chunks`, already sorted by data offset.
-/// A chunk whose bytes are not its range's length, an empty or inverted
-/// range included, is `LocalFault::ChunkLengthMismatch`; one whose range
-/// overlaps the chunk before it is `LocalFault::ChunkOverlap`. Both are
-/// checked in every build, not only in debug as `Segments::new` checks its
-/// parts: the header is written to a file that outlives the process and is
-/// trusted by every later reader, so what it promises is verified here.
+/// The header for `identity` over `verification`, the record verified
+/// `under`, and `chunks`, already sorted by data offset, with the crc32c of
+/// the payload they make. A chunk whose bytes are not its range's length,
+/// an empty or inverted range included, is `LocalFault::ChunkLengthMismatch`;
+/// one whose range overlaps the chunk before it is `LocalFault::ChunkOverlap`.
+/// Both are checked in every build, not only in debug as `Segments::new`
+/// checks its parts: the header is written to a file that outlives the
+/// process and is trusted by every later reader, so what it promises is
+/// verified here.
 pub(super) fn header_for(
     identity: &DataFileIdentity,
+    under: VerifiedUnder,
+    verification: &[u8],
     chunks: &[(Range<u64>, Bytes)],
 ) -> std::result::Result<ChunkFileHeader, LocalFault> {
     let mut spans = Vec::with_capacity(chunks.len());
@@ -368,28 +509,56 @@ pub(super) fn header_for(
         })?;
         spans.push(span);
     }
-    Ok(header_of(identity, spans))
+    let crc = chunks
+        .iter()
+        .fold(crc32c::crc32c(verification), |crc, (_, bytes)| {
+            crc32c::crc32c_append(crc, bytes)
+        });
+    Ok(header_of(
+        identity,
+        under,
+        spans,
+        approx::count(verification.len()),
+        crc,
+    ))
 }
 
-/// The header naming `identity` and `spans`, the one layout `write_chunks`
-/// writes and `chunk_file_bytes` measures.
-fn header_of(identity: &DataFileIdentity, spans: Vec<ChunkSpan>) -> ChunkFileHeader {
+/// The header naming `identity`, `under`, `spans`, a verification record of
+/// `verification_length` bytes, and the payload checksum `crc`: the one
+/// layout `write_chunks` writes and `chunk_file_bytes` measures.
+fn header_of(
+    identity: &DataFileIdentity,
+    under: VerifiedUnder,
+    spans: Vec<ChunkSpan>,
+    verification_length: u64,
+    crc: u32,
+) -> ChunkFileHeader {
     ChunkFileHeader {
         data_file_path: identity.path.clone(),
         data_file_size: identity.size,
         footer_digest: identity.footer_digest.to_vec(),
         chunks: spans,
+        verification_length,
+        payload_crc32c: Some(crc),
+        key_type: StoredKeyType::of(under.key_type).into(),
+        verifier_version: under.verifier_version,
     }
 }
 
 /// The bytes the chunk file `write_chunks` would write for `identity` over
-/// `ranges` occupies: the envelope, the encoded header, and the chunks back
-/// to back. This is what `LocalDir::index_bytes_in_use` measures for the
-/// file once written, so a disk budget checked against it at the footer
-/// stage agrees with the directory after the write. Saturates rather than
-/// wraps: every range is bounded by its data file, but a footer that lies
-/// may repeat one range in every row group.
-pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>]) -> u64 {
+/// `ranges` with a verification record of `verification_length` bytes
+/// verified `under` occupies: the envelope, the encoded header, the record,
+/// and the chunks back to back. Exact for a record of that length, since the
+/// checksum is encoded at its fixed width: this is what
+/// `LocalDir::index_bytes_in_use` measures for the file once written.
+/// Saturates rather than wraps: every range is bounded by its data file,
+/// but a footer that lies may repeat one range in every row group.
+pub(crate) fn chunk_file_bytes(
+    identity: &DataFileIdentity,
+    under: VerifiedUnder,
+    ranges: &[Range<u64>],
+    verification_length: u64,
+) -> u64 {
     let spans = ranges
         .iter()
         .map(|range| ChunkSpan {
@@ -397,24 +566,35 @@ pub(crate) fn chunk_file_bytes(identity: &DataFileIdentity, ranges: &[Range<u64>
             length: range.end.saturating_sub(range.start),
         })
         .collect::<Vec<_>>();
-    let payload = spans
+    let chunk_bytes = spans
         .iter()
         .map(|span| span.length)
         .fold(0, u64::saturating_add);
-    let header = approx::count(header_of(identity, spans).encoded_len());
-    HEADER_OFFSET.saturating_add(header).saturating_add(payload)
+    let header = header_of(identity, under, spans, verification_length, 0);
+    HEADER_OFFSET
+        .saturating_add(approx::count(header.encoded_len()))
+        .saturating_add(verification_length)
+        .saturating_add(chunk_bytes)
 }
 
 /// Writes one chunk file at `path`, which must not exist: the magic byte,
 /// the version byte, the little-endian `u32` length of the encoded header,
-/// the header, then every chunk's bytes back to back in `chunks` order,
-/// synced to disk before it returns. `chunks` is in the header's span
-/// order. Returns the handle it wrote through, open for reading, so the
-/// caller reads the file this call wrote and not whatever later lands at
-/// its name.
+/// the header, the verification record, then every chunk's bytes back to
+/// back in `chunks` order, which is the header's span order. Returns the
+/// handle it wrote through, open for reading, so the caller reads the file
+/// this call wrote and not whatever later lands at its name.
+///
+/// The file is not synced. A crash can leave it holding fewer bytes than
+/// were written, or its length with blocks never written, and a reader
+/// rejects either: the first by its length, the second by the payload
+/// checksum. What `write_chunks` promises is only that no reader sees a
+/// partial file under its final name, which the rename gives; losing a file
+/// to a crash costs one fetch of its chunks, since the directory is
+/// disposable.
 pub(super) fn write_envelope(
     path: &Path,
     header: &ChunkFileHeader,
+    verification: &[u8],
     chunks: &[(Range<u64>, Bytes)],
 ) -> std::result::Result<File, LocalFault> {
     let encoded = header.encode_to_vec();
@@ -432,11 +612,11 @@ pub(super) fn write_envelope(
     file.write_all(&[CHUNK_FILE_MAGIC, CHUNK_FILE_VERSION])
         .and_then(|()| file.write_all(&header_len.to_le_bytes()))
         .and_then(|()| file.write_all(&encoded))
+        .and_then(|()| file.write_all(verification))
         .map_err(LocalFault::Io)?;
     for (_, bytes) in chunks {
         file.write_all(bytes).map_err(LocalFault::Io)?;
     }
-    file.sync_all().map_err(LocalFault::Io)?;
     Ok(file)
 }
 
@@ -469,14 +649,15 @@ mod tests {
     use crate::local::format::{
         CHUNK_FILE_MAGIC, CHUNK_FILE_VERSION, ChunkFileHeader, ChunkSpan, HEADER_OFFSET,
         LENGTH_OFFSET, LENGTH_PREFIX_BYTES, MAGIC_OFFSET, MAX_HEADER_BYTES, ParseFailure,
-        Rejection, StoredSpan, VERSION_OFFSET, header_for, hex, validate, write_envelope,
+        Rejection, StoredKeyType, StoredSpan, VERSION_OFFSET, header_for, hex, validate,
+        write_envelope,
     };
     use crate::local::testing::{
         DATA_PATH, DATA_SIZE, EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, FOOTER_DIGEST,
-        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, chunk_file, chunks, entries, identity,
-        inverted_range, open, overwrite, payload_len, range_len, write,
+        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks, entries,
+        identity, inverted_range, open, overwrite, payload_len, range_len, write,
     };
-    use crate::local::{DIGEST_BYTES, DataFileIdentity, LocalDir, LocalFault};
+    use crate::local::{ChunkFileLookup, DIGEST_BYTES, DataFileIdentity, LocalDir, LocalFault};
 
     /// The final component of `DATA_PATH`, which no hex name can contain.
     const DATA_FILE_NAME: &str = "part-00000.parquet";
@@ -495,6 +676,18 @@ mod tests {
     const OVERLAPPING_RANGE: Range<u64> = 104..108;
     /// A byte appended after the payload.
     const EXTRA: &[u8] = b"!";
+    /// A key type value no build assigns.
+    const UNKNOWN_KEY_TYPE: i32 = 99;
+
+    /// The header `write` writes for the fixture.
+    fn fixture_header() -> ChunkFileHeader {
+        header_for(&identity(), UNDER, VERIFICATION, &chunks()).unwrap()
+    }
+
+    /// Writes the fixture's record and chunks at `path` under `header`.
+    fn write_under(path: &Path, header: &ChunkFileHeader) {
+        write_envelope(path, header, VERIFICATION, &chunks()).unwrap();
+    }
 
     fn at(offset: u64) -> usize {
         approx::length(offset)
@@ -705,16 +898,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (local, _) = open(dir.path());
         let path = chunk_file(&local);
-        let mut swapped = header_for(&identity(), &chunks()).unwrap();
+        let mut swapped = fixture_header();
         swapped.chunks.reverse();
-        let mut overlapping = header_for(&identity(), &chunks()).unwrap();
+        let mut overlapping = fixture_header();
         overlapping.chunks[1].data_offset = OVERLAPPING_RANGE.start;
-        let mut empty = header_for(&identity(), &chunks()).unwrap();
+        let mut empty = fixture_header();
         empty.chunks[0].length = 0;
-        let mut past_the_end = header_for(&identity(), &chunks()).unwrap();
+        let mut past_the_end = fixture_header();
         past_the_end.chunks[1].data_offset = u64::MAX - 1;
-        for header in [swapped, overlapping, empty, past_the_end] {
-            write_envelope(&path, &header, &chunks()).unwrap();
+        let mut record_past_the_end = fixture_header();
+        record_past_the_end.verification_length = u64::MAX - 1;
+        for header in [
+            swapped,
+            overlapping,
+            empty,
+            past_the_end,
+            record_past_the_end,
+        ] {
+            write_under(&path, &header);
             assert_eq!(rejection_of(&path, &identity()), Rejection::SpanLayout);
             assert!(local.chunks_for(&identity()).unwrap().is_none());
             fs::remove_file(&path).unwrap();
@@ -726,9 +927,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (local, _) = open(dir.path());
         let path = chunk_file(&local);
-        let mut header = header_for(&identity(), &chunks()).unwrap();
+        let mut header = fixture_header();
         header.footer_digest = SHORT_DIGEST.to_vec();
-        write_envelope(&path, &header, &chunks()).unwrap();
+        write_under(&path, &header);
         assert_eq!(
             rejection_of(&path, &identity()),
             Rejection::DigestLength {
@@ -736,6 +937,57 @@ mod tests {
             }
         );
         assert!(local.chunks_for(&identity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_validate_missing_checksum_and_unknown_key_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let path = chunk_file(&local);
+        let mut unchecked = fixture_header();
+        unchecked.payload_crc32c = None;
+        let mut unknown = fixture_header();
+        unknown.key_type = UNKNOWN_KEY_TYPE;
+        let mut unspecified = fixture_header();
+        unspecified.key_type = StoredKeyType::Unspecified.into();
+        let cases = [
+            (unchecked, Rejection::MissingChecksum),
+            (
+                unknown,
+                Rejection::UnknownKeyType {
+                    value: UNKNOWN_KEY_TYPE,
+                },
+            ),
+            (unspecified, Rejection::UnknownKeyType { value: 0 }),
+        ];
+        for (header, expected) in cases {
+            write_under(&path, &header);
+            assert_eq!(rejection_of(&path, &identity()), expected);
+            assert!(matches!(
+                local.lookup(&identity()).unwrap(),
+                ChunkFileLookup::Rejected(rejection) if rejection == expected
+            ));
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_validate_a_record_longer_than_the_file_holds_is_a_short_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let path = chunk_file(&local);
+        let mut header = fixture_header();
+        header.verification_length += 1;
+        write_under(&path, &header);
+        assert_eq!(rejection_of(&path, &identity()), Rejection::ShortPayload);
+    }
+
+    #[test]
+    fn test_stored_key_type_round_trips_every_key_type() {
+        for key_type in KeyType::ALL {
+            let stored: i32 = StoredKeyType::of(key_type).into();
+            assert_eq!(StoredKeyType::key_type(stored), Some(key_type));
+        }
     }
 
     #[test]
@@ -770,7 +1022,7 @@ mod tests {
         let mut reversed = chunks();
         reversed.reverse();
         let disk = local
-            .write_chunks(&identity(), reversed.into_iter())
+            .write_chunks(&identity(), UNDER, VERIFICATION, reversed.into_iter())
             .unwrap();
         let bytes = fs::read(chunk_file(&local)).unwrap();
 
@@ -779,6 +1031,7 @@ mod tests {
         let header_len = at(u64::from(header_len(&chunk_file(&local))));
         let header_end = at(HEADER_OFFSET) + header_len;
         let header = ChunkFileHeader::decode(&bytes[at(HEADER_OFFSET)..header_end]).unwrap();
+        let payload = [VERIFICATION, FIRST_BYTES, SECOND_BYTES].concat();
         assert_eq!(
             header,
             ChunkFileHeader {
@@ -795,27 +1048,37 @@ mod tests {
                         length: range_len(&SECOND_RANGE),
                     },
                 ],
+                verification_length: approx::count(VERIFICATION.len()),
+                payload_crc32c: Some(crc32c::crc32c(&payload)),
+                key_type: StoredKeyType::of(UNDER.key_type).into(),
+                verifier_version: UNDER.verifier_version,
             }
         );
         assert_eq!(header.encoded_len(), header_len);
-        assert_eq!(&bytes[header_end..], [FIRST_BYTES, SECOND_BYTES].concat());
+        assert_eq!(&bytes[header_end..], payload);
         assert_eq!(bytes.len(), header_end + at(payload_len()));
         assert_eq!(
             approx::count(bytes.len()),
-            chunk_file_bytes(&identity(), &[FIRST_RANGE, SECOND_RANGE])
+            chunk_file_bytes(
+                &identity(),
+                UNDER,
+                &[FIRST_RANGE, SECOND_RANGE],
+                approx::count(VERIFICATION.len())
+            )
         );
+        let chunks_start = approx::count(header_end + VERIFICATION.len());
         assert_eq!(
             disk.shared.spans,
             vec![
                 StoredSpan {
                     data_offset: FIRST_RANGE.start,
                     length: range_len(&FIRST_RANGE),
-                    file_offset: approx::count(header_end),
+                    file_offset: chunks_start,
                 },
                 StoredSpan {
                     data_offset: SECOND_RANGE.start,
                     length: range_len(&SECOND_RANGE),
-                    file_offset: approx::count(header_end) + range_len(&FIRST_RANGE),
+                    file_offset: chunks_start + range_len(&FIRST_RANGE),
                 },
             ]
         );
@@ -832,6 +1095,8 @@ mod tests {
     ) -> (u64, u64, u64) {
         let result = local.write_chunks(
             &identity(),
+            UNDER,
+            VERIFICATION,
             std::iter::once((range, Bytes::from_static(bytes))),
         );
         let Err(Error::Local {
@@ -874,7 +1139,7 @@ mod tests {
             (OVERLAPPING_RANGE, Bytes::from_static(SECOND_BYTES)),
             (FIRST_RANGE, Bytes::from_static(FIRST_BYTES)),
         ];
-        let result = local.write_chunks(&identity(), overlapping.into_iter());
+        let result = local.write_chunks(&identity(), UNDER, VERIFICATION, overlapping.into_iter());
         let Err(Error::Local {
             path,
             fault: LocalFault::ChunkOverlap { start, end },
@@ -899,6 +1164,8 @@ mod tests {
             (Rejection::TruncatedHeader, "truncated_header"),
             (Rejection::UndecodableHeader, "undecodable_header"),
             (Rejection::DigestLength { len: 0 }, "digest_length"),
+            (Rejection::MissingChecksum, "missing_checksum"),
+            (Rejection::UnknownKeyType { value: 0 }, "unknown_key_type"),
             (Rejection::SpanLayout, "span_layout"),
             (Rejection::ShortPayload, "short_payload"),
             (Rejection::TrailingBytes, "trailing_bytes"),
@@ -906,6 +1173,11 @@ mod tests {
             (Rejection::SizeMismatch, "size_mismatch"),
             (Rejection::DigestMismatch, "digest_mismatch"),
             (Rejection::NameMismatch, "name_mismatch"),
+            (
+                Rejection::VerificationTooLarge { len: 0, most: 0 },
+                "verification_too_large",
+            ),
+            (Rejection::ChecksumMismatch, "checksum_mismatch"),
         ];
         for (rejection, name) in cases {
             assert_eq!(rejection.to_string(), name);

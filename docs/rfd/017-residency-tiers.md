@@ -4,6 +4,11 @@
 > system's page cache serves without blocking runs on the worker; a read
 > that would block still runs on the blocking pool.
 
+> Updated 2026-09-29: a chunk file stores what verifying its keys
+> established and a checksum of its payload, and a restart trusts a file
+> whose checksum and verification context match without decoding a key;
+> chunk files are no longer synced when written.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs, per key,
@@ -60,10 +65,18 @@ it into a refusal carrying the bytes needed and the budget, before anything
 expensive is fetched.
 
 The disk tier's chunk files are named by the data file they hold and carry
-its identity (path, size, footer digest). A data file is immutable, so a
-replica that restarts reuses every chunk file already on its disk without
-fetching the chunks again, and a generation that drops a file deletes its
-chunk file. Pages are read from the chunk files with explicit positioned
+its identity (path, size, footer digest). Each also stores what verifying
+the file's keys established (the fences, each row group's first and last
+key, the longest key), the key type and the version of the verifier's rules
+it was established under, and a crc32c of everything after its header. A
+data file is immutable, so a replica that restarts reuses every chunk file
+already on its disk whose identity, verification context, and checksum
+match, without fetching the chunks again or decoding a key: checking the
+checksum is one sequential local read of the file. A file that fails any
+of these, or holds other chunks than the footer names, or whose stored
+result does not describe the footer's pages, is stale and is rebuilt from
+object storage as a missing file is; a stale file never fails a load. A
+generation that drops a file deletes its chunk file. Pages are read from the chunk files with explicit positioned
 reads, counted in the accounting of RFD 003 (One storage stack) beside GETs;
 the operating system's page cache is not the memory knob. No async worker
 waits for data from the disk: a read the operating system's page cache can
@@ -100,6 +113,14 @@ Bloom filters only, with no disk tier. Rejected: the disk tier beats the
 bloom tier on hit cost, miss cost, and memory, losing only the disk
 dependency, and would be the tier most large tables actually run; bloom
 stays for deployments that cannot attach a disk.
+
+Re-verifying a reused chunk file's keys on every restart, with a synced
+write-then-rename as the only guard against a torn file. Rejected: a
+restart over reused chunk files cost 85 to 90% of a first load's CPU on a
+four-core Linux pod, minutes for a table of a billion rows, to re-establish
+what the first load had already established from the same immutable bytes;
+a checksum over the payload turns a torn file into a stale one, which is
+what the re-verification guarded against.
 
 An index built once into a separate store beside the data, as some
 published designs do. Rejected: a second system and a second artifact to
@@ -145,8 +166,21 @@ The chunk files are the persisted index RFD 004 (Resident key-chunk index)
 rejected for the in-memory tier, where load time never made one necessary
 ([prototype findings, finding 3](../analysis/2026-09-10-prototype-findings.md#3-load-time));
 here they cost nothing extra to keep, and a restart of a disk-tier table
-fetches footers only. Their header follows the persisted-state envelope of
-RFD 011 (Configuration).
+fetches footers only and decodes no key but those of files in overlap
+groups, which a first load merges to prove key uniqueness (RFD 005
+(Generations and refresh)). Their header follows the persisted-state
+envelope of RFD 011 (Configuration); a file of another format version is
+stale, since the directory is disposable and nothing converts it. A
+change to the rules verification enforces raises the verifier's version,
+so a result established under other rules is never trusted.
+
+A chunk file is written under a temporary name and renamed into place, and
+neither the file nor the directory is synced. A crash can leave a file
+short or holding blocks never written; its length check or its checksum
+rejects it and the next load rebuilds it, and a lost rename costs one fetch
+of the file's chunks. The rename is what keeps a reader from seeing a
+partial file under its name. The checksum covers accidental damage, not a
+file changed on purpose: the directory is the replica's own.
 
 Two extensions beyond a replica's memory and disk are permitted by this
 design and not built in the first version. A fences-only tier with no local
@@ -178,7 +212,11 @@ same check.
 
 The chunk-file budget is a bound on disk, so the loader checks it against
 the `index/` directory as it is when the load begins, plus what the new
-generation would write. Several disk tables load at once, so each load
+generation would write. What a file would write is known from its footer
+but for its stored verification result, a key per key page, which is exact
+for keys of one width (longs, uuids, fixed-width binary) and estimated for
+string and binary keys as the fences' memory is; it is a small fraction of
+the chunks beside it. Several disk tables load at once, so each load
 reserves what it would write from the check until its writes finish, and
 the check counts every other load's reservation too: two loads that fit
 alone but not together cannot both pass, and which one is refused depends

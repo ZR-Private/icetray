@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::format::{ParsedChunkFile, StoredSpan};
-use super::{LocalFault, local_fault};
+use super::format::{ParsedChunkFile, Rejection, StoredSpan};
+use super::{LocalFault, VerifiedUnder, local_fault};
 use crate::approx;
 use crate::blocking::on_blocking_pool;
 use crate::error::{Error, Result};
@@ -25,8 +25,14 @@ pub struct DiskChunks {
     pub(super) shared: Arc<ChunkFile>,
 }
 
+/// The read size of the checksum pass over a reused chunk file's chunks: a
+/// mebibyte, large enough that the sequential read runs at the disk's
+/// throughput and the checksum at the processor's, small enough that the
+/// pass holds one buffer of it however large the file.
+const CHECKSUM_READ_BYTES: u64 = 1024 * 1024;
+
 /// What every clone of a `DiskChunks` shares: the open file, the span
-/// table, and the counter.
+/// table, what the header says of the payload, and the counter.
 #[derive(Debug)]
 pub(super) struct ChunkFile {
     /// Read only through positioned reads, so the handle has no cursor to
@@ -36,6 +42,16 @@ pub(super) struct ChunkFile {
     path: PathBuf,
     /// Ascending by data offset, so a page's span is found by binary search.
     pub(super) spans: Vec<StoredSpan>,
+    /// What the verification record was computed under.
+    under: VerifiedUnder,
+    /// Where the payload, and with it the verification record, starts.
+    payload_offset: u64,
+    /// The verification record's length.
+    verification_length: u64,
+    /// The payload's checksum as the header carries it.
+    payload_crc32c: u32,
+    /// Where the payload ends: the file's length when it was parsed.
+    end: u64,
     stats: Arc<IoStats>,
 }
 
@@ -51,6 +67,11 @@ impl DiskChunks {
                 file,
                 path,
                 spans: parsed.spans,
+                under: parsed.under,
+                payload_offset: parsed.payload_offset,
+                verification_length: parsed.verification_length,
+                payload_crc32c: parsed.payload_crc32c,
+                end: parsed.end,
                 stats,
             }),
         }
@@ -86,12 +107,72 @@ impl DiskChunks {
             .map_err(|canceled| self.shared.error(LocalFault::Join(canceled)))?
     }
 
-    /// Whether one stored chunk holds the whole of `range`, so `page` would
-    /// serve it: what the index checks before it skips a chunk fetch on a
-    /// reused file, since the identity does not say which column's chunks
-    /// the file holds.
-    pub(crate) fn holds(&self, range: &Range<u64>) -> bool {
-        self.shared.locate(range.start, range.end).is_some()
+    /// What the file's verification record was computed under, as its
+    /// header says.
+    pub(crate) fn verified_under(&self) -> VerifiedUnder {
+        self.shared.under
+    }
+
+    /// Whether the stored chunks are exactly `ranges`, in any order: what
+    /// the index checks before it trusts a reused file, since the identity
+    /// does not say which column's chunks the file holds, and the
+    /// verification record describes those chunks and no others.
+    pub(crate) fn stores_exactly(&self, ranges: &[Range<u64>]) -> bool {
+        let mut wanted: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|range| (range.start, range.end.saturating_sub(range.start)))
+            .collect();
+        wanted.sort_unstable();
+        let stored = self
+            .shared
+            .spans
+            .iter()
+            .map(|span| (span.data_offset, span.length));
+        wanted.into_iter().eq(stored)
+    }
+
+    /// The verification record, once the crc32c of the whole payload (the
+    /// record and every chunk) matches the header's: one sequential pass
+    /// over the file after the header, the chunks in reads of
+    /// `CHECKSUM_READ_BYTES`, and no page decoded. `Err` is the check the
+    /// file failed: `Rejection::VerificationTooLarge` for a record longer
+    /// than `most`, checked before anything is read or allocated, so a
+    /// corrupt length cannot ask for gigabytes; `Rejection::ShortPayload`
+    /// for a file that ends early, cut short since it was opened; and
+    /// `Rejection::ChecksumMismatch`. The pass validates the file, as the
+    /// header reads do, and is not a local read in the sense of RFD 003; it
+    /// is synchronous file I/O, for the blocking pool. Only an I/O failure
+    /// is an error.
+    pub(crate) fn checked_verification(
+        &self,
+        most: u64,
+    ) -> Result<std::result::Result<Vec<u8>, Rejection>> {
+        let shared = &self.shared;
+        let len = shared.verification_length;
+        if len > most {
+            return Ok(Err(Rejection::VerificationTooLarge { len, most }));
+        }
+        let mut record = vec![0u8; approx::length(len)];
+        if !shared.read_exact_or_eof(&mut record, shared.payload_offset)? {
+            return Ok(Err(Rejection::ShortPayload));
+        }
+        let mut crc = crc32c::crc32c(&record);
+        let mut offset = shared.payload_offset + len;
+        let mut buf = Vec::new();
+        while offset < shared.end {
+            let take = (shared.end - offset).min(CHECKSUM_READ_BYTES);
+            buf.resize(approx::length(take), 0);
+            if !shared.read_exact_or_eof(&mut buf, offset)? {
+                return Ok(Err(Rejection::ShortPayload));
+            }
+            crc = crc32c::crc32c_append(crc, &buf);
+            offset += take;
+        }
+        Ok(if crc == shared.payload_crc32c {
+            Ok(record)
+        } else {
+            Err(Rejection::ChecksumMismatch)
+        })
     }
 }
 
@@ -108,6 +189,16 @@ impl ChunkFile {
             return None;
         }
         Some((span.file_offset + within, len))
+    }
+
+    /// Fills `buf` from `offset` of the chunk file by positioned read;
+    /// `false` when the file ends first.
+    fn read_exact_or_eof(&self, buf: &mut [u8], offset: u64) -> Result<bool> {
+        match self.file.read_exact_at(buf, offset) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(self.error(LocalFault::Io(error))),
+        }
     }
 
     /// `len` bytes at `offset` of the chunk file by positioned read: no seek
@@ -211,7 +302,8 @@ mod tests {
     use super::*;
     use crate::local::testing::{
         EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE, SECOND_BYTES,
-        SECOND_RANGE, inverted_range, open, range_len, write,
+        SECOND_RANGE, UNDER, VERIFICATION, chunk_file, identity, inverted_range, open, overwrite,
+        payload_len, range_len, write,
     };
     use crate::local::{DiskChunks, LocalDir, LocalFault};
 
@@ -308,24 +400,93 @@ mod tests {
     }
 
     #[test]
-    fn test_holds_is_true_for_a_range_one_span_covers_whole() {
+    fn test_stores_exactly_is_true_for_the_stored_ranges_in_any_order_alone() {
         let dir = tempfile::tempdir().unwrap();
         let (local, stats) = open(dir.path());
         let disk = write(&local);
-        for range in [FIRST_RANGE, SECOND_RANGE, INNER_RANGE, LAST_OF_FIRST] {
-            assert!(disk.holds(&range), "{range:?}");
-        }
-        for range in [
-            STRADDLING_RANGE,
-            OUTSIDE_RANGE,
-            GAP_RANGE,
-            PAST_FIRST_END,
-            EMPTY_AT_FIRST_END,
-            inverted_range(),
+        assert!(disk.stores_exactly(&[FIRST_RANGE, SECOND_RANGE]));
+        assert!(disk.stores_exactly(&[SECOND_RANGE, FIRST_RANGE]));
+        for ranges in [
+            vec![FIRST_RANGE],
+            vec![FIRST_RANGE, SECOND_RANGE, GAP_RANGE],
+            vec![INNER_RANGE, SECOND_RANGE],
+            vec![PAST_FIRST_END, SECOND_RANGE],
+            vec![],
         ] {
-            assert!(!disk.holds(&range), "{range:?}");
+            assert!(!disk.stores_exactly(&ranges), "{ranges:?}");
         }
+        assert_eq!(disk.verified_under(), UNDER);
         assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// The record a check of the whole payload returns, or the check the
+    /// file failed.
+    fn checked(disk: &DiskChunks) -> std::result::Result<Vec<u8>, Rejection> {
+        disk.checked_verification(u64::MAX).unwrap()
+    }
+
+    #[test]
+    fn test_checked_verification_returns_the_record_and_counts_no_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, stats) = open(dir.path());
+        let disk = write(&local);
+        assert_eq!(checked(&disk), Ok(VERIFICATION.to_vec()));
+        let reopened = local.chunks_for(&identity()).unwrap().unwrap();
+        assert_eq!(checked(&reopened), Ok(VERIFICATION.to_vec()));
+        assert_eq!(stats.local_reads(), 0, "a check is not a page read");
+        assert_eq!(stats.local_bytes(), 0);
+    }
+
+    #[test]
+    fn test_checked_verification_refuses_a_record_over_the_bound_before_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let disk = write(&local);
+        let len = approx::count(VERIFICATION.len());
+        assert_eq!(
+            disk.checked_verification(len - 1).unwrap(),
+            Err(Rejection::VerificationTooLarge { len, most: len - 1 })
+        );
+        assert_eq!(
+            disk.checked_verification(len).unwrap(),
+            Ok(VERIFICATION.to_vec())
+        );
+    }
+
+    #[test]
+    fn test_checked_verification_fails_for_any_payload_byte_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        write(&local);
+        let path = chunk_file(&local);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let payload_start = len - payload_len();
+        let original = std::fs::read(&path).unwrap();
+        for offset in payload_start..len {
+            let byte = original[approx::length(offset)];
+            overwrite(&path, offset, &[!byte]);
+            let disk = local.chunks_for(&identity()).unwrap().unwrap();
+            assert_eq!(checked(&disk), Err(Rejection::ChecksumMismatch), "{offset}");
+            overwrite(&path, offset, &[byte]);
+        }
+        let disk = local.chunks_for(&identity()).unwrap().unwrap();
+        assert_eq!(checked(&disk), Ok(VERIFICATION.to_vec()));
+    }
+
+    #[test]
+    fn test_checked_verification_of_a_file_cut_short_under_its_handle_is_a_short_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let disk = write(&local);
+        let path = chunk_file(&local);
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        assert_eq!(checked(&disk), Err(Rejection::ShortPayload));
     }
 
     /// Drops the chunk file's pages from the operating system's page cache,

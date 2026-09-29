@@ -13,6 +13,7 @@ mod inspect;
 mod page_header;
 mod pages;
 mod plain;
+mod record;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -481,6 +482,18 @@ enum KeyShape {
     Uuid,
 }
 
+impl KeyShape {
+    /// The key type the shape decodes keys of.
+    fn key_type(self) -> KeyType {
+        match self {
+            Self::Long => KeyType::Long,
+            Self::Str => KeyType::String,
+            Self::Bin | Self::FixedBin => KeyType::Binary,
+            Self::Uuid => KeyType::Uuid,
+        }
+    }
+}
+
 /// How the value column's values decode, fixed at build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueShape {
@@ -570,10 +583,12 @@ impl FileIndex {
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
     /// fetched.
     ///
-    /// Full keeps the chunks in memory. Disk reuses a chunk file in `local`
-    /// whose identity matches and holds every chunk (reading the chunks
-    /// back as counted local reads, no GET) or fetches them, verifies, and
-    /// writes them; it keeps no key bytes in memory. Bloom fetches and
+    /// Full keeps the chunks in memory. Disk trusts a chunk file in `local`
+    /// whose identity, verification context, and payload checksum match
+    /// and which stores exactly the key chunks, taking what verification
+    /// established from the record it stores (no GET, no chunk read, no key
+    /// decoded), or fetches the chunks, verifies them, and writes them with
+    /// that record; it keeps no key bytes in memory. Bloom fetches and
     /// verifies the chunks, drops them, and keeps the filters. Every tier
     /// keeps the footer, both page indexes of the key column, every
     /// column's offset index, and the fences; the column index of every
@@ -614,7 +629,8 @@ impl FileIndex {
         let layout = Layout::inspect(table, &handle, &loaded, key_column, value_column, key_type)?;
         let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf));
         drop(loaded);
-        let predicted = Self::predicted_resident_bytes(&metadata, layout.key_leaf, &handle);
+        let predicted =
+            Self::predicted_resident_bytes(&metadata, layout.key_leaf, key_type, &handle);
         tracing::debug!(
             path = %handle.location,
             full = predicted.full,
@@ -648,9 +664,13 @@ impl FileIndex {
     /// row group's filter is absent or one a Bloom-tier `build` refuses as
     /// `FileFault::UnplaceableBloomFilter`), and the chunk file (the
     /// envelope and the header the Disk tier writes for the handle's
-    /// identity over the key chunks, then the chunks; the identity carries
-    /// the footer digest, so `handle` has loaded its footer). Every total
-    /// saturates at `u64::MAX` rather than wrapping. Estimated: the fences, one `Key` per key page plus, for
+    /// identity over the key chunks, the verification record, then the
+    /// chunks; the identity carries the footer digest, so `handle` has
+    /// loaded its footer), except that the record, a key per key page, is
+    /// exact only for keys of one width (longs, uuids, a fixed-width binary
+    /// column) and estimated as the fences are for string and binary keys,
+    /// `key_type` saying which. Every total saturates at `u64::MAX` rather
+    /// than wrapping. Estimated: the fences, one `Key` per key page plus, for
     /// `BYTE_ARRAY` keys, the page's minimum from the column index when the
     /// file has one, which a writer may truncate, else the chunk's mean
     /// encoded bytes per value, and for `FIXED_LEN_BYTE_ARRAY` keys the
@@ -659,9 +679,12 @@ impl FileIndex {
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        key_type: KeyType,
         handle: &FileHandle,
     ) -> ResidentBytes {
-        tiers(&ResidentSet::from_footer(metadata, key_leaf, handle, None))
+        tiers(&ResidentSet::from_footer(
+            metadata, key_leaf, key_type, handle, None,
+        ))
     }
 
     /// The tier the index was built in.
@@ -687,6 +710,11 @@ impl FileIndex {
     /// Rows in the file; above zero.
     pub(crate) fn rows(&self) -> i64 {
         self.rows
+    }
+
+    /// The key type the file's keys were verified as.
+    pub(crate) fn key_type(&self) -> KeyType {
+        self.key_shape.key_type()
     }
 
     /// The leaf column index of the key.
@@ -736,6 +764,7 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.key_leaf,
+            self.key_type(),
             &self.handle,
             Some(&self.fences),
         ));
@@ -1288,9 +1317,9 @@ mod tests {
     use crate::index::page_header::{MOST_VALUE_PAGE_BYTES, PageBody, PageHeader};
     use crate::index::testing::{
         BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened,
-        PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, contract_rows,
-        fault_of, group_rows, header_at, key_for, location, moved_by_header, pages_of,
-        predicted_of, row_of, stepped, store, store_file, value_for, value_of_len,
+        PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, absent_after,
+        contract_rows, fault_of, group_rows, header_at, key_for, location, moved_by_header,
+        pages_of, predicted_of, row_of, stepped, store, store_file, value_for, value_of_len,
         with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
     };
     use crate::storage::IoStats;
@@ -1319,25 +1348,6 @@ mod tests {
     const MISALIGNED_PAGE_BYTES: usize = 16 * 1024;
     /// Every `NULL_EVERY`th value of the nullable fixture is null.
     const NULL_EVERY: usize = 7;
-    /// The key just after `key` in served order, which no fixture holds:
-    /// keys step by `KEY_STEP`, and strings and bytes are extended.
-    fn absent_after(key: &Key) -> Key {
-        match key {
-            Key::Long(value) => Key::Long(value + 1),
-            Key::Str(text) => Key::Str(format!("{text}x")),
-            Key::Bytes(bytes) => {
-                let mut longer = bytes.clone();
-                longer.push(0);
-                Key::Bytes(longer)
-            }
-            Key::Uuid(uuid) => {
-                let mut next = *uuid;
-                next[UUID_BYTES - 1] += 1;
-                Key::Uuid(next)
-            }
-        }
-    }
-
     /// A key below every key `key_for` produces.
     fn below_range(key_type: KeyType) -> Key {
         match key_type {

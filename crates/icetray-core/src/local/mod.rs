@@ -6,14 +6,18 @@
 //! `cache/`; and positioned, counted reads of the pages the chunk files
 //! hold. Everything here is rebuilt from object storage and needs no backup.
 //!
-//! A chunk file's payload carries no checksum: the header's identity covers
-//! the data file's footer and the length check covers the payload's extent,
-//! and nothing covers the payload's bytes.
+//! A chunk file also stores what verifying its keys established (the
+//! verification record, which the index encodes) and a crc32c of its
+//! payload, so a restart trusts a file whose identity, verification context,
+//! and checksum match without decoding a key. The checksum is what makes an
+//! unsynced write safe: a file a crash tore fails it and is rebuilt, and the
+//! write-then-rename keeps a reader from seeing a partial file under its
+//! name.
 
 mod disk;
 mod format;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
@@ -25,17 +29,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 pub use disk::{DiskChunks, DiskLevel};
-pub(crate) use format::chunk_file_bytes;
 use format::{
-    HEADER_OFFSET, MAX_HEADER_BYTES, ParseFailure, ParsedChunkFile, Rejection, chunk_name,
-    header_for, parse_chunk_file, stored_spans, validate, write_envelope,
+    HEADER_OFFSET, MAX_HEADER_BYTES, ParseFailure, ParsedChunkFile, chunk_name, header_for,
+    parse_chunk_file, validate, write_envelope,
 };
+pub(crate) use format::{Rejection, chunk_file_bytes};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::approx;
 use crate::config::LocalConfig;
 use crate::error::{Error, RefusalReason, Result};
+use crate::key::KeyType;
 use crate::storage::IoStats;
 
 /// The directory under `LocalConfig::dir` that holds chunk files.
@@ -44,7 +49,7 @@ const INDEX_DIR: &str = "index";
 /// level.
 const CACHE_DIR: &str = "cache";
 /// The extension of a chunk file still being written. A file carrying it is
-/// incomplete: `write_chunks` renames it away once it is synced, and
+/// incomplete: `write_chunks` renames it away once it is written, and
 /// `retain` deletes any that no writer in this process has open, which is
 /// what a process that died mid-write leaves behind.
 const TEMP_EXTENSION: &str = "tmp";
@@ -73,6 +78,31 @@ pub struct DataFileIdentity {
     /// `digest` of the footer bytes the loader read. This module stores and
     /// compares it and never computes it.
     pub footer_digest: [u8; DIGEST_BYTES],
+}
+
+/// What a chunk file's verification record was computed under (RFD 017):
+/// the key type the table verifies its keys as, and the version of the
+/// rules verification enforced (`index::VERIFIER_VERSION`). The header
+/// carries it, and a record computed under anything but the reader's is
+/// never trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedUnder {
+    /// The key type the keys were verified as.
+    pub(crate) key_type: KeyType,
+    /// The verifier's rules.
+    pub(crate) verifier_version: u32,
+}
+
+/// What `LocalDir::lookup` finds under a data file's chunk file name.
+#[derive(Debug)]
+pub(crate) enum ChunkFileLookup {
+    /// No file.
+    Absent,
+    /// A file that fails a check of its envelope, header, or identity: the
+    /// check it failed.
+    Rejected(Rejection),
+    /// A file that passes them.
+    Found(DiskChunks),
 }
 
 /// Why the local directory failed; the set is closed. The path the
@@ -136,8 +166,9 @@ pub enum LocalFault {
 ///
 /// Every method is synchronous and does its file I/O on the caller's
 /// thread; the caller decides whether to run one on a blocking thread. The
-/// header reads that validate or sweep chunk files are not local reads in
-/// the sense of RFD 003; only `DiskChunks::page` counts one.
+/// header reads that validate or sweep chunk files, and the payload read
+/// that checks a reused file's checksum, are not local reads in the sense
+/// of RFD 003; only `DiskChunks::page` counts one.
 #[derive(Debug)]
 pub struct LocalDir {
     index_dir: PathBuf,
@@ -179,51 +210,68 @@ impl LocalDir {
     }
 
     /// The chunk file for a data file, identified by path, size, and footer
-    /// digest; `None` if absent or stale. A file that fails a check of its
-    /// envelope, header, or identity is logged at warn with the check it
-    /// failed and treated as absent; `retain` deletes it later. Only an I/O
-    /// failure is an error.
+    /// digest; `None` if absent or failing a check of its envelope, header,
+    /// or identity (`lookup` says which). Only an I/O failure is an error.
     pub fn chunks_for(&self, identity: &DataFileIdentity) -> Result<Option<DiskChunks>> {
-        let path = self.chunk_path(identity);
-        let opened = open_parsed(&path, |file| validate(file, identity))?;
-        Ok(opened
-            .map(|(file, parsed)| DiskChunks::new(file, path, parsed, Arc::clone(&self.stats))))
+        Ok(match self.lookup(identity)? {
+            ChunkFileLookup::Found(disk) => Some(disk),
+            ChunkFileLookup::Absent | ChunkFileLookup::Rejected(_) => None,
+        })
     }
 
-    /// Writes verified key chunks and returns the handle the index keeps.
-    /// The header names every span before the first payload byte, so the
-    /// chunks are collected first and sorted by data offset; one file's
-    /// chunks is the disk tier's stated load peak (RFD 017). The file is
-    /// written to a temporary name unique to this call, synced, and renamed
-    /// over `index/<name>`, so a reader never sees a partial file and two
-    /// writers of one identity never share a temporary file; the handle
-    /// returned is over the file this call wrote, whichever writer's rename
-    /// lands last. The directory itself is not synced: durability across a
-    /// power loss is not promised, since the directory is disposable and a
-    /// lost rename costs one re-fetch. Every chunk's bytes must be its
-    /// range's length and no two chunks may overlap.
+    /// What is under the chunk file name for a data file: nothing, a file
+    /// failing a check of its envelope, header, or identity with the check
+    /// it failed, or a file passing them. Reads the envelope and header and
+    /// no payload byte; the caller that trusts the file checks the payload
+    /// (`DiskChunks::checked_verification`), and logs whatever makes it
+    /// rebuild the file. A rejected file stays until `write_chunks` replaces
+    /// it or `retain` deletes it. Only an I/O failure is an error.
+    pub(crate) fn lookup(&self, identity: &DataFileIdentity) -> Result<ChunkFileLookup> {
+        let path = self.chunk_path(identity);
+        Ok(match open_parsed(&path, |file| validate(file, identity))? {
+            Opened::Absent => ChunkFileLookup::Absent,
+            Opened::Rejected(rejection) => ChunkFileLookup::Rejected(rejection),
+            Opened::Parsed(file, parsed) => {
+                ChunkFileLookup::Found(DiskChunks::new(file, path, parsed, Arc::clone(&self.stats)))
+            }
+        })
+    }
+
+    /// Writes verified key chunks with their verification record, the bytes
+    /// the index encoded from what verifying them established `under`, and
+    /// returns the handle the index keeps. The header names every span and
+    /// the payload's checksum before the first payload byte, so the chunks
+    /// are collected first and sorted by data offset; one file's chunks is
+    /// the disk tier's stated load peak (RFD 017). The file is written to a
+    /// temporary name unique to this call and renamed over `index/<name>`,
+    /// so a reader never sees a partial file under that name and two writers
+    /// of one identity never share a temporary file; the handle returned is
+    /// over the file this call wrote, whichever writer's rename lands last.
+    /// Neither the file nor the directory is synced: a file a crash tore,
+    /// cut short or holding blocks never written, fails its length check or
+    /// its payload checksum and is rebuilt, and a lost rename costs one
+    /// re-fetch, since the directory is disposable. Every chunk's bytes must
+    /// be its range's length and no two chunks may overlap.
     pub(crate) fn write_chunks(
         &self,
         identity: &DataFileIdentity,
+        under: VerifiedUnder,
+        verification: &[u8],
         chunks: impl Iterator<Item = (Range<u64>, Bytes)>,
     ) -> Result<DiskChunks> {
         let path = self.chunk_path(identity);
         let mut chunks: Vec<(Range<u64>, Bytes)> = chunks.collect();
         chunks.sort_by_key(|(range, _)| range.start);
-        let header =
-            header_for(identity, &chunks).map_err(|fault| local_fault(path.clone(), fault))?;
+        let header = header_for(identity, under, verification, &chunks)
+            .map_err(|fault| local_fault(path.clone(), fault))?;
         let temp = self.begin_temp(&path);
-        let file = write_envelope(&temp.path, &header, &chunks)
+        let file = write_envelope(&temp.path, &header, verification, &chunks)
             .map_err(|fault| local_fault(temp.path.clone(), fault))?;
         fs::rename(&temp.path, &path).map_err(|error| local_error(path.clone(), error))?;
         drop(temp);
-        let encoded_len = approx::count(header.encoded_len());
-        let (spans, _) = stored_spans(&header.chunks, HEADER_OFFSET + encoded_len)
-            .expect("header_for admits only non-empty, ascending, disjoint spans");
-        let parsed = ParsedChunkFile {
-            identity: identity.clone(),
-            spans,
-        };
+        let payload_offset = HEADER_OFFSET + approx::count(header.encoded_len());
+        let parsed = ParsedChunkFile::from_header(header, payload_offset)
+            .expect("header_for writes only headers a reader accepts");
         Ok(DiskChunks::new(file, path, parsed, Arc::clone(&self.stats)))
     }
 
@@ -362,8 +410,13 @@ impl LocalDir {
         if is_temp(path) {
             return Ok(self.lock_in_flight().contains(path));
         }
-        let Some((_file, parsed)) = open_parsed(path, parse_chunk_file)? else {
-            return Ok(false);
+        let parsed = match open_parsed(path, parse_chunk_file)? {
+            Opened::Parsed(_file, parsed) => parsed,
+            Opened::Absent => return Ok(false),
+            Opened::Rejected(rejection) => {
+                warn_rejected(path, rejection);
+                return Ok(false);
+            }
         };
         if path != self.chunk_path(&parsed.identity) {
             warn_rejected(path, Rejection::NameMismatch);
@@ -452,24 +505,30 @@ fn remove_if_present(path: &Path, len: u64) -> Result<u64> {
     }
 }
 
-/// Opens the file at `path` and parses it with `parse`: `None` when there
-/// is no file or it fails a check, which is logged at warn with the check it
-/// failed; only an I/O failure is an error.
+/// A file under `index/` as `open_parsed` found it.
+enum Opened<T> {
+    /// No file.
+    Absent,
+    /// A file that failed a check.
+    Rejected(Rejection),
+    /// A file that passed, open, with what the parse took from it.
+    Parsed(File, T),
+}
+
+/// Opens the file at `path` and parses it with `parse`; only an I/O failure
+/// is an error.
 fn open_parsed<T>(
     path: &Path,
     parse: impl FnOnce(&File) -> std::result::Result<T, ParseFailure>,
-) -> Result<Option<(File, T)>> {
+) -> Result<Opened<T>> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Opened::Absent),
         Err(error) => return Err(local_error(path.to_path_buf(), error)),
     };
     match parse(&file) {
-        Ok(parsed) => Ok(Some((file, parsed))),
-        Err(ParseFailure::Rejected(rejection)) => {
-            warn_rejected(path, rejection);
-            Ok(None)
-        }
+        Ok(parsed) => Ok(Opened::Parsed(file, parsed)),
+        Err(ParseFailure::Rejected(rejection)) => Ok(Opened::Rejected(rejection)),
         Err(ParseFailure::Io(error)) => Err(local_error(path.to_path_buf(), error)),
     }
 }
@@ -485,9 +544,9 @@ fn local_error(path: PathBuf, error: io::Error) -> Error {
     local_fault(path, LocalFault::Io(error))
 }
 
-/// The one warn line for a chunk file that failed a check: the path, the
-/// check, and the check's fields, so a reader knows which file to look at,
-/// why it was skipped, and the value that failed.
+/// The one warn line for a chunk file `retain` deletes because it failed a
+/// check: the path, the check, and the check's fields, so a reader knows
+/// which file was deleted, why, and the value that failed.
 fn warn_rejected(path: &Path, rejection: Rejection) {
     tracing::warn!(
         path = %path.display(),
@@ -505,12 +564,11 @@ mod tests {
     use crate::local::format::{CHUNK_FILE_MAGIC, MAGIC_OFFSET, chunk_name};
     use crate::local::testing::{
         DATA_SIZE, DISK_CACHE_BYTES, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE,
-        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, chunk_file, chunks, config, entries, identity,
-        open, overwrite, payload_len, write,
+        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks, config,
+        entries, identity, open, overwrite, payload_len, stale_temp, write, write_for,
     };
     use crate::local::{
-        CACHE_DIR, DataFileIdentity, INDEX_DIR, LocalDir, LocalFault, TEMP_EXTENSION, is_temp,
-        remove_if_present,
+        CACHE_DIR, DataFileIdentity, INDEX_DIR, LocalDir, LocalFault, is_temp, remove_if_present,
     };
 
     /// What a leftover temporary file holds.
@@ -518,11 +576,6 @@ mod tests {
     /// The bytes a second writer of the same identity stores at
     /// `FIRST_RANGE`, distinguishable from `FIRST_BYTES`.
     const RIVAL_BYTES: &[u8] = b"ABCDEF";
-    /// The path of a temporary file no writer in this process has open:
-    /// what a process that died mid-write leaves behind.
-    fn stale_temp(path: &Path) -> PathBuf {
-        path.with_extension(TEMP_EXTENSION)
-    }
 
     #[test]
     fn test_open_creates_index_and_cache_dirs() {
@@ -566,7 +619,12 @@ mod tests {
         let written = write(&local);
         assert_eq!(
             local.index_bytes_in_use().unwrap(),
-            chunk_file_bytes(&identity(), &[FIRST_RANGE, SECOND_RANGE])
+            chunk_file_bytes(
+                &identity(),
+                UNDER,
+                &[FIRST_RANGE, SECOND_RANGE],
+                approx::count(VERIFICATION.len())
+            )
         );
         let found = local.chunks_for(&identity()).unwrap().unwrap();
         assert_eq!(found.shared.spans, written.shared.spans);
@@ -664,9 +722,7 @@ mod tests {
             path: OTHER_PATH.to_string(),
             ..identity()
         };
-        local
-            .write_chunks(&dropped, chunks().into_iter().take(1))
-            .unwrap();
+        write_for(&local, &dropped, chunks().into_iter().take(1).collect());
         let dropped_len = fs::metadata(local.chunk_path(&dropped)).unwrap().len();
         assert_eq!(entries(&local.index_dir).len(), 2);
 
@@ -749,9 +805,7 @@ mod tests {
             path: OTHER_PATH.to_string(),
             ..identity()
         };
-        local
-            .write_chunks(&other, chunks().into_iter().take(1))
-            .unwrap();
+        write_for(&local, &other, chunks().into_iter().take(1).collect());
         let expected: u64 = entries(&local.index_dir)
             .iter()
             .map(|path| fs::metadata(path).unwrap().len())
@@ -827,8 +881,11 @@ mod tests {
         let (local, _) = open(dir.path());
         let rival = vec![(FIRST_RANGE, Bytes::from_static(RIVAL_BYTES))];
         let (first, second) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| local.write_chunks(&identity(), chunks().into_iter()));
-            let second = scope.spawn(|| local.write_chunks(&identity(), rival.into_iter()));
+            let first = scope.spawn(|| {
+                local.write_chunks(&identity(), UNDER, VERIFICATION, chunks().into_iter())
+            });
+            let second = scope
+                .spawn(|| local.write_chunks(&identity(), UNDER, VERIFICATION, rival.into_iter()));
             (first.join().unwrap(), second.join().unwrap())
         });
         let first = first.unwrap();

@@ -55,11 +55,11 @@ the re-exports at the crate root (`icetray_core::FileIndex`).
 | `contract` | the serving layout's numbers as named constants (page rows, value page byte bound, the page cache's disk block, file size target, key length cap and advice); a shared constant that is not a layout number lives with what it bounds (`key`, `check::thresholds`, `config`) | 002, 008 |
 | `config` | the configuration schema and its validation; TOML and JSON parsing; defaults | 011 |
 | `storage` | every byte read from object storage: store per prefix, location rewriting, request counting, credential chain with cached refresh, hedging | 003, 013 |
-| `local` | the optional local directory: chunk files for disk residency (naming by data-file identity, reuse on restart, deletion with the generation), a disk budget, local-read counting, and the `DiskLevel` handle `cache` uses for its disk level. A directory module: `local/mod.rs` holds the public surface and `LocalDir`, `local/format.rs` the chunk file format (envelope, header, checks, writer), `local/disk.rs` the read side (`DiskChunks`, `DiskLevel`), and `local/testing.rs` the fixtures the three files' tests share | 017, 012 |
+| `local` | the optional local directory: chunk files for disk residency (naming by data-file identity, a stored verification record and payload checksum so a restart reuses them without decoding a key, deletion with the generation), a disk budget, local-read counting, and the `DiskLevel` handle `cache` uses for its disk level. A directory module: `local/mod.rs` holds the public surface and `LocalDir`, `local/format.rs` the chunk file format (envelope, header, checks, writer), `local/disk.rs` the read side (`DiskChunks` with its checksum pass, `DiskLevel`), and `local/testing.rs` the fixtures and chunk-file edits the three files' tests and the index's share | 017, 012 |
 | `catalog` | where the current metadata comes from (static root with version hint, metadata file, any catalog incl. REST); one-read change detection | 005 |
 | `manifest` | snapshot to live data files; table layout (key and value columns, bucket transform) derived from the snapshot's schema and each manifest's partition spec; delete-file refusal | 005, 009 |
 | `parquet_io` | Parquet byte access: one-GET footer load, `Segments` (in-memory `ChunkReader` that never fetches) | 004, 006 |
-| `index` | the per-file resident index: key chunks, fences, exact per-row-group ranges, `find` (no I/O), `read_value` (one page through the cache). A directory module by pipeline stage: `index/mod.rs` holds the public surface and the lookup path, `index/inspect.rs` the footer stage, `index/build.rs` the chunk stage, and `index/testing.rs` the fixtures the three stages' tests share | 004, 006 |
+| `index` | the per-file resident index: key chunks, fences, exact per-row-group ranges, `find` (no I/O), `read_value` (one page through the cache). A directory module by pipeline stage: `index/mod.rs` holds the public surface and the lookup path, `index/inspect.rs` the footer stage, `index/build.rs` the chunk stage (verification, and the Disk tier's reuse of a chunk file), `index/record.rs` the verification record a Disk-tier chunk file stores (encode, decode checked against the footer, its bound and estimate), `index/pages.rs` the pages one decode hands parquet's column reader, `index/page_header.rs` the page headers read and bounded ahead of parquet's page reader, `index/plain.rs` the in-place reader of plain byte-array key chunks, and `index/testing.rs` the fixtures the stages' tests share | 004, 006, 017 |
 | `cache` | the shared value-page cache keyed by (file, page offset) with fetch coalescing | 004 |
 | `generation` | `Generation` (one snapshot, fully indexed, deterministic file order), overlap grouping and duplicate refusal, the residency budget check at the footer stage | 005, 017 |
 | `check` | the doctor: tiers, finding codes, penalties, thresholds table | 007, 016 |
@@ -322,12 +322,18 @@ pub enum LocalFault { Io(std::io::Error), RangeNotResident { start: u64, end: u6
 pub struct LocalDir;
 impl LocalDir {
     pub fn open(config: &LocalConfig, stats: Arc<IoStats>) -> Result<Self>;
-    /// The chunk file for a data file, identified by path, size, and footer digest; `None` if absent or stale.
+    /// The chunk file for a data file, identified by path, size, and footer digest; `None` if absent or
+    /// failing a check of its envelope, header, or identity.
     pub fn chunks_for(&self, identity: &DataFileIdentity) -> Result<Option<DiskChunks>>;
-    /// Writes verified key chunks, collected and sorted by data offset because the
-    /// header names every span before the first payload byte; returns the handle
-    /// the index keeps.
-    pub(crate) fn write_chunks(&self, identity: &DataFileIdentity, chunks: impl Iterator<Item = (Range<u64>, Bytes)>) -> Result<DiskChunks>;
+    /// What is under a data file's chunk file name: `Absent`, `Rejected(Rejection)` with the check
+    /// it failed, or `Found(DiskChunks)`; reads the envelope and header, no payload byte.
+    pub(crate) fn lookup(&self, identity: &DataFileIdentity) -> Result<ChunkFileLookup>;
+    /// Writes verified key chunks with their verification record (bytes the index encodes) and the
+    /// context it was verified `under`, collected and sorted by data offset because the header
+    /// names every span and the payload's crc32c before the first payload byte; written to a
+    /// temporary name and renamed, never synced (a torn file fails its length or checksum check);
+    /// returns the handle the index keeps.
+    pub(crate) fn write_chunks(&self, identity: &DataFileIdentity, under: VerifiedUnder, verification: &[u8], chunks: impl Iterator<Item = (Range<u64>, Bytes)>) -> Result<DiskChunks>;
     /// Deletes chunk files no current generation references. `live` is the union
     /// over every table sharing the directory.
     pub(crate) fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64>;
@@ -349,15 +355,25 @@ impl LocalDir {
 pub struct DiskChunks;
 impl DiskChunks {
     pub(crate) async fn page(&self, range: Range<u64>) -> Result<Bytes>;
-    /// Whether one stored chunk holds the whole range; checked before a reused file skips the chunk fetch.
-    pub(crate) fn holds(&self, range: &Range<u64>) -> bool;
+    /// What the header says the verification record was computed under.
+    pub(crate) fn verified_under(&self) -> VerifiedUnder;
+    /// Whether the stored chunks are exactly these ranges; checked before a reused file is trusted.
+    pub(crate) fn stores_exactly(&self, ranges: &[Range<u64>]) -> bool;
+    /// The verification record once the crc32c of the whole payload matches the header's: one
+    /// sequential pass, not a counted local read, for the blocking pool; `Err(Rejection)` for a
+    /// record over `most` (checked before any read), a file cut short, or a checksum mismatch.
+    pub(crate) fn checked_verification(&self, most: u64) -> Result<std::result::Result<Vec<u8>, Rejection>>;
 }
+/// The key type and verifier version (`index::VERIFIER_VERSION`) a chunk file's record was verified
+/// under; a record verified under another is never trusted.
+pub(crate) struct VerifiedUnder { pub(crate) key_type: KeyType, pub(crate) verifier_version: u32 }
 /// What a chunk file is named by and validated against; written into its
 /// header inside the RFD 011 envelope as a `ChunkFileHeader` message.
 pub struct DataFileIdentity { pub path: String, pub size: u64, pub footer_digest: [u8; DIGEST_BYTES] }
-/// The header, a `pub(crate)` prost message declared in `local` (section 4);
-/// its spans are what lets a restart serve pages without the footer.
-// message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; }
+/// The header, a `pub(crate)` prost message declared in `local` (section 4), at format version 2;
+/// its spans are what lets a restart serve pages without the footer. The payload after it is the
+/// verification record, then the chunks; `payload_crc32c` covers both.
+// message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; uint64 verification_length = 5; optional fixed32 payload_crc32c = 6; StoredKeyType key_type = 7; uint32 verifier_version = 8; }
 // message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
 /// The page cache's disk level, handed to `PageCache` by `local` (RFD 017):
 /// the `cache/` directory, its size bound, and the `IoStats` a page served
@@ -587,7 +603,8 @@ pub enum WireType { BoolTrue, BoolFalse, Byte, I16, I32, I64, Double, Binary, Li
 /// `check::thresholds` re-exports it as the trigger of `value_pages_over_ceiling`.
 pub const MOST_VALUE_PAGE_BYTES: u64;
 /// Every tier's resident bytes for one file, from the footer alone (RFD 017).
-/// `disk_bytes` is the whole chunk file the Disk tier writes (envelope, header, key chunks), the
+/// `disk_bytes` is the whole chunk file the Disk tier writes (envelope, header, verification record,
+/// key chunks; the record estimated for string and binary keys), the
 /// figure `index_budget_bytes` is charged; `key_chunk_bytes` and `filter_bytes` are the parts the
 /// Full and Bloom tiers hold beyond `disk_memory`.
 pub struct ResidentBytes { pub full: u64, pub disk_memory: u64, pub disk_bytes: u64, pub bloom: Option<u64> /* None when a row group lacks a filter */, pub bloom_bits_per_key: Option<f64>, pub key_chunk_bytes: u64, pub filter_bytes: Option<u64> }
@@ -618,8 +635,9 @@ impl FileIndex {
     /// other chunk, or one holding a page that reader does not read exactly, by parquet's column reader, which then
     /// meets and reports every fault, so both reach the same keys, refusals, and faults; the
     /// verification runs on the blocking pool, off the async workers that answer lookups; Full keeps the chunks in memory, Disk writes
-    /// them through `LocalDir`, also on the blocking pool (or reuses a chunk file with matching identity
-    /// and skips the chunk fetch), Bloom keeps filters. The column index of
+    /// them through `LocalDir` with a verification record of what `verify` established, also on the blocking pool (or trusts a chunk
+    /// file whose identity, verification context, and payload checksum match and which stores exactly the key chunks, taking the
+    /// record in place of the fetch and the decode; any other file is stale, logged at info, and rebuilt), Bloom keeps filters. The column index of
     /// every column but the key is dropped after the offset indexes are
     /// taken; it is never part of the resident set. `build` is `inspect`
     /// followed by `Inspected::build`; only tests call it (`#[cfg(test)]`),
@@ -637,8 +655,9 @@ impl FileIndex {
     /// past the file's size counts as zero (`inspect` refuses it) and a filter
     /// past it makes `bloom` `None` (a Bloom build refuses it); the totals
     /// saturate. `disk_bytes` is the chunk file for the handle's identity,
-    /// header and key chunks, so the handle has loaded its footer.
-    pub(crate) fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, handle: &FileHandle) -> ResidentBytes;
+    /// header, verification record (estimated for string and binary keys, exact for `key_type`s of
+    /// one width), and key chunks, so the handle has loaded its footer.
+    pub(crate) fn predicted_resident_bytes(metadata: &ParquetMetaData, key_leaf: usize, key_type: KeyType, handle: &FileHandle) -> ResidentBytes;
     pub fn key_range(&self) -> (&Key, &Key);
     pub(crate) fn may_contain(&self, key: &Key) -> bool;
     /// Exact position. Full: decodes one resident key page, no I/O. Disk:
@@ -682,11 +701,11 @@ pub(crate) struct Inspected;
 impl Inspected {
     pub(crate) fn predicted(&self) -> &ResidentBytes;
     /// What a Disk-tier `build` would add to `local`'s `index/`: zero when a
-    /// chunk file with the file's identity already holds every key chunk, so
-    /// a restart is not charged for what is on disk, else the chunk file it
-    /// would write, header and key chunks (`predicted().disk_bytes`), the
+    /// chunk file with the file's identity and verification context already stores exactly the key
+    /// chunks, so a restart is not charged for what is on disk, else the chunk file it
+    /// would write (`predicted().disk_bytes`), the
     /// bytes `LocalDir::index_bytes_in_use` then counts for it. Reads the
-    /// chunk file's header and no chunk.
+    /// chunk file's header and no payload byte.
     pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64>;
     /// The chunk stage of `FileIndex::build`. A Disk-tier chunk file write
     /// holds `reservation`, the load's hold on the budget, until it ends.
@@ -1126,8 +1145,18 @@ reads a chunk file, and `icetray-core` depends on no workspace crate. As
 built:
 
 ```proto
-message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; }
+message ChunkFileHeader { string data_file_path = 1; uint64 data_file_size = 2; bytes footer_digest = 3; repeated ChunkSpan chunks = 4; uint64 verification_length = 5; optional fixed32 payload_crc32c = 6; StoredKeyType key_type = 7; uint32 verifier_version = 8; }
 message ChunkSpan { uint64 data_offset = 1; uint64 length = 2; }
+enum StoredKeyType { UNSPECIFIED = 0; LONG = 1; STRING = 2; BINARY = 3; UUID = 4; }
+```
+
+The payload after the header is a second message, the verification record, which
+`icetray-core::index` declares beside `verify` and `local` frames without reading, then the key
+chunks; the header's `payload_crc32c` covers both:
+
+```proto
+message VerificationRecord { repeated RowGroupRecord row_groups = 1; uint64 max_key_bytes = 2; }
+message RowGroupRecord { repeated bytes fences = 1; bytes last = 2; }
 ```
 
 Comments describe the contract, not internals. Enum values carry their
@@ -1154,9 +1183,12 @@ local read is counted and no page fault stalls a worker. On Linux a read is
 first tried on the worker with `preadv2` and `RWF_NOWAIT`, which the page
 cache serves without blocking or refuses; a read it refuses, and on other
 systems every read, runs on the blocking pool (RFD 017).
-Startup reuses chunk files whose identity matches; a generation swap
-deletes chunk files nothing references; a disk budget refuses loads that
-would exceed it, at the footer stage.
+Startup reuses chunk files whose identity, verification context, and
+payload checksum match, taking the verification record they store in place
+of decoding their keys; any other file is rebuilt from object storage and
+never fails the load. A generation swap deletes chunk files nothing
+references; a disk budget refuses loads that would exceed it, at the footer
+stage.
 
 **`icetray serve`.** `serve` takes only the configuration path, from
 `--config` or `ICETRAY_CONFIG` (RFD 012); TOML or JSON. The binary uses
