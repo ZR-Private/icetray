@@ -63,8 +63,13 @@ const SAMPLE_ID: u64 = 1_414;
 /// lookups.
 const TAIL_IDS: Range<u64> = 0..200_000;
 
-/// The injected tail: every tenth request stalls for this long.
-const STALL_EVERY: u32 = 10;
+/// The injected tail: every twentieth request stalls for this long. The
+/// tail is thinner than the hedge percentile's, so the window's ninetieth
+/// percentile is a fast request's wherever the stalls fall; a tail as thick
+/// as the percentile puts it on a stall whenever a window holds one stall
+/// more than its share, and the result then turns on how many requests the
+/// load happened to make.
+const STALL_EVERY: u32 = 20;
 const STALL: Duration = Duration::from_millis(300);
 
 /// The hedge window: the warm-up fills it, and nothing hedges before.
