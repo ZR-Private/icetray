@@ -10,7 +10,7 @@ use std::fmt;
 /// gRPC calls received, by `call`.
 pub const REQUESTS_TOTAL: &str = "icetray_requests_total";
 /// Object-store GETs issued, by `kind`; a hedge is a GET and counts here too.
-pub(crate) const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
+pub const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
 /// Bytes requested across those GETs, by `kind`.
 pub(crate) const OBJECT_BYTES_TOTAL: &str = "icetray_object_bytes_total";
 /// Reads served from the local directory (RFD 017).
@@ -59,7 +59,7 @@ pub const TABLE_STATE: &str = "icetray_table_state";
 /// The `call` label: the RPC, from the RPC enum's `Display`.
 pub const LABEL_CALL: &str = "call";
 /// The `kind` label: the read path, from `ReadKind`.
-pub(crate) const LABEL_KIND: &str = "kind";
+pub const LABEL_KIND: &str = "kind";
 /// The `table` label: the table's configured name.
 pub const LABEL_TABLE: &str = "table";
 /// The `result` label: the lookup outcome, from `LookupResult`.
@@ -78,7 +78,7 @@ pub const LABEL_STATE: &str = "state";
 /// client waits on and are the only ones hedged (RFD 013). Display gives the
 /// label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ReadKind {
+pub enum ReadKind {
     /// A read made while a generation is built.
     Load,
     /// A read made to answer a client's lookup.

@@ -43,6 +43,7 @@ use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
 use icetray_testkit::keys::{
     SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES, VALUE_BYTES,
 };
+use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
 use icetray_testkit::{
     FixtureSpec, KeyShape, MemoryCatalog, ValueKind, absent_key_from, key_at_shaped, write_fixture,
@@ -859,8 +860,9 @@ fn local_path(location: &str) -> BenchResult<PathBuf> {
 // Serving.
 
 /// The page cache of the warm and miss scenarios: large enough to hold
-/// every value page of either table (about 200 MB of 100-byte values) and,
-/// under the Bloom tier, every key page besides, so nothing is evicted.
+/// every value page of a table of 100-byte values (about 200 MB) and,
+/// under the Bloom tier, every key page besides, so nothing is evicted. A
+/// table whose pages do not fit is not run warm (`fits_warm_cache`).
 const WARM_CACHE_BYTES: usize = 1 << 30;
 
 /// The page cache of the cold-hit scenario: one mebibyte, about ten of a
@@ -976,7 +978,7 @@ fn pinned(prepared: &Prepared) -> SourceConfig {
 // Lookups.
 
 /// Keys in each scenario's pool; a run cycles through them. A million is
-/// half the table, so a warm run touches every page and no run repeats a
+/// half a table of `ROWS`, so a warm run touches every page and no run repeats a
 /// key before it has used many thousands of others.
 const KEY_POOL: usize = 1 << 20;
 
@@ -984,7 +986,7 @@ const KEY_POOL: usize = 1 << 20;
 const KEY_SEED: u64 = 0x1ce7_4a7b_e4c4_0001;
 
 /// Ids between two keys of the pass that fills the warm cache: a value page
-/// holds a thousand rows of one bucket, which span a few thousand ids, so
+/// of 100-byte values holds a thousand rows of one bucket, which span a few thousand ids, so
 /// every page is asked many times over.
 const PRIME_STRIDE: u64 = 100;
 
@@ -1192,37 +1194,15 @@ struct Measured {
     /// Lookups per operation: one, or a `MultiGet`'s batch.
     keys_per_op: usize,
     elapsed: Duration,
-    /// Every operation's latency, ascending.
-    sorted: Vec<Duration>,
+    /// Every operation's latency.
+    latencies: Latencies,
     counters: Counters,
 }
 
 /// One second, the unit of the throughput figure.
 const SECOND: Duration = Duration::from_secs(1);
 
-/// One microsecond, the unit latencies are written to JSON in.
-const MICROSECOND: Duration = Duration::from_micros(1);
-
-/// The percentiles reported, in thousandths, beside the maximum.
-const P50: usize = 500;
-const P90: usize = 900;
-const P99: usize = 990;
-const PER_MILLE: usize = 1_000;
-
 impl Measured {
-    /// The nearest-rank percentile at `per_mille` thousandths.
-    fn percentile(&self, per_mille: usize) -> Duration {
-        let rank = (self.sorted.len() * per_mille).div_ceil(PER_MILLE);
-        self.sorted
-            .get(rank.saturating_sub(1))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn max(&self) -> Duration {
-        self.sorted.last().copied().unwrap_or_default()
-    }
-
     fn ops_per_second(&self) -> f64 {
         approx::gauge(approx::count(self.ops)) * SECOND.div_duration_f64(self.elapsed)
     }
@@ -1232,8 +1212,8 @@ impl Measured {
     }
 
     fn to_json(&self) -> Json {
-        let micros = |duration: Duration| duration.div_duration_f64(MICROSECOND);
         let counters = self.counters;
+        let latencies = &self.latencies;
         json!({
             "scenario": self.label.scenario.name(),
             "table": self.label.table.name.as_str(),
@@ -1245,10 +1225,10 @@ impl Measured {
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
             "ops_per_second": self.ops_per_second(),
-            "p50_us": micros(self.percentile(P50)),
-            "p90_us": micros(self.percentile(P90)),
-            "p99_us": micros(self.percentile(P99)),
-            "max_us": micros(self.max()),
+            "p50_us": micros(latencies.percentile(P50)),
+            "p90_us": micros(latencies.percentile(P90)),
+            "p99_us": micros(latencies.percentile(P99)),
+            "max_us": micros(latencies.max()),
             "allocations_per_op": self.per_op(counters.allocations.calls),
             "allocated_bytes_per_op": self.per_op(counters.allocations.bytes),
             "page_fetches_per_op": self.per_op(counters.fetches),
@@ -1277,10 +1257,9 @@ async fn measure(
     let reserve = (warm_ops / label.tasks + 1) * windows * SAMPLE_HEADROOM;
     let before = Counters::read(served);
     let started = Instant::now();
-    let (ops, mut sorted) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
+    let (ops, samples) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
-    sorted.sort_unstable();
     let keys_per_op = match op {
         Op::Get { .. } => 1,
         Op::MultiGet { batch, .. } => *batch,
@@ -1290,7 +1269,7 @@ async fn measure(
         ops,
         keys_per_op,
         elapsed,
-        sorted,
+        latencies: Latencies::of(samples),
         counters,
     })
 }
@@ -1476,11 +1455,9 @@ async fn two_tables(
         until,
         reserve(warm_batches, one),
     );
-    let (hit_ops, mut hit_samples) = join_loops(hit_loops).await?;
-    let (batch_ops, mut batch_samples) = join_loops(batch_loops).await?;
+    let (hit_ops, hit_samples) = join_loops(hit_loops).await?;
+    let (batch_ops, batch_samples) = join_loops(batch_loops).await?;
     let elapsed = started.elapsed();
-    hit_samples.sort_unstable();
-    batch_samples.sort_unstable();
 
     let label = |table, mode, tasks| RunLabel {
         scenario: Scenario::TwoTable,
@@ -1495,7 +1472,7 @@ async fn two_tables(
             ops: batch_ops,
             keys_per_op: BATCH_1000,
             elapsed,
-            sorted: batch_samples,
+            latencies: Latencies::of(batch_samples),
             counters: Counters::default(),
         },
         Measured {
@@ -1503,7 +1480,7 @@ async fn two_tables(
             ops: hit_ops,
             keys_per_op: 1,
             elapsed,
-            sorted: hit_samples,
+            latencies: Latencies::of(hit_samples),
             counters: Counters::default(),
         },
     ];
@@ -1608,7 +1585,6 @@ struct Loaded {
 
 impl Loaded {
     fn to_json(&self) -> Json {
-        let micros = |duration: Duration| duration.div_duration_f64(MICROSECOND);
         json!({
             "what": self.what,
             "table": self.table.name.as_str(),
@@ -1778,10 +1754,10 @@ fn row(run: &Measured) -> String {
         run.label.mode.name(),
         run.label.tasks,
         run.ops_per_second(),
-        run.percentile(P50),
-        run.percentile(P90),
-        run.percentile(P99),
-        run.max(),
+        run.latencies.percentile(P50),
+        run.latencies.percentile(P90),
+        run.latencies.percentile(P99),
+        run.latencies.max(),
         run.per_op(counters.allocations.calls),
         run.per_op(counters.allocations.bytes),
         run.per_op(counters.fetches),
@@ -2038,8 +2014,6 @@ async fn main() -> BenchResult<()> {
     let report = json!({
         "machine": machine,
         "settings": {
-            "rows": ROWS,
-            "appended_rows": APPENDED_ROWS,
             "key_pool": KEY_POOL,
             "key_seed": KEY_SEED,
             "warm_cache_bytes": WARM_CACHE_BYTES,

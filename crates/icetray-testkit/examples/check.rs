@@ -33,6 +33,7 @@ use icetray_core::{approx, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::{self, GetRequest, KeyType, MultiGetRequest, Presence, TableInfoRequest};
 use icetray_testkit::TestkitError;
+use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::truth::{self, Entry, Outcome};
 use icetray_testkit::verify::series_sum;
 use serde_json::{Value as Json, json};
@@ -177,17 +178,6 @@ enum CheckError {
 // ---------------------------------------------------------------------------
 // The metrics.
 
-/// Object-store GETs, by `kind`: `icetray_core::metric::OBJECT_GETS_TOTAL`,
-/// which is crate-private there, so the name is repeated here.
-const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
-
-/// The `kind` label of `OBJECT_GETS_TOTAL`, and its value for a GET made
-/// to answer a lookup: `metric::LABEL_KIND` and `ReadKind::Lookup`, both
-/// crate-private in `icetray_core::metric`. Load GETs of a refresh during
-/// the run are left out.
-const LABEL_KIND: &str = "kind";
-const KIND_LOOKUP: &str = "lookup";
-
 /// The two counters a run is priced by, as one scrape reads them.
 #[derive(Clone, Copy, Debug)]
 struct Counters {
@@ -221,8 +211,14 @@ async fn scrape(location: &str, table: &str) -> Result<Counters, CheckError> {
         return Err(CheckError::MetricsStatus { status });
     }
     let body = String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec())?;
+    // Lookup GETs only: load GETs of a refresh during the run are left out.
+    let lookup = metric::ReadKind::Lookup.to_string();
     Ok(Counters {
-        object_gets: series_sum(&body, OBJECT_GETS_TOTAL, &[(LABEL_KIND, KIND_LOOKUP)]),
+        object_gets: series_sum(
+            &body,
+            metric::OBJECT_GETS_TOTAL,
+            &[(metric::LABEL_KIND, &lookup)],
+        ),
         lookups: series_sum(
             &body,
             metric::LOOKUPS_TOTAL,
@@ -431,53 +427,29 @@ async fn pass(
 // ---------------------------------------------------------------------------
 // Reporting.
 
-/// One microsecond, the unit latencies are written to JSON in.
-const MICROSECOND: Duration = Duration::from_micros(1);
-
-/// The percentiles reported, in thousandths, beside the maximum.
-const P50: usize = 500;
-const P90: usize = 900;
-const P99: usize = 990;
-const PER_MILLE: usize = 1_000;
-
 /// The latencies of one class of a pass's calls.
-struct Latencies {
+struct ClassLatencies {
     class: &'static str,
-    /// Every call's latency, ascending.
-    sorted: Vec<Duration>,
+    latencies: Latencies,
 }
 
-impl Latencies {
-    fn of(class: &'static str, mut samples: Vec<Duration>) -> Self {
-        samples.sort_unstable();
+impl ClassLatencies {
+    fn of(class: &'static str, samples: Vec<Duration>) -> Self {
         Self {
             class,
-            sorted: samples,
+            latencies: Latencies::of(samples),
         }
     }
 
-    /// The nearest-rank percentile at `per_mille` thousandths.
-    fn percentile(&self, per_mille: usize) -> Duration {
-        let rank = (self.sorted.len() * per_mille).div_ceil(PER_MILLE);
-        self.sorted
-            .get(rank.saturating_sub(1))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn max(&self) -> Duration {
-        self.sorted.last().copied().unwrap_or_default()
-    }
-
     fn to_json(&self) -> Json {
-        let micros = |duration: Duration| duration.div_duration_f64(MICROSECOND);
+        let latencies = &self.latencies;
         json!({
             "class": self.class,
-            "calls": self.sorted.len(),
-            "p50_us": micros(self.percentile(P50)),
-            "p90_us": micros(self.percentile(P90)),
-            "p99_us": micros(self.percentile(P99)),
-            "max_us": micros(self.max()),
+            "calls": latencies.len(),
+            "p50_us": micros(latencies.percentile(P50)),
+            "p90_us": micros(latencies.percentile(P90)),
+            "p99_us": micros(latencies.percentile(P99)),
+            "max_us": micros(latencies.max()),
         })
     }
 }
@@ -545,7 +517,7 @@ struct PassReport {
     /// the first `MISMATCH_SAMPLE` in file order.
     failures: Vec<(String, usize, Failure)>,
     failed_calls: usize,
-    latencies: Vec<Latencies>,
+    latencies: Vec<ClassLatencies>,
 }
 
 impl PassReport {
@@ -583,10 +555,10 @@ impl PassReport {
                 }
             }
         }
-        let mut latencies = vec![Latencies::of("all", all)];
+        let mut latencies = vec![ClassLatencies::of("all", all)];
         if mode == Mode::Get {
-            latencies.push(Latencies::of("present", present));
-            latencies.push(Latencies::of("absent", absent));
+            latencies.push(ClassLatencies::of("present", present));
+            latencies.push(ClassLatencies::of("absent", absent));
         }
         Self {
             pass,
@@ -620,15 +592,15 @@ impl PassReport {
             "  {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}",
             "class", "calls", "p50", "p90", "p99", "max"
         );
-        for latencies in &self.latencies {
+        for class in &self.latencies {
             println!(
                 "  {:<8} {:>8} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?}",
-                latencies.class,
-                latencies.sorted.len(),
-                latencies.percentile(P50),
-                latencies.percentile(P90),
-                latencies.percentile(P99),
-                latencies.max(),
+                class.class,
+                class.latencies.len(),
+                class.latencies.percentile(P50),
+                class.latencies.percentile(P90),
+                class.latencies.percentile(P99),
+                class.latencies.max(),
             );
         }
         for (key, outcome) in &self.mismatches {
@@ -645,10 +617,10 @@ impl PassReport {
     fn to_json(&self) -> Json {
         json!({
             "pass": self.pass,
-            "wall_us": self.wall.div_duration_f64(MICROSECOND),
+            "wall_us": micros(self.wall),
             "outcomes": self.tally.to_json(),
             "failed_calls": self.failed_calls,
-            "latency": self.latencies.iter().map(Latencies::to_json).collect::<Vec<_>>(),
+            "latency": self.latencies.iter().map(ClassLatencies::to_json).collect::<Vec<_>>(),
             "mismatches": self.mismatches.iter().map(|(key, outcome)| json!({
                 "key": key,
                 "outcome": outcome_text(*outcome),

@@ -52,12 +52,12 @@ FIXED_CONCURRENCY=64
 # Keys per MultiGet, the batch the in-process benchmark also measures.
 MULTI_GET_KEYS=100
 
-# The page cache: a gibibyte holds every value page of both tables (about
-# 200 MB each), so after the warm-up every hit is warm and no run pays for
-# a page read.
+# The page cache: a gibibyte holds every value page of the four prepared
+# tables (about 200 MB each), so after the warm-up every hit is warm and no
+# run pays for a page read.
 PAGE_CACHE_BYTES=1073741824
 
-# Seconds to wait for /ready: the first loads of both tables take well
+# Seconds to wait for /ready: the first loads of the four tables take well
 # under a second from local files; two minutes bounds a start that has
 # wedged.
 READY_TIMEOUT_SECONDS=120

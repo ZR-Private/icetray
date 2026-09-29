@@ -7,6 +7,7 @@ pub mod error;
 pub mod fixture;
 pub mod golden;
 pub mod keys;
+pub mod latency;
 pub mod layout;
 pub mod s3;
 pub mod sim;
