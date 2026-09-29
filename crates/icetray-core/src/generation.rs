@@ -35,19 +35,15 @@ use crate::time;
 /// Files one load keeps in flight per worker thread. A load's time is its
 /// files' round trips over its concurrency until its CPU binds: an object
 /// not read in the last moments answers a range GET in 90 ms or more, and a
-/// file's decode, verification, and chunk-file write are CPU. Measured on a
-/// first load of 1.2 billion rows in 32,768 files against real S3, which
-/// took 335 to 380 CPU seconds at every concurrency: on four cores, 283 s
-/// at 64 files in flight, 171 s at 128, 128 s at 256, 104 s at 512 (by
-/// then about three and a half cores busy), and 101 s at 1,024; on two, 245
-/// s at 128 and 201 s at 512. The knee sits near 128 files per core.
+/// file's decode, verification, and chunk-file write are CPU, whose total
+/// does not change with the concurrency. Against real S3 the knee sits near
+/// 128 files per core.
 const LOAD_FILES_PER_WORKER: usize = 128;
 
 /// The most files one load keeps in flight on any machine. Past the knee
 /// more concurrency buys no time and holds more: each file in flight at the
 /// chunk stage holds its key chunks in memory and a blocking-pool task over
-/// them, and 1,024 in flight held about half a gigabyte more than 512 for
-/// three seconds less.
+/// them.
 const LOAD_FILES_MAX: usize = 1024;
 
 /// Files worked on at once while a generation loads: footers loaded at the
@@ -1719,21 +1715,6 @@ mod tests {
         values_of,
     };
     use super::*;
-
-    /// Two worker threads keep twice `LOAD_FILES_PER_WORKER` files in
-    /// flight.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_load_concurrency_scales_with_the_worker_threads() {
-        assert_eq!(load_concurrency(), 2 * LOAD_FILES_PER_WORKER);
-    }
-
-    /// More workers than `LOAD_FILES_MAX` over `LOAD_FILES_PER_WORKER` keep
-    /// `LOAD_FILES_MAX` in flight, not more.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn test_load_concurrency_stops_at_its_ceiling() {
-        assert!(shard::workers() * LOAD_FILES_PER_WORKER > LOAD_FILES_MAX);
-        assert_eq!(load_concurrency(), LOAD_FILES_MAX);
-    }
     use crate::catalog::TableSource;
     use crate::config::HedgeConfig;
     use crate::key::KeyType;
@@ -3104,5 +3085,20 @@ mod tests {
         assert_send_sync::<Value>();
         assert_send_sync::<Lookup>();
         assert_send_sync::<MultiLookup>();
+    }
+
+    /// Two worker threads keep twice `LOAD_FILES_PER_WORKER` files in
+    /// flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_load_concurrency_scales_with_the_worker_threads() {
+        assert_eq!(load_concurrency(), 2 * LOAD_FILES_PER_WORKER);
+    }
+
+    /// More workers than `LOAD_FILES_MAX` over `LOAD_FILES_PER_WORKER` keep
+    /// `LOAD_FILES_MAX` in flight, not more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_load_concurrency_stops_at_its_ceiling() {
+        assert!(shard::workers() * LOAD_FILES_PER_WORKER > LOAD_FILES_MAX);
+        assert_eq!(load_concurrency(), LOAD_FILES_MAX);
     }
 }

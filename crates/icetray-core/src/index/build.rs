@@ -483,7 +483,8 @@ fn verify(
 }
 
 /// `verify`, each row group decoded by `decoder` where it can be
-/// (`check_run`).
+/// (`check_run`). The decoder is a parameter so that tests can hold the
+/// plain decoder to the column reader's answers.
 fn verify_with(
     table: &str,
     column: &Column<'_>,

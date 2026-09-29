@@ -473,7 +473,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_estimated_len_is_exact_for_keys_of_one_width() {
+    async fn test_estimated_len_is_exact_for_the_contract_fixtures() {
+        // Every contract fixture's keys are of one width within the column
+        // index's truncation, which is when the estimate is exact.
         for (key_type, index) in indexes().await {
             let groups = index.fences().iter().map(|fences| {
                 let key_bytes = fences.iter().map(|key| count(key.as_bytes().len())).sum();

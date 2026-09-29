@@ -122,11 +122,10 @@ const DEFAULT_MAX_MULTI_GET_KEYS: usize = 1000;
 
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after
-/// one failed, reads every file's footer and key chunks; a table of
-/// 1.2 billion rows in 32,768 files loaded in 221 s against real S3, so
-/// this admits tables several times that. It is bounded all the same: the
-/// build holds the table's load lock, which `Opened::retain` waits on for
-/// every table in turn.
+/// one failed, reads every file's footer and key chunks, so it is allowed
+/// several times the largest first load measured (RFD 013). It is bounded
+/// all the same: the build holds the table's load lock, which
+/// `Opened::retain` waits on for every table in turn.
 const DEFAULT_LOAD_DEADLINE: Duration = Duration::from_mins(30);
 
 /// How long a refresh over a serving generation may run when the file says

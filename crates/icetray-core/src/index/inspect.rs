@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_predicted_disk_bytes_is_the_chunk_file_written_for_keys_of_one_width() {
+    async fn test_predicted_disk_bytes_is_the_chunk_file_written_for_the_contract_fixtures() {
         // Every contract fixture's keys are of one width within the column
         // index's truncation, so the record's estimate is exact.
         for key_type in KeyType::ALL {
