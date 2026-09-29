@@ -63,8 +63,10 @@ in the
 - Data files of 32 to 64 MiB; a small range read answers faster from a small
   object than from a large one, warm
   ([range-GET latency, results](../analysis/2026-09-10-s3-range-get-latency.md#results))
-  and cold, where the step falls lower, between 16 and 64 MiB
-  ([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
+  and cold, where the step falls lower, between 16 and 64 MiB, so a 64 MiB
+  file read cold is already in the slow class
+  ([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results));
+  whether to lower the target is open, below.
 
 A table that misses a checked clause is refused, served at a penalty, or
 served with advice, by tier (RFD 007 (Serving tiers)); what the doctor
@@ -130,8 +132,9 @@ The file-size target rests on two measurements
 ([range-GET latency, what this does and does not establish](../analysis/2026-09-10-s3-range-get-latency.md#what-this-does-and-does-not-establish);
 [cold range-GET latency, what this does and does not establish](../analysis/2026-09-29-cold-range-get-latency.md#what-this-does-and-does-not-establish))
 and may move: read cold, as most cold hits are, a 64 MiB file answers like
-a 256 MiB one, about 55 ms slower at the median than a 16 MiB one. Smaller files keep every GET in the fast size class at the
-price of more files, more GETs at load, and more index bytes per key. Larger
+a 256 MiB one, about 55 ms slower at the median than a 16 MiB one.
+Smaller files keep every GET in the fast size class at the price of more
+files, more GETs at load, and more index bytes per key. Larger
 files cut the file count, and the slow mode may begin anywhere in the
 unmeasured band above the target.
 

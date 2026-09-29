@@ -69,17 +69,18 @@ under 200 ms, so 5 seconds is already a failure, and the refusals keep a
 wedged store from piling up requests until the process runs out of memory.
 The cap counts requests, not GETs: a page GET can outlast the request that
 started it, by at most one `Get` deadline, since the request was open when
-the fetch began and the fetch ends 5 seconds after that. The background path, loads and refreshes, is patient
-but bounded: a catalog call has 30 seconds, a first load 30 minutes, and a
+the fetch began and the fetch ends 5 seconds after that.
+
+The background path, loads and refreshes, is patient but bounded: a catalog call has 30 seconds, a first load 30 minutes, and a
 refresh 5 minutes, after which it fails, the table is degraded, and the
 next poll tries again, so no load holds its table's lock longer than that.
 The two differ because the work does: a first load, or any build while no
 generation serves, reads every file's footer and key chunks, where a
 refresh reuses every file the new snapshot still names and reads only the
-rest. A table of 1.2 billion rows in 32,768 files took 221 seconds to
-load against real S3 at 128 files in flight, and 835 seconds at 16, past
-a five-minute bound. Both
-paths share the S3 client's bounds: two retries, none started more than a
+rest. A first load of a table of 1.2 billion rows in 32,768 files
+against real S3 took 835 seconds at 16 files in flight, past a
+five-minute bound, and 79 seconds on four cores at 128 files per worker
+thread. Both paths share the S3 client's bounds: two retries, none started more than a
 minute after the first attempt, a 1-second connect timeout, and 30 seconds
 per attempt, which together end inside the two minutes a cached credential
 is kept short of its expiry (RFD 003). Shutdown waits 20 seconds for open
