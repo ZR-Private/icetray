@@ -33,8 +33,7 @@ pub(super) const CHUNK_FILE_MAGIC: u8 = 0xC1;
 /// one it reads (RFD 011). A build that changes the layout raises it and
 /// decides whether to convert or refuse older files; a file of another
 /// version is stale and rebuilt from object storage, which is what the
-/// directory's disposability allows. Version 2 added the verification
-/// record and the payload checksum.
+/// directory's disposability allows.
 pub(super) const CHUNK_FILE_VERSION: u8 = 2;
 /// Where the magic byte sits in a chunk file.
 pub(super) const MAGIC_OFFSET: u64 = 0;
@@ -181,9 +180,9 @@ impl From<Rejection> for ParseFailure {
 /// the data file whose key chunks the payload holds, one span per chunk
 /// saying which bytes of that data file it is, the length of the
 /// verification record before the chunks, what that record was computed
-/// under, and the payload's checksum. The spans are what lets a restarted
-/// process serve pages without the Parquet footer, and the record what lets
-/// it skip decoding them. Nothing outside icetray reads a chunk file, so
+/// under, and the payload's checksum. The spans say where each range of the
+/// data file sits in the chunk file, which the footer does not, and the
+/// record is what lets a restarted process skip decoding their keys. Nothing outside icetray reads a chunk file, so
 /// the message is declared here and not in the client contract. Field
 /// numbers are never reused.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -646,18 +645,12 @@ mod tests {
 
     use super::*;
     use crate::error::Error;
-    use crate::local::format::{
-        CHUNK_FILE_MAGIC, CHUNK_FILE_VERSION, ChunkFileHeader, ChunkSpan, HEADER_OFFSET,
-        LENGTH_OFFSET, LENGTH_PREFIX_BYTES, MAGIC_OFFSET, MAX_HEADER_BYTES, ParseFailure,
-        Rejection, StoredKeyType, StoredSpan, VERSION_OFFSET, header_for, hex, validate,
-        write_envelope,
-    };
     use crate::local::testing::{
         DATA_PATH, DATA_SIZE, EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, FOOTER_DIGEST,
         OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks, entries,
         identity, inverted_range, open, overwrite, payload_len, range_len, write,
     };
-    use crate::local::{ChunkFileLookup, DIGEST_BYTES, DataFileIdentity, LocalDir, LocalFault};
+    use crate::local::{ChunkFileLookup, LocalDir};
 
     /// The final component of `DATA_PATH`, which no hex name can contain.
     const DATA_FILE_NAME: &str = "part-00000.parquet";
@@ -880,6 +873,11 @@ mod tests {
         truncate(&path, len - 1);
         assert_eq!(rejection_of(&path, &identity()), Rejection::ShortPayload);
         assert!(local.chunks_for(&identity()).unwrap().is_none());
+        fs::remove_file(&path).unwrap();
+        let mut header = fixture_header();
+        header.verification_length += 1;
+        write_under(&path, &header);
+        assert_eq!(rejection_of(&path, &identity()), Rejection::ShortPayload);
     }
 
     #[test]
@@ -969,17 +967,6 @@ mod tests {
             ));
             fs::remove_file(&path).unwrap();
         }
-    }
-
-    #[test]
-    fn test_validate_a_record_longer_than_the_file_holds_is_a_short_payload() {
-        let dir = tempfile::tempdir().unwrap();
-        let (local, _) = open(dir.path());
-        let path = chunk_file(&local);
-        let mut header = fixture_header();
-        header.verification_length += 1;
-        write_under(&path, &header);
-        assert_eq!(rejection_of(&path, &identity()), Rejection::ShortPayload);
     }
 
     #[test]

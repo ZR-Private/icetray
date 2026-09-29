@@ -300,12 +300,12 @@ impl DiskLevel {
 mod tests {
 
     use super::*;
+    use crate::local::LocalDir;
     use crate::local::testing::{
         EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE, SECOND_BYTES,
         SECOND_RANGE, UNDER, VERIFICATION, chunk_file, identity, inverted_range, open, overwrite,
         payload_len, range_len, write,
     };
-    use crate::local::{DiskChunks, LocalDir, LocalFault};
 
     /// A range that starts in the first chunk and ends in the second.
     const STRADDLING_RANGE: Range<u64> = 104..202;
