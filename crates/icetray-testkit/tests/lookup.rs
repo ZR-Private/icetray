@@ -8,14 +8,18 @@ use icetray_core::approx::{count, length};
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
 use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Value, diagnose};
-use icetray_testkit::error::Precondition;
+use icetray_testkit::error::{Precondition, SpecFault};
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, SAMPLE, SAMPLE_4K,
     SMALL_BUCKETS, SMALL_FILE_BYTES, SMALL_IDS, UNPARTITIONED_FILE_BYTES, WIDE_VALUE_BYTES,
     local_catalog,
 };
+use icetray_testkit::keys::SCATTERED_ID_SPACE;
 use icetray_testkit::verify;
-use icetray_testkit::{Fixture, FixtureSpec, Layout, Nulls, Result, TestkitError, write_fixture};
+use icetray_testkit::{
+    Fixture, FixtureSpec, KeyShape, Layout, Nulls, Result, TestkitError, scattered_key_at,
+    write_fixture,
+};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 
 /// Every this-many-th id is looked up once: routing over every bucket and
@@ -308,6 +312,52 @@ async fn test_long_keys_serve_at_one_get_per_hit() -> Result<()> {
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let served = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K).await?;
     verify::verify_misses(&served, &fixture, &SAMPLE_4K).await
+}
+
+/// Scattered string keys route, serve at one GET per hit, and miss beside
+/// every sampled key.
+#[tokio::test]
+async fn test_scattered_keys_serve_at_one_get_per_hit() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        key_shape: KeyShape::Scattered,
+        ..FixtureSpec::small("kv_scattered", KeyType::String)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    assert_eq!(fixture.key(SAMPLE[1]), scattered_key_at(SAMPLE[1], 0));
+    let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
+    let served = verify::verify_hit_cost(served, &fixture, &SAMPLE).await?;
+    verify::verify_misses(&served, &fixture, &SAMPLE).await
+}
+
+/// A scattered shape on a key other than a string, and a scattered id
+/// with no key, are refused.
+#[tokio::test]
+async fn test_scattered_keys_refuse_other_types_and_ids_outside_the_space() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let long = FixtureSpec {
+        key_shape: KeyShape::Scattered,
+        ..FixtureSpec::small("kv_scattered_long", KeyType::Long)
+    };
+    let refused = write_fixture(catalog.as_ref(), NAMESPACE, long).await;
+    assert!(matches!(
+        refused,
+        Err(TestkitError::Spec(SpecFault::ScatteredNonStringKey {
+            key_type: KeyType::Long
+        }))
+    ));
+    let beyond = FixtureSpec {
+        key_shape: KeyShape::Scattered,
+        ids: SCATTERED_ID_SPACE - 1..SCATTERED_ID_SPACE + 1,
+        ..FixtureSpec::small("kv_scattered_beyond", KeyType::String)
+    };
+    let refused = write_fixture(catalog.as_ref(), NAMESPACE, beyond).await;
+    assert!(matches!(
+        refused,
+        Err(TestkitError::Spec(SpecFault::IdOutsideScatteredSpace { id }))
+            if id == SCATTERED_ID_SPACE
+    ));
+    Ok(())
 }
 
 /// A null value is served as present with null, distinct from absent, at

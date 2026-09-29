@@ -3,7 +3,10 @@
 //! filesystem, so every number is icetray's own CPU and allocation cost with
 //! no object-store latency in it. It writes a long-key and a string-key
 //! table of `ROWS` rows each, once with random values and once with text
-//! values (`Values`), through the fixture writer (once, then reused from
+//! values (`Values`), and, when `--table scattered` names it, a table shaped
+//! like a serving table (`SCATTERED_ROWS` rows of random-looking string
+//! keys and 4 KiB values in byte-bounded pages, `SCATTERED_ROWS_PER_FILE`
+//! rows per file), through the fixture writer (once, then reused from
 //! `--data-dir`), reports how far zstd compressed each table's key and
 //! value columns, serves them through `Table` over `Storage`'s
 //! `file://` store in every residency tier, and reports latency
@@ -30,16 +33,20 @@ use iceberg::spec::MAIN_BRANCH;
 use icetray_core::config::{
     LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
-use icetray_core::contract::TARGET_FILE_BYTES_MAX;
+use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
     CallsInFlight, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles, TableSource,
     Value,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
-use icetray_testkit::keys::{STRING_KEY_FIXED_BYTES, VALUE_BYTES};
-use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
-use icetray_testkit::{FixtureSpec, ValueKind, absent_key_from, key_at, write_fixture};
+use icetray_testkit::keys::{
+    SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES, VALUE_BYTES,
+};
+use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
+use icetray_testkit::{
+    FixtureSpec, KeyShape, MemoryCatalog, ValueKind, absent_key_from, key_at_shaped, write_fixture,
+};
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -215,6 +222,15 @@ impl Scenario {
         Self::MultiGet1000,
     ];
 
+    /// Whether the scenario measures a page cache primed to hold every
+    /// value page.
+    fn is_warm(self) -> bool {
+        match self {
+            Self::WarmHit | Self::MultiGet100 | Self::MultiGet1000 | Self::TwoTable => true,
+            Self::ColdHit | Self::Miss | Self::Load | Self::Refresh => false,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::WarmHit => "warm-hit",
@@ -249,11 +265,18 @@ impl Tier {
     }
 }
 
-/// The key column of a benchmark table.
+/// A benchmark table, by its keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum TableName {
+    /// Long keys, contract layout.
     Long,
+    /// Sequential string keys sharing a long prefix, contract layout.
     String,
+    /// A table shaped like a serving table: random-looking string keys,
+    /// 4 KiB random values in 64 KiB value pages, and about 37,500 rows per
+    /// file. Runs only when named, and only its load, refresh, cold-hit,
+    /// and miss scenarios: its value pages outrun the warm cache.
+    Scattered,
 }
 
 /// What a benchmark table's values are made of.
@@ -317,7 +340,7 @@ struct Cli {
     /// Residency tiers to run them in.
     #[arg(long, value_enum, value_delimiter = ',')]
     tier: Vec<Tier>,
-    /// Tables to run them over, by key column.
+    /// Tables to run them over, by keys; `scattered` runs only when named.
     #[arg(long, value_enum, value_delimiter = ',')]
     table: Vec<TableName>,
     /// Tables to run them over, by values.
@@ -344,11 +367,12 @@ struct Cli {
     /// Where the JSON results go.
     #[arg(long, default_value = "target/bench")]
     out_dir: PathBuf,
-    /// Write the tables again even when `--data-dir` holds them.
+    /// Write the tables again even when `--data-dir` holds them; the
+    /// directory is emptied first.
     #[arg(long)]
     rewrite: bool,
-    /// Write or reuse the tables, print one line per table (name, key
-    /// type, rows, and the first build's metadata file), and exit.
+    /// Write or reuse the selected tables, print one line per table (name,
+    /// key type, rows, and the first build's metadata file), and exit.
     #[arg(long)]
     prepare: bool,
     /// Measure without the binary's Prometheus recorder installed, so the
@@ -360,12 +384,45 @@ struct Cli {
 // ---------------------------------------------------------------------------
 // The tables.
 
-/// Rows of each benchmark table's first build.
+/// Rows of each contract-shaped benchmark table's first build.
 const ROWS: u64 = 2_000_000;
 
-/// Rows the second build appends above the first's ids, one percent of
-/// `ROWS`: a small file per bucket, the refresh scenario's new snapshot.
-const APPENDED_ROWS: u64 = 20_000;
+/// A table's first build over its second: the second appends one percent,
+/// a small file per bucket, the refresh scenario's new snapshot.
+const APPEND_DIVISOR: u64 = 100;
+
+/// Rows the second build appends above the first's ids.
+const APPENDED_ROWS: u64 = ROWS / APPEND_DIVISOR;
+
+/// Rows per file of the scattered table: the mean of a serving table of
+/// 1.2 billion rows over 32,768 buckets, so the table's per-file work
+/// (footers, page indexes, key chunks) is in proportion to its rows as it
+/// is there.
+const SCATTERED_ROWS_PER_FILE: u64 = 37_500;
+
+/// Buckets of the scattered table, one file each: enough that per-file
+/// costs show in a load's profile, few enough that the table writes in a
+/// few minutes and takes about 5 GB of disk.
+const SCATTERED_BUCKETS: u64 = 32;
+
+/// Rows of the scattered table's first build: `SCATTERED_ROWS_PER_FILE`
+/// in each of `SCATTERED_BUCKETS`, 1.2 million.
+const SCATTERED_ROWS: u64 = SCATTERED_BUCKETS * SCATTERED_ROWS_PER_FILE;
+
+/// Rows the scattered table's second build appends.
+const SCATTERED_APPENDED_ROWS: u64 = SCATTERED_ROWS / APPEND_DIVISOR;
+
+// Both builds' ids have scattered keys.
+const _: () = assert!(SCATTERED_ROWS + SCATTERED_APPENDED_ROWS <= SCATTERED_ID_SPACE);
+
+/// Bytes per value of the scattered table: 4 KiB, a serving table's
+/// value, so a 64 KiB value page holds about sixteen.
+const SCATTERED_VALUE_BYTES: usize = 4_096;
+
+/// The file size target of the scattered table: 256 MiB, above the
+/// ~155 MB a bucket's incompressible rows take, so the rolling writer
+/// keeps each bucket in one file of `SCATTERED_ROWS_PER_FILE` rows.
+const SCATTERED_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The file prefix of the second build.
 const SECOND_BUILD_PREFIX: &str = "build2";
@@ -376,41 +433,72 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// The scheme the fixture writer's local catalog records locations under.
 const FILE_URI: &str = "file://";
 
-/// A benchmark table as written: its key column, key type, the bytes a
-/// row holds before compression, from which the bucket count follows, and
-/// what its values are made of.
+/// A benchmark table as written: its name, key type and shape, the bytes a
+/// key and a value hold before compression, from which a contract table's
+/// bucket count follows, what its values are made of, and its two builds'
+/// rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TableShape {
     name: TableName,
     key_type: KeyType,
+    key_shape: KeyShape,
     key_bytes: usize,
+    value_bytes: usize,
     values: Values,
+    rows: u64,
+    appended_rows: u64,
 }
 
-const SHAPES: [TableShape; 4] = [
+const SHAPES: [TableShape; 5] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
+        key_shape: KeyShape::Sequential,
         key_bytes: size_of::<i64>(),
+        value_bytes: VALUE_BYTES,
         values: Values::Random,
+        rows: ROWS,
+        appended_rows: APPENDED_ROWS,
     },
     TableShape {
         name: TableName::String,
         key_type: KeyType::String,
+        key_shape: KeyShape::Sequential,
         key_bytes: STRING_KEY_FIXED_BYTES,
+        value_bytes: VALUE_BYTES,
         values: Values::Random,
+        rows: ROWS,
+        appended_rows: APPENDED_ROWS,
     },
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
+        key_shape: KeyShape::Sequential,
         key_bytes: size_of::<i64>(),
+        value_bytes: VALUE_BYTES,
         values: Values::Text,
+        rows: ROWS,
+        appended_rows: APPENDED_ROWS,
     },
     TableShape {
         name: TableName::String,
         key_type: KeyType::String,
+        key_shape: KeyShape::Sequential,
         key_bytes: STRING_KEY_FIXED_BYTES,
+        value_bytes: VALUE_BYTES,
         values: Values::Text,
+        rows: ROWS,
+        appended_rows: APPENDED_ROWS,
+    },
+    TableShape {
+        name: TableName::Scattered,
+        key_type: KeyType::String,
+        key_shape: KeyShape::Scattered,
+        key_bytes: SCATTERED_KEY_FIXED_BYTES,
+        value_bytes: SCATTERED_VALUE_BYTES,
+        values: Values::Random,
+        rows: SCATTERED_ROWS,
+        appended_rows: SCATTERED_APPENDED_ROWS,
     },
 ];
 
@@ -422,6 +510,7 @@ impl TableName {
         match self {
             Self::Long => "long",
             Self::String => "string",
+            Self::Scattered => "scattered",
         }
     }
 }
@@ -436,16 +525,62 @@ impl TableShape {
         }
     }
 
-    /// One file per bucket at the contract's upper file size: the raw row
-    /// bytes over `TARGET_FILE_BYTES_MAX`, rounded up. Random values do not
-    /// shrink under zstd, so those files come close to the raw size, inside
-    /// the contract's 32 to 64 MiB. A text table keeps the bucket count of
-    /// the random table with its key column, so the two differ in their
-    /// values alone; its files come out smaller by the values' compression.
+    /// A contract table has one file per bucket at the contract's upper
+    /// file size: the raw row bytes over `TARGET_FILE_BYTES_MAX`, rounded
+    /// up. Random values do not shrink under zstd, so those files come
+    /// close to the raw size, inside the contract's 32 to 64 MiB. A text
+    /// table keeps the bucket count of the random table with its key
+    /// column, so the two differ in their values alone; its files come out
+    /// smaller by the values' compression. The scattered table has one
+    /// file of `SCATTERED_ROWS_PER_FILE` rows per bucket.
     fn buckets(self) -> u32 {
-        let row_bytes = approx::count(self.key_bytes + VALUE_BYTES);
-        u32::try_from((ROWS * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX))
-            .expect("a few hundred megabytes over 64 MiB is a handful of buckets")
+        let buckets = match self.name {
+            TableName::Long | TableName::String => {
+                let row_bytes = approx::count(self.key_bytes + self.value_bytes);
+                (self.rows * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
+            }
+            TableName::Scattered => self.rows.div_ceil(SCATTERED_ROWS_PER_FILE),
+        };
+        u32::try_from(buckets).expect("a benchmark table has a few dozen buckets at most")
+    }
+
+    /// The Parquet layout: the contract's, or for the scattered table value
+    /// pages bounded at the contract's `VALUE_PAGE_BYTES` (the byte bound
+    /// shortens the writer's page-size check to every two rows, so a page
+    /// overshoots it by one value at most) and files rolled at
+    /// `SCATTERED_FILE_BYTES`.
+    fn layout(self) -> FileLayout {
+        match self.name {
+            TableName::Long | TableName::String => FileLayout::contract(),
+            TableName::Scattered => FileLayout {
+                page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
+                target_file_bytes: SCATTERED_FILE_BYTES,
+                ..FileLayout::contract()
+            },
+        }
+    }
+
+    /// Whether the warm scenarios' page cache holds every value page of the
+    /// table, which their measurement assumes.
+    fn fits_warm_cache(self) -> bool {
+        approx::length(self.rows) * self.value_bytes <= WARM_CACHE_BYTES
+    }
+
+    /// The table's `i`-th key.
+    fn key(self, i: u64) -> Key {
+        key_at_shaped(i, self.key_type, 0, self.key_shape)
+    }
+
+    /// Whether the command line selects the table: named by `--table`, or
+    /// `--table` absent and the table not the scattered one, and its values
+    /// among `values`.
+    fn selected(self, tables: &[TableName], values: &[Values]) -> bool {
+        let named = if tables.is_empty() {
+            self.name != TableName::Scattered
+        } else {
+            tables.contains(&self.name)
+        };
+        named && values.contains(&self.values)
     }
 }
 
@@ -464,6 +599,9 @@ impl Prepared {
             "name": self.shape.table_name(),
             "values": self.shape.values.as_str(),
             "buckets": self.shape.buckets(),
+            "rows": self.shape.rows,
+            "appended_rows": self.shape.appended_rows,
+            "value_bytes": self.shape.value_bytes,
             "root": self.root,
             "first": self.first,
             "second": self.second,
@@ -471,98 +609,133 @@ impl Prepared {
     }
 }
 
-/// The tables under `dir`: reused when its manifest records the same rows
-/// and tables, else written again from an empty directory.
-async fn prepare(dir: &Path, rewrite: bool) -> BenchResult<Vec<Prepared>> {
-    if !rewrite && let Some(prepared) = read_manifest(dir)? {
-        eprintln!("reusing the tables under {}", dir.display());
-        return Ok(prepared);
-    }
-    if dir.exists() {
+/// `shapes` under `dir`, in that order: each reused when the manifest
+/// records it as this program writes it now, else written, alone, in place
+/// of whatever its directory held. `rewrite` empties `dir` first. The
+/// manifest keeps every table it records that is still current, selected
+/// or not, so selecting one table never rewrites another.
+async fn prepare(dir: &Path, rewrite: bool, shapes: &[TableShape]) -> BenchResult<Vec<Prepared>> {
+    if rewrite && dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }
+    let mut recorded = read_manifest(dir)?;
     std::fs::create_dir_all(dir)?;
     let catalog = memory_catalog_local(&std::path::absolute(dir)?).await?;
-    let mut prepared = Vec::with_capacity(SHAPES.len());
-    for shape in SHAPES {
-        let started = Instant::now();
-        let spec = FixtureSpec {
-            buckets: shape.buckets(),
-            ids: 0..ROWS,
-            value_kind: shape.values.kind(),
-            ..FixtureSpec::small(&shape.table_name(), shape.key_type)
-        };
-        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-        let first = fixture.metadata_location().to_string();
-        fixture
-            .append(
-                catalog.as_ref(),
-                ROWS..ROWS + APPENDED_ROWS,
-                SECOND_BUILD_PREFIX,
-            )
-            .await?;
-        eprintln!(
-            "wrote {} ({ROWS} rows, {} buckets, then {APPENDED_ROWS} more): {:.1?}",
-            shape.table_name(),
-            shape.buckets(),
-            started.elapsed()
-        );
-        prepared.push(Prepared {
-            shape,
-            root: fixture.root().to_string(),
-            first,
-            second: fixture.metadata_location().to_string(),
-        });
+    let mut prepared = Vec::with_capacity(shapes.len());
+    for &shape in shapes {
+        if let Some(table) = recorded.iter().find(|table| table.shape == shape) {
+            eprintln!("reusing {} under {}", shape.table_name(), dir.display());
+            prepared.push(table.clone());
+            continue;
+        }
+        let table = write_table(catalog.as_ref(), dir, shape).await?;
+        recorded.retain(|other| other.shape.table_name() != shape.table_name());
+        recorded.push(table.clone());
+        write_manifest(dir, &recorded)?;
+        prepared.push(table);
     }
+    Ok(prepared)
+}
+
+/// Writes `shape` under `dir` through `catalog`, after removing what its
+/// directory held: the first build of `shape.rows` rows, then the second,
+/// `shape.appended_rows` more above them.
+async fn write_table(
+    catalog: &MemoryCatalog,
+    dir: &Path,
+    shape: TableShape,
+) -> BenchResult<Prepared> {
+    let name = shape.table_name();
+    let table_dir = dir.join(NAMESPACE).join(&name);
+    if table_dir.exists() {
+        std::fs::remove_dir_all(&table_dir)?;
+    }
+    let started = Instant::now();
+    let spec = FixtureSpec {
+        buckets: shape.buckets(),
+        ids: 0..shape.rows,
+        key_shape: shape.key_shape,
+        value_bytes: shape.value_bytes,
+        value_kind: shape.values.kind(),
+        layout: shape.layout(),
+        ..FixtureSpec::small(&name, shape.key_type)
+    };
+    let mut fixture = write_fixture(catalog, NAMESPACE, spec).await?;
+    let first = fixture.metadata_location().to_string();
+    fixture
+        .append(
+            catalog,
+            shape.rows..shape.rows + shape.appended_rows,
+            SECOND_BUILD_PREFIX,
+        )
+        .await?;
+    eprintln!(
+        "wrote {name} ({} rows, {} buckets, then {} more): {:.1?}",
+        shape.rows,
+        shape.buckets(),
+        shape.appended_rows,
+        started.elapsed()
+    );
+    Ok(Prepared {
+        shape,
+        root: fixture.root().to_string(),
+        first,
+        second: fixture.metadata_location().to_string(),
+    })
+}
+
+/// Records `tables` as the manifest under `dir`.
+fn write_manifest(dir: &Path, tables: &[Prepared]) -> BenchResult<()> {
     let manifest = json!({
-        "rows": ROWS,
-        "appended_rows": APPENDED_ROWS,
-        "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
+        "tables": tables.iter().map(Prepared::to_json).collect::<Vec<_>>(),
     });
     std::fs::write(
         dir.join(MANIFEST_FILE),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
-    Ok(prepared)
+    Ok(())
 }
 
-/// The manifest under `dir` when it describes the tables this program
-/// writes now; `None` when it is absent or describes anything else.
-fn read_manifest(dir: &Path) -> BenchResult<Option<Vec<Prepared>>> {
+/// The tables the manifest under `dir` records as this program writes them
+/// now, whose builds' metadata files are still there; none when it is
+/// absent.
+fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
     let path = dir.join(MANIFEST_FILE);
     if !path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let manifest: Json = serde_json::from_slice(&std::fs::read(path)?)?;
-    if manifest["rows"].as_u64() != Some(ROWS)
-        || manifest["appended_rows"].as_u64() != Some(APPENDED_ROWS)
-    {
-        return Ok(None);
-    }
     let Some(tables) = manifest["tables"].as_array() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let mut prepared = Vec::with_capacity(SHAPES.len());
-    for (shape, table) in SHAPES.iter().zip(tables) {
+    let mut recorded = Vec::with_capacity(tables.len());
+    for table in tables {
+        let Some(shape) = SHAPES
+            .into_iter()
+            .find(|shape| table["name"].as_str() == Some(shape.table_name().as_str()))
+        else {
+            continue;
+        };
         let text = |field: &str| table[field].as_str().map(str::to_string);
         let (Some(root), Some(first), Some(second)) = (text("root"), text("first"), text("second"))
         else {
-            return Ok(None);
+            continue;
         };
-        if table["name"].as_str() != Some(shape.table_name().as_str())
-            || table["values"].as_str() != Some(shape.values.as_str())
-            || table["buckets"].as_u64() != Some(u64::from(shape.buckets()))
-        {
-            return Ok(None);
+        let current = table["values"].as_str() == Some(shape.values.as_str())
+            && table["buckets"].as_u64() == Some(u64::from(shape.buckets()))
+            && table["rows"].as_u64() == Some(shape.rows)
+            && table["appended_rows"].as_u64() == Some(shape.appended_rows)
+            && table["value_bytes"].as_u64() == Some(approx::count(shape.value_bytes));
+        if current && local_path(&first)?.exists() && local_path(&second)?.exists() {
+            recorded.push(Prepared {
+                shape,
+                root,
+                first,
+                second,
+            });
         }
-        prepared.push(Prepared {
-            shape: *shape,
-            root,
-            first,
-            second,
-        });
     }
-    Ok((prepared.len() == SHAPES.len()).then_some(prepared))
+    Ok(recorded)
 }
 
 /// Reads every file under `dir` once, so the operating system's page cache
@@ -818,7 +991,7 @@ const SAMPLE_HEADROOM: usize = 2;
 fn key_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
     let mut rng = StdRng::seed_from_u64(KEY_SEED);
     let hits: Vec<Key> = (0..KEY_POOL)
-        .map(|_| key_at(rng.random_range(0..ROWS), shape.key_type))
+        .map(|_| shape.key(rng.random_range(0..shape.rows)))
         .collect();
     let misses = hits.iter().map(absent_key_from).collect();
     (Arc::new(hits), Arc::new(misses))
@@ -1119,8 +1292,8 @@ async fn measure(
 /// warm cache holds every value page (and under Bloom every key page)
 /// before a warm run starts.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
-    for id in (0..ROWS).step_by(approx::length(PRIME_STRIDE)) {
-        table.get(&key_at(id, shape.key_type)).await?;
+    for id in (0..shape.rows).step_by(approx::length(PRIME_STRIDE)) {
+        table.get(&shape.key(id)).await?;
     }
     Ok(())
 }
@@ -1707,6 +1880,61 @@ fn or_all<T: Copy>(chosen: &[T], all: &[T]) -> Vec<T> {
     }
 }
 
+/// One line per table on stdout: its name, key type, rows, and the first
+/// build's metadata file, tab-separated.
+fn print_prepared(prepared: &[Prepared]) {
+    for table in prepared {
+        println!(
+            "{}\t{:?}\t{}\t{}",
+            table.shape.table_name(),
+            table.shape.key_type,
+            table.shape.rows,
+            table.first
+        );
+    }
+}
+
+/// The tables the command line measures, and beside them every table to
+/// prepare: those, and under the two-table scenario the long and string
+/// tables of random values it serves.
+fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<TableShape>) {
+    let values = or_all(&cli.values, &Values::ALL);
+    let measured: Vec<TableShape> = SHAPES
+        .into_iter()
+        .filter(|shape| shape.selected(&cli.table, &values))
+        .collect();
+    let two_table = scenarios.contains(&Scenario::TwoTable) && !cli.prepare;
+    let needed = SHAPES
+        .into_iter()
+        .filter(|shape| {
+            measured.contains(shape)
+                || (two_table
+                    && shape.values == Values::Random
+                    && matches!(shape.name, TableName::Long | TableName::String))
+        })
+        .collect();
+    (measured, needed)
+}
+
+/// The lookup scenarios of `scenarios` that measure what they say on
+/// `shape`: all of them, or without the warm ones when the warm cache
+/// cannot hold the table's value pages, which it says.
+fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
+    let fits = shape.fits_warm_cache();
+    let kept: Vec<Scenario> = scenarios
+        .iter()
+        .copied()
+        .filter(|scenario| fits || !scenario.is_warm())
+        .collect();
+    if kept.len() < scenarios.len() {
+        eprintln!(
+            "{}: warm scenarios skipped, its value pages outrun the warm cache",
+            shape.table_name()
+        );
+    }
+    kept
+}
+
 /// Installs the binary's metrics recorder and drains its histograms on the
 /// binary's schedule, as `serve` does, so the measured paths pay what the
 /// daemon's do.
@@ -1729,23 +1957,21 @@ async fn main() -> BenchResult<()> {
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
-    let prepared = prepare(&cli.data_dir, cli.rewrite).await?;
+    let scenarios = or_all(&cli.scenario, &Scenario::ALL);
+    let (measured_shapes, needed) = select_shapes(&cli, &scenarios);
+    let prepared = prepare(&cli.data_dir, cli.rewrite, &needed).await?;
     let compression = compression(&prepared)?;
     if cli.prepare {
-        for table in &prepared {
-            println!(
-                "{}\t{:?}\t{ROWS}\t{}",
-                table.shape.table_name(),
-                table.shape.key_type,
-                table.first
-            );
-        }
+        print_prepared(&prepared);
         return Ok(());
     }
     if !cli.no_metrics {
         install_recorder()?;
     }
-    let primed = prime_os_cache(&cli.data_dir)?;
+    let mut primed = 0;
+    for table in &prepared {
+        primed += prime_os_cache(&local_path(&table.root)?)?;
+    }
     eprintln!("read {:.0} MiB to prime the OS page cache", mib(primed));
     let tasks = cli
         .tasks
@@ -1757,7 +1983,6 @@ async fn main() -> BenchResult<()> {
         duration: Duration::from_secs(cli.duration),
         windows: cli.duration.div_ceil(cli.warmup),
     };
-    let scenarios = or_all(&cli.scenario, &Scenario::ALL);
     let lookup_scenarios: Vec<Scenario> = scenarios
         .iter()
         .copied()
@@ -1766,8 +1991,7 @@ async fn main() -> BenchResult<()> {
     let tiers = or_all(&cli.tier, &Tier::ALL);
     let tables: Vec<&Prepared> = prepared
         .iter()
-        .filter(|table| cli.table.is_empty() || cli.table.contains(&table.shape.name))
-        .filter(|table| or_all(&cli.values, &Values::ALL).contains(&table.shape.values))
+        .filter(|table| measured_shapes.contains(&table.shape))
         .collect();
     let machine = machine(tasks, !cli.no_metrics);
     eprintln!("{machine}");
@@ -1775,9 +1999,10 @@ async fn main() -> BenchResult<()> {
     let mut measured = Vec::new();
     let mut loaded = Vec::new();
     for table in &tables {
+        let table_lookups = lookups_for(table.shape, &lookup_scenarios);
         for &tier in &tiers {
-            if !lookup_scenarios.is_empty() {
-                measured.extend(lookups(table, tier, &lookup_scenarios, &settings).await?);
+            if !table_lookups.is_empty() {
+                measured.extend(lookups(table, tier, &table_lookups, &settings).await?);
             }
             if scenarios.contains(&Scenario::Load) {
                 loaded.extend(loads(table, tier, cli.load_rounds).await?);

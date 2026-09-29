@@ -51,8 +51,8 @@ use tempfile::TempDir;
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{
-    STRING_KEY_FIXED_BYTES, VALUE_BYTES, ValueKind, absent_key_from, id_of, key_at_padded,
-    value_of_kind,
+    KeyShape, SCATTERED_ID_SPACE, STRING_KEY_FIXED_BYTES, VALUE_BYTES, ValueKind, absent_key_from,
+    id_of, key_at_shaped, value_of_kind,
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::s3::S3Fixture;
@@ -247,7 +247,7 @@ pub struct FixtureSpec {
     /// Buckets of the `bucket(N, key)` spec; zero writes an unpartitioned
     /// table.
     pub buckets: u32,
-    /// The ids written, in fixture key space (`key_at_padded`).
+    /// The ids written, in fixture key space (`key_at_shaped`).
     pub ids: Range<u64>,
     /// Write every `id_stride`-th id of `ids`; one (or zero) writes every
     /// id. A later `append` of the skipped ids interleaves keys into the
@@ -258,6 +258,9 @@ pub struct FixtureSpec {
     /// Extra prefix bytes on every string or binary key, for long keys; a
     /// long or uuid key takes none.
     pub key_pad: usize,
+    /// How string keys are spelled; a key of another type takes the
+    /// sequential shape alone.
+    pub key_shape: KeyShape,
     /// Bytes per value.
     pub value_bytes: usize,
     /// What the values are made of.
@@ -289,8 +292,8 @@ pub enum Nulls {
 
 impl FixtureSpec {
     /// The small fixture: `SMALL_IDS` in `SMALL_BUCKETS`, every id, ascending,
-    /// no padding, `VALUE_BYTES` random bytes per value, no nulls, the
-    /// contract layout.
+    /// sequential keys with no padding, `VALUE_BYTES` random bytes per
+    /// value, no nulls, the contract layout.
     /// Every other shape is a struct update on it.
     pub fn small(name: &str, key_type: KeyType) -> Self {
         Self {
@@ -301,6 +304,7 @@ impl FixtureSpec {
             id_stride: 1,
             order: Order::Ascending,
             key_pad: 0,
+            key_shape: KeyShape::Sequential,
             value_bytes: VALUE_BYTES,
             value_kind: ValueKind::Random,
             nulls: Nulls::None,
@@ -319,6 +323,23 @@ impl FixtureSpec {
             id_stride: INTERLEAVE_STRIDE,
             buckets: INTERLEAVED_BUCKETS,
             ..Self::small(name, KeyType::Long)
+        }
+    }
+
+    /// The `i`-th key in this specification's key type, padding, and shape.
+    fn key(&self, i: u64) -> Key {
+        key_at_shaped(i, self.key_type, self.key_pad, self.key_shape)
+    }
+
+    /// `SpecFault::IdOutsideScatteredSpace` for the first of `ids` that has
+    /// no scattered key, when the keys are scattered.
+    fn check_ids(&self, ids: &[u64]) -> Result<()> {
+        if self.key_shape != KeyShape::Scattered {
+            return Ok(());
+        }
+        match ids.iter().find(|&&id| id >= SCATTERED_ID_SPACE) {
+            Some(&id) => Err(SpecFault::IdOutsideScatteredSpace { id }.into()),
+            None => Ok(()),
         }
     }
 
@@ -469,9 +490,9 @@ impl Fixture {
         &self.metadata
     }
 
-    /// The `i`-th key of this fixture, in its key type and padding.
+    /// The `i`-th key of this fixture, in its key type, padding, and shape.
     pub fn key(&self, i: u64) -> Key {
-        key_at_padded(i, self.spec.key_type, self.spec.key_pad)
+        self.spec.key(i)
     }
 
     /// A key just above the `i`-th that no fixture holds.
@@ -482,7 +503,8 @@ impl Fixture {
     /// The value stored for `key`: `None` for an id `Nulls` names, else the
     /// `value_bytes` bytes of `value_kind` derived from the key.
     pub fn value(&self, key: &Key) -> Option<Vec<u8>> {
-        let null = id_of(key, self.spec.key_pad).is_some_and(|id| self.spec.is_null(id));
+        let null = id_of(key, self.spec.key_pad, self.spec.key_shape)
+            .is_some_and(|id| self.spec.is_null(id));
         (!null).then(|| value_of_kind(key, self.spec.value_bytes, self.spec.value_kind))
     }
 
@@ -591,6 +613,7 @@ impl Fixture {
             return Err(SpecFault::CatalogBehind.into());
         }
         let ids: Vec<u64> = ids.into_iter().collect();
+        self.spec.check_ids(&ids)?;
         let files = write_data_files(&self.table, &self.spec, ids.iter().copied(), prefix).await?;
         self.commit_files(catalog, files).await?;
         self.ids.extend(ids);
@@ -605,6 +628,7 @@ impl Fixture {
     /// `bucket` is the partition tuple's integer. `append_raw` commits it;
     /// the ids are not added to the fixture's.
     pub fn raw_file_in_bucket(&self, name: &str, ids: &[u64], bucket: i32) -> Result<RawFile> {
+        self.spec.check_ids(ids)?;
         let schema = self.metadata.current_schema();
         let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
         let keys: Vec<Key> = ids.iter().map(|&id| self.key(id)).collect();
@@ -819,7 +843,9 @@ pub async fn memory_catalog_s3(s3: &S3Fixture, prefix: &str) -> Result<Arc<Memor
 /// Creates the table `spec` describes in `namespace` (creating the namespace
 /// when absent) and commits `spec.ids` at `spec.id_stride` in `spec.order`
 /// as its first snapshot. A `key_pad` on a long or uuid key is
-/// `SpecFault::PadOnFixedWidthKey`.
+/// `SpecFault::PadOnFixedWidthKey`, a scattered key of a type other than
+/// string `SpecFault::ScatteredNonStringKey`, and a scattered id at or
+/// above `SCATTERED_ID_SPACE` `SpecFault::IdOutsideScatteredSpace`.
 pub async fn write_fixture(
     catalog: &dyn Catalog,
     namespace: &str,
@@ -827,6 +853,12 @@ pub async fn write_fixture(
 ) -> Result<Fixture> {
     if spec.key_pad > 0 && spec.key_type.is_fixed_width() {
         return Err(SpecFault::PadOnFixedWidthKey {
+            key_type: spec.key_type,
+        }
+        .into());
+    }
+    if spec.key_shape == KeyShape::Scattered && spec.key_type != KeyType::String {
+        return Err(SpecFault::ScatteredNonStringKey {
             key_type: spec.key_type,
         }
         .into());
@@ -943,7 +975,7 @@ struct BucketRows {
 }
 
 /// Writes `ids` into `table`'s layout as new data files, not yet committed:
-/// keys through `key_at_padded`, grouped by bucket through the library's own
+/// keys through `key_at_shaped`, grouped by bucket through the library's own
 /// bucket transform, in the given order within a bucket, through a
 /// `ClusteredWriter` over the rolling data file writer under
 /// `spec.layout`'s properties and file size target, in batches of
@@ -997,10 +1029,7 @@ fn group_by_bucket(
     ids: impl IntoIterator<Item = u64>,
 ) -> Result<BTreeMap<i32, BucketRows>> {
     let ids: Vec<u64> = ids.into_iter().collect();
-    let keys: Vec<Key> = ids
-        .iter()
-        .map(|&id| key_at_padded(id, spec.key_type, spec.key_pad))
-        .collect();
+    let keys: Vec<Key> = ids.iter().map(|&id| spec.key(id)).collect();
     let buckets: Vec<i32> = if spec.buckets == 0 {
         vec![UNPARTITIONED_BUCKET; ids.len()]
     } else {
@@ -1050,9 +1079,9 @@ fn batch(
     Ok(RecordBatch::try_new(Arc::clone(arrow_schema), columns)?)
 }
 
-/// The message of the impossible case: `key_at_padded` builds every key
+/// The message of the impossible case: `key_at_shaped` builds every key
 /// `key_array` sees, in the type it is given.
-const MIXED_KEYS: &str = "key_at_padded builds keys of the type the fixture names";
+const MIXED_KEYS: &str = "key_at_shaped builds keys of the type the fixture names";
 
 /// `keys`, all of `key_type`, as the key column's array: `Int64`, `Utf8`,
 /// `Binary`, or `FixedSizeBinary(16)`, what the library's schema conversion

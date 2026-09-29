@@ -75,6 +75,20 @@ pub enum SpecFault {
         /// The fixed-width key type the specification named.
         key_type: KeyType,
     },
+    /// `KeyShape::Scattered` spells string keys; a key of another type has
+    /// no scattered spelling.
+    #[error("a scattered key shape applies to string keys, not {key_type}")]
+    ScatteredNonStringKey {
+        /// The key type the specification named.
+        key_type: KeyType,
+    },
+    /// An id a scattered fixture was asked to write has no scattered key:
+    /// it is at or above `keys::SCATTERED_ID_SPACE`.
+    #[error("id {id} is outside the scattered key space of {space} ids", space = crate::keys::SCATTERED_ID_SPACE)]
+    IdOutsideScatteredSpace {
+        /// The first such id.
+        id: u64,
+    },
     /// The fixture has committed a snapshot by hand, so its catalog record
     /// is behind its root and a commit through the catalog would fork the
     /// table; only `commit_by_hand` may advance it from then on.

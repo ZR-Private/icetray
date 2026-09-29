@@ -1306,24 +1306,31 @@ more printed. The one-shots log to stderr at `warn`, since their stdout is
 data.
 
 **Testkit.** `icetray-testkit` is `error` (`TestkitError`, one variant per
-failure source; `SpecFault { PadOnFixedWidthKey, CatalogBehind }` for a
+failure source; `SpecFault { PadOnFixedWidthKey, ScatteredNonStringKey,
+IdOutsideScatteredSpace, CatalogBehind }` for a
 specification the writer refuses; `Precondition { OracleNotFull,
 CacheNotCold, GoldenUnset, RestUriUnset }` for a helper called in a state
 it cannot measure; `TruthFault { Json, Base64 }` for a truth-file line that
 cannot be read, naming the line; `required_var`, the one place a gate's
-variable is read), `keys` (`key_at`, `key_at_padded`, `absent_key_from`,
-`absent_key_near`, `far_key`, `value_for`, `value_for_len`,
-`text_value_for_len`, `value_of_kind` over `ValueKind { Random, Text }`;
-`KEY_STEP`, `VALUE_BYTES`, `STRING_KEY_FIXED_BYTES`; keys of all four
-types, uuid as sixteen bytes with the big-endian value in the tail, and
-values a function of the key: random bytes by default, or JSON-like text
-records with repeated field names and a skewed vocabulary, which zstd
-compresses), `layout` (`Layout` with `page_rows`, `page_bytes`,
+variable is read), `keys` (`key_at`, `key_at_padded`, `key_at_shaped`
+over `KeyShape { Sequential, Scattered }`, `scattered_key_at`,
+`absent_key_from`, `absent_key_near`, `far_key`, `value_for`,
+`value_for_len`, `text_value_for_len`, `value_of_kind` over
+`ValueKind { Random, Text }`; `KEY_STEP`, `VALUE_BYTES`,
+`STRING_KEY_FIXED_BYTES`, `SCATTERED_KEY_FIXED_BYTES`,
+`SCATTERED_ID_SPACE`; keys of all four types, uuid as sixteen bytes with
+the big-endian value in the tail, string keys sequential by default or
+scattered: a 126-bit value whose top bits are the id and the rest
+pseudo-random, in 21 order-preserving base64url characters and a fixed
+suffix, so neighbors in a bucket share only a few leading characters as
+random identifiers do; and values a function of the key: random bytes by
+default, or JSON-like text records with repeated field names and a skewed
+vocabulary, which zstd compresses), `layout` (`Layout` with `page_rows`, `page_bytes`,
 `Dictionary`, `column_index_truncate`, `Statistics`, `Bloom`,
 `row_group_rows`, `target_file_bytes`, and `Layout::contract()` built from
 `contract`'s constants; `KEY_BLOOM_FPP`, `OVERSIZED_FPP`, `UNDERSIZED_FPP`,
 `KEY_COLUMN`, `VALUE_COLUMN`), `fixture` (`FixtureSpec` with `small` and
-`interleaved`, its values' kind in `value_kind`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
+`interleaved`, its string keys' shape in `key_shape`, its values' kind in `value_kind`, `Order`, `Nulls`, `Fixture` with its accessors, `files`,
 `keys_at`, and the sources `catalog_source`, `root_source`,
 `pinned_source`, and `raw_file_in_bucket`; `RawFile::from_batch`; `HandSnapshot`; `write_fixture`,
 `write_table_of_types`, `position_delete_file`, `memory_catalog_local`,
