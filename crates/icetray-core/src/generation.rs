@@ -37,12 +37,15 @@ use crate::time;
 /// checked at once by the doctor's bucket check. Each file in flight is one
 /// GET or local read waiting, and at the chunk stage one file's key chunks
 /// in memory and at most one blocking-pool task over them at a time (its
-/// verification, then in the Disk tier its chunk file's write); sixteen
-/// keeps a load of hundreds of files a few round trips deep, and its
-/// verifications and writes on up to sixteen threads, without holding more
-/// than sixteen files' chunks before they are kept or dropped. The bound is
-/// per load: tables loading at once each run their own sixteen.
-const LOAD_CONCURRENCY: usize = 16;
+/// verification, then in the Disk tier its chunk file's write). A load's
+/// time is its files' round trips over this bound until the bytes bind: an
+/// object not read in the last moments answers a range GET in about 90 ms,
+/// so at sixteen a first load of 32,768 files took 835 s against real S3,
+/// at 64 took 289 s, and at 128 took 221 s, by then bound by its 64 GB, with
+/// resident memory unchanged. The bound also caps the files' chunks held
+/// before they are kept or dropped and the blocking-pool tasks over them,
+/// 128 of each. It is per load: tables loading at once each run their own.
+const LOAD_CONCURRENCY: usize = 128;
 
 /// One data file with its manifest entry and its resident index.
 #[derive(Debug)]
