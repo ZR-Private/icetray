@@ -410,8 +410,10 @@ changed, which only a restart applies; the refusal is logged with its
 reason and counted, `icetray_config_pending` reads 1 until the file and
 the server agree again, and the poll does not try the same file again
 until it changes, though a SIGHUP does. Readiness does not change on a
-reload. A file mounted where the orchestrator never updates it in place,
-such as a single-file mount fixed at start, is never seen to change.
+reload. A file mounted where the orchestrator never updates it, such as a
+single-file mount fixed at start, is never seen to change. Replace the file
+whole, by a rename, rather than writing it in place: a read in the middle
+of an in-place write can see a shorter file that still parses.
 
 ## Deploying
 

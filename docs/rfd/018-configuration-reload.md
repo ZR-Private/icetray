@@ -131,3 +131,9 @@ A deployer that mounts the file where the orchestrator never updates it,
 such as a single-file mount that is fixed at start, gets no reload from a
 change and must restart as before; that is the deployer's choice of mount,
 not a mode icetray detects.
+
+The file must be replaced whole, by a rename or an orchestrator's
+symlink swap, never written in place. A read in the middle of an in-place
+write can see a prefix of the new file, and a prefix that ends between
+two tables parses and validates as a configuration without the rest: a
+poll would drop those tables and the next would load them again.
