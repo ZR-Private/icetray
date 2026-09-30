@@ -149,7 +149,7 @@ impl Serving {
         listeners: Listeners,
         opened: Opened,
         handle: PrometheusHandle,
-        options: ServeOptions,
+        mut options: ServeOptions,
     ) -> Self {
         let (health, health_service) = tonic_health::server::health_reporter();
         set_health(&health, ServingStatus::NotServing).await;
@@ -187,7 +187,7 @@ impl Serving {
         let drain_deadline = config.server.drain_deadline;
         let reloader = options
             .reload
-            .clone()
+            .take()
             .map(|source| Reloader::new(source, config, poll_interval, Arc::clone(&reload)));
         let run = Run {
             opened: Arc::clone(&opened),
@@ -668,7 +668,7 @@ fn log_serving(table: &Table) {
 
 /// Deletes the chunk files no table serves any more and logs what it freed;
 /// a failure here leaves the daemon serving and is logged.
-async fn retain(opened: &Opened) {
+pub(crate) async fn retain(opened: &Opened) {
     match opened.retain().await {
         Ok(freed) if freed > 0 => tracing::info!(freed_bytes = freed, "chunk files retained"),
         Ok(_) => {}
@@ -680,7 +680,7 @@ async fn retain(opened: &Opened) {
 
 /// An interval of `period` whose first tick is one period from now, not at
 /// once, and which delays rather than bursts after a missed tick.
-fn ticker(period: Duration) -> tokio::time::Interval {
+pub(crate) fn ticker(period: Duration) -> tokio::time::Interval {
     let start = tokio::time::Instant::now() + period;
     let mut interval = tokio::time::interval_at(start, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);

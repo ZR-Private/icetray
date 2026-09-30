@@ -18,7 +18,8 @@ use icetray_core::config::{Config, ConfigError};
 use icetray_core::{Applied, Opened, Refused, Table, metric};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
-use tokio::time::MissedTickBehavior;
+
+use crate::serve::{retain, ticker};
 
 /// Bytes in a configuration digest: SHA-256's output.
 pub const DIGEST_BYTES: usize = 32;
@@ -123,8 +124,6 @@ impl fmt::Debug for Reload {
 /// Why a reload changed nothing. Display gives the log's `reason`.
 #[derive(Debug)]
 pub enum ReloadRefusal {
-    /// No bytes could be read.
-    Read(io::Error),
     /// The bytes do not parse or validate.
     Invalid(icetray_core::Error),
     /// Settings outside the tables changed, by their names in the file.
@@ -136,7 +135,6 @@ pub enum ReloadRefusal {
 impl fmt::Display for ReloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read(error) => write!(f, "the configuration cannot be read: {error}"),
             Self::Invalid(error) => write!(f, "the configuration is invalid: {error}"),
             Self::Restart(settings) => write!(
                 f,
@@ -187,6 +185,9 @@ pub(crate) struct Reloader {
     /// it again; a request does, since a table's load can fail for a
     /// reason that has since passed.
     refused: Option<Digest>,
+    /// Whether the last read failed, so a file that stays unreadable is
+    /// logged once and not at every poll.
+    unreadable: bool,
     ticker: tokio::time::Interval,
     requested: Arc<Notify>,
 }
@@ -200,16 +201,14 @@ impl Reloader {
         poll_interval: Duration,
         requested: Arc<Notify>,
     ) -> Self {
-        let start = tokio::time::Instant::now() + poll_interval;
-        let mut ticker = tokio::time::interval_at(start, poll_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         metrics::gauge!(metric::CONFIG_PENDING).set(0.0);
         Self {
             source: reload.source,
             running,
             applied: reload.started_from,
             refused: None,
-            ticker,
+            unreadable: false,
+            ticker: ticker(poll_interval),
             requested,
         }
     }
@@ -217,7 +216,10 @@ impl Reloader {
     /// Waits for polls and requests until one reload applies, then returns
     /// what it changed. A read that finds the configuration applied, or on
     /// a poll the one last refused, does nothing further; a refused reload
-    /// is logged and counted, and the wait goes on. Dropping the future
+    /// is logged and counted, and the wait goes on. A read that fails is
+    /// no reload: it is logged when the file becomes unreadable, and
+    /// neither counted nor reflected in `config_pending`, since whether the
+    /// file differs is unknown. Dropping the future
     /// drops a reload in flight, which swaps nothing in.
     pub(crate) async fn next(&mut self, opened: &Opened) -> Applied {
         loop {
@@ -241,10 +243,14 @@ impl Reloader {
         let reading = match read {
             Ok(reading) => reading,
             Err(error) => {
-                self.refuse(None, &ReloadRefusal::Read(error));
+                if !self.unreadable {
+                    tracing::warn!(%error, "configuration cannot be read");
+                }
+                self.unreadable = true;
                 return None;
             }
         };
+        self.unreadable = false;
         let digest = reading.digest;
         if digest == self.applied {
             metrics::gauge!(metric::CONFIG_PENDING).set(0.0);
@@ -257,7 +263,13 @@ impl Reloader {
         match self.reload(opened, reading).await {
             Ok(applied) => Some(applied),
             Err(refusal) => {
-                self.refuse(Some(digest), &refusal);
+                self.refuse(digest, &refusal);
+                if matches!(refusal, ReloadRefusal::Tables(_)) {
+                    // The tables that did load wrote chunk files no table
+                    // serves; the next swap's retention would free them
+                    // only then.
+                    retain(opened).await;
+                }
                 None
             }
         }
@@ -296,9 +308,8 @@ impl Reloader {
     }
 
     /// Logs and counts `refusal` of the configuration digested as `digest`,
-    /// `None` when nothing could be read, and remembers the digest. A read
-    /// that failed leaves the digest last refused as it was.
-    fn refuse(&mut self, digest: Option<Digest>, refusal: &ReloadRefusal) {
+    /// and remembers the digest.
+    fn refuse(&mut self, digest: Digest, refusal: &ReloadRefusal) {
         if let ReloadRefusal::Tables(refused) = refusal {
             for (table, error) in &refused.failures {
                 tracing::warn!(
@@ -309,12 +320,8 @@ impl Reloader {
                 );
             }
         }
-        if let Some(digest) = digest {
-            tracing::warn!(%digest, reason = %refusal, "configuration reload refused");
-            self.refused = Some(digest);
-        } else {
-            tracing::warn!(reason = %refusal, "configuration reload refused");
-        }
+        tracing::warn!(%digest, reason = %refusal, "configuration reload refused");
+        self.refused = Some(digest);
         count(ReloadResult::Refused);
         metrics::gauge!(metric::CONFIG_PENDING).set(1.0);
     }

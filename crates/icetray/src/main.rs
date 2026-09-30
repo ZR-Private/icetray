@@ -189,7 +189,8 @@ async fn daemon(config: Config, reload: Reload) -> Result<ExitCode, CliError> {
 
 /// Asks `serving` to reload on every SIGHUP `hangup` receives (RFD 018).
 /// The listener is registered before the daemon starts, replacing the
-/// signal's default action, which would end the process. A signal the
+/// signal's default action, which would end the process; a SIGHUP before
+/// that, while the file is read and logging set up, still ends it. A signal the
 /// runtime cannot listen for, or a listener that stops receiving, is
 /// logged, and a change to the file is then applied on the poll alone.
 async fn hangups(hangup: std::io::Result<Signal>, serving: &Serving) -> std::convert::Infallible {

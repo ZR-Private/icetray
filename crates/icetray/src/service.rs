@@ -94,8 +94,6 @@ fn table<'a>(tables: &'a Tables, name: &str) -> Result<&'a Arc<Table>, Status> {
         .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
 }
 
-impl Service {}
-
 /// The variant a wire `Key` carries (RFD 010), the closed set the `oneof`
 /// declares, for the fault naming one the table's key type does not take.
 /// Display gives the field's name in the contract.
