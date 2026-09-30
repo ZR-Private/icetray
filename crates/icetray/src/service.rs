@@ -78,8 +78,9 @@ impl Service {
 
     /// The tables served as they stand, borrowed for one call
     /// (`Opened::serving_tables`): a call holds them to its end, so a
-    /// reload that drops its table meanwhile does not cut it short, and
-    /// finding the table writes no shared reference count.
+    /// reload that drops its table meanwhile does not cut it short. With
+    /// the lookup's own generation guard, a call waiting on a read holds
+    /// two of its thread's fast slots.
     fn serving(&self) -> Guard<Arc<Tables>> {
         self.opened.serving_tables()
     }

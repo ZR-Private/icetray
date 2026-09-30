@@ -143,10 +143,10 @@ impl Opened {
     }
 
     /// The tables served, borrowed through one `ArcSwap` load guard: what
-    /// a call holds for its whole duration, so looking its table up writes
-    /// no reference count shared across cores, and a swap meanwhile keeps
-    /// the borrowed set alive until the guard drops, as `Table::get` holds
-    /// its generation.
+    /// a call holds for its whole duration, and a swap meanwhile keeps the
+    /// borrowed set alive until the guard drops, as `Table::get` holds its
+    /// generation. The guard takes a fast slot as that one does, and falls
+    /// back to a counted reference when its thread's slots are all held.
     pub fn serving_tables(&self) -> Guard<Arc<Tables>> {
         self.tables.load()
     }

@@ -198,9 +198,14 @@ pub struct Table {
     local: Option<Arc<LocalDir>>,
     hedge: Arc<HedgeWindow>,
     /// The serving generation. A `get` borrows it through one `load` guard
-    /// for the lookup's whole duration, so the lookup neither touches the
-    /// generation's shared reference count nor sees a swap; a swap
-    /// meanwhile keeps the borrowed generation alive until the guard drops.
+    /// for the lookup's whole duration, so the lookup does not see a swap,
+    /// and a swap meanwhile keeps the borrowed generation alive until the
+    /// guard drops. The guard takes one of its thread's eight fast slots
+    /// (arc-swap's debts) and writes no shared reference count; a lookup
+    /// that reads nothing completes without suspending and frees its slot
+    /// at once, while one waiting on a read holds it through the wait. A
+    /// load on a thread whose slots are all held falls back to a counted
+    /// reference, what `load_full` costs.
     current: ArcSwapOption<Generation>,
     /// Never held across an `await`.
     state: Mutex<TableState>,
@@ -2445,6 +2450,33 @@ mod tests {
                 .to_bits(),
             approx::gauge_len(strict_bytes).to_bits()
         );
+    }
+
+    /// A lookup that reads nothing, a warm hit or a Full-tier miss,
+    /// completes on its first poll, so the generation guard it holds is
+    /// never parked on its thread's fast slots; a cold hit, which waits on
+    /// its page's read, holds one across the wait.
+    #[tokio::test]
+    async fn test_a_lookup_that_reads_nothing_completes_on_its_first_poll() {
+        use futures::FutureExt as _;
+
+        let (fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let key = Key::Long(all[0]);
+        assert!(
+            table.get(&key).now_or_never().is_none(),
+            "a cold hit waits on its page's read"
+        );
+        table.get(&key).await.unwrap();
+        let warm = table.get(&key).now_or_never();
+        assert_eq!(
+            warm.expect("a warm hit is ready").unwrap().value,
+            present(all[0])
+        );
+        let absent = Key::Long(all.iter().max().unwrap() + 1);
+        let miss = table.get(&absent).now_or_never();
+        assert_eq!(miss.expect("a miss is ready").unwrap().value, Value::Absent);
     }
 
     /// A table built hidden over `fixture`, as a reload builds one.
