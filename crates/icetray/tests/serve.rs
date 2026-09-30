@@ -1592,6 +1592,11 @@ async fn test_reload_refreshes_a_changed_table_under_its_new_configuration() -> 
     versions.set(next);
     stack.serving.reload();
     stack.reloaded(ReloadResult::Applied, before).await?;
+    assert_eq!(
+        stack.table_info(TABLE).await?.snapshot_id,
+        first,
+        "the changed table starts from the snapshot it served"
+    );
 
     stack.fixtures[0]
         .append(stack.catalog.as_ref(), NEW_IDS, APPEND_PREFIX)
