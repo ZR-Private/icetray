@@ -28,7 +28,9 @@ The server reads the file on its poll interval (RFD 005) and compares a
 digest of its bytes with the digest of the file it applied; SIGHUP reads
 it at once. A read that finds the bytes unchanged costs nothing further. A
 change that fails to parse or validate (RFD 011 (Configuration)) is refused
-as a whole.
+as a whole. A poll does not try a refused file again until its bytes
+change; SIGHUP does, since a table's load can fail for a reason that has
+since passed.
 
 A reload applies the tables only. A file whose server, storage, or log
 settings differ from the running ones is refused as a whole with a reason
@@ -63,8 +65,11 @@ operator can see that a replica serves a configuration other than its file
 without comparing digests, which as a gauge would lose digits
 ([prototype findings, finding 14](../analysis/2026-09-10-prototype-findings.md#14-metrics)).
 Readiness does not change: a refused reload leaves the replica serving the
-configuration it applied. A removed table's per-table series leave the
-metrics output.
+configuration it applied. A table being loaded for a reload writes none of
+its per-table gauges until the swap, so the table serving under its name
+keeps its own. The metrics recorder cannot remove a series, so a removed
+table's state series all read 0 and its index bytes 0, and its other
+series keep their last values until the process restarts.
 
 ## Alternatives Considered
 
