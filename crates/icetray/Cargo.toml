@@ -9,6 +9,7 @@ description = "One binary: the serve daemon and the one-shot doctor, get, and in
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }

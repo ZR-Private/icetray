@@ -6,11 +6,12 @@
 //! A running daemon replaces its set of tables through `Opened::apply`
 //! (RFD 018).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use futures::future::join_all;
 
 use crate::cache::{self, PageCache};
@@ -31,9 +32,9 @@ pub struct Opened {
     pub cache: PageCache,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
-    /// The tables served, in configuration order, each in `Loading` until
-    /// the caller loads it. Read without a lock; `apply` replaces it whole.
-    tables: ArcSwap<Vec<Arc<Table>>>,
+    /// The tables served, each in `Loading` until the caller loads it.
+    /// Read without a lock; `apply` replaces the set whole.
+    tables: ArcSwap<Tables>,
     /// The tables an `apply` has built and not yet swapped in or dropped.
     /// Their loads write chunk files no serving generation references, so
     /// `retain` counts them live. Never held across an `await`.
@@ -52,6 +53,41 @@ pub struct Opened {
     /// Whether `tables` is every configured table: `only` narrowed nothing,
     /// or named every one. `retain`'s live set is complete only then.
     complete: bool,
+}
+
+/// The tables an `Opened` serves: a slice in configuration order, through
+/// `Deref`, and by name through `get`. Immutable; `Opened::apply` swaps in
+/// another.
+pub struct Tables {
+    in_order: Vec<Arc<Table>>,
+    /// Each table's position in `in_order`, by its configured name.
+    by_name: HashMap<String, usize>,
+}
+
+impl Tables {
+    /// `in_order`, indexed by name. The names are distinct: configuration
+    /// validation refuses a repeated one.
+    fn new(in_order: Vec<Arc<Table>>) -> Self {
+        let by_name = in_order
+            .iter()
+            .enumerate()
+            .map(|(at, table)| (table.name().to_string(), at))
+            .collect();
+        Self { in_order, by_name }
+    }
+
+    /// The table served under `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&Arc<Table>> {
+        self.by_name.get(name).map(|&at| &self.in_order[at])
+    }
+}
+
+impl Deref for Tables {
+    type Target = [Arc<Table>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.in_order
+    }
 }
 
 /// The server's deadlines a table is built under (`Table::new`).
@@ -100,19 +136,24 @@ impl Drop for Registered<'_> {
 }
 
 impl Opened {
-    /// The tables served, in configuration order: the set as it stands,
-    /// which a later `apply` does not change.
-    pub fn tables(&self) -> Arc<Vec<Arc<Table>>> {
+    /// The tables served: the set as it stands, which a later `apply`
+    /// does not change.
+    pub fn tables(&self) -> Arc<Tables> {
         self.tables.load_full()
+    }
+
+    /// The tables served, borrowed through one `ArcSwap` load guard: what
+    /// a call holds for its whole duration, so looking its table up writes
+    /// no reference count shared across cores, and a swap meanwhile keeps
+    /// the borrowed set alive until the guard drops, as `Table::get` holds
+    /// its generation.
+    pub fn serving_tables(&self) -> Guard<Arc<Tables>> {
+        self.tables.load()
     }
 
     /// The table served under `name`, if any.
     pub fn table(&self, name: &str) -> Option<Arc<Table>> {
-        self.tables
-            .load()
-            .iter()
-            .find(|table| table.name() == name)
-            .cloned()
+        self.tables.load().get(name).cloned()
     }
 
     /// Replaces the tables served with `configs`, all or nothing (RFD
@@ -180,7 +221,7 @@ impl Opened {
             for table in &stopped {
                 table.withdraw();
             }
-            self.tables.store(Arc::new(next));
+            self.tables.store(Arc::new(Tables::new(next)));
             drop(registered);
             for table in &started {
                 table.show();
@@ -348,7 +389,7 @@ pub async fn open_with(
         storage,
         cache,
         local,
-        tables: ArcSwap::from_pointee(tables),
+        tables: ArcSwap::from_pointee(Tables::new(tables)),
         pending: Mutex::new(Vec::new()),
         membership: tokio::sync::Mutex::new(()),
         applying: tokio::sync::Mutex::new(()),
@@ -499,7 +540,7 @@ mod tests {
             .await
             .unwrap();
         let tables = opened.tables();
-        let [first, second] = tables.as_slice() else {
+        let [first, second] = &tables[..] else {
             panic!("two tables open");
         };
         assert_eq!(second.calls_in_flight().sum(), 0);

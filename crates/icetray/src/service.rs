@@ -12,10 +12,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::Guard;
 use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Value, approx};
+use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Tables, Value, approx};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
@@ -75,15 +76,24 @@ impl Service {
         })
     }
 
-    /// The table served under `name`; a name not served is `NOT_FOUND`. A
-    /// call holds the table it found to its end, so a reload that drops
-    /// the table meanwhile does not cut the call short.
-    pub fn table(&self, name: &str) -> Result<Arc<Table>, Status> {
-        self.opened
-            .table(name)
-            .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
+    /// The tables served as they stand, borrowed for one call
+    /// (`Opened::serving_tables`): a call holds them to its end, so a
+    /// reload that drops its table meanwhile does not cut it short, and
+    /// finding the table writes no shared reference count.
+    fn serving(&self) -> Guard<Arc<Tables>> {
+        self.opened.serving_tables()
     }
 }
+
+/// The table `tables` serves under `name`; a name not served is
+/// `NOT_FOUND`.
+fn table<'a>(tables: &'a Tables, name: &str) -> Result<&'a Arc<Table>, Status> {
+    tables
+        .get(name)
+        .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
+}
+
+impl Service {}
 
 /// The variant a wire `Key` carries (RFD 010), the closed set the `oneof`
 /// declares, for the fault naming one the table's key type does not take.
@@ -241,7 +251,8 @@ fn key_type_wire(key_type: KeyType) -> v1::KeyType {
 impl Service {
     /// `Get` inside its deadline.
     async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
-        let table = self.table(&request.table)?;
+        let tables = self.serving();
+        let table = table(&tables, &request.table)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, key_type)?;
         let lookup = table.get(&key).await.map_err(|error| status_from(&error))?;
@@ -258,7 +269,8 @@ impl Service {
         &self,
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        let table = self.table(&request.table)?;
+        let tables = self.serving();
+        let table = table(&tables, &request.table)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let keys = request
             .keys
@@ -322,7 +334,8 @@ impl Icetray for Service {
     ) -> Result<Response<TableInfoResponse>, Status> {
         telemetry::count(Call::TableInfo);
         let request = request.into_inner();
-        let table = self.table(&request.table)?;
+        let tables = self.serving();
+        let table = table(&tables, &request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
         Ok(Response::new(TableInfoResponse {
             table: request.table,

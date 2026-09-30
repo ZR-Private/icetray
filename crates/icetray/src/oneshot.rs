@@ -124,7 +124,7 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
 pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result<(), CliError> {
     let opened = open_tables(config, only).await?;
     let tables = opened.tables();
-    let table = match tables.as_slice() {
+    let table = match &tables[..] {
         [table] => table,
         tables => {
             return Err(CliError::TableNameRequired {
