@@ -342,8 +342,8 @@ impl Lookups {
 }
 
 /// A table's lookup metric handles, one pair per `LookupResult` under the
-/// table's name, registered once in `Table::new` with the recorder current
-/// then, so a lookup clones no name, formats no label, and looks up no
+/// table's name, registered once when the table is built, with the
+/// recorder current then, so a lookup clones no name, formats no label, and looks up no
 /// series. A lookup's count goes to its thread's shard of `counts` and
 /// reaches `lookups_total` at `publish`, which a scrape runs first and a
 /// dropped table runs last, so a scrape reads every lookup counted before

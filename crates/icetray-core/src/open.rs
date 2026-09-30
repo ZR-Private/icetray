@@ -1,10 +1,9 @@
 //! Opening every configured table (RFD 012): one storage, one page cache,
 //! the optional local directory, one count of calls in flight, and every
-//! table in `Loading` over them, built the
-//! same way for the daemon and the one-shot subcommands, so a subcommand
-//! reads a table exactly as `serve` does. Loading is the caller's step.
-//! A running daemon replaces its set of tables through `Opened::apply`
-//! (RFD 018).
+//! table in `Loading` over them, built the same way for the daemon and the
+//! one-shot subcommands, so a subcommand reads a table exactly as `serve`
+//! does. Loading is the caller's step. A running daemon replaces its set of
+//! tables through `Opened::apply` (RFD 018).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -40,8 +39,10 @@ pub struct Opened {
     /// `retain` counts them live. Never held across an `await`.
     pending: Mutex<Vec<Arc<Table>>>,
     /// Held by `retain` from computing its live set to its deletes, and by
-    /// `apply` to add to `pending` and to swap, so no table joins or leaves
-    /// between the two.
+    /// `apply` to add to `pending` and to swap, so no table joins the set
+    /// between the two; retains run one at a time. A refused or dropped
+    /// `apply` takes its tables out of `pending` without it: a table
+    /// leaving only makes a retain in progress keep more than it needs.
     membership: tokio::sync::Mutex<()>,
     /// Held by `apply` throughout: one reload at a time, each diffed
     /// against the set the last one left.
@@ -151,11 +152,6 @@ impl Opened {
         self.tables.load()
     }
 
-    /// The table served under `name`, if any.
-    pub fn table(&self, name: &str) -> Option<Arc<Table>> {
-        self.tables.load().get(name).cloned()
-    }
-
     /// Replaces the tables served with `configs`, all or nothing (RFD
     /// 018). Tables are matched by name: one whose configuration is equal
     /// in every field is kept as it is, generation and refresh untouched;
@@ -167,9 +163,11 @@ impl Opened {
     /// after the swap finds the new set; a call in flight finishes on the
     /// generation it holds. When any table fails to open or load, the
     /// tables built are dropped and the set serving is untouched, and
-    /// `Refused` names every failure. The caller spawns and stops the
-    /// refreshes, and runs `retain` after the swap to free what the
-    /// dropped tables held. `configs` is taken as validated: the names are
+    /// `Refused` names every failure: every load runs to its end or its
+    /// deadline, so a refusal holds what the loads reserved until the
+    /// slowest ends. The caller spawns and stops the refreshes, and runs
+    /// `retain` after either outcome, to free what the dropped tables held
+    /// or what the refused ones wrote. `configs` is taken as validated: the names are
     /// distinct. An `Opened` that `only` narrowed stays narrowed, and its
     /// `retain` still frees nothing.
     pub async fn apply(&self, configs: &[TableConfig]) -> std::result::Result<Applied, Refused> {
@@ -237,15 +235,7 @@ impl Opened {
     /// A table for `config` over this process's handles and deadlines, not
     /// showing its gauges (`Table::hidden`).
     async fn build(&self, config: &TableConfig) -> Result<Table> {
-        let source = TableSource::from_config(&config.source).await?;
-        Ok(Table::hidden(
-            config.clone(),
-            source,
-            self.handles.clone(),
-            self.deadlines.load,
-            self.deadlines.refresh,
-            self.deadlines.get,
-        ))
+        build(config, &self.handles, self.deadlines).await
     }
 
     /// Adds `tables` to `pending` while no `retain` runs, until the
@@ -268,7 +258,7 @@ impl Opened {
     /// table served and every table an `apply` is loading, computed and
     /// applied while every one's load lock is held, in `tables` order and
     /// then the pending ones, so no load is in flight anywhere meanwhile,
-    /// and while no table joins or leaves the set. An
+    /// and while `membership` is held, so no table joins the set. An
     /// `Opened` that `only` narrowed frees nothing: the tables it left out
     /// share the directory, and their chunk files are live to them. This
     /// is the one place chunk files are deleted: the serve loop calls it
@@ -279,8 +269,8 @@ impl Opened {
     /// Every lock is taken because a load in flight has written chunk files
     /// that no serving generation references yet, and a live set computed
     /// beside it would delete them from under the generation about to swap
-    /// in. The locks are taken one at a time in `tables` order, so two
-    /// calls at once cannot each hold a lock the other waits for. The cost
+    /// in. The locks are taken one at a time, and nothing that holds one
+    /// waits for `membership`, so no lock is waited for in a cycle. The cost
     /// is that a slow table holds retention up, and with it the next load
     /// or refresh of every table whose lock is already held. A load or
     /// refresh gives its lock up once its deadline has passed since it took
@@ -374,15 +364,9 @@ pub async fn open_with(
         .iter()
         .filter(|table| only.is_none_or(|name| table.name == name))
     {
-        let source = TableSource::from_config(&table.source).await?;
-        tables.push(Arc::new(Table::new(
-            table.clone(),
-            source,
-            handles.clone(),
-            deadlines.load,
-            deadlines.refresh,
-            deadlines.get,
-        )));
+        let table = build(table, &handles, deadlines).await?;
+        table.show();
+        tables.push(Arc::new(table));
     }
     let complete = tables.len() == config.tables.len();
     Ok(Opened {
@@ -399,9 +383,29 @@ pub async fn open_with(
     })
 }
 
+/// A table for `config` over `handles`, under `deadlines`, in `Loading` and
+/// not showing its gauges (`Table::hidden`).
+async fn build(
+    config: &TableConfig,
+    handles: &TableHandles,
+    deadlines: Deadlines,
+) -> Result<Table> {
+    let source = TableSource::from_config(&config.source).await?;
+    Ok(Table::hidden(
+        config.clone(),
+        source,
+        handles.clone(),
+        deadlines.load,
+        deadlines.refresh,
+        deadlines.get,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use futures::FutureExt as _;
 
     use super::*;
     use crate::approx;
@@ -464,11 +468,12 @@ mod tests {
     }
 
     fn names(opened: &Opened) -> Vec<String> {
-        opened
-            .tables()
-            .iter()
-            .map(|table| table.name().to_string())
-            .collect()
+        names_of(&opened.tables())
+    }
+
+    /// The table `opened` serves under `name`, if any.
+    fn table_named(opened: &Opened, name: &str) -> Option<Arc<Table>> {
+        opened.tables().get(name).cloned()
     }
 
     #[tokio::test]
@@ -762,26 +767,25 @@ mod tests {
         assert_eq!(names_of(&applied.started), [THIRD_TABLE]);
         assert_eq!(names_of(&applied.stopped), [SECOND_TABLE]);
         assert_eq!(names(&opened), [THIRD_TABLE, FIRST_TABLE]);
-        let kept = opened.table(FIRST_TABLE).unwrap();
+        let kept = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(Arc::ptr_eq(&kept, &before[0]));
         assert!(Arc::ptr_eq(&kept.current().unwrap(), &serving));
         assert!(matches!(
-            opened.table(THIRD_TABLE).unwrap().state(),
+            table_named(&opened, THIRD_TABLE).unwrap().state(),
             TableState::Serving { .. }
         ));
-        assert!(opened.table(SECOND_TABLE).is_none());
+        assert!(table_named(&opened, SECOND_TABLE).is_none());
         assert!(opened.pending.lock().unwrap().is_empty());
     }
 
-    /// A table whose configuration changed is built and loaded beside the
-    /// one serving under its name, which serves until the swap and is
-    /// then dropped.
+    /// A table whose configuration changed is built and loaded as a new
+    /// table under its name, and the one it replaces is dropped.
     #[tokio::test]
     async fn test_apply_replaces_a_changed_table_under_its_name() {
         let fixture = two_file_fixture().await;
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let opened = loaded(&config(vec![first.clone()])).await;
-        let before = opened.table(FIRST_TABLE).unwrap();
+        let before = table_named(&opened, FIRST_TABLE).unwrap();
         let changed = TableConfig {
             strict: !first.strict,
             ..first
@@ -791,7 +795,7 @@ mod tests {
         assert_eq!(applied.kept, 0);
         assert_eq!(names_of(&applied.started), [FIRST_TABLE]);
         assert!(Arc::ptr_eq(&applied.stopped[0], &before));
-        let after = opened.table(FIRST_TABLE).unwrap();
+        let after = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(!Arc::ptr_eq(&after, &before));
         assert_eq!(after.config(), &changed);
         assert!(after.current().is_some());
@@ -822,18 +826,45 @@ mod tests {
             .collect();
         assert_eq!(failed, [THIRD_TABLE]);
         assert!(Arc::ptr_eq(&opened.tables(), &before));
-        assert!(opened.table(SECOND_TABLE).is_none());
+        assert!(table_named(&opened, SECOND_TABLE).is_none());
         assert!(opened.pending.lock().unwrap().is_empty());
         assert!(matches!(
-            opened.table(FIRST_TABLE).unwrap().state(),
+            table_named(&opened, FIRST_TABLE).unwrap().state(),
             TableState::Serving { .. }
         ));
     }
 
-    /// The chunk files a table still loading for a reload wrote are live to
-    /// `retain` until the reload lets the table go, and freed after.
+    /// A reload dropped while its new table loads leaves nothing behind:
+    /// nothing pending, and the set serving as it was.
     #[tokio::test]
-    async fn test_retain_keeps_what_a_pending_table_loaded() {
+    async fn test_apply_dropped_while_loading_leaves_the_set_as_it_was() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let opened = loaded(&config(vec![first.clone()])).await;
+        let before = opened.tables();
+        let configs = [first, named(SECOND_TABLE, &fixture, Residency::Full)];
+
+        let mut applying = Box::pin(opened.apply(&configs));
+        assert!(
+            futures::poll!(applying.as_mut()).is_pending(),
+            "the new table's load waits on its reads"
+        );
+        assert_eq!(
+            opened.pending.lock().unwrap().len(),
+            1,
+            "the reload registered its table"
+        );
+        drop(applying);
+        assert!(opened.pending.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&opened.tables(), &before));
+        assert!(table_named(&opened, SECOND_TABLE).is_none());
+    }
+
+    /// `retain` waits for the load lock of a table still loading for a
+    /// reload before it computes its live set, and the chunk files that
+    /// table wrote are live until the reload lets it go, and freed after.
+    #[tokio::test]
+    async fn test_retain_waits_for_and_keeps_what_a_pending_table_loads() {
         let first = two_file_fixture().await;
         let second = two_file_fixture().await;
         let dir = tempfile::tempdir().unwrap();
@@ -850,6 +881,12 @@ mod tests {
                 .unwrap(),
         );
         let registered = opened.register(std::slice::from_ref(&pending)).await;
+        let loading = pending.serialized().await;
+        assert!(
+            opened.retain().now_or_never().is_none(),
+            "retain waits for the pending table's load"
+        );
+        drop(loading);
         pending.load().await.unwrap();
         let written = pending.current().unwrap().identities();
 
@@ -876,8 +913,7 @@ mod tests {
             vec![kept.clone(), named(SECOND_TABLE, &second, Residency::Disk)],
         );
         let opened = loaded(&config).await;
-        let dropped = opened
-            .table(SECOND_TABLE)
+        let dropped = table_named(&opened, SECOND_TABLE)
             .unwrap()
             .current()
             .unwrap()
