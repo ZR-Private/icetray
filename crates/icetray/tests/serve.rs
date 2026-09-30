@@ -1,7 +1,8 @@
 //! The daemon in-process over the in-process S3 server (RFD 014, P tier):
 //! health and readiness before and after the first loads, the wire contract
 //! of RFD 010 with its error mapping, request counting, refresh within the
-//! poll interval, the drain, and the start-or-fail rule of RFD 005.
+//! poll interval, the drain, the start-or-fail rule of RFD 005, and the
+//! configuration reload of RFD 018.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -10,10 +11,11 @@ use std::time::Duration;
 
 use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
+use icetray::reload::{ConfigSource, Digest, Reading, Reload, ReloadResult};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
 use icetray::{ServeError, ServeOptions, Serving, telemetry};
 use icetray_core::approx;
-use icetray_core::config::{Config, Residency, ServerConfig, TableConfig};
+use icetray_core::config::{Config, Residency, ServerConfig, SourceConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
@@ -314,7 +316,7 @@ impl Stack {
 
     /// The generation the first served table holds.
     fn generation(&self) -> Arc<Generation> {
-        self.serving.opened().tables[0]
+        self.serving.opened().tables()[0]
             .current()
             .expect("the table was loaded")
     }
@@ -928,7 +930,7 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
         },
     )
     .await?;
-    let table = Arc::clone(&stack.serving.opened().tables[0]);
+    let table = Arc::clone(&stack.serving.opened().tables()[0]);
     poll_until(REFRESH_WAIT, "the first load failing", async || {
         Ok(matches!(table.state(), TableState::Degraded { .. }).then_some(()))
     })
@@ -1007,7 +1009,7 @@ async fn test_shutdown_during_the_grace_ends_the_run_without_waiting() -> TestRe
         },
     )
     .await?;
-    let table = Arc::clone(&stack.serving.opened().tables[0]);
+    let table = Arc::clone(&stack.serving.opened().tables()[0]);
     poll_until(REFRESH_WAIT, "the first load failing", async || {
         Ok(matches!(table.state(), TableState::Degraded { .. }).then_some(()))
     })
@@ -1341,5 +1343,266 @@ async fn test_drain_stops_waiting_at_its_deadline() -> TestResult {
         !in_flight.is_finished(),
         "the drain did not wait out the call"
     );
+    Ok(())
+}
+
+/// A configuration a reload test changes under the running daemon, read as
+/// the daemon reads its file: each version under a digest of its own.
+struct Versions {
+    current: std::sync::Mutex<(u64, Config)>,
+    /// Reads the daemon made.
+    reads: std::sync::atomic::AtomicU64,
+}
+
+impl Versions {
+    /// Version 0, `config`.
+    fn new(config: Config) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::Mutex::new((0, config)),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// What the daemon follows these versions through, from version 0.
+    fn reload(self: &Arc<Self>) -> Reload {
+        Reload {
+            source: Arc::clone(self) as Arc<dyn ConfigSource>,
+            started_from: Self::digest(0),
+        }
+    }
+
+    /// Makes `config` the next version.
+    fn set(&self, config: Config) {
+        let mut current = self.current.lock().expect("no test panics holding it");
+        *current = (current.0 + 1, config);
+    }
+
+    /// The configuration as it stands.
+    fn config(&self) -> Config {
+        self.current
+            .lock()
+            .expect("no test panics holding it")
+            .1
+            .clone()
+    }
+
+    /// Reads the daemon made so far.
+    fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn digest(version: u64) -> Digest {
+        Digest::of(&version.to_le_bytes())
+    }
+}
+
+impl ConfigSource for Versions {
+    fn read(&self) -> std::io::Result<Reading> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (version, config) = self
+            .current
+            .lock()
+            .expect("no test panics holding it")
+            .clone();
+        Ok(Reading {
+            digest: Self::digest(version),
+            config: Ok(config),
+        })
+    }
+}
+
+/// A stack over two small fixtures, `TABLE` and `UUID_TABLE`, serving
+/// `TABLE` alone and following `Versions` from there, loaded.
+async fn following() -> Result<(Stack, Arc<Versions>), BoxError> {
+    let mut followed = None;
+    let mut stack = Stack::start_with(
+        vec![
+            FixtureSpec::small(TABLE, KeyType::Long),
+            FixtureSpec::small(UUID_TABLE, KeyType::Uuid),
+        ],
+        async |setup| {
+            setup.config.tables.truncate(1);
+            let versions = Versions::new(setup.config.clone());
+            setup.options.reload = Some(versions.reload());
+            followed = Some(versions);
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let versions = followed.ok_or("the setup ran")?;
+    Ok((stack, versions))
+}
+
+impl Stack {
+    /// `UUID_TABLE`'s configuration as `start_with` would serve it.
+    fn uuid_table(&self) -> TableConfig {
+        self.fixtures[1].config(Residency::Full, false)
+    }
+
+    /// `config_reloads_total` of `result` in a scrape now; zero before the
+    /// first, when the series is not yet exposed.
+    async fn reloads(&self, result: ReloadResult) -> Result<f64, BoxError> {
+        let (_, scrape) = self.http_get(METRICS_PATH).await?;
+        Ok(series_value(
+            &scrape,
+            metric::CONFIG_RELOADS_TOTAL,
+            &[(metric::LABEL_RESULT, &result.to_string())],
+        )
+        .unwrap_or(0.0))
+    }
+
+    /// `config_pending` in a scrape now.
+    async fn pending(&self) -> Result<Option<f64>, BoxError> {
+        let (_, scrape) = self.http_get(METRICS_PATH).await?;
+        Ok(series_value(&scrape, metric::CONFIG_PENDING, &[]))
+    }
+
+    /// Waits for `config_reloads_total` of `result` to pass `before`.
+    async fn reloaded(&self, result: ReloadResult, before: f64) -> Result<(), BoxError> {
+        poll_until(REFRESH_WAIT, "a reload counted", async || {
+            Ok((self.reloads(result).await? > before).then_some(()))
+        })
+        .await
+    }
+}
+
+/// Polls the retry test waits for after a refusal: two whose attempts it
+/// checks, and the one that shows they ended.
+const POLLS_OVER_A_REFUSAL: u64 = 3;
+
+/// A table no fixture holds: its first load fails.
+fn missing_table(fixture: &Fixture) -> TableConfig {
+    TableConfig {
+        name: "missing".to_string(),
+        source: SourceConfig::Static {
+            location: format!("{S3_SCHEME}{BUCKET}/{WAREHOUSE}/missing/metadata/v1.metadata.json"),
+        },
+        ..fixture.config(Residency::Full, false)
+    }
+}
+
+/// A reload that adds one table and removes another swaps both at once:
+/// the added table answers, the removed one is `NOT_FOUND`, readiness
+/// stays, and nothing is left pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_adds_and_removes_tables_on_request() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let before = stack.reloads(ReloadResult::Applied).await?;
+    let mut next = versions.config();
+    next.tables = vec![stack.uuid_table()];
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Applied, before).await?;
+
+    let uuid_key = stack.fixtures[1].key(SAMPLE[0]);
+    let response = stack.get(UUID_TABLE, Some(wire_key(&uuid_key))).await?;
+    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    assert_eq!(code_of(stack.table_info(TABLE).await), Code::NotFound);
+    let (status, _) = stack.http_get(READY_PATH).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stack.pending().await?, Some(0.0));
+    Ok(())
+}
+
+/// A changed file is found on the poll, with no request.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_follows_the_file_on_the_poll() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let mut next = versions.config();
+    next.tables.push(stack.uuid_table());
+    versions.set(next);
+    poll_until(REFRESH_WAIT, "the added table serving", async || {
+        Ok(stack.table_info(UUID_TABLE).await.ok())
+    })
+    .await?;
+    stack.table_info(TABLE).await?;
+    Ok(())
+}
+
+/// A change outside the tables refuses the whole reload: the table it
+/// would have added is not served, and `config_pending` reads 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_refuses_a_change_outside_the_tables() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let before = stack.reloads(ReloadResult::Refused).await?;
+    let mut next = versions.config();
+    next.tables.push(stack.uuid_table());
+    next.server.max_in_flight += 1;
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, before).await?;
+
+    assert_eq!(code_of(stack.table_info(UUID_TABLE).await), Code::NotFound);
+    stack.table_info(TABLE).await?;
+    assert_eq!(stack.pending().await?, Some(1.0));
+    Ok(())
+}
+
+/// A table that fails its load refuses every change the reload carries,
+/// and a poll does not try the refused file again; a request does.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_refused_for_a_failed_load_is_retried_on_request_only() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let before = stack.reloads(ReloadResult::Refused).await?;
+    let mut next = versions.config();
+    next.tables.push(stack.uuid_table());
+    next.tables.push(missing_table(&stack.fixtures[0]));
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, before).await?;
+    assert_eq!(code_of(stack.table_info(UUID_TABLE).await), Code::NotFound);
+    stack.table_info(TABLE).await?;
+
+    // A reader's attempts run one after another, so once three more polls
+    // have read, the attempts of the first two have ended.
+    let refused = stack.reloads(ReloadResult::Refused).await?;
+    let reads = versions.reads();
+    poll_until(REFRESH_WAIT, "three more polls", async || {
+        Ok((versions.reads() >= reads + POLLS_OVER_A_REFUSAL).then_some(()))
+    })
+    .await?;
+    assert_eq!(
+        stack.reloads(ReloadResult::Refused).await?.to_bits(),
+        refused.to_bits(),
+        "the polls pass the refused file over"
+    );
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, refused).await?;
+    Ok(())
+}
+
+/// A table whose configuration changed is refreshed as the new
+/// configuration says: the old table, pinned to its metadata file, is
+/// replaced by one following the table root, which the poll then advances.
+/// The old table's refresh, stopped by the reload, does not end the run.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_refreshes_a_changed_table_under_its_new_configuration() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let first = stack.table_info(TABLE).await?.snapshot_id;
+    let before = stack.reloads(ReloadResult::Applied).await?;
+    stack.fixtures[0].write_hint().await?;
+    let mut next = versions.config();
+    next.tables[0].source = stack.fixtures[0].root_source();
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Applied, before).await?;
+
+    stack.fixtures[0]
+        .append(stack.catalog.as_ref(), NEW_IDS, APPEND_PREFIX)
+        .await?;
+    stack.fixtures[0].write_hint().await?;
+    poll_until(REFRESH_WAIT, "the changed table advancing", async || {
+        let info = stack.table_info(TABLE).await?;
+        Ok((info.snapshot_id != first).then_some(()))
+    })
+    .await?;
+    let (status, _) = stack.http_get(READY_PATH).await?;
+    assert_eq!(status, StatusCode::OK);
     Ok(())
 }

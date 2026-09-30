@@ -8,7 +8,6 @@
 //! none is refused at once. A `MultiGet` carries at most
 //! `server.max_multi_get_keys` keys.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +28,14 @@ use tonic::{Request, Response, Status};
 use crate::error::{CallFault, WireKeyFault};
 use crate::telemetry::{self, Call};
 
-/// The served tables by name and the bounds each call runs under. Clone:
-/// tonic hands one clone to every connection, and they share the tables
-/// and the in-flight slots.
+/// The served tables and the bounds each call runs under. Clone: tonic
+/// hands one clone to every connection, and they share the tables and the
+/// in-flight slots.
 #[derive(Clone)]
 pub struct Service {
-    tables: Arc<HashMap<String, Arc<Table>>>,
+    /// The tables a call looks up by name, as the last reload left them
+    /// (RFD 018).
+    opened: Arc<Opened>,
     get_deadline: Duration,
     multi_get_deadline: Duration,
     /// `Get` and `MultiGet` together; nothing closes it.
@@ -46,19 +47,14 @@ pub struct Service {
 }
 
 impl Service {
-    /// The service over every table `opened` holds, by configured name,
+    /// The service over the tables `opened` serves, by configured name,
     /// under `server`'s request bounds. `max_in_flight` is held to tokio's
     /// `Semaphore::MAX_PERMITS`, which is far above any count of calls one
     /// process can hold open.
-    pub fn new(opened: &Opened, server: &ServerConfig) -> Self {
-        let tables = opened
-            .tables
-            .iter()
-            .map(|table| (table.name().to_string(), Arc::clone(table)))
-            .collect();
+    pub fn new(opened: &Arc<Opened>, server: &ServerConfig) -> Self {
         let max_in_flight = server.max_in_flight.min(Semaphore::MAX_PERMITS);
         Self {
-            tables: Arc::new(tables),
+            opened: Arc::clone(opened),
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
             in_flight: Arc::new(Semaphore::new(max_in_flight)),
@@ -79,10 +75,12 @@ impl Service {
         })
     }
 
-    /// The table served under `name`; a name not served is `NOT_FOUND`.
-    pub fn table(&self, name: &str) -> Result<&Arc<Table>, Status> {
-        self.tables
-            .get(name)
+    /// The table served under `name`; a name not served is `NOT_FOUND`. A
+    /// call holds the table it found to its end, so a reload that drops
+    /// the table meanwhile does not cut the call short.
+    pub fn table(&self, name: &str) -> Result<Arc<Table>, Status> {
+        self.opened
+            .table(name)
             .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
     }
 }

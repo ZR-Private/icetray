@@ -244,7 +244,8 @@ async fn test_retain_frees_only_what_no_table_serves() -> Result<()> {
     let storage = Arc::new(Storage::new(config.storage.clone()));
     let opened = open_with(&config, None, storage).await?;
     let local = opened.local.clone().unwrap();
-    let (a, b) = (&opened.tables[0], &opened.tables[1]);
+    let tables = opened.tables();
+    let (a, b) = (&tables[0], &tables[1]);
     a.load().await?;
     b.load().await?;
     assert_eq!(opened.retain().await?, 0);

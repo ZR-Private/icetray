@@ -23,10 +23,12 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 tikv-jemallocator = { workspace = true }
-# `net` for the two listeners, `signal` for the SIGTERM drain (RFD 012).
+# `net` for the two listeners, `signal` for the SIGTERM drain (RFD 012)
+# and the SIGHUP reload (RFD 018).
 tokio = { workspace = true, features = ["net", "signal"] }
 tonic = { workspace = true }
 tonic-health = { workspace = true }

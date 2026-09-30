@@ -3,13 +3,19 @@
 //! table in `Loading` over them, built the
 //! same way for the daemon and the one-shot subcommands, so a subcommand
 //! reads a table exactly as `serve` does. Loading is the caller's step.
+//! A running daemon replaces its set of tables through `Opened::apply`
+//! (RFD 018).
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use futures::future::join_all;
 
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::storage::Storage;
@@ -25,24 +31,209 @@ pub struct Opened {
     pub cache: PageCache,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
-    /// The tables, in configuration order, each in `Loading`.
-    pub tables: Vec<Arc<Table>>,
+    /// The tables served, in configuration order, each in `Loading` until
+    /// the caller loads it. Read without a lock; `apply` replaces it whole.
+    tables: ArcSwap<Vec<Arc<Table>>>,
+    /// The tables an `apply` has built and not yet swapped in or dropped.
+    /// Their loads write chunk files no serving generation references, so
+    /// `retain` counts them live. Never held across an `await`.
+    pending: Mutex<Vec<Arc<Table>>>,
+    /// Held by `retain` from computing its live set to its deletes, and by
+    /// `apply` to add to `pending` and to swap, so no table joins or leaves
+    /// between the two.
+    membership: tokio::sync::Mutex<()>,
+    /// Held by `apply` throughout: one reload at a time, each diffed
+    /// against the set the last one left.
+    applying: tokio::sync::Mutex<()>,
+    /// What every table is built over, for the tables `apply` adds.
+    handles: TableHandles,
+    /// The server's deadlines every table is built under.
+    deadlines: Deadlines,
     /// Whether `tables` is every configured table: `only` narrowed nothing,
     /// or named every one. `retain`'s live set is complete only then.
     complete: bool,
 }
 
+/// The server's deadlines a table is built under (`Table::new`).
+#[derive(Clone, Copy)]
+struct Deadlines {
+    load: Duration,
+    refresh: Duration,
+    get: Duration,
+}
+
+/// What `Opened::apply` changed: the tables it loaded and swapped in, the
+/// tables it swapped out, and how many it kept as they were. A table whose
+/// configuration changed is in both lists, under one name.
+pub struct Applied {
+    /// The tables swapped in, each serving its first generation.
+    pub started: Vec<Arc<Table>>,
+    /// The tables swapped out, whose gauges are withdrawn.
+    pub stopped: Vec<Arc<Table>>,
+    /// The tables kept, whose configuration is unchanged.
+    pub kept: usize,
+}
+
+/// Why `Opened::apply` changed nothing: every table it could not open or
+/// load, by name, in configuration order.
+#[derive(Debug)]
+pub struct Refused {
+    /// Each table that failed, with its failure.
+    pub failures: Vec<(String, Error)>,
+}
+
+/// Tables `apply` added to `Opened::pending`, taken out again when this
+/// drops, whether the tables were swapped in or dropped with the reload.
+struct Registered<'a> {
+    opened: &'a Opened,
+    tables: Vec<Arc<Table>>,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.opened
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|pending| !self.tables.iter().any(|table| Arc::ptr_eq(table, pending)));
+    }
+}
+
 impl Opened {
+    /// The tables served, in configuration order: the set as it stands,
+    /// which a later `apply` does not change.
+    pub fn tables(&self) -> Arc<Vec<Arc<Table>>> {
+        self.tables.load_full()
+    }
+
+    /// The table served under `name`, if any.
+    pub fn table(&self, name: &str) -> Option<Arc<Table>> {
+        self.tables
+            .load()
+            .iter()
+            .find(|table| table.name() == name)
+            .cloned()
+    }
+
+    /// Replaces the tables served with `configs`, all or nothing (RFD
+    /// 018). Tables are matched by name: one whose configuration is equal
+    /// in every field is kept as it is, generation and refresh untouched;
+    /// every other is built and loaded beside the set serving, the
+    /// serving table of its name included, and neither is touched until
+    /// every one has loaded. Then the set is swapped at once: the tables
+    /// no longer configured are withdrawn (`Table::withdraw`) and dropped
+    /// from the set, the new ones shown, and a call that looks a table up
+    /// after the swap finds the new set; a call in flight finishes on the
+    /// generation it holds. When any table fails to open or load, the
+    /// tables built are dropped and the set serving is untouched, and
+    /// `Refused` names every failure. The caller spawns and stops the
+    /// refreshes, and runs `retain` after the swap to free what the
+    /// dropped tables held. `configs` is taken as validated: the names are
+    /// distinct. An `Opened` that `only` narrowed stays narrowed, and its
+    /// `retain` still frees nothing.
+    pub async fn apply(&self, configs: &[TableConfig]) -> std::result::Result<Applied, Refused> {
+        let _applying = self.applying.lock().await;
+        let serving = self.tables();
+        let mut next = Vec::with_capacity(configs.len());
+        let mut started = Vec::new();
+        let mut failures = Vec::new();
+        for config in configs {
+            let kept = serving
+                .iter()
+                .find(|table| table.name() == config.name && table.config() == config);
+            if let Some(kept) = kept {
+                next.push(Arc::clone(kept));
+                continue;
+            }
+            match self.build(config).await {
+                Ok(table) => {
+                    let table = Arc::new(table);
+                    started.push(Arc::clone(&table));
+                    next.push(table);
+                }
+                Err(error) => failures.push((config.name.clone(), error)),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(Refused { failures });
+        }
+        let registered = self.register(&started).await;
+        let loads = join_all(started.iter().map(|table| table.load())).await;
+        let failures: Vec<(String, Error)> = started
+            .iter()
+            .zip(loads)
+            .filter_map(|(table, loaded)| {
+                loaded.err().map(|error| (table.name().to_string(), error))
+            })
+            .collect();
+        if !failures.is_empty() {
+            return Err(Refused { failures });
+        }
+        let stopped: Vec<Arc<Table>> = serving
+            .iter()
+            .filter(|table| !next.iter().any(|kept| Arc::ptr_eq(kept, table)))
+            .cloned()
+            .collect();
+        let kept = next.len() - started.len();
+        {
+            let _members = self.membership.lock().await;
+            for table in &stopped {
+                table.withdraw();
+            }
+            self.tables.store(Arc::new(next));
+            drop(registered);
+            for table in &started {
+                table.show();
+            }
+        }
+        Ok(Applied {
+            started,
+            stopped,
+            kept,
+        })
+    }
+
+    /// A table for `config` over this process's handles and deadlines, not
+    /// showing its gauges (`Table::hidden`).
+    async fn build(&self, config: &TableConfig) -> Result<Table> {
+        let source = TableSource::from_config(&config.source).await?;
+        Ok(Table::hidden(
+            config.clone(),
+            source,
+            self.handles.clone(),
+            self.deadlines.load,
+            self.deadlines.refresh,
+            self.deadlines.get,
+        ))
+    }
+
+    /// Adds `tables` to `pending` while no `retain` runs, until the
+    /// returned registration drops.
+    async fn register(&self, tables: &[Arc<Table>]) -> Registered<'_> {
+        let _members = self.membership.lock().await;
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(tables.iter().cloned());
+        Registered {
+            opened: self,
+            tables: tables.to_vec(),
+        }
+    }
+
     /// Deletes the chunk files no table's serving generation references and
     /// returns the bytes freed; `Ok(0)` with no local directory. The live
-    /// set is the union of every table's `Generation::identities` (RFD
-    /// 017), computed and applied while every table's load lock is held,
-    /// in `tables` order, so no load is in flight anywhere meanwhile. An
+    /// set is the union of `Generation::identities` (RFD 017) over every
+    /// table served and every table an `apply` is loading, computed and
+    /// applied while every one's load lock is held, in `tables` order and
+    /// then the pending ones, so no load is in flight anywhere meanwhile,
+    /// and while no table joins or leaves the set. An
     /// `Opened` that `only` narrowed frees nothing: the tables it left out
     /// share the directory, and their chunk files are live to them. This
     /// is the one place chunk files are deleted: the serve loop calls it
-    /// after every table's first `load` and after any `refresh` that
-    /// swapped, and a one-shot subcommand may call it before exit.
+    /// after every table's first `load`, after any `refresh` that swapped,
+    /// and after an `apply` that did, and a one-shot subcommand may call it
+    /// before exit.
     ///
     /// Every lock is taken because a load in flight has written chunk files
     /// that no serving generation references yet, and a live set computed
@@ -69,12 +260,18 @@ impl Opened {
         if !self.complete {
             return Ok(0);
         }
-        let mut held = Vec::with_capacity(self.tables.len());
-        for table in &self.tables {
+        let _members = self.membership.lock().await;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let tables: Vec<Arc<Table>> = self.tables().iter().cloned().chain(pending).collect();
+        let mut held = Vec::with_capacity(tables.len());
+        for table in &tables {
             held.push(table.serialized().await);
         }
-        let live: HashSet<DataFileIdentity> = self
-            .tables
+        let live: HashSet<DataFileIdentity> = tables
             .iter()
             .filter_map(|table| table.current())
             .flat_map(|generation| generation.identities())
@@ -125,6 +322,11 @@ pub async fn open_with(
         local: local.clone(),
         calls: CallsInFlight::new(),
     };
+    let deadlines = Deadlines {
+        load: config.server.load_deadline,
+        refresh: config.server.refresh_deadline,
+        get: config.server.get_deadline,
+    };
     let mut tables = Vec::with_capacity(config.tables.len());
     for table in config
         .tables
@@ -136,9 +338,9 @@ pub async fn open_with(
             table.clone(),
             source,
             handles.clone(),
-            config.server.load_deadline,
-            config.server.refresh_deadline,
-            config.server.get_deadline,
+            deadlines.load,
+            deadlines.refresh,
+            deadlines.get,
         )));
     }
     let complete = tables.len() == config.tables.len();
@@ -146,7 +348,12 @@ pub async fn open_with(
         storage,
         cache,
         local,
-        tables,
+        tables: ArcSwap::from_pointee(tables),
+        pending: Mutex::new(Vec::new()),
+        membership: tokio::sync::Mutex::new(()),
+        applying: tokio::sync::Mutex::new(()),
+        handles,
+        deadlines,
         complete,
     })
 }
@@ -158,7 +365,8 @@ mod tests {
     use super::*;
     use crate::approx;
     use crate::config::{
-        ConfigViolation, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
+        ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig,
+        TableConfig,
     };
     use crate::generation::testing::{
         FIRST_SNAPSHOT, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TWO, Table as Fixture,
@@ -214,8 +422,12 @@ mod tests {
         Arc::new(Storage::new(config.storage.clone()))
     }
 
-    fn names(opened: &Opened) -> Vec<&str> {
-        opened.tables.iter().map(|table| table.name()).collect()
+    fn names(opened: &Opened) -> Vec<String> {
+        opened
+            .tables()
+            .iter()
+            .map(|table| table.name().to_string())
+            .collect()
     }
 
     #[tokio::test]
@@ -231,7 +443,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE, SECOND_TABLE]);
-        for table in &opened.tables {
+        for table in opened.tables().iter() {
             assert!(matches!(table.state(), TableState::Loading));
             assert!(table.current().is_none());
         }
@@ -286,7 +498,8 @@ mod tests {
         let opened = open_with(&config, None, storage_for(&config))
             .await
             .unwrap();
-        let [first, second] = opened.tables.as_slice() else {
+        let tables = opened.tables();
+        let [first, second] = tables.as_slice() else {
             panic!("two tables open");
         };
         assert_eq!(second.calls_in_flight().sum(), 0);
@@ -311,7 +524,7 @@ mod tests {
         let none = open_with(&config, Some(NO_TABLE), storage_for(&config))
             .await
             .unwrap();
-        assert!(none.tables.is_empty());
+        assert!(none.tables().is_empty());
     }
 
     #[tokio::test]
@@ -330,7 +543,7 @@ mod tests {
             .await
             .unwrap();
         let local = opened.local.as_ref().unwrap();
-        for table in &opened.tables {
+        for table in opened.tables().iter() {
             table.load().await.unwrap();
             assert!(matches!(table.state(), TableState::Serving { .. }));
             let generation = table.current().unwrap();
@@ -361,13 +574,13 @@ mod tests {
         let opened = open_with(&config, None, storage_for(&config))
             .await
             .unwrap();
-        for table in &opened.tables {
+        for table in opened.tables().iter() {
             table.load().await.unwrap();
         }
         let local = opened.local.as_ref().unwrap();
         assert_eq!(opened.retain().await.unwrap(), 0);
 
-        let before = opened.tables[0].current().unwrap().identities();
+        let before = opened.tables()[0].current().unwrap().identities();
         fixture.remove_file("f1");
         fixture
             .commit(
@@ -377,8 +590,8 @@ mod tests {
                 SECOND_VERSION,
             )
             .await;
-        assert!(opened.tables[0].refresh().await.unwrap());
-        let after = opened.tables[0].current().unwrap().identities();
+        assert!(opened.tables()[0].refresh().await.unwrap());
+        let after = opened.tables()[0].current().unwrap().identities();
         let dropped: Vec<&DataFileIdentity> = before.difference(&after).collect();
         assert_eq!(dropped.len(), 1);
         assert!(local.chunks_for(dropped[0]).unwrap().is_some());
@@ -388,7 +601,7 @@ mod tests {
             "the second table still serves the dropped file"
         );
 
-        assert!(opened.tables[1].refresh().await.unwrap());
+        assert!(opened.tables()[1].refresh().await.unwrap());
         assert!(opened.retain().await.unwrap() > 0);
         assert!(local.chunks_for(dropped[0]).unwrap().is_none());
         assert_eq!(opened.retain().await.unwrap(), 0, "nothing left to free");
@@ -409,11 +622,11 @@ mod tests {
         let every = open_with(&config, None, storage_for(&config))
             .await
             .unwrap();
-        for table in &every.tables {
+        for table in every.tables().iter() {
             table.load().await.unwrap();
         }
         assert!(every.complete);
-        let second_files = every.tables[1].current().unwrap().identities();
+        let second_files = every.tables()[1].current().unwrap().identities();
         drop(every);
 
         let narrowed = open_with(&config, Some(FIRST_TABLE), storage_for(&config))
@@ -421,7 +634,7 @@ mod tests {
             .unwrap();
         assert!(!narrowed.complete);
         assert_eq!(names(&narrowed), [FIRST_TABLE]);
-        narrowed.tables[0].load().await.unwrap();
+        narrowed.tables()[0].load().await.unwrap();
         assert_eq!(narrowed.retain().await.unwrap(), 0);
         let local = narrowed.local.as_ref().unwrap();
         for identity in &second_files {
@@ -449,9 +662,192 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        opened.tables[0].load().await.unwrap();
+        opened.tables()[0].load().await.unwrap();
         let retained = tokio::spawn(async move { opened.retain().await });
         assert_eq!(retained.await.unwrap().unwrap(), 0);
+    }
+
+    /// The name the reload tests add a table under.
+    const THIRD_TABLE: &str = "c";
+
+    /// `names` of `tables`.
+    fn names_of(tables: &[Arc<Table>]) -> Vec<String> {
+        tables
+            .iter()
+            .map(|table| table.name().to_string())
+            .collect()
+    }
+
+    /// Opens `config` and loads every table.
+    async fn loaded(config: &Config) -> Opened {
+        let opened = open_with(config, None, storage_for(config)).await.unwrap();
+        for table in opened.tables().iter() {
+            table.load().await.unwrap();
+        }
+        opened
+    }
+
+    /// A table whose source names a root with no table in it, so its
+    /// first load fails.
+    fn missing(name: &str, fixture: &Fixture) -> TableConfig {
+        TableConfig {
+            source: SourceConfig::Static {
+                location: format!("{}/missing", fixture.root()),
+            },
+            ..named(name, fixture, Residency::Full)
+        }
+    }
+
+    /// A table whose configuration is unchanged is kept as it serves; one
+    /// no longer configured is dropped and withdrawn; one newly configured
+    /// is loaded and swapped in serving, in configuration order.
+    #[tokio::test]
+    async fn test_apply_keeps_unchanged_tables_adds_new_ones_and_drops_the_rest() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let config = config(vec![
+            first.clone(),
+            named(SECOND_TABLE, &fixture, Residency::Full),
+        ]);
+        let opened = loaded(&config).await;
+        let before = opened.tables();
+        let serving = before[0].current().unwrap();
+
+        let applied = opened
+            .apply(&[named(THIRD_TABLE, &fixture, Residency::Full), first])
+            .await
+            .unwrap();
+        assert_eq!(applied.kept, 1);
+        assert_eq!(names_of(&applied.started), [THIRD_TABLE]);
+        assert_eq!(names_of(&applied.stopped), [SECOND_TABLE]);
+        assert_eq!(names(&opened), [THIRD_TABLE, FIRST_TABLE]);
+        let kept = opened.table(FIRST_TABLE).unwrap();
+        assert!(Arc::ptr_eq(&kept, &before[0]));
+        assert!(Arc::ptr_eq(&kept.current().unwrap(), &serving));
+        assert!(matches!(
+            opened.table(THIRD_TABLE).unwrap().state(),
+            TableState::Serving { .. }
+        ));
+        assert!(opened.table(SECOND_TABLE).is_none());
+        assert!(opened.pending.lock().unwrap().is_empty());
+    }
+
+    /// A table whose configuration changed is built and loaded beside the
+    /// one serving under its name, which serves until the swap and is
+    /// then dropped.
+    #[tokio::test]
+    async fn test_apply_replaces_a_changed_table_under_its_name() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let opened = loaded(&config(vec![first.clone()])).await;
+        let before = opened.table(FIRST_TABLE).unwrap();
+        let changed = TableConfig {
+            strict: !first.strict,
+            ..first
+        };
+
+        let applied = opened.apply(std::slice::from_ref(&changed)).await.unwrap();
+        assert_eq!(applied.kept, 0);
+        assert_eq!(names_of(&applied.started), [FIRST_TABLE]);
+        assert!(Arc::ptr_eq(&applied.stopped[0], &before));
+        let after = opened.table(FIRST_TABLE).unwrap();
+        assert!(!Arc::ptr_eq(&after, &before));
+        assert_eq!(after.config(), &changed);
+        assert!(after.current().is_some());
+    }
+
+    /// A table that fails its first load refuses the whole reload: the set
+    /// serving is the one before it, a table the reload would have added
+    /// is dropped, and nothing is left pending.
+    #[tokio::test]
+    async fn test_apply_refuses_every_change_when_one_table_fails_to_load() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let opened = loaded(&config(vec![first.clone()])).await;
+        let before = opened.tables();
+
+        let refused = opened
+            .apply(&[
+                named(SECOND_TABLE, &fixture, Residency::Full),
+                missing(THIRD_TABLE, &fixture),
+            ])
+            .await
+            .err()
+            .expect("the missing table fails its load");
+        let failed: Vec<&str> = refused
+            .failures
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(failed, [THIRD_TABLE]);
+        assert!(Arc::ptr_eq(&opened.tables(), &before));
+        assert!(opened.table(SECOND_TABLE).is_none());
+        assert!(opened.pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            opened.table(FIRST_TABLE).unwrap().state(),
+            TableState::Serving { .. }
+        ));
+    }
+
+    /// The chunk files a table still loading for a reload wrote are live to
+    /// `retain` until the reload lets the table go, and freed after.
+    #[tokio::test]
+    async fn test_retain_keeps_what_a_pending_table_loaded() {
+        let first = two_file_fixture().await;
+        let second = two_file_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local(
+            dir.path(),
+            vec![named(FIRST_TABLE, &first, Residency::Disk)],
+        );
+        let opened = loaded(&config).await;
+        let local = opened.local.as_ref().unwrap();
+        let pending = Arc::new(
+            opened
+                .build(&named(SECOND_TABLE, &second, Residency::Disk))
+                .await
+                .unwrap(),
+        );
+        let registered = opened.register(std::slice::from_ref(&pending)).await;
+        pending.load().await.unwrap();
+        let written = pending.current().unwrap().identities();
+
+        assert_eq!(opened.retain().await.unwrap(), 0);
+        for identity in &written {
+            assert!(local.chunks_for(identity).unwrap().is_some());
+        }
+        drop(registered);
+        assert!(opened.retain().await.unwrap() > 0);
+        for identity in &written {
+            assert!(local.chunks_for(identity).unwrap().is_none());
+        }
+    }
+
+    /// A reload that drops a disk table lets `retain` free its chunk files.
+    #[tokio::test]
+    async fn test_retain_after_apply_frees_a_dropped_table_s_chunk_files() {
+        let first = two_file_fixture().await;
+        let second = two_file_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let kept = named(FIRST_TABLE, &first, Residency::Disk);
+        let config = config_with_local(
+            dir.path(),
+            vec![kept.clone(), named(SECOND_TABLE, &second, Residency::Disk)],
+        );
+        let opened = loaded(&config).await;
+        let dropped = opened
+            .table(SECOND_TABLE)
+            .unwrap()
+            .current()
+            .unwrap()
+            .identities();
+
+        opened.apply(&[kept]).await.unwrap();
+        assert!(opened.retain().await.unwrap() > 0);
+        let local = opened.local.as_ref().unwrap();
+        for identity in &dropped {
+            assert!(local.chunks_for(identity).unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -461,7 +857,7 @@ mod tests {
         let opened = open_with(&config, None, storage_for(&config))
             .await
             .unwrap();
-        opened.tables[0].load().await.unwrap();
+        opened.tables()[0].load().await.unwrap();
         assert_eq!(opened.retain().await.unwrap(), 0);
     }
 }

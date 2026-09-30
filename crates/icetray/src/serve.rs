@@ -1,14 +1,15 @@
 //! The daemon (RFD 012, RFD 005): both listeners bound and the health
 //! service registered before any table loads, every table loaded
 //! concurrently, readiness and `SERVING` once every table serves, one
-//! refresh task per table and one sampler on the poll interval, and a drain
-//! on shutdown that ends health watches, waits up to the drain deadline for
-//! in-flight calls, and flushes the page cache's disk level. A first-load failure keeps health
-//! `NOT_SERVING` for a grace period, so an orchestrator's probe sees it,
-//! then ends the run; a periodic task that panics ends the run at once,
-//! with the task named.
+//! refresh task per table and one sampler on the poll interval, the
+//! configuration followed when the run was given one to follow (RFD 018),
+//! and a drain on shutdown that ends health watches, waits up to the drain
+//! deadline for in-flight calls, and flushes the page cache's disk level.
+//! A first-load failure keeps health `NOT_SERVING` for a grace period, so
+//! an orchestrator's probe sees it, then ends the run; a periodic task that
+//! panics ends the run at once, with the task named.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
 use std::net::SocketAddr;
@@ -22,8 +23,8 @@ use icetray_core::{ErrorKind, Opened, Storage, Table, open};
 use icetray_proto::v1::icetray_server::{IcetrayServer, SERVICE_NAME};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
+use tokio::sync::{Notify, watch};
+use tokio::task::{AbortHandle, Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -32,6 +33,7 @@ use tonic_health::server::HealthReporter;
 
 use crate::error::ServeError;
 use crate::listen::serve_http;
+use crate::reload::{Reload, Reloader};
 use crate::service::Service;
 use crate::telemetry;
 
@@ -48,19 +50,25 @@ pub const OVERALL_SERVICE: &str = "";
 /// the `Icetray` service, which change status together.
 const HEALTH_NAMES: [&str; 2] = [OVERALL_SERVICE, SERVICE_NAME];
 
-/// What a caller of `Serving::start` chooses; the binary takes the defaults
-/// and tests shorten the grace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a caller of `Serving::start` chooses; the binary follows its
+/// configuration file and takes the default grace, and tests shorten the
+/// grace.
+#[derive(Clone, Debug)]
 pub struct ServeOptions {
     /// How long a first-load failure stays on the health service before the
     /// run ends.
     pub start_failure_grace: Duration,
+    /// Where the run reads its configuration again once every table
+    /// serves (RFD 018); `None` serves the tables it started with until it
+    /// ends.
+    pub reload: Option<Reload>,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             start_failure_grace: START_FAILURE_GRACE,
+            reload: None,
         }
     }
 }
@@ -73,6 +81,8 @@ pub struct Serving {
     opened: Arc<Opened>,
     ready: watch::Receiver<bool>,
     shutdown: watch::Sender<bool>,
+    /// Asks the run to read its configuration again now.
+    reload: Arc<Notify>,
     task: JoinHandle<Result<(), ServeError>>,
 }
 
@@ -168,17 +178,25 @@ impl Serving {
         tracing::info!(
             grpc = %listeners.listen,
             metrics = %listeners.metrics_addr,
-            tables = opened.tables.len(),
+            tables = opened.tables().len(),
             "listening"
         );
 
+        let reload = Arc::new(Notify::new());
+        let poll_interval = config.server.poll_interval;
+        let drain_deadline = config.server.drain_deadline;
+        let reloader = options
+            .reload
+            .clone()
+            .map(|source| Reloader::new(source, config, poll_interval, Arc::clone(&reload)));
         let run = Run {
             opened: Arc::clone(&opened),
             health,
             handle,
             options,
-            poll_interval: config.server.poll_interval,
-            drain_deadline: config.server.drain_deadline,
+            poll_interval,
+            drain_deadline,
+            reloader,
             shutdown: shutdown.clone(),
             ready: ready_tx,
             grpc,
@@ -191,6 +209,7 @@ impl Serving {
             opened,
             ready,
             shutdown,
+            reload,
             task,
         }
     }
@@ -224,6 +243,15 @@ impl Serving {
     /// the run failed its first loads and signaled it itself.
     pub async fn stopped(&self) {
         stop(self.shutdown.subscribe()).await;
+    }
+
+    /// Asks the run to read its configuration again now, as a poll would
+    /// but also retrying a configuration the last reload refused (RFD
+    /// 018); the binary calls it on SIGHUP. A request made before every
+    /// table serves is taken up once they do. Without `ServeOptions::reload`
+    /// it does nothing.
+    pub fn reload(&self) {
+        self.reload.notify_one();
     }
 
     /// Asks the run to drain: the servers stop accepting, in-flight calls
@@ -300,10 +328,16 @@ impl fmt::Display for PeriodicTask {
 
 /// The run's periodic tasks, each under its name. Every loop runs until it
 /// is aborted, so a task that ends on its own ends by a `JoinError`: a
-/// panic inside it.
+/// panic inside it, or an abort by `stop_refresh`.
 struct Periodic {
     tasks: JoinSet<Infallible>,
     names: HashMap<Id, PeriodicTask>,
+    /// Each served table's refresh task, to stop when a reload drops the
+    /// table.
+    refreshes: Vec<(Arc<Table>, AbortHandle)>,
+    /// Refresh tasks `stop_refresh` aborted, whose cancellation `ended`
+    /// passes over.
+    stopped: HashSet<Id>,
 }
 
 impl Periodic {
@@ -311,6 +345,8 @@ impl Periodic {
         Self {
             tasks: JoinSet::new(),
             names: HashMap::new(),
+            refreshes: Vec::new(),
+            stopped: HashSet::new(),
         }
     }
 
@@ -319,20 +355,57 @@ impl Periodic {
         &mut self,
         task: PeriodicTask,
         future: impl Future<Output = Infallible> + Send + 'static,
-    ) {
-        let id = self.tasks.spawn(future).id();
-        self.names.insert(id, task);
+    ) -> AbortHandle {
+        let handle = self.tasks.spawn(future);
+        self.names.insert(handle.id(), task);
+        handle
     }
 
-    /// Completes when a task ends, naming it. The sampler is in the set
-    /// until `shutdown`, so there is always a task to wait on.
+    /// Spawns the refresh of `table`, over `opened`, every `poll_interval`.
+    fn spawn_refresh(&mut self, table: &Arc<Table>, opened: &Arc<Opened>, poll_interval: Duration) {
+        let handle = self.spawn(
+            PeriodicTask::Refresh {
+                table: table.name().to_string(),
+            },
+            refresh_loop(Arc::clone(table), Arc::clone(opened), poll_interval),
+        );
+        self.refreshes.push((Arc::clone(table), handle));
+    }
+
+    /// Aborts the refresh of `table`, which a reload dropped. A poll in
+    /// flight is dropped where it waits, as a shutdown drops it.
+    fn stop_refresh(&mut self, table: &Arc<Table>) {
+        let Some(at) = self
+            .refreshes
+            .iter()
+            .position(|(refreshed, _)| Arc::ptr_eq(refreshed, table))
+        else {
+            return;
+        };
+        let (_, handle) = self.refreshes.swap_remove(at);
+        self.stopped.insert(handle.id());
+        handle.abort();
+    }
+
+    /// Completes when a task ends other than by `stop_refresh`, naming it.
+    /// The sampler is in the set until `shutdown`, so there is always a
+    /// task to wait on.
     async fn ended(&mut self) -> (PeriodicTask, JoinError) {
-        let outcome = self
-            .tasks
-            .join_next()
-            .await
-            .expect("the sampler is in the set until shutdown");
-        self.named(outcome)
+        loop {
+            let outcome = self
+                .tasks
+                .join_next()
+                .await
+                .expect("the sampler is in the set until shutdown");
+            if let Err(error) = &outcome
+                && error.is_cancelled()
+                && self.stopped.contains(&error.id())
+            {
+                self.named(outcome);
+                continue;
+            }
+            return self.named(outcome);
+        }
     }
 
     /// Aborts every task and waits for them to end. Returns the first task
@@ -357,6 +430,7 @@ impl Periodic {
         match outcome {
             Ok(never) => match never {},
             Err(error) => {
+                self.stopped.remove(&error.id());
                 let task = self
                     .names
                     .remove(&error.id())
@@ -376,6 +450,9 @@ struct Run {
     options: ServeOptions,
     poll_interval: Duration,
     drain_deadline: Duration,
+    /// Follows the configuration once every table serves, when the run
+    /// was given one to follow.
+    reloader: Option<Reloader>,
     shutdown: watch::Sender<bool>,
     ready: watch::Sender<bool>,
     grpc: JoinHandle<Result<(), tonic::transport::Error>>,
@@ -396,8 +473,11 @@ impl Run {
     /// asked for once the loads have failed cuts the grace short. A
     /// periodic task that panics before the shutdown aborts it, a pending
     /// shutdown included, ends the run as `Periodic`, so the process exits
-    /// non-zero instead of serving on with nothing refreshing.
-    async fn run(self) -> Result<(), ServeError> {
+    /// non-zero instead of serving on with nothing refreshing. A reload
+    /// that applies stops the refreshes of the tables it dropped and
+    /// starts those of the tables it added, then runs retention; a
+    /// shutdown drops a reload in flight, which swaps nothing in.
+    async fn run(mut self) -> Result<(), ServeError> {
         // Biased, the loads first: when they have ended and a shutdown is
         // pending at the same poll, their outcome stands.
         let loaded = tokio::select! {
@@ -426,17 +506,8 @@ impl Run {
         self.ready.send_modify(|ready| *ready = true);
 
         let mut periodic = Periodic::new();
-        for table in &self.opened.tables {
-            periodic.spawn(
-                PeriodicTask::Refresh {
-                    table: table.name().to_string(),
-                },
-                refresh_loop(
-                    Arc::clone(table),
-                    Arc::clone(&self.opened),
-                    self.poll_interval,
-                ),
-            );
+        for table in self.opened.tables().iter() {
+            periodic.spawn_refresh(table, &self.opened, self.poll_interval);
         }
         periodic.spawn(
             PeriodicTask::Sampler,
@@ -448,11 +519,27 @@ impl Run {
         );
 
         // Biased, the ended task first: when a task has ended and a
-        // shutdown is pending at the same poll, the failure is the outcome.
-        let ended = tokio::select! {
-            biased;
-            ended = periodic.ended() => Some(ended),
-            () = stop(self.shutdown.subscribe()) => None,
+        // shutdown is pending at the same poll, the failure is the outcome;
+        // then the shutdown, over a reload that finished at the same poll.
+        let mut reloader = self.reloader.take();
+        let ended = loop {
+            tokio::select! {
+                biased;
+                ended = periodic.ended() => break Some(ended),
+                () = stop(self.shutdown.subscribe()) => break None,
+                applied = next_reload(reloader.as_mut(), &self.opened) => {
+                    for table in &applied.stopped {
+                        periodic.stop_refresh(table);
+                    }
+                    for table in &applied.started {
+                        periodic.spawn_refresh(table, &self.opened, self.poll_interval);
+                    }
+                    tokio::select! {
+                        () = retain(&self.opened) => {}
+                        () = stop(self.shutdown.subscribe()) => break None,
+                    }
+                }
+            }
         };
         let raced = periodic.shutdown().await;
         let Some((task, source)) = ended.or(raced) else {
@@ -533,12 +620,21 @@ async fn withdraw_health(health: &mut HealthReporter) {
     }
 }
 
+/// The next reload `reloader` applies; without one, never.
+async fn next_reload(reloader: Option<&mut Reloader>, opened: &Opened) -> icetray_core::Applied {
+    match reloader {
+        Some(reloader) => reloader.next(opened).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Loads every table concurrently and logs each outcome; returns the
 /// tables that failed with the kind of their failure.
 async fn load_all(opened: &Opened) -> Vec<(String, ErrorKind)> {
-    let outcomes = join_all(opened.tables.iter().map(|table| table.load())).await;
+    let tables = opened.tables();
+    let outcomes = join_all(tables.iter().map(|table| table.load())).await;
     let mut failures = Vec::new();
-    for (table, outcome) in opened.tables.iter().zip(outcomes) {
+    for (table, outcome) in tables.iter().zip(outcomes) {
         match outcome {
             Ok(()) => log_serving(table),
             Err(error) => {

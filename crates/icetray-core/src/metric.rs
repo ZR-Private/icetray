@@ -30,6 +30,9 @@ pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 pub(crate) const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
 /// Generations swapped in, by `table`.
 pub(crate) const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
+/// Configuration reloads that read a changed file, by `result`: applied or
+/// refused (RFD 018).
+pub const CONFIG_RELOADS_TOTAL: &str = "icetray_config_reloads_total";
 
 /// Lookup latency in seconds, by `table` and `result`.
 pub const LOOKUP_SECONDS: &str = "icetray_lookup_seconds";
@@ -55,6 +58,9 @@ pub const GENERATION_SEQUENCE_NUMBER: &str = "icetray_generation_sequence_number
 pub const GENERATION_SWAPPED_AT_SECONDS: &str = "icetray_generation_swapped_at_seconds";
 /// 1 for the table's current state and 0 for the others, by `table` and `state`.
 pub const TABLE_STATE: &str = "icetray_table_state";
+/// 1 while the configuration file differs from the configuration the
+/// server applied, 0 once they match (RFD 018).
+pub const CONFIG_PENDING: &str = "icetray_config_pending";
 
 /// The `call` label: the RPC, from the RPC enum's `Display`.
 pub const LABEL_CALL: &str = "call";
@@ -62,8 +68,9 @@ pub const LABEL_CALL: &str = "call";
 pub const LABEL_KIND: &str = "kind";
 /// The `table` label: the table's configured name.
 pub const LABEL_TABLE: &str = "table";
-/// The `result` label: the lookup outcome, from `LookupResult`.
-pub(crate) const LABEL_RESULT: &str = "result";
+/// The `result` label: a lookup's outcome, from `LookupResult`, or a
+/// reload's.
+pub const LABEL_RESULT: &str = "result";
 /// The `reason` label: why a refresh failed, from `ErrorKind`, which gives
 /// the refusal's own name for a refusal.
 pub(crate) const LABEL_REASON: &str = "reason";

@@ -326,8 +326,9 @@ Counters: `icetray_requests_total{call}`, `icetray_object_gets_total{kind}`,
 `icetray_local_bytes_total`, `icetray_hedges_total`,
 `icetray_page_cache_hits_total`, `icetray_page_cache_fetches_total`,
 `icetray_lookups_total{table,result}`,
-`icetray_refresh_errors_total{table,reason}`, and
-`icetray_generation_swaps_total{table}`. Histograms:
+`icetray_refresh_errors_total{table,reason}`,
+`icetray_generation_swaps_total{table}`, and
+`icetray_config_reloads_total{result}`. Histograms:
 `icetray_lookup_seconds{table,result}` and
 `icetray_object_get_seconds{kind}`. Gauges: `icetray_index_bytes{table}`
 (the index's live bytes, exported beside `icetray_process_rss_bytes`
@@ -336,7 +337,9 @@ on every platform), `icetray_page_cache_bytes`,
 `icetray_findings{table,code}`, `icetray_generation_age_seconds{table}`,
 `icetray_generation_sequence_number{table}` (the serving snapshot's
 sequence number), `icetray_generation_swapped_at_seconds{table}` (when it
-was swapped in, in Unix seconds), and `icetray_table_state{table,state}`.
+was swapped in, in Unix seconds), `icetray_table_state{table,state}`, and
+`icetray_config_pending` (1 while the configuration file differs from the
+configuration applied).
 No metric carries the snapshot id, so the series count does not grow with
 swaps; the id is in the swap's log line and in `TableInfo`. Every label value is the name of an
 enum variant, so the set of values is closed.
@@ -394,6 +397,21 @@ without affecting readiness. Snapshot retention on the served ref must
 exceed the longest lag a replica can have, since an expired snapshot's data
 files vanish under a replica still serving it; icetray exposes the lag as
 `icetray_generation_age_seconds` and cannot enforce the retention.
+
+The configuration file is read again on the same interval, and at once on
+SIGHUP; a change to its tables applies without a restart (RFD 018). A
+table whose entry is unchanged keeps serving untouched. An added table,
+and a changed one, load beside the tables serving, a changed one beside
+the table serving under its name, and once every one of them serves, the
+whole set swaps at once; a removed table then answers `NOT_FOUND`. A
+reload changes nothing when any of those tables fails to load, when the
+file does not parse or validate, or when any setting outside `[[tables]]`
+changed, which only a restart applies; the refusal is logged with its
+reason and counted, `icetray_config_pending` reads 1 until the file and
+the server agree again, and the poll does not try the same file again
+until it changes, though a SIGHUP does. Readiness does not change on a
+reload. A file mounted where the orchestrator never updates it in place,
+such as a single-file mount fixed at start, is never seen to change.
 
 ## Deploying
 

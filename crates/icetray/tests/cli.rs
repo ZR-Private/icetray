@@ -5,18 +5,22 @@
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hyper::StatusCode;
 use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
+use icetray::reload::ReloadResult;
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
 use icetray_core::contract::VALUE_PAGE_BYTES;
-use icetray_core::metric::{LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE};
+use icetray_core::metric::{
+    CONFIG_PENDING, CONFIG_RELOADS_TOTAL, LABEL_RESULT, LABEL_STATE, LABEL_TABLE,
+    PROCESS_RSS_BYTES, TABLE_STATE,
+};
 use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
 use icetray_testkit::fixture::{
     IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS, TWO_BUCKETS,
@@ -166,6 +170,28 @@ fn write_file(dir: &Path, name: &str, text: &str) -> Result<String, BoxError> {
         .to_str()
         .expect("a temporary path is UTF-8")
         .to_string())
+}
+
+/// Reads a daemon's log lines up to its `listening` line, checking each,
+/// and returns the gRPC and metrics addresses it names.
+fn until_listening(
+    reader: &mut BufReader<ChildStdout>,
+) -> Result<(SocketAddr, SocketAddr), BoxError> {
+    loop {
+        let mut text = String::new();
+        assert!(
+            reader.read_line(&mut text)? > 0,
+            "the daemon exited before listening"
+        );
+        let line: Json = serde_json::from_str(&text)?;
+        check_log_line(&line);
+        if line[MESSAGE_FIELD] == "listening" {
+            let address = |field: &str| line[field].as_str().map(str::parse::<SocketAddr>);
+            let grpc = address("grpc").expect("the grpc address")?;
+            let metrics = address("metrics").expect("the metrics address")?;
+            return Ok((grpc, metrics));
+        }
+    }
 }
 
 /// Waits for `child` to exit, up to `wait`.
@@ -744,28 +770,7 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
     );
     let stdout = daemon.0.stdout.take().expect("stdout is piped");
     let mut reader = BufReader::new(stdout);
-    let mut listening = None;
-    while listening.is_none() {
-        let mut text = String::new();
-        assert!(
-            reader.read_line(&mut text)? > 0,
-            "the daemon exited before listening"
-        );
-        let line: Json = serde_json::from_str(&text)?;
-        check_log_line(&line);
-        if line[MESSAGE_FIELD] == "listening" {
-            listening = Some(line);
-        }
-    }
-    let listening = listening.expect("the listening line was read");
-    let grpc: SocketAddr = listening["grpc"]
-        .as_str()
-        .expect("the grpc address")
-        .parse()?;
-    let metrics: SocketAddr = listening["metrics"]
-        .as_str()
-        .expect("the metrics address")
-        .parse()?;
+    let (grpc, metrics) = until_listening(&mut reader)?;
 
     // The health service answers as soon as the listener is up, while the
     // table may still be loading: the answer is one of the two states,
@@ -823,5 +828,119 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
     for line in &lines(drained.as_bytes()) {
         check_log_line(line);
     }
+    Ok(())
+}
+
+/// A poll interval no test outlasts, so only a SIGHUP makes the daemon read
+/// its file again.
+const POLL_NEVER: &str = "24h";
+
+/// `json_config` over `tables`, each pinned to its fixture, polling every
+/// `POLL_NEVER`.
+fn json_config_polling_never(tables: &[(&str, &Fixture)]) -> String {
+    let mut config: Json =
+        serde_json::from_str(&json_config(tables[0].0, tables[0].1)).expect("json_config is JSON");
+    config["server"]["poll_interval"] = Json::from(POLL_NEVER);
+    config["tables"] = tables
+        .iter()
+        .map(|(name, fixture)| json_table(name, fixture))
+        .collect();
+    config.to_string()
+}
+
+/// SIGHUP makes the daemon read its file at once, with no poll due, and
+/// apply the table it adds; the process lives through the signal, whose
+/// default action would end it, and drains on SIGTERM as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let first = local_fixture(dir.path(), FixtureSpec::small("kv_first", KeyType::Long)).await?;
+    let second = local_fixture(dir.path(), FixtureSpec::small("kv_second", KeyType::Long)).await?;
+    let config = write_file(
+        dir.path(),
+        "serve.json",
+        &json_config_polling_never(&[(TABLE_A, &first)]),
+    )?;
+    let mut daemon = Daemon(
+        Command::new(BIN)
+            .args(["serve", "--config", &config])
+            .env_remove(ENV_CONFIG)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = daemon.0.stdout.take().expect("stdout is piped");
+    let mut reader = BufReader::new(stdout);
+    let (_, metrics) = until_listening(&mut reader)?;
+    poll_until(READY_WAIT, "readiness", async || {
+        let (status, _) = http_get(metrics, READY_PATH).await?;
+        Ok((status == StatusCode::OK).then_some(()))
+    })
+    .await?;
+
+    std::fs::write(
+        &config,
+        json_config_polling_never(&[(TABLE_A, &first), (TABLE_B, &second)]),
+    )?;
+    let hung_up = Command::new("kill")
+        .arg("-HUP")
+        .arg(daemon.0.id().to_string())
+        .status()?;
+    assert!(hung_up.success());
+    let applied = ReloadResult::Applied.to_string();
+    let exposition = poll_until(READY_WAIT, "the reload applied", async || {
+        let (_, exposition) = http_get(metrics, METRICS_PATH).await?;
+        let reloads = series_value(
+            &exposition,
+            CONFIG_RELOADS_TOTAL,
+            &[(LABEL_RESULT, &applied)],
+        );
+        Ok(reloads.is_some().then_some(exposition))
+    })
+    .await?;
+    assert_eq!(
+        series_value(
+            &exposition,
+            CONFIG_RELOADS_TOTAL,
+            &[(LABEL_RESULT, &applied)]
+        )
+        .map(f64::to_bits),
+        Some(1.0_f64.to_bits())
+    );
+    assert_eq!(
+        series_value(
+            &exposition,
+            TABLE_STATE,
+            &[(LABEL_TABLE, TABLE_B), (LABEL_STATE, &serving_state())]
+        )
+        .map(f64::to_bits),
+        Some(1.0_f64.to_bits()),
+        "the added table serves"
+    );
+    assert_eq!(
+        series_value(&exposition, CONFIG_PENDING, &[]).map(f64::to_bits),
+        Some(0.0_f64.to_bits())
+    );
+    assert!(
+        daemon.0.try_wait()?.is_none(),
+        "the daemon lives through SIGHUP"
+    );
+
+    let killed = Command::new("kill")
+        .arg("-TERM")
+        .arg(daemon.0.id().to_string())
+        .status()?;
+    assert!(killed.success());
+    let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT).await?;
+    assert_eq!(status.code(), Some(i32::from(EXIT_OK)));
+    let mut drained = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut drained)?;
+    let logged = lines(drained.as_bytes());
+    assert!(
+        logged
+            .iter()
+            .any(|line| line[MESSAGE_FIELD] == "configuration reloaded"),
+        "the reload is logged"
+    );
     Ok(())
 }

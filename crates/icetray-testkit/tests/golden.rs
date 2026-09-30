@@ -57,7 +57,7 @@ impl Golden {
 async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
     let warehouse = golden::warehouse()?;
     let opened = open(&golden::config(&warehouse, table, strict), None).await?;
-    let table = Arc::clone(&opened.tables[0]);
+    let table = Arc::clone(&opened.tables()[0]);
     table.load().await?;
     table.serving()?.verify_buckets().await?;
     Ok(Golden {
@@ -282,7 +282,7 @@ async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {
         None,
     )
     .await?;
-    let error = opened.tables[0].load().await.unwrap_err();
+    let error = opened.tables()[0].load().await.unwrap_err();
     let Error::Inefficient { findings, .. } = error else {
         panic!("strict refuses the default layout: {error:?}");
     };

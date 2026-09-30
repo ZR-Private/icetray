@@ -1,7 +1,8 @@
 //! The one binary as a thin library: `serve` is the daemon (the gRPC
 //! service over the generated contract, gRPC health, the metrics and
-//! readiness listener, one refresh task per table, the twelve-factor
-//! surface of RFD 012, a graceful drain) and `doctor`, `get`, and `info` are
+//! readiness listener, one refresh task per table, the configuration
+//! reload of RFD 018, the twelve-factor surface of RFD 012, a graceful
+//! drain) and `doctor`, `get`, and `info` are
 //! one-shot subcommands printing JSON lines. Every subcommand opens tables
 //! through `icetray_core::open` and shares one flag vocabulary; this library
 //! holds everything `main` dispatches to, so the integration tests drive the
@@ -14,6 +15,7 @@ pub mod listen;
 pub mod logging;
 pub mod oneshot;
 pub mod output;
+pub mod reload;
 pub mod serve;
 pub mod service;
 pub mod telemetry;

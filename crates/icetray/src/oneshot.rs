@@ -19,7 +19,7 @@ use crate::output::{FileLine, FindingLine, GetLine, Kind, RefusedLine, SummaryLi
 /// `CliError::NoTableMatched`. Nothing is loaded.
 pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, CliError> {
     let opened = open(config, only).await?;
-    if opened.tables.is_empty() {
+    if opened.tables().is_empty() {
         return Err(CliError::NoTableMatched {
             name: only.map(str::to_string),
         });
@@ -28,9 +28,10 @@ pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, 
 }
 
 /// Loads every table concurrently; the outcomes in table order.
-async fn load_all(opened: &Opened) -> Vec<(&Arc<Table>, icetray_core::Result<()>)> {
-    let outcomes = join_all(opened.tables.iter().map(|table| table.load())).await;
-    opened.tables.iter().zip(outcomes).collect()
+async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)> {
+    let tables = opened.tables();
+    let outcomes = join_all(tables.iter().map(|table| table.load())).await;
+    tables.iter().cloned().zip(outcomes).collect()
 }
 
 /// `doctor`: one `doctor` line per table with its findings and, with
@@ -99,7 +100,7 @@ pub async fn doctor(
 /// that fails ends the run before any line is printed.
 pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     let opened = open_tables(config, only).await?;
-    let mut loaded = Vec::with_capacity(opened.tables.len());
+    let mut loaded = Vec::with_capacity(opened.tables().len());
     for (table, outcome) in load_all(&opened).await {
         outcome?;
         loaded.push(table);
@@ -122,7 +123,8 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
 /// the lookup issued and its elapsed time.
 pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result<(), CliError> {
     let opened = open_tables(config, only).await?;
-    let table = match opened.tables.as_slice() {
+    let tables = opened.tables();
+    let table = match tables.as_slice() {
         [table] => table,
         tables => {
             return Err(CliError::TableNameRequired {

@@ -7,15 +7,17 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser as _;
 use icetray::cli::{Cli, Command, Target};
 use icetray::error::{CliError, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use icetray::logging::{self, LogSink};
+use icetray::reload::{ConfigFile, ConfigSource as _, Reload};
 use icetray::serve::{ServeOptions, Serving};
 use icetray::{oneshot, telemetry};
 use icetray_core::config::Config;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::Level;
 
 /// jemalloc, with background purging turned on at start, so memory freed
@@ -132,10 +134,19 @@ fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
 
 /// `serve`: the configuration from `path`, logging to stdout at `info`
 /// (twelve-factor: the log stream is stdout), jemalloc's background
-/// purging, then the daemon, whose outcome is finished into the exit code
-/// as a one-shot's is.
+/// purging, then the daemon following `path` (RFD 018), whose outcome is
+/// finished into the exit code as a one-shot's is.
 async fn serve(path: &Path) -> ExitCode {
-    let config = match Config::from_path(path) {
+    let file = ConfigFile::new(path);
+    let reading = match file.read() {
+        Ok(reading) => reading,
+        Err(error) => {
+            return report(&CliError::Core(icetray_core::Error::Config(
+                icetray_core::config::ConfigError::Read(error),
+            )));
+        }
+    };
+    let config = match reading.config {
         Ok(config) => config,
         Err(error) => return report(&CliError::Core(error)),
     };
@@ -146,23 +157,53 @@ async fn serve(path: &Path) -> ExitCode {
         // schedule.
         tracing::warn!(%error, "jemalloc background purging is unavailable");
     }
-    finish(daemon(config).await)
+    let reload = Reload {
+        source: Arc::new(file),
+        started_from: reading.digest,
+    };
+    finish(daemon(config, reload).await)
 }
 
-/// The metrics recorder, the daemon, and a drain on SIGTERM or SIGINT.
-/// `EXIT_OK` after a drain; a failure to start or a failed run, which a
-/// first-load failure is on its own (RFD 005), and a drain that passed its
-/// deadline, are `CliError::Serve`.
-async fn daemon(config: Config) -> Result<ExitCode, CliError> {
+/// The metrics recorder, the daemon following `reload`, a reload on
+/// SIGHUP, and a drain on SIGTERM or SIGINT. `EXIT_OK` after a drain; a
+/// failure to start or a failed run, which a first-load failure is on its
+/// own (RFD 005), and a drain that passed its deadline, are
+/// `CliError::Serve`.
+async fn daemon(config: Config, reload: Reload) -> Result<ExitCode, CliError> {
     let handle = telemetry::install()?;
-    let serving = Serving::start(config, handle, ServeOptions::default()).await?;
+    let hangup = signal(SignalKind::hangup());
+    let options = ServeOptions {
+        reload: Some(reload),
+        ..ServeOptions::default()
+    };
+    let serving = Serving::start(config, handle, options).await?;
     tokio::select! {
         () = signaled() => tracing::info!("draining"),
         () = serving.stopped() => {}
+        never = hangups(hangup, &serving) => match never {},
     }
     serving.shutdown();
     serving.join().await?;
     Ok(ExitCode::from(EXIT_OK))
+}
+
+/// Asks `serving` to reload on every SIGHUP `hangup` receives (RFD 018).
+/// The listener is registered before the daemon starts, replacing the
+/// signal's default action, which would end the process. A signal the
+/// runtime cannot listen for, or a listener that stops receiving, is
+/// logged, and a change to the file is then applied on the poll alone.
+async fn hangups(hangup: std::io::Result<Signal>, serving: &Serving) -> std::convert::Infallible {
+    match hangup {
+        Ok(mut hangup) => {
+            while hangup.recv().await.is_some() {
+                tracing::info!("reload requested");
+                serving.reload();
+            }
+            tracing::warn!("SIGHUP listener ended");
+        }
+        Err(error) => tracing::warn!(%error, "cannot listen for SIGHUP"),
+    }
+    std::future::pending().await
 }
 
 /// Completes on SIGTERM or SIGINT. A signal the runtime cannot listen for

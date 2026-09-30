@@ -47,7 +47,7 @@ pub use index::{
 pub use key::{Key, KeyBytes, KeyType};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout};
-pub use open::{Opened, open};
+pub use open::{Applied, Opened, Refused, open};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, Storage};
 pub use table::{CallsInFlight, Table, TableHandles, TableState};

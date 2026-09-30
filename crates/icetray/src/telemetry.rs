@@ -83,7 +83,7 @@ pub fn count(call: Call) {
 /// (`PageCache::publish_hit_counts`) published first, so the scrape reads
 /// every lookup answered and every page hit before it.
 pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
-    for table in &opened.tables {
+    for table in opened.tables().iter() {
         table.publish_lookup_counts();
     }
     opened.cache.publish_hit_counts();
@@ -95,7 +95,7 @@ pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
 /// now, and `process_rss_bytes` when the platform reports a resident set
 /// size; then runs the recorder's upkeep, which drains histogram samples.
 pub fn sample(opened: &Opened, handle: &PrometheusHandle) {
-    for table in &opened.tables {
+    for table in opened.tables().iter() {
         if let Some(generation) = table.current() {
             metrics::gauge!(
                 metric::GENERATION_AGE_SECONDS,

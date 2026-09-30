@@ -383,6 +383,99 @@ impl Config {
         Ok(self)
     }
 
+    /// The settings outside `tables` whose value in `next` differs from
+    /// this configuration's, by their names in the file, in file order:
+    /// what a reload refuses, since the server builds them once at start
+    /// (RFD 018). Empty when only the tables differ. Every field is named
+    /// in a destructuring with no rest pattern, so a setting added later
+    /// does not compile until it is compared.
+    pub fn restart_settings(&self, next: &Self) -> Vec<&'static str> {
+        let ServerConfig {
+            listen,
+            metrics_listen,
+            poll_interval,
+            page_cache_bytes,
+            log,
+            get_deadline,
+            multi_get_deadline,
+            max_in_flight,
+            max_multi_get_keys,
+            load_deadline,
+            refresh_deadline,
+            drain_deadline,
+        } = &self.server;
+        let StorageConfig {
+            s3,
+            rewrite,
+            hedge,
+            local,
+            max_retries,
+            connect_timeout,
+            catalog_timeout,
+        } = &self.storage;
+        let server = &next.server;
+        let storage = &next.storage;
+        let compared = [
+            ("server.listen", *listen == server.listen),
+            (
+                "server.metrics_listen",
+                *metrics_listen == server.metrics_listen,
+            ),
+            (
+                "server.poll_interval",
+                *poll_interval == server.poll_interval,
+            ),
+            (
+                "server.page_cache_bytes",
+                *page_cache_bytes == server.page_cache_bytes,
+            ),
+            ("server.log", *log == server.log),
+            ("server.get_deadline", *get_deadline == server.get_deadline),
+            (
+                "server.multi_get_deadline",
+                *multi_get_deadline == server.multi_get_deadline,
+            ),
+            (
+                "server.max_in_flight",
+                *max_in_flight == server.max_in_flight,
+            ),
+            (
+                "server.max_multi_get_keys",
+                *max_multi_get_keys == server.max_multi_get_keys,
+            ),
+            (
+                "server.load_deadline",
+                *load_deadline == server.load_deadline,
+            ),
+            (
+                "server.refresh_deadline",
+                *refresh_deadline == server.refresh_deadline,
+            ),
+            (
+                "server.drain_deadline",
+                *drain_deadline == server.drain_deadline,
+            ),
+            ("storage.s3", *s3 == storage.s3),
+            ("storage.rewrite", *rewrite == storage.rewrite),
+            ("storage.hedge", *hedge == storage.hedge),
+            ("storage.local", *local == storage.local),
+            ("storage.max_retries", *max_retries == storage.max_retries),
+            (
+                "storage.connect_timeout",
+                *connect_timeout == storage.connect_timeout,
+            ),
+            (
+                "storage.catalog_timeout",
+                *catalog_timeout == storage.catalog_timeout,
+            ),
+        ];
+        compared
+            .into_iter()
+            .filter(|(_, same)| !same)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Reads the file, then `parse`s it; a file that cannot be read is
     /// `ConfigError::Read`.
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -1439,6 +1532,23 @@ locaton = "typo"
     fn test_parse_refuses_empty_table_name() {
         let text = TOML_MINIMAL.replace("name = \"kv\"", "name = \"\"");
         assert_eq!(violation(&text), ConfigViolation::EmptyTableName);
+    }
+
+    /// Two configurations that differ in their tables alone need no
+    /// restart; each other setting that differs is named as the file
+    /// names it.
+    #[test]
+    fn test_restart_settings_names_what_differs_outside_the_tables() {
+        let running = Config::parse(TOML_MINIMAL).unwrap();
+        let mut next = running.clone();
+        next.tables.clear();
+        assert!(running.restart_settings(&next).is_empty());
+        next.server.poll_interval += Duration::from_secs(1);
+        next.storage.max_retries += 1;
+        assert_eq!(
+            running.restart_settings(&next),
+            ["server.poll_interval", "storage.max_retries"]
+        );
     }
 
     #[test]

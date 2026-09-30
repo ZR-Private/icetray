@@ -31,7 +31,7 @@ use crate::key::{Key, KeyType};
 use crate::local::LocalDir;
 use crate::metric::{self, LookupResult};
 use crate::shard::{self, Sharded};
-use crate::snapshot::SnapshotId;
+use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
@@ -223,6 +223,29 @@ pub struct Table {
     /// `serial` doing its work, from `server.refresh_deadline`.
     refresh_deadline: Duration,
     lookups: Arc<Lookups>,
+    /// What the table's state and generation gauges read, and whether it
+    /// shows them. A table a reload loads beside the one serving under its
+    /// name shows none until the reload swaps it in, so the serving table's
+    /// series describe the serving table (RFD 018). Held while a gauge is
+    /// written, so a withdrawal and a publish never interleave; never held
+    /// across an `await`.
+    gauges: Mutex<Gauges>,
+}
+
+/// A table's gauges: whether they are shown, and what its serving
+/// generation set them to.
+struct Gauges {
+    shown: bool,
+    generation: Option<GenerationGauges>,
+}
+
+/// What a swap sets the generation gauges to, kept so a table shown after
+/// its swap publishes them then.
+struct GenerationGauges {
+    index_bytes: usize,
+    findings: BTreeMap<FindingCode, u64>,
+    sequence_number: SequenceNumber,
+    swapped_at: f64,
 }
 
 /// What a lookup needs beside its generation: the table's page cache
@@ -428,8 +451,31 @@ impl Table {
     /// bounded by it. Every `get` and `multi_get` counts among `handles`'
     /// calls in flight while it runs. The lookup metrics are registered
     /// here, with the recorder current then: a process installs its
-    /// recorder first.
+    /// recorder first. The table shows its gauges from here on.
     pub fn new(
+        config: TableConfig,
+        source: TableSource,
+        handles: TableHandles,
+        load_deadline: Duration,
+        refresh_deadline: Duration,
+        get_deadline: Duration,
+    ) -> Self {
+        let table = Self::hidden(
+            config,
+            source,
+            handles,
+            load_deadline,
+            refresh_deadline,
+            get_deadline,
+        );
+        table.show();
+        table
+    }
+
+    /// `new`, with the table's state and generation gauges not shown until
+    /// `show`: what a reload builds beside a table serving under the same
+    /// name, whose series it must leave alone until the swap (RFD 018).
+    pub(crate) fn hidden(
         config: TableConfig,
         source: TableSource,
         handles: TableHandles,
@@ -449,7 +495,7 @@ impl Table {
             metrics: LookupMetrics::new(&config.name),
             in_flight: calls,
         });
-        let table = Self {
+        Self {
             config,
             source,
             storage,
@@ -462,9 +508,51 @@ impl Table {
             load_deadline,
             refresh_deadline,
             lookups,
-        };
-        table.publish_state();
-        table
+            gauges: Mutex::new(Gauges {
+                shown: false,
+                generation: None,
+            }),
+        }
+    }
+
+    /// Shows the table's gauges from now on and publishes them: its state,
+    /// and its serving generation's when it has one.
+    pub(crate) fn show(&self) {
+        let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        gauges.shown = true;
+        self.write_state(&gauges);
+        if let Some(generation) = &gauges.generation {
+            self.write_generation(generation);
+        }
+    }
+
+    /// Stops showing the table's gauges, for a table a reload removed or
+    /// replaced (RFD 018). The recorder cannot remove a series, so the
+    /// state series all read 0, saying the table is in none of the states,
+    /// and `index_bytes` reads 0, since the index is dropped; the table's
+    /// other series keep their last values. A replacement shown after this
+    /// writes its own values over them.
+    pub(crate) fn withdraw(&self) {
+        let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        gauges.shown = false;
+        for name in StateName::ALL {
+            metrics::gauge!(
+                metric::TABLE_STATE,
+                metric::LABEL_TABLE => self.config.name.clone(),
+                metric::LABEL_STATE => name.to_string()
+            )
+            .set(0.0);
+        }
+        metrics::gauge!(
+            metric::INDEX_BYTES,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(0.0);
+    }
+
+    /// The table's configuration.
+    pub fn config(&self) -> &TableConfig {
+        &self.config
     }
 
     /// First load: resolves the source, builds the snapshot the ref names,
@@ -813,11 +901,11 @@ impl Table {
         }
     }
 
-    /// Makes `generation` the serving one. The table's
-    /// `generation_sequence_number` and `generation_swapped_at_seconds`
-    /// gauges are set from it and the clock; the `findings` gauge is set
-    /// from `findings` for every code, zero for the absent ones, so a code
-    /// that cleared on the swap reads zero.
+    /// Makes `generation` the serving one. The generation gauges it sets,
+    /// `index_bytes`, `findings` from `findings`,
+    /// `generation_sequence_number`, and `generation_swapped_at_seconds`
+    /// from the clock, are kept and written while the table shows them
+    /// (`write_generation`).
     fn swap(
         &self,
         generation: Generation,
@@ -841,29 +929,19 @@ impl Table {
             index_bytes = generation.index_bytes,
             "swapped in a generation"
         );
-        metrics::gauge!(
-            metric::INDEX_BYTES,
-            metric::LABEL_TABLE => self.config.name.clone()
-        )
-        .set(approx::gauge_len(generation.index_bytes));
-        for code in FindingCode::ALL {
-            metrics::gauge!(
-                metric::FINDINGS,
-                metric::LABEL_TABLE => self.config.name.clone(),
-                metric::LABEL_CODE => code.to_string()
-            )
-            .set(approx::gauge(findings.get(&code).copied().unwrap_or(0)));
+        let published = GenerationGauges {
+            index_bytes: generation.index_bytes,
+            findings: findings.clone(),
+            sequence_number: generation.sequence_number,
+            swapped_at: time::unix_seconds(time::now()),
+        };
+        {
+            let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+            if gauges.shown {
+                self.write_generation(&published);
+            }
+            gauges.generation = Some(published);
         }
-        metrics::gauge!(
-            metric::GENERATION_SEQUENCE_NUMBER,
-            metric::LABEL_TABLE => self.config.name.clone()
-        )
-        .set(approx::signed_gauge(generation.sequence_number.0));
-        metrics::gauge!(
-            metric::GENERATION_SWAPPED_AT_SECONDS,
-            metric::LABEL_TABLE => self.config.name.clone()
-        )
-        .set(time::unix_seconds(time::now()));
         let snapshot_id = generation.snapshot_id;
         self.current.store(Some(Arc::new(generation)));
         self.serve_state(snapshot_id);
@@ -893,9 +971,19 @@ impl Table {
     }
 
     /// Sets the `table_state` gauge to 1 for the current state and 0 for
-    /// each of the other two; every state the table is ever in, the initial
-    /// `Loading` included, passes through here.
+    /// each of the other two, while the table shows its gauges; every
+    /// state the table is ever in, the initial `Loading` included, passes
+    /// through here or through `show`.
     fn publish_state(&self) {
+        let gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        if gauges.shown {
+            self.write_state(&gauges);
+        }
+    }
+
+    /// Writes the `table_state` gauge; `_shown` is the held lock that
+    /// orders the write against `withdraw`.
+    fn write_state(&self, _shown: &Gauges) {
         let current = self.state().name();
         for name in StateName::ALL {
             metrics::gauge!(
@@ -905,6 +993,37 @@ impl Table {
             )
             .set(approx::gauge(u64::from(name == current)));
         }
+    }
+
+    /// Writes the generation gauges from `generation`; called with the
+    /// gauges' lock held. The `findings` gauge is set for every code, zero
+    /// for the absent ones, so a code that cleared on the swap reads zero.
+    fn write_generation(&self, generation: &GenerationGauges) {
+        metrics::gauge!(
+            metric::INDEX_BYTES,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(approx::gauge_len(generation.index_bytes));
+        for code in FindingCode::ALL {
+            metrics::gauge!(
+                metric::FINDINGS,
+                metric::LABEL_TABLE => self.config.name.clone(),
+                metric::LABEL_CODE => code.to_string()
+            )
+            .set(approx::gauge(
+                generation.findings.get(&code).copied().unwrap_or(0),
+            ));
+        }
+        metrics::gauge!(
+            metric::GENERATION_SEQUENCE_NUMBER,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(approx::signed_gauge(generation.sequence_number.0));
+        metrics::gauge!(
+            metric::GENERATION_SWAPPED_AT_SECONDS,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(generation.swapped_at);
     }
 
     /// `Error::NotReady` for this table.
@@ -2004,6 +2123,14 @@ mod tests {
             }
         }
 
+        /// The series named `name`, of any labels.
+        fn named(&self, name: &str) -> usize {
+            self.0
+                .iter()
+                .filter(|(key, ..)| key.key().name() == name)
+                .count()
+        }
+
         /// The series, of any name, that carry `label`.
         fn labeled_with(&self, label: &str) -> usize {
             self.0
@@ -2317,6 +2444,86 @@ mod tests {
                 )
                 .to_bits(),
             approx::gauge_len(strict_bytes).to_bits()
+        );
+    }
+
+    /// A table built hidden over `fixture`, as a reload builds one.
+    async fn hidden_over(fixture: &Fixture) -> Table {
+        let defaults = ServerConfig::default();
+        Table::hidden(
+            fixture.config(Residency::Full, None),
+            TableSource::Static {
+                location: fixture.root(),
+            },
+            handles_over(fixture).await,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+            defaults.get_deadline,
+        )
+    }
+
+    /// A hidden table writes no gauge while it loads, so the table serving
+    /// under its name keeps its series; `show` then publishes its state and
+    /// its generation's gauges as the swap set them.
+    #[test]
+    fn test_a_hidden_table_writes_its_gauges_once_shown() {
+        let (index_bytes, loading) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = hidden_over(&fixture).await;
+            table.load().await.unwrap();
+            table.current().unwrap().index_bytes
+        });
+        let gauges = [
+            metric::TABLE_STATE,
+            metric::INDEX_BYTES,
+            metric::FINDINGS,
+            metric::GENERATION_SEQUENCE_NUMBER,
+            metric::GENERATION_SWAPPED_AT_SECONDS,
+        ];
+        for name in gauges {
+            assert_eq!(loading.named(name), 0, "{name}");
+        }
+
+        let ((), shown) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = hidden_over(&fixture).await;
+            table.load().await.unwrap();
+            table.show();
+        });
+        assert_eq!(
+            state_gauge(&shown, TABLE, StateName::Serving).to_bits(),
+            approx::gauge(1).to_bits()
+        );
+        assert_eq!(
+            shown.gauge(metric::INDEX_BYTES, &[table_label()]).to_bits(),
+            approx::gauge_len(index_bytes).to_bits()
+        );
+    }
+
+    /// A withdrawn table reads in no state and holds no index bytes, and a
+    /// refresh after the withdrawal writes neither back.
+    #[test]
+    fn test_a_withdrawn_table_reads_in_no_state_and_writes_no_gauge() {
+        let ((), series) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            table.withdraw();
+            fixture.remove_hint();
+            table.refresh().await.unwrap_err();
+        });
+        for name in StateName::ALL {
+            assert_eq!(
+                state_gauge(&series, TABLE, name).to_bits(),
+                approx::gauge(0).to_bits(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            series
+                .gauge(metric::INDEX_BYTES, &[table_label()])
+                .to_bits(),
+            approx::gauge(0).to_bits()
         );
     }
 
