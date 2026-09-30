@@ -53,7 +53,9 @@ refusal; overlap without duplicates is a cost finding, priced under RFD 007
 Refresh failure keeps the last good generation serving and reports it. A
 server refuses to start if any configured table fails to open: a silently
 missing table is worse than a crash at boot, and a stale table is better
-than none. Refreshes of one table are serialized.
+than none. A running server applies a change to its configured tables
+under the same rule, all or nothing (RFD 018 (Configuration reload)).
+Refreshes of one table are serialized.
 
 ## Alternatives Considered
 

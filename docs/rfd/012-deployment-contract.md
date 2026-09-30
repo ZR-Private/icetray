@@ -35,7 +35,9 @@ carrying its configuration and log field names.
 
 Configuration is a file, located by a flag or an environment variable,
 in either syntax RFD 011 (Configuration) accepts, so a deployer whose
-pipeline emits JSON hands the file over as is.
+pipeline emits JSON hands the file over as is. A running server follows a
+change to the file's tables without a restart (RFD 018 (Configuration
+reload)).
 
 `icetray serve` runs the server; `doctor` (RFD 016 (Doctor)), `get`, and
 `info` are subcommands of the same binary with the same flags for where
