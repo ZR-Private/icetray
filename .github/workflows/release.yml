@@ -1,0 +1,100 @@
+name: Release
+
+# A tag vX.Y.Z builds the icetray binary for Linux on x86-64 and arm64 and
+# publishes both to a GitHub Release with SHA-256 sums. Run by hand, the
+# workflow builds the same archives and keeps them as run artifacts,
+# publishing nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    # Ubuntu 24.04, not the image CI tests on: a binary needs the glibc it
+    # was linked against or newer, and 24.04's is the oldest the release
+    # promises to run on.
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: install toolchain
+        run: rustup toolchain install
+      - name: version
+        id: version
+        run: |
+          crate=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "icetray") | .version')
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$crate" ]]; then
+              echo "tag $GITHUB_REF_NAME does not match the crate version $crate" >&2
+              exit 1
+            fi
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$crate-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # A release builds from nothing: no cache, so the binary depends only
+      # on the commit, the lockfile, and the toolchain.
+      - name: build
+        run: cargo build --release --locked -p icetray --bin icetray
+      - name: check the binary
+        run: |
+          target/release/icetray --version
+          file target/release/icetray
+          echo "newest glibc symbol required:"
+          objdump -T target/release/icetray | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+      - name: package
+        id: package
+        run: |
+          name="icetray-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/icetray README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.tar.gz
+            ${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

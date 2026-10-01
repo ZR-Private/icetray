@@ -51,3 +51,23 @@ loads them, and times lookups and a refresh:
 ```sh
 cargo run -p icetray-testkit --example scale --release
 ```
+
+## Releases
+
+A release is a tag. Set `version` under `[workspace.package]` in
+`Cargo.toml`, commit, then tag that commit with the same version and push
+the tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow (`.github/workflows/release.yml`) refuses a tag that
+differs from the crate version. It builds `icetray` with `--release
+--locked` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`,
+each on Ubuntu 24.04, so the binaries run on that release's glibc or
+newer, and publishes a GitHub Release with one archive per target and its
+SHA-256 sum. Each archive holds the binary, the README, and both licenses.
+Run by hand from the Actions tab, the workflow builds the same archives as
+run artifacts and publishes nothing.
