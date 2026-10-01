@@ -18,10 +18,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# The runner image is pinned like the toolchain and the actions: a new
+# image arrives in a commit of its own, not under a run.
 jobs:
   lint:
     name: lint (fmt + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # Third-party actions are pinned to a commit SHA, not a tag, so a moved
       # tag cannot re-point CI at different code. Renovate keeps the SHAs
@@ -45,7 +47,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: install toolchain
