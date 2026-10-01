@@ -2,10 +2,10 @@
 
 Batch-frozen data, served one cube at a time.
 
-icetray serves key lookups from Apache Iceberg tables on object storage. A
-batch job writes a table and publishes it by moving an Iceberg ref; icetray
-follows the ref and answers `Get` and `MultiGet` over gRPC from the Parquet
-files where they sit.
+icetray is a Rust server for key lookups on Apache Iceberg tables in object
+storage. A batch job writes a table and publishes it by moving an Iceberg
+ref; icetray follows the ref and answers `Get` and `MultiGet` over gRPC
+from the Parquet files where they sit.
 
 It is built for data that is computed in batch and read by key, such as
 embeddings and model features. Tables with a hot working set and a long,
