@@ -2,68 +2,55 @@
 
 Batch-frozen data, served one cube at a time.
 
-icetray is a read-only get-by-key server over Apache Iceberg tables on
-object storage. A batch job writes a table in the layout described below
-and publishes each build by moving an Iceberg ref; icetray follows the ref,
-reads the Parquet data files where they are, and answers lookups over gRPC.
-There is no bulk load into a database, no write path, and no compaction of
-its own. The data files under a snapshot are immutable, so nothing icetray
-caches ever has to be invalidated.
+icetray serves key lookups from Apache Iceberg tables on object storage. A
+batch job writes a table and publishes it by moving an Iceberg ref; icetray
+follows the ref and answers `Get` and `MultiGet` over gRPC from the Parquet
+files where they sit.
 
-The cost of a lookup is fixed by the layout. Each data file's key column
-stays resident (in memory, in a local file, or as bloom filters, a choice
-the table owner makes per table), so a key is routed to its bucket by the
-Iceberg bucket transform, to its file by exact key range, and to its page by
-a binary search, without touching object storage. A cold hit then costs one
-range GET, for the value page; a miss costs none. Every answer carries the
-snapshot id it came from. When the ref moves, icetray builds the new
-snapshot as a generation beside the one serving, reusing the index of every
-data file whose path is unchanged, verifies it, and swaps atomically; a
-snapshot that cannot be served leaves the last good generation in place.
+It is built for data that is computed in batch and read by key, such as
+embeddings and model features. Tables with a hot working set and a long,
+rarely read tail suit it best: hot pages come from memory, and a cold page
+costs one range GET.
 
-Because the reader assumes nothing about how a table was written, the same
-binary carries a doctor that reports whether a table can be served, what
-each deviation from the layout costs per lookup, and which writer property
-fixes it. The server runs the same check at every load, so the verdict a
-build pipeline gates on is the verdict the server acts on.
+## How it works
 
-## The table contract
+- On load, icetray reads each data file's footer and key column once and
+  keeps the keys resident in memory, in a local file, or as Bloom filters,
+  chosen per table.
+- A lookup finds its bucket with the Iceberg bucket transform, its file by
+  key range, and its page by binary search.
+- A hit reads one value page, from the page cache or with one range GET.
+- When the ref moves, icetray loads the new snapshot beside the current one,
+  reuses the index of every unchanged file, verifies it, and swaps it in
+  atomically. Each answer carries the id of the snapshot it came from.
+- `icetray doctor` checks a table's files against the
+  [table contract](docs/table-contract.md) and reports what each deviation
+  costs per lookup and which writer setting fixes it. The server runs the
+  same check on every load.
 
-The writer decides what a lookup costs, so the contract is a description of
-written files, verified on the files and never inferred from the properties
-that were set. A table that meets it has:
+## Performance
 
-- One key column of Iceberg type `long`, `string`, `binary`, or `uuid`
-  (`fixed` is served as binary). A composite key is the caller's encoding
-  into that column; icetray moves the bytes unchanged. Keys over 4,096
-  bytes are refused; keys over 128 bytes draw advice, because resident
-  bytes per key grow with key length.
-- One value column of type `binary`, `fixed`, or `string`, nulls allowed.
-  The value's bytes are served unchanged, and a null value is answered as
-  present with no value, distinct from an absent key. What a null means is
-  the table owner's rule. A table with more than one column of interest
-  packs them into one binary value at write time; a second column would be
-  a second GET per hit.
-- `bucket(N, key)` partitioning with hash distribution, so a lookup routes
-  to one bucket by arithmetic.
-- Each file sorted by key as a local write order. No global sort is needed,
-  and an unsorted file cannot be served.
-- Dictionary encoding off. A dictionary-encoded value column costs one
-  extra GET per hit.
-- Pages of 1,000 rows, so a lookup decodes one key page and fetches one
-  value page.
-- Value pages bounded by bytes (64 KiB) for large values, with the writer's
-  page-size check interval shortened so the bound binds. A row limit alone
-  leaves value pages of many megabytes.
-- Full-length manifest metrics and column index on the key. Truncated
-  bounds make every file in a bucket report the same key range.
-- A bloom filter on the key, which the bloom residency tier serves from.
-- zstd compression.
-- Data files of 32 to 64 MiB. First-byte latency of a range GET rises with
-  object size.
+| | |
+|---|---|
+| Warm hit, in-process | 12.8 µs |
+| Warm hits, in-process, eleven tasks | 497,000 a second |
+| Cold hit, S3 in-region, median | 81 ms, 0.5 ms of it in icetray |
+| First load, 1.2 billion rows in 32,768 files, four cores | 79 s |
 
-As an example, this is how the project's own golden tables are written in
-Spark SQL (the full recipe is `dev/golden-tables.py`):
+Methods and machines are in the
+[performance sweep](docs/analysis/2026-09-26-performance-sweep.md), the
+[cold range-GET analysis](docs/analysis/2026-09-29-cold-range-get-latency.md),
+and [RFD 013](docs/rfd/013-tail-latency.md).
+
+## Quick start
+
+Build:
+
+```sh
+cargo build --release
+```
+
+Write a table to the contract. In Spark SQL:
 
 ```sql
 CREATE TABLE db.kv (key BIGINT, value BINARY) USING iceberg
@@ -84,50 +71,19 @@ TBLPROPERTIES (
 ALTER TABLE db.kv WRITE LOCALLY ORDERED BY key;
 ```
 
-For values of kilobytes per key, the recipe lowers
-`write.parquet.page-size-bytes` to `65536` and sets
-`write.parquet.row-group-check-min-record-count` and
-`write.parquet.row-group-check-max-record-count` to small values so the
-byte bound is checked often enough to hold. Compaction has to carry the
-same file-size target or it undoes the layout.
+Check it. The doctor exits 0 for a table that serves at full speed, 2 for
+one that serves at a penalty, and 1 for one it refuses:
 
-Deviations fall into three tiers, and the line between them is what a
-client could observe. A table icetray cannot serve correctly is refused at
-load with a named reason: unsorted files, null or duplicate keys, keys
-outside their file's recorded bucket, a key column whose physical type
-contradicts the schema, an unsupported key or
-value type, delete files, keys over the cap, and the residency refusals
-below. A table that serves correctly but slowly is priced: a dictionary
-encoded value column, key pages over 2,000 rows, no bucket partition, and
-overlapping files within a bucket each carry a measured penalty in extra
-GETs per hit, key bytes decoded per lookup, or files probed per lookup. A
-priced table is refused when its `strict` setting is on, which is the
-default, and served with its penalty reported when it is off. Everything
-else (truncated bounds, oversized value pages, value pages above the
-64 MiB ceiling past which a lookup into them is refused, long keys,
-oversized files, a truncated column index, too many files per bucket, a
-bloom filter that is absent or badly sized) is advice, which names the
-writer property to change and never affects whether a table serves.
+```sh
+icetray doctor --location s3://warehouse/db/kv
+```
 
-`icetray doctor` is the check. The tiers are RFD 002 (the contract), RFD
-007 (the tiers and their penalties), and RFD 016 (what the doctor checks
-and reports), under `docs/rfd/`.
-
-## Running against a table
-
-Configuration is one file, TOML or JSON, read into one schema; the syntax is
-decided by content (a document whose first non-whitespace character is `{`
-is JSON). A file with one static table and one table from a REST catalog:
+Serve it with a configuration file:
 
 ```toml
 [server]
 listen = "0.0.0.0:7433"
 metrics_listen = "0.0.0.0:9433"
-poll_interval = "10s"
-
-[storage.local]
-dir = "/var/lib/icetray"
-page_cache_disk_bytes = 8589934592
 
 [[tables]]
 name = "kv"
@@ -138,405 +94,57 @@ value_column = "value"
 [tables.source]
 type = "static"
 location = "s3://warehouse/db/kv"
-
-[[tables]]
-name = "profiles"
-ref = "serving"
-key_column = "user_id"
-value_column = "vector"
-residency = "disk"
-
-[tables.source]
-type = "rest"
-uri = "http://catalog.example:8181"
-warehouse = "example"
-namespace = "db"
-table = "profiles"
 ```
-
-A static source is a table root, followed through its
-`metadata/version-hint.text`, or a metadata file location. A REST source is
-an Iceberg REST catalog, a namespace, and a table name. Each table also
-takes `strict` (default `true`), `residency` (`full`, `disk`, or `bloom`,
-default `full`), and `resident_budget_bytes`, a budget a `full` load is
-refused over, at the footer stage, before any key chunk is fetched.
-
-Every section defaults when absent, and a key the schema does not know is
-an error. The server defaults are `listen = "127.0.0.1:7433"`,
-`metrics_listen = "127.0.0.1:9433"`, `poll_interval = "10s"` (at least
-`"1s"`, since a table's poll calls its catalog or reads its version hint,
-and at most `"24h"`), and `page_cache_bytes = 268435456` (256 MiB). The cache's memory has one shard
-per tokio worker thread (one per core unless `TOKIO_WORKER_THREADS` says
-otherwise), rounded up to a power of two, and a budget below one 64 KiB
-value page and its 64-byte entry overhead per shard is refused, since each
-shard would keep a page whatever its share and the budget would bound
-nothing: parsing refuses less than one shard's 65600 bytes, and opening the
-cache refuses less than the shards' total (1049600 bytes for the 16 shards
-of an 11-core machine), before any table loads, with exit code 1. Under `storage`, `s3` holds
-explicit client settings (`endpoint`, `region`, `access_key_id` and
-`secret_access_key` as a pair, `allow_http`, `path_style`) and is omitted to
-use the AWS default credential chain; `rewrite` is a list of `{from, to}`
-prefix rules applied to every location the metadata yields, for a mirrored
-or relocated table; `hedge` controls the hedging of lookup GETs (on by
-default, at the 95th percentile of a 256-request window, capped at five
-percent of requests); `local` is the optional local directory described
-under Serving. Locations may be `s3://`, `s3a://`, or `file://`.
-
-The server and storage sections also bound how long work may run, so a
-wedged object store or catalog fails requests fast instead of piling them
-up. Under `server`: `get_deadline = "5s"` and `multi_get_deadline = "15s"`
-cap a `Get` and a whole `MultiGet` (expiry is `DEADLINE_EXCEEDED`; a
-client's own deadline is enforced by the gRPC layer), and `get_deadline` also caps
-every page GET a lookup makes, in a `MultiGet` too, so a GET to a store
-that has stopped answering is canceled rather than left running; `max_in_flight = 1024` requests
-may run at once, and one more is refused at once with `RESOURCE_EXHAUSTED`;
-`max_multi_get_keys = 1000` keys may be in one `MultiGet`, and more is
-`INVALID_ARGUMENT`; `load_deadline = "30m"` caps a table's first load, or
-any build while no generation serves, and `refresh_deadline = "5m"` one
-refresh over a serving generation, after which the table is degraded and
-the next poll tries again; `drain_deadline = "20s"` is how long a shutdown waits for open
-requests. Under `storage`: `max_retries = 2` retries of a failed S3 request
-(zero tries once), `connect_timeout = "1s"` for an S3 connection, and
-`catalog_timeout = "30s"` for one catalog call. Each value above is the
-default; every duration and both limits must be above zero, and
-`poll_interval` between one second and one day.
-
-With the file in hand:
-
-```sh
-icetray doctor --config icetray.toml
-icetray info --config icetray.toml
-icetray get --config icetray.toml --table kv 42
-```
-
-`doctor` prints one `doctor` line per table with the summary, one `finding`
-line per cost or advice finding, and with `--files` one `file` line per data
-file; a table it could not load is one `refused` line, and so is one whose
-keys it finds outside their file's recorded bucket (the load hashes each
-file's page-boundary keys, the doctor every key). `info` prints one
-`table` line per served table. `get` prints one `get` line per key; `--table`
-is required when more than one table is configured. Keys are typed as
-icetray prints them: a long as its digits, a string as its text, a binary
-key as hex with or without `0x`, a uuid hyphenated or as 32 hex digits.
-`--table` on `doctor` and `info` limits the run to one table. With neither
-`--config` nor `--location`, the file comes from `ICETRAY_CONFIG`; a
-`--location` run ignores the variable.
-
-One table can be opened without a file. `--location` takes a table root or
-a metadata file and opens it under the name `table`, with `--key-column`
-(default `key`), `--value-column` (default `value`), `--ref` (default
-`main`), and `--residency` (`full` or `bloom`, default `full`; `disk` is a
-usage error, since a one-shot loads once and exits and the doctor under
-`full` already reports every tier's predicted bytes); `--rewrite FROM=TO` applies a
-prefix rewrite under either target and may be repeated. A command-line rule
-takes precedence over the file's for the same prefix, and is checked with
-the file's, so an empty `FROM` exits 1 as it does in a file. A located table is
-never strict, so the doctor reports what `strict` would refuse.
-
-```sh
-icetray doctor --location s3://warehouse/db/kv
-icetray get --location s3://warehouse/db/kv/metadata/v3.metadata.json 42
-```
-
-Output is JSON, one object per line, with `kind` first and `table` second so
-a reader can route a line before parsing the rest. A `get` line:
-
-```json
-{"kind":"get","table":"kv","key":"42","presence":"present","value_base64":"aGVsbG8=","value_utf8":"hello","value_bytes":5,"snapshot_id":8412603190021477089,"gets":1,"elapsed_micros":250}
-```
-
-`presence` is `present`, `null`, or `absent`; the value fields appear only
-for a present value, and `value_utf8` only when the bytes are UTF-8. `gets`
-is the number of GETs the lookup issued. The `table` and `doctor` lines
-carry the table's `snapshot_id`, `serviceability` (`efficient` or
-`inefficient`), `residency`, `file_count`, `buckets`, `records`,
-`index_bytes`, the count of `costs` and `advice`, and under `predicted` the
-resident bytes each tier would need, computed from footers alone, so an
-owner chooses a tier from one run.
-
-Exit codes: 0 when the run did what was asked (for the doctor, no cost
-finding; advice does not change the code); 2 when the doctor found a cost
-finding, which a build pipeline gates on; 1 for a load or read error, a
-table the doctor could not load or refused (which dominates 2), a
-configuration that cannot be read or parsed or breaks one of its rules (a
-bad log field mapping among them), or a listener that would not bind; 64
-when the command line could not be used: neither or both of `--config` and
-`--location`, a location flag with `--config`, a `--residency` other than
-`full` or `bloom`, no table matched, `--table` required, or a key that does
-not parse. The
-one-shots log to stderr at `warn`, since their stdout is data.
-
-## Serving
 
 ```sh
 icetray serve --config icetray.toml
-ICETRAY_CONFIG=/etc/icetray/icetray.toml icetray serve
 ```
 
-`serve` takes only the configuration path. It binds the gRPC listener and
-the metrics listener, registers the gRPC health service as `NOT_SERVING`,
-and then loads every table concurrently, so the listeners accept while
-tables load. Once every table serves its first generation, health flips to
-`SERVING` and `/ready` on the metrics listener answers 200; until then it
-answers 503. A table that fails its first load is fatal: the reason is
-logged, health stays `NOT_SERVING` for ten seconds so an orchestrator's
-probe sees the refusal beside its logged reason, and the process exits 1.
-A silently missing table is worse than a crash at boot. SIGTERM or SIGINT
-drains in-flight requests, flushes the page cache's disk level, and exits 0.
-A signal that arrives while the first loads run ends them where they wait,
-so a slow first load does not hold the drain past an orchestrator's grace.
-The drain waits at most `server.drain_deadline` for open calls. Past it,
-the drain stops waiting, the page cache is still flushed, and the process
-exits 1; a call still open ends with the process.
+Look a key up with any client generated from
+[`icetray.proto`](crates/icetray-proto/proto/icetray.proto):
 
-The client contract is the checked-in protobuf,
-`crates/icetray-proto/proto/icetray.proto`, from which clients in any
-language are generated; icetray ships no hand-written client. The service
-has three calls. `Get` looks one key up in one table and returns a presence
-(`PRESENCE_PRESENT` with the value's bytes, `PRESENCE_NULL`, or
-`PRESENCE_ABSENT`) and the snapshot id it was read from. `MultiGet` answers
-many keys in request order, all from one snapshot named once on the
-response; when any key cannot be answered the whole call fails and the
-caller retries the batch it built, so a response never answers only some of
-the keys. `TableInfo` reports the served snapshot id, bucket count, data
-file count, row count, key type, and resident index bytes; clients switch
-on the key type to choose the key variant. A key is a oneof of `long`,
-`str`, and `bin`, where `bin` carries binary, fixed, and uuid keys; the
-wrong variant is an `INVALID_ARGUMENT` error, a table the server does not
-serve is `NOT_FOUND`, and a miss is a normal answer, never an error. A
-`Get` or `MultiGet` still running at its deadline (`server.get_deadline` or
-`server.multi_get_deadline`) is `DEADLINE_EXCEEDED`. A deadline the client
-sends is enforced by the gRPC layer: the client's library ends the call at
-it and reports the expiry as its own (a tonic client reports `CANCELLED`),
-and the server drops the call then, freeing its slot. `Get` and `MultiGet`
-share `server.max_in_flight` slots, each held until its call ends; a call
-that finds none free is refused at once with `RESOURCE_EXHAUSTED` rather
-than queued. `TableInfo` takes no slot. A `MultiGet` of more than
-`server.max_multi_get_keys` keys is `INVALID_ARGUMENT` before any lookup.
-
-The listener speaks plaintext gRPC and terminates no TLS. icetray expects a
-private network or a service mesh that encrypts traffic and authenticates
-callers, and carries no certificate, credential store, or access policy of
-its own. The default listen addresses are loopback for the same reason:
-exposing the port is a decision the deployer writes into the file.
-
-The metrics listener serves `/metrics` in Prometheus format and `/ready`.
-Counters: `icetray_requests_total{call}`, `icetray_object_gets_total{kind}`,
-`icetray_object_bytes_total{kind}`, `icetray_local_reads_total`,
-`icetray_local_bytes_total`, `icetray_hedges_total`,
-`icetray_page_cache_hits_total`, `icetray_page_cache_fetches_total`,
-`icetray_lookups_total{table,result}`,
-`icetray_refresh_errors_total{table,reason}`,
-`icetray_generation_swaps_total{table}`, and
-`icetray_config_reloads_total{result}`. Histograms:
-`icetray_lookup_seconds{table,result}` and
-`icetray_object_get_seconds{kind}`. Gauges: `icetray_index_bytes{table}`
-(the index's live bytes, exported beside `icetray_process_rss_bytes`
-because a residency tier that sheds bytes is not visible in process memory
-on every platform), `icetray_page_cache_bytes`,
-`icetray_findings{table,code}`, `icetray_generation_age_seconds{table}`,
-`icetray_generation_sequence_number{table}` (the serving snapshot's
-sequence number), `icetray_generation_swapped_at_seconds{table}` (when it
-was swapped in, in Unix seconds), `icetray_table_state{table,state}`, and
-`icetray_config_pending` (1 while the configuration file differs from the
-configuration applied).
-No metric carries the snapshot id, so the series count does not grow with
-swaps; the id is in the swap's log line and in `TableInfo`. Every label value is the name of an
-enum variant, so the set of values is closed.
-
-Logs are JSON events on stdout at `info`, one object per line. The standard
-fields are `time` (RFC 3339, UTC), `level`, `message`, and `target`;
-`server.log.fields` maps each to the name a deployer's log schema expects,
-and `server.log.static_fields` adds constant fields to every event:
-
-```toml
-[server.log.fields]
-time = "ts"
-level = "severity"
-
-[server.log.static_fields]
-service = "icetray"
+```sh
+grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
+  -d '{"table": "kv", "key": {"long": "42"}}' \
+  127.0.0.1:7433 icetray.v1.Icetray/Get
 ```
 
-A key of `fields` that names no standard field, or two standard fields
-emitted under one name, is refused with the rest of the configuration,
-before anything is opened, with exit 1.
+or from the command line, which loads the table itself:
 
-`storage.local.dir` names an optional local directory. It holds two things:
-the chunk files of tables with `residency = "disk"`, which keep each data
-file's key column on local disk with only the fence array in memory, and
-the disk level of the value-page cache, bounded by
-`storage.local.page_cache_disk_bytes` (zero turns the level off; any other
-value is at least one 4 MiB block). `index_budget_bytes` bounds the chunk
-files across every table, measured against the directory as it is when a
-load begins: the serving generation's chunk files stay until the new one
-has swapped in, so a refresh that rewrites every data file needs room for
-both sets, and a table rewritten wholesale wants a budget of about twice
-its steady footprint. The steady footprint is the doctor's
-`predicted.disk_bytes`: each chunk file's header and key chunks, the bytes
-the budget is charged. A disk-tier lookup costs one local read and, on a
-hit, one GET. On Linux, put the directory on a mounted volume with a
-filesystem such as ext4, not in a container's overlay filesystem: a local
-read the operating system's page cache holds then runs on the worker
-thread answering the request instead of handing off to another thread,
-which overlayfs does not allow.
-A `bloom` table keeps the key column's bloom filters in memory instead, needs no disk, and pays two GETs per hit and a GET per miss
-at the filter's false-positive rate. `disk` residency without a local
-directory is a configuration error, and `bloom` on a table whose files
-carry no key bloom filter is a refusal at load.
-
-Each table's ref is re-resolved every `server.poll_interval`. A poll that
-finds the metadata location unchanged costs one read. A poll that finds a
-new snapshot builds the generation beside the current one, loading only the
-data files the previous generation did not hold and checking key
-uniqueness only across overlap groups that gained a file, then swaps it in;
-`icetray_generation_swaps_total` counts the swap. A refresh that fails
-leaves the last good generation serving, counts
-`icetray_refresh_errors_total`, and moves the table's state to degraded
-without affecting readiness. Snapshot retention on the served ref must
-exceed the longest lag a replica can have, since an expired snapshot's data
-files vanish under a replica still serving it; icetray exposes the lag as
-`icetray_generation_age_seconds` and cannot enforce the retention.
-
-The configuration file is read again on the same interval, and at once on
-SIGHUP; a change to its tables applies without a restart (RFD 018). A
-table whose entry is unchanged keeps serving untouched. An added table,
-and a changed one, load beside the tables serving, a changed one beside
-the table serving under its name, and once every one of them serves, the
-whole set swaps at once; a removed table then answers `NOT_FOUND`. A
-reload changes nothing when any of those tables fails to load, when the
-file does not parse or validate, or when any setting outside `[[tables]]`
-changed, which only a restart applies; the refusal is logged with its
-reason and counted, `icetray_config_pending` reads 1 until the file and
-the server agree again, and the poll does not try the same file again
-until it changes, though a SIGHUP does. Readiness does not change on a
-reload. A file mounted where the orchestrator never updates it, such as a
-single-file mount fixed at start, is never seen to change. Replace the file
-whole, by a rename, rather than writing it in place: a read in the middle
-of an in-place write can see a shorter file that still parses.
+```sh
+icetray get --location s3://warehouse/db/kv 42
+```
 
 ## Deploying
 
-icetray is operable through a twelve-factor surface and carries no
-deployer-specific code. The test for anything added to it is whether a
-second organization could deploy the result without editing source.
+- Configuration is one TOML or JSON file, from `--config` or
+  `ICETRAY_CONFIG`. Changes to its tables apply on the next poll or on
+  SIGHUP.
+- Credentials come from the AWS SDK's default chain.
+- Logs are JSON on stdout; metrics are Prometheus on the metrics port, with
+  `/ready` and gRPC health for the orchestrator.
+- The gRPC port speaks plaintext; put it on a private network or behind a
+  service mesh.
+- Size the memory limit from the doctor's predicted bytes for each table's
+  residency tier.
+- Mount a local volume for the local-file tier and the page cache's disk
+  level.
 
-The deployer's wrapper is a container image, built from source (no image is
-published yet), that carries the binary, its configuration file, and its
-log field names. The configuration path comes from `ICETRAY_CONFIG`, so a
-pod passes no flags; a pipeline that renders JSON hands the file over as is,
-since both syntaxes read into the same schema. The same image carries
-`doctor`, `get`, and `info`, so an operator can run them inside the pod
-against the daemon's own configuration and credentials to explain a
-refusal.
+## Documentation
 
-Credentials come from the AWS SDK's default chain: profiles, single
-sign-on, external credential helpers, and pod identity, resolved once and
-cached until shortly before expiry, so a credential helper is not spawned
-per GET. Static keys in `storage.s3` win over the chain and are the path
-for S3-compatible endpoints; `endpoint`, `allow_http`, and `path_style` are
-there for the same stores. No secret format of icetray's own exists.
+- [The table contract](docs/table-contract.md)
+- [Configuration and the command line](docs/configuration.md)
+- [Operating icetray](docs/operating.md)
+- [Building and testing](docs/development.md)
+- [Design decisions](docs/rfd/) and the [measurements](docs/analysis/)
+  behind them
+- [Contributing](CONTRIBUTING.md)
 
-The gRPC port is plaintext and unauthenticated. Run it on a private network
-or behind a mesh or sidecar; there is no mode in which the port is safe to
-expose directly.
+## Prior art
 
-Run each replica under a container memory limit, the backstop for what
-load's checks do not cover. Size it as the sum, over the tables the replica
-serves, of the doctor's `predicted` bytes for each table's tier
-(`predicted.full`, `predicted.disk_memory`, or `predicted.bloom`), doubled
-for a table a refresh can rewrite wholesale, since the new generation loads
-beside the serving one; plus `server.page_cache_bytes`; plus a margin of a
-quarter of that total for the process itself, requests in flight, and a
-load's transient chunks. Load refuses a key page header, and a lookup a
-value page header, that declares more than its page can hold or than a 64
-MiB ceiling that does not rest on the footer, before parquet allocates for
-it, but the lengths inside a delta-encoded page still size buffers from the
-file, and there the limit is what stops the process. A file that trips it takes down every
-replica that loads it, since they all load the same snapshot and restart
-into the same file; that is why the cases the checks know are refused
-instead, which on a refresh keeps the last good generation serving. A panic
-inside parquet's decoding of a file is caught and refused the same way.
-
-A local volume is optional. Mount one to run disk-residency tables or to
-keep a disk level of the page cache across restarts. Everything in it is a
-copy of bytes in object storage, named by the data file it came from and
-checked against that file's identity, and is rebuilt on demand; a replica
-that restarts with its volume reuses every chunk file whose data file is
-still referenced and deletes the rest. The volume needs capacity and
-nothing else: nobody backs it up or shares it between replicas, and losing
-it costs one cold load. Each disk-tier data file keeps one chunk file open
-for the life of its generation, and a refresh that rewrites a table
-holds the old and the new generation's at once, so set the descriptor limit
-(`ulimit -n`, or the container runtime's `nofile`) to at least twice the
-number of disk-tier data files the replica serves, plus a headroom of 1,024
-for sockets, the page cache's disk level, and the one chunk file retention
-opens at a time.
-
-## Building and testing
-
-`rust-toolchain.toml` pins the stable toolchain and the `rustfmt` and
-`clippy` components; rustup installs it on first use. Building from source
-needs no protobuf compiler on the host, since the build carries its own.
-
-```sh
-cargo build --release
-cargo test --workspace
-dev/ci-checks.sh
-```
-
-`dev/ci-checks.sh` is the lint gate: `cargo fmt --all --check` and `cargo
-clippy --workspace --all-targets --locked -- -D warnings`. CI runs that
-script and `cargo test --workspace --locked`, the same two commands a
-contributor runs before a push.
-
-Two suites are gated behind fixtures and refuse to run rather than report a
-pass they did not earn; under a plain `cargo test` they show as ignored.
-`dev/test-int.sh` runs the REST catalog tests against a catalog at
-`ICETRAY_REST_URI` (default `http://127.0.0.1:8181`); `dev/runtime.sh up`
-followed by `dev/rest-fixture.sh up` starts the reference catalog in a
-container. `dev/test-golden.sh` runs the layout tests against the golden
-tables `dev/golden-tables.py` writes, one contract-shaped table per key
-type, one more in table format version 3 (the rest are version 2, the
-writer's default), and the off-contract layouts whose cost and advice
-findings the doctor reports:
-
-```sh
-dev/golden-tables.sh
-ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
-```
-
-The testkit also carries a scale probe, a program and not a test, that
-writes 1,500 files under a temporary directory, loads them, times lookups
-and a refresh, and prints what it measured:
-
-```sh
-cargo run -p icetray-testkit --example scale --release
-```
-
-`dev/golden-tables.sh` runs the recipe with Spark 4.1.3 and Iceberg 1.11.0
-(`iceberg-spark-runtime-4.1_2.13`) in a container, so the host needs neither
-Spark nor a Java runtime; the recipe itself runs anywhere Spark 4.1 has the
-Iceberg runtime on its classpath and can write to any object store or local
-directory. Spark 4.1 is the newest line Iceberg 1.11 ships a runtime for.
-The REST suite runs against the `apache/iceberg-rest-fixture:1.10.1` image.
-The recipe is also the worked example of the contract: the properties it
-sets are the ones a table owner sets.
-
-## Design
-
-The decisions are recorded in `docs/rfd/`, one per file, starting with
-`docs/rfd/001-how-to-rfd.md`. The measurements behind them are in
-`docs/analysis/`, and the build they describe is in `docs/plans/`.
-Conventions for contributors are in `CONTRIBUTING.md`; agents read
-`AGENTS.md` as well.
-
-The lineage: [ElephantDB](https://github.com/nathanmarz/elephantdb) proved
-the batch-build-then-serve shape, and at least one published design showed
-it works directly against lake files. icetray is that idea on stock Iceberg
-tables: the bucket transform routes a key to its partition by arithmetic,
-the resident key column finds the row, and every byte below a snapshot is
-immutable, so caches never invalidate.
+[ElephantDB](https://github.com/nathanmarz/elephantdb) established building
+a dataset in batch and serving it read-only. icetray applies that shape to
+Iceberg tables.
 
 ## License
 

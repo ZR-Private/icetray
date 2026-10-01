@@ -325,7 +325,7 @@ Full tier does:
 
 On overlayfs, which refuses the non-blocking read, nothing moves: every
 read falls back, at a cost of about a microsecond for the refused attempt.
-The local directory belongs on a mounted volume, as the README says.
+The local directory belongs on a mounted volume, as [Operating icetray](../operating.md#the-local-directory) says.
 
 ## Decompression: the open question
 
