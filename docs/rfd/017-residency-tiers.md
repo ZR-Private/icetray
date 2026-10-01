@@ -126,11 +126,11 @@ for deployments that cannot attach a disk.
 
 Re-verifying a reused chunk file's keys on every restart, with a synced
 write-then-rename as the only guard against a torn file. Rejected: a
-restart over reused chunk files cost 85 to 90% of a first load's CPU on a
-four-core Linux pod, minutes for a table of a billion rows, to
-re-establish what the first load had already established from the same
-immutable bytes. A checksum over the payload turns a torn file into a
-stale one, and a torn file is what the re-verification guarded against.
+restart over reused chunk files cost nearly as much CPU as a first load,
+minutes for a table of a billion rows, to re-establish what the first
+load had already established from the same immutable bytes. A checksum
+over the payload turns a torn file into a stale one, and a torn file is
+what the re-verification guarded against.
 
 An index built once into a separate store beside the data, as some
 published designs do. Rejected: it is a second system and a second

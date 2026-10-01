@@ -40,8 +40,8 @@ the same size, keeps its resident index from the previous generation, and
 only new files are loaded. Because load work is per file and unchanged
 files are reused, a refresh costs its delta
 ([prototype findings, finding 3](../analysis/2026-09-10-prototype-findings.md#3-load-time)).
-In simulation a build of 16 files takes 6 dependent round trips; how that
-depth grows with more files is open
+In simulation a small build takes well under one dependent round trip per
+file; how that depth grows with more files is open
 ([prototype findings, finding 12](../analysis/2026-09-10-prototype-findings.md#12-deterministic-simulation)).
 
 Data files in one bucket whose exact key ranges intersect form an overlap

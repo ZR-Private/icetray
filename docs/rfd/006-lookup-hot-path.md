@@ -73,8 +73,9 @@ cheaper than another.
 ## Consequences
 
 Per-lookup CPU is two pages: one key page decoded and one value page
-decompressed. On a warm hit most of the time goes to decompressing the
-value page and little to the lookup itself
+decompressed. On a warm hit nearly all of the time goes to decoding those
+two pages, and little to the lookup itself; which page dominates depends
+on whether the values compress
 ([prototype findings, finding 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)).
 That is why RFD 002 (Serving layout contract) bounds value pages by bytes
 for large values, and why large key pages are a cost finding priced in
@@ -93,31 +94,30 @@ to pay for that depends on the page cache's hit-rate curve under a skewed
 key distribution, and that curve is the unknown the question turns on
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)).
 
-The decompression figures bound what the level could buy
+Decompression is over half of a warm hit in the Full tier when the values
+do not compress, and nearly all of one when they compress well
 ([performance sweep, decompression](../analysis/2026-09-26-performance-sweep.md#decompression-the-open-question)).
-On the long-key table in the Full tier, zstd is 61.5% of a warm hit with
-values it stores as they are (random bytes, ratio 1.00) and 92.4% with
-JSON-like values it compresses 4.38 times. It is 84% of a miss with either,
-since a miss decompresses only the key page. The value page's share is
-about 2.3 µs of a 12.8 µs warm hit with the random values and about 60 µs
-of 71.2 µs with the text ones. By estimate from those figures, the level
-would take a text-valued warm hit to about 11 µs, some six times the
-throughput per core, and a random-valued one to about 10.5 µs. It would
-save nothing on a miss or on a cold hit's GET.
+It is most of a miss either way, since a miss decompresses only the key
+page. The value page is the smaller part of a warm hit with incompressible
+values, where the key page's decode dominates, and most of one with
+compressible values. By estimate from the sweep, the level would
+multiply the throughput per core of warm hits on compressible values
+several times and barely change it for incompressible ones. It would save
+nothing on a miss or on a cold hit's GET.
 
-What the level costs is the ratio. For random values that is nothing. For
-the text values it is 4.38 times the memory per page (the fixture's value
-pages are 45.7 MiB compressed and 200 MiB decompressed), so the same budget
-holds 4.4 times fewer pages. A page the smaller cache loses comes back as a
-cold hit, one S3 GET of about 90 to 175 ms at the in-region median for a
-file not read recently
-([cold range-GET latency](../analysis/2026-09-29-cold-range-get-latency.md)).
-That one GET costs what some 1,500 to 2,900 text-valued warm hits would
-save at 60 µs each, so the level pays only while it turns fewer than about
-0.03 to 0.07% of lookups into extra cold hits. A small decompressed level
-in front of the compressed cache, holding only the hottest pages, is one
-possible arrangement. The question stays open on the hit-rate curve. A
-production replica's `icetray_page_cache_hits_total` and
-`icetray_page_cache_fetches_total` give its hit rate at the budget it runs,
-and the same counters on a replica whose budget is divided by its tables'
-value compression ratio give the rate the level would leave it.
+What the level costs is the ratio. For values that do not compress that
+is nothing. For values that do, each page takes its compression ratio in
+extra memory, so the same budget holds that many times fewer pages. A page
+the smaller cache loses comes back as a cold hit, one S3 GET of around a
+tenth of a second for a file not read recently
+([cold range-GET latency](../analysis/2026-09-29-cold-range-get-latency.md)),
+against tens of microseconds that the level saves on one warm hit of
+compressible values. One extra cold hit undoes more than a thousand warm
+hits' savings, so the level pays only while it turns well under one lookup
+in a thousand into an extra cold hit. A small decompressed level in front
+of the compressed cache, holding only the hottest pages, is one possible
+arrangement. The question stays open on the hit-rate curve. A production
+replica's `icetray_page_cache_hits_total` and
+`icetray_page_cache_fetches_total` give its hit rate at the budget it
+runs, and the same counters on a replica whose budget is divided by its
+tables' value compression ratio give the rate the level would leave it.

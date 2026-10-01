@@ -175,23 +175,21 @@ per-table memory budget they would remove the per-lookup decode for tables
 that can afford the memory. Withholding them keeps one code path and one
 memory model until a workload shows that the decode is what it waits on.
 
-The [performance sweep](../analysis/2026-09-26-performance-sweep.md#decompression-the-open-question)
-gives the decode's cost. In the Full tier a miss decodes one key page and
-nothing else: 6.5 µs on the long-key table, 84% of it zstd, against
-0.2 µs for a Bloom-tier miss, which decodes nothing. The key page costs a
-warm hit about the same, 6.4 µs of 12.8 µs with random values and 6.7 µs
-of 71.2 µs with values that compress 4.38 times.
+In the Full tier a miss decodes one key page and nothing else, and
+decompression is most of that decode
+([performance sweep, decompression](../analysis/2026-09-26-performance-sweep.md#decompression-the-open-question)).
+A Bloom-tier miss, which decodes nothing, costs a small fraction of a
+Full-tier one. A warm hit pays the same key page decode, which is about
+half of a warm hit whose values do not compress and about a tenth of one
+whose values compress well.
 
-What decoded keys would save and cost are estimates from those figures.
-They would take a miss to under a microsecond and save about 6.4 µs of
-every warm hit and of every key of a MultiGet, which is half of a
-random-valued warm hit and a tenth of a text-valued one. Their cost is
-each key's uncompressed size, which comes to roughly the key column's
-compression ratio times the resident index. On the sweep's two million
-keys that is about 15.4 MiB for the long keys and 48 MiB for the 21-byte
-string keys, against a Full index of 2.49 and 5.18 MiB, so 6 and 9 times
-the index. At 8 bytes a key, three billion 64-bit keys take about 22 GiB
-decoded.
+By estimate from the sweep, decoded keys would take a miss to under
+a microsecond and remove that decode from every warm hit and from every
+key of a MultiGet. Their cost
+is each key's uncompressed size, which comes to roughly the key column's
+compression ratio times the resident index: several times the index on
+the tables measured, and more for string keys than for 64-bit ones. At
+8 bytes a key, three billion 64-bit keys take about 22 GiB decoded.
 
 The answer depends on the workload. On a production table,
 `icetray_lookups_total` by result gives its share of misses, and

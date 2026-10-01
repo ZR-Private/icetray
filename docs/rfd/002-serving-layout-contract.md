@@ -137,11 +137,11 @@ The file-size target rests on two measurements
 ([range-GET latency, what this does and does not establish](../analysis/2026-09-10-s3-range-get-latency.md#what-this-does-and-does-not-establish);
 [cold range-GET latency, what this does and does not establish](../analysis/2026-09-29-cold-range-get-latency.md#what-this-does-and-does-not-establish))
 and may move. Read cold, as most cold hits are, a 64 MiB file answers like
-a 256 MiB one, about 55 ms slower at the median than a 16 MiB one. Smaller
-files keep every GET in the fast size class at the price of more files,
-more GETs at load, and more index bytes per key. Larger files cut the file
-count, but the slow mode may begin anywhere in the band above the target,
-which the evidence does not cover.
+a 256 MiB one, tens of milliseconds slower at the median than a 16 MiB
+one. Smaller files keep every GET in the fast size class at the price of
+more files, more GETs at load, and more index bytes per key. Larger files
+cut the file count, but the slow mode may begin anywhere in the band above
+the target, which the evidence does not cover.
 
 The other is whether the contract requires the writer's adaptive skew
 splitting to be off. With it off, each bucket gets sorted files that do

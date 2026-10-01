@@ -106,8 +106,8 @@ correctly (finding 1), and a contract that gates serving would turn every
 writer default into an outage.
 
 Refuse overlapping files. Rejected because overlap without duplicates is a
-cost, and a batch writer at its default settings produces it: one of the
-two writes in finding 9 came out overlapping.
+cost, and a batch writer at its default settings can produce it
+(finding 9).
 
 ## Consequences
 

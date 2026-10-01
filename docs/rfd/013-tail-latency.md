@@ -10,9 +10,10 @@ object store. First-byte time for a range read varies with the size of the
 data file and carries a tail even at the file sizes RFD 002 (Serving
 layout contract) targets
 ([range-GET latency analysis, what the evidence implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)).
-It varies more with how recently the file was read: in-region, the median
-is about 26 ms for a file read moments before, about 90 ms for one read
-hours before, and up to about 175 ms for one never read
+It varies more with how recently the file was read: in-region, a file read
+moments before answers in tens of milliseconds at the median, one read
+hours before takes several times as long, and one never read takes longer
+still
 ([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
 
 The tail matters because of where icetray sits. The workload it is built
@@ -86,10 +87,10 @@ next poll tries again, so no load holds its table's lock longer than that.
 The two load bounds differ because the work does. A first load, or any
 build while no generation serves, reads every file's footer and key
 chunks, where a refresh reuses every file the new snapshot still names and
-reads only the rest. A first load of a table of 1.2 billion rows in
-32,768 files from real S3 takes 835 seconds at 16 files in flight, past a
-five-minute bound, and 79 seconds on four cores at 128 files per worker
-thread.
+reads only the rest. A first load from real S3 of a table of over a
+billion rows in tens of thousands of files runs past a five-minute bound
+when few files are in flight. At 128 files per worker thread it is bound
+by CPU instead and takes a fraction of that.
 
 Both paths share the S3 client's bounds: two retries, none started more
 than a minute after the first attempt, a 1-second connect timeout, and 30
