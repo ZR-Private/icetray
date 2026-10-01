@@ -1,5 +1,8 @@
 # How to RFD
 
+> Updated 2026-09-30: an RFD states its evidence as the conclusion it
+> supports; exact measurements stay in analyses and benchmarks.
+
 ## Problem
 
 Decisions in a small project get made in conversation, often with an AI
@@ -16,9 +19,11 @@ sentence of the form "problem A will be solved with approach X."
 
 An RFD records a decision once it has been made. The discussion behind it
 happens live, in a conversation or a working session, and is usually over
-by the time anyone writes the RFD. The evidence that grounded the decision
-lives in `docs/analysis/`, and the step-by-step work of carrying it out
-lives in `docs/plans/`. The RFD cites both and contains neither.
+by the time anyone writes the RFD. The measurements behind a decision live
+in `docs/analysis/`, and the step-by-step work of carrying it out lives in
+`docs/plans/`. The RFD says what the evidence showed and what was decided
+because of it; the measurements themselves and the plan stay in their own
+documents.
 
 ## Structure
 
@@ -79,6 +84,17 @@ If an RFD no longer describes reality and nobody will update it, mark it
 superseded and point to its replacement. A stale RFD misleads the reader
 who trusts it, which makes it worse than a missing one.
 
+**Evidence appears as the conclusion it supports.** An RFD says what was
+measured and what it showed: "the column reader was faster on every
+layout tried", "load is bound by CPU once enough files are in flight".
+Where the size of something is the argument, an order of magnitude makes
+it: a cold range GET costs tens of milliseconds and a resident lookup
+microseconds. Numbers that are part of the decision, such as a threshold,
+a default, or a limit, are stated exactly. Exact figures, machines, and
+dates belong in an analysis, and published benchmarks in documents of
+their own. An RFD may link to them where a reader would want the detail,
+and makes its claims without depending on the link.
+
 **An RFD says what was decided and leaves the how to a plan.** It names
 its dependencies without versioning them, since versions come from the
 registry at implementation time. Build steps, file layouts, and sequencing
@@ -95,8 +111,8 @@ belong in a plan.
 | Audience | Anyone, including future maintainers | Whoever is about to decide | The person or agent implementing |
 
 An analysis can exist without an RFD, because a survey that leads nowhere
-is still worth keeping. An RFD that rests on evidence cites the analysis
-instead of repeating it. A plan cites the RFD it implements and can be
+is still worth keeping. An RFD that rests on evidence states what it
+concluded from it and may link the analysis behind it. A plan cites the RFD it implements and can be
 deleted once the work has landed, while the RFD outlives it.
 
 ## When to write one
@@ -118,6 +134,11 @@ uses, and git history already records dates and authorship.
 debate suit teams with many stakeholders. Here the discussion has usually
 happened before anything is written, so a document shaped for it would
 mostly sit empty.
+
+**A measured figure beside every claim.** Citing the exact numbers behind
+each claim ties a decision to one machine and one day, so every
+re-measurement edits the RFD, and the reasoning gets lost among the
+figures. The analysis keeps the figures; the RFD keeps what they meant.
 
 **No records, with the commits left to speak for themselves.** A commit
 message says what changed, but leaves out what was rejected and why, and
