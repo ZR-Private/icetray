@@ -13,6 +13,12 @@ dev/ci-checks.sh
 clippy --workspace --all-targets --locked -- -D warnings`. CI runs that
 script and `cargo test --workspace --locked`.
 
+On Linux, the disk tier's tests need their temporary directory on a
+filesystem that serves non-blocking reads of cached pages, such as ext4,
+xfs, or btrfs. Where `/tmp` is tmpfs or overlayfs, as on some
+distributions and in most containers, point `TMPDIR` at a directory on
+disk.
+
 ## Gated suites
 
 Two suites need fixtures and show as ignored under a plain `cargo test`.

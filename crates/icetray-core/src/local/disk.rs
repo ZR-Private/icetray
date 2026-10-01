@@ -507,7 +507,9 @@ mod tests {
     /// just written) is read on the worker, to the bytes the blocking-pool
     /// read returns, and `page` counts it as one read. The temporary
     /// directory must be on a filesystem that serves `RWF_NOWAIT` reads
-    /// (ext4, xfs, btrfs), not overlayfs: set `TMPDIR` inside a container.
+    /// (ext4, xfs, btrfs), not tmpfs or overlayfs: set `TMPDIR` where `/tmp`
+    /// is either, as in a container or on a system that mounts `/tmp` in
+    /// memory.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_page_reads_a_cached_page_on_the_worker_to_the_pool_read_bytes() {
@@ -518,7 +520,8 @@ mod tests {
             let (offset, len) = disk.shared.locate(range.start, range.end).unwrap();
             let inline = disk.shared.read_cached(offset, len).expect(
                 "a just-written page was not served without blocking: is the temporary \
-                 directory on overlayfs or another filesystem without RWF_NOWAIT reads?",
+                 directory on tmpfs, overlayfs, or another filesystem without RWF_NOWAIT \
+                 reads? Set TMPDIR to a directory on ext4, xfs, or btrfs.",
             );
             let pooled = disk.shared.read_at(offset, len).unwrap();
             assert_eq!(inline, pooled, "{range:?}");
