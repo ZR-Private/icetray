@@ -124,6 +124,8 @@ icetray get --location s3://warehouse/db/kv 42
 
 ## Deploying
 
+- Each release publishes Linux binaries for x86-64 and arm64 and a
+  container image for both to the GitHub Container Registry.
 - Configuration is one TOML or JSON file, from `--config` or
   `ICETRAY_CONFIG`. Changes to its tables apply on the next poll or on
   SIGHUP.

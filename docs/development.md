@@ -69,5 +69,8 @@ differs from the crate version. It builds `icetray` with `--release
 each on Ubuntu 24.04, so the binaries run on that release's glibc or
 newer, and publishes a GitHub Release with one archive per target and its
 SHA-256 sum. Each archive holds the binary, the README, and both licenses.
-Run by hand from the Actions tab, the workflow builds the same archives as
-run artifacts and publishes nothing.
+It also pushes a container image for both architectures to the GitHub
+Container Registry, `ghcr.io/<owner>/icetray:<version>` without the `v`,
+built from the same binaries on Ubuntu 24.04 by the `Dockerfile`. Run by
+hand from the Actions tab, the workflow builds the same archives as run
+artifacts and the same image, and publishes nothing.

@@ -1,9 +1,11 @@
 name: Release
 
-# A tag vX.Y.Z builds the icetray binary for Linux on x86-64 and arm64 and
-# publishes both to a GitHub Release with SHA-256 sums. Run by hand, the
-# workflow builds the same archives and keeps them as run artifacts,
-# publishing nothing.
+# A tag vX.Y.Z builds the icetray binary for Linux on x86-64 and arm64,
+# publishes both to a GitHub Release with SHA-256 sums, and pushes a
+# container image for both architectures to the GitHub Container Registry
+# as ghcr.io/<owner>/icetray:X.Y.Z. Run by hand, the workflow builds the
+# same archives and image, keeps the archives as run artifacts, and
+# publishes nothing.
 on:
   push:
     tags: ["v*"]
@@ -98,3 +100,64 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag
+
+  image:
+    name: image
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: archives
+          merge-multiple: true
+      # The Dockerfile copies dist/<architecture>/icetray, in the
+      # architecture names the image platforms use.
+      - name: unpack the binaries
+        id: unpack
+        run: |
+          for pair in x86_64:amd64 aarch64:arm64; do
+            target="${pair%%:*}-unknown-linux-gnu"
+            arch="${pair##*:}"
+            archive=$(ls archives/icetray-*-"$target".tar.gz)
+            mkdir -p "dist/$arch"
+            tar xzf "$archive" -C "dist/$arch" --strip-components=1
+          done
+          name=$(basename "$archive" "-$target.tar.gz")
+          version="${name#icetray-v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      # Before anything is pushed: the amd64 image starts its binary and
+      # carries the root certificates TLS to object storage needs.
+      - name: smoke-test the image
+        run: |
+          docker buildx build . --platform linux/amd64 --load --tag icetray:smoke
+          docker run --rm icetray:smoke --version
+          docker run --rm --entrypoint /usr/bin/test icetray:smoke \
+            -s /etc/ssl/certs/ca-certificates.crt
+      - name: log in to the registry
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      # The Dockerfile only copies, so both platforms build here without
+      # emulation. The source label and index annotation link the package
+      # to this repository; a multi-platform image is read from the index.
+      - name: build the image
+        run: |
+          push=()
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then push=(--push); fi
+          docker buildx build . \
+            --platform linux/amd64,linux/arm64 \
+            --tag "${{ steps.unpack.outputs.image }}" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=${{ steps.unpack.outputs.version }}" \
+            --label "org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            "${push[@]}"
+          echo "built ${{ steps.unpack.outputs.image }}"

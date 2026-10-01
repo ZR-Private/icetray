@@ -1,0 +1,3 @@
+# The image takes only the unpacked release binaries.
+*
+!dist/

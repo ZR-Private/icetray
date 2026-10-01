@@ -174,10 +174,14 @@ SIGHUP. A change to its tables applies without a restart
 icetray's code is the same for every deployer, and anything added to it
 must be deployable by a second organization without editing source.
 
-- The deployer's wrapper is a container image built from source,
-  carrying the binary, its configuration file, and its log field names.
-  The same image carries `doctor`, `get`, and `info`, for running inside
-  the pod with the daemon's configuration and credentials.
+- Each release publishes a container image,
+  `ghcr.io/<owner>/icetray:<version>`, for amd64 and arm64: the release
+  binary on Ubuntu 24.04, running as an unprivileged user, with
+  `icetray serve` as its command. A deployer runs it as it is, with the
+  configuration file mounted, or builds a wrapper image from it or from
+  source that carries the configuration and log field names. The same
+  image carries `doctor`, `get`, and `info`, for running inside the pod
+  with the daemon's configuration and credentials.
 - The configuration path comes from `ICETRAY_CONFIG`, so a pod passes no
   flags. TOML and JSON read into the same schema.
 - Credentials come from the AWS SDK's default chain (profiles, single

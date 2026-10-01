@@ -17,3 +17,4 @@
 
 # Uncommitted research and prototypes (see docs/rfd/001-how-to-rfd.md for what gets kept)
 docs/scratch/
+/dist/
