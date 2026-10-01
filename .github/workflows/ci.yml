@@ -48,11 +48,6 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-26.04
-    # The disk tier's tests read cached chunk-file pages with RWF_NOWAIT,
-    # which tmpfs and overlayfs refuse, so their temporary files go on the
-    # runner's disk rather than wherever /tmp is mounted.
-    env:
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: install toolchain
@@ -60,7 +55,15 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
-      - name: temporary directory's filesystem
-        run: findmnt --target "$TMPDIR"
+      # The disk tier's tests read cached chunk-file pages with RWF_NOWAIT,
+      # which tmpfs and overlayfs refuse, so their temporary files go on the
+      # runner's disk rather than wherever /tmp is mounted. The runner
+      # context is available to steps only, so the variable is exported
+      # here for the steps after this one.
+      - name: temporary files on the runner's disk
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          findmnt --target /tmp
+          findmnt --target "$RUNNER_TEMP"
       - name: cargo test
         run: cargo test --workspace --locked
