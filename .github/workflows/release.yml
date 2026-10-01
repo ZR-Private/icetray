@@ -147,12 +147,16 @@ jobs:
       # The Dockerfile only copies, so both platforms build here without
       # emulation. The source label and index annotation link the package
       # to this repository; a multi-platform image is read from the index.
+      # The index holds the two images alone: buildx's default provenance
+      # attestations add entries of an unknown platform, which registries
+      # and copy tools handle unevenly.
       - name: build the image
         run: |
           push=()
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then push=(--push); fi
           docker buildx build . \
             --platform linux/amd64,linux/arm64 \
+            --provenance=false \
             --tag "${{ steps.unpack.outputs.image }}" \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.version=${{ steps.unpack.outputs.version }}" \
