@@ -1,5 +1,12 @@
 # icetray
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/icetray-dark.svg">
+    <img src="docs/images/icetray.svg" width="480" alt="Cubes break off an iceberg and fall into an ice tray">
+  </picture>
+</p>
+
 Batch-frozen data, served one cube at a time.
 
 icetray is a Rust server for key lookups on Apache Iceberg tables in object
