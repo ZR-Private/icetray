@@ -2,9 +2,11 @@
 
 ## Problem
 
-Decisions made in conversation are lost; the code shows what was decided
-but not why, and the question is argued again. The record has to be cheap
-enough to be written at the moment of deciding.
+Decisions in a small project get made in conversation, often with an AI
+partner, and then evaporate. Months later the code shows what was decided
+but not why. The same question gets argued again, and the reasoning that
+would have made the next decision easier is gone. A record of decisions
+only helps if it is cheap enough to write at the moment of deciding.
 
 ## Decision
 
@@ -12,9 +14,11 @@ Decisions in this project will be recorded as short RFDs in `docs/rfd/`,
 one decision per file, each stating its decision as a single affirmative
 sentence of the form "problem A will be solved with approach X."
 
-Discussion happens live and is usually over before the RFD is written.
-Evidence lives in `docs/analysis/`, implementation steps in `docs/plans/`;
-the RFD cites both and contains neither.
+An RFD records a decision once it has been made. The discussion behind it
+happens live, in a conversation or a working session, and is usually over
+by the time anyone writes the RFD. The evidence that grounded the decision
+lives in `docs/analysis/`, and the step-by-step work of carrying it out
+lives in `docs/plans/`. The RFD cites both and contains neither.
 
 ## Structure
 
@@ -39,36 +43,44 @@ What else was on the table and why it lost. A sentence or two each.
 What follows from the decision, including the costs being accepted.
 ```
 
-Sections can be a sentence long. A section that does not apply is omitted.
-No frontmatter, status field, author line, approval workflow, or date
-header; git history carries date and author.
+A section can be a single sentence, and a section that does not apply is
+left out. An RFD has only its title and these sections: frontmatter,
+status fields, author lines, approval workflows, and date headers are all
+left out, because the file's git history records when it was written and
+by whom.
 
 ## House rules
 
-**The decision is a sentence, and it is affirmative.** "The primary-key
-index will be the Parquet page index over sorted, bucket-partitioned
-data; there will be no sidecar index in v1" is a decision. "We should
-consider using the page index" is not, and neither is a list of options.
-If the sentence cannot be written, the RFD is not ready.
+**The decision is one affirmative sentence.** "The primary-key index will
+be the Parquet page index over sorted, bucket-partitioned data; there will
+be no sidecar index in v1" is a decision. "We should consider using the
+page index" is not one, and a list of options is not one either. If the
+sentence cannot be written, the decision has not been made yet and the RFD
+is not ready.
 
-**One decision per RFD.** Three decisions are three files that
-cross-reference each other. An RFD reads in under five minutes.
+**One decision per RFD.** Three decisions belong in three files that
+cross-reference each other. An RFD should take under five minutes to read.
+One that takes longer is either several decisions or an implementation
+plan under the wrong name.
 
-**Numbering is identity, not order.** Files are `NNN-short-name.md`,
-three digits, sequential, in `docs/rfd/`. The number exists so that "See
-RFD 004" resolves.
+**The number identifies an RFD and implies nothing about order.** Files
+are named `NNN-short-name.md`, with three sequential digits, in
+`docs/rfd/`. The number exists so that "See RFD 004" points at one file,
+and that is all it is for.
 
-**Update in place.** When a decision changes, edit the RFD. A material
+**Update in place.** When a decision changes, edit its RFD. A material
 change gets a note at the top:
 
 ```markdown
 > Updated 2026-11-02: the sidecar index is now in scope for v1. See RFD 009.
 ```
 
-An RFD that no longer describes reality and will not be updated is marked
-superseded with a pointer to its replacement.
+If an RFD no longer describes reality and nobody will update it, mark it
+superseded and point to its replacement. A stale RFD misleads the reader
+who trusts it, which makes it worse than a missing one.
 
-**RFDs say what, not how.** Dependencies are named; versions come from the
+**An RFD says what was decided and leaves the how to a plan.** It names
+its dependencies without versioning them, since versions come from the
 registry at implementation time. Build steps, file layouts, and sequencing
 belong in a plan.
 
@@ -82,30 +94,39 @@ belong in a plan.
 | Naming | `NNN-short-name.md` | `YYYY-MM-DD-topic.md` | `YYYY-MM-DD-topic.md`, with a paired `-design.md` when one exists |
 | Audience | Anyone, including future maintainers | Whoever is about to decide | The person or agent implementing |
 
-An analysis can exist without an RFD. An RFD cites its analysis. A plan
-cites its RFD and is deletable once the work has landed.
+An analysis can exist without an RFD, because a survey that leads nowhere
+is still worth keeping. An RFD that rests on evidence cites the analysis
+instead of repeating it. A plan cites the RFD it implements and can be
+deleted once the work has landed, while the RFD outlives it.
 
 ## When to write one
 
 Write an RFD when there was more than one reasonable approach, when the
-choice would be expensive to reverse, or when a future reader will ask
-why. Skip it for choices that are obvious, trivially reversible, or only
-matter while building. If problem and approach do not fit on a page,
-reconsider the work.
+choice would be expensive to reverse, or when a future reader is likely to
+ask why. Skip it for choices that are obvious, trivially reversible, or
+only matter while building. If the problem and the approach cannot be
+explained in a page, reconsider the work instead of writing a longer
+document.
 
 ## Alternatives Considered
 
-**ADR format with status metadata.** Ceremony a one-person project never
-uses; git history records dates and authorship.
+**ADR format with status metadata.** Status fields (proposed, accepted,
+deprecated) and frontmatter add ceremony that a one-person project never
+uses, and git history already records dates and authorship.
 
-**Discussion-first RFDs.** The discussion has usually already happened;
-the document would stay empty.
+**Discussion-first RFDs.** Processes that make the document the venue for
+debate suit teams with many stakeholders. Here the discussion has usually
+happened before anything is written, so a document shaped for it would
+mostly sit empty.
 
-**No records; let the commits speak.** Commits say what changed and lose
-what was rejected and why.
+**No records, with the commits left to speak for themselves.** A commit
+message says what changed, but leaves out what was rejected and why, and
+the reasons for rejecting an alternative are exactly what gets lost.
 
 ## Consequences
 
-Some decisions are written down after the fact, so the record holds the
-reasoning without the debate. That is the trade for a record cheap enough
-to exist.
+Some decisions will be written down after the fact, and the record will
+hold the reasoning without the debate that produced it. Readers get the
+reasons rather than the argument, and in exchange the record is cheap
+enough to exist at all. What keeps the system honest is the affirmative
+sentence: when it cannot be written, the work is not ready to start.

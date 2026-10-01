@@ -54,7 +54,7 @@ Compaction must carry the same file-size target.
 
 ## Deviations
 
-Three tiers.
+A deviation falls in one of three tiers.
 
 - Refused at load, with a named reason: unsorted files, null or duplicate
   keys, keys outside their file's recorded bucket, a key column whose

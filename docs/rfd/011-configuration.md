@@ -2,12 +2,20 @@
 
 ## Problem
 
-icetray owns three kinds of bytes: configuration a person edits,
-configuration a pipeline renders, and state it persists for itself. The
-person wants comments and unambiguous types; most pipelines emit JSON. A
-format chosen for one is a translation step for the other. The first
-persisted state is the header of a chunk file under the disk residency of
-RFD 017 (Residency tiers); choosing its envelope beforehand is cheap.
+icetray owns the format of three kinds of bytes: configuration a person
+edits, configuration a pipeline renders, and state icetray may one day
+persist for itself. The person wants comments and unambiguous types. The
+pipeline renders the same settings from templates and orchestrator values,
+and most such pipelines emit JSON. A format chosen for one author becomes a
+translation step for the other, and across that step copies drift until a
+setting is valid on one side and refused on the other. Either way the
+settings are structured: a list of tables, each with several fields,
+beside server and storage settings that other RFDs define.
+
+The first thing icetray persists for itself is the header of a chunk file
+under the disk residency of RFD 017 (Residency tiers). An artifact whose
+format is picked under shipping pressure gets whatever format is at hand,
+and choosing the envelope beforehand is cheap.
 
 ## Decision
 
@@ -16,60 +24,72 @@ as JSON so that machine-produced configuration can be consumed without a
 translation step, and any state icetray persists for itself will be a
 length-prefixed protobuf behind a magic byte and a version.
 
-One schema, two syntaxes, one parser: both are read into the same
-structure and validated once, and a test loads one configuration through
-both. The syntax might be chosen by file extension or declared alongside
-the path; RFD 012 (Deployment contract) says where the path comes from.
+There is one schema, and a single parser reads both syntaxes into the same
+structure and validates it once. No setting can therefore be accepted in
+one syntax and refused in the other, and a test holds the two equivalent
+by loading one configuration through both. The syntax might be chosen by
+file extension or declared alongside the path; RFD 012 (Deployment
+contract) says where the path comes from.
 
-The configuration covers:
-
-- Server: listen addresses, the ref poll interval of RFD 005 (Generations
-  and refresh), and the page cache budget.
-- Storage: endpoint, region, the prefix map for location rewriting, the
-  hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
-  static keys of RFD 003 (One storage stack), and the optional local
-  directory of RFD 012.
-- Tables: a list, each with a name, a source, a ref, a key column, a value
-  column, `strict` (RFD 007 (Serving tiers)), and the `residency` and
-  resident-bytes budget of RFD 017.
-
-A running server applies a change to the tables and refuses one to the
-rest; a restart applies it (RFD 018 (Configuration reload)). The prototype
-ran on this shape in TOML
+The configuration covers the server, storage, and tables. For the server
+it holds the listen addresses, the interval at which RFD 005 (Generations
+and refresh) polls the ref, and the page cache budget. For storage it
+holds the endpoint and region, the prefix map for location rewriting, the
+hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
+static keys RFD 003 (One storage stack) lets configuration supply, and the
+optional local directory of RFD 012 (Deployment contract). Tables are a
+list, and each entry has a name, a source, a ref, a key column, a value
+column, `strict` (whose meaning is RFD 007 (Serving tiers)), and the
+`residency` and resident-bytes budget of RFD 017 (Residency tiers). The
+prototype's TOML configuration had this shape
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).
 
-In the envelope, the magic byte identifies a file as icetray's before it
-is parsed, the version lets a newer build refuse or convert an older file,
-and the length prefix detects truncation and lets several messages share
-one file. Protobuf is already in the build for RFD 010 (Transport and
-client contract).
+A running server applies a change to the tables and refuses a change to
+anything else, which takes a restart (RFD 018 (Configuration reload)).
+
+The envelope rule exists so that the first persisted artifact does not
+invent a format. The magic byte identifies a file as icetray's before any
+of it is parsed. The version lets a newer build refuse or convert an older
+file instead of misreading it. The length prefix frames the message, so
+truncation is detected and several messages can share one file. Protobuf
+is already in the build for RFD 010 (Transport and client contract), so
+the rule adds no dependency.
 
 ## Alternatives Considered
 
-YAML. Rejected: an unquoted value can parse as a number or a boolean when
-a string was meant.
+YAML for the user-editable file. Rejected because an unquoted value can
+parse as a number or a boolean when a string was meant, and configuration
+is where that surprise costs the most.
 
 Environment variables only. Rejected: a list of tables is structured data,
-and flattening it into variable names is a format of its own.
+and flattening records into variable names invents a format of its own,
+one that has neither comments nor types.
 
-JSON only. Rejected: humans edit this file, and JSON has no comments and
-no tolerance for a trailing comma.
+JSON only. Rejected because humans edit this file, and JSON allows neither
+comments nor a trailing comma. Accepting JSON serves the pipeline;
+requiring it would tax the person.
 
-Serializing the in-memory structure for persisted state. Rejected: it
-changes whenever the structure does and carries no version.
+Serializing the in-memory structure as it stands for persisted state.
+Rejected: the bytes would change whenever the structure does, and nothing
+in them would say which build wrote them, so a file could not be read
+across builds.
 
 ## Consequences
 
-Pipelines that emit JSON hand icetray the file directly; the repository
-holds no converter between the syntaxes.
+Deployers whose pipelines emit JSON hand icetray the file directly, under
+the surface RFD 012 (Deployment contract) defines. Nothing in this
+repository converts between the syntaxes.
 
-The chunk file of RFD 017 is the first artifact under the envelope: magic
-byte, version byte, and a length-prefixed `ChunkFileHeader` message, read
-and written by the core crate's chunk file format. A later artifact uses a
-magic byte of its own.
+The chunk file of RFD 017 (Residency tiers) is the first artifact under the
+envelope: its magic byte, version byte, and length-prefixed
+`ChunkFileHeader` message are the envelope, and the core crate's chunk
+file format reads and writes them. A later persisted artifact follows the
+same rule under a magic byte of its own.
 
 Open question: whether individual settings may also be set from the
-environment, above the file. For: a container often varies one or two
-values per environment, the twelve-factor habit. Against: two sources for
-one setting need a precedence rule and a second place to look, and a
-JSON-emitting pipeline can already vary a value in the file.
+environment, layered above the file. For: a container often
+varies one or two values per environment, such as a listen address or a
+region, and setting them without rendering a file is the twelve-factor
+habit. Against: two sources for one setting need a precedence rule and
+give an operator a second place to look when a value is wrong, and a
+pipeline that emits JSON can already vary a value inside the file.

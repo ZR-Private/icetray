@@ -88,8 +88,8 @@ Gauges:
 - `icetray_config_pending`: 1 while the configuration file differs from
   the configuration applied.
 
-The snapshot id is in the swap's log line and in `TableInfo`, in no
-metric. Every label value is an enum variant name.
+The snapshot id appears in the swap's log line and in `TableInfo` but in
+no metric. Every label value is an enum variant name.
 
 Logs are JSON on stdout at `info`, one object per line. The standard
 fields are `time` (RFC 3339, UTC), `level`, `message`, and `target`.
@@ -171,13 +171,13 @@ SIGHUP. A change to its tables applies without a restart
 
 ## Deploying
 
-icetray carries no deployer-specific code. Anything added to it must be
-deployable by a second organization without editing source.
+icetray's code is the same for every deployer, and anything added to it
+must be deployable by a second organization without editing source.
 
-- The deployer's wrapper is a container image built from source (no image
-  is published yet) carrying the binary, its configuration file, and its
-  log field names. The same image carries `doctor`, `get`, and `info`, for
-  running inside the pod with the daemon's configuration and credentials.
+- The deployer's wrapper is a container image built from source,
+  carrying the binary, its configuration file, and its log field names.
+  The same image carries `doctor`, `get`, and `info`, for running inside
+  the pod with the daemon's configuration and credentials.
 - The configuration path comes from `ICETRAY_CONFIG`, so a pod passes no
   flags. TOML and JSON read into the same schema.
 - Credentials come from the AWS SDK's default chain (profiles, single
@@ -186,8 +186,8 @@ deployable by a second organization without editing source.
   chain and are the path for S3-compatible endpoints, with `endpoint`,
   `allow_http`, and `path_style`. icetray has no secret format of its own.
 - The gRPC port is plaintext and unauthenticated. Run it on a private
-  network or behind a mesh or sidecar; there is no mode in which the port
-  is safe to expose directly.
+  network or behind a mesh or sidecar; the port is never safe to expose
+  directly.
 
 Memory:
 
@@ -211,8 +211,8 @@ The local volume:
   its data file's identity and rebuilt on demand. A restarted replica
   reuses every chunk file whose data file is still referenced and deletes
   the rest.
-- The volume needs capacity only. Nobody backs it up or shares it between
-  replicas; losing it costs one cold load.
+- The volume needs only capacity. It is not backed up or shared between
+  replicas, and losing it costs one cold load.
 - Each disk-tier data file keeps one chunk file open for the life of its
   generation, and a refresh holds two generations' at once. Set the
   descriptor limit (`ulimit -n`, or the container runtime's `nofile`) to
