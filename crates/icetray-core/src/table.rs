@@ -2461,13 +2461,22 @@ mod tests {
         use futures::FutureExt as _;
 
         let (fixture, all) = two_bucket_table().await;
+        // A plain local read can finish on the blocking pool before the poll
+        // that started it looks, and let a cold hit be ready at once; reads
+        // go through a gate the test closes, so the cold hit waits.
+        let gate = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
+        fixture
+            .storage
+            .register(FILE_PREFIX, Arc::clone(&gate) as _);
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         table.load().await.unwrap();
         let key = Key::Long(all[0]);
+        gate.fill_to(2);
         assert!(
             table.get(&key).now_or_never().is_none(),
             "a cold hit waits on its page's read"
         );
+        gate.fill_to(0);
         table.get(&key).await.unwrap();
         let warm = table.get(&key).now_or_never();
         assert_eq!(

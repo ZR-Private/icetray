@@ -406,6 +406,8 @@ mod tests {
     use std::path::Path;
 
     use futures::FutureExt as _;
+    use object_store::local::LocalFileSystem;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
     use super::*;
     use crate::approx;
@@ -417,6 +419,8 @@ mod tests {
         FIRST_SNAPSHOT, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TWO, Table as Fixture,
         two_bucket_table,
     };
+    use crate::storage::FILE_PREFIX;
+    use crate::storage::testing::STALL;
     use crate::table::TableState;
 
     /// The names of the two configured tables.
@@ -843,6 +847,19 @@ mod tests {
         let opened = loaded(&config(vec![first.clone()])).await;
         let before = opened.tables();
         let configs = [first, named(SECOND_TABLE, &fixture, Residency::Full)];
+        // Every read from here on stalls, so the new table's load is
+        // waiting when the reload is dropped; a plain local read can finish
+        // within the first poll and let the whole reload complete.
+        opened.storage.register(
+            FILE_PREFIX,
+            Arc::new(ThrottledStore::new(
+                LocalFileSystem::new(),
+                ThrottleConfig {
+                    wait_get_per_call: STALL,
+                    ..ThrottleConfig::default()
+                },
+            )),
+        );
 
         let mut applying = Box::pin(opened.apply(&configs));
         assert!(
