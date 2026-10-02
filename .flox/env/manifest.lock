@@ -15,6 +15,9 @@
       "ghz": {
         "pkg-path": "ghz"
       },
+      "grpcurl": {
+        "pkg-path": "grpcurl"
+      },
       "rustup": {
         "pkg-path": "rustup"
       },
@@ -377,6 +380,93 @@
       ],
       "outputs": {
         "out": "/nix/store/a25zzm41w9yk98a4gn4dc72yimzwgagg-ghz-0.121.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "grpcurl",
+      "broken": false,
+      "derivation": "/nix/store/y32l5nd2q5awg6jdv153rjmbpzpq44w4-grpcurl-1.9.4.drv",
+      "description": "Like cURL, but for gRPC: Command-line tool for interacting with gRPC servers",
+      "install_id": "grpcurl",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "grpcurl-1.9.4",
+      "pname": "grpcurl",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T04:58:09.272954Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.9.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/6n16pkrgza044ql37afhizl6vw0whfpz-grpcurl-1.9.4"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "grpcurl",
+      "broken": false,
+      "derivation": "/nix/store/67s2cl0cbwnvn10yvq48gz2qz7g82y9n-grpcurl-1.9.4.drv",
+      "description": "Like cURL, but for gRPC: Command-line tool for interacting with gRPC servers",
+      "install_id": "grpcurl",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "grpcurl-1.9.4",
+      "pname": "grpcurl",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T05:30:11.878838Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.9.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/l3x740ny5sqyswlqb8y5h58fl2sfnqjq-grpcurl-1.9.4"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "grpcurl",
+      "broken": false,
+      "derivation": "/nix/store/92s75y49yklfwrb9np0yaqzd8q1kmn1w-grpcurl-1.9.4.drv",
+      "description": "Like cURL, but for gRPC: Command-line tool for interacting with gRPC servers",
+      "install_id": "grpcurl",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "name": "grpcurl-1.9.4",
+      "pname": "grpcurl",
+      "rev": "ef34387ddd751e1ab8857adf4676492d32eb24ec",
+      "rev_count": 1073009,
+      "rev_date": "2026-09-13T08:01:44Z",
+      "scrape_date": "2026-09-15T06:07:19.206219Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.9.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/igb59h8br7rpsll64jq9lpf9pkn0xnk0-grpcurl-1.9.4"
       },
       "system": "x86_64-linux",
       "group": "toplevel",

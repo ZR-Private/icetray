@@ -16,6 +16,9 @@ docker-compose.pkg-path = "docker-compose"
 # (crates/icetray-testkit/examples), ghz drives the gRPC server under load.
 samply.pkg-path = "samply"
 ghz.pkg-path = "ghz"
+# Ad hoc calls to a running server; icetray serves no reflection, so pass
+# -proto crates/icetray-proto/proto/icetray.proto.
+grpcurl.pkg-path = "grpcurl"
 
 [options]
 systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]
