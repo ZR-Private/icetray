@@ -18,8 +18,8 @@ use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
 use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::metric::{
-    CONFIG_PENDING, CONFIG_RELOADS_TOTAL, LABEL_RESULT, LABEL_STATE, LABEL_TABLE,
-    PROCESS_RSS_BYTES, TABLE_STATE,
+    ALLOCATOR_ALLOCATED_BYTES, ALLOCATOR_RESIDENT_BYTES, CONFIG_PENDING, CONFIG_RELOADS_TOTAL,
+    LABEL_RESULT, LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE,
 };
 use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
 use icetray_testkit::fixture::{
@@ -805,6 +805,14 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
     let rss = series_value(&exposition, PROCESS_RSS_BYTES, &[])
         .expect("the scrape carries the process's memory");
     assert!(rss > 0.0, "a running process holds memory: {rss}");
+    let allocated = series_value(&exposition, ALLOCATOR_ALLOCATED_BYTES, &[])
+        .expect("the scrape carries jemalloc's live bytes");
+    let resident = series_value(&exposition, ALLOCATOR_RESIDENT_BYTES, &[])
+        .expect("the scrape carries jemalloc's resident bytes");
+    assert!(
+        allocated > 0.0 && allocated <= resident,
+        "the server allocates through jemalloc: {allocated} allocated, {resident} resident"
+    );
     assert_eq!(
         series_value(
             &exposition,

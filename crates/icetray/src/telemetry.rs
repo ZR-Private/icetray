@@ -1,13 +1,15 @@
 //! The binary's share of the metrics (blueprint section 7): the Prometheus
 //! recorder with the latency buckets, the `requests_total` counter with its
-//! `call` label, and the sampler for `generation_age_seconds` and
-//! `process_rss_bytes`. Core's modules emit every other series.
+//! `call` label, and the sampler for `generation_age_seconds`,
+//! `process_rss_bytes`, and the allocator gauges. Core's modules emit every
+//! other series.
 
 use std::fmt;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use icetray_core::{Opened, approx, metric, time};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use tikv_jemalloc_ctl::{epoch, stats};
 
 use crate::error::ServeError;
 
@@ -92,8 +94,9 @@ pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
 
 /// Samples the gauges the binary owns: `generation_age_seconds` for every
 /// table serving a generation, from the snapshot's own timestamp against
-/// now, and `process_rss_bytes` when the platform reports a resident set
-/// size; then runs the recorder's upkeep, which drains histogram samples.
+/// now, `process_rss_bytes` when the platform reports a resident set size,
+/// and the allocator gauges; then runs the recorder's upkeep, which drains
+/// histogram samples.
 pub fn sample(opened: &Opened, handle: &PrometheusHandle) {
     for table in opened.tables().iter() {
         if let Some(generation) = table.current() {
@@ -107,7 +110,32 @@ pub fn sample(opened: &Opened, handle: &PrometheusHandle) {
     if let Some(stats) = memory_stats::memory_stats() {
         metrics::gauge!(metric::PROCESS_RSS_BYTES).set(approx::gauge_len(stats.physical_mem));
     }
+    sample_allocator();
     handle.run_upkeep();
+}
+
+/// Sets the allocator gauges from jemalloc's statistics. jemalloc refreshes
+/// them only when its epoch advances, so the epoch is advanced first. A
+/// statistic jemalloc cannot read leaves its gauge as it was: the gauges
+/// explain `process_rss_bytes`, and serving does not depend on them.
+fn sample_allocator() {
+    if let Err(error) = epoch::advance() {
+        tracing::debug!(%error, "jemalloc statistics are unavailable");
+        return;
+    }
+    let gauges = [
+        (metric::ALLOCATOR_ALLOCATED_BYTES, stats::allocated::read()),
+        (metric::ALLOCATOR_ACTIVE_BYTES, stats::active::read()),
+        (metric::ALLOCATOR_METADATA_BYTES, stats::metadata::read()),
+        (metric::ALLOCATOR_RESIDENT_BYTES, stats::resident::read()),
+        (metric::ALLOCATOR_RETAINED_BYTES, stats::retained::read()),
+    ];
+    for (name, bytes) in gauges {
+        match bytes {
+            Ok(bytes) => metrics::gauge!(name).set(approx::gauge_len(bytes)),
+            Err(error) => tracing::debug!(%error, gauge = name, "jemalloc statistic unavailable"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +174,28 @@ mod tests {
             LATENCY_BUCKETS[LATENCY_BUCKETS.len() - 1].to_bits(),
             LAST_BUCKET.to_bits()
         );
+    }
+
+    /// Each allocator gauge is set, and they nest as jemalloc defines them:
+    /// live bytes within active pages within what it holds resident.
+    #[test]
+    fn test_sample_allocator_sets_every_gauge_in_order() {
+        let handle = install().unwrap();
+        sample_allocator();
+        let exposition = handle.render();
+        let read = |name: &str| {
+            series_value(&exposition, name, &[]).unwrap_or_else(|| panic!("{name} in {exposition}"))
+        };
+        let allocated = read(metric::ALLOCATOR_ALLOCATED_BYTES);
+        let active = read(metric::ALLOCATOR_ACTIVE_BYTES);
+        let resident = read(metric::ALLOCATOR_RESIDENT_BYTES);
+        read(metric::ALLOCATOR_METADATA_BYTES);
+        read(metric::ALLOCATOR_RETAINED_BYTES);
+        assert!(
+            allocated <= active,
+            "allocated {allocated} > active {active}"
+        );
+        assert!(active <= resident, "active {active} > resident {resident}");
     }
 
     #[test]

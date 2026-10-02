@@ -44,6 +44,19 @@ pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
 pub(crate) const INDEX_BYTES: &str = "icetray_index_bytes";
 /// The process's resident set size.
 pub const PROCESS_RSS_BYTES: &str = "icetray_process_rss_bytes";
+/// Bytes the program holds in live allocations, as jemalloc counts them.
+pub const ALLOCATOR_ALLOCATED_BYTES: &str = "icetray_allocator_allocated_bytes";
+/// Bytes in jemalloc's pages that hold live allocations: at least
+/// `allocated`, the excess being space those pages hold free.
+pub const ALLOCATOR_ACTIVE_BYTES: &str = "icetray_allocator_active_bytes";
+/// Bytes of jemalloc's own bookkeeping.
+pub const ALLOCATOR_METADATA_BYTES: &str = "icetray_allocator_metadata_bytes";
+/// Bytes jemalloc has resident: active pages, its metadata, and freed pages
+/// it has not yet returned to the operating system.
+pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
+/// Bytes of address space jemalloc keeps mapped for reuse after returning
+/// its pages: virtual, not resident.
+pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
 /// Bytes the page cache holds.
 pub(crate) const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and `code`.

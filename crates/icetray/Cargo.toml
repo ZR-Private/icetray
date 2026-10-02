@@ -26,7 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tikv-jemalloc-ctl = { workspace = true }
+# `stats` for the allocator gauges `telemetry::sample` reads.
+tikv-jemalloc-ctl = { workspace = true, features = ["stats"] }
 tikv-jemallocator = { workspace = true }
 # `net` for the two listeners, `signal` for the SIGTERM drain (RFD 012)
 # and the SIGHUP reload (RFD 018).

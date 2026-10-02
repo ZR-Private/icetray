@@ -79,6 +79,12 @@ Gauges:
 - `icetray_index_bytes{table}`: the index's live bytes, beside
   `icetray_process_rss_bytes`.
 - `icetray_page_cache_bytes`
+- `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`,
+  `_resident_bytes`, and `_retained_bytes`: jemalloc's own counts, which
+  split the resident set. `allocated` is live data; `active` minus
+  `allocated` is free space inside pages in use; `resident` minus `active`
+  and `metadata` is freed memory not yet returned to the system;
+  `retained` is address space only.
 - `icetray_findings{table,code}`
 - `icetray_generation_age_seconds{table}`
 - `icetray_generation_sequence_number{table}`: the serving snapshot's
