@@ -584,8 +584,12 @@ impl Run {
                 }
             })?,
         };
+        // Copied into an allocation of its own: the store can hand back a
+        // slice of a larger buffer, such as the HTTP connection's read
+        // buffer, which the entry would keep alive while `weigh` charges
+        // only the slice.
         fetched
-            .map(PageValue)
+            .map(|page| PageValue(Bytes::copy_from_slice(&page)))
             .map_err(|error| FetchFailed::Failed(Arc::new(error)))
     }
 }
@@ -983,6 +987,26 @@ mod tests {
                 assert_eq!(published(), 1, "the last clone dropped publishes the rest");
             });
         });
+    }
+
+    /// A fetch that answers with a slice of a larger buffer, as hyper's
+    /// connection read buffer is, is cached in an allocation of its own:
+    /// the entry is charged the slice's length, so it must not keep the
+    /// rest of the buffer alive.
+    #[tokio::test]
+    async fn test_fetched_slice_is_cached_apart_from_its_buffer() {
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+        let buffer = Bytes::from([PAGE, OTHER_PAGE].concat());
+        let slice = buffer.slice(..PAGE.len());
+        let (page, _) = cache
+            .get_or_fetch(key(FIRST_OFFSET), move || async move { Ok(slice) })
+            .await
+            .unwrap();
+        assert_eq!(page, PAGE);
+        assert!(
+            !buffer.as_ptr_range().contains(&page.as_ptr()),
+            "the cached page points into the fetch's buffer"
+        );
     }
 
     #[tokio::test]
