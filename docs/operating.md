@@ -205,8 +205,10 @@ Memory:
   over the tables the replica serves, of the doctor's `predicted` bytes
   for each table's tier (`predicted.full`, `predicted.disk_memory`, or
   `predicted.bloom`), doubled for a table a refresh can rewrite wholesale;
-  plus `server.page_cache_bytes`; plus a quarter of that total for the
-  process, requests in flight, and a load's transient chunks.
+  plus `server.page_cache_bytes`; plus a third of that total for the
+  process, requests in flight, a load's transient chunks, and the
+  allocator's fragmentation and bookkeeping. The `icetray_allocator_*`
+  gauges show how much of the resident set is the allocator's.
 - Load refuses a key page header, and a lookup a value page header, that
   declares more than its page can hold or more than a 64 MiB ceiling, and
   a panic inside parquet's decoding refuses the file. The lengths inside a

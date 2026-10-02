@@ -125,8 +125,11 @@ A replica runs under a memory limit its deployer sets. The limit is sized
 from the doctor's predicted resident bytes for each table's tier, doubled
 for a table a refresh can rewrite wholesale since the new generation loads
 beside the serving one, plus the page cache's memory budget, plus a margin
-of a quarter of that total for the process, requests in flight, and a
-load's transient chunks.
+of a third of that total for the process, requests in flight, a load's
+transient chunks, and the allocator's fragmentation and bookkeeping. A
+quarter was the first margin and proved too small: with the page cache
+full, the process held about a third more than the cache and index
+together, most of it allocator overhead on the cache's small pages.
 
 The limit backs up the load checks without replacing them, catching the
 allocations they do not cover. RFD 004 (Resident key-chunk index) refuses a
