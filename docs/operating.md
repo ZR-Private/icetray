@@ -130,10 +130,13 @@ when a load begins. The serving generation's chunk files stay until the
 new one has swapped in, so a table rewritten wholesale wants about twice
 its steady footprint, the doctor's `predicted.disk_bytes`.
 
-A disk-tier lookup costs one local read and, on a hit, one GET. On Linux,
-put the directory on a mounted volume with a filesystem such as ext4; a
-container's overlay filesystem forces every local read onto another
-thread.
+A disk-tier lookup costs one local read and, on a hit, one GET. The local
+read is a memory copy while the kernel's page cache holds the chunk file,
+and a device read when it does not, so a disk tier serves at memory speed
+only with room for its chunk files in that cache (see Memory under
+[Deploying](#deploying)). On Linux, put the directory on a mounted volume
+with a filesystem such as ext4; a container's overlay filesystem forces
+every local read onto another thread.
 
 A `bloom` table keeps the key column's bloom filters in memory, needs no
 disk, and pays two GETs per hit and a GET per miss at the filter's
@@ -209,6 +212,14 @@ Memory:
   process, requests in flight, a load's transient chunks, and the
   allocator's fragmentation and bookkeeping. The `icetray_allocator_*`
   gauges show how much of the resident set is the allocator's.
+- For `disk` tables, raise the limit by their chunk files' size, the
+  doctor's `predicted.disk_bytes`. On Linux the page cache of the files a
+  container reads counts against its memory limit, and a limit sized for
+  the process alone leaves the chunk files nowhere to stay cached, so
+  their reads go to the device and each lookup waits on it. The extra is
+  cache the kernel reclaims under pressure, not memory the process holds:
+  a scheduler's reservation, such as a Kubernetes memory request, can stay
+  at the sum above.
 - Load refuses a key page header, and a lookup a value page header, that
   declares more than its page can hold or more than a 64 MiB ceiling, and
   a panic inside parquet's decoding refuses the file. The lengths inside a
