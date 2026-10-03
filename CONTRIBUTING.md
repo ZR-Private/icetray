@@ -171,6 +171,11 @@ gets a paragraph; a sentence carrying no load gets deleted.
 - A test never sleeps a fixed time to let something happen: it waits for
   the condition, polling within a bound that fails with a message, or holds
   a fixture so the order is forced.
+- A test never bets on how long an operation takes. If it needs work still
+  in flight when it looks, or already finished, it makes that so: it holds
+  the work behind a gate it opens itself, or waits for the work to finish.
+  A read that is usually slower than one poll will, on some machine, finish
+  within it.
 - A test proves what it claims. Run it and read the output. If the number
   you assert on is zero when it should not be, the test passed without
   proving anything.
