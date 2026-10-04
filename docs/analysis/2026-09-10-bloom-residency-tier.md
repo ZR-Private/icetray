@@ -109,7 +109,7 @@ Server memory for `long_50m` after load, steady for 30 seconds:
   tables' index by about 90 percent, and the same applies in proportion to
   every table.
 - **The permuted-key table overlaps.** `long_wide_shuffled_250k`, written
-  with skew splitting on and a permuted 64-bit key, is priced by the doctor
+  with skew splitting on and a permuted 64-bit key, is reported inefficient by the doctor
   as two files probed per lookup in each of its buckets, with no duplicate.
   The overlapping-files fixture on S3 exists, correcting the earlier note in
   prototype findings, finding 9.

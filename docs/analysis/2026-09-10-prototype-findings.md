@@ -147,7 +147,7 @@ Tables written this way:
 
 An unpartitioned in-process table (no `bucket` transform) also served
 correctly, with every file a candidate narrowed by its exact key range; the
-doctor prices that layout by files probed per lookup.
+doctor reports that layout as inefficient by files probed per lookup.
 
 The off-contract layouts serve at the same GET count because the resident
 key chunks answer "which page" exactly, without consulting the column index
@@ -346,7 +346,7 @@ gained a file, keeps cursors ordered by their head with binary-search
 reinsertion, and decodes one key page at a time; a test asserts that a
 disjoint append verifies zero groups. The merge was not re-timed on the same
 fixtures after the change. An S3 fixture of the overlapping case built with
-a permuted 64-bit key was written later and is priced by the doctor at two
+a permuted 64-bit key was written later and is reported inefficient by the doctor at two
 files probed per lookup
 ([bloom residency tier, observations](2026-09-10-bloom-residency-tier.md#observations)).
 
@@ -450,16 +450,16 @@ tests it.
   notebook pod on two days.
 - Load time at thousands of files on S3 (1,500 files was measured from
   local disk only). Load time on S3 after the credential fix was measured
-  with the rebuilt binary: under four seconds for `long_50m` and `long_2m`
+  with the icetray binary of 2026-09-21: under four seconds for `long_50m` and `long_2m`
   loading together
-  ([the clean build against real S3](2026-09-21-real-s3-verification.md#load-time-after-the-credential-fix)).
+  ([icetray against real S3](2026-09-21-real-s3-verification.md#load-time-after-the-credential-fix)).
 - Throughput per core and behavior under concurrent load; the page cache's
   hit-rate curve under a skewed key distribution.
 - Adaptive hedging under a real stall episode. The mechanism was verified
-  against S3 with the rebuilt binary (the window fills, the percentile is
+  against S3 with the icetray binary of 2026-09-21 (the window fills, the percentile is
   taken, the ceiling binds) on an afternoon whose latency had one mode, so
   it trimmed nothing
-  ([the clean build against real S3](2026-09-21-real-s3-verification.md#adaptive-hedging)).
+  ([icetray against real S3](2026-09-21-real-s3-verification.md#adaptive-hedging)).
 - The bloom-filter fallback was measured after this document was first
   written; see [the bloom residency tier](2026-09-10-bloom-residency-tier.md).
 - The overlap merge's cost after the review changes, on the 25-file fixtures.

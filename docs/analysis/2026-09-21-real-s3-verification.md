@@ -1,14 +1,13 @@
-# The clean build against real S3
+# icetray against real S3
 
-Measured 2026-09-21 with the rebuilt binary (`icetray` at the end of stage 3
-of [the clean build](../plans/2026-09-10-clean-build.md)) against the S3
-tables the prototype wrote ([prototype findings, writer
+Measured 2026-09-21 with the `icetray` binary of that date, ahead of the
+0.1.0 release, against the S3 tables the prototype wrote ([prototype findings, writer
 recipe](2026-09-10-prototype-findings.md#writer-recipe-for-the-s3-tables)),
 from the same laptop and the same kind of residential connection, with
 profile credentials. Everything the design promises about cost held on
 every table: one GET per cold hit, none per warm hit or miss, every value
 byte-identical to the recipe's function of its key, the doctor's verdicts as
-RFD 007 prices the layouts, a load of the 50-million-row table in under
+RFD 007 classifies the layouts, a load of the 50-million-row table in under
 four seconds, and a snapshot appended by Spark swapped in within one poll.
 Adaptive hedging spent GETs inside its ceiling and trimmed nothing, because
 this connection's latency had no second mode to trim. Two things the
@@ -17,7 +16,7 @@ hedging that adapts.
 
 ## Method
 
-- **Binary.** A release build of the `icetray` crate at stage 3's end,
+- **Binary.** A release build of the `icetray` crate as of 2026-09-21,
   run as `doctor`, `get`, and `serve` with a `--location` table root or a
   JSON configuration; credentials through the AWS SDK's default chain from
   a named profile with an external credential helper; the storage layer's
@@ -70,7 +69,7 @@ Two of the findings describe the recipe rather than the table. The 192-byte
 tables' value pages decompress to 160 to 196 KB, above the doctor's 128 KiB
 advice threshold, because the recipe bounds pages by 1,000 rows and leaves
 the byte bound at 8 MiB for small values; the same advice appears on the
-stage 3 golden tables written by the checked-in recipe. The prototype's four
+golden tables written by the checked-in recipe. The prototype's four
 append files on `long_2m`, of 1,225 rows each, carry the writer's fixed 1
 MiB filters, or about 6,600 bits per key. Neither affects a lookup's cost.
 
@@ -142,13 +141,13 @@ connection, and the simulation tests hold the bimodal case.
 
 ## What this establishes
 
-- The rebuilt reader serves the prototype's S3 tables with the cost model
+- icetray serves the prototype's S3 tables with the cost model
   intact: one GET per cold hit, none otherwise, values exact, on 64-bit
   keys, 91-byte string keys, 192-byte values, and 16 KB values, across 4 to
   25 files per table.
 - The doctor's verdicts on real Spark output match RFD 007's tiers: the
   contract tables are efficient with advice only, and the one overlapping
-  table is priced as two files probed and refused under `strict`.
+  table is inefficient at two files probed and refused under `strict`.
 - Load time on S3 with the credential bridge in place is a few seconds for
   a 2 GB table of 25 files, and the daemon serves while it loads.
 - A snapshot committed by a Spark job is picked up within one poll, reusing
