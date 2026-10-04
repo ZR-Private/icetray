@@ -250,7 +250,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
 }
 
 #[tokio::test]
-async fn test_doctor_prices_an_unpartitioned_table_and_exits_2() -> TestResult {
+async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() -> TestResult {
     let dir = tempfile::tempdir()?;
     let spec = FixtureSpec {
         buckets: 0,
@@ -269,7 +269,7 @@ async fn test_doctor_prices_an_unpartitioned_table_and_exits_2() -> TestResult {
     assert!(
         report.iter().any(|line| line["kind"] == "finding"
             && line["code"] == "no_bucket_partition"
-            && line["tier"] == "cost"),
+            && line["tier"] == "inefficient"),
         "{report:?}"
     );
     Ok(())

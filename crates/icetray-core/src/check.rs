@@ -28,14 +28,14 @@ use crate::snapshot::SnapshotId;
 pub mod thresholds {
     use crate::contract;
 
-    /// Key page rows above which `large_key_pages` is a cost: twice
+    /// Key page rows above which `large_key_pages` is inefficient: twice
     /// `contract::PAGE_ROWS`. A lookup decodes one key page, so its rows
     /// set the CPU a lookup spends (prototype findings, finding 1: the
     /// writer's default 17,900-row pages served at the same GET count and
     /// cost CPU per lookup instead). The slack up to twice the contract is a
     /// chosen margin, so a writer whose page rounding overshoots the
     /// contract draws no finding (RFD 016, consequences).
-    pub const KEY_PAGE_ROWS_COST: i64 = 2 * contract::PAGE_ROWS;
+    pub const KEY_PAGE_ROWS_INEFFICIENT: i64 = 2 * contract::PAGE_ROWS;
 
     /// Mean uncompressed value page bytes above which `large_value_pages`
     /// is advice: 1 MiB, `VALUE_PAGE_ADVICE_FACTOR` times
@@ -119,36 +119,36 @@ const MIN_EXPLAINED_FILES: u64 = 1;
 /// `column_index_truncated`.
 const DISTINCT_MINS_UNOBSERVABLE: f64 = 1.0;
 
-/// What a finding bears on (RFD 007). `Cost`: every answer is right and
-/// some lookups do more work, with the penalty measured; `Advice`: memory,
-/// load time, or tuning, and never a wrong answer. Serde gives the
+/// What a finding bears on (RFD 007). `Inefficient`: every answer is right
+/// and some lookups do more work, with the penalty measured; `Advice`:
+/// memory, load time, or tuning, and never a wrong answer. Serde gives the
 /// lowercase name. The derived order puts `Advice` first; the report sorts
-/// by its reverse, costs first.
+/// by its reverse, inefficient findings first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// Tuning the writer could do; no lookup's answer is wrong for it.
     Advice,
-    /// Served correctly at a measured price per lookup; a refusal when the
-    /// table is `strict`.
-    Cost,
+    /// Served correctly with a measured penalty per lookup; a refusal when
+    /// the table is `strict`.
+    Inefficient,
 }
 
-/// Whether the generation serves at the contract's cost. `Inefficient` iff
-/// any `Cost` finding, which `strict` turns into a refusal; advice never
-/// changes it. Serde gives the lowercase name.
+/// Whether the generation serves with the contract's work per lookup.
+/// `Inefficient` iff any `Tier::Inefficient` finding, which `strict` turns
+/// into a refusal; advice never changes it. Serde gives the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Serviceability {
     /// One GET per cold hit, none per miss, one contract-sized key page
     /// decoded, one file probed.
     Efficient,
-    /// At least one cost finding.
+    /// At least one inefficient finding.
     Inefficient,
 }
 
 impl Serviceability {
-    /// The verdict `costs` cost findings give: `Inefficient` for any.
+    /// The verdict `costs` inefficient findings give: `Inefficient` for any.
     fn from_costs(costs: usize) -> Self {
         if costs > 0 {
             Self::Inefficient
@@ -158,8 +158,8 @@ impl Serviceability {
     }
 }
 
-/// A cost finding's penalty per lookup over the contract layout, in RFD
-/// 007's three units; a unit the finding does not affect is `None`.
+/// An inefficient finding's penalty per lookup over the contract layout,
+/// in RFD 007's three units; a unit the finding does not affect is `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Penalty {
     /// GETs a hit makes beyond the one value page.
@@ -171,8 +171,8 @@ pub struct Penalty {
 }
 
 impl Penalty {
-    /// A penalty priced in files probed per lookup alone, the unit every
-    /// table-level cost is measured in.
+    /// A penalty in files probed per lookup alone, the unit every
+    /// table-level inefficiency is measured in.
     pub(crate) fn files_probed(files: usize) -> Self {
         Self {
             files_probed_per_lookup: Some(files),
@@ -195,8 +195,8 @@ pub enum FindingCode {
     /// The value column is dictionary-encoded; its dictionary page costs one
     /// extra GET per hit.
     DictionaryEncodedValue,
-    /// Key pages hold more rows than the cost threshold; a lookup decodes
-    /// them all.
+    /// Key pages hold more rows than the inefficient threshold; a lookup
+    /// decodes them all.
     LargeKeyPages,
     /// No bucket transform on the key and more than one file; a lookup
     /// probes every file.
@@ -359,10 +359,11 @@ impl fmt::Display for WriterProperty {
 
 /// One observation about a generation: its tier and code decide what it
 /// means, the message carries the numbers for a reader, and the property
-/// names what a writer changes; `penalty` is `Some` exactly for a `Cost`.
-/// The fields are private and `cost` and `advice` are the only
-/// constructors, so the tier and the penalty cannot disagree: a cost always
-/// carries one and advice never does. Serializes with the field names of
+/// names what a writer changes; `penalty` is `Some` exactly for
+/// `Tier::Inefficient`. The fields are private and `inefficient` and
+/// `advice` are the only constructors, so the tier and the penalty cannot
+/// disagree: an inefficient finding always carries one and advice never
+/// does. Serializes with the field names of
 /// its getters.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
@@ -375,9 +376,9 @@ pub struct Finding {
 }
 
 impl Finding {
-    /// A cost finding, served at `penalty`'s price; `file` names the data
-    /// file, `None` for a table-level one.
-    pub(crate) fn cost(
+    /// An inefficient finding, served with `penalty`; `file` names the
+    /// data file, `None` for a table-level one.
+    pub(crate) fn inefficient(
         code: FindingCode,
         file: Option<&str>,
         message: String,
@@ -385,7 +386,7 @@ impl Finding {
         property: Option<WriterProperty>,
     ) -> Self {
         Self {
-            tier: Tier::Cost,
+            tier: Tier::Inefficient,
             code,
             message,
             file: file.map(str::to_string),
@@ -394,10 +395,11 @@ impl Finding {
         }
     }
 
-    /// An advice finding: no answer is wrong and no priced work is added,
+    /// An advice finding: no answer is wrong and no lookup does more work,
     /// so there is no penalty.
     /// Public so a crate that renders findings can build one in its tests;
-    /// `cost` is crate-private, since only the diagnosis measures a penalty.
+    /// `inefficient` is crate-private, since only the diagnosis measures a
+    /// penalty.
     pub fn advice(
         code: FindingCode,
         file: Option<&str>,
@@ -414,7 +416,7 @@ impl Finding {
         }
     }
 
-    /// Cost or advice.
+    /// Inefficient or advice.
     pub fn tier(&self) -> Tier {
         self.tier
     }
@@ -435,7 +437,7 @@ impl Finding {
         self.file.as_deref()
     }
 
-    /// The measured penalty; `Some` exactly for a cost finding.
+    /// The measured penalty; `Some` exactly for an inefficient finding.
     pub fn penalty(&self) -> Option<Penalty> {
         self.penalty
     }
@@ -518,7 +520,7 @@ pub struct TableSummary {
     pub table: String,
     /// The snapshot diagnosed.
     pub snapshot_id: SnapshotId,
-    /// Efficient, or served at a cost.
+    /// Efficient or inefficient.
     pub serviceability: Serviceability,
     /// The tier the generation was loaded in.
     pub residency: Residency,
@@ -538,20 +540,20 @@ pub struct TableSummary {
     /// Every tier's resident bytes, from the footers alone (RFD 017), so an
     /// owner chooses a tier from one run.
     pub predicted: ResidentBytes,
-    /// Cost findings.
+    /// Inefficient findings.
     pub costs: usize,
     /// Advice findings.
     pub advice: usize,
 }
 
-/// The whole report: the summary, the findings costs first, and one report
-/// per file in generation order.
+/// The whole report: the summary, the findings inefficient first, and one
+/// report per file in generation order.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct TableReport {
     /// The verdict and the table-level numbers.
     pub summary: TableSummary,
-    /// Every finding, `Cost` before `Advice`, then in the finding table's
-    /// order, then by file in generation order.
+    /// Every finding, `Inefficient` before `Advice`, then in the finding
+    /// table's order, then by file in generation order.
     pub findings: Vec<Finding>,
     /// One report per file, in generation order.
     pub files: Vec<FileReport>,
@@ -561,7 +563,7 @@ pub struct TableReport {
 /// holds, raises each finding of the finding table whose trigger the
 /// measurements meet, and sums every tier's predicted resident bytes from
 /// the footers. No I/O and no metrics; `Serviceability::Inefficient` iff a
-/// `Cost` finding was raised.
+/// `Tier::Inefficient` finding was raised.
 pub fn diagnose(g: &Generation) -> TableReport {
     let facts: Vec<FileFacts> = g
         .files
@@ -577,7 +579,7 @@ pub fn diagnose(g: &Generation) -> TableReport {
     sort_findings(&mut findings);
     let costs = findings
         .iter()
-        .filter(|finding| finding.tier() == Tier::Cost)
+        .filter(|finding| finding.tier() == Tier::Inefficient)
         .count();
     let serviceability = Serviceability::from_costs(costs);
     let summary = TableSummary {
@@ -865,18 +867,18 @@ fn bounds_intact(entry: &DataFileEntry, (first, last): (&Key, &Key)) -> bool {
 /// trigger, in the table's order.
 fn file_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
     let mut findings = Vec::new();
-    file_cost_findings(facts, layout, &mut findings);
+    file_inefficient_findings(facts, layout, &mut findings);
     file_advice_findings(facts, layout, &mut findings);
     bloom_findings(facts, layout, &mut findings);
     findings
 }
 
-/// The per-file cost findings: a dictionary-encoded value column and large
-/// key pages. `f64` never enters.
-fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
+/// The per-file inefficient findings: a dictionary-encoded value column
+/// and large key pages. `f64` never enters.
+fn file_inefficient_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if facts.value_dictionary {
-        findings.push(Finding::cost(
+        findings.push(Finding::inefficient(
             FindingCode::DictionaryEncodedValue,
             Some(&report.path),
             format!(
@@ -892,14 +894,14 @@ fn file_cost_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
             Some(WriterProperty::EnableDictionary),
         ));
     }
-    if report.max_key_page_rows > thresholds::KEY_PAGE_ROWS_COST {
-        findings.push(Finding::cost(
+    if report.max_key_page_rows > thresholds::KEY_PAGE_ROWS_INEFFICIENT {
+        findings.push(Finding::inefficient(
             FindingCode::LargeKeyPages,
             Some(&report.path),
             format!(
                 "key pages hold up to {rows} rows, above {limit}; a lookup decodes that many keys ({property}={contract_rows})",
                 rows = report.max_key_page_rows,
-                limit = thresholds::KEY_PAGE_ROWS_COST,
+                limit = thresholds::KEY_PAGE_ROWS_INEFFICIENT,
                 property = WriterProperty::PageRowLimit,
                 contract_rows = contract::PAGE_ROWS,
             ),
@@ -1068,7 +1070,7 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
         .count();
     if unbucketed > 0 && g.files.len() > 1 {
         let probed = unbucketed + usize::from(unbucketed < g.files.len());
-        findings.push(Finding::cost(
+        findings.push(Finding::inefficient(
             FindingCode::NoBucketPartition,
             None,
             format!(
@@ -1080,7 +1082,7 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
         ));
     }
     for (&bucket, &probed) in g.overlapping_buckets() {
-        findings.push(Finding::cost(
+        findings.push(Finding::inefficient(
             FindingCode::OverlappingFiles,
             None,
             format!(
@@ -1112,7 +1114,7 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
     findings
 }
 
-/// Cost before advice, then the finding table's order, then by file in
+/// Inefficient before advice, then the finding table's order, then by file in
 /// generation order, which is the order the findings were raised in and
 /// the stable sort keeps, so two runs over one generation print the same
 /// report.
@@ -1153,8 +1155,8 @@ mod tests {
 
     use super::thresholds::{
         BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, MOST_VALUE_PAGE_BYTES,
-        VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
+        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_INEFFICIENT,
+        MOST_VALUE_PAGE_BYTES, VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
     use crate::error::Error;
@@ -1174,9 +1176,9 @@ mod tests {
     /// bucket may get, for the same reason.
     const CONTRACT_KEYS: i64 = 96;
     const MIN_BUCKET_KEYS: usize = 16;
-    /// Rows of the large-key-page fixture: one page just above the cost
-    /// threshold.
-    const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_COST + 1;
+    /// Rows of the large-key-page fixture: one page just above the
+    /// inefficient threshold.
+    const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_INEFFICIENT + 1;
     /// How many advice thresholds the large-value-page fixture's one page
     /// spans: two, so its mean is above the line and not at it.
     const LARGE_VALUE_PAGE_FACTOR: u64 = 2;
@@ -1435,13 +1437,13 @@ mod tests {
     }
 
     /// Asserts `report` raised exactly `expected`, in order, that every
-    /// cost finding and no advice carries a penalty, and that the summary's
+    /// inefficient finding and no advice carries a penalty, and that the summary's
     /// counts and serviceability follow them.
     fn assert_findings(report: &TableReport, expected: &[Shape]) {
         assert_eq!(shapes_of(&report.findings), expected);
         let costs = expected
             .iter()
-            .filter(|(_, tier, ..)| *tier == Tier::Cost)
+            .filter(|(_, tier, ..)| *tier == Tier::Inefficient)
             .count();
         assert_eq!(report.summary.costs, costs);
         assert_eq!(report.summary.advice, expected.len() - costs);
@@ -1452,7 +1454,7 @@ mod tests {
         for finding in &report.findings {
             assert_eq!(
                 finding.penalty().is_some(),
-                finding.tier() == Tier::Cost,
+                finding.tier() == Tier::Inefficient,
                 "{:?}",
                 finding.code
             );
@@ -1460,14 +1462,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_costs_is_inefficient_for_any_cost() {
+    fn test_from_costs_is_inefficient_for_any_inefficient_finding() {
         assert_eq!(Serviceability::from_costs(0), Serviceability::Efficient);
         assert_eq!(Serviceability::from_costs(1), Serviceability::Inefficient);
     }
 
     #[test]
     fn test_thresholds_derive_from_contract() {
-        assert_eq!(KEY_PAGE_ROWS_COST, 2 * contract::PAGE_ROWS);
+        assert_eq!(KEY_PAGE_ROWS_INEFFICIENT, 2 * contract::PAGE_ROWS);
         assert_eq!(
             VALUE_PAGE_BYTES_ADVICE,
             VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES
@@ -1565,8 +1567,8 @@ mod tests {
             Json::String("advice".to_string())
         );
         assert_eq!(
-            serde_json::to_value(Tier::Cost).unwrap(),
-            Json::String("cost".to_string())
+            serde_json::to_value(Tier::Inefficient).unwrap(),
+            Json::String("inefficient".to_string())
         );
         assert_eq!(
             serde_json::to_value(Serviceability::Efficient).unwrap(),
@@ -1663,7 +1665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_dictionary_encoded_value_is_a_cost_of_one_extra_get() {
+    async fn test_diagnose_dictionary_encoded_value_is_inefficient_by_one_extra_get() {
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
@@ -1674,7 +1676,7 @@ mod tests {
             &report,
             &[(
                 FindingCode::DictionaryEncodedValue,
-                Tier::Cost,
+                Tier::Inefficient,
                 Some(Penalty {
                     extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
                     ..Penalty::default()
@@ -1699,7 +1701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_large_key_pages_cost_is_the_rows_decoded() {
+    async fn test_diagnose_large_key_pages_penalty_is_the_rows_decoded() {
         let mut table = Table::bucketed(ONE);
         let keys = testing::long_keys(&testing::keys_from(0, LARGE_PAGE_ROWS));
         let layout = WriterLayout {
@@ -1714,7 +1716,7 @@ mod tests {
             &report,
             &[(
                 FindingCode::LargeKeyPages,
-                Tier::Cost,
+                Tier::Inefficient,
                 Some(Penalty {
                     keys_decoded_per_lookup: Some(LARGE_PAGE_ROWS),
                     ..Penalty::default()
@@ -1728,7 +1730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_no_bucket_partition_costs_every_file_probed() {
+    async fn test_diagnose_no_bucket_partition_penalty_is_every_file_probed() {
         let mut table = Table::new(KeyType::Long, unpartitioned());
         two_disjoint_files(&mut table, Partition::None, WriterLayout::contract()).await;
         let report = diagnose(&load(&mut table, Residency::Full, None).await);
@@ -1736,7 +1738,7 @@ mod tests {
             &report,
             &[(
                 FindingCode::NoBucketPartition,
-                Tier::Cost,
+                Tier::Inefficient,
                 Some(Penalty::files_probed(2)),
                 None,
                 None,
@@ -1765,7 +1767,7 @@ mod tests {
             &report,
             &[(
                 FindingCode::NoBucketPartition,
-                Tier::Cost,
+                Tier::Inefficient,
                 Some(Penalty::files_probed(3)),
                 None,
                 None,
@@ -1873,7 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_overlapping_files_cost_is_the_widest_group_of_the_bucket() {
+    async fn test_diagnose_overlapping_files_penalty_is_the_widest_group_of_the_bucket() {
         let mut table = Table::bucketed(ONE);
         let first = testing::keys_from(0, FILE_KEYS);
         let interleaved: Vec<i64> = first.iter().map(|key| key + 1).collect();
@@ -1886,7 +1888,7 @@ mod tests {
             &report,
             &[(
                 FindingCode::OverlappingFiles,
-                Tier::Cost,
+                Tier::Inefficient,
                 Some(Penalty::files_probed(2)),
                 Some(WriterProperty::SkewSplitting),
                 None,
@@ -2234,7 +2236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_orders_cost_before_advice_then_code_then_file() {
+    async fn test_diagnose_orders_inefficient_before_advice_then_code_then_file() {
         let mut table = Table::new(KeyType::Long, unpartitioned());
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
@@ -2262,21 +2264,21 @@ mod tests {
             &[
                 (
                     FindingCode::DictionaryEncodedValue,
-                    Tier::Cost,
+                    Tier::Inefficient,
                     dictionary,
                     Some(WriterProperty::EnableDictionary),
                     Some(a.clone()),
                 ),
                 (
                     FindingCode::DictionaryEncodedValue,
-                    Tier::Cost,
+                    Tier::Inefficient,
                     dictionary,
                     Some(WriterProperty::EnableDictionary),
                     Some(b.clone()),
                 ),
                 (
                     FindingCode::NoBucketPartition,
-                    Tier::Cost,
+                    Tier::Inefficient,
                     Some(Penalty::files_probed(2)),
                     None,
                     None,
@@ -2300,7 +2302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_serviceability_follows_cost_findings_only() {
+    async fn test_diagnose_serviceability_follows_inefficient_findings_only() {
         let advice_only = WriterLayout {
             bloom: Bloom::Off,
             ..WriterLayout::contract()
@@ -2310,11 +2312,11 @@ mod tests {
         assert_eq!(report.summary.serviceability, Serviceability::Efficient);
         assert_eq!((report.summary.costs, report.summary.advice), (0, 1));
 
-        let cost = WriterLayout {
+        let inefficient = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        let (_table, generation) = one_file(cost).await;
+        let (_table, generation) = one_file(inefficient).await;
         let report = diagnose(&generation);
         assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
         assert_eq!((report.summary.costs, report.summary.advice), (1, 0));
@@ -2393,7 +2395,7 @@ mod tests {
     }
 
     /// The report of a one-file table whose value column is
-    /// dictionary-encoded, so it carries exactly one cost finding, with the
+    /// dictionary-encoded, so it carries exactly one inefficient finding, with the
     /// JSON it serializes to.
     async fn dictionary_value_report() -> (Table, TableReport, Json) {
         let layout = WriterLayout {
@@ -2457,7 +2459,7 @@ mod tests {
     async fn test_serialize_finding_snake_case_fields_with_display_strings() {
         let (table, _report, json) = dictionary_value_report().await;
         let finding = &json["findings"][0];
-        assert_eq!(finding["tier"], Json::String("cost".to_string()));
+        assert_eq!(finding["tier"], Json::String("inefficient".to_string()));
         assert_eq!(
             finding["code"],
             Json::String(FindingCode::DictionaryEncodedValue.to_string())

@@ -1,9 +1,9 @@
 //! The contract fixture and one fixture per `FindingCode` (RFD 007, RFD
 //! 016), each written through the Iceberg writer and diagnosed after a Full
 //! load. Every test asserts the designed code at its tier and the exact set
-//! of codes the report raises: the cost set is the designed one (empty for
+//! of codes the report raises: the inefficient set is the designed one (empty for
 //! an advice fixture), and advice a layout cannot avoid is named in the
-//! test's doc comment and asserted with it. `strict` refuses a cost fixture
+//! test's doc comment and asserted with it. `strict` refuses an inefficient fixture
 //! naming its codes and loads an advice fixture: the doctor's verdicts live
 //! here, the GET costs of the same layouts in `lookup.rs` and `refresh.rs`.
 //! The completeness of `FindingCode::ALL` is core's to prove (its successor
@@ -19,7 +19,7 @@ use icetray_core::approx;
 use icetray_core::check::Tier;
 use icetray_core::check::thresholds::{
     BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-    FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_COST, MOST_VALUE_PAGE_BYTES,
+    FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_INEFFICIENT, MOST_VALUE_PAGE_BYTES,
 };
 use icetray_core::config::Residency;
 use icetray_core::{
@@ -38,9 +38,9 @@ use icetray_testkit::{
     write_fixture,
 };
 
-/// Rows per key page of the large-key-page fixture: twice the cost
-/// threshold, so the finding is a cost and not the chosen margin.
-const LARGE_PAGE_ROWS: i64 = 2 * KEY_PAGE_ROWS_COST;
+/// Rows per key page of the large-key-page fixture: twice the inefficient
+/// threshold, so the finding is inefficient and not the chosen margin.
+const LARGE_PAGE_ROWS: i64 = 2 * KEY_PAGE_ROWS_INEFFICIENT;
 
 /// Ids of the large-key-page fixture: two such pages in its one file.
 const LARGE_PAGE_IDS: Range<u64> = 0..8_000;
@@ -120,13 +120,14 @@ fn codes_at(report: &TableReport, tier: Tier) -> BTreeSet<FindingCode> {
         .collect()
 }
 
-/// Asserts `report` raises exactly `costs` at `Cost` and `advice` at
-/// `Advice`, and that its serviceability follows the costs.
-fn assert_codes(report: &TableReport, costs: &[FindingCode], advice: &[FindingCode]) {
+/// Asserts `report` raises exactly `inefficient` at `Tier::Inefficient`
+/// and `advice` at `Tier::Advice`, and that its serviceability follows the
+/// inefficient findings.
+fn assert_codes(report: &TableReport, inefficient: &[FindingCode], advice: &[FindingCode]) {
     assert_eq!(
-        codes_at(report, Tier::Cost),
-        costs.iter().copied().collect::<BTreeSet<_>>(),
-        "cost findings: {:?}",
+        codes_at(report, Tier::Inefficient),
+        inefficient.iter().copied().collect::<BTreeSet<_>>(),
+        "inefficient findings: {:?}",
         report.findings
     );
     assert_eq!(
@@ -135,7 +136,7 @@ fn assert_codes(report: &TableReport, costs: &[FindingCode], advice: &[FindingCo
         "advice findings: {:?}",
         report.findings
     );
-    let serviceability = if costs.is_empty() {
+    let serviceability = if inefficient.is_empty() {
         Serviceability::Efficient
     } else {
         Serviceability::Inefficient
@@ -147,7 +148,7 @@ fn assert_codes(report: &TableReport, costs: &[FindingCode], advice: &[FindingCo
     );
 }
 
-/// Serves `fixture` under `strict`: the cost codes the refusal names, or
+/// Serves `fixture` under `strict`: the inefficient codes the refusal names, or
 /// none when it loads, which advice alone must allow.
 async fn strict_refusal(fixture: &Fixture, catalog: &Arc<dyn Catalog>) -> Result<Vec<FindingCode>> {
     let Err(error) = verify::serve_catalog(fixture, catalog, Residency::Full, true).await else {
@@ -183,7 +184,7 @@ async fn test_contract_fixture_is_efficient_with_no_findings() -> Result<()> {
 /// A dictionary-encoded value column costs one dictionary page per file on
 /// a cold cache besides the value pages, and nothing warm.
 #[tokio::test]
-async fn test_dictionary_encoded_value_is_a_cost_of_one_extra_get() -> Result<()> {
+async fn test_dictionary_encoded_value_is_inefficient_by_one_extra_get() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         layout: Layout {
@@ -223,7 +224,7 @@ async fn test_dictionary_encoded_value_is_a_cost_of_one_extra_get() -> Result<()
 }
 
 #[tokio::test]
-async fn test_large_key_pages_cost_is_the_rows_decoded() -> Result<()> {
+async fn test_large_key_pages_penalty_is_the_rows_decoded() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         ids: LARGE_PAGE_IDS,
@@ -248,9 +249,9 @@ async fn test_large_key_pages_cost_is_the_rows_decoded() -> Result<()> {
 }
 
 /// Twenty unbucketed files of a few hundred kibibytes in one bucket also
-/// draw `ManyFilesPerBucket`; `strict` refuses the cost and names only it.
+/// draw `ManyFilesPerBucket`; `strict` refuses the inefficiency and names only it.
 #[tokio::test]
-async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
+async fn test_no_bucket_partition_is_inefficient() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         buckets: 0,
@@ -283,7 +284,7 @@ async fn test_no_bucket_partition_is_a_cost() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_overlapping_files_is_a_cost() -> Result<()> {
+async fn test_overlapping_files_is_inefficient() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let mut fixture = write_fixture(
         catalog.as_ref(),

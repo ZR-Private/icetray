@@ -40,11 +40,11 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// (`Generation::verify_buckets`, which decodes and hashes every key and
 /// which no load or refresh runs) finds a key outside its file's recorded
 /// bucket or cannot finish: that table would answer a present key absent,
-/// so it is a refusal, not a cost or advice (RFD 007). Every table is
-/// opened with `strict` off, so a table `strict` would refuse for cost is
-/// reported rather than refused (RFD 016). The exit code is `EXIT_FAILURE`
-/// when any table was refused, else `EXIT_INEFFICIENT` when any serves at
-/// a cost, else `EXIT_OK`.
+/// so it is a refusal, not an inefficiency or advice (RFD 007). Every
+/// table is opened with `strict` off, so a table `strict` would refuse as
+/// inefficient is reported rather than refused (RFD 016). The exit code is
+/// `EXIT_FAILURE` when any table was refused, else `EXIT_INEFFICIENT` when
+/// any is inefficient, else `EXIT_OK`.
 pub async fn doctor(
     config: &Config,
     only: Option<&str>,

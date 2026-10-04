@@ -1,6 +1,6 @@
 //! The table lifecycle (RFD 005, RFD 007): a `Table` follows one ref,
 //! builds each new snapshot as a `Generation` beside the one it serves,
-//! runs the doctor on the new generation and refuses a cost-tier one under
+//! runs the doctor on the new generation and refuses an inefficient one under
 //! `strict`, then swaps it in atomically. Loads and refreshes of one table
 //! are serialized; a failed one leaves the last generation serving and the
 //! table `Degraded`. A lookup takes one generation and answers from it
@@ -883,10 +883,11 @@ impl Table {
     }
 
     /// The strict gate (RFD 007, RFD 016): the doctor's verdict on a built
-    /// generation before it is swapped in. Every finding is logged, cost at
-    /// warn and advice at info. Under `strict`, a cost-tier generation is
-    /// dropped, never swapped, as `Error::Inefficient` with the distinct
-    /// cost codes in the report's order; advice never affects admission.
+    /// generation before it is swapped in. Every finding is logged,
+    /// inefficient at warn and advice at info. Under `strict`, an
+    /// inefficient generation is dropped, never swapped, as
+    /// `Error::Inefficient` with the distinct inefficient codes in the
+    /// report's order; advice never affects admission.
     /// `Ok` carries the admitted generation's findings per code, for the
     /// `findings` gauge; a refused generation's reach the logs and the
     /// error and never the gauge, which describes the serving generation.
@@ -900,7 +901,7 @@ impl Table {
         match report.summary.serviceability {
             Serviceability::Inefficient if self.config.strict => Err(Error::Inefficient {
                 table: self.config.name.clone(),
-                findings: cost_codes(&report.findings),
+                findings: inefficient_codes(&report.findings),
             }),
             Serviceability::Inefficient | Serviceability::Efficient => Ok(counts),
         }
@@ -1063,7 +1064,7 @@ impl fmt::Debug for Table {
     }
 }
 
-/// One finding as a log event: cost at warn, advice at info, with the
+/// One finding as a log event: inefficient at warn, advice at info, with the
 /// table, code, tier, and file as fields and the finding's message as the
 /// event's.
 fn log_finding(table: &str, finding: &Finding) {
@@ -1072,18 +1073,18 @@ fn log_finding(table: &str, finding: &Finding) {
     let tier = finding.tier();
     let file = finding.file();
     match tier {
-        Tier::Cost => tracing::warn!(table, code = %code, tier = ?tier, file, "{message}"),
+        Tier::Inefficient => tracing::warn!(table, code = %code, tier = ?tier, file, "{message}"),
         Tier::Advice => tracing::info!(table, code = %code, tier = ?tier, file, "{message}"),
     }
 }
 
-/// The distinct codes of the cost findings, in the order the report gives
+/// The distinct codes of the inefficient findings, in the order the report gives
 /// them: what `Error::Inefficient` carries.
-fn cost_codes(findings: &[Finding]) -> Vec<FindingCode> {
+fn inefficient_codes(findings: &[Finding]) -> Vec<FindingCode> {
     let mut codes = Vec::new();
     for finding in findings
         .iter()
-        .filter(|finding| finding.tier() == Tier::Cost)
+        .filter(|finding| finding.tier() == Tier::Inefficient)
     {
         if !codes.contains(&finding.code()) {
             codes.push(finding.code());
@@ -1731,12 +1732,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_strict_refuses_a_cost_finding_and_only_that() {
-        let cost = WriterLayout {
+    async fn test_load_strict_refuses_an_inefficient_finding_and_only_that() {
+        let inefficient = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        let fixture = one_file_fixture(cost).await;
+        let fixture = one_file_fixture(inefficient).await;
         let strict = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         assert!(strict.config.strict);
         let error = strict.load().await.unwrap_err();
@@ -2007,15 +2008,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_strict_refuses_a_cost_finding_and_keeps_serving() {
+    async fn test_refresh_strict_refuses_an_inefficient_finding_and_keeps_serving() {
         let (mut fixture, all) = two_bucket_table().await;
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         table.load().await.unwrap();
-        let cost = WriterLayout {
+        let inefficient = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        append_second(&mut fixture, &all, "dict", cost).await;
+        append_second(&mut fixture, &all, "dict", inefficient).await;
         let error = table.refresh().await.unwrap_err();
         let Error::Inefficient { findings, .. } = error else {
             panic!("expected Inefficient, got {error:?}");
@@ -2386,12 +2387,12 @@ mod tests {
 
     #[test]
     fn test_metrics_findings_and_index_bytes_describe_the_serving_generation() {
-        let cost = WriterLayout {
+        let inefficient = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
         let ((lenient_bytes, strict_bytes), series) = recorded(async {
-            let fixture = one_file_fixture(cost).await;
+            let fixture = one_file_fixture(inefficient).await;
             let lenient = table_over(
                 &fixture,
                 TableConfig {
@@ -2414,7 +2415,7 @@ mod tests {
             .await;
             strict.load().await.unwrap();
             let strict_bytes = strict.current().unwrap().index_bytes;
-            append_second(&mut fixture, &all, "dict", cost).await;
+            append_second(&mut fixture, &all, "dict", inefficient).await;
             assert!(matches!(
                 strict.refresh().await.unwrap_err(),
                 Error::Inefficient { .. }

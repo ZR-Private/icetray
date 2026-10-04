@@ -42,5 +42,5 @@ pub const MAX_KEY_BYTES: usize = 4_096;
 
 /// The key length above which the doctor advises. Resident bytes per key
 /// grow with key length, and the price is memory, which no penalty unit
-/// measures, so the finding is advice rather than a cost (RFD 008).
+/// measures, so the finding is advice rather than inefficient (RFD 008).
 pub const KEY_BYTES_ADVICE: usize = 128;

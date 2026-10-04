@@ -1,8 +1,8 @@
 //! Serving fixture tables from a memory catalog on local disk in the Full
 //! tier (the P tier of RFD 014): routing over every key type, one GET per
 //! cold hit and none per warm hit or miss, `Generation::plan` as the oracle
-//! for `multi_get`, and the GET costs of the layouts the doctor prices or
-//! advises on; `findings.rs` holds the doctor's verdicts on them.
+//! for `multi_get`, and the GET costs of the layouts the doctor finds
+//! inefficient or advises on; `findings.rs` holds the doctor's verdicts on them.
 
 use icetray_core::approx::{count, length};
 use icetray_core::config::Residency;

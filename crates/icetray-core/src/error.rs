@@ -46,12 +46,12 @@ pub enum Error {
         /// Why it cannot be served (RFD 007).
         reason: RefusalReason,
     },
-    /// The table serves at a cost and `strict` is on.
-    #[error("table {table} serves at a cost and strict is on: {}", finding_list(.findings))]
+    /// The table is inefficient and `strict` is on.
+    #[error("table {table} is inefficient and strict is on: {}", finding_list(.findings))]
     Inefficient {
         /// The table's configured name.
         table: String,
-        /// The cost findings the doctor raised.
+        /// The inefficient findings the doctor raised.
         findings: Vec<FindingCode>,
     },
     /// A lookup key whose type is not the table's key type.

@@ -85,8 +85,8 @@ Load is per file, so load time follows file count
 and that pressure is one the file-size target in RFD 002 weighs.
 
 A lookup's CPU cost depends on the size of the key page it decodes. That
-is why RFD 007 (Serving tiers) lists oversized key pages as a cost
-finding: they serve at the same GET count but cost more to decode. A miss
+is why RFD 007 (Serving tiers) lists oversized key pages as an
+inefficient finding: they serve at the same GET count but cost more to decode. A miss
 costs no round trip
 ([prototype findings, finding 12](../analysis/2026-09-10-prototype-findings.md#12-deterministic-simulation)).
 Resident bytes per key grow with key length

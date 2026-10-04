@@ -64,9 +64,9 @@ pub enum Command {
         #[arg(long, short, env = ENV_CONFIG)]
         config: PathBuf,
     },
-    /// Diagnose tables: serviceability, cost findings with their penalties,
-    /// and advice. Exits 2 when a table serves at a cost, 1 when one cannot
-    /// be loaded or is refused.
+    /// Diagnose tables: serviceability, inefficient findings with their
+    /// penalties, and advice. Exits 2 when a table is inefficient, 1 when
+    /// one cannot be loaded or is refused.
     Doctor {
         /// Where the tables come from.
         #[command(flatten)]

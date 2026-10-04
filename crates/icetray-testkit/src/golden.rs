@@ -90,7 +90,8 @@ pub enum GoldenTable {
     /// `long_v3_50k`: the contract layout, long keys, in table format
     /// version 3 (the recipe's `FORMAT_V3`).
     LongV3_50k,
-    /// `default_layout_1m`: the writer's defaults, priced by the doctor.
+    /// `default_layout_1m`: the writer's defaults, which the doctor finds
+    /// inefficient.
     DefaultLayout1m,
     /// `unpartitioned_500k`: no bucket partition.
     Unpartitioned500k,

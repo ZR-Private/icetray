@@ -70,12 +70,12 @@ them are the writer recipe in the
   ([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
   Whether to lower the target is open, below.
 
-A table that misses a checked clause is refused, served at a penalty, or
-served with advice, depending on its tier (RFD 007 (Serving tiers)). What
-the doctor checks and how it reports is RFD 016 (Doctor). Two clauses are
-listed for completeness and draw no finding. One is the codec. The other
-is dictionary encoding on the key column, whose dictionary page costs
-nothing extra once the chunk is resident. The file-size clause draws
+A table that misses a checked clause is refused, served as inefficient,
+or served with advice, depending on its tier (RFD 007 (Serving tiers)).
+What the doctor checks and how it reports is RFD 016 (Doctor). Two
+clauses are listed for completeness and draw no finding. One is the codec.
+The other is dictionary encoding on the key column, whose dictionary page
+costs nothing extra once the chunk is resident. The file-size clause draws
 advice only above the doctor's threshold, so a file between the target and
 that threshold passes unremarked.
 
@@ -112,9 +112,9 @@ legitimate row and the wire can say so without ambiguity. Refusing nulls
 would rule out the membership-set use and gain nothing in correctness.
 
 Requiring the contract and refusing every other table. Rejected because
-off-contract tables serve correctly at a cost
+off-contract tables serve correctly, if inefficiently
 ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)),
-and pricing that cost is RFD 007's domain.
+and measuring that inefficiency is RFD 007's domain.
 
 ## Consequences
 
@@ -149,4 +149,4 @@ not overlap, however many the file-size target rolls. On is the writer's
 default and balances a skewed bucket across tasks, at the price that a
 bucket may hold overlapping sorted files
 ([prototype findings, finding 9](../analysis/2026-09-10-prototype-findings.md#9-spark-writes-several-sorted-files-per-bucket-sometimes-overlapping)),
-which is a cost finding that RFD 007 (Serving tiers) prices.
+which RFD 007 (Serving tiers) reports as an inefficient finding.

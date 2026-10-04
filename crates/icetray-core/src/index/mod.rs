@@ -820,8 +820,8 @@ impl FileIndex {
     /// The value at `row` and where its page came from: the one value page
     /// holding it through `cache` (one GET cold, none warm) and, when the
     /// value column chunk has a dictionary page, that page too (the one
-    /// extra GET RFD 007 prices), then exactly one row decoded. `Some`
-    /// carries the bytes unchanged, a slice of the fetched page where
+    /// extra GET of RFD 007's penalty), then exactly one row decoded.
+    /// `Some` carries the bytes unchanged, a slice of the fetched page where
     /// parquet decoded them in place and a copy otherwise (`value_bytes`);
     /// `None` is a null value, distinct from an absent key. The origin is
     /// the value page's: `Fetched` for the GET of a cold hit, `Cached` for a warm one; the dictionary page, when there

@@ -47,8 +47,8 @@ file; how that depth grows with more files is open
 Data files in one bucket whose exact key ranges intersect form an overlap
 group. The group's sorted key runs are merged from the resident key column
 chunks to find any key present in more than one file. A duplicate key is a
-refusal. Overlap without duplicates is a cost finding, priced under RFD 007
-(Serving tiers).
+refusal. Overlap without duplicates is an inefficient finding, measured under
+RFD 007 (Serving tiers).
 
 When a refresh fails, the last good generation keeps serving and the
 failure is reported. A server refuses to start if any configured table

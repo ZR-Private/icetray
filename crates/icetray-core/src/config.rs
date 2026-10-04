@@ -63,7 +63,7 @@ const DEFAULT_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// (`cache::check_capacity`).
 const PARSE_CACHE_SHARDS: usize = 1;
 
-/// `strict` when a table says nothing: on. A table that serves at a cost is
+/// `strict` when a table says nothing: on. A table that is inefficient is
 /// refused until its owner turns strict off with one line (RFD 007).
 const DEFAULT_STRICT: bool = true;
 
@@ -935,7 +935,7 @@ pub struct TableConfig {
     pub key_column: String,
     /// The value column; Iceberg binary, fixed, or string.
     pub value_column: String,
-    /// Refuse a generation the doctor prices at a cost (RFD 007).
+    /// Refuse a generation the doctor finds inefficient (RFD 007).
     #[serde(default = "default_strict")]
     pub strict: bool,
     /// Where the key chunks live (RFD 017).

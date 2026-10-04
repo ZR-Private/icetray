@@ -24,7 +24,8 @@ Snapshots whose data files are the whole truth (appends and copy-on-write
 upserts) will be served, re-indexing only the files that changed; snapshots
 carrying delete files or deletion vectors (merge-on-read) will be refused
 in the first version, with a compaction-advanced serving ref as the
-recommended pattern and native merge-on-read reads as a later cost tier.
+recommended pattern and native merge-on-read reads as a later inefficient
+finding.
 
 Whole-truth snapshots need nothing new. Under RFD 005 (Generations and
 refresh) a refresh already pays only for the files that changed, so an
@@ -43,16 +44,17 @@ generation keeps serving, and the table advances again once the ref moves
 to a snapshot without delete files. At boot there is no generation to keep,
 so RFD 005's start-or-fail rule applies.
 
-The later cost tier would apply deletion vectors and equality deletes
-newest file first, priced by uncompacted deltas per bucket. That is a unit
-RFD 007 (Serving tiers) would have to add to its penalty vocabulary.
+Native merge-on-read would apply deletion vectors and equality deletes
+newest file first, an inefficient finding measured by uncompacted deltas
+per bucket. That is a unit RFD 007 (Serving tiers) would have to add to
+its penalty vocabulary.
 
 ## Alternatives Considered
 
 Native merge-on-read in the first version. Rejected because the per-lookup
 cost of applying deletes is unknown
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
-and a cost tier needs a measured penalty before it can be one.
+and an inefficient finding needs a measured penalty before it can be one.
 
 Serve only full rebuilds. Rejected because appends and copy-on-write
 upserts produce data files that are the truth, and refresh already pays

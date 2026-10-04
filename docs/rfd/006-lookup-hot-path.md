@@ -40,7 +40,7 @@ The path is the same for every table whose key chunks are resident:
 
 Two more segments are intended reads, counted as reads rather than raised
 as errors. One is the value column's dictionary page when one exists, which
-is the GET that RFD 007 (Serving tiers) prices. The other is the key page
+is the extra GET that RFD 007 (Serving tiers) counts as its penalty. The other is the key page
 itself under the disk and bloom tiers of RFD 017 (Residency tiers), which
 fixes where that page comes from and what it costs.
 
@@ -78,8 +78,8 @@ two pages, and little to the lookup itself; which page dominates depends
 on whether the values compress
 ([prototype findings, finding 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)).
 That is why RFD 002 (Serving layout contract) bounds value pages by bytes
-for large values, and why large key pages are a cost finding priced in
-RFD 007.
+for large values, and why large key pages are an inefficient finding
+measured in RFD 007.
 
 A layout the resident index does not cover fails loudly, as an error in
 the counting tests of RFD 014 (Test layering), instead of showing up as an

@@ -128,11 +128,11 @@ fn string_text(key: &Key) -> String {
     text.clone()
 }
 
-fn cost_codes(golden: &Golden) -> Vec<FindingCode> {
+fn inefficient_codes(golden: &Golden) -> Vec<FindingCode> {
     diagnose(&golden.current())
         .findings
         .iter()
-        .filter(|finding| finding.tier() == Tier::Cost)
+        .filter(|finding| finding.tier() == Tier::Inefficient)
         .map(Finding::code)
         .collect()
 }
@@ -165,7 +165,7 @@ async fn test_golden_long_contract_serves_one_get_per_hit() -> Result<()> {
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_string_contract_serves() -> Result<()> {
     let golden = open_golden(GoldenTable::Str2m, false).await?;
-    assert!(cost_codes(&golden).is_empty());
+    assert!(inefficient_codes(&golden).is_empty());
     let keys: Vec<Key> = IDS_2M.iter().map(|&id| golden::string_key(id)).collect();
     verify_contract_hits(&golden, &keys, |key| golden::value(&string_text(key))).await
 }
@@ -177,7 +177,7 @@ async fn test_golden_string_contract_serves() -> Result<()> {
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_bin16_contract_serves() -> Result<()> {
     let golden = open_golden(GoldenTable::Bin16_500k, false).await?;
-    assert!(cost_codes(&golden).is_empty());
+    assert!(inefficient_codes(&golden).is_empty());
     let generation = golden.current();
     let keys: Vec<Key> = generation
         .files
@@ -237,7 +237,7 @@ async fn test_golden_wide_values_are_byte_bounded() -> Result<()> {
 }
 
 /// A contract table in table format version 3 serves as version 2 does:
-/// the doctor finds it efficient with no cost finding, and a cold hit costs
+/// the doctor finds it efficient with no inefficient finding, and a cold hit costs
 /// the value pages the oracle names. Its files are small, so the writer's
 /// fixed-size bloom filter may draw advice; that is the doctor's to report.
 #[tokio::test]
@@ -254,18 +254,22 @@ async fn test_golden_format_v3_contract_serves_one_get_per_hit() -> Result<()> {
     assert_eq!(metadata.format_version(), FormatVersion::V3);
     let report = diagnose(&generation);
     assert_eq!(report.summary.serviceability, Serviceability::Efficient);
-    assert!(cost_codes(&golden).is_empty(), "{:?}", report.findings);
+    assert!(
+        inefficient_codes(&golden).is_empty(),
+        "{:?}",
+        report.findings
+    );
     let keys: Vec<Key> = IDS_50K.iter().map(|&id| golden::long_key(id)).collect();
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
-async fn test_golden_default_layout_is_priced() -> Result<()> {
+async fn test_golden_default_layout_is_inefficient() -> Result<()> {
     let golden = open_golden(GoldenTable::DefaultLayout1m, false).await?;
     let report = diagnose(&golden.current());
     assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
-    assert!(cost_codes(&golden).contains(&FindingCode::LargeKeyPages));
+    assert!(inefficient_codes(&golden).contains(&FindingCode::LargeKeyPages));
     let advice = advice_codes(&golden);
     assert!(advice.contains(&FindingCode::NoBloomFilter), "{advice:?}");
     assert!(advice.contains(&FindingCode::LargeValuePages), "{advice:?}");
@@ -295,16 +299,16 @@ async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
-async fn test_golden_unpartitioned_is_priced() -> Result<()> {
+async fn test_golden_unpartitioned_is_inefficient() -> Result<()> {
     let golden = open_golden(GoldenTable::Unpartitioned500k, false).await?;
-    assert!(cost_codes(&golden).contains(&FindingCode::NoBucketPartition));
+    assert!(inefficient_codes(&golden).contains(&FindingCode::NoBucketPartition));
     let keys: Vec<Key> = IDS_500K.iter().map(|&id| golden::long_key(id)).collect();
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
-async fn test_golden_overlap_serves_and_prices_overlap() -> Result<()> {
+async fn test_golden_overlap_serves_and_reports_overlap_inefficient() -> Result<()> {
     let golden = open_golden(GoldenTable::Overlap250k, false).await?;
     let keys: Vec<Key> = IDS_250K
         .iter()
@@ -323,7 +327,10 @@ async fn test_golden_overlap_serves_and_prices_overlap() -> Result<()> {
          (spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled), \
          so each bucket is split across several sorted tasks; regenerate the table"
     );
-    let costs = cost_codes(&golden);
-    assert!(costs.contains(&FindingCode::OverlappingFiles), "{costs:?}");
+    let inefficient = inefficient_codes(&golden);
+    assert!(
+        inefficient.contains(&FindingCode::OverlappingFiles),
+        "{inefficient:?}"
+    );
     Ok(())
 }
