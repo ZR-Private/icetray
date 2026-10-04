@@ -9,6 +9,11 @@
 > whose checksum and verification context match without decoding a key;
 > chunk files are no longer synced when written.
 
+> Updated 2026-10-04: the descriptor rule counts the page cache's disk
+> level, one descriptor per 4 MiB block, apart from the headroom, and
+> counts a load's concurrent reads; icetray raises its soft open-file
+> limit to the hard limit at start.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -157,10 +162,19 @@ and a directory mounted `noatime` makes none.
 
 The disk tier holds one open file descriptor per data file for the life of
 its generation, and twice that while a refresh that rewrote the table
-loads beside the serving generation. A deployment sizes its descriptor
-limit to at least twice its disk-tier file count plus a headroom of 1,024
-for sockets, the page cache's disk level, and the one chunk file that
-retention opens at a time.
+loads beside the serving generation. The page cache's disk level holds one
+descriptor per 4 MiB block for the life of the process, 2,048 for an 8 GiB
+level, and a load keeps up to 128 reads in flight per worker thread, at
+most 1,024, each a descriptor. A deployment therefore sizes its
+descriptor limit to at least twice its disk-tier data files, plus
+`page_cache_disk_bytes` / 4 MiB, plus the load's concurrent reads up to
+1,024, plus a headroom for sockets and the one chunk file that retention
+opens at a time. The disk level is a term of its own rather than part of
+the headroom, because at a few gigabytes it alone exceeds any fixed
+headroom. icetray
+raises its soft limit to the hard limit at start, so the hard limit is the
+one a deployment sets, and the server warns at start when that limit is
+below what the disk level and a load need.
 
 Load peaks differ by tier. The disk tier holds one overlap group's chunks
 at a time, since a group is verified by reading pages back from the chunk
