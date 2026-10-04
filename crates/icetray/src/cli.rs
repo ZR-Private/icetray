@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
+use icetray_core::catalog::table_root_name;
 use icetray_core::config::{
     Config, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig, SourceConfig,
     StorageConfig, TableConfig,
@@ -26,8 +27,10 @@ use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 /// a path.
 pub const ENV_CONFIG: &str = "ICETRAY_CONFIG";
 
-/// The name a `--location` table is opened and printed under.
-pub const LOCATION_TABLE_NAME: &str = "table";
+/// The name a `--location` table is opened and printed under when its
+/// table root has no last component to name it after
+/// (`catalog::table_root_name`), as for a bucket alone.
+pub const LOCATION_FALLBACK_TABLE_NAME: &str = "table";
 
 /// The key column of a `--location` table when `--key-column` says nothing.
 pub const DEFAULT_KEY_COLUMN: &str = "key";
@@ -125,7 +128,8 @@ pub struct Target {
     #[arg(long, short)]
     pub config: Option<PathBuf>,
     /// A table root or a metadata file to open without a configuration
-    /// file, under the name `table`; `ICETRAY_CONFIG` is ignored.
+    /// file, under the name of the table root's last directory;
+    /// `ICETRAY_CONFIG` is ignored.
     #[arg(long, conflicts_with = "config")]
     pub location: Option<String>,
     /// A location prefix rewrite FROM=TO applied before any read; repeatable,
@@ -261,14 +265,23 @@ impl Target {
     /// rule that matches, so a command-line rule takes precedence over the
     /// file's for the same prefix. A violation names a file rule by its
     /// index in the file. No flag and no variable, or an empty one, is
-    /// `NoTarget`.
-    pub fn config(&self) -> Result<Config, CliError> {
-        self.config_with_env(std::env::var_os(ENV_CONFIG))
+    /// `NoTarget`. A run that selects a table by name, `table`, selects
+    /// among configured tables, so with `--location` it is
+    /// `TableWithLocation`.
+    pub fn config(&self, table: Option<&str>) -> Result<Config, CliError> {
+        self.config_with_env(table, std::env::var_os(ENV_CONFIG))
     }
 
     /// `config` with the variable's value passed in, so a test needs no
     /// process environment.
-    fn config_with_env(&self, env: Option<OsString>) -> Result<Config, CliError> {
+    fn config_with_env(
+        &self,
+        table: Option<&str>,
+        env: Option<OsString>,
+    ) -> Result<Config, CliError> {
+        if table.is_some() && self.location.is_some() {
+            return Err(CliError::TableWithLocation);
+        }
         let mut config = match &self.location {
             Some(location) => self.location_config(location.clone()).validated()?,
             None => {
@@ -284,13 +297,15 @@ impl Target {
     }
 
     /// The configuration of one table at `location` under this target's
-    /// column, ref, and residency flags or their defaults.
+    /// column, ref, and residency flags or their defaults, named after its
+    /// table root.
     fn location_config(&self, location: String) -> Config {
         Config {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             tables: vec![TableConfig {
-                name: LOCATION_TABLE_NAME.to_string(),
+                name: table_root_name(&location)
+                    .unwrap_or_else(|| LOCATION_FALLBACK_TABLE_NAME.to_string()),
                 source: SourceConfig::Static { location },
                 r#ref: self
                     .r#ref
@@ -344,7 +359,7 @@ mod tests {
     fn test_config_synthesizes_the_location_table_with_defaults() {
         let rewrite = format!("{REWRITE_FROM}={REWRITE_TO}");
         let cli = parse(&["info", "--location", LOCATION, "--rewrite", &rewrite]).unwrap();
-        let config = target(cli).config().unwrap();
+        let config = target(cli).config(None).unwrap();
         assert_eq!(config.server, ServerConfig::default());
         assert_eq!(
             config.storage,
@@ -359,7 +374,7 @@ mod tests {
         assert_eq!(
             config.tables,
             vec![TableConfig {
-                name: LOCATION_TABLE_NAME.to_string(),
+                name: "kv".to_string(),
                 source: SourceConfig::Static {
                     location: LOCATION.to_string(),
                 },
@@ -389,7 +404,7 @@ mod tests {
             "bloom",
         ])
         .unwrap();
-        let config = target(cli).config().unwrap();
+        let config = target(cli).config(None).unwrap();
         let table = &config.tables[0];
         assert_eq!(table.key_column, "id");
         assert_eq!(table.value_column, "payload");
@@ -438,15 +453,15 @@ value_column = "value"
 
         let bare = target(parse(&["info"]).unwrap());
         let from_env = bare
-            .config_with_env(Some(file.path().as_os_str().to_owned()))
+            .config_with_env(None, Some(file.path().as_os_str().to_owned()))
             .unwrap();
         assert_eq!(from_env.tables[0].name, "kv");
         for unset in [None, Some(OsString::new())] {
-            let error = bare.config_with_env(unset.clone()).unwrap_err();
+            let error = bare.config_with_env(None, unset.clone()).unwrap_err();
             assert!(matches!(error, CliError::NoTarget), "{unset:?}: {error:?}");
         }
         let unreadable = bare
-            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .config_with_env(None, Some(missing.as_os_str().to_owned()))
             .unwrap_err();
         assert!(
             matches!(
@@ -459,15 +474,34 @@ value_column = "value"
 
         let located = target(parse(&["info", "--location", LOCATION]).unwrap());
         let ignoring_env = located
-            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .config_with_env(None, Some(missing.as_os_str().to_owned()))
             .unwrap();
-        assert_eq!(ignoring_env.tables[0].name, LOCATION_TABLE_NAME);
+        assert_eq!(ignoring_env.tables[0].name, "kv");
 
         let flagged = target(parse(&["info", "--config", file.path().to_str().unwrap()]).unwrap());
         let from_flag = flagged
-            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .config_with_env(None, Some(missing.as_os_str().to_owned()))
             .unwrap();
         assert_eq!(from_flag.tables[0].name, "kv");
+    }
+
+    #[test]
+    fn test_config_names_a_located_table_after_its_root_or_the_fallback() {
+        for (location, name) in [
+            ("s3://warehouse/db/kv/metadata/v3.metadata.json", "kv"),
+            ("s3://warehouse", LOCATION_FALLBACK_TABLE_NAME),
+        ] {
+            let cli = parse(&["info", "--location", location]).unwrap();
+            let config = target(cli).config(None).unwrap();
+            assert_eq!(config.tables[0].name, name, "{location}");
+        }
+    }
+
+    #[test]
+    fn test_config_refuses_a_table_name_with_a_location() {
+        let located = target(parse(&["info", "--location", LOCATION]).unwrap());
+        let error = located.config_with_env(Some("kv"), None).unwrap_err();
+        assert!(matches!(error, CliError::TableWithLocation), "{error:?}");
     }
 
     #[test]
@@ -599,7 +633,7 @@ value_column = "value"
         let rewrite = format!("{REWRITE_FROM}={REWRITE_TO}");
         let path = file.path().to_str().unwrap();
         let cli = parse(&["info", "--config", path, "--rewrite", &rewrite]).unwrap();
-        let config = target(cli).config().unwrap();
+        let config = target(cli).config(None).unwrap();
         assert_eq!(
             config.storage.rewrite,
             vec![

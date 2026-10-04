@@ -39,7 +39,7 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
-/// configuration and no target, a `--table` name no table is configured under, a table name
+/// configuration and no target, `--table` with `--location`, a `--table` name no table is configured under, a table name
 /// required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
@@ -65,6 +65,8 @@ pub fn render(message: &dyn fmt::Display, hint: Option<&Hint>) -> String {
 /// How to fix a failure, where the fix is plain from the failure alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hint {
+    /// Choose between selecting a configured table and opening one directly.
+    TableOrLocation,
     /// Name one of the configured tables.
     PassTable {
         /// The configured names, in configuration order.
@@ -80,6 +82,9 @@ pub enum Hint {
 impl fmt::Display for Hint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TableOrLocation => f.write_str(
+                "drop --table to open the location, or pass --config to select a configured table",
+            ),
             Self::PassTable { tables } => {
                 write!(f, "pass --table with one of: {}", tables.join(", "))
             }
@@ -305,6 +310,10 @@ pub enum CliError {
         /// The configured names, in configuration order.
         tables: Vec<String>,
     },
+    /// `--table` with `--location`: the one selects among the tables a
+    /// configuration lists, the other opens one table without any.
+    #[error("--table selects a configured table and --location opens one table directly")]
+    TableWithLocation,
     /// A `get` with no `--table` while more than one table is configured.
     #[error("several tables are configured and get reads one")]
     TableNameRequired {
@@ -341,6 +350,7 @@ impl CliError {
             Self::Key(fault) => Some(Hint::KeyForm {
                 key_type: fault.key_type(),
             }),
+            Self::TableWithLocation => Some(Hint::TableOrLocation),
             Self::Core(_)
             | Self::NoTarget
             | Self::NoConfig
@@ -362,6 +372,7 @@ impl CliError {
             | Self::Serve(_) => EXIT_FAILURE,
             Self::NoTarget
             | Self::NoConfig
+            | Self::TableWithLocation
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
             | Self::Key(_) => EXIT_USAGE,
@@ -423,6 +434,7 @@ mod tests {
         let cases = [
             CliError::NoTarget,
             CliError::NoConfig,
+            CliError::TableWithLocation,
             CliError::NoTableMatched {
                 name: TABLE.to_string(),
                 tables: vec!["a".to_string()],

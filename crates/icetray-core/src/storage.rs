@@ -618,7 +618,7 @@ impl Storage {
 /// authority-less `file:/path`, and a bare absolute path all give the
 /// `file://` prefix with the absolute path as the rest; a relative path is a
 /// configuration fault.
-fn split_location(location: &str) -> Result<(String, String)> {
+pub(crate) fn split_location(location: &str) -> Result<(String, String)> {
     if let Some(path) = location.strip_prefix(FILE_PREFIX) {
         return Ok((FILE_PREFIX.to_string(), path.to_string()));
     }

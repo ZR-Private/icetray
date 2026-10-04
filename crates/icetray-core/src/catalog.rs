@@ -20,7 +20,7 @@ use iceberg_catalog_rest::{
 use crate::config::SourceConfig;
 use crate::error::{Error, Result};
 use crate::snapshot::SnapshotId;
-use crate::storage::{PATH_SEPARATOR, SCHEME_SEPARATOR, Storage};
+use crate::storage::{PATH_SEPARATOR, SCHEME_SEPARATOR, Storage, split_location};
 
 /// The file under a static table root that names the current metadata
 /// version, as the Hadoop catalog lays a table out. Its content is a bare
@@ -325,6 +325,31 @@ pub(crate) fn under(root: &str, rest: &str) -> String {
 /// writer names the file through it.
 pub fn hint_location(root: &str) -> String {
     under(root, VERSION_HINT)
+}
+
+/// The directory names a path can end in that name no directory of their
+/// own: the one it is in and the one above.
+const RELATIVE_DIRS: [&str; 2] = [".", ".."];
+
+/// The name of the table a static `location` opens: the last component of
+/// its table root, `kv` for `s3://warehouse/db/kv/` and for
+/// `s3://warehouse/db/kv/metadata/v3.metadata.json`, whose root is the
+/// directory holding its `metadata/`. `None` when the root has no such
+/// component, as for a bucket alone or a path ending in `..`, or the
+/// location is not one `Storage` resolves.
+pub fn table_root_name(location: &str) -> Option<String> {
+    let (_, path) = split_location(location).ok()?;
+    let mut components = path
+        .rsplit(PATH_SEPARATOR)
+        .filter(|component| !component.is_empty());
+    let mut name = components.next()?;
+    if name.ends_with(METADATA_SUFFIX) {
+        name = components.next()?;
+        if name == METADATA_DIR {
+            name = components.next()?;
+        }
+    }
+    (!RELATIVE_DIRS.contains(&name)).then(|| name.to_string())
 }
 
 /// The metadata file a bare `version` names under `root`:
@@ -833,5 +858,37 @@ mod tests {
             0,
             "a catalog source never reads object storage"
         );
+    }
+
+    #[test]
+    fn test_table_root_name_is_the_root_s_last_component() {
+        let kv = Some("kv".to_string());
+        for location in [
+            "s3://warehouse/db/kv",
+            "s3://warehouse/db/kv/",
+            "s3://warehouse/db/kv/metadata/v3.metadata.json",
+            "s3://warehouse/db/kv/metadata/00001-6a3e.metadata.json",
+            "s3://warehouse/kv/v3.metadata.json",
+            "file:///data/kv",
+            "/data/kv//",
+            "/data/kv/metadata/v1.metadata.json",
+        ] {
+            assert_eq!(table_root_name(location), kv, "{location}");
+        }
+    }
+
+    #[test]
+    fn test_table_root_name_is_none_without_a_usable_component() {
+        for location in [
+            "s3://warehouse",
+            "s3://warehouse/",
+            "s3://warehouse/metadata/v3.metadata.json",
+            "/",
+            "/data/..",
+            "/data/.",
+            "relative/kv",
+        ] {
+            assert_eq!(table_root_name(location), None, "{location}");
+        }
     }
 }

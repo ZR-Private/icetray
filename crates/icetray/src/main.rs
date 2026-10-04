@@ -66,7 +66,7 @@ async fn run(cli: Cli) -> ExitCode {
             table,
             files,
         } => {
-            run_oneshot(&target, |config| async move {
+            run_oneshot(&target, table, |config, table| async move {
                 oneshot::doctor(&config, table.as_deref(), files).await
             })
             .await
@@ -76,7 +76,7 @@ async fn run(cli: Cli) -> ExitCode {
             table,
             keys,
         } => {
-            run_oneshot(&target, |config| async move {
+            run_oneshot(&target, table, |config, table| async move {
                 oneshot::get(&config, table.as_deref(), &keys)
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
@@ -84,7 +84,7 @@ async fn run(cli: Cli) -> ExitCode {
             .await
         }
         Command::Info { target, table } => {
-            run_oneshot(&target, |config| async move {
+            run_oneshot(&target, table, |config, table| async move {
                 oneshot::info(&config, table.as_deref())
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
@@ -94,14 +94,19 @@ async fn run(cli: Cli) -> ExitCode {
     }
 }
 
-/// One one-shot subcommand: its configuration prepared from `target`,
-/// `subcommand` run over it, and the outcome finished into the exit code.
-async fn run_oneshot<Fut>(target: &Target, subcommand: impl FnOnce(Config) -> Fut) -> ExitCode
+/// One one-shot subcommand: its configuration prepared from `target` for a
+/// run that selects `table`, `subcommand` run over both, and the outcome
+/// finished into the exit code.
+async fn run_oneshot<Fut>(
+    target: &Target,
+    table: Option<String>,
+    subcommand: impl FnOnce(Config, Option<String>) -> Fut,
+) -> ExitCode
 where
     Fut: Future<Output = Result<ExitCode, CliError>>,
 {
-    match prepare(target) {
-        Ok(config) => finish(subcommand(config).await),
+    match prepare(target, table.as_deref()) {
+        Ok(config) => finish(subcommand(config, table).await),
         Err(code) => code,
     }
 }
@@ -114,11 +119,12 @@ fn report(error: &CliError) -> ExitCode {
     error.exit_code()
 }
 
-/// The one-shot's configuration, with logging to stderr at `warn` under its
-/// `server.log`, since a one-shot's stdout is data. A target that cannot be
-/// used is reported with its exit code.
-fn prepare(target: &Target) -> Result<Config, ExitCode> {
-    let config = target.config().map_err(|error| report(&error))?;
+/// The one-shot's configuration for a run that selects `table`, with
+/// logging to stderr at `warn` under its `server.log`, since a one-shot's
+/// stdout is data. A target that cannot be used is reported with its exit
+/// code.
+fn prepare(target: &Target, table: Option<&str>) -> Result<Config, ExitCode> {
+    let config = target.config(table).map_err(|error| report(&error))?;
     logging::init(&config.server.log, LogSink::Stderr, Level::WARN);
     Ok(config)
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hyper::StatusCode;
-use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
+use icetray::cli::ENV_CONFIG;
 use icetray::error::{ERROR_PREFIX, HINT_PREFIX};
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::reload::ReloadResult;
@@ -244,14 +244,15 @@ async fn test_info_serializes_the_summary() -> TestResult {
     let raw = String::from_utf8(output.stdout.clone())?;
     assert!(
         raw.starts_with(&format!(
-            "{{\"kind\":\"table\",\"table\":\"{LOCATION_TABLE_NAME}\","
+            "{{\"kind\":\"table\",\"table\":\"{}\",",
+            fixture.ident().name()
         )),
         "{raw}"
     );
     let info = lines(&output.stdout);
     assert_eq!(info.len(), 1);
     assert_eq!(info[0]["kind"], "table");
-    assert_eq!(info[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(info[0]["table"], fixture.ident().name());
     assert_eq!(info[0]["file_count"], Json::from(SMALL_BUCKETS));
     assert_eq!(
         info[0]["records"],
@@ -273,7 +274,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     assert_exit(&output, EXIT_OK);
     let report = lines(&output.stdout);
     assert_eq!(report[0]["kind"], "doctor");
-    assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["serviceability"], "efficient");
     assert_eq!(report[0]["costs"], Json::from(0));
     assert_eq!(report[0]["advice"], Json::from(0));
@@ -378,7 +379,7 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     let report = lines(&output.stdout);
     assert_eq!(report.len(), 1);
     assert_eq!(report[0]["kind"], "refused");
-    assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["reason"], "unsorted");
     assert!(report[0]["message"].is_string());
     Ok(())
@@ -433,7 +434,7 @@ async fn test_doctor_refuses_a_key_outside_its_bucket_that_the_load_serves() -> 
     let report = lines(&output.stdout);
     assert_eq!(report.len(), 1);
     assert_eq!(report[0]["kind"], "refused");
-    assert_eq!(report[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["reason"], "key_outside_bucket");
     Ok(())
 }
@@ -466,7 +467,7 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
     assert_eq!(got.len(), keys.len());
     for (line, key) in got.iter().zip(&keys) {
         assert_eq!(line["kind"], "get");
-        assert_eq!(line["table"], LOCATION_TABLE_NAME);
+        assert_eq!(line["table"], fixture.ident().name());
         assert_eq!(line["key"], Json::String(key.clone()));
         assert_eq!(line["snapshot_id"], got[0]["snapshot_id"]);
     }
@@ -625,6 +626,9 @@ async fn test_config_toml_and_json_open_the_same_table() -> TestResult {
     Ok(())
 }
 
+/// Flags that describe a located table, no target at all, and `--table`
+/// beside `--location`, which opens one table rather than selecting among
+/// configured ones, are each a usage error before anything is opened.
 #[tokio::test]
 async fn test_location_only_flags_are_rejected_under_config() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -639,12 +643,16 @@ async fn test_location_only_flags_are_rejected_under_config() -> TestResult {
     assert_exit(&targetless, EXIT_USAGE);
     assert!(targetless.stdout.is_empty());
 
-    let unknown = run(
-        &[&["info"][..], &location(&fixture), &["--table", "nobody"]].concat(),
+    let selected = run(
+        &[&["info"][..], &location(&fixture), &["--table", "kv_flags"]].concat(),
         &[],
     );
-    assert_exit(&unknown, EXIT_USAGE);
-    assert!(unknown.stdout.is_empty());
+    assert_exit(&selected, EXIT_USAGE);
+    assert!(selected.stdout.is_empty());
+    assert!(
+        assert_plain_error(&selected),
+        "the choice between the two is the hint"
+    );
     Ok(())
 }
 
@@ -661,7 +669,7 @@ async fn test_location_ignores_the_environment_and_a_bare_run_reads_it() -> Test
         &[(ENV_CONFIG, missing)],
     );
     assert_exit(&located, EXIT_OK);
-    assert_eq!(lines(&located.stdout)[0]["table"], LOCATION_TABLE_NAME);
+    assert_eq!(lines(&located.stdout)[0]["table"], fixture.ident().name());
 
     let config = write_file(dir.path(), "env.toml", &toml_table(TABLE_A, &fixture))?;
     let bare = run(&["info"], &[(ENV_CONFIG, &config)]);
