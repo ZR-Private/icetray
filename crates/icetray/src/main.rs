@@ -168,10 +168,14 @@ async fn serve(flag: Option<&Path>) -> ExitCode {
     };
     logging::init(&config.server.log, LogSink::Stdout, Level::INFO);
     if let Err(error) = tikv_jemalloc_ctl::background_thread::write(true) {
-        // Background purging is a Linux feature of jemalloc; elsewhere freed
-        // memory returns to the operating system on the allocator's own
-        // schedule.
-        tracing::warn!(%error, "jemalloc background purging is unavailable");
+        // Background purging is a Linux feature of jemalloc, so only there
+        // does its absence mean something is wrong; elsewhere freed memory
+        // returns to the operating system on the allocator's own schedule.
+        if cfg!(target_os = "linux") {
+            tracing::warn!(%error, "jemalloc background purging is unavailable");
+        } else {
+            tracing::debug!(%error, "jemalloc background purging is unavailable");
+        }
     }
     let reload = Reload {
         source: Arc::new(ConfigFile::new(&file.path)),
