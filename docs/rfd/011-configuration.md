@@ -1,5 +1,8 @@
 # Configuration
 
+> Updated 2026-10-04: a configuration lists at least one table; one that
+> lists none is invalid.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -38,11 +41,17 @@ holds the endpoint and region, the prefix map for location rewriting, the
 hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
 static keys RFD 003 (One storage stack) lets configuration supply, and the
 optional local directory of RFD 012 (Deployment contract). Tables are a
-list, and each entry has a name, a source, a ref, a key column, a value
-column, `strict` (whose meaning is RFD 007 (Serving tiers)), and the
-`residency` and resident-bytes budget of RFD 017 (Residency tiers). The
-prototype's TOML configuration had this shape
+list of at least one, and each entry has a name, a source, a ref, a key
+column, a value column, `strict` (whose meaning is RFD 007 (Serving
+tiers)), and the `residency` and resident-bytes budget of RFD 017
+(Residency tiers). The prototype's TOML configuration had this shape
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).
+
+A configuration that lists no table is invalid. A server started on it
+would report ready while serving nothing, and the mistake is in the file,
+so it is refused there like any other rule a configuration breaks: `serve`
+does not start, a reload is refused, and a one-shot fails rather than
+reporting a usage error.
 
 A running server applies a change to the tables and refuses a change to
 anything else, which takes a restart (RFD 018 (Configuration reload)).

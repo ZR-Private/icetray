@@ -27,9 +27,9 @@ use crate::service::WireVariant;
 pub const EXIT_OK: u8 = 0;
 
 /// The run failed: a configuration that cannot be read, parsed, or
-/// validated, a load or read error, a table the doctor could not load, a
-/// first-load failure, a listener that would not bind, a drain that passed
-/// its deadline.
+/// validated, one that lists no table included, a load or read error, a
+/// table the doctor could not load or refused, a first-load failure, a
+/// listener that would not bind, a drain that passed its deadline.
 pub const EXIT_FAILURE: u8 = 1;
 
 /// The doctor found an inefficient finding (RFD 016): the table serves,
@@ -37,8 +37,8 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
-/// target, no table matched, a table name required, a key that does not
-/// parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
+/// target, a `--table` name no table is configured under, a table name
+/// required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
 
@@ -211,11 +211,13 @@ pub enum CliError {
     /// unset, so there is nothing to open.
     #[error("pass --config or --location, or set {ENV_CONFIG}")]
     NoTarget,
-    /// The configuration names no table, or none by the name asked for.
-    #[error("{}", no_table_matched(name.as_deref()))]
+    /// No table is configured under the name asked for with `--table`. A
+    /// configuration with no table at all is `ConfigViolation::NoTables`,
+    /// the file's fault rather than the command line's.
+    #[error("no table named {name} is configured")]
     NoTableMatched {
-        /// The name asked for with `--table`, when one was.
-        name: Option<String>,
+        /// The name asked for with `--table`.
+        name: String,
     },
     /// A `get` with no `--table` while more than one table is configured.
     #[error("several tables are configured, pass --table with one of: {}", tables.join(", "))]
@@ -239,14 +241,6 @@ pub enum CliError {
     /// `serve` failed.
     #[error(transparent)]
     Serve(#[from] ServeError),
-}
-
-/// `no table matched`, naming the `--table` filter when there was one.
-fn no_table_matched(name: Option<&str>) -> String {
-    match name {
-        Some(name) => format!("no table named {name} is configured"),
-        None => "no table is configured".to_string(),
-    }
 }
 
 impl CliError {
@@ -307,9 +301,8 @@ mod tests {
     fn test_exit_code_usage_variants() {
         let cases = [
             CliError::NoTarget,
-            CliError::NoTableMatched { name: None },
             CliError::NoTableMatched {
-                name: Some(TABLE.to_string()),
+                name: TABLE.to_string(),
             },
             CliError::TableNameRequired {
                 tables: vec!["a".to_string(), "b".to_string()],

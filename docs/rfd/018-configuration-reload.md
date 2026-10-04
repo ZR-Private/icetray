@@ -1,5 +1,8 @@
 # Configuration reload
 
+> Updated 2026-10-04: a file that lists no table fails validation, so a
+> reload to it is refused and the tables serving serve on.
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing
@@ -30,9 +33,11 @@ The server reads the file on its poll interval (RFD 005) and compares a
 digest of its bytes with the digest of the file it applied, and SIGHUP
 makes it read the file at once. When the bytes are unchanged the read
 costs nothing further. A change that fails to parse or validate (RFD 011
-(Configuration)) is refused as a whole. A poll does not try a refused file
-again until its bytes change, but SIGHUP does, because a table's load can
-fail for a reason that has since passed.
+(Configuration)) is refused as a whole, and a file that lists no table
+fails validation, so emptying the file's tables never empties the
+server. A poll does not try a refused file again until its bytes change,
+but SIGHUP does, because a table's load can fail for a reason that has
+since passed.
 
 A reload applies the tables only. A listener, the page cache, and the
 storage client are built once at start, so a file whose server, storage,

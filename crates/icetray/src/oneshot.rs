@@ -15,16 +15,17 @@ use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
 use crate::output::{FileLine, FindingLine, GetLine, Kind, RefusedLine, SummaryLine, emit};
 
-/// Opens every table of `config`, or the one named by `only`; no table is
-/// `CliError::NoTableMatched`. Nothing is loaded.
+/// Opens every table of `config`, or the one named by `only`; a name no
+/// table is configured under is `CliError::NoTableMatched`. `config` is
+/// validated, so it names at least one table. Nothing is loaded.
 pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, CliError> {
     let opened = open(config, only).await?;
-    if opened.tables().is_empty() {
-        return Err(CliError::NoTableMatched {
-            name: only.map(str::to_string),
-        });
+    match only {
+        Some(name) if opened.tables().is_empty() => Err(CliError::NoTableMatched {
+            name: name.to_string(),
+        }),
+        Some(_) | None => Ok(opened),
     }
-    Ok(opened)
 }
 
 /// Loads every table concurrently; the outcomes in table order.

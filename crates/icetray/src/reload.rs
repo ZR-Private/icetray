@@ -368,6 +368,8 @@ fn names(tables: &[Arc<Table>]) -> Vec<&str> {
 mod tests {
     use std::io::Write as _;
 
+    use icetray_core::config::ConfigViolation;
+
     use super::*;
 
     /// A configuration `Config::parse` accepts: one static table.
@@ -404,6 +406,18 @@ location = "s3://warehouse/kv"
         let reading = ConfigFile::new(file.path()).read().unwrap();
         assert_eq!(reading.digest, Digest::of(bytes));
         assert!(reading.config.is_err());
+    }
+
+    #[test]
+    fn test_config_file_reads_a_file_with_no_table_as_invalid() {
+        let file = file_with(b"[server]\npoll_interval = \"30s\"\n");
+        let reading = ConfigFile::new(file.path()).read().unwrap();
+        assert!(matches!(
+            reading.config,
+            Err(icetray_core::Error::Config(ConfigError::Invalid(
+                ConfigViolation::NoTables
+            )))
+        ));
     }
 
     #[test]

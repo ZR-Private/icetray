@@ -800,6 +800,57 @@ async fn test_serve_exits_1_when_the_page_cache_is_below_its_shards_minimum() ->
     Ok(())
 }
 
+/// A configuration with no table, `[[tables]]` absent or an empty list, is
+/// the file's fault: every one-shot refuses it with exit 1 before anything
+/// is opened, not with the usage code.
+#[tokio::test]
+async fn test_a_configuration_with_no_table_exits_1() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let configs = [
+        ("absent.toml", "[server]\npoll_interval = \"30s\"\n"),
+        ("empty.json", "{\"tables\": []}"),
+    ];
+    for (name, text) in configs {
+        let config = write_file(dir.path(), name, text)?;
+        for args in [
+            &["doctor", "--config", &config][..],
+            &["info", "--config", &config],
+            &["get", "--config", &config, "1"],
+        ] {
+            let output = run(args, &[]);
+            assert_exit(&output, EXIT_FAILURE);
+            assert!(output.stdout.is_empty(), "{args:?}: {}", stderr(&output));
+        }
+    }
+    Ok(())
+}
+
+/// `serve` refuses to start on a configuration with no table, exit 1,
+/// rather than report ready while serving nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_exits_1_on_a_configuration_with_no_table() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = serde_json::json!({
+        "server": {"listen": "127.0.0.1:0", "metrics_listen": "127.0.0.1:0"},
+        "tables": []
+    });
+    let path = write_file(dir.path(), "serve.json", &config.to_string())?;
+    // Spawned and waited on within a bound rather than run to its end, so
+    // a daemon that wrongly starts serving fails the test instead of
+    // holding it open.
+    let mut daemon = Daemon(
+        Command::new(BIN)
+            .args(["serve", "--config", &path])
+            .env_remove(ENV_CONFIG)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let status = wait_within(&mut daemon.0, READY_WAIT).await?;
+    assert_eq!(status.code(), Some(i32::from(EXIT_FAILURE)));
+    Ok(())
+}
+
 /// The `state` label value of a table that serves, as core renders the
 /// state; the state's fields do not reach the label, so any snapshot and
 /// instant give it.
@@ -886,11 +937,7 @@ async fn test_serve_conformance_from_the_environment() -> TestResult {
         "the scrape carries the table's state"
     );
 
-    let killed = Command::new("kill")
-        .arg("-TERM")
-        .arg(daemon.0.id().to_string())
-        .status()?;
-    assert!(killed.success());
+    send(&daemon, "-TERM")?;
     let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT).await?;
     assert_eq!(status.code(), Some(i32::from(EXIT_OK)));
     let mut drained = String::new();
@@ -918,22 +965,15 @@ fn json_config_polling_never(tables: &[(&str, &Fixture)]) -> String {
     config.to_string()
 }
 
-/// SIGHUP makes the daemon read its file at once, with no poll due, and
-/// apply the table it adds; the process lives through the signal, whose
-/// default action would end it, and drains on SIGTERM as before.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let first = local_fixture(dir.path(), FixtureSpec::small("kv_first", KeyType::Long)).await?;
-    let second = local_fixture(dir.path(), FixtureSpec::small("kv_second", KeyType::Long)).await?;
-    let config = write_file(
-        dir.path(),
-        "serve.json",
-        &json_config_polling_never(&[(TABLE_A, &first)]),
-    )?;
+/// A daemon serving the configuration at `config`, spawned and waited on
+/// until ready: the daemon, the reader of its log, kept open so the
+/// daemon's log writes never meet a closed pipe, and its metrics address.
+async fn serve_ready(
+    config: &str,
+) -> Result<(Daemon, BufReader<ChildStdout>, SocketAddr), BoxError> {
     let mut daemon = Daemon(
         Command::new(BIN)
-            .args(["serve", "--config", &config])
+            .args(["serve", "--config", config])
             .env_remove(ENV_CONFIG)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -947,32 +987,65 @@ async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
         Ok((status == StatusCode::OK).then_some(()))
     })
     .await?;
+    Ok((daemon, reader, metrics))
+}
+
+/// Sends `signal` (`-HUP`, `-TERM`) to `daemon` through `kill`.
+fn send(daemon: &Daemon, signal: &str) -> TestResult {
+    let sent = Command::new("kill")
+        .arg(signal)
+        .arg(daemon.0.id().to_string())
+        .status()?;
+    assert!(sent.success(), "kill {signal}");
+    Ok(())
+}
+
+/// Waits for the scrape at `metrics` to count a reload of `result`, and
+/// returns that scrape.
+async fn reload_counted(metrics: SocketAddr, result: ReloadResult) -> Result<String, BoxError> {
+    let label = result.to_string();
+    poll_until(READY_WAIT, "a reload counted", async || {
+        let (_, exposition) = http_get(metrics, METRICS_PATH).await?;
+        let reloads = series_value(&exposition, CONFIG_RELOADS_TOTAL, &[(LABEL_RESULT, &label)]);
+        Ok(reloads.is_some().then_some(exposition))
+    })
+    .await
+}
+
+/// Ends `daemon` with SIGTERM and asserts its drain exits 0.
+async fn drain(mut daemon: Daemon) -> TestResult {
+    send(&daemon, "-TERM")?;
+    let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT).await?;
+    assert_eq!(status.code(), Some(i32::from(EXIT_OK)));
+    Ok(())
+}
+
+/// SIGHUP makes the daemon read its file at once, with no poll due, and
+/// apply the table it adds; the process lives through the signal, whose
+/// default action would end it, and drains on SIGTERM as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let first = local_fixture(dir.path(), FixtureSpec::small("kv_first", KeyType::Long)).await?;
+    let second = local_fixture(dir.path(), FixtureSpec::small("kv_second", KeyType::Long)).await?;
+    let config = write_file(
+        dir.path(),
+        "serve.json",
+        &json_config_polling_never(&[(TABLE_A, &first)]),
+    )?;
+    let (mut daemon, _log, metrics) = serve_ready(&config).await?;
 
     std::fs::write(
         &config,
         json_config_polling_never(&[(TABLE_A, &first), (TABLE_B, &second)]),
     )?;
-    let hung_up = Command::new("kill")
-        .arg("-HUP")
-        .arg(daemon.0.id().to_string())
-        .status()?;
-    assert!(hung_up.success());
-    let applied = ReloadResult::Applied.to_string();
-    let exposition = poll_until(READY_WAIT, "the reload applied", async || {
-        let (_, exposition) = http_get(metrics, METRICS_PATH).await?;
-        let reloads = series_value(
-            &exposition,
-            CONFIG_RELOADS_TOTAL,
-            &[(LABEL_RESULT, &applied)],
-        );
-        Ok(reloads.is_some().then_some(exposition))
-    })
-    .await?;
+    send(&daemon, "-HUP")?;
+    let exposition = reload_counted(metrics, ReloadResult::Applied).await?;
     assert_eq!(
         series_value(
             &exposition,
             CONFIG_RELOADS_TOTAL,
-            &[(LABEL_RESULT, &applied)]
+            &[(LABEL_RESULT, &ReloadResult::Applied.to_string())]
         )
         .map(f64::to_bits),
         Some(1.0_f64.to_bits())
@@ -995,13 +1068,40 @@ async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
         daemon.0.try_wait()?.is_none(),
         "the daemon lives through SIGHUP"
     );
+    drain(daemon).await
+}
 
-    let killed = Command::new("kill")
-        .arg("-TERM")
-        .arg(daemon.0.id().to_string())
-        .status()?;
-    assert!(killed.success());
-    let status = wait_within(&mut daemon.0, SHUTDOWN_WAIT).await?;
-    assert_eq!(status.code(), Some(i32::from(EXIT_OK)));
-    Ok(())
+/// A reload to a file with no table is refused like any file that does
+/// not validate: the table serving serves on, readiness stays, and
+/// `config_pending` reads 1 while the file differs from what is applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_serve_refuses_a_reload_to_a_file_with_no_table() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_kept", KeyType::Long)).await?;
+    let text = json_config_polling_never(&[(TABLE_A, &fixture)]);
+    let config = write_file(dir.path(), "serve.json", &text)?;
+    let (daemon, _log, metrics) = serve_ready(&config).await?;
+
+    let mut empty: Json = serde_json::from_str(&text)?;
+    empty["tables"] = Json::Array(Vec::new());
+    std::fs::write(&config, empty.to_string())?;
+    send(&daemon, "-HUP")?;
+    let exposition = reload_counted(metrics, ReloadResult::Refused).await?;
+    assert_eq!(
+        series_value(&exposition, CONFIG_PENDING, &[]).map(f64::to_bits),
+        Some(1.0_f64.to_bits())
+    );
+    assert_eq!(
+        series_value(
+            &exposition,
+            TABLE_STATE,
+            &[(LABEL_TABLE, TABLE_A), (LABEL_STATE, &serving_state())]
+        )
+        .map(f64::to_bits),
+        Some(1.0_f64.to_bits()),
+        "the table serving serves on"
+    );
+    let (status, _) = http_get(metrics, READY_PATH).await?;
+    assert_eq!(status, StatusCode::OK);
+    drain(daemon).await
 }

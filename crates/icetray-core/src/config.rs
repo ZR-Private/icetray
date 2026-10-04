@@ -185,6 +185,12 @@ pub enum ConfigError {
 /// the same, since the remedy is a rewrite rule or a registered store.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ConfigViolation {
+    /// No table is configured: a server would serve nothing and report
+    /// ready, and a one-shot would have nothing to open. The file is at
+    /// fault, so `serve` refuses to start, a reload is refused, and a
+    /// one-shot fails, as for any other violation.
+    #[error("no table is configured; list at least one under [[tables]]")]
+    NoTables,
     /// A table has an empty name.
     #[error("a table has an empty name")]
     EmptyTableName,
@@ -353,7 +359,7 @@ pub struct Config {
     /// Object storage, hedging, and the optional local directory.
     #[serde(default)]
     pub storage: StorageConfig,
-    /// The tables to serve; names are unique and non-empty.
+    /// The tables to serve: at least one, with names unique and non-empty.
     #[serde(default)]
     pub tables: Vec<TableConfig>,
 }
@@ -526,6 +532,9 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
             bytes: local.page_cache_disk_bytes,
             minimum: PAGE_CACHE_DISK_BLOCK_BYTES,
         });
+    }
+    if config.tables.is_empty() {
+        return Err(ConfigViolation::NoTables);
     }
     let mut names = HashSet::new();
     for table in &config.tables {
@@ -1508,24 +1517,31 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_parse_dispatches_on_first_non_whitespace_brace() {
-        let json = Config::parse("  \n\t {\"tables\": []}").unwrap();
+    fn test_from_text_dispatches_on_first_non_whitespace_brace() {
+        let json = Config::from_text("  \n\t {\"tables\": []}").unwrap();
         assert!(json.tables.is_empty());
-        let toml = Config::parse("  \n\t tables = []\n").unwrap();
+        let toml = Config::from_text("  \n\t tables = []\n").unwrap();
         assert!(toml.tables.is_empty());
         // A brace later in the text does not make TOML into JSON.
-        let inline = Config::parse("storage = { rewrite = [] }\n").unwrap();
+        let inline = Config::from_text("storage = { rewrite = [] }\n").unwrap();
         assert!(inline.storage.rewrite.is_empty());
-        let malformed_json = Config::parse(" { not json");
+        let malformed_json = Config::from_text(" { not json");
         assert!(matches!(
             malformed_json,
             Err(Error::Config(ConfigError::Json(_)))
         ));
-        let malformed_toml = Config::parse("not = toml = either");
+        let malformed_toml = Config::from_text("not = toml = either");
         assert!(matches!(
             malformed_toml,
             Err(Error::Config(ConfigError::Toml(_)))
         ));
+    }
+
+    #[test]
+    fn test_parse_refuses_a_configuration_with_no_table() {
+        for text in ["", "tables = []\n", "{}", "{\"tables\": []}", "[server]\n"] {
+            assert_eq!(violation(text), ConfigViolation::NoTables, "{text:?}");
+        }
     }
 
     #[test]
