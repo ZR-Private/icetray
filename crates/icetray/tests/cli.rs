@@ -273,7 +273,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     );
     assert_exit(&output, EXIT_OK);
     let report = lines(&output.stdout);
-    assert_eq!(report[0]["kind"], "doctor");
+    assert_eq!(report[0]["kind"], "table");
     assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["serviceability"], "efficient");
     assert_eq!(report[0]["costs"], Json::from(0));
@@ -300,10 +300,10 @@ async fn unpartitioned_fixture(dir: &Path, name: &str) -> Result<Fixture, BoxErr
     local_fixture(dir, spec).await
 }
 
-/// Asserts `report` opens with an inefficient `doctor` line and carries
+/// Asserts `report` opens with an inefficient `table` line and carries
 /// the `no_bucket_partition` finding at the inefficient tier.
 fn assert_unpartitioned_findings(report: &[Json]) {
-    assert_eq!(report[0]["kind"], "doctor");
+    assert_eq!(report[0]["kind"], "table");
     assert_eq!(report[0]["serviceability"], "inefficient");
     assert!(
         report.iter().any(|line| line["kind"] == "finding"
@@ -321,7 +321,7 @@ async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() ->
     assert_exit(&output, EXIT_INEFFICIENT);
     let report = lines(&output.stdout);
     assert_unpartitioned_findings(&report);
-    assert!(report.iter().all(|line| line["kind"] != "refused"));
+    assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
 }
 
@@ -344,7 +344,7 @@ async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict
     assert_unpartitioned_findings(&report);
     let refused: Vec<&Json> = report
         .iter()
-        .filter(|line| line["kind"] == "refused")
+        .filter(|line| line["kind"] == "refusal")
         .collect();
     assert_eq!(refused.len(), 1, "{report:?}");
     assert_eq!(refused[0]["table"], TABLE_A);
@@ -361,7 +361,7 @@ async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict
     assert_exit(&output, EXIT_INEFFICIENT);
     let report = lines(&output.stdout);
     assert_unpartitioned_findings(&report);
-    assert!(report.iter().all(|line| line["kind"] != "refused"));
+    assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
 }
 
@@ -378,7 +378,7 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
     assert_eq!(report.len(), 1);
-    assert_eq!(report[0]["kind"], "refused");
+    assert_eq!(report[0]["kind"], "refusal");
     assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["reason"], "unsorted");
     assert!(report[0]["message"].is_string());
@@ -433,7 +433,7 @@ async fn test_doctor_refuses_a_key_outside_its_bucket_that_the_load_serves() -> 
     assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
     assert_eq!(report.len(), 1);
-    assert_eq!(report[0]["kind"], "refused");
+    assert_eq!(report[0]["kind"], "refusal");
     assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["reason"], "key_outside_bucket");
     Ok(())
@@ -466,7 +466,7 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
     let got = lines(&output.stdout);
     assert_eq!(got.len(), keys.len());
     for (line, key) in got.iter().zip(&keys) {
-        assert_eq!(line["kind"], "get");
+        assert_eq!(line["kind"], "lookup");
         assert_eq!(line["table"], fixture.ident().name());
         assert_eq!(line["key"], Json::String(key.clone()));
         assert_eq!(line["snapshot_id"], got[0]["snapshot_id"]);
@@ -842,7 +842,7 @@ async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     let mut first = String::new();
     reader.read_line(&mut first)?;
     let line: Json = serde_json::from_str(&first)?;
-    assert_eq!(line["kind"], "get");
+    assert_eq!(line["kind"], "lookup");
     drop(reader);
     let output = child.wait_with_output()?;
     assert_exit(&output, EXIT_OK);

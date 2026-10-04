@@ -13,7 +13,7 @@ use icetray_core::{Opened, Serviceability, Table, admit, diagnose, open, time};
 
 use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
-use crate::output::{FileLine, FindingLine, GetLine, Kind, RefusedLine, SummaryLine, emit};
+use crate::output::{FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, emit};
 
 /// Opens every table of `config`, or the one named by `only`; a name no
 /// table is configured under is `CliError::NoTableMatched`. `config` is
@@ -40,8 +40,8 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
     tables.iter().cloned().zip(outcomes).collect()
 }
 
-/// `doctor`: one `doctor` line per table with its findings and, with
-/// `files`, its data files. A table that cannot be loaded is a `refused`
+/// `doctor`: one `table` line per table with its findings and, with
+/// `files`, its data files. A table that cannot be loaded is a `refusal`
 /// line, and so is one the load admits but whose full bucket check
 /// (`Generation::verify_buckets`, which decodes and hashes every key and
 /// which no load or refresh runs) finds a key outside its file's recorded
@@ -49,7 +49,7 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// so it is a refusal, not an inefficiency or advice (RFD 007). Every
 /// table is loaded with `strict` off, so its findings are reported whatever
 /// its setting, and then judged by `admit` under its configured `strict`:
-/// an inefficient table that `serve` would refuse gets a `refused` line
+/// an inefficient table that `serve` would refuse gets a `refusal` line
 /// after its findings (RFD 016). A `--location` table is never strict
 /// (`Target::config`). The exit code is `EXIT_FAILURE` when any table was
 /// refused, else `EXIT_INEFFICIENT` when any is inefficient, else
@@ -71,12 +71,12 @@ pub async fn doctor(
             Ok(()) => {
                 let generation = table.serving()?;
                 if let Err(error) = generation.verify_buckets().await {
-                    emit(&RefusedLine::new(table.name(), &error))?;
+                    emit(&RefusalLine::new(table.name(), &error))?;
                     refused = true;
                     continue;
                 }
                 let report = diagnose(&generation);
-                emit(&SummaryLine::new(Kind::Doctor, &report.summary))?;
+                emit(&SummaryLine::new(&report.summary))?;
                 for finding in &report.findings {
                     emit(&FindingLine::new(table.name(), finding))?;
                 }
@@ -86,14 +86,14 @@ pub async fn doctor(
                     }
                 }
                 if let Err(error) = admit(&report, configured_strict(config, table.name())) {
-                    emit(&RefusedLine::new(table.name(), &error))?;
+                    emit(&RefusalLine::new(table.name(), &error))?;
                     refused = true;
                 } else if report.summary.serviceability == Serviceability::Inefficient {
                     inefficient = true;
                 }
             }
             Err(error) => {
-                emit(&RefusedLine::new(table.name(), &error))?;
+                emit(&RefusalLine::new(table.name(), &error))?;
                 refused = true;
             }
         }
@@ -130,15 +130,12 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     }
     for table in loaded {
         let generation = table.serving()?;
-        emit(&SummaryLine::new(
-            Kind::Table,
-            &diagnose(&generation).summary,
-        ))?;
+        emit(&SummaryLine::new(&diagnose(&generation).summary))?;
     }
     Ok(())
 }
 
-/// `get`: one `get` line per key from the table named by `only`, or the
+/// `get`: one `lookup` line per key from the table named by `only`, or the
 /// only configured table; several tables and no name is
 /// `CliError::TableNameRequired`. Every key is parsed under the key type
 /// of the snapshot the ref names, read from the table's metadata before
@@ -171,7 +168,7 @@ pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result
         let started = Instant::now();
         let lookup = table.get(key).await?;
         let elapsed = time::micros(started.elapsed());
-        emit(&GetLine::new(
+        emit(&LookupLine::new(
             table.name(),
             key,
             &lookup,

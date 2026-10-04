@@ -1,7 +1,9 @@
 //! The JSON lines the one-shot subcommands print: one object per line, the
 //! `kind` first and the `table` second, so a reader routes a line before it
-//! parses the rest. `doctor` and `info` lines flatten core's `TableSummary`,
-//! so a new measurement in core reaches both without a change here.
+//! parses the rest. A kind names what the line describes, not the command
+//! that printed it. The `table` line of `doctor` and of `info` flattens
+//! core's `TableSummary`, so a new measurement in core reaches both without
+//! a change here.
 
 use std::io::Write as _;
 
@@ -12,25 +14,24 @@ use serde::Serialize;
 
 use crate::error::CliError;
 
-/// The kind of a line, its first key. Serialized as the lowercase name.
+/// The kind of a line, its first key: the thing the line describes.
+/// Serialized as the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// An `info` line: the served snapshot's summary.
+    /// One table's summary, from `info` or `doctor`.
     Table,
-    /// A `doctor` line: the diagnosed snapshot's summary.
-    Doctor,
     /// One finding of a `doctor` run.
     Finding,
     /// One data file of a `doctor --files` run.
     File,
-    /// A table the doctor could not load.
-    Refused,
-    /// One lookup of a `get` run.
-    Get,
+    /// A table the doctor refused.
+    Refusal,
+    /// One lookup of a `get` run, as `icetray_lookups_total` counts it.
+    Lookup,
 }
 
-/// A lookup's outcome as the `get` line carries it; the same three values
+/// A lookup's outcome as the `lookup` line carries it; the same three values
 /// as the wire (RFD 010). Serialized as the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,9 +55,8 @@ impl Presence {
     }
 }
 
-/// An `info` line (`Kind::Table`) or a `doctor` line (`Kind::Doctor`):
-/// `kind`, then the summary, whose first field is `table`. The two
-/// subcommands print the same summary under their own kind.
+/// A `table` line, which `info` and `doctor` both print: `kind`, then the
+/// summary, whose first field is `table`.
 #[derive(Debug, Serialize)]
 pub struct SummaryLine<'a> {
     kind: Kind,
@@ -65,9 +65,12 @@ pub struct SummaryLine<'a> {
 }
 
 impl<'a> SummaryLine<'a> {
-    /// The line for `summary` under `kind`.
-    pub fn new(kind: Kind, summary: &'a TableSummary) -> Self {
-        Self { kind, summary }
+    /// The line for `summary`.
+    pub fn new(summary: &'a TableSummary) -> Self {
+        Self {
+            kind: Kind::Table,
+            summary,
+        }
     }
 }
 
@@ -111,21 +114,21 @@ impl<'a> FileLine<'a> {
     }
 }
 
-/// A table the doctor could not load: the kind of the failure as the
-/// `reason` label would carry it, and the error's message for a person.
+/// A table the doctor refused: the kind of the failure as the `reason`
+/// label would carry it, and the error's message for a person.
 #[derive(Debug, Serialize)]
-pub struct RefusedLine<'a> {
+pub struct RefusalLine<'a> {
     kind: Kind,
     table: &'a str,
     reason: String,
     message: String,
 }
 
-impl<'a> RefusedLine<'a> {
+impl<'a> RefusalLine<'a> {
     /// The line for the failure of `table`'s load.
     pub fn new(table: &'a str, error: &icetray_core::Error) -> Self {
         Self {
-            kind: Kind::Refused,
+            kind: Kind::Refusal,
             table,
             reason: error.kind().to_string(),
             message: error.to_string(),
@@ -133,12 +136,12 @@ impl<'a> RefusedLine<'a> {
     }
 }
 
-/// One lookup of a `get` run: the key as `Display` prints it, the outcome,
+/// One lookup of a `get` run, a `lookup` line: the key as `Display` prints it, the outcome,
 /// the value as standard base64 with padding and, when its bytes are UTF-8,
 /// as text, the snapshot answered from, the GETs the lookup issued, and the
 /// time it took. The value fields are absent for a null or absent key.
 #[derive(Debug, Serialize)]
-pub struct GetLine<'a> {
+pub struct LookupLine<'a> {
     kind: Kind,
     table: &'a str,
     key: String,
@@ -153,7 +156,7 @@ pub struct GetLine<'a> {
     elapsed_micros: u64,
 }
 
-impl<'a> GetLine<'a> {
+impl<'a> LookupLine<'a> {
     /// The line for `lookup` of `key` on `table`, which issued `gets` GETs
     /// and took `elapsed_micros`.
     pub fn new(table: &'a str, key: &Key, lookup: &Lookup, gets: u64, elapsed_micros: u64) -> Self {
@@ -162,7 +165,7 @@ impl<'a> GetLine<'a> {
             Value::Null | Value::Absent => None,
         };
         Self {
-            kind: Kind::Get,
+            kind: Kind::Lookup,
             table,
             key: key.to_string(),
             presence: Presence::of(&lookup.value),
@@ -254,10 +257,10 @@ mod tests {
     /// Standard base64 with padding of `TEXT_VALUE`.
     const TEXT_VALUE_BASE64: &str = "aGVsbG8=";
 
-    /// The GETs the sample `get` line carries: one cold hit.
+    /// The GETs the sample `lookup` line carries: one cold hit.
     const GETS: u64 = 1;
 
-    /// The microseconds the sample `get` line carries.
+    /// The microseconds the sample `lookup` line carries.
     const ELAPSED_MICROS: u64 = 250;
 
     /// The first `LEADING_KEYS` keys of `line`'s JSON.
@@ -340,11 +343,7 @@ mod tests {
         let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
         let key = Key::Long(1);
         assert_eq!(
-            leading_keys(&SummaryLine::new(Kind::Table, &summary)),
-            ["kind", "table"]
-        );
-        assert_eq!(
-            leading_keys(&SummaryLine::new(Kind::Doctor, &summary)),
+            leading_keys(&SummaryLine::new(&summary)),
             ["kind", "table"]
         );
         assert_eq!(
@@ -356,29 +355,27 @@ mod tests {
             ["kind", "table"]
         );
         assert_eq!(
-            leading_keys(&RefusedLine::new(TABLE, &error)),
+            leading_keys(&RefusalLine::new(TABLE, &error)),
             ["kind", "table"]
         );
         assert_eq!(
-            leading_keys(&GetLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS)),
+            leading_keys(&LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS)),
             ["kind", "table"]
         );
     }
 
     #[test]
-    fn test_serialize_info_and_doctor_lines_carry_the_summary_under_their_kind() {
+    fn test_serialize_summary_line_is_a_table_line_carrying_the_summary() {
         let summary = summary();
-        let info = serde_json::to_value(SummaryLine::new(Kind::Table, &summary)).unwrap();
-        assert_eq!(info["kind"], Json::String("table".to_string()));
-        assert_eq!(info["table"], Json::String(TABLE.to_string()));
-        assert_eq!(info["snapshot_id"], Json::String(SNAPSHOT.to_string()));
+        let line = serde_json::to_value(SummaryLine::new(&summary)).unwrap();
+        assert_eq!(line["kind"], Json::String("table".to_string()));
+        assert_eq!(line["table"], Json::String(TABLE.to_string()));
+        assert_eq!(line["snapshot_id"], Json::String(SNAPSHOT.to_string()));
         assert_eq!(
-            info["serviceability"],
+            line["serviceability"],
             Json::String("efficient".to_string())
         );
-        let doctor = serde_json::to_value(SummaryLine::new(Kind::Doctor, &summary)).unwrap();
-        assert_eq!(doctor["kind"], Json::String("doctor".to_string()));
-        assert_eq!(doctor["costs"], Json::from(0));
+        assert_eq!(line["costs"], Json::from(0));
     }
 
     #[test]
@@ -398,24 +395,24 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_refused_line_carries_the_kind_as_reason() {
+    fn test_serialize_refusal_line_carries_the_kind_as_reason() {
         let error = icetray_core::Error::Refused {
             table: TABLE.to_string(),
             reason: icetray_core::RefusalReason::DeleteFiles,
         };
-        let line = serde_json::to_value(RefusedLine::new(TABLE, &error)).unwrap();
-        assert_eq!(line["kind"], Json::String("refused".to_string()));
+        let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
+        assert_eq!(line["kind"], Json::String("refusal".to_string()));
         assert_eq!(line["reason"], Json::String(error.kind().to_string()));
         assert!(line["message"].is_string());
     }
 
     #[test]
-    fn test_serialize_get_line_present_value_as_base64_and_utf8() {
+    fn test_serialize_lookup_line_present_value_as_base64_and_utf8() {
         let key = Key::Long(1);
         let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
-        let line = serde_json::to_value(GetLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
+        let line = serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
             .unwrap();
-        assert_eq!(line["kind"], Json::String("get".to_string()));
+        assert_eq!(line["kind"], Json::String("lookup".to_string()));
         assert_eq!(line["key"], Json::String(key.to_string()));
         assert_eq!(line["presence"], Json::String("present".to_string()));
         assert_eq!(
@@ -430,10 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_get_line_non_utf8_value_has_no_utf8_field() {
+    fn test_serialize_lookup_line_non_utf8_value_has_no_utf8_field() {
         let key = Key::Long(1);
         let present = lookup(Value::Present(Bytes::from_static(&BINARY_VALUE)));
-        let line = serde_json::to_value(GetLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
+        let line = serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
             .unwrap();
         assert!(line["value_base64"].is_string());
         assert!(line.get("value_utf8").is_none());
@@ -441,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_get_line_null_and_absent_carry_no_value() {
+    fn test_serialize_lookup_line_null_and_absent_carry_no_value() {
         let key = Key::Long(1);
         for (value, name) in [(Value::Null, "null"), (Value::Absent, "absent")] {
             let line =
-                serde_json::to_value(GetLine::new(TABLE, &key, &lookup(value), 0, ELAPSED_MICROS))
+                serde_json::to_value(LookupLine::new(TABLE, &key, &lookup(value), 0, ELAPSED_MICROS))
                     .unwrap();
             assert_eq!(line["presence"], Json::String(name.to_string()));
             assert!(line.get("value_base64").is_none());
