@@ -371,7 +371,7 @@ mod tests {
         let info = serde_json::to_value(SummaryLine::new(Kind::Table, &summary)).unwrap();
         assert_eq!(info["kind"], Json::String("table".to_string()));
         assert_eq!(info["table"], Json::String(TABLE.to_string()));
-        assert_eq!(info["snapshot_id"], Json::from(SNAPSHOT));
+        assert_eq!(info["snapshot_id"], Json::String(SNAPSHOT.to_string()));
         assert_eq!(
             info["serviceability"],
             Json::String("efficient".to_string())
@@ -424,7 +424,7 @@ mod tests {
         );
         assert_eq!(line["value_utf8"], Json::String(TEXT_VALUE.to_string()));
         assert_eq!(line["value_bytes"], Json::from(TEXT_VALUE.len()));
-        assert_eq!(line["snapshot_id"], Json::from(SNAPSHOT));
+        assert_eq!(line["snapshot_id"], Json::String(SNAPSHOT.to_string()));
         assert_eq!(line["gets"], Json::from(GETS));
         assert_eq!(line["elapsed_micros"], Json::from(ELAPSED_MICROS));
     }

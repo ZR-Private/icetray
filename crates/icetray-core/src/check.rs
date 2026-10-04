@@ -2489,7 +2489,10 @@ mod tests {
             ])
         );
         assert_eq!(summary["table"], Json::String(TABLE.to_string()));
-        assert_eq!(summary["snapshot_id"], Json::from(FIRST_SNAPSHOT));
+        assert_eq!(
+            summary["snapshot_id"],
+            Json::String(FIRST_SNAPSHOT.to_string())
+        );
         assert_eq!(
             summary["serviceability"],
             Json::String("inefficient".to_string())

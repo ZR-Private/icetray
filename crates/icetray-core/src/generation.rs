@@ -239,7 +239,7 @@ impl Generation {
         let index_bytes = files.iter().map(|file| file.index.resident_bytes()).sum();
         tracing::debug!(
             table,
-            snapshot_id = snapshot.snapshot_id(),
+            snapshot_id = %snapshot.snapshot_id(),
             files = files.len(),
             index_bytes,
             overlap_groups_verified = to_verify.len(),
