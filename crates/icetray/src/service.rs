@@ -570,7 +570,9 @@ mod tests {
                 Code::Internal,
             ),
             (
-                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName)),
+                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName {
+                    index: 0,
+                })),
                 Code::Internal,
             ),
             (

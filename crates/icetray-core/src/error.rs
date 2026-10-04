@@ -33,7 +33,7 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     /// Configuration that cannot be read or acted on.
-    #[error("config: {0}")]
+    #[error(transparent)]
     Config(#[from] ConfigError),
     /// The page cache could not produce a page.
     #[error("page cache: {0}")]
@@ -563,7 +563,9 @@ mod tests {
                 "json",
             ),
             (
-                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName)),
+                Error::Config(ConfigError::Invalid(ConfigViolation::EmptyTableName {
+                    index: 0,
+                })),
                 "config",
             ),
             (

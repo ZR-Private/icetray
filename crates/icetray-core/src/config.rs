@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 
 use crate::approx;
 use crate::cache::min_memory_bytes;
@@ -161,21 +162,90 @@ const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// What `S3Config`'s `Debug` prints in place of the secret access key.
 const SECRET_PLACEHOLDER: &str = "[redacted]";
 
-/// Why a configuration could not be read or acted on.
+/// Why a configuration could not be read or acted on. A document that is
+/// not TOML or JSON at all is `Toml` or `Json`; one that is, but whose
+/// content does not fit the schema, is `Schema`; one that fits but breaks
+/// a rule is `Invalid`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read.
-    #[error("cannot read configuration file: {0}")]
-    Read(#[from] std::io::Error),
-    /// The text did not parse as TOML.
+    /// The configuration file at `path` could not be read, or its bytes are
+    /// not UTF-8.
+    #[error("cannot read configuration file {}: {source}", path.display())]
+    Read {
+        /// The file.
+        path: PathBuf,
+        /// The operating system's refusal, or the decoding failure.
+        source: std::io::Error,
+    },
+    /// The text is not TOML.
     #[error("configuration is not valid toml: {0}")]
-    Toml(#[from] toml::de::Error),
-    /// The text did not parse as JSON.
+    Toml(toml::de::Error),
+    /// The text is not JSON.
     #[error("configuration is not valid json: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(serde_json::Error),
+    /// The text is TOML or JSON, but the setting at `at` does not fit the
+    /// schema: a required key missing, a key the schema does not know, a
+    /// value of the wrong type or form. A missing key's `at` is the table
+    /// that lacks it; the root is not named.
+    #[error("invalid configuration: {}", schema_detail(at, fault))]
+    Schema {
+        /// Where in the document the fault is, as serde walked it:
+        /// `tables[0]`, `server.poll_interval`.
+        at: serde_path_to_error::Path,
+        /// What does not fit; boxed, since a TOML error is large and every
+        /// result that can fail on configuration carries the variant.
+        fault: Box<SchemaFault>,
+    },
     /// The configuration parsed but breaks a rule.
     #[error("invalid configuration: {0}")]
     Invalid(#[from] ConfigViolation),
+}
+
+/// What in a document does not fit the schema, in the syntax's own words.
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaFault {
+    /// From a TOML document; its message alone, without the source excerpt
+    /// the TOML error prints, which frames every fault as a parse error.
+    #[error("{}", .0.message())]
+    Toml(toml::de::Error),
+    /// From a JSON document, with the line and column it carries.
+    #[error("{0}")]
+    Json(serde_json::Error),
+}
+
+/// A schema fault prefixed by where it is, unless it is at the root.
+fn schema_detail(at: &serde_path_to_error::Path, fault: &SchemaFault) -> String {
+    let place = place(at);
+    if place.is_empty() {
+        fault.to_string()
+    } else {
+        format!("{place}: {fault}")
+    }
+}
+
+/// `at` as the file spells a setting's place: keys joined by `.`, a list
+/// entry as `[index]`. A step serde could not name, such as a map key that
+/// is not a string, is left out, so the place reads as far as it is known.
+fn place(at: &serde_path_to_error::Path) -> String {
+    let mut place = String::new();
+    for segment in at {
+        match segment {
+            serde_path_to_error::Segment::Seq { index } => {
+                place.push('[');
+                place.push_str(&index.to_string());
+                place.push(']');
+            }
+            serde_path_to_error::Segment::Map { key: name }
+            | serde_path_to_error::Segment::Enum { variant: name } => {
+                if !place.is_empty() {
+                    place.push('.');
+                }
+                place.push_str(name);
+            }
+            serde_path_to_error::Segment::Unknown => {}
+        }
+    }
+    place
 }
 
 /// A rule a parsed configuration breaks. The set is closed; a rule not
@@ -192,20 +262,40 @@ pub enum ConfigViolation {
     #[error("no table is configured; list at least one under [[tables]]")]
     NoTables,
     /// A table has an empty name.
-    #[error("a table has an empty name")]
-    EmptyTableName,
-    /// Two tables share a name.
-    #[error("table name {0} is configured more than once")]
-    DuplicateTableName(String),
+    #[error("tables[{index}].name is empty")]
+    EmptyTableName {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// A table has the name of a table before it.
+    #[error("tables[{index}].name {name} is configured more than once")]
+    DuplicateTableName {
+        /// The later table's position in `tables`.
+        index: usize,
+        /// The name both carry.
+        name: String,
+    },
     /// One of the two static S3 keys is set without the other.
-    #[error("static credentials need both access_key_id and secret_access_key")]
+    #[error(
+        "storage.s3.access_key_id and storage.s3.secret_access_key are set together or not at all"
+    )]
     IncompleteStaticKeys,
     /// A resident-bytes budget on a table whose residency has nothing to budget.
-    #[error("resident_budget_bytes is set on a table whose residency does not take a budget")]
-    BudgetWithoutResidency,
+    #[error("table {table}: resident_budget_bytes is set, but {residency} residency takes none")]
+    BudgetWithoutResidency {
+        /// The table's name.
+        table: String,
+        /// Its residency.
+        residency: Residency,
+    },
     /// Disk residency with no local directory to write chunk files to.
-    #[error("disk residency needs a local directory under storage.local")]
-    DiskResidencyWithoutLocalDir,
+    /// Raised by validation and again by a load, which knows the table by
+    /// name alone.
+    #[error("table {table}: disk residency needs a local directory under storage.local")]
+    DiskResidencyWithoutLocalDir {
+        /// The table's name.
+        table: String,
+    },
     /// The memory budget of the page cache cannot hold one value page in
     /// every shard of its memory level, so the cache would keep a page per
     /// shard however small the budget, and the budget would bound nothing
@@ -214,7 +304,7 @@ pub enum ConfigViolation {
     /// checks it against the shards it has on the runtime it opens on, one
     /// per worker thread rounded up to a power of two.
     #[error(
-        "page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
+        "server.page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
     )]
     PageCacheTooSmall {
         /// The configured budget.
@@ -228,7 +318,7 @@ pub enum ConfigViolation {
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
     #[error(
-        "page_cache_disk_bytes {bytes} is below one block of {minimum} bytes; zero means no disk level"
+        "storage.local.page_cache_disk_bytes {bytes} is below one block of {minimum} bytes; zero means no disk level"
     )]
     PageCacheDiskTooSmall {
         /// The configured size.
@@ -238,25 +328,29 @@ pub enum ConfigViolation {
     },
     /// The hedge percentile is outside `(0, 1]`; the delay is that percentile
     /// of the latency window (RFD 013).
-    #[error("hedge percentile {percentile} is not in (0, 1]")]
+    #[error("storage.hedge.percentile {percentile} is not in (0, 1]")]
     HedgePercentileOutOfRange {
         /// The configured percentile.
         percentile: f64,
     },
     /// The hedge ceiling is outside `[0, 1]`; it is the share of requests
     /// that may hedge (RFD 013).
-    #[error("hedge max_rate {max_rate} is not in [0, 1]")]
+    #[error("storage.hedge.max_rate {max_rate} is not in [0, 1]")]
     HedgeMaxRateOutOfRange {
         /// The configured ceiling.
         max_rate: f64,
     },
     /// The hedge window holds no samples, so it has no percentile.
-    #[error("hedge window must hold at least one sample")]
+    #[error("storage.hedge.window 0 holds no sample; it must be at least 1")]
     HedgeWindowEmpty,
     /// A poll interval below `MIN_POLL_INTERVAL`: each table's poll would
     /// call the catalog or read its version hint in a busy loop, and at
     /// zero the runtime's interval refuses the period.
-    #[error("poll_interval {interval:?} is below the minimum of {minimum:?}")]
+    #[error(
+        "server.poll_interval {} is below the minimum of {}",
+        time::friendly(*interval),
+        time::friendly(*minimum)
+    )]
     PollIntervalTooShort {
         /// The configured interval.
         interval: Duration,
@@ -265,7 +359,11 @@ pub enum ConfigViolation {
     },
     /// A poll interval above `MAX_POLL_INTERVAL`, past which a table is not
     /// followed and the first tick's `Instant` can overflow.
-    #[error("poll_interval {interval:?} is above the maximum of {maximum:?}")]
+    #[error(
+        "server.poll_interval {} is above the maximum of {}",
+        time::friendly(*interval),
+        time::friendly(*maximum)
+    )]
     PollIntervalTooLong {
         /// The configured interval.
         interval: Duration,
@@ -273,40 +371,42 @@ pub enum ConfigViolation {
         maximum: Duration,
     },
     /// A `Get` deadline of zero, which would fail every lookup unstarted.
-    #[error("get_deadline must be above zero")]
+    #[error("server.get_deadline 0s is not above zero")]
     GetDeadlineZero,
     /// A `MultiGet` deadline of zero, which would fail every batch unstarted.
-    #[error("multi_get_deadline must be above zero")]
+    #[error("server.multi_get_deadline 0s is not above zero")]
     MultiGetDeadlineZero,
     /// No request may be in flight, so every request would be refused.
-    #[error("max_in_flight must be above zero")]
+    #[error("server.max_in_flight 0 is not above zero")]
     MaxInFlightZero,
     /// No key may be in a `MultiGet`, so every batch would be refused.
-    #[error("max_multi_get_keys must be above zero")]
+    #[error("server.max_multi_get_keys 0 is not above zero")]
     MaxMultiGetKeysZero,
     /// A load deadline of zero, which would fail every first load
     /// unstarted.
-    #[error("load_deadline must be above zero")]
+    #[error("server.load_deadline 0s is not above zero")]
     LoadDeadlineZero,
     /// A refresh deadline of zero, which would fail every refresh
     /// unstarted.
-    #[error("refresh_deadline must be above zero")]
+    #[error("server.refresh_deadline 0s is not above zero")]
     RefreshDeadlineZero,
     /// A drain deadline of zero, which would cut every open request off at
     /// shutdown.
-    #[error("drain_deadline must be above zero")]
+    #[error("server.drain_deadline 0s is not above zero")]
     DrainDeadlineZero,
     /// An object-store connect timeout of zero, which would fail every
     /// connection before it opened.
-    #[error("connect_timeout must be above zero")]
+    #[error("storage.connect_timeout 0s is not above zero")]
     ConnectTimeoutZero,
     /// A catalog timeout of zero, which would fail every catalog call
     /// unstarted.
-    #[error("catalog_timeout must be above zero")]
+    #[error("storage.catalog_timeout 0s is not above zero")]
     CatalogTimeoutZero,
     /// Two standard log fields emitted under one name, so every line would
     /// lose one of them (RFD 012).
-    #[error("log fields {first} and {second} are both emitted as {name}; each needs its own name")]
+    #[error(
+        "server.log.fields: {first} and {second} are both emitted as {name}; each needs its own name"
+    )]
     LogFieldCollision {
         /// The emitted name both fields map to.
         name: String,
@@ -376,12 +476,36 @@ impl Config {
         Self::from_text(text)?.validated()
     }
 
-    /// The text as either syntax reads it, not yet validated.
+    /// The text as either syntax reads it, not yet validated. The syntax
+    /// is checked apart from the schema, so a document that parses is never
+    /// reported as malformed TOML or JSON: TOML is parsed whole before it is
+    /// deserialized, and a JSON error is sorted by `serde_json`'s category.
     fn from_text(text: &str) -> Result<Self> {
         if text.trim_start().starts_with(JSON_OPENING) {
-            Ok(serde_json::from_str(text).map_err(ConfigError::Json)?)
+            let mut document = serde_json::Deserializer::from_str(text);
+            let config = serde_path_to_error::deserialize(&mut document).map_err(|error| {
+                let at = error.path().clone();
+                let inner = error.into_inner();
+                match inner.classify() {
+                    Category::Data => ConfigError::Schema {
+                        at,
+                        fault: Box::new(SchemaFault::Json(inner)),
+                    },
+                    Category::Io | Category::Syntax | Category::Eof => ConfigError::Json(inner),
+                }
+            })?;
+            document.end().map_err(ConfigError::Json)?;
+            Ok(config)
         } else {
-            Ok(toml::from_str(text).map_err(ConfigError::Toml)?)
+            let document = toml::Deserializer::parse(text).map_err(ConfigError::Toml)?;
+            Ok(
+                serde_path_to_error::deserialize(document).map_err(|error| {
+                    ConfigError::Schema {
+                        at: error.path().clone(),
+                        fault: Box::new(SchemaFault::Toml(error.into_inner())),
+                    }
+                })?,
+            )
         }
     }
 
@@ -489,7 +613,10 @@ impl Config {
     /// Reads the file, then `parse`s it; a file that cannot be read is
     /// `ConfigError::Read`.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Self::parse(&text)
     }
 }
@@ -534,23 +661,31 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         return Err(ConfigViolation::NoTables);
     }
     let mut names = HashSet::new();
-    for table in &config.tables {
+    for (index, table) in config.tables.iter().enumerate() {
         if table.name.is_empty() {
-            return Err(ConfigViolation::EmptyTableName);
+            return Err(ConfigViolation::EmptyTableName { index });
         }
         if !names.insert(table.name.as_str()) {
-            return Err(ConfigViolation::DuplicateTableName(table.name.clone()));
+            return Err(ConfigViolation::DuplicateTableName {
+                index,
+                name: table.name.clone(),
+            });
         }
         match table.residency {
             Residency::Full => {}
             Residency::Disk | Residency::Bloom => {
                 if table.resident_budget_bytes.is_some() {
-                    return Err(ConfigViolation::BudgetWithoutResidency);
+                    return Err(ConfigViolation::BudgetWithoutResidency {
+                        table: table.name.clone(),
+                        residency: table.residency,
+                    });
                 }
             }
         }
         if table.residency == Residency::Disk && config.storage.local.is_none() {
-            return Err(ConfigViolation::DiskResidencyWithoutLocalDir);
+            return Err(ConfigViolation::DiskResidencyWithoutLocalDir {
+                table: table.name.clone(),
+            });
         }
     }
     Ok(())
@@ -1082,6 +1217,8 @@ pub enum SourceConfig {
 mod tests {
     use std::io::Write as _;
 
+    use serde_path_to_error::Segment;
+
     use super::*;
     use crate::contract::VALUE_PAGE_BYTES;
     use crate::error::Error;
@@ -1459,21 +1596,55 @@ value_column = "value"
         assert_eq!(s3.secret_access_key, None);
     }
 
+    /// One step of a schema fault's place, comparable.
+    #[derive(Debug, PartialEq, Eq)]
+    enum At {
+        /// A key of a table or object.
+        Key(String),
+        /// An entry of a list.
+        Index(usize),
+        /// A variant of an externally tagged enum.
+        Variant(String),
+        /// A step serde could not name.
+        Unknown,
+    }
+
+    /// Where `text`'s schema fault is, as the steps serde walked to it.
+    /// Anything but a schema fault fails the test.
+    fn schema_fault_at(text: &str) -> Vec<At> {
+        match Config::parse(text) {
+            Err(Error::Config(ConfigError::Schema { at, .. })) => at
+                .iter()
+                .map(|segment| match segment {
+                    Segment::Map { key } => At::Key(key.clone()),
+                    Segment::Seq { index } => At::Index(*index),
+                    Segment::Enum { variant } => At::Variant(variant.clone()),
+                    Segment::Unknown => At::Unknown,
+                })
+                .collect(),
+            other => panic!("expected a schema fault, got {other:?}"),
+        }
+    }
+
+    /// The step to `key`.
+    fn key(key: &str) -> At {
+        At::Key(key.to_string())
+    }
+
     #[test]
-    fn test_parse_rejects_unknown_field() {
-        let toml = Config::parse(&format!(
-            "{TOML_MINIMAL}\n[server]\nlisten_addr = \"127.0.0.1:1\"\n"
-        ));
-        assert!(matches!(toml, Err(Error::Config(ConfigError::Toml(_)))));
-        let nested = Config::parse(&format!(
-            "{TOML_MINIMAL}\n[storage.hedge]\npercentil = 0.5\n"
-        ));
-        assert!(matches!(nested, Err(Error::Config(ConfigError::Toml(_)))));
-        let json = Config::parse(r#"{"server": {"listen_addr": "127.0.0.1:1"}}"#);
-        assert!(matches!(json, Err(Error::Config(ConfigError::Json(_)))));
-        // The source is the one internally tagged enum in the schema.
-        let source = Config::parse(
-            r#"
+    fn test_parse_rejects_unknown_field_as_a_schema_fault() {
+        let toml = format!("{TOML_MINIMAL}\n[server]\nlisten_addr = \"127.0.0.1:1\"\n");
+        assert_eq!(schema_fault_at(&toml), [key("server"), key("listen_addr")]);
+        let nested = format!("{TOML_MINIMAL}\n[storage.hedge]\npercentil = 0.5\n");
+        assert_eq!(
+            schema_fault_at(&nested),
+            [key("storage"), key("hedge"), key("percentil")]
+        );
+        let json = r#"{"server": {"listen_addr": "127.0.0.1:1"}}"#;
+        assert_eq!(schema_fault_at(json), [key("server"), key("listen_addr")]);
+        // The source is the one internally tagged enum in the schema, which
+        // serde buffers, so the fault is placed at the source itself.
+        let source = r#"
 [[tables]]
 name = "kv"
 ref = "main"
@@ -1484,25 +1655,74 @@ value_column = "value"
 type = "static"
 location = "s3://example-warehouse/db/kv"
 locaton = "typo"
-"#,
+"#;
+        assert_eq!(
+            schema_fault_at(source),
+            [key("tables"), At::Index(0), key("source")]
         );
-        assert!(matches!(source, Err(Error::Config(ConfigError::Toml(_)))));
     }
 
     #[test]
-    fn test_parse_rejects_a_log_field_that_names_no_standard_field() {
-        let toml = Config::parse(&format!(
-            "{TOML_MINIMAL}\n[server.log.fields]\ntimestamp = \"ts\"\n"
-        ));
+    fn test_parse_reports_a_missing_key_at_its_table_in_either_syntax() {
+        let toml = TOML_MINIMAL.replace("ref = \"main\"\n", "");
+        let at_first_table = [key("tables"), At::Index(0)];
+        assert_eq!(schema_fault_at(&toml), at_first_table);
+        let json = r#"{"tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "key_column": "key", "value_column": "value"}]}"#;
+        assert_eq!(schema_fault_at(json), at_first_table);
+    }
+
+    #[test]
+    fn test_parse_reports_a_value_of_the_wrong_form_at_its_key() {
+        let toml = format!("{TOML_MINIMAL}\n[server]\npoll_interval = \"10\"\n");
+        assert_eq!(
+            schema_fault_at(&toml),
+            [key("server"), key("poll_interval")]
+        );
+        let json = r#"{"server": {"max_in_flight": "many"}}"#;
+        assert_eq!(schema_fault_at(json), [key("server"), key("max_in_flight")]);
+    }
+
+    #[test]
+    fn test_place_spells_a_setting_as_the_file_does() {
+        let text = TOML_MINIMAL.replace("ref = \"main\"\n", "ref = \"main\"\nstrict = 1\n");
+        let Err(Error::Config(ConfigError::Schema { at, .. })) = Config::parse(&text) else {
+            panic!("strict = 1 is the wrong type");
+        };
+        assert_eq!(place(&at), "tables[0].strict");
+        let log = format!("{TOML_MINIMAL}\n[server.log.fields]\ntimestamp = \"ts\"\n");
+        let Err(Error::Config(ConfigError::Schema { at, .. })) = Config::parse(&log) else {
+            panic!("timestamp names no standard field");
+        };
+        assert_eq!(place(&at), "server.log.fields");
+    }
+
+    #[test]
+    fn test_parse_reports_malformed_text_as_its_syntax_s_error() {
+        let toml = Config::parse("[[tables]\n");
         assert!(
             matches!(toml, Err(Error::Config(ConfigError::Toml(_)))),
             "{toml:?}"
         );
-        let json = Config::parse(r#"{"server": {"log": {"fields": {"timestamp": "ts"}}}}"#);
-        assert!(
-            matches!(json, Err(Error::Config(ConfigError::Json(_)))),
-            "{json:?}"
-        );
+        for json in [
+            "{\"tables\": [",
+            "{\"tables\": []} trailing",
+            "{\"tables\" []}",
+        ] {
+            let result = Config::parse(json);
+            assert!(
+                matches!(result, Err(Error::Config(ConfigError::Json(_)))),
+                "{json}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_a_log_field_that_names_no_standard_field() {
+        let toml = format!("{TOML_MINIMAL}\n[server.log.fields]\ntimestamp = \"ts\"\n");
+        let at_fields = [key("server"), key("log"), key("fields"), At::Unknown];
+        assert_eq!(schema_fault_at(&toml), at_fields);
+        let json = r#"{"server": {"log": {"fields": {"timestamp": "ts"}}}}"#;
+        assert_eq!(schema_fault_at(json), at_fields);
     }
 
     #[test]
@@ -1572,7 +1792,10 @@ locaton = "typo"
     #[test]
     fn test_parse_refuses_empty_table_name() {
         let text = TOML_MINIMAL.replace("name = \"kv\"", "name = \"\"");
-        assert_eq!(violation(&text), ConfigViolation::EmptyTableName);
+        assert_eq!(
+            violation(&text),
+            ConfigViolation::EmptyTableName { index: 0 }
+        );
     }
 
     /// Two configurations that differ in their tables alone need no
@@ -1597,7 +1820,10 @@ locaton = "typo"
         let text = format!("{TOML_MINIMAL}{TOML_MINIMAL}");
         assert_eq!(
             violation(&text),
-            ConfigViolation::DuplicateTableName("kv".to_string())
+            ConfigViolation::DuplicateTableName {
+                index: 1,
+                name: "kv".to_string(),
+            }
         );
     }
 
@@ -1619,13 +1845,25 @@ locaton = "typo"
             "{}\nresidency = \"bloom\"\nresident_budget_bytes = 1\n",
             TOML_MINIMAL.trim_end()
         );
-        assert_eq!(violation(&bloom), ConfigViolation::BudgetWithoutResidency);
+        assert_eq!(
+            violation(&bloom),
+            ConfigViolation::BudgetWithoutResidency {
+                table: "kv".to_string(),
+                residency: Residency::Bloom,
+            }
+        );
         // Disk has its local directory, so the budget is the only fault.
         let disk = format!(
             "{}\nresidency = \"disk\"\nresident_budget_bytes = 1\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {PAGE_CACHE_DISK_BLOCK_BYTES}\n",
             TOML_MINIMAL.trim_end()
         );
-        assert_eq!(violation(&disk), ConfigViolation::BudgetWithoutResidency);
+        assert_eq!(
+            violation(&disk),
+            ConfigViolation::BudgetWithoutResidency {
+                table: "kv".to_string(),
+                residency: Residency::Disk,
+            }
+        );
     }
 
     #[test]
@@ -1689,7 +1927,9 @@ locaton = "typo"
         let text = format!("{}\nresidency = \"disk\"\n", TOML_MINIMAL.trim_end());
         assert_eq!(
             violation(&text),
-            ConfigViolation::DiskResidencyWithoutLocalDir
+            ConfigViolation::DiskResidencyWithoutLocalDir {
+                table: "kv".to_string(),
+            }
         );
     }
 
@@ -1898,7 +2138,10 @@ locaton = "typo"
     fn test_from_path_missing_file_is_read_error() {
         let dir = tempfile::tempdir().unwrap();
         let result = Config::from_path(&dir.path().join("missing.toml"));
-        assert!(matches!(result, Err(Error::Config(ConfigError::Read(_)))));
+        assert!(matches!(
+            result,
+            Err(Error::Config(ConfigError::Read { path, .. })) if path == dir.path().join("missing.toml")
+        ));
     }
 
     #[test]

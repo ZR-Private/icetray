@@ -140,9 +140,12 @@ async fn serve(path: &Path) -> ExitCode {
     let file = ConfigFile::new(path);
     let reading = match file.read() {
         Ok(reading) => reading,
-        Err(error) => {
+        Err(source) => {
             return report(&CliError::Core(icetray_core::Error::Config(
-                icetray_core::config::ConfigError::Read(error),
+                icetray_core::config::ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                },
             )));
         }
     };

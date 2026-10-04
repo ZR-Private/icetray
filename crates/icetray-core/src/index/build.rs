@@ -67,9 +67,13 @@ impl Inspected {
                 (KeyResidency::Chunks(chunks), verified)
             }
             Residency::Disk => {
-                let local = local.ok_or(Error::Config(ConfigError::Invalid(
-                    ConfigViolation::DiskResidencyWithoutLocalDir,
-                )))?;
+                let local = local.ok_or_else(|| {
+                    Error::Config(ConfigError::Invalid(
+                        ConfigViolation::DiskResidencyWithoutLocalDir {
+                            table: to_verify.table.clone(),
+                        },
+                    ))
+                })?;
                 let (disk, verified) = disk_chunks(&to_verify, local, reservation, &ranges).await?;
                 (KeyResidency::Disk(disk), verified)
             }
@@ -2558,7 +2562,7 @@ mod tests {
             matches!(
                 error,
                 Error::Config(ConfigError::Invalid(
-                    ConfigViolation::DiskResidencyWithoutLocalDir
+                    ConfigViolation::DiskResidencyWithoutLocalDir { .. }
                 ))
             ),
             "{error:?}"

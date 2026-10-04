@@ -78,6 +78,15 @@ pub fn millis_after(base: i64, step: Duration) -> i64 {
     base.saturating_add(i64::try_from(step.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// A duration as configuration text, in the friendly form
+/// `friendly_duration` reads: `"0s"`, `"250ms"`, `"1m 30s"`. What a
+/// message prints a configured duration as, so it reads as the file wrote
+/// it; text that spelled the same duration in other units reads back in
+/// the largest units that hold it.
+pub fn friendly(duration: Duration) -> String {
+    jiff::fmt::friendly::SpanPrinter::new().unsigned_duration_to_string(&duration)
+}
+
 /// Serde `with` module for a `std::time::Duration` field written in jiff's
 /// friendly form: `"10s"`, `"250ms"`, `"1m 30s"`. Only that grammar is
 /// accepted: a negative duration (`"-1s"`, `"1s ago"`) and text without a
@@ -131,6 +140,22 @@ mod tests {
 
     fn parse(text: &str) -> Result<Holder, serde_json::Error> {
         serde_json::from_str(&format!("{{\"elapsed\": \"{text}\"}}"))
+    }
+
+    #[test]
+    fn test_friendly_round_trips_through_the_parser() {
+        for duration in [
+            Duration::ZERO,
+            TEN_SECONDS,
+            ONE_MINUTE,
+            QUARTER_SECOND,
+            NINETY_SECONDS,
+        ] {
+            let text = super::friendly(duration);
+            assert_eq!(parse(&text).unwrap().elapsed, duration, "{text}");
+        }
+        assert_eq!(super::friendly(Duration::ZERO), "0s");
+        assert_eq!(super::friendly(NINETY_SECONDS), "1m 30s");
     }
 
     #[test]

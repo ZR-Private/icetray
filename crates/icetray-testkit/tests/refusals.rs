@@ -478,7 +478,7 @@ async fn test_disk_tier_without_a_local_directory_is_a_config_violation() -> Res
         matches!(
             error,
             Error::Config(ConfigError::Invalid(
-                ConfigViolation::DiskResidencyWithoutLocalDir
+                ConfigViolation::DiskResidencyWithoutLocalDir { .. }
             ))
         ),
         "{error:?}"

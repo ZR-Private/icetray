@@ -93,10 +93,10 @@ impl ConfigSource for ConfigFile {
         let digest = Digest::of(&bytes);
         let config = std::str::from_utf8(&bytes)
             .map_err(|error| {
-                icetray_core::Error::Config(ConfigError::Read(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    error,
-                )))
+                icetray_core::Error::Config(ConfigError::Read {
+                    path: self.path.clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, error),
+                })
             })
             .and_then(Config::parse);
         Ok(Reading { digest, config })
@@ -135,7 +135,7 @@ pub enum ReloadRefusal {
 impl fmt::Display for ReloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid(error) => write!(f, "the configuration is invalid: {error}"),
+            Self::Invalid(error) => write!(f, "{error}"),
             Self::Restart(settings) => write!(
                 f,
                 "{} changed, which only a restart applies",
@@ -426,7 +426,7 @@ location = "s3://warehouse/kv"
         let reading = ConfigFile::new(file.path()).read().unwrap();
         assert!(matches!(
             reading.config,
-            Err(icetray_core::Error::Config(ConfigError::Read(_)))
+            Err(icetray_core::Error::Config(ConfigError::Read { .. }))
         ));
     }
 
