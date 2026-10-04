@@ -35,7 +35,7 @@ use crate::error::ServeError;
 use crate::listen::serve_http;
 use crate::reload::{Reload, Reloader};
 use crate::service::Service;
-use crate::telemetry;
+use crate::telemetry::{self, Scrape};
 
 /// How long a first-load failure stays visible on the health service before
 /// the process exits: long enough for an orchestrator's probe, at the usual
@@ -156,6 +156,7 @@ impl Serving {
 
         let opened = Arc::new(opened);
         let service = Service::new(&opened, &config.server);
+        let scrape = Scrape::new(handle.clone(), Arc::clone(&opened), service.slots().clone());
         let (shutdown, _stop) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
 
@@ -170,8 +171,7 @@ impl Serving {
         );
         let http = tokio::spawn(serve_http(
             listeners.metrics,
-            handle.clone(),
-            Arc::clone(&opened),
+            scrape,
             ready.clone(),
             shutdown.subscribe(),
         ));

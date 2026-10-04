@@ -30,6 +30,52 @@ use tonic::{Request, Response, Status};
 use crate::error::{CallFault, WireKeyFault};
 use crate::telemetry::{Answering, Call};
 
+/// The in-flight slots `Get` and `MultiGet` hold together, at most
+/// `server.max_in_flight`: what admits a call, and what
+/// `requests_in_flight` reads, so the gauge counts the slots the bound
+/// holds and cannot drift from it. Clone shares the slots.
+#[derive(Clone, Debug)]
+pub struct Slots {
+    /// Nothing closes it.
+    semaphore: Arc<Semaphore>,
+    /// The slots `semaphore` was built with.
+    limit: usize,
+}
+
+impl Slots {
+    /// `max_in_flight` slots, held to tokio's `Semaphore::MAX_PERMITS`,
+    /// which is far above any count of calls one process can hold open.
+    pub fn new(max_in_flight: usize) -> Self {
+        let limit = max_in_flight.min(Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    /// A slot for one call, held until the call ends, its deadline
+    /// included; with none free the call is refused at once, never queued.
+    fn admit(&self) -> Result<SemaphorePermit<'_>, CallFault> {
+        self.semaphore.try_acquire().map_err(|error| match error {
+            // `Closed` is unreachable, since nothing closes the
+            // semaphore; were it closed, no call could be admitted.
+            TryAcquireError::NoPermits | TryAcquireError::Closed => {
+                CallFault::Overloaded { limit: self.limit }
+            }
+        })
+    }
+
+    /// The slots there are: `server.max_in_flight` as the bound enforces it.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The slots held now, one per call admitted and not yet ended.
+    pub fn admitted(&self) -> usize {
+        self.limit - self.semaphore.available_permits()
+    }
+}
+
 /// The served tables and the bounds each call runs under. Clone: tonic
 /// hands one clone to every connection, and they share the tables and the
 /// in-flight slots.
@@ -40,41 +86,28 @@ pub struct Service {
     opened: Arc<Opened>,
     get_deadline: Duration,
     multi_get_deadline: Duration,
-    /// `Get` and `MultiGet` together; nothing closes it.
-    in_flight: Arc<Semaphore>,
-    /// The slots `in_flight` was built with, for the refusal.
-    max_in_flight: usize,
+    /// `Get` and `MultiGet` together.
+    slots: Slots,
     /// The most keys one `MultiGet` may carry.
     max_multi_get_keys: usize,
 }
 
 impl Service {
     /// The service over the tables `opened` serves, by configured name,
-    /// under `server`'s request bounds. `max_in_flight` is held to tokio's
-    /// `Semaphore::MAX_PERMITS`, which is far above any count of calls one
-    /// process can hold open.
+    /// under `server`'s request bounds.
     pub fn new(opened: &Arc<Opened>, server: &ServerConfig) -> Self {
-        let max_in_flight = server.max_in_flight.min(Semaphore::MAX_PERMITS);
         Self {
             opened: Arc::clone(opened),
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
-            in_flight: Arc::new(Semaphore::new(max_in_flight)),
-            max_in_flight,
+            slots: Slots::new(server.max_in_flight),
             max_multi_get_keys: server.max_multi_get_keys,
         }
     }
 
-    /// A slot for one call, held until the call ends, its deadline
-    /// included; with none free the call is refused at once, never queued.
-    fn admit(&self) -> Result<SemaphorePermit<'_>, CallFault> {
-        self.in_flight.try_acquire().map_err(|error| match error {
-            // `Closed` is unreachable, since nothing closes the
-            // semaphore; were it closed, no call could be admitted.
-            TryAcquireError::NoPermits | TryAcquireError::Closed => CallFault::Overloaded {
-                limit: self.max_in_flight,
-            },
-        })
+    /// The in-flight slots the service admits calls through.
+    pub fn slots(&self) -> &Slots {
+        &self.slots
     }
 
     /// The tables served as they stand, borrowed for one call
@@ -302,7 +335,7 @@ impl Service {
 
     /// `Get`, admitted and inside its deadline.
     async fn answer_get(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
-        let _slot = self.admit()?;
+        let _slot = self.slots.admit()?;
         within(self.get_deadline, self.lookup(request)).await
     }
 
@@ -320,7 +353,7 @@ impl Service {
             }
             .into());
         }
-        let _slot = self.admit()?;
+        let _slot = self.slots.admit()?;
         within(self.multi_get_deadline, self.lookup_batch(request)).await
     }
 
@@ -532,6 +565,30 @@ mod tests {
         for (fault, code) in cases {
             assert_eq!(Status::from(fault).code(), code);
         }
+    }
+
+    /// A slot is held from `admit` to the drop of what it returns, and
+    /// with every slot held the next call is refused.
+    #[test]
+    fn test_admit_holds_a_slot_until_dropped_and_refuses_past_the_limit() {
+        let slots = Slots::new(SAMPLE_LIMIT);
+        assert_eq!((slots.limit(), slots.admitted()), (SAMPLE_LIMIT, 0));
+        let held: Vec<_> = (0..SAMPLE_LIMIT).map(|_| slots.admit().unwrap()).collect();
+        assert_eq!(slots.admitted(), SAMPLE_LIMIT);
+        assert!(matches!(
+            slots.admit(),
+            Err(CallFault::Overloaded {
+                limit: SAMPLE_LIMIT
+            })
+        ));
+        assert_eq!(slots.admitted(), SAMPLE_LIMIT, "a refusal holds no slot");
+        drop(held);
+        assert_eq!(slots.admitted(), 0);
+    }
+
+    #[test]
+    fn test_new_holds_max_in_flight_to_the_semaphore_s_bound() {
+        assert_eq!(Slots::new(usize::MAX).limit(), Semaphore::MAX_PERMITS);
     }
 
     #[test]

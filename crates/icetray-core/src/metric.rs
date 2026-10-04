@@ -74,6 +74,12 @@ pub const TABLE_STATE: &str = "icetray_table_state";
 /// 1 while the configuration file differs from the configuration the
 /// server applied, 0 once they match (RFD 018).
 pub const CONFIG_PENDING: &str = "icetray_config_pending";
+/// `Get` and `MultiGet` calls admitted and not yet ended, each holding one
+/// of the `max_in_flight` slots.
+pub const REQUESTS_IN_FLIGHT: &str = "icetray_requests_in_flight";
+/// The in-flight slots there are, `server.max_in_flight`: a call that finds
+/// every one held is refused `RESOURCE_EXHAUSTED`.
+pub const MAX_IN_FLIGHT: &str = "icetray_max_in_flight";
 
 /// The `call` label: the RPC, from the RPC enum's `Display`.
 pub const LABEL_CALL: &str = "call";

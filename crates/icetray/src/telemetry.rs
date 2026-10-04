@@ -1,11 +1,12 @@
 //! The binary's share of the metrics (blueprint section 7): the Prometheus
 //! recorder with the latency buckets, the `requests_total` counter with its
-//! `call` and `code` labels, and the sampler for `generation_age_seconds`,
+//! `call` and `code` labels, the in-flight gauges a scrape reads from the
+//! service's slots, and the sampler for `generation_age_seconds`,
 //! `process_rss_bytes`, and the allocator gauges. Core's modules emit every
 //! other series.
 
 use std::fmt;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use icetray_core::{Opened, approx, metric, time};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -13,6 +14,7 @@ use tikv_jemalloc_ctl::{epoch, stats};
 use tonic::{Code, Status};
 
 use crate::error::ServeError;
+use crate::service::Slots;
 
 /// Histogram bucket bounds in seconds for `lookup_seconds` and
 /// `object_get_seconds`, from 100 microseconds to 2 seconds: sized from
@@ -150,16 +152,40 @@ fn count(call: Call, code: Code) {
     .increment(1);
 }
 
-/// The exposition a scrape of `/metrics` returns, with every table's lookup
-/// counts (`Table::publish_lookup_counts`) and the page cache's hit counts
-/// (`PageCache::publish_hit_counts`) published first, so the scrape reads
-/// every lookup answered and every page hit before it.
-pub fn render(opened: &Opened, handle: &PrometheusHandle) -> String {
-    for table in opened.tables().iter() {
-        table.publish_lookup_counts();
+/// What a scrape of `/metrics` reads: the recorder, the tables and page
+/// cache whose counts it publishes first, and the service's in-flight
+/// slots. Clone: every metrics connection holds one.
+#[derive(Clone)]
+pub struct Scrape {
+    handle: PrometheusHandle,
+    opened: Arc<Opened>,
+    slots: Slots,
+}
+
+impl Scrape {
+    /// A scrape of `handle`'s recorder over `opened` and `slots`.
+    pub fn new(handle: PrometheusHandle, opened: Arc<Opened>, slots: Slots) -> Self {
+        Self {
+            handle,
+            opened,
+            slots,
+        }
     }
-    opened.cache.publish_hit_counts();
-    handle.render()
+
+    /// The exposition, with every table's lookup counts
+    /// (`Table::publish_lookup_counts`) and the page cache's hit counts
+    /// (`PageCache::publish_hit_counts`) published first, so the scrape
+    /// reads every lookup answered and every page hit before it, and the
+    /// in-flight gauges read from the slots as they stand.
+    pub fn render(&self) -> String {
+        for table in self.opened.tables().iter() {
+            table.publish_lookup_counts();
+        }
+        self.opened.cache.publish_hit_counts();
+        metrics::gauge!(metric::REQUESTS_IN_FLIGHT).set(approx::gauge_len(self.slots.admitted()));
+        metrics::gauge!(metric::MAX_IN_FLIGHT).set(approx::gauge_len(self.slots.limit()));
+        self.handle.render()
+    }
 }
 
 /// Samples the gauges the binary owns: `generation_age_seconds` for every

@@ -372,6 +372,27 @@ fn assert_counted(before: &str, after: &str, call: Call, code: Code, expected: u
     );
 }
 
+/// The value of the unlabeled gauge `name` in `exposition`, which must
+/// expose it.
+fn gauge(exposition: &str, name: &str) -> f64 {
+    series_value(exposition, name, &[]).unwrap_or_else(|| panic!("{name} in {exposition}"))
+}
+
+/// Asserts that `exposition` reads `admitted` calls in flight of `limit`
+/// slots.
+fn assert_in_flight(exposition: &str, admitted: usize, limit: usize) {
+    for (name, expected) in [
+        (metric::REQUESTS_IN_FLIGHT, admitted),
+        (metric::MAX_IN_FLIGHT, limit),
+    ] {
+        assert_eq!(
+            gauge(exposition, name).to_bits(),
+            approx::gauge_len(expected).to_bits(),
+            "{name}"
+        );
+    }
+}
+
 /// `call`'s outcome beside how long it took.
 async fn timed<T>(call: impl Future<Output = T>) -> (T, Duration) {
     let started = tokio::time::Instant::now();
@@ -1223,6 +1244,7 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
     .await?;
 
     let before = stack.scrape().await?;
+    assert_in_flight(&before, IN_FLIGHT_CAP, IN_FLIGHT_CAP);
     let (outcome, elapsed) = timed(stack.get(TABLE, Some(wire_key(&keys[2])))).await;
     assert_eq!(code_of(outcome), Code::ResourceExhausted);
     assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
@@ -1244,9 +1266,11 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
         assert_counted(&before, &after, call, Code::ResourceExhausted, 1);
         assert_counted(&before, &after, call, Code::DeadlineExceeded, 1);
     }
+    assert_in_flight(&after, 0, IN_FLIGHT_CAP);
     stack.s3.release();
     let response = stack.get(TABLE, Some(wire_key(&keys[2]))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    assert_in_flight(&stack.scrape().await?, 0, IN_FLIGHT_CAP);
     Ok(())
 }
 

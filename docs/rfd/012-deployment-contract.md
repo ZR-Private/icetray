@@ -1,7 +1,7 @@
 # Deployment contract
 
 > Updated 2026-10-04: request counts carry the status code each call
-> answered.
+> answered, and the calls in flight show beside their bound.
 
 ## Problem
 
@@ -71,6 +71,9 @@ Metrics are Prometheus, and they cover:
 - request counts by call and by the gRPC status code each call answered,
   so errors show on the server's side; a call dropped before it answers,
   as at its client's deadline, counts as cancelled;
+- the calls in flight beside `server.max_in_flight`, the bound past which
+  a call is refused, both as gauges, so saturation shows before the
+  refusals do;
 - GET counts, local read counts, and latency histograms by kind (load,
   lookup), read from the request counter of RFD 003 (One storage stack);
 - lookup latency by table and by result (cold hit, warm hit, miss);
