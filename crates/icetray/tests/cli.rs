@@ -276,7 +276,7 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     assert_eq!(report[0]["kind"], "table");
     assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["serviceability"], "efficient");
-    assert_eq!(report[0]["costs"], Json::from(0));
+    assert_eq!(report[0]["inefficient"], Json::from(0));
     assert_eq!(report[0]["advice"], Json::from(0));
     assert!(report.iter().all(|line| line["kind"] != "finding"));
     assert_eq!(

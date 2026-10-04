@@ -356,7 +356,7 @@ mod tests {
                 key_chunk_bytes: 1,
                 filter_bytes: None,
             },
-            costs: 0,
+            inefficient: 0,
             advice: 0,
         }
     }
@@ -443,7 +443,7 @@ mod tests {
             line["serviceability"],
             Json::String("efficient".to_string())
         );
-        assert_eq!(line["costs"], Json::from(0));
+        assert_eq!(line["inefficient"], Json::from(0));
     }
 
     #[test]

@@ -149,9 +149,10 @@ pub enum Serviceability {
 }
 
 impl Serviceability {
-    /// The verdict `costs` inefficient findings give: `Inefficient` for any.
-    fn from_costs(costs: usize) -> Self {
-        if costs > 0 {
+    /// The verdict `inefficient` inefficient findings give: `Inefficient`
+    /// for any.
+    fn from_inefficient(inefficient: usize) -> Self {
+        if inefficient > 0 {
             Self::Inefficient
         } else {
             Self::Efficient
@@ -541,9 +542,9 @@ pub struct TableSummary {
     /// Every tier's resident bytes, from the footers alone (RFD 017), so an
     /// owner chooses a tier from one run.
     pub predicted: ResidentBytes,
-    /// Inefficient findings.
-    pub costs: usize,
-    /// Advice findings.
+    /// Inefficient findings, the count of `Tier::Inefficient`.
+    pub inefficient: usize,
+    /// Advice findings, the count of `Tier::Advice`.
     pub advice: usize,
 }
 
@@ -578,11 +579,11 @@ pub fn diagnose(g: &Generation) -> TableReport {
         .collect();
     findings.extend(table_findings(g, &buckets));
     sort_findings(&mut findings);
-    let costs = findings
+    let inefficient = findings
         .iter()
         .filter(|finding| finding.tier() == Tier::Inefficient)
         .count();
-    let serviceability = Serviceability::from_costs(costs);
+    let serviceability = Serviceability::from_inefficient(inefficient);
     let summary = TableSummary {
         table: g.table.clone(),
         snapshot_id: g.snapshot_id,
@@ -595,8 +596,8 @@ pub fn diagnose(g: &Generation) -> TableReport {
         records: g.records,
         index_bytes: g.index_bytes,
         predicted: predicted_total(&facts),
-        costs,
-        advice: findings.len() - costs,
+        inefficient,
+        advice: findings.len() - inefficient,
     };
     TableReport {
         summary,
@@ -1473,15 +1474,15 @@ mod tests {
     /// counts and serviceability follow them.
     fn assert_findings(report: &TableReport, expected: &[Shape]) {
         assert_eq!(shapes_of(&report.findings), expected);
-        let costs = expected
+        let inefficient = expected
             .iter()
             .filter(|(_, tier, ..)| *tier == Tier::Inefficient)
             .count();
-        assert_eq!(report.summary.costs, costs);
-        assert_eq!(report.summary.advice, expected.len() - costs);
+        assert_eq!(report.summary.inefficient, inefficient);
+        assert_eq!(report.summary.advice, expected.len() - inefficient);
         assert_eq!(
             report.summary.serviceability,
-            Serviceability::from_costs(costs)
+            Serviceability::from_inefficient(inefficient)
         );
         for finding in &report.findings {
             assert_eq!(
@@ -1494,9 +1495,15 @@ mod tests {
     }
 
     #[test]
-    fn test_from_costs_is_inefficient_for_any_inefficient_finding() {
-        assert_eq!(Serviceability::from_costs(0), Serviceability::Efficient);
-        assert_eq!(Serviceability::from_costs(1), Serviceability::Inefficient);
+    fn test_from_inefficient_is_inefficient_for_any_inefficient_finding() {
+        assert_eq!(
+            Serviceability::from_inefficient(0),
+            Serviceability::Efficient
+        );
+        assert_eq!(
+            Serviceability::from_inefficient(1),
+            Serviceability::Inefficient
+        );
     }
 
     #[test]
@@ -2342,7 +2349,7 @@ mod tests {
         let (_table, generation) = one_file(advice_only).await;
         let report = diagnose(&generation);
         assert_eq!(report.summary.serviceability, Serviceability::Efficient);
-        assert_eq!((report.summary.costs, report.summary.advice), (0, 1));
+        assert_eq!((report.summary.inefficient, report.summary.advice), (0, 1));
 
         let inefficient = WriterLayout {
             dictionary: Dictionary::Value,
@@ -2351,7 +2358,7 @@ mod tests {
         let (_table, generation) = one_file(inefficient).await;
         let report = diagnose(&generation);
         assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
-        assert_eq!((report.summary.costs, report.summary.advice), (1, 0));
+        assert_eq!((report.summary.inefficient, report.summary.advice), (1, 0));
     }
 
     #[tokio::test]
@@ -2484,7 +2491,7 @@ mod tests {
                 "records",
                 "index_bytes",
                 "predicted",
-                "costs",
+                "inefficient",
                 "advice",
             ])
         );
@@ -2502,7 +2509,7 @@ mod tests {
             Json::String(Residency::Full.to_string())
         );
         assert_eq!(summary["buckets"], Json::from(ONE));
-        assert_eq!(summary["costs"], Json::from(1));
+        assert_eq!(summary["inefficient"], Json::from(1));
         assert_eq!(summary["advice"], Json::from(0));
         assert_eq!(
             summary["predicted"]["full"],

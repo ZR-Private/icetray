@@ -143,7 +143,7 @@ fn assert_codes(report: &TableReport, inefficient: &[FindingCode], advice: &[Fin
     };
     assert_eq!(report.summary.serviceability, serviceability);
     assert_eq!(
-        report.summary.costs,
+        report.summary.inefficient,
         report.findings.len() - report.summary.advice
     );
 }
@@ -177,7 +177,7 @@ async fn test_contract_fixture_is_efficient_with_no_findings() -> Result<()> {
     let report = diagnose(&served.current());
     assert_eq!(report.summary.serviceability, Serviceability::Efficient);
     assert!(report.findings.is_empty(), "{:?}", report.findings);
-    assert_eq!((report.summary.costs, report.summary.advice), (0, 0));
+    assert_eq!((report.summary.inefficient, report.summary.advice), (0, 0));
     Ok(())
 }
 
