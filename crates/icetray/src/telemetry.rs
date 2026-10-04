@@ -52,7 +52,7 @@ static INSTALLING: Mutex<()> = Mutex::new(());
 /// every later call returns the same handle, since a `metrics` recorder is
 /// global and the daemon's tests start several servers in one process.
 /// Histograms use `LATENCY_BUCKETS`; gauges expire after
-/// `GAUGE_IDLE_TIMEOUT`.
+/// `GAUGE_IDLE_TIMEOUT`; every metric is described (`metric::describe`).
 pub fn install() -> Result<PrometheusHandle, ServeError> {
     let _installing = INSTALLING.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(handle) = HANDLE.get() {
@@ -69,6 +69,7 @@ pub fn install() -> Result<PrometheusHandle, ServeError> {
         )?
         .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT))
         .install_recorder()?;
+    metric::describe();
     Ok(HANDLE.get_or_init(|| handle).clone())
 }
 

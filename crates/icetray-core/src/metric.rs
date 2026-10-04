@@ -81,6 +81,185 @@ pub const REQUESTS_IN_FLIGHT: &str = "icetray_requests_in_flight";
 /// every one held is refused `RESOURCE_EXHAUSTED`.
 pub const MAX_IN_FLIGHT: &str = "icetray_max_in_flight";
 
+/// Which `metrics` describe macro names a metric, by what it records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A count that only rises.
+    Counter,
+    /// A value that is set.
+    Gauge,
+    /// A distribution of samples, in buckets.
+    Histogram,
+}
+
+/// Every metric a process can emit, with its kind and the one sentence its
+/// `# HELP` line carries; the unit is in the name or the sentence.
+pub const DESCRIPTIONS: [(&str, Kind, &str); 30] = [
+    (
+        REQUESTS_TOTAL,
+        Kind::Counter,
+        "gRPC calls answered, by call and the status code each answered.",
+    ),
+    (
+        OBJECT_GETS_TOTAL,
+        Kind::Counter,
+        "Object-store GETs issued, hedges included, by read kind.",
+    ),
+    (
+        OBJECT_BYTES_TOTAL,
+        Kind::Counter,
+        "Bytes requested by object-store GETs, by read kind.",
+    ),
+    (
+        LOCAL_READS_TOTAL,
+        Kind::Counter,
+        "Reads served from the local directory.",
+    ),
+    (
+        LOCAL_BYTES_TOTAL,
+        Kind::Counter,
+        "Bytes read from the local directory.",
+    ),
+    (
+        HEDGES_TOTAL,
+        Kind::Counter,
+        "Second GETs issued because a lookup read was slow.",
+    ),
+    (
+        PAGE_CACHE_HITS_TOTAL,
+        Kind::Counter,
+        "Value pages served from the page cache without a fetch.",
+    ),
+    (
+        PAGE_CACHE_FETCHES_TOTAL,
+        Kind::Counter,
+        "Value-page fetches the page cache ran, after coalescing.",
+    ),
+    (
+        LOOKUPS_TOTAL,
+        Kind::Counter,
+        "Lookups answered, by table and result.",
+    ),
+    (
+        REFRESH_ERRORS_TOTAL,
+        Kind::Counter,
+        "Refreshes that failed and left the previous generation serving, by table and reason.",
+    ),
+    (
+        GENERATION_SWAPS_TOTAL,
+        Kind::Counter,
+        "Generations a refresh swapped in, by table.",
+    ),
+    (
+        CONFIG_RELOADS_TOTAL,
+        Kind::Counter,
+        "Configuration reloads that read a changed file, by result.",
+    ),
+    (
+        LOOKUP_SECONDS,
+        Kind::Histogram,
+        "Lookup latency in seconds, by table and result.",
+    ),
+    (
+        OBJECT_GET_SECONDS,
+        Kind::Histogram,
+        "Object-store GET latency in seconds, by read kind.",
+    ),
+    (
+        INDEX_BYTES,
+        Kind::Gauge,
+        "Bytes the serving generation's resident index holds, by table.",
+    ),
+    (
+        PROCESS_RSS_BYTES,
+        Kind::Gauge,
+        "The process's resident set size in bytes.",
+    ),
+    (
+        ALLOCATOR_ALLOCATED_BYTES,
+        Kind::Gauge,
+        "Bytes in live allocations, as jemalloc counts them.",
+    ),
+    (
+        ALLOCATOR_ACTIVE_BYTES,
+        Kind::Gauge,
+        "Bytes in jemalloc's pages that hold live allocations.",
+    ),
+    (
+        ALLOCATOR_METADATA_BYTES,
+        Kind::Gauge,
+        "Bytes of jemalloc's own bookkeeping.",
+    ),
+    (
+        ALLOCATOR_RESIDENT_BYTES,
+        Kind::Gauge,
+        "Bytes jemalloc holds resident, freed pages not yet returned included.",
+    ),
+    (
+        ALLOCATOR_RETAINED_BYTES,
+        Kind::Gauge,
+        "Bytes of address space jemalloc keeps mapped for reuse, not resident.",
+    ),
+    (
+        PAGE_CACHE_BYTES,
+        Kind::Gauge,
+        "Bytes the page cache holds in memory against its budget.",
+    ),
+    (
+        FINDINGS,
+        Kind::Gauge,
+        "Findings the doctor raised on the serving generation, by table and code.",
+    ),
+    (
+        GENERATION_AGE_SECONDS,
+        Kind::Gauge,
+        "Seconds since the serving snapshot was committed, by table.",
+    ),
+    (
+        GENERATION_SEQUENCE_NUMBER,
+        Kind::Gauge,
+        "The serving snapshot's sequence number, by table.",
+    ),
+    (
+        GENERATION_SWAPPED_AT_SECONDS,
+        Kind::Gauge,
+        "When the serving generation was swapped in, in seconds since the Unix epoch, by table.",
+    ),
+    (
+        TABLE_STATE,
+        Kind::Gauge,
+        "1 for the table's lifecycle state and 0 for the others, by table and state.",
+    ),
+    (
+        CONFIG_PENDING,
+        Kind::Gauge,
+        "1 while the configuration file differs from the configuration applied, else 0.",
+    ),
+    (
+        REQUESTS_IN_FLIGHT,
+        Kind::Gauge,
+        "Get and MultiGet calls admitted and not yet ended.",
+    ),
+    (
+        MAX_IN_FLIGHT,
+        Kind::Gauge,
+        "The in-flight slots there are, server.max_in_flight.",
+    ),
+];
+
+/// Gives every metric of `DESCRIPTIONS` its description in the current
+/// recorder, for its `# HELP` line; a process calls this once it has
+/// installed its recorder.
+pub fn describe() {
+    for (name, kind, help) in DESCRIPTIONS {
+        match kind {
+            Kind::Counter => metrics::describe_counter!(name, help),
+            Kind::Gauge => metrics::describe_gauge!(name, help),
+            Kind::Histogram => metrics::describe_histogram!(name, help),
+        }
+    }
+}
+
 /// The `call` label: the RPC, from the RPC enum's `Display`.
 pub const LABEL_CALL: &str = "call";
 /// The `kind` label: the read path, from `ReadKind`.
@@ -152,7 +331,22 @@ impl fmt::Display for LookupResult {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    /// Every description names a distinct metric under the `icetray_`
+    /// prefix and is one sentence.
+    #[test]
+    fn test_descriptions_name_each_metric_once_in_one_sentence() {
+        let mut names = HashSet::new();
+        for (name, _, help) in DESCRIPTIONS {
+            assert!(names.insert(name), "{name} described twice");
+            assert!(name.starts_with("icetray_"), "{name}");
+            assert!(help.ends_with('.'), "{name}: {help}");
+            assert_eq!(help.matches(". ").count(), 0, "{name}: {help}");
+        }
+    }
 
     #[test]
     fn test_fmt_lookup_result_snake_case_names() {

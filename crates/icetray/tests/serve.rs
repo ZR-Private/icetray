@@ -364,6 +364,27 @@ fn calls(exposition: &str, call: Call, code: Code) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Asserts that every metric `exposition` types has a `# HELP` line, and
+/// that it types some.
+fn assert_every_metric_described(exposition: &str) {
+    let named = |prefix: &str| -> Vec<String> {
+        exposition
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix)?.split_whitespace().next())
+            .map(str::to_string)
+            .collect()
+    };
+    let typed = named("# TYPE ");
+    let described = named("# HELP ");
+    assert!(!typed.is_empty(), "{exposition}");
+    for name in &typed {
+        assert!(
+            described.contains(name),
+            "{name} has no HELP in {exposition}"
+        );
+    }
+}
+
 /// Whether `exposition` exposes the `requests_total` series of `call`
 /// answering `code`.
 fn calls_exposed(exposition: &str, call: Call, code: Code) -> bool {
@@ -748,6 +769,7 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     stack.table_info(TABLE).await?;
 
     let after = stack.scrape().await?;
+    assert_every_metric_described(&after);
     assert_counted(&before, &after, Call::Get, Code::Ok, COUNTED_GETS);
     assert_counted(&before, &after, Call::MultiGet, Code::Ok, 1);
     assert_counted(&before, &after, Call::TableInfo, Code::Ok, 1);
