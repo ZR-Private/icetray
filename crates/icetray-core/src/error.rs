@@ -207,7 +207,7 @@ impl Error {
 /// `refresh_errors_total`; a refusal carries its `RefusalReason`, so the
 /// label names the refusal. Display gives the label value: the refusal's own
 /// name for `Refused`, `inefficient` for the strict gate, and the variant's
-/// `snake_case` name for the rest.
+/// `snake_case` name for the rest; serde gives the same string.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     /// `Error::Iceberg`.
@@ -274,6 +274,15 @@ impl fmt::Display for ErrorKind {
             Self::LookupCanceled => "lookup_canceled",
         };
         f.write_str(name)
+    }
+}
+
+impl serde::Serialize for ErrorKind {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 

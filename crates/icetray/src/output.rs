@@ -5,11 +5,12 @@
 //! core's `TableSummary`, so a new measurement in core reaches both without
 //! a change here.
 
+use std::fmt;
 use std::io::Write as _;
 
 use base64::Engine as _;
 use icetray_core::generation::{Lookup, Value};
-use icetray_core::{FileReport, Finding, Key, SnapshotId, TableSummary};
+use icetray_core::{ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotId, TableSummary};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -114,23 +115,87 @@ impl<'a> FileLine<'a> {
     }
 }
 
-/// A table the doctor refused: the kind of the failure as the `reason`
-/// label would carry it, and the error's message for a person.
+/// What a `refusal` line's `reason` carries: the name of the rule the
+/// table breaks, or `load_failed` when an error rather than a rule stopped
+/// its load. Display and serde give the `snake_case` code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefusalCode {
+    /// A refusal reason of RFD 007, under its own name.
+    Rule(RefusalReason),
+    /// `inefficient`: the table is inefficient and `strict` is on.
+    Inefficient,
+    /// `load_failed`: the load failed with an error that names no rule.
+    LoadFailed,
+}
+
+impl RefusalCode {
+    /// The code a failure of `kind` refuses a table under, and `kind`
+    /// itself when that code is `LoadFailed`, since the code alone does not
+    /// say what failed.
+    pub fn of(kind: ErrorKind) -> (Self, Option<ErrorKind>) {
+        match kind {
+            ErrorKind::Refused(reason) => (Self::Rule(reason), None),
+            ErrorKind::Inefficient => (Self::Inefficient, None),
+            failed @ (ErrorKind::Iceberg
+            | ErrorKind::Parquet
+            | ErrorKind::ObjectStore
+            | ErrorKind::ObjectStorePath
+            | ErrorKind::Json
+            | ErrorKind::Config
+            | ErrorKind::Cache
+            | ErrorKind::KeyType
+            | ErrorKind::Table
+            | ErrorKind::File
+            | ErrorKind::NotReady
+            | ErrorKind::Local
+            | ErrorKind::CatalogTimeout
+            | ErrorKind::LoadDeadline
+            | ErrorKind::RefreshDeadline
+            | ErrorKind::VerifyCanceled
+            | ErrorKind::LookupCanceled) => (Self::LoadFailed, Some(failed)),
+        }
+    }
+}
+
+impl fmt::Display for RefusalCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rule(reason) => reason.fmt(f),
+            Self::Inefficient => f.write_str("inefficient"),
+            Self::LoadFailed => f.write_str("load_failed"),
+        }
+    }
+}
+
+impl Serialize for RefusalCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// A table the doctor refused: the refusal code, the error's kind when the
+/// code is `load_failed`, and the error's message for a person. Whichever
+/// of `reason` and `error_kind` is the more specific is the `reason` label
+/// `refresh_errors_total` carries for the same failure.
 #[derive(Debug, Serialize)]
 pub struct RefusalLine<'a> {
     kind: Kind,
     table: &'a str,
-    reason: String,
+    reason: RefusalCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<ErrorKind>,
     message: String,
 }
 
 impl<'a> RefusalLine<'a> {
-    /// The line for the failure of `table`'s load.
+    /// The line for `error`, which refused `table`.
     pub fn new(table: &'a str, error: &icetray_core::Error) -> Self {
+        let (reason, error_kind) = RefusalCode::of(error.kind());
         Self {
             kind: Kind::Refusal,
             table,
-            reason: error.kind().to_string(),
+            reason,
+            error_kind,
             message: error.to_string(),
         }
     }
@@ -342,10 +407,7 @@ mod tests {
         };
         let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
         let key = Key::Long(1);
-        assert_eq!(
-            leading_keys(&SummaryLine::new(&summary)),
-            ["kind", "table"]
-        );
+        assert_eq!(leading_keys(&SummaryLine::new(&summary)), ["kind", "table"]);
         assert_eq!(
             leading_keys(&FindingLine::new(TABLE, &finding)),
             ["kind", "table"]
@@ -359,7 +421,13 @@ mod tests {
             ["kind", "table"]
         );
         assert_eq!(
-            leading_keys(&LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS)),
+            leading_keys(&LookupLine::new(
+                TABLE,
+                &key,
+                &present,
+                GETS,
+                ELAPSED_MICROS
+            )),
             ["kind", "table"]
         );
     }
@@ -395,23 +463,49 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_refusal_line_carries_the_kind_as_reason() {
-        let error = icetray_core::Error::Refused {
+    fn test_serialize_refusal_line_rule_is_its_reason_with_no_error_kind() {
+        let refused = icetray_core::Error::Refused {
             table: TABLE.to_string(),
-            reason: icetray_core::RefusalReason::DeleteFiles,
+            reason: RefusalReason::DeleteFiles,
         };
-        let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
-        assert_eq!(line["kind"], Json::String("refusal".to_string()));
-        assert_eq!(line["reason"], Json::String(error.kind().to_string()));
-        assert!(line["message"].is_string());
+        let inefficient = icetray_core::Error::Inefficient {
+            table: TABLE.to_string(),
+            findings: vec![FindingCode::NoBucketPartition],
+        };
+        for (error, code) in [(refused, "delete_files"), (inefficient, "inefficient")] {
+            let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
+            assert_eq!(line["kind"], Json::String("refusal".to_string()));
+            assert_eq!(line["reason"], Json::String(code.to_string()));
+            assert!(line.get("error_kind").is_none(), "{line}");
+            assert!(line["message"].is_string());
+        }
+    }
+
+    #[test]
+    fn test_serialize_refusal_line_error_is_load_failed_with_its_kind() {
+        let table = icetray_core::Error::Table {
+            table: TABLE.to_string(),
+            fault: TableFault::MetadataLocationUnknown,
+        };
+        let deadline = icetray_core::Error::LoadDeadline {
+            table: TABLE.to_string(),
+            after: std::time::Duration::ZERO,
+        };
+        for (error, kind) in [(table, "table"), (deadline, "load_deadline")] {
+            let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
+            assert_eq!(line["reason"], Json::String("load_failed".to_string()));
+            assert_eq!(line["error_kind"], Json::String(kind.to_string()));
+            assert!(line["message"].is_string());
+        }
     }
 
     #[test]
     fn test_serialize_lookup_line_present_value_as_base64_and_utf8() {
         let key = Key::Long(1);
         let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
-        let line = serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
-            .unwrap();
+        let line =
+            serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
+                .unwrap();
         assert_eq!(line["kind"], Json::String("lookup".to_string()));
         assert_eq!(line["key"], Json::String(key.to_string()));
         assert_eq!(line["presence"], Json::String("present".to_string()));
@@ -430,8 +524,9 @@ mod tests {
     fn test_serialize_lookup_line_non_utf8_value_has_no_utf8_field() {
         let key = Key::Long(1);
         let present = lookup(Value::Present(Bytes::from_static(&BINARY_VALUE)));
-        let line = serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
-            .unwrap();
+        let line =
+            serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
+                .unwrap();
         assert!(line["value_base64"].is_string());
         assert!(line.get("value_utf8").is_none());
         assert_eq!(line["value_bytes"], Json::from(BINARY_VALUE.len()));
@@ -441,9 +536,14 @@ mod tests {
     fn test_serialize_lookup_line_null_and_absent_carry_no_value() {
         let key = Key::Long(1);
         for (value, name) in [(Value::Null, "null"), (Value::Absent, "absent")] {
-            let line =
-                serde_json::to_value(LookupLine::new(TABLE, &key, &lookup(value), 0, ELAPSED_MICROS))
-                    .unwrap();
+            let line = serde_json::to_value(LookupLine::new(
+                TABLE,
+                &key,
+                &lookup(value),
+                0,
+                ELAPSED_MICROS,
+            ))
+            .unwrap();
             assert_eq!(line["presence"], Json::String(name.to_string()));
             assert!(line.get("value_base64").is_none());
             assert!(line.get("value_utf8").is_none());

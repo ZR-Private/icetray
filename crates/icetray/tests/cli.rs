@@ -381,6 +381,7 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     assert_eq!(report[0]["kind"], "refusal");
     assert_eq!(report[0]["table"], fixture.ident().name());
     assert_eq!(report[0]["reason"], "unsorted");
+    assert!(report[0].get("error_kind").is_none(), "{report:?}");
     assert!(report[0]["message"].is_string());
     Ok(())
 }

@@ -4,6 +4,10 @@
 > configured `strict`, so a table `serve` would refuse is reported
 > refused, with exit 1, after its findings.
 
+> Updated 2026-10-04: a refusal's reason is only ever a refusal code; a
+> table whose load fails with an error rather than a rule is refused as
+> `load_failed`, with the error's kind beside it.
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -66,7 +70,13 @@ bytes, computed from footers alone, so an owner chooses a tier (RFD 017
 
 The command exits 0 for a table with no inefficient finding (advice does
 not change the code), 2 when an inefficient finding is present, and 1
-with the refusal reason when the table cannot be served. A table from a
+with the refusal reason when the table cannot be served. The reason is
+always a refusal code: one of RFD 007's refusal reasons, `inefficient`
+under `strict`, or `load_failed` when an error rather than a rule stopped
+the load (an object store failure, a table that cannot be opened), with
+the error's kind reported beside it. A pipeline that gates on the reason
+then matches a closed set of rules, and a new error kind lands under
+`load_failed` instead of reading as a new rule. A table from a
 configuration file is judged under its configured `strict`, as `serve`
 judges it: an inefficient table whose `strict` is on is reported with
 every finding and then refused under RFD 007's `inefficient` reason, with
