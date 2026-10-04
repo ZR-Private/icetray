@@ -1,5 +1,8 @@
 # Serving tiers
 
+> Updated 2026-10-04: the doctor honors each configured table's `strict`,
+> as the load does. See RFD 016.
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -91,8 +94,8 @@ Placements settled elsewhere:
   ([prototype findings, finding 13](../analysis/2026-09-10-prototype-findings.md#13-key-length)).
 
 `strict` is per table and defaults to on. The doctor applies the same
-classification as the load path; what it reports, and how, is RFD 016
-(Doctor).
+classification as the load path and the same `strict` to a configured
+table; what it reports, and how, is RFD 016 (Doctor).
 
 ## Alternatives Considered
 

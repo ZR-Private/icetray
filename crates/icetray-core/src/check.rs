@@ -16,6 +16,7 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use crate::approx;
 use crate::config::Residency;
 use crate::contract;
+use crate::error::{Error, Result};
 use crate::generation::{Generation, LoadedFile};
 use crate::index::{FileIndex, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all};
 use crate::key::{Key, KeyType};
@@ -602,6 +603,37 @@ pub fn diagnose(g: &Generation) -> TableReport {
         findings,
         files: facts.into_iter().map(|file| file.report).collect(),
     }
+}
+
+/// The strict gate's verdict on `report` (RFD 007, RFD 016):
+/// `Error::Inefficient`, with the distinct inefficient codes in the
+/// report's order, when the report is inefficient and `strict` is on; `Ok`
+/// otherwise, since advice never bears on admission. The load decides
+/// whether a generation is swapped in through it, and the doctor whether a
+/// configured table is reported refused, so the two cannot disagree.
+pub fn admit(report: &TableReport, strict: bool) -> Result<()> {
+    match report.summary.serviceability {
+        Serviceability::Inefficient if strict => Err(Error::Inefficient {
+            table: report.summary.table.clone(),
+            findings: inefficient_codes(&report.findings),
+        }),
+        Serviceability::Inefficient | Serviceability::Efficient => Ok(()),
+    }
+}
+
+/// The distinct codes of the inefficient findings, in the order the report
+/// gives them: what `Error::Inefficient` carries.
+fn inefficient_codes(findings: &[Finding]) -> Vec<FindingCode> {
+    let mut codes = Vec::new();
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.tier() == Tier::Inefficient)
+    {
+        if !codes.contains(&finding.code()) {
+            codes.push(finding.code());
+        }
+    }
+    codes
 }
 
 /// Everything measured about one file: its report, and what the findings
@@ -2320,6 +2352,31 @@ mod tests {
         let report = diagnose(&generation);
         assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
         assert_eq!((report.summary.costs, report.summary.advice), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn test_admit_refuses_an_inefficient_report_only_under_strict() {
+        let (_table, report, _json) = dictionary_value_report().await;
+        admit(&report, false).unwrap();
+        let error = admit(&report, true).unwrap_err();
+        let Error::Inefficient {
+            table: name,
+            findings,
+        } = error
+        else {
+            panic!("expected Inefficient, got {error:?}");
+        };
+        assert_eq!(name, TABLE);
+        assert_eq!(findings, [FindingCode::DictionaryEncodedValue]);
+
+        let advice_only = WriterLayout {
+            bloom: Bloom::Off,
+            ..WriterLayout::contract()
+        };
+        let (_table, generation) = one_file(advice_only).await;
+        let report = diagnose(&generation);
+        assert_eq!(report.summary.advice, 1);
+        admit(&report, true).unwrap();
     }
 
     #[tokio::test]

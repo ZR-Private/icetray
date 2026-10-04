@@ -31,7 +31,7 @@ pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
     FileReport, Finding, FindingCode, Penalty, Serviceability, TableReport, TableSummary, Tier,
-    WriterProperty, diagnose,
+    WriterProperty, admit, diagnose,
 };
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,

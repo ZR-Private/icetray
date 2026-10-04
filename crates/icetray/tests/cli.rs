@@ -112,10 +112,19 @@ fn location(fixture: &Fixture) -> [&str; 2] {
     ["--location", fixture.metadata_location()]
 }
 
-/// A table of the two-table configuration, in TOML, pinned to `fixture`.
+/// A table of the two-table configuration, in TOML, pinned to `fixture`,
+/// with `strict` off.
 fn toml_table(name: &str, fixture: &Fixture) -> String {
     format!(
-        "[[tables]]\nname = \"{name}\"\nsource = {{ type = \"static\", location = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\nstrict = false\n",
+        "{}strict = false\n",
+        toml_table_default_strict(name, fixture)
+    )
+}
+
+/// `toml_table` with `strict` left out, so the table takes the default.
+fn toml_table_default_strict(name: &str, fixture: &Fixture) -> String {
+    format!(
+        "[[tables]]\nname = \"{name}\"\nsource = {{ type = \"static\", location = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n",
         fixture.metadata_location()
     )
 }
@@ -249,21 +258,23 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() -> TestResult {
-    let dir = tempfile::tempdir()?;
+/// A small fixture with no bucket partition, which the doctor finds
+/// inefficient.
+async fn unpartitioned_fixture(dir: &Path, name: &str) -> Result<Fixture, BoxError> {
     let spec = FixtureSpec {
         buckets: 0,
         layout: Layout {
             target_file_bytes: UNPARTITIONED_FILE_BYTES,
             ..Layout::contract()
         },
-        ..FixtureSpec::small("kv_flat", KeyType::Long)
+        ..FixtureSpec::small(name, KeyType::Long)
     };
-    let fixture = local_fixture(dir.path(), spec).await?;
-    let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
-    assert_exit(&output, EXIT_INEFFICIENT);
-    let report = lines(&output.stdout);
+    local_fixture(dir, spec).await
+}
+
+/// Asserts `report` opens with an inefficient `doctor` line and carries
+/// the `no_bucket_partition` finding at the inefficient tier.
+fn assert_unpartitioned_findings(report: &[Json]) {
     assert_eq!(report[0]["kind"], "doctor");
     assert_eq!(report[0]["serviceability"], "inefficient");
     assert!(
@@ -272,6 +283,57 @@ async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() ->
             && line["tier"] == "inefficient"),
         "{report:?}"
     );
+}
+
+#[tokio::test]
+async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = unpartitioned_fixture(dir.path(), "kv_flat").await?;
+    let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
+    assert_exit(&output, EXIT_INEFFICIENT);
+    let report = lines(&output.stdout);
+    assert_unpartitioned_findings(&report);
+    assert!(report.iter().all(|line| line["kind"] != "refused"));
+    Ok(())
+}
+
+/// A configured table keeps its `strict`: under the default, on, the
+/// doctor reports the inefficient table's findings and then refuses it, as
+/// `info` and `serve` do, with exit 1; with `strict` off it is inefficient,
+/// exit 2.
+#[tokio::test]
+async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = unpartitioned_fixture(dir.path(), "kv_flat_strict").await?;
+    let strict = write_file(
+        dir.path(),
+        "strict.toml",
+        &toml_table_default_strict(TABLE_A, &fixture),
+    )?;
+    let output = run(&["doctor", "--config", &strict], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    let report = lines(&output.stdout);
+    assert_unpartitioned_findings(&report);
+    let refused: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "refused")
+        .collect();
+    assert_eq!(refused.len(), 1, "{report:?}");
+    assert_eq!(refused[0]["table"], TABLE_A);
+    assert_eq!(refused[0]["reason"], "inefficient");
+    assert_eq!(
+        report.last(),
+        Some(refused[0]),
+        "the refusal follows the findings"
+    );
+    assert_exit(&run(&["info", "--config", &strict], &[]), EXIT_FAILURE);
+
+    let lenient = write_file(dir.path(), "lenient.toml", &toml_table(TABLE_A, &fixture))?;
+    let output = run(&["doctor", "--config", &lenient], &[]);
+    assert_exit(&output, EXIT_INEFFICIENT);
+    let report = lines(&output.stdout);
+    assert_unpartitioned_findings(&report);
+    assert!(report.iter().all(|line| line["kind"] != "refused"));
     Ok(())
 }
 

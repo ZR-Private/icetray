@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use crate::approx;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
-use crate::check::{self, Finding, FindingCode, Serviceability, Tier};
+use crate::check::{self, Finding, FindingCode, Tier};
 use crate::config::TableConfig;
 use crate::error::{Error, ErrorKind, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
@@ -885,10 +885,8 @@ impl Table {
     /// The strict gate (RFD 007, RFD 016): the doctor's verdict on a built
     /// generation before it is swapped in. Every finding is logged,
     /// inefficient at warn and advice at info. Under `strict`, an
-    /// inefficient generation is dropped, never swapped, as
-    /// `Error::Inefficient` with the distinct inefficient codes in the
-    /// report's order; advice never affects admission.
-    /// `Ok` carries the admitted generation's findings per code, for the
+    /// inefficient generation is dropped, never swapped, with the
+    /// `Error::Inefficient` that `check::admit` gives. `Ok` carries the admitted generation's findings per code, for the
     /// `findings` gauge; a refused generation's reach the logs and the
     /// error and never the gauge, which describes the serving generation.
     fn gate(&self, generation: &Generation) -> Result<BTreeMap<FindingCode, u64>> {
@@ -898,13 +896,8 @@ impl Table {
             *counts.entry(finding.code()).or_default() += 1;
             log_finding(self.name(), finding);
         }
-        match report.summary.serviceability {
-            Serviceability::Inefficient if self.config.strict => Err(Error::Inefficient {
-                table: self.config.name.clone(),
-                findings: inefficient_codes(&report.findings),
-            }),
-            Serviceability::Inefficient | Serviceability::Efficient => Ok(counts),
-        }
+        check::admit(&report, self.config.strict)?;
+        Ok(counts)
     }
 
     /// Makes `generation` the serving one. The generation gauges it sets,
@@ -1076,21 +1069,6 @@ fn log_finding(table: &str, finding: &Finding) {
         Tier::Inefficient => tracing::warn!(table, code = %code, tier = ?tier, file, "{message}"),
         Tier::Advice => tracing::info!(table, code = %code, tier = ?tier, file, "{message}"),
     }
-}
-
-/// The distinct codes of the inefficient findings, in the order the report gives
-/// them: what `Error::Inefficient` carries.
-fn inefficient_codes(findings: &[Finding]) -> Vec<FindingCode> {
-    let mut codes = Vec::new();
-    for finding in findings
-        .iter()
-        .filter(|finding| finding.tier() == Tier::Inefficient)
-    {
-        if !codes.contains(&finding.code()) {
-            codes.push(finding.code());
-        }
-    }
-    codes
 }
 
 #[cfg(test)]

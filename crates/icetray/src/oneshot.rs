@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use icetray_core::config::Config;
-use icetray_core::{Opened, Serviceability, Table, diagnose, open, time};
+use icetray_core::{Opened, Serviceability, Table, admit, diagnose, open, time};
 
 use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
@@ -41,10 +41,13 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// which no load or refresh runs) finds a key outside its file's recorded
 /// bucket or cannot finish: that table would answer a present key absent,
 /// so it is a refusal, not an inefficiency or advice (RFD 007). Every
-/// table is opened with `strict` off, so a table `strict` would refuse as
-/// inefficient is reported rather than refused (RFD 016). The exit code is
-/// `EXIT_FAILURE` when any table was refused, else `EXIT_INEFFICIENT` when
-/// any is inefficient, else `EXIT_OK`.
+/// table is loaded with `strict` off, so its findings are reported whatever
+/// its setting, and then judged by `admit` under its configured `strict`:
+/// an inefficient table that `serve` would refuse gets a `refused` line
+/// after its findings (RFD 016). A `--location` table is never strict
+/// (`Target::config`). The exit code is `EXIT_FAILURE` when any table was
+/// refused, else `EXIT_INEFFICIENT` when any is inefficient, else
+/// `EXIT_OK`.
 pub async fn doctor(
     config: &Config,
     only: Option<&str>,
@@ -76,7 +79,10 @@ pub async fn doctor(
                         emit(&FileLine::new(table.name(), file))?;
                     }
                 }
-                if report.summary.serviceability == Serviceability::Inefficient {
+                if let Err(error) = admit(&report, configured_strict(config, table.name())) {
+                    emit(&RefusedLine::new(table.name(), &error))?;
+                    refused = true;
+                } else if report.summary.serviceability == Serviceability::Inefficient {
                     inefficient = true;
                 }
             }
@@ -94,6 +100,17 @@ pub async fn doctor(
         EXIT_OK
     };
     Ok(ExitCode::from(code))
+}
+
+/// The `strict` that `config` gives the table named `name`, which `open`
+/// opened from it, so the name is configured.
+fn configured_strict(config: &Config, name: &str) -> bool {
+    config
+        .tables
+        .iter()
+        .find(|table| table.name == name)
+        .expect("every opened table is configured")
+        .strict
 }
 
 /// `info`: one `table` line per table from the doctor's summary. A load

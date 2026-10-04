@@ -177,14 +177,14 @@ impl Target {
     /// The configuration the target denotes: the file parsed (TOML or JSON
     /// by content, RFD 011), named by `--config` or, with no target flag,
     /// by `ICETRAY_CONFIG`; or one table synthesized from the location with
-    /// server and storage defaults, never strict, since the one-shots exist
-    /// to report what `strict` would refuse. The `--rewrite` rules go ahead
-    /// of the file's in `storage.rewrite`, and storage applies the first rule
-    /// that matches, so a command-line rule takes precedence over the file's
-    /// for the same prefix. Only then is the whole validated, so the
-    /// command-line rules and a located table are held to every rule
-    /// `Config::parse` checks: an empty `--rewrite` prefix is the same
-    /// violation a file would be. No flag and no variable is `NoTarget`.
+    /// server and storage defaults, never strict, since no configuration
+    /// asks for it and a located table is opened to be inspected. The
+    /// `--rewrite` rules go ahead of the file's in `storage.rewrite`, and
+    /// storage applies the first rule that matches, so a command-line rule
+    /// takes precedence over the file's for the same prefix. Only then is
+    /// the whole validated, so the command-line rules and a located table
+    /// are held to every rule `Config::parse` checks: an empty `--rewrite`
+    /// prefix is the same violation a file would be. No flag and no variable is `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
         self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
     }

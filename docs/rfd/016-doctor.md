@@ -1,5 +1,9 @@
 # Doctor
 
+> Updated 2026-10-04: the doctor judges a configured table under its
+> configured `strict`, so a table `serve` would refuse is reported
+> refused, with exit 1, after its findings.
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -62,7 +66,13 @@ bytes, computed from footers alone, so an owner chooses a tier (RFD 017
 
 The command exits 0 for a table with no inefficient finding (advice does
 not change the code), 2 when an inefficient finding is present, and 1
-with the refusal reason when the table cannot be served.
+with the refusal reason when the table cannot be served. A table from a
+configuration file is judged under its configured `strict`, as `serve`
+judges it: an inefficient table whose `strict` is on is reported with
+every finding and then refused under RFD 007's `inefficient` reason, with
+exit 1, so the doctor never passes with 2 a table that `serve` refuses. A
+table located directly, with no configuration, is never strict, since
+nothing configures it to be.
 
 Only the doctor checks every key's bucket. After the load it decodes every
 key of every bucketed file, hashes it under the file's own bucketing, and
