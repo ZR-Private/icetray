@@ -1,7 +1,7 @@
 //! The daemon (RFD 012, RFD 005): both listeners bound and the health
 //! service registered before any table loads, every table loaded
 //! concurrently, readiness and `SERVING` once every table serves, one
-//! refresh task per table and one sampler on the poll interval, the
+//! refresh task per table and the recorder's upkeep on the poll interval, the
 //! configuration followed when the run was given one to follow (RFD 018),
 //! and a drain on shutdown that ends health watches, waits up to the drain
 //! deadline for in-flight calls, and flushes the page cache's disk level.
@@ -33,9 +33,9 @@ use tonic_health::server::HealthReporter;
 
 use crate::error::ServeError;
 use crate::listen::serve_http;
-use crate::reload::{Reload, Reloader};
+use crate::reload::{Pending, Reload, Reloader};
 use crate::service::Service;
-use crate::telemetry::{self, Scrape};
+use crate::telemetry::Scrape;
 
 /// How long a first-load failure stays visible on the health service before
 /// the process exits: long enough for an orchestrator's probe, at the usual
@@ -156,7 +156,13 @@ impl Serving {
 
         let opened = Arc::new(opened);
         let service = Service::new(&opened, &config.server);
-        let scrape = Scrape::new(handle.clone(), Arc::clone(&opened), service.slots().clone());
+        let pending = options.reload.is_some().then(Pending::default);
+        let scrape = Scrape::new(
+            handle.clone(),
+            Arc::clone(&opened),
+            service.slots().clone(),
+            pending.clone(),
+        );
         let (shutdown, _stop) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
 
@@ -185,10 +191,9 @@ impl Serving {
         let reload = Arc::new(Notify::new());
         let poll_interval = config.server.poll_interval;
         let drain_deadline = config.server.drain_deadline;
-        let reloader = options
-            .reload
-            .take()
-            .map(|source| Reloader::new(source, config, poll_interval, Arc::clone(&reload)));
+        let reloader = options.reload.take().zip(pending).map(|(source, pending)| {
+            Reloader::new(source, config, poll_interval, Arc::clone(&reload), pending)
+        });
         let run = Run {
             opened: Arc::clone(&opened),
             health,
@@ -313,15 +318,15 @@ pub enum PeriodicTask {
         /// The table's configured name.
         table: String,
     },
-    /// The sampler of the binary's gauges.
-    Sampler,
+    /// The recorder's upkeep, which drains its histogram samples.
+    Upkeep,
 }
 
 impl fmt::Display for PeriodicTask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refresh { table } => write!(f, "refresh of table {table}"),
-            Self::Sampler => f.write_str("sampler"),
+            Self::Upkeep => f.write_str("recorder upkeep"),
         }
     }
 }
@@ -388,7 +393,7 @@ impl Periodic {
     }
 
     /// Completes when a task ends other than by `stop_refresh`, naming it.
-    /// The sampler is in the set until `shutdown`, so there is always a
+    /// The upkeep is in the set until `shutdown`, so there is always a
     /// task to wait on.
     async fn ended(&mut self) -> (PeriodicTask, JoinError) {
         loop {
@@ -396,7 +401,7 @@ impl Periodic {
                 .tasks
                 .join_next()
                 .await
-                .expect("the sampler is in the set until shutdown");
+                .expect("the upkeep is in the set until shutdown");
             if let Err(error) = &outcome
                 && error.is_cancelled()
                 && self.stopped.contains(&error.id())
@@ -501,7 +506,6 @@ impl Run {
         }
 
         retain(&self.opened).await;
-        telemetry::sample(&self.opened, &self.handle);
         set_health(&self.health, ServingStatus::Serving).await;
         self.ready.send_modify(|ready| *ready = true);
 
@@ -510,12 +514,8 @@ impl Run {
             periodic.spawn_refresh(table, &self.opened, self.poll_interval);
         }
         periodic.spawn(
-            PeriodicTask::Sampler,
-            sample_loop(
-                Arc::clone(&self.opened),
-                self.handle.clone(),
-                self.poll_interval,
-            ),
+            PeriodicTask::Upkeep,
+            upkeep_loop(self.handle.clone(), self.poll_interval),
         );
 
         // Biased, the ended task first: when a task has ended and a
@@ -743,16 +743,15 @@ fn report_refresh(table: &Table, outcome: icetray_core::Result<bool>) -> bool {
     }
 }
 
-/// Samples the binary's gauges every `poll_interval`.
-async fn sample_loop(
-    opened: Arc<Opened>,
-    handle: PrometheusHandle,
-    poll_interval: Duration,
-) -> Infallible {
+/// Runs the recorder's upkeep every `poll_interval`, which drains the
+/// histogram samples recorded since, so they do not pile up between
+/// scrapes, or without any. The gauges are written by the scrape itself
+/// (`Scrape::render`).
+async fn upkeep_loop(handle: PrometheusHandle, poll_interval: Duration) -> Infallible {
     let mut ticker = ticker(poll_interval);
     loop {
         ticker.tick().await;
-        telemetry::sample(&opened, &handle);
+        handle.run_upkeep();
     }
 }
 
@@ -794,9 +793,9 @@ mod tests {
     async fn test_shutdown_reports_a_task_that_panicked_before_it() {
         let mut periodic = Periodic::new();
         let (unwound, panicked) = oneshot::channel::<()>();
-        periodic.spawn(PeriodicTask::Sampler, async move {
+        periodic.spawn(PeriodicTask::Upkeep, async move {
             let _unwound = unwound;
-            panic!("the sampler fails");
+            panic!("the upkeep fails");
         });
         periodic.spawn(
             PeriodicTask::Refresh {
@@ -813,7 +812,7 @@ mod tests {
         let Some((task, source)) = reported else {
             panic!("expected the panicked task, got none");
         };
-        assert_eq!(task, PeriodicTask::Sampler);
+        assert_eq!(task, PeriodicTask::Upkeep);
         assert!(source.is_panic(), "{source}");
     }
 }

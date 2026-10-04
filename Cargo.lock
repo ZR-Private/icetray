@@ -2588,6 +2588,7 @@ dependencies = [
  "memory-stats",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "serde",
  "serde_json",
  "sha2",

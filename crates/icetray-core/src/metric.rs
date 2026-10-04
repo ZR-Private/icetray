@@ -12,13 +12,13 @@ pub const REQUESTS_TOTAL: &str = "icetray_requests_total";
 /// Object-store GETs issued, by `kind`; a hedge is a GET and counts here too.
 pub const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
 /// Bytes requested across those GETs, by `kind`.
-pub(crate) const OBJECT_BYTES_TOTAL: &str = "icetray_object_bytes_total";
+pub const OBJECT_BYTES_TOTAL: &str = "icetray_object_bytes_total";
 /// Reads served from the local directory (RFD 017).
-pub(crate) const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
+pub const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
 /// Bytes of those local reads.
-pub(crate) const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
+pub const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
 /// Second requests issued because a lookup GET was slow (RFD 013).
-pub(crate) const HEDGES_TOTAL: &str = "icetray_hedges_total";
+pub const HEDGES_TOTAL: &str = "icetray_hedges_total";
 /// Value pages served from the page cache without a fetch.
 pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Value-page fetches the page cache ran, after coalescing.
@@ -27,9 +27,9 @@ pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Refreshes that failed and left the previous generation serving, by
 /// `table` and `reason`.
-pub(crate) const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
+pub const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
 /// Generations swapped in, by `table`.
-pub(crate) const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
+pub const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
 /// Configuration reloads that read a changed file, by `result`: applied or
 /// refused (RFD 018).
 pub const CONFIG_RELOADS_TOTAL: &str = "icetray_config_reloads_total";
@@ -41,7 +41,7 @@ pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
 
 /// The resident index's live bytes, by `table`: what a residency tier sheds,
 /// which process memory does not show on every platform.
-pub(crate) const INDEX_BYTES: &str = "icetray_index_bytes";
+pub const INDEX_BYTES: &str = "icetray_index_bytes";
 /// The process's resident set size.
 pub const PROCESS_RSS_BYTES: &str = "icetray_process_rss_bytes";
 /// Bytes the program holds in live allocations, as jemalloc counts them.
@@ -58,9 +58,9 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 /// its pages: virtual, not resident.
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
 /// Bytes the page cache holds.
-pub(crate) const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
+pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and `code`.
-pub(crate) const FINDINGS: &str = "icetray_findings";
+pub const FINDINGS: &str = "icetray_findings";
 /// Seconds from the served snapshot's timestamp to now, by `table`.
 pub const GENERATION_AGE_SECONDS: &str = "icetray_generation_age_seconds";
 /// The serving snapshot's sequence number, by `table`: one series per
@@ -92,7 +92,7 @@ pub const LABEL_TABLE: &str = "table";
 pub const LABEL_RESULT: &str = "result";
 /// The `reason` label: why a refresh failed, from `ErrorKind`, which gives
 /// the refusal's own name for a refusal.
-pub(crate) const LABEL_REASON: &str = "reason";
+pub const LABEL_REASON: &str = "reason";
 /// The `code` label: the finding, from `FindingCode`, or the gRPC status a
 /// request answered, in the gRPC specification's name in lower snake case.
 pub const LABEL_CODE: &str = "code";
@@ -125,7 +125,7 @@ impl fmt::Display for ReadKind {
 /// The three outcomes of a lookup as the `result` metric label sees them.
 /// Display gives the `snake_case` label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum LookupResult {
+pub enum LookupResult {
     /// The key was present and its value page was fetched.
     ColdHit,
     /// The key was present and its value page was already cached.
@@ -136,7 +136,7 @@ pub(crate) enum LookupResult {
 
 impl LookupResult {
     /// Every outcome, for the per-result series of a table.
-    pub(crate) const ALL: [Self; 3] = [Self::ColdHit, Self::WarmHit, Self::Miss];
+    pub const ALL: [Self; 3] = [Self::ColdHit, Self::WarmHit, Self::Miss];
 }
 
 impl fmt::Display for LookupResult {

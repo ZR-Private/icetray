@@ -18,7 +18,8 @@ use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, SourceConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState, metric};
+use icetray_core::metric::{self, LookupResult};
+use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
@@ -58,6 +59,9 @@ const UUID_TABLE: &str = "kv_uuid";
 
 /// A name no table is served under.
 const NOBODY: &str = "nobody";
+
+/// A table no other test serves, so its counters read this test's alone.
+const FRESH_TABLE: &str = "kv_fresh";
 
 /// Loopback with an OS-assigned port, for both listeners.
 const LOOPBACK_ANY_PORT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -360,6 +364,20 @@ fn calls(exposition: &str, call: Call, code: Code) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Whether `exposition` exposes the `requests_total` series of `call`
+/// answering `code`.
+fn calls_exposed(exposition: &str, call: Call, code: Code) -> bool {
+    series_value(
+        exposition,
+        metric::REQUESTS_TOTAL,
+        &[
+            (metric::LABEL_CALL, &call.to_string()),
+            (metric::LABEL_CODE, &CodeLabel(code).to_string()),
+        ],
+    )
+    .is_some()
+}
+
 /// Asserts that `after` counts `expected` more `call`s answering `code`
 /// than `before`. A counter's integer is exact in the float the exposition
 /// carries it as, so the difference compares exactly.
@@ -372,7 +390,7 @@ fn assert_counted(before: &str, after: &str, call: Call, code: Code, expected: u
     );
 }
 
-/// The value of the unlabeled gauge `name` in `exposition`, which must
+/// The value of the unlabeled series `name` in `exposition`, which must
 /// expose it.
 fn gauge(exposition: &str, name: &str) -> f64 {
     series_value(exposition, name, &[]).unwrap_or_else(|| panic!("{name} in {exposition}"))
@@ -759,7 +777,7 @@ async fn test_requests_total_counts_every_call() -> TestResult {
         "every page hit before the scrape is in it: {served}"
     );
     let rss = series_value(&after, metric::PROCESS_RSS_BYTES, &[])
-        .expect("the sampler ran after the first loads");
+        .expect("the scrape samples the resident set size");
     assert!(rss > 0.0, "a running process holds memory: {rss}");
     let age = series_value(
         &after,
@@ -770,6 +788,65 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     assert!(
         age >= 0.0,
         "the snapshot was committed before the scrape: {age}"
+    );
+    Ok(())
+}
+
+/// Every series an alert keys on is exposed once the server serves, before
+/// any call, swap, or reload: a new table's counters at zero, each call's
+/// `OK` count, each reload result, the page cache's counters and bytes,
+/// nothing in flight of the default slots, and nothing pending. The
+/// process-wide counters other tests also count are checked for presence.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(FRESH_TABLE, KeyType::Long)],
+        async |setup| {
+            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let scrape = stack.scrape().await?;
+
+    let table = (metric::LABEL_TABLE, FRESH_TABLE);
+    for result in LookupResult::ALL {
+        let result = result.to_string();
+        let labels = [table, (metric::LABEL_RESULT, result.as_str())];
+        assert_eq!(
+            series_value(&scrape, metric::LOOKUPS_TOTAL, &labels),
+            Some(0.0),
+            "{result}"
+        );
+    }
+    assert_eq!(
+        series_value(&scrape, metric::GENERATION_SWAPS_TOTAL, &[table]),
+        Some(0.0)
+    );
+    for call in Call::ALL {
+        assert!(calls_exposed(&scrape, call, Code::Ok), "{call} in {scrape}");
+    }
+    for result in ReloadResult::ALL {
+        let result = result.to_string();
+        let labels = [(metric::LABEL_RESULT, result.as_str())];
+        assert!(
+            series_value(&scrape, metric::CONFIG_RELOADS_TOTAL, &labels).is_some(),
+            "{result} in {scrape}"
+        );
+    }
+    for name in [
+        metric::PAGE_CACHE_FETCHES_TOTAL,
+        metric::PAGE_CACHE_HITS_TOTAL,
+        metric::PAGE_CACHE_BYTES,
+    ] {
+        gauge(&scrape, name);
+    }
+    assert_in_flight(&scrape, 0, ServerConfig::default().max_in_flight);
+    assert_eq!(
+        series_value(&scrape, metric::CONFIG_PENDING, &[]),
+        Some(0.0)
     );
     Ok(())
 }
@@ -1013,7 +1090,7 @@ async fn test_first_load_failure_stays_visible_then_fails() -> TestResult {
 /// process exits non-zero instead of answering `/ready` 200 from tables
 /// nothing refreshes. A poll interval of zero is what `Config::parse`
 /// refuses as `PollIntervalTooShort`, and what tokio's interval refuses with a
-/// panic at the first tick of the refresh and sampler tasks; the
+/// panic at the first tick of the refresh and upkeep tasks; the
 /// configuration is built directly, so the panic is reached. Both tasks
 /// panic at once, and whichever the run joins first is the one named.
 #[tokio::test(flavor = "multi_thread")]
@@ -1035,7 +1112,7 @@ async fn test_periodic_task_panic_ends_the_run_naming_the_task() -> TestResult {
     assert!(source.is_panic(), "{source}");
     match task {
         PeriodicTask::Refresh { table } => assert_eq!(table, TABLE),
-        PeriodicTask::Sampler => {}
+        PeriodicTask::Upkeep => {}
     }
     Ok(())
 }
@@ -1572,8 +1649,40 @@ async fn test_reload_adds_and_removes_tables_on_request() -> TestResult {
     let (status, _) = stack.http_get(READY_PATH).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stack.pending().await?, Some(0.0));
+
+    // The removed table's gauges leave the exposition rather than read
+    // their last values; its counters stay, and the added table's gauges
+    // are there.
+    let removed = (metric::LABEL_TABLE, TABLE);
+    let scrape = poll_until(
+        REFRESH_WAIT,
+        "the removed table's gauges dropped",
+        async || {
+            let scrape = stack.scrape().await?;
+            let left = TABLE_GAUGES
+                .iter()
+                .any(|name| series_value(&scrape, name, &[removed]).is_some());
+            Ok((!left).then_some(scrape))
+        },
+    )
+    .await?;
+    assert!(series_value(&scrape, metric::LOOKUPS_TOTAL, &[removed]).is_some());
+    for name in TABLE_GAUGES {
+        let added = [(metric::LABEL_TABLE, UUID_TABLE)];
+        assert!(series_value(&scrape, name, &added).is_some(), "{name}");
+    }
     Ok(())
 }
+
+/// Every gauge a serving table exports under its name.
+const TABLE_GAUGES: [&str; 6] = [
+    metric::TABLE_STATE,
+    metric::INDEX_BYTES,
+    metric::FINDINGS,
+    metric::GENERATION_SEQUENCE_NUMBER,
+    metric::GENERATION_SWAPPED_AT_SECONDS,
+    metric::GENERATION_AGE_SECONDS,
+];
 
 /// A changed file is found on the poll, with no request.
 #[tokio::test(flavor = "multi_thread")]

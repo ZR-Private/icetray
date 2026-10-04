@@ -5,17 +5,20 @@
 //! nothing. A reload refuses a change to any setting outside the tables,
 //! since the server builds those once at start. Each reload that read a
 //! changed file is logged with its digest and counted under
-//! `config_reloads_total` by result, and `config_pending` reads 1 while the
-//! file differs from what the server applied.
+//! `config_reloads_total` by result, each result's series registered at
+//! zero when the reload starts, and `config_pending` reads 1 while the file
+//! differs from what the server applied.
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use icetray_core::config::{Config, ConfigError};
-use icetray_core::{Applied, Opened, Refused, Table, metric};
+use icetray_core::{Applied, Opened, Refused, Table, approx, metric};
+use metrics::Counter;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
@@ -164,12 +167,38 @@ pub enum ReloadResult {
     Refused,
 }
 
+impl ReloadResult {
+    /// Every result, for the series registered when the reload starts.
+    pub const ALL: [Self; 2] = [Self::Applied, Self::Refused];
+}
+
 impl fmt::Display for ReloadResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Applied => "applied",
             Self::Refused => "refused",
         })
+    }
+}
+
+/// Whether the configuration file differs from the configuration the
+/// server applied, what `config_pending` reads (RFD 018): set by the
+/// reload, written to the gauge by every scrape (`Scrape::render`).
+/// Clone shares the flag; it starts false, the file started from being the
+/// one applied.
+#[derive(Clone, Debug, Default)]
+pub struct Pending(Arc<AtomicBool>);
+
+impl Pending {
+    fn set(&self, pending: bool) {
+        self.0.store(pending, Ordering::Relaxed);
+    }
+
+    /// Sets `config_pending` to the flag: 1 while the file differs, 0 once
+    /// they match.
+    pub fn publish(&self) {
+        let pending = self.0.load(Ordering::Relaxed);
+        metrics::gauge!(metric::CONFIG_PENDING).set(approx::gauge(u64::from(pending)));
     }
 }
 
@@ -191,18 +220,25 @@ pub(crate) struct Reloader {
     unreadable: bool,
     ticker: tokio::time::Interval,
     requested: Arc<Notify>,
+    /// Whether the file read last differs from `running`.
+    pending: Pending,
 }
 
 impl Reloader {
     /// Follows `reload` from `running`, reading on every `poll_interval`
-    /// from one interval from now and whenever `requested` is notified.
+    /// from one interval from now and whenever `requested` is notified, and
+    /// keeping `pending`, which starts false. Registers
+    /// `config_reloads_total` of every result.
     pub(crate) fn new(
         reload: Reload,
         running: Config,
         poll_interval: Duration,
         requested: Arc<Notify>,
+        pending: Pending,
     ) -> Self {
-        metrics::gauge!(metric::CONFIG_PENDING).set(0.0);
+        for result in ReloadResult::ALL {
+            reloads_total(result).increment(0);
+        }
         Self {
             source: reload.source,
             running,
@@ -211,6 +247,7 @@ impl Reloader {
             unreadable: false,
             ticker: ticker(poll_interval),
             requested,
+            pending,
         }
     }
 
@@ -254,10 +291,10 @@ impl Reloader {
         self.unreadable = false;
         let digest = reading.digest;
         if digest == self.applied {
-            metrics::gauge!(metric::CONFIG_PENDING).set(0.0);
+            self.pending.set(false);
             return None;
         }
-        metrics::gauge!(metric::CONFIG_PENDING).set(1.0);
+        self.pending.set(true);
         if !requested && self.refused == Some(digest) {
             return None;
         }
@@ -301,7 +338,7 @@ impl Reloader {
             "configuration reloaded"
         );
         count(ReloadResult::Applied);
-        metrics::gauge!(metric::CONFIG_PENDING).set(0.0);
+        self.pending.set(false);
         self.running = config;
         self.applied = reading.digest;
         self.refused = None;
@@ -324,17 +361,21 @@ impl Reloader {
         tracing::warn!(%digest, reason = %refusal, "configuration reload refused");
         self.refused = Some(digest);
         count(ReloadResult::Refused);
-        metrics::gauge!(metric::CONFIG_PENDING).set(1.0);
+        self.pending.set(true);
     }
 }
 
 /// Counts one reload of `result` under `config_reloads_total`.
 fn count(result: ReloadResult) {
+    reloads_total(result).increment(1);
+}
+
+/// The `config_reloads_total` series of `result`.
+fn reloads_total(result: ReloadResult) -> Counter {
     metrics::counter!(
         metric::CONFIG_RELOADS_TOTAL,
         metric::LABEL_RESULT => result.to_string()
     )
-    .increment(1);
 }
 
 /// The names `applied` added, changed, and removed: a name both started

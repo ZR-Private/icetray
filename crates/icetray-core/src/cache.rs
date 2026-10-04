@@ -285,7 +285,7 @@ fn origin_of(source: Source) -> PageOrigin {
 pub struct PageCache {
     level: Arc<Level>,
     hits: Arc<Hits>,
-    fetches: Arc<AtomicU64>,
+    fetches: Arc<Fetches>,
     /// How long a fetch this handle runs may take; `None` is no bound.
     fetch_deadline: Option<Duration>,
 }
@@ -323,7 +323,7 @@ impl PageCache {
         Ok(Self {
             level: Arc::new(level),
             hits: Arc::new(Hits::new()),
-            fetches: Arc::default(),
+            fetches: Arc::new(Fetches::new()),
             fetch_deadline: None,
         })
     }
@@ -418,7 +418,14 @@ impl PageCache {
     /// Fetch futures run, after coalescing: concurrent misses on one key run
     /// one and count one.
     pub fn fetches(&self) -> u64 {
-        self.fetches.load(Ordering::Relaxed)
+        self.fetches.count.load(Ordering::Relaxed)
+    }
+
+    /// Sets `page_cache_bytes` to the bytes the memory budget holds now
+    /// (`usage`); a scrape calls this, so the gauge reads evictions as well
+    /// as inserts.
+    pub fn publish_usage(&self) {
+        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
     }
 
     /// Bytes charged against the memory budget: each page in memory at its
@@ -454,7 +461,7 @@ impl PageCache {
     /// every lookup it served.
     fn record(&self, source: Source, stats: Option<&IoStats>, page: &Bytes) {
         match source {
-            Source::Outer => self.record_insert(),
+            Source::Outer => {}
             Source::Memory => self.record_hit(),
             Source::Disk => {
                 self.record_hit();
@@ -469,11 +476,30 @@ impl PageCache {
     fn record_hit(&self) {
         self.hits.shards.mine().fetch_add(1, Ordering::Relaxed);
     }
+}
 
-    /// One page fetched and inserted: the one event that raises the memory
-    /// budget's usage, so the gauge is set here and not on every lookup.
-    fn record_insert(&self) {
-        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
+/// A cache's fetch runs, counted in `count` for `PageCache::fetches` and in
+/// `page_cache_fetches_total` through a handle registered once in
+/// `PageCache::new`, so the series reads 0 from then on rather than
+/// appearing at the first fetch.
+#[derive(Debug)]
+struct Fetches {
+    count: AtomicU64,
+    total: Counter,
+}
+
+impl Fetches {
+    fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            total: metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL),
+        }
+    }
+
+    /// One fetch run.
+    fn record(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total.increment(1);
     }
 }
 
@@ -611,7 +637,7 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
 /// through.
 struct Run {
     page: PageKey,
-    fetches: Arc<AtomicU64>,
+    fetches: Arc<Fetches>,
     deadline: Option<Duration>,
 }
 
@@ -624,8 +650,7 @@ impl Run {
     where
         Fut: Future<Output = Result<Bytes>>,
     {
-        self.fetches.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL).increment(1);
+        self.fetches.record();
         let fetched = match self.deadline {
             None => fut.await,
             Some(after) => tokio::time::timeout(after, fut).await.map_err(|_elapsed| {
@@ -978,6 +1003,57 @@ mod tests {
     /// reads each as it is counted. A snapshot of the debugging recorder
     /// takes the counter's value and resets it, so each snapshot reads what
     /// was published since the one before.
+    /// A cache's counters are registered at zero when it opens, before
+    /// any lookup, and a fetch counts in `page_cache_fetches_total` as it
+    /// runs; `publish_usage` sets `page_cache_bytes` to what memory holds.
+    #[test]
+    fn test_new_registers_the_counters_and_publish_usage_sets_the_bytes() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = |name: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .map(|(.., value)| value)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+                for name in [
+                    metric::PAGE_CACHE_HITS_TOTAL,
+                    metric::PAGE_CACHE_FETCHES_TOTAL,
+                ] {
+                    assert_eq!(value(name), Some(DebugValue::Counter(0)), "{name}");
+                }
+                assert_eq!(value(metric::PAGE_CACHE_BYTES), None, "set by a scrape");
+                let runs = Arc::new(AtomicU64::new(0));
+                cache
+                    .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    value(metric::PAGE_CACHE_FETCHES_TOTAL),
+                    Some(DebugValue::Counter(1))
+                );
+                cache.publish_usage();
+                let Some(DebugValue::Gauge(bytes)) = value(metric::PAGE_CACHE_BYTES) else {
+                    panic!("page_cache_bytes is a gauge");
+                };
+                assert_eq!(
+                    bytes.into_inner().to_bits(),
+                    approx::gauge_len(cache.usage()).to_bits()
+                );
+                assert!(cache.usage() > 0, "the fetched page is held");
+            });
+        });
+    }
+
     #[test]
     fn test_publish_hit_counts_moves_every_thread_count_once() {
         let workers = 4;

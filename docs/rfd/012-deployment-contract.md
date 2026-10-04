@@ -1,7 +1,8 @@
 # Deployment contract
 
 > Updated 2026-10-04: request counts carry the status code each call
-> answered, and the calls in flight show beside their bound.
+> answered, the calls in flight show beside their bound, and the series an
+> alert keys on are exposed from the start.
 
 ## Problem
 
@@ -83,6 +84,17 @@ Metrics are Prometheus, and they cover:
   memory on every platform;
 - per table, the serving snapshot's sequence number and when it was
   swapped in.
+
+A series an alert keys on is exposed from the start, at zero for a
+counter, so the alert has data before the first event rather than only
+after it: request counts of every call answering OK, lookups of every table
+and result, swaps of every table, reloads of every result, the page
+cache's fetches, hits, and bytes, and the in-flight gauges. A table a
+reload adds gets its series when it is added. Refresh errors are the
+exception: their reason has a value per error kind and refusal, too many to
+expose per table, so a refresh error's series appears with the first
+failure, and the table's degraded state, exposed from the start, is the
+series to alert on.
 
 The snapshot id itself goes in logs and the table-info reply and stays out
 of metrics. As a gauge value it loses digits

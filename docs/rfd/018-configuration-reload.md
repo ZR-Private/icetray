@@ -3,6 +3,9 @@
 > Updated 2026-10-04: a file that lists no table fails validation, so a
 > reload to it is refused and the tables serving serve on.
 
+> Updated 2026-10-04: a removed table's gauges leave the metrics at the
+> next scrape instead of keeping their last values.
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing
@@ -75,9 +78,11 @@ configuration other than its file without comparing digests. Readiness
 does not change, because a refused reload leaves the replica serving the
 configuration it applied. A table being loaded for a reload writes its
 per-table gauges only from the swap on, so until then the table serving
-under its name keeps its own. The metrics recorder cannot remove a series.
-A removed table's state series therefore all read 0 and its index bytes 0,
-and its other series keep their last values until the process restarts.
+under its name keeps its own. A removed table's gauges leave the metrics at
+the next scrape: every scrape writes the gauges of the tables serving, and
+the recorder drops a gauge no scrape wrote, so no series goes on reading a
+table that is gone. Its counters stay, as a counter of something gone does
+in Prometheus.
 
 ## Alternatives Considered
 

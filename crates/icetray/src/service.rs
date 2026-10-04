@@ -28,7 +28,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
 use crate::error::{CallFault, WireKeyFault};
-use crate::telemetry::{Answering, Call};
+use crate::telemetry::{self, Answering, Call};
 
 /// The in-flight slots `Get` and `MultiGet` hold together, at most
 /// `server.max_in_flight`: what admits a call, and what
@@ -94,8 +94,10 @@ pub struct Service {
 
 impl Service {
     /// The service over the tables `opened` serves, by configured name,
-    /// under `server`'s request bounds.
+    /// under `server`'s request bounds, with `requests_total` of every call
+    /// answering `OK` registered at zero (`telemetry::register_requests`).
     pub fn new(opened: &Arc<Opened>, server: &ServerConfig) -> Self {
+        telemetry::register_requests();
         Self {
             opened: Arc::clone(opened),
             get_deadline: server.get_deadline,

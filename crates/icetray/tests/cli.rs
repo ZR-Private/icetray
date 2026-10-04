@@ -1126,14 +1126,16 @@ fn send(daemon: &Daemon, signal: &str) -> TestResult {
     Ok(())
 }
 
-/// Waits for the scrape at `metrics` to count a reload of `result`, and
-/// returns that scrape.
+/// Waits for the scrape at `metrics` to count a reload of `result`, whose
+/// series reads 0 from the start, and returns that scrape.
 async fn reload_counted(metrics: SocketAddr, result: ReloadResult) -> Result<String, BoxError> {
     let label = result.to_string();
     poll_until(READY_WAIT, "a reload counted", async || {
         let (_, exposition) = http_get(metrics, METRICS_PATH).await?;
         let reloads = series_value(&exposition, CONFIG_RELOADS_TOTAL, &[(LABEL_RESULT, &label)]);
-        Ok(reloads.is_some().then_some(exposition))
+        Ok(reloads
+            .is_some_and(|count| count > 0.0)
+            .then_some(exposition))
     })
     .await
 }

@@ -244,6 +244,10 @@ pub struct Table {
     /// `serial` doing its work, from `server.refresh_deadline`.
     refresh_deadline: Duration,
     lookups: Arc<Lookups>,
+    /// `generation_swaps_total` under the table's name, registered when the
+    /// table is built, so the series reads 0 from then on rather than
+    /// appearing at the first swap.
+    swaps: Counter,
     /// Where the doctor's findings on an admitted generation go.
     findings: FindingLog,
     /// What the table's state and generation gauges read, and whether it
@@ -472,9 +476,10 @@ impl Table {
     /// failing as `CacheError::FetchDeadline` for every lookup waiting on
     /// it (RFD 013); load reads do not go through the cache and are not
     /// bounded by it. Every `get` and `multi_get` counts among `handles`'
-    /// calls in flight while it runs. The lookup metrics are registered
-    /// here, with the recorder current then: a process installs its
-    /// recorder first. The table shows its gauges from here on.
+    /// calls in flight while it runs. The lookup metrics and
+    /// `generation_swaps_total` are registered here, at zero, with the
+    /// recorder current then: a process installs its recorder first. The
+    /// table shows its gauges from here on.
     pub fn new(
         config: TableConfig,
         source: TableSource,
@@ -519,6 +524,10 @@ impl Table {
             metrics: LookupMetrics::new(&config.name),
             in_flight: calls,
         });
+        let swaps = metrics::counter!(
+            metric::GENERATION_SWAPS_TOTAL,
+            metric::LABEL_TABLE => config.name.clone()
+        );
         Self {
             config,
             source,
@@ -532,6 +541,7 @@ impl Table {
             load_deadline,
             refresh_deadline,
             lookups,
+            swaps,
             findings,
             gauges: Mutex::new(Gauges {
                 shown: false,
@@ -545,34 +555,39 @@ impl Table {
     pub(crate) fn show(&self) {
         let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
         gauges.shown = true;
-        self.write_state(&gauges);
-        if let Some(generation) = &gauges.generation {
-            self.write_generation(generation);
-        }
+        self.write_gauges(&gauges);
     }
 
     /// Stops showing the table's gauges, for a table a reload removed or
-    /// replaced (RFD 018). The recorder cannot remove a series, so the
-    /// state series all read 0, saying the table is in none of the states,
-    /// and `index_bytes` reads 0, since the index is dropped; the table's
-    /// other series keep their last values. A replacement shown after this
-    /// writes its own values over them.
+    /// replaced (RFD 018): from here on neither a state change, a swap,
+    /// nor `publish_gauges` writes one. The binary's recorder drops a gauge
+    /// that no scrape has written since the last, so a removed table's
+    /// gauges leave the exposition at the next scrape instead of reading
+    /// stale values; a replacement shown after this writes its own over
+    /// them.
     pub(crate) fn withdraw(&self) {
         let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
         gauges.shown = false;
-        for name in StateName::ALL {
-            metrics::gauge!(
-                metric::TABLE_STATE,
-                metric::LABEL_TABLE => self.config.name.clone(),
-                metric::LABEL_STATE => name.to_string()
-            )
-            .set(0.0);
+    }
+
+    /// Writes the table's state and serving generation's gauges again as
+    /// they stand, while the table shows them, as `show` does; a scrape
+    /// calls this for every table served, since the binary's recorder
+    /// drops a gauge no scrape wrote.
+    pub fn publish_gauges(&self) {
+        let gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        if gauges.shown {
+            self.write_gauges(&gauges);
         }
-        metrics::gauge!(
-            metric::INDEX_BYTES,
-            metric::LABEL_TABLE => self.config.name.clone()
-        )
-        .set(0.0);
+    }
+
+    /// Writes the state gauges and, when there is a serving generation,
+    /// its gauges; `gauges` is the held lock.
+    fn write_gauges(&self, gauges: &Gauges) {
+        self.write_state(gauges);
+        if let Some(generation) = &gauges.generation {
+            self.write_generation(generation);
+        }
     }
 
     /// The table's configuration.
@@ -621,11 +636,7 @@ impl Table {
         match outcome {
             Ok(swapped) => {
                 if swapped {
-                    metrics::counter!(
-                        metric::GENERATION_SWAPS_TOTAL,
-                        metric::LABEL_TABLE => self.config.name.clone()
-                    )
-                    .increment(1);
+                    self.swaps.increment(1);
                 }
                 Ok(swapped)
             }
@@ -2551,15 +2562,39 @@ mod tests {
         )
     }
 
-    /// A hidden table writes no gauge while it loads, so the table serving
-    /// under its name keeps its series; `show` then publishes its state and
-    /// its generation's gauges as the swap set them.
+    /// A table's counters are registered at zero when it is built, before
+    /// any lookup or swap, so each series exists from the start.
+    #[test]
+    fn test_new_registers_the_table_s_counters_at_zero() {
+        let ((), series) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        });
+        for result in LookupResult::ALL {
+            let labels = [table_label(), (metric::LABEL_RESULT, result.to_string())];
+            assert_eq!(
+                series.counter(metric::LOOKUPS_TOTAL, &labels),
+                0,
+                "{result}"
+            );
+        }
+        assert_eq!(
+            series.counter(metric::GENERATION_SWAPS_TOTAL, &[table_label()]),
+            0
+        );
+    }
+
+    /// A hidden table writes no gauge while it loads, nor when a scrape
+    /// publishes, so the table serving under its name keeps its series;
+    /// `show` then publishes its state and its generation's gauges as the
+    /// swap set them.
     #[test]
     fn test_a_hidden_table_writes_its_gauges_once_shown() {
         let (index_bytes, loading) = recorded(async {
             let (fixture, _) = two_bucket_table().await;
             let table = hidden_over(&fixture).await;
             table.load().await.unwrap();
+            table.publish_gauges();
             table.current().unwrap().index_bytes
         });
         let gauges = [
@@ -2589,10 +2624,12 @@ mod tests {
         );
     }
 
-    /// A withdrawn table reads in no state and holds no index bytes, and a
-    /// refresh after the withdrawal writes neither back.
+    /// A withdrawn table writes no gauge: a refresh that fails after the
+    /// withdrawal, which would read `Degraded`, and a scrape's publish
+    /// leave its series as the withdrawal found them, for the binary's
+    /// recorder to drop.
     #[test]
-    fn test_a_withdrawn_table_reads_in_no_state_and_writes_no_gauge() {
+    fn test_a_withdrawn_table_writes_no_gauge() {
         let ((), series) = recorded(async {
             let (fixture, _) = two_bucket_table().await;
             let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
@@ -2600,20 +2637,16 @@ mod tests {
             table.withdraw();
             fixture.remove_hint();
             table.refresh().await.unwrap_err();
+            table.publish_gauges();
         });
         for name in StateName::ALL {
+            let shown = u64::from(name == StateName::Serving);
             assert_eq!(
                 state_gauge(&series, TABLE, name).to_bits(),
-                approx::gauge(0).to_bits(),
+                approx::gauge(shown).to_bits(),
                 "{name}"
             );
         }
-        assert_eq!(
-            series
-                .gauge(metric::INDEX_BYTES, &[table_label()])
-                .to_bits(),
-            approx::gauge(0).to_bits()
-        );
     }
 
     #[test]
