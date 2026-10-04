@@ -13,8 +13,30 @@ dev/ci-checks.sh
 clippy --workspace --all-targets --locked -- -D warnings`. CI runs that
 script and `cargo test --workspace --locked`.
 
-On Linux, the disk tier's tests need their temporary directory on a
-filesystem that serves non-blocking reads of cached pages, such as ext4,
+## The development environment
+
+`.flox/env/manifest.toml` declares an optional [flox](https://flox.dev)
+environment. `flox activate` puts on PATH rustup, which installs the
+pinned toolchain; colima, the docker client, and docker-compose, which
+`dev/runtime.sh` drives for the container-gated suites and the golden
+tables; grpcurl, for calls to a running server; and ghz and samply, which
+the performance sweep uses to load the gRPC server and profile it.
+Nothing in CI, the hooks, or the `dev/` scripts needs it, and any of the
+same tools installed another way work as well.
+
+```sh
+flox activate -- cargo test --workspace
+flox activate -- grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
+  -d '{"table": "long_2m"}' 127.0.0.1:7433 icetray.v1.Icetray/TableInfo
+```
+
+The server offers no gRPC reflection, so grpcurl and ghz are given the
+proto file (`-proto` for grpcurl, `--proto` for ghz).
+
+## Platform notes
+
+On Linux, the tests of `disk` residency need their temporary directory on
+a filesystem that serves non-blocking reads of cached pages, such as ext4,
 xfs, or btrfs. Where `/tmp` is tmpfs or overlayfs, as on some
 distributions and in most containers, point `TMPDIR` at a directory on
 disk.
@@ -30,7 +52,7 @@ Two suites need fixtures and show as ignored under a plain `cargo test`.
 - `dev/test-golden.sh` runs the layout tests against the golden tables
   `dev/golden-tables.py` writes: one contract-shaped table per key type,
   one in table format version 3 (the rest are version 2, the writer's
-  default), and the off-contract layouts whose cost and advice findings
+  default), and the off-contract layouts whose inefficient and advice findings
   the doctor reports.
 
 ```sh
@@ -39,9 +61,25 @@ ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 ```
 
 `dev/golden-tables.sh` runs the recipe with Spark 4.1.3 and Iceberg 1.11.0
-(`iceberg-spark-runtime-4.1_2.13`) in a container. The recipe runs anywhere
-Spark 4.1 has the Iceberg runtime on its classpath and writes to any object
-store or local directory.
+(`iceberg-spark-runtime-4.1_2.13`) in the `apache/spark:4.1.3-python3`
+image, which carries Java 21, so the host needs a container runtime
+(`dev/runtime.sh up`) and `python3`. `--only contract` or `--only
+off-contract` writes one group. The recipe also runs on the host with
+PySpark 4.1 and Java 17 or later, and writes to any object store or local
+directory:
+
+```sh
+pip install 'pyspark==4.1.*'
+python3 dev/golden-tables.py --warehouse "file://$PWD/target/golden-warehouse"
+```
+
+The first run of either downloads the Iceberg runtime from Maven Central.
+Both groups together are about 4.3 GB, most of it the two tables of 16 KiB
+values. The tables are also the quickest way to try the binary:
+`icetray get --location target/golden-warehouse/db/long_2m 42` answers
+from one of them, and the README's
+[Try it locally](../README.md#try-it-locally) walks through `get`,
+`doctor`, and `serve`.
 
 ## Scale probe
 
