@@ -120,7 +120,9 @@ pub enum Command {
 /// `--config`: clap waives a requirement whose argument conflicts with a
 /// present one, so `requires` alone would let `--config` and `--key-column`
 /// pass together, and the conflict alone would let `--key-column` pass with
-/// no target and go unread under the variable.
+/// no target and go unread under the variable. Their defaults are clap's,
+/// and a defaulted argument counts as absent to both checks, so the
+/// defaults stand under `--config` without tripping either.
 #[derive(Args, Debug)]
 pub struct Target {
     /// The configuration file listing the tables, TOML or JSON. With
@@ -136,25 +138,41 @@ pub struct Target {
     /// and ahead of the file's rules, so it wins for the same prefix.
     #[arg(long, value_name = "FROM=TO", value_parser = parse_rewrite)]
     pub rewrite: Vec<RewriteRule>,
-    /// The key column of the located table (default: key).
-    #[arg(long, requires = "location", conflicts_with = "config")]
-    pub key_column: Option<String>,
-    /// The value column of the located table (default: value).
-    #[arg(long, requires = "location", conflicts_with = "config")]
-    pub value_column: Option<String>,
-    /// The ref of the located table (default: main).
-    #[arg(long, requires = "location", conflicts_with = "config")]
-    pub r#ref: Option<String>,
-    /// Where the located table keeps its key chunks (default: full). Disk
+    /// The key column of the located table.
+    #[arg(
+        long,
+        requires = "location",
+        conflicts_with = "config",
+        default_value = DEFAULT_KEY_COLUMN
+    )]
+    pub key_column: String,
+    /// The value column of the located table.
+    #[arg(
+        long,
+        requires = "location",
+        conflicts_with = "config",
+        default_value = DEFAULT_VALUE_COLUMN
+    )]
+    pub value_column: String,
+    /// The ref of the located table.
+    #[arg(
+        long,
+        requires = "location",
+        conflicts_with = "config",
+        default_value = DEFAULT_REF
+    )]
+    pub r#ref: String,
+    /// Where the located table keeps its key chunks. Disk
     /// is not offered: a one-shot loads once and exits, and the doctor
     /// under full reports every tier's predicted bytes.
     #[arg(
         long,
         requires = "location",
         conflicts_with = "config",
-        value_parser = located_residency()
+        value_parser = located_residency(),
+        default_value_t = DEFAULT_RESIDENCY
     )]
-    pub residency: Option<Residency>,
+    pub residency: Residency,
 }
 
 /// Where a configuration file's path came from, which a message about the
@@ -307,20 +325,11 @@ impl Target {
                 name: table_root_name(&location)
                     .unwrap_or_else(|| LOCATION_FALLBACK_TABLE_NAME.to_string()),
                 source: SourceConfig::Static { location },
-                r#ref: self
-                    .r#ref
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_REF.to_string()),
-                key_column: self
-                    .key_column
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_KEY_COLUMN.to_string()),
-                value_column: self
-                    .value_column
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_VALUE_COLUMN.to_string()),
+                r#ref: self.r#ref.clone(),
+                key_column: self.key_column.clone(),
+                value_column: self.value_column.clone(),
                 strict: false,
-                residency: self.residency.unwrap_or(DEFAULT_RESIDENCY),
+                residency: self.residency,
                 resident_budget_bytes: None,
             }],
         }
@@ -432,6 +441,25 @@ mod tests {
         let error =
             parse(&["info", "--config", "icetray.toml", "--residency", "bloom"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
+        let alone = parse(&["info", "--residency", "bloom"]).unwrap_err();
+        assert_eq!(alone.kind(), ErrorKind::MissingRequiredArgument, "{alone}");
+    }
+
+    #[test]
+    fn test_try_parse_located_defaults_trip_no_conflict_or_requirement() {
+        for args in [
+            &["info"][..],
+            &["info", "--config", "icetray.toml"],
+            &["doctor", "--config", "icetray.toml"],
+            &["get", "--config", "icetray.toml", "7"],
+            &["info", "--location", LOCATION],
+        ] {
+            let parsed = target(parse(args).unwrap());
+            assert_eq!(parsed.key_column, DEFAULT_KEY_COLUMN, "{args:?}");
+            assert_eq!(parsed.value_column, DEFAULT_VALUE_COLUMN, "{args:?}");
+            assert_eq!(parsed.r#ref, DEFAULT_REF, "{args:?}");
+            assert_eq!(parsed.residency, DEFAULT_RESIDENCY, "{args:?}");
+        }
     }
 
     /// The smallest configuration a file can hold, for the tests that read
@@ -528,7 +556,7 @@ value_column = "value"
                 &residency.to_string(),
             ])
             .unwrap();
-            assert_eq!(target(cli).residency, Some(residency));
+            assert_eq!(target(cli).residency, residency);
         }
         for refused in [&Residency::Disk.to_string(), "memory"] {
             let error =
