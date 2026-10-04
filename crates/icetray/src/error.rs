@@ -8,9 +8,11 @@
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
 //! failure to an exit code; the two failures before any subcommand runs, a
 //! command line clap refuses and a runtime that cannot start, are mapped in
-//! `main`. The service maps faults to status codes by variant, so nothing
-//! decides on a message.
+//! `main`. `render` is the plain text a failure is reported in, with the
+//! `Hint` `CliError::hint` gives. The service maps faults to status codes
+//! by variant, so nothing decides on a message.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -42,6 +44,55 @@ pub const EXIT_INEFFICIENT: u8 = 2;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
 
+/// What starts a failure's line on stderr: clap's own prefix, so a usage
+/// error clap reports and one icetray reports read alike.
+pub const ERROR_PREFIX: &str = "error: ";
+
+/// What starts the line after a failure that says how to fix it.
+pub const HINT_PREFIX: &str = "  hint: ";
+
+/// A failure as the plain text a command ends with on stderr: one line
+/// `error: <message>`, and with `hint` one more, `  hint: <hint>`. A
+/// one-shot reports every failure so, and `serve` every failure before its
+/// logging starts; stdout carries data alone.
+pub fn render(message: &dyn fmt::Display, hint: Option<&Hint>) -> String {
+    match hint {
+        Some(hint) => format!("{ERROR_PREFIX}{message}\n{HINT_PREFIX}{hint}\n"),
+        None => format!("{ERROR_PREFIX}{message}\n"),
+    }
+}
+
+/// How to fix a failure, where the fix is plain from the failure alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hint {
+    /// Name one of the configured tables.
+    PassTable {
+        /// The configured names, in configuration order.
+        tables: Vec<String>,
+    },
+    /// Write the key in the form its table's key type takes.
+    KeyForm {
+        /// The table's key type.
+        key_type: KeyType,
+    },
+}
+
+impl fmt::Display for Hint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PassTable { tables } => {
+                write!(f, "pass --table with one of: {}", tables.join(", "))
+            }
+            Self::KeyForm { key_type } => f.write_str(match key_type {
+                KeyType::Long => "a long key is its digits, with a leading - when negative",
+                KeyType::String => "a string key is its text as given",
+                KeyType::Binary => "a binary key is two hex digits per byte, with or without 0x",
+                KeyType::Uuid => "a uuid key is hyphenated or 32 hex digits",
+            }),
+        }
+    }
+}
+
 /// Why command-line text is not a key of the table's type. The messages
 /// carry the text, since the shell may have changed what the person typed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -70,6 +121,17 @@ pub enum KeyTextFault {
         /// The text as given.
         text: String,
     },
+}
+
+impl KeyTextFault {
+    /// The key type the text did not parse as.
+    pub fn key_type(&self) -> KeyType {
+        match self {
+            Self::NotALong { .. } => KeyType::Long,
+            Self::OddHexLength { .. } | Self::NotHex { .. } => KeyType::Binary,
+            Self::NotAUuid { .. } => KeyType::Uuid,
+        }
+    }
 }
 
 /// Why `--rewrite` text is not a rule. clap reports it as a value
@@ -240,9 +302,11 @@ pub enum CliError {
     NoTableMatched {
         /// The name asked for with `--table`.
         name: String,
+        /// The configured names, in configuration order.
+        tables: Vec<String>,
     },
     /// A `get` with no `--table` while more than one table is configured.
-    #[error("several tables are configured, pass --table with one of: {}", tables.join(", "))]
+    #[error("several tables are configured and get reads one")]
     TableNameRequired {
         /// The configured names, in configuration order.
         tables: Vec<String>,
@@ -266,6 +330,28 @@ pub enum CliError {
 }
 
 impl CliError {
+    /// How to fix this failure, when the failure alone makes it plain.
+    pub fn hint(&self) -> Option<Hint> {
+        match self {
+            Self::NoTableMatched { tables, .. } | Self::TableNameRequired { tables } => {
+                Some(Hint::PassTable {
+                    tables: tables.clone(),
+                })
+            }
+            Self::Key(fault) => Some(Hint::KeyForm {
+                key_type: fault.key_type(),
+            }),
+            Self::Core(_)
+            | Self::NoTarget
+            | Self::NoConfig
+            | Self::ConfigUnreadable { .. }
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::BrokenPipe
+            | Self::Serve(_) => None,
+        }
+    }
+
     /// The exit code the process ends with for this failure.
     pub fn exit_code(&self) -> ExitCode {
         let code = match self {
@@ -339,6 +425,7 @@ mod tests {
             CliError::NoConfig,
             CliError::NoTableMatched {
                 name: TABLE.to_string(),
+                tables: vec!["a".to_string()],
             },
             CliError::TableNameRequired {
                 tables: vec!["a".to_string(), "b".to_string()],
@@ -350,6 +437,56 @@ mod tests {
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_USAGE), "{error}");
         }
+    }
+
+    #[test]
+    fn test_hint_names_the_tables_to_choose_from() {
+        let tables = vec!["a".to_string(), "b".to_string()];
+        let pass_table = Some(Hint::PassTable {
+            tables: tables.clone(),
+        });
+        let unmatched = CliError::NoTableMatched {
+            name: TABLE.to_string(),
+            tables: tables.clone(),
+        };
+        assert_eq!(unmatched.hint(), pass_table);
+        assert_eq!(CliError::TableNameRequired { tables }.hint(), pass_table);
+        assert_eq!(CliError::NoTarget.hint(), None);
+    }
+
+    #[test]
+    fn test_hint_gives_the_form_of_the_key_type_the_text_missed() {
+        let text = || "abc".to_string();
+        let cases = [
+            (KeyTextFault::NotALong { text: text() }, KeyType::Long),
+            (KeyTextFault::OddHexLength { text: text() }, KeyType::Binary),
+            (KeyTextFault::NotHex { text: text() }, KeyType::Binary),
+            (KeyTextFault::NotAUuid { text: text() }, KeyType::Uuid),
+        ];
+        for (fault, key_type) in cases {
+            assert_eq!(
+                CliError::Key(fault).hint(),
+                Some(Hint::KeyForm { key_type })
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_is_an_error_line_and_a_hint_line_when_there_is_a_hint() {
+        let error = CliError::TableNameRequired {
+            tables: vec!["a".to_string(), "b".to_string()],
+        };
+        let with_hint = render(&error, error.hint().as_ref());
+        let lines: Vec<&str> = with_hint.lines().collect();
+        assert_eq!(lines.len(), 2, "{with_hint}");
+        assert!(lines[0].starts_with(ERROR_PREFIX), "{with_hint}");
+        assert!(lines[1].starts_with(HINT_PREFIX), "{with_hint}");
+        assert!(with_hint.ends_with('\n'));
+
+        let bare = render(&CliError::NoTarget, None);
+        assert_eq!(bare.lines().count(), 1, "{bare}");
+        assert!(bare.starts_with(ERROR_PREFIX), "{bare}");
+        assert!(bare.ends_with('\n'));
     }
 
     #[test]

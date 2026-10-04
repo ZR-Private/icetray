@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use clap::Parser as _;
 use icetray::cli::{Cli, Command, ConfigPath, Target};
-use icetray::error::{CliError, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
+use icetray::error::{CliError, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, render};
 use icetray::logging::{self, LogSink};
 use icetray::reload::{ConfigFile, Reload};
 use icetray::serve::{ServeOptions, Serving};
@@ -47,7 +47,10 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("cannot start the runtime: {error}");
+            eprint!(
+                "{}",
+                render(&format_args!("cannot start the runtime: {error}"), None)
+            );
             return ExitCode::from(EXIT_FAILURE);
         }
     };
@@ -103,10 +106,11 @@ where
     }
 }
 
-/// Reports `error` on stderr, where a failure before logging exists goes,
-/// and gives its exit code.
+/// Reports `error` on stderr as plain text with its hint, the form of a
+/// one-shot's every failure and of `serve`'s before its logging starts, and
+/// gives its exit code.
 fn report(error: &CliError) -> ExitCode {
-    eprintln!("{error}");
+    eprint!("{}", render(error, error.hint().as_ref()));
     error.exit_code()
 }
 
@@ -119,24 +123,31 @@ fn prepare(target: &Target) -> Result<Config, ExitCode> {
     Ok(config)
 }
 
-/// A run's outcome, a one-shot's or `serve`'s, as the exit code: a failure
-/// is logged, except a closed stdout, which ends the run quietly with exit 0.
+/// A one-shot's outcome as the exit code: a failure is reported as plain
+/// text, as before logging started, so a mistake reads the same however
+/// far the run got; warnings logged on the way stay log events. A closed
+/// stdout ends the run quietly with exit 0.
 fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
     match outcome {
         Ok(code) => code,
         Err(CliError::BrokenPipe) => CliError::BrokenPipe.exit_code(),
-        Err(error) => {
-            tracing::error!(%error, "run failed");
-            error.exit_code()
-        }
+        Err(error) => report(&error),
     }
+}
+
+/// The daemon's outcome as the exit code: a failure is logged, since once
+/// its logging starts the daemon reports through its log stream (RFD 012).
+fn finish_logged(outcome: Result<ExitCode, CliError>) -> ExitCode {
+    outcome.unwrap_or_else(|error| {
+        tracing::error!(%error, "run failed");
+        error.exit_code()
+    })
 }
 
 /// `serve`: the configuration from `--config`, given as `flag`, or from
 /// `ICETRAY_CONFIG`, logging to stdout at `info` (twelve-factor: the log
 /// stream is stdout), jemalloc's background purging, then the daemon
-/// following the file (RFD 018), whose outcome is finished into the exit
-/// code as a one-shot's is.
+/// following the file (RFD 018), whose failure is logged.
 async fn serve(flag: Option<&Path>) -> ExitCode {
     let Some(file) = ConfigPath::resolve(flag) else {
         return report(&CliError::NoConfig);
@@ -160,7 +171,7 @@ async fn serve(flag: Option<&Path>) -> ExitCode {
         source: Arc::new(ConfigFile::new(&file.path)),
         started_from: reading.digest,
     };
-    finish(daemon(config, reload).await)
+    finish_logged(daemon(config, reload).await)
 }
 
 /// The metrics recorder, the daemon following `reload`, a reload on

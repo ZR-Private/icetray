@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hyper::StatusCode;
 use icetray::cli::{ENV_CONFIG, LOCATION_TABLE_NAME};
+use icetray::error::{ERROR_PREFIX, HINT_PREFIX};
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::reload::ReloadResult;
 use icetray::serve::OVERALL_SERVICE;
@@ -99,6 +100,32 @@ fn lines(stdout: &[u8]) -> Vec<Json> {
 /// The stderr of a run, for a failing assertion's message.
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Asserts the run ended by reporting its failure as plain text on stderr:
+/// after whatever warnings it logged there, each a JSON log event, one
+/// error line in clap's form, then at most one hint line. Returns whether
+/// the hint line is there.
+fn assert_plain_error(output: &Output) -> bool {
+    let text = stderr(output);
+    let is_event =
+        |line: &str| serde_json::from_str::<Json>(line).is_ok_and(|json| json.is_object());
+    let lines: Vec<&str> = text.lines().collect();
+    let report = lines
+        .iter()
+        .position(|line| !is_event(line))
+        .map_or(&[][..], |first| &lines[first..]);
+    assert!(
+        report
+            .first()
+            .is_some_and(|line| line.starts_with(ERROR_PREFIX)),
+        "{text}"
+    );
+    match &report[1..] {
+        [] => false,
+        [hint] if hint.starts_with(HINT_PREFIX) => true,
+        _ => panic!("more than an error and a hint after the log events: {text}"),
+    }
 }
 
 /// Writes `spec` as a fixture under `dir` through a memory catalog.
@@ -508,6 +535,7 @@ async fn test_get_rejects_a_key_that_does_not_parse() -> TestResult {
     let output = run(&[&["get"][..], &location(&fixture), &["abc"]].concat(), &[]);
     assert_exit(&output, EXIT_USAGE);
     assert!(output.stdout.is_empty());
+    assert!(assert_plain_error(&output), "the key's form is the hint");
     Ok(())
 }
 
@@ -534,6 +562,12 @@ async fn test_get_needs_a_table_name_when_several_are_configured() -> TestResult
     let unnamed = run(&["get", "--config", &config, &key], &[]);
     assert_exit(&unnamed, EXIT_USAGE);
     assert!(unnamed.stdout.is_empty());
+    assert!(assert_plain_error(&unnamed), "the tables are the hint");
+
+    let unknown = run(&["get", "--config", &config, "--table", "c", &key], &[]);
+    assert_exit(&unknown, EXIT_USAGE);
+    assert!(unknown.stdout.is_empty());
+    assert!(assert_plain_error(&unknown), "the tables are the hint");
 
     let named = run(&["get", "--config", &config, "--table", TABLE_A, &key], &[]);
     assert_exit(&named, EXIT_OK);
@@ -622,11 +656,14 @@ fn test_every_command_treats_an_empty_config_variable_as_unset() -> TestResult {
             let output = run(args, env);
             assert_exit(&output, EXIT_USAGE);
             assert!(output.stdout.is_empty(), "{args:?} {env:?}");
+            assert_plain_error(&output);
         }
         let from_env = run(args, &[(ENV_CONFIG, missing)]);
         assert_exit(&from_env, EXIT_FAILURE);
+        assert_plain_error(&from_env);
         let from_flag = run(&[args, &["--config", missing]].concat(), &[]);
         assert_exit(&from_flag, EXIT_FAILURE);
+        assert_plain_error(&from_flag);
     }
     Ok(())
 }
@@ -855,13 +892,16 @@ async fn test_a_configuration_with_no_table_exits_1() -> TestResult {
             let output = run(args, &[]);
             assert_exit(&output, EXIT_FAILURE);
             assert!(output.stdout.is_empty(), "{args:?}: {}", stderr(&output));
+            assert_plain_error(&output);
         }
     }
     Ok(())
 }
 
 /// `serve` refuses to start on a configuration with no table, exit 1,
-/// rather than report ready while serving nothing.
+/// rather than report ready while serving nothing. The refusal comes before
+/// logging starts, so it is plain text on stderr and the log stream,
+/// stdout, carries nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_serve_exits_1_on_a_configuration_with_no_table() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -877,12 +917,25 @@ async fn test_serve_exits_1_on_a_configuration_with_no_table() -> TestResult {
         Command::new(BIN)
             .args(["serve", "--config", &path])
             .env_remove(ENV_CONFIG)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?,
     );
     let status = wait_within(&mut daemon.0, READY_WAIT).await?;
     assert_eq!(status.code(), Some(i32::from(EXIT_FAILURE)));
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    if let Some(mut stdout) = daemon.0.stdout.take() {
+        std::io::Read::read_to_end(&mut stdout, &mut output.stdout)?;
+    }
+    if let Some(mut stderr) = daemon.0.stderr.take() {
+        std::io::Read::read_to_end(&mut stderr, &mut output.stderr)?;
+    }
+    assert!(output.stdout.is_empty(), "{}", stderr(&output));
+    assert_plain_error(&output);
     Ok(())
 }
 

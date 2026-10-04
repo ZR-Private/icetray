@@ -23,6 +23,11 @@ pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, 
     match only {
         Some(name) if opened.tables().is_empty() => Err(CliError::NoTableMatched {
             name: name.to_string(),
+            tables: config
+                .tables
+                .iter()
+                .map(|table| table.name.clone())
+                .collect(),
         }),
         Some(_) | None => Ok(opened),
     }
