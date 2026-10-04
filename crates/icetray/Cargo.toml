@@ -12,7 +12,8 @@ workspace = true
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-clap = { workspace = true }
+# `wrap_help` so help wraps to the terminal's width, at most 100 columns.
+clap = { workspace = true, features = ["wrap_help"] }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

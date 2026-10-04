@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::builder::{PossibleValuesParser, Styles, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 use icetray_core::catalog::table_root_name;
 use icetray_core::config::{
@@ -16,7 +16,9 @@ use icetray_core::config::{
     StorageConfig, TableConfig,
 };
 
-use crate::error::{CliError, RewriteTextFault};
+use crate::error::{
+    CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE, RewriteTextFault,
+};
 use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 
 /// The environment variable that names the configuration file when no flag
@@ -53,61 +55,137 @@ const LOCATED_RESIDENCIES: [Residency; 2] = [Residency::Full, Residency::Bloom];
 /// occurrence, since a location may itself carry one.
 const REWRITE_SEPARATOR: char = '=';
 
+/// The help heading of the flags that choose the tables, on every command.
+const HEADING_TABLES: &str = "Table selection";
+
+/// The help heading of the flags that describe a `--location` table.
+const HEADING_LOCATED: &str = "Located table (with --location)";
+
+/// The help heading of the flags that add to what a command prints.
+const HEADING_OUTPUT: &str = "Output";
+
+/// What `--config` is, the same words on every command.
+const CONFIG_HELP: &str = "The configuration file, TOML or JSON";
+
+/// `--config`'s help: `CONFIG_HELP` with `ENV_CONFIG` named in the form
+/// clap's env feature gives, which is off (see `ENV_CONFIG`). Clap writes a
+/// spec like `[default: ..]` after the help on the same line under `-h`.
+fn config_help() -> String {
+    format!("{CONFIG_HELP} [env: {ENV_CONFIG}]")
+}
+
+/// `config_help` for `--help`, where clap puts a spec in its own paragraph.
+fn config_long_help() -> String {
+    format!("{CONFIG_HELP}\n\n[env: {ENV_CONFIG}]")
+}
+
+/// The root command's footer: the environment it reads, its exit statuses
+/// from the `EXIT_*` codes, and examples, under headings styled as clap
+/// styles its own; clap drops the styling when it does not print in color.
+fn footer() -> String {
+    let heading = *Styles::default().get_header();
+    format!(
+        "{heading}Environment:{heading:#}
+  {ENV_CONFIG}  The configuration file when no --config or --location is given
+  RUST_LOG        Log filter, such as debug (default: info for serve, else warn)
+
+{heading}Exit status:{heading:#}
+  {EXIT_OK:<3} Success; an absent key is an answer
+  {EXIT_FAILURE:<3} Failure, or a table refused
+  {EXIT_INEFFICIENT:<3} The doctor found an inefficient table it did not refuse
+  {EXIT_USAGE:<3} Usage error
+
+{heading}Examples:{heading:#}
+  icetray get --location s3://warehouse/db/kv 42 43
+  icetray doctor --config icetray.toml
+  icetray serve --config icetray.toml"
+    )
+}
+
 /// Serve get-by-key lookups over Apache Iceberg tables, or inspect and
 /// query them.
 #[derive(Parser, Debug)]
-#[command(name = "icetray", version)]
+#[command(name = "icetray", version, after_help = footer())]
 pub struct Cli {
     /// What to run.
     #[command(subcommand)]
     pub command: Command,
 }
 
-/// The subcommands.
+/// The subcommands. Each one's doc comment is its help: the first paragraph
+/// the summary `-h` and the command list show, the whole of it what
+/// `--help` shows.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the daemon: the gRPC service, health, metrics, and readiness.
+    /// Run the gRPC server.
+    ///
+    /// Serves lookups and gRPC health for the tables the configuration file
+    /// lists, with metrics and readiness over HTTP, and logs JSON lines to
+    /// stdout. Reloads the file when it changes and on SIGHUP; drains and
+    /// exits on SIGTERM or SIGINT.
     Serve {
-        /// The configuration file, TOML or JSON. With none, the file
-        /// `ICETRAY_CONFIG` names.
-        #[arg(long, short)]
+        /// The configuration file.
+        #[arg(
+            long,
+            short,
+            value_name = "PATH",
+            help = config_help(),
+            long_help = config_long_help(),
+            help_heading = HEADING_TABLES
+        )]
         config: Option<PathBuf>,
     },
-    /// Diagnose tables: serviceability, inefficient findings with their
-    /// penalties, and advice. Exits 2 when a table is inefficient, 1 when
-    /// one cannot be loaded or is refused.
+    /// Check tables against the table contract.
+    ///
+    /// Loads each table and prints a JSON table line with its summary, a
+    /// finding line for each inefficient finding or advice, and a refusal
+    /// line for a table that cannot be served. A table from a configuration
+    /// file is judged under its strict setting, as serve judges it.
+    ///
+    /// Exits 0 when no table is inefficient, 2 when one is inefficient and
+    /// not refused, and 1 when one cannot be loaded or is refused.
     Doctor {
         /// Where the tables come from.
         #[command(flatten)]
         target: Target,
         /// Only the table with this configured name.
-        #[arg(long)]
+        #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
-        /// Also print one line per data file.
-        #[arg(long)]
+        /// Also print one file line per data file.
+        #[arg(long, help_heading = HEADING_OUTPUT)]
         files: bool,
     },
-    /// Look keys up in one table and print one line per key.
+    /// Look up keys in one table.
+    ///
+    /// Prints one JSON lookup line per key, in the order given, saying
+    /// whether the key is present, null, or absent. An absent key is an
+    /// answer, not a failure: the exit status is 0.
     Get {
         /// Where the tables come from.
         #[command(flatten)]
         target: Target,
         /// The table to read; needed when more than one is configured.
-        #[arg(long)]
+        #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
-        /// Keys in the form icetray prints them: a long as its digits (a
-        /// negative one too), a string as its text, a binary key as hex with
-        /// or without 0x, a uuid hyphenated or as 32 hex digits.
-        #[arg(required = true, allow_negative_numbers = true)]
+        /// Keys to look up, in the form icetray prints them.
+        ///
+        /// A long is its digits, a negative one included; a string is its
+        /// text; a binary key is hex, with or without 0x; a uuid is
+        /// hyphenated or 32 hex digits. A key that starts with - and is not
+        /// a number goes after --.
+        #[arg(value_name = "KEY", required = true, allow_negative_numbers = true)]
         keys: Vec<String>,
     },
-    /// Describe the served snapshot of each table.
+    /// Describe each table's current snapshot.
+    ///
+    /// Loads each table and prints one JSON table line per table with its
+    /// snapshot, size, serviceability, and each residency's resident bytes.
     Info {
         /// Where the tables come from.
         #[command(flatten)]
         target: Target,
         /// Only the table with this configured name.
-        #[arg(long)]
+        #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
     },
 }
@@ -122,55 +200,84 @@ pub enum Command {
 /// pass together, and the conflict alone would let `--key-column` pass with
 /// no target and go unread under the variable. Their defaults are clap's,
 /// and a defaulted argument counts as absent to both checks, so the
-/// defaults stand under `--config` without tripping either.
+/// defaults stand under `--config` without tripping either. Each field's
+/// doc comment is its help.
 #[derive(Args, Debug)]
 pub struct Target {
-    /// The configuration file listing the tables, TOML or JSON. With
-    /// neither this nor --location, the file `ICETRAY_CONFIG` names.
-    #[arg(long, short)]
+    /// The configuration file listing the tables.
+    #[arg(
+        long,
+        short,
+        value_name = "PATH",
+        help = config_help(),
+        long_help = config_long_help(),
+        help_heading = HEADING_TABLES
+    )]
     pub config: Option<PathBuf>,
-    /// A table root or a metadata file to open without a configuration
-    /// file, under the name of the table root's last directory;
-    /// `ICETRAY_CONFIG` is ignored.
-    #[arg(long, conflicts_with = "config")]
+    /// A table root or metadata file to open as one table.
+    ///
+    /// The table is named after the table root's last directory, and no
+    /// configuration file is read, not even one the environment names.
+    #[arg(
+        long,
+        value_name = "URI",
+        conflicts_with = "config",
+        help_heading = HEADING_TABLES
+    )]
     pub location: Option<String>,
-    /// A location prefix rewrite FROM=TO applied before any read; repeatable,
-    /// and ahead of the file's rules, so it wins for the same prefix.
-    #[arg(long, value_name = "FROM=TO", value_parser = parse_rewrite)]
+    /// Rewrite the location prefix FROM to TO before reading; repeatable.
+    ///
+    /// A rule given here goes ahead of the configuration file's, so it wins
+    /// for the same prefix.
+    #[arg(
+        long,
+        value_name = "FROM=TO",
+        value_parser = parse_rewrite,
+        help_heading = HEADING_TABLES
+    )]
     pub rewrite: Vec<RewriteRule>,
     /// The key column of the located table.
     #[arg(
         long,
+        value_name = "COLUMN",
         requires = "location",
         conflicts_with = "config",
-        default_value = DEFAULT_KEY_COLUMN
+        default_value = DEFAULT_KEY_COLUMN,
+        help_heading = HEADING_LOCATED
     )]
     pub key_column: String,
     /// The value column of the located table.
     #[arg(
         long,
+        value_name = "COLUMN",
         requires = "location",
         conflicts_with = "config",
-        default_value = DEFAULT_VALUE_COLUMN
+        default_value = DEFAULT_VALUE_COLUMN,
+        help_heading = HEADING_LOCATED
     )]
     pub value_column: String,
-    /// The ref of the located table.
+    /// The branch or tag of the located table to read.
     #[arg(
         long,
+        value_name = "REF",
         requires = "location",
         conflicts_with = "config",
-        default_value = DEFAULT_REF
+        default_value = DEFAULT_REF,
+        help_heading = HEADING_LOCATED
     )]
     pub r#ref: String,
-    /// Where the located table keeps its key chunks. Disk
-    /// is not offered: a one-shot loads once and exits, and the doctor
-    /// under full reports every tier's predicted bytes.
+    /// Where the located table keeps its key chunks.
+    ///
+    /// Disk residency needs a local directory and is available through a
+    /// configuration file.
     #[arg(
         long,
+        value_name = "RESIDENCY",
         requires = "location",
         conflicts_with = "config",
         value_parser = located_residency(),
-        default_value_t = DEFAULT_RESIDENCY
+        default_value_t = DEFAULT_RESIDENCY,
+        help_heading = HEADING_LOCATED
     )]
     pub residency: Residency,
 }
@@ -338,6 +445,7 @@ impl Target {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
     use clap::error::ErrorKind;
 
     use super::*;
@@ -580,6 +688,30 @@ value_column = "value"
             };
             assert_eq!(keys[0], NEGATIVE_KEY, "{args:?}");
         }
+    }
+
+    #[test]
+    fn test_debug_assert_accepts_the_definition() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_try_parse_takes_t_for_table_on_every_one_shot() {
+        for args in [
+            &["doctor", "-t", "kv"][..],
+            &["get", "-t", "kv", "7"],
+            &["info", "-t", "kv"],
+        ] {
+            let table = match parse(args).unwrap().command {
+                Command::Doctor { table, .. }
+                | Command::Get { table, .. }
+                | Command::Info { table, .. } => table,
+                Command::Serve { .. } => panic!("{args:?} is a one-shot"),
+            };
+            assert_eq!(table.as_deref(), Some("kv"), "{args:?}");
+        }
+        let error = parse(&["serve", "-t", "kv"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{error}");
     }
 
     #[test]
