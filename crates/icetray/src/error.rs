@@ -29,9 +29,11 @@ use crate::service::WireVariant;
 pub const EXIT_OK: u8 = 0;
 
 /// The run failed: a configuration that cannot be read, parsed, or
-/// validated, one that lists no table included, a load or read error, a
-/// table the doctor could not load or refused, a first-load failure, a
-/// listener that would not bind, a drain that passed its deadline.
+/// validated, one that lists no table included, a relative path on the
+/// command line with no working directory to resolve it against, a load or
+/// read error, a table the doctor could not load or refused, a first-load
+/// failure, a listener that would not bind, a drain that passed its
+/// deadline.
 pub const EXIT_FAILURE: u8 = 1;
 
 /// The doctor found an inefficient finding (RFD 016): the table serves,
@@ -315,6 +317,28 @@ pub enum CliError {
         /// The configured names, in configuration order.
         tables: Vec<String>,
     },
+    /// A relative local path on the command line, a `--location` or a
+    /// `--rewrite` TO, and a working directory that cannot be read to
+    /// resolve it against.
+    #[error("cannot resolve {location} against the working directory: {source}")]
+    WorkingDirectory {
+        /// The path as given.
+        location: String,
+        /// The operating system's refusal.
+        source: std::io::Error,
+    },
+    /// A relative local path on the command line, and a working directory
+    /// whose path is not UTF-8, which a location must be.
+    #[error(
+        "cannot resolve {location} against the working directory {}: its path is not UTF-8",
+        path.display()
+    )]
+    WorkingDirectoryNotUtf8 {
+        /// The path as given.
+        location: String,
+        /// The working directory.
+        path: std::path::PathBuf,
+    },
     /// `--table` with `--location`: the one selects among the tables a
     /// configuration lists, the other opens one table without any.
     #[error("--table selects a configured table and --location opens one table directly")]
@@ -363,6 +387,8 @@ impl CliError {
             | Self::NoTarget
             | Self::NoConfig
             | Self::ConfigUnreadable { .. }
+            | Self::WorkingDirectory { .. }
+            | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Io(_)
             | Self::Json(_)
             | Self::BrokenPipe
@@ -375,6 +401,8 @@ impl CliError {
         let code = match self {
             Self::Core(_)
             | Self::ConfigUnreadable { .. }
+            | Self::WorkingDirectory { .. }
+            | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Io(_)
             | Self::Json(_)
             | Self::Serve(_) => EXIT_FAILURE,
@@ -430,6 +458,14 @@ mod tests {
                     origin: PathOrigin::Env,
                 },
                 source: std::io::Error::other("sample"),
+            },
+            CliError::WorkingDirectory {
+                location: TABLE.to_string(),
+                source: std::io::Error::other("sample"),
+            },
+            CliError::WorkingDirectoryNotUtf8 {
+                location: TABLE.to_string(),
+                path: "/".into(),
             },
         ];
         for error in cases {

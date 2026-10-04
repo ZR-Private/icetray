@@ -352,6 +352,33 @@ pub fn table_root_name(location: &str) -> Option<String> {
     (!RELATIVE_DIRS.contains(&name)).then(|| name.to_string())
 }
 
+/// What ends a URI's scheme (RFC 3986).
+const SCHEME_END: char = ':';
+
+/// Whether `location` is a relative local path: not empty, not starting at
+/// the root, and naming no URI scheme, which RFC 3986 spells as a letter,
+/// then letters, digits, `+`, `-`, or `.`, up to a `:`. `Storage` refuses
+/// such a location, since it names no store; the command line makes one
+/// absolute against its working directory first, while a configuration
+/// file's locations must be absolute or URIs already, so the file reads the
+/// same from any directory.
+pub fn is_relative_path(location: &str) -> bool {
+    let scheme = location
+        .split_once(SCHEME_END)
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| is_scheme(scheme));
+    !location.is_empty() && !location.starts_with(PATH_SEPARATOR) && scheme.is_none()
+}
+
+/// Whether `text` is a URI scheme as RFC 3986 spells one.
+fn is_scheme(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|rest| rest.is_ascii_alphanumeric() || matches!(rest, '+' | '-' | '.'))
+}
+
 /// The metadata file a bare `version` names under `root`:
 /// `metadata/v<version>.metadata.json`, the Hadoop catalog's layout. A
 /// writer publishing a snapshot by hand names its metadata file through it.
@@ -874,6 +901,32 @@ mod tests {
             "/data/kv/metadata/v1.metadata.json",
         ] {
             assert_eq!(table_root_name(location), kv, "{location}");
+        }
+    }
+
+    #[test]
+    fn test_is_relative_path_only_for_a_local_path_off_the_root() {
+        for location in [
+            "kv",
+            "db/kv",
+            "./db/kv",
+            "../warehouse/db/kv/",
+            "db/a:b",
+            "1db:kv",
+        ] {
+            assert!(is_relative_path(location), "{location}");
+        }
+        for location in [
+            "",
+            "/data/kv",
+            "s3://warehouse/db/kv",
+            "s3a://warehouse/db/kv",
+            "file:///data/kv",
+            "file:/data/kv",
+            "file:data/kv",
+            "mem+x.y-z:kv",
+        ] {
+            assert!(!is_relative_path(location), "{location}");
         }
     }
 

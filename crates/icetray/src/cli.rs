@@ -6,11 +6,11 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 
 use clap::builder::{PossibleValuesParser, Styles, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
-use icetray_core::catalog::table_root_name;
+use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
     Config, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig, SourceConfig,
     StorageConfig, TableConfig,
@@ -217,8 +217,10 @@ pub struct Target {
     pub config: Option<PathBuf>,
     /// A table root or metadata file to open as one table.
     ///
-    /// The table is named after the table root's last directory, and no
-    /// configuration file is read, not even one the environment names.
+    /// A URI, or a local path, which may be relative to the working
+    /// directory. The table is named after the table root's last directory,
+    /// and no configuration file is read, not even one the environment
+    /// names.
     #[arg(
         long,
         value_name = "URI",
@@ -229,7 +231,8 @@ pub struct Target {
     /// Rewrite the location prefix FROM to TO before reading; repeatable.
     ///
     /// A rule given here goes ahead of the configuration file's, so it wins
-    /// for the same prefix.
+    /// for the same prefix. A TO that is a local path may be relative to
+    /// the working directory.
     #[arg(
         long,
         value_name = "FROM=TO",
@@ -379,6 +382,47 @@ fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
     }
 }
 
+/// `location` made absolute against the working directory when it is a
+/// relative local path (`catalog::is_relative_path`), with its `.` and `..`
+/// components resolved by name, since storage refuses either in a path, and
+/// a trailing separator kept, since a `--rewrite` TO is a prefix the rest
+/// of a location follows; any other location as given. The working
+/// directory is read only for a relative path: one that cannot be read is
+/// `CliError::WorkingDirectory`, one whose path is not UTF-8
+/// `CliError::WorkingDirectoryNotUtf8`.
+fn absolute_location(location: &str) -> Result<String, CliError> {
+    if !is_relative_path(location) {
+        return Ok(location.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|source| CliError::WorkingDirectory {
+        location: location.to_string(),
+        source,
+    })?;
+    let mut path = PathBuf::new();
+    for component in cwd.join(location).components() {
+        match component {
+            Component::ParentDir => {
+                path.pop();
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                path.push(component);
+            }
+        }
+    }
+    let mut absolute =
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| CliError::WorkingDirectoryNotUtf8 {
+                location: location.to_string(),
+                path: cwd,
+            })?;
+    if location.ends_with(MAIN_SEPARATOR) && !absolute.ends_with(MAIN_SEPARATOR) {
+        absolute.push(MAIN_SEPARATOR);
+    }
+    Ok(absolute)
+}
+
 impl Target {
     /// The configuration the target denotes: the file parsed and validated
     /// (TOML or JSON by content, RFD 011), named by `--config` or, with no
@@ -393,7 +437,9 @@ impl Target {
     /// index in the file. No flag and no variable, or an empty one, is
     /// `NoTarget`. A run that selects a table by name, `table`, selects
     /// among configured tables, so with `--location` it is
-    /// `TableWithLocation`.
+    /// `TableWithLocation`. A `--location` and a `--rewrite` TO that are
+    /// relative local paths are made absolute first (`absolute_location`);
+    /// the file's own locations are left as written.
     pub fn config(&self, table: Option<&str>) -> Result<Config, CliError> {
         self.config_with_env(table, std::env::var_os(ENV_CONFIG))
     }
@@ -409,7 +455,9 @@ impl Target {
             return Err(CliError::TableWithLocation);
         }
         let mut config = match &self.location {
-            Some(location) => self.location_config(location.clone()).validated()?,
+            Some(location) => self
+                .location_config(absolute_location(location)?)
+                .validated()?,
             None => {
                 ConfigPath::resolve_with_env(self.config.as_deref(), env)
                     .ok_or(CliError::NoTarget)?
@@ -418,7 +466,17 @@ impl Target {
             }
         };
         let from_file = std::mem::take(&mut config.storage.rewrite);
-        config.storage.rewrite = self.rewrite.iter().cloned().chain(from_file).collect();
+        let given = self
+            .rewrite
+            .iter()
+            .map(|rule| {
+                Ok(RewriteRule {
+                    from: rule.from.clone(),
+                    to: absolute_location(&rule.to)?,
+                })
+            })
+            .collect::<Result<Vec<_>, CliError>>()?;
+        config.storage.rewrite = given.into_iter().chain(from_file).collect();
         Ok(config)
     }
 
@@ -807,6 +865,76 @@ value_column = "value"
                     to: file_to.to_string(),
                 },
             ]
+        );
+    }
+
+    /// The working directory joined with `relative`, as a location.
+    fn under_cwd(relative: &str) -> String {
+        let cwd = std::env::current_dir().unwrap();
+        format!("{}{MAIN_SEPARATOR}{relative}", cwd.to_str().unwrap())
+    }
+
+    /// A relative `--location` and a relative `--rewrite` TO are made
+    /// absolute against the working directory, `.` and `..` resolved by
+    /// name and the TO's trailing separator kept; the table is named after
+    /// the resolved root, and a URI FROM is left alone.
+    #[test]
+    fn test_config_makes_relative_command_line_paths_absolute() {
+        let cli = parse(&[
+            "info",
+            "--location",
+            "./warehouse/../warehouse/db/kv",
+            "--rewrite",
+            "s3://warehouse/=./mirror/",
+        ])
+        .unwrap();
+        let config = target(cli).config(None).unwrap();
+        assert_eq!(config.tables[0].name, "kv");
+        assert_eq!(
+            config.tables[0].source,
+            SourceConfig::Static {
+                location: under_cwd("warehouse/db/kv"),
+            }
+        );
+        assert_eq!(
+            config.storage.rewrite,
+            vec![RewriteRule {
+                from: "s3://warehouse/".to_string(),
+                to: under_cwd("mirror/"),
+            }]
+        );
+    }
+
+    /// A URI and an absolute path are taken as given; only a relative
+    /// local path is resolved.
+    #[test]
+    fn test_absolute_location_leaves_uris_and_absolute_paths_alone() {
+        for location in [LOCATION, "file:///data/kv", "file:/data/kv", "/data/../kv"] {
+            assert_eq!(absolute_location(location).unwrap(), location);
+        }
+        assert_eq!(absolute_location("..").unwrap(), {
+            let cwd = std::env::current_dir().unwrap();
+            cwd.parent().unwrap().to_str().unwrap().to_string()
+        });
+    }
+
+    /// A configuration file's relative location is left as written, for
+    /// storage to refuse: a file reads the same from any directory.
+    #[test]
+    fn test_config_leaves_a_file_s_relative_location_as_written() {
+        let relative = "db/kv";
+        let text = TOML_ONE_TABLE.replace(LOCATION, relative);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        let path = file.path().to_str().unwrap();
+        let config = target(parse(&["info", "--config", path]).unwrap())
+            .config(None)
+            .unwrap();
+        assert_eq!(
+            config.tables[0].source,
+            SourceConfig::Static {
+                location: relative.to_string(),
+            }
         );
     }
 

@@ -235,6 +235,42 @@ async fn wait_within(child: &mut Child, wait: Duration) -> Result<ExitStatus, Bo
     poll_until(wait, "the child exiting", async || Ok(child.try_wait()?)).await
 }
 
+/// A `--location` that is a relative path opens the table under the
+/// working directory, named after its root, while a configuration file
+/// holding the same relative path is refused: a file means the same from
+/// any directory.
+#[tokio::test]
+async fn test_info_resolves_a_relative_location_but_not_a_file_s() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let name = "kv_relative";
+    let fixture = local_fixture(dir.path(), FixtureSpec::small(name, KeyType::Long)).await?;
+    let under_dir = format!("file://{}/", dir.path().display());
+    let relative = fixture
+        .metadata_location()
+        .strip_prefix(&under_dir)
+        .ok_or("the fixture lives under the directory")?;
+    let in_dir = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(dir.path())
+            .env_remove(ENV_CONFIG)
+            .output()
+    };
+
+    let located = in_dir(&["info", "--location", relative])?;
+    assert_exit(&located, EXIT_OK);
+    let info = lines(&located.stdout);
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0]["table"], name);
+
+    let text = toml_table(TABLE_A, &fixture).replace(fixture.metadata_location(), relative);
+    let config = write_file(dir.path(), "relative.toml", &text)?;
+    let configured = in_dir(&["info", "--config", &config])?;
+    assert_exit(&configured, EXIT_FAILURE);
+    assert!(configured.stdout.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_info_serializes_the_summary() -> TestResult {
     let dir = tempfile::tempdir()?;
