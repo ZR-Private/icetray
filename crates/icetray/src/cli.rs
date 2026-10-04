@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 use icetray_core::config::{
-    Config, DEFAULT_RESIDENCY, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
-    TableConfig,
+    Config, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig, SourceConfig,
+    StorageConfig, TableConfig,
 };
 
 use crate::error::{CliError, RewriteTextFault};
@@ -124,7 +124,7 @@ pub struct Target {
     pub location: Option<String>,
     /// A location prefix rewrite FROM=TO applied before any read; repeatable,
     /// and ahead of the file's rules, so it wins for the same prefix.
-    #[arg(long, value_parser = parse_rewrite)]
+    #[arg(long, value_name = "FROM=TO", value_parser = parse_rewrite)]
     pub rewrite: Vec<RewriteRule>,
     /// The key column of the located table (default: key).
     #[arg(long, requires = "location", conflicts_with = "config")]
@@ -157,34 +157,36 @@ fn located_residency() -> impl TypedValueParser<Value = Residency> {
     })
 }
 
-/// A `--rewrite` rule from `FROM=TO`, split at the first `=`. The rule's
-/// content is checked with the rest of the configuration by
-/// `Target::config`, so an empty `FROM` is the same violation here as in a
-/// file.
+/// A `--rewrite` rule from `FROM=TO`, split at the first `=` and checked by
+/// `RewriteRule::fault`, the check a file's rules go through, so a rule
+/// the file would refuse is refused here as a usage error.
 fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
-    let (from, to) =
-        text.split_once(REWRITE_SEPARATOR)
-            .ok_or_else(|| RewriteTextFault::NoSeparator {
-                text: text.to_string(),
-            })?;
-    Ok(RewriteRule {
+    let (from, to) = text
+        .split_once(REWRITE_SEPARATOR)
+        .ok_or(RewriteTextFault::NoSeparator)?;
+    let rule = RewriteRule {
         from: from.to_string(),
         to: to.to_string(),
-    })
+    };
+    match rule.fault() {
+        None => Ok(rule),
+        Some(RewriteFault::EmptyFrom) => Err(RewriteTextFault::EmptyFrom),
+        Some(RewriteFault::EmptyTo) => Err(RewriteTextFault::EmptyTo),
+    }
 }
 
 impl Target {
-    /// The configuration the target denotes: the file parsed (TOML or JSON
-    /// by content, RFD 011), named by `--config` or, with no target flag,
-    /// by `ICETRAY_CONFIG`; or one table synthesized from the location with
-    /// server and storage defaults, never strict, since no configuration
-    /// asks for it and a located table is opened to be inspected. The
-    /// `--rewrite` rules go ahead of the file's in `storage.rewrite`, and
-    /// storage applies the first rule that matches, so a command-line rule
-    /// takes precedence over the file's for the same prefix. Only then is
-    /// the whole validated, so the command-line rules and a located table
-    /// are held to every rule `Config::parse` checks: an empty `--rewrite`
-    /// prefix is the same violation a file would be. No flag and no variable is `NoTarget`.
+    /// The configuration the target denotes: the file parsed and validated
+    /// (TOML or JSON by content, RFD 011), named by `--config` or, with no
+    /// target flag, by `ICETRAY_CONFIG`; or one table synthesized from the
+    /// location with server and storage defaults, never strict, since no
+    /// configuration asks for it and a located table is opened to be
+    /// inspected, and validated as a file is. The `--rewrite` rules, which
+    /// `parse_rewrite` already held to the file's rule check, then go ahead
+    /// of the file's in `storage.rewrite`, and storage applies the first
+    /// rule that matches, so a command-line rule takes precedence over the
+    /// file's for the same prefix. A violation names a file rule by its
+    /// index in the file. No flag and no variable is `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
         self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
     }
@@ -193,14 +195,14 @@ impl Target {
     /// process environment.
     fn config_with_env(&self, env_path: Option<PathBuf>) -> Result<Config, CliError> {
         let mut config = match (&self.config, &self.location, env_path) {
-            (Some(path), _, _) => Config::from_path_unvalidated(path)?,
-            (None, Some(location), _) => self.location_config(location.clone()),
-            (None, None, Some(path)) => Config::from_path_unvalidated(&path)?,
+            (Some(path), _, _) => Config::from_path(path)?,
+            (None, Some(location), _) => self.location_config(location.clone()).validated()?,
+            (None, None, Some(path)) => Config::from_path(&path)?,
             (None, None, None) => return Err(CliError::NoTarget),
         };
         let from_file = std::mem::take(&mut config.storage.rewrite);
         config.storage.rewrite = self.rewrite.iter().cloned().chain(from_file).collect();
-        Ok(config.validated()?)
+        Ok(config)
     }
 
     /// The configuration of one table at `location` under this target's
@@ -235,7 +237,6 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use clap::error::ErrorKind;
-    use icetray_core::config::{ConfigError, ConfigViolation};
 
     use super::*;
 
@@ -450,12 +451,19 @@ value_column = "value"
                 to: "s3://b/?x=1".to_string(),
             })
         );
-        assert_eq!(
-            parse_rewrite("no-separator"),
-            Err(RewriteTextFault::NoSeparator {
-                text: "no-separator".to_string(),
-            })
-        );
+    }
+
+    #[test]
+    fn test_parse_rewrite_refuses_a_rule_the_file_would_refuse() {
+        let cases = [
+            ("no-separator", RewriteTextFault::NoSeparator),
+            ("=s3://b/", RewriteTextFault::EmptyFrom),
+            ("s3://a/=", RewriteTextFault::EmptyTo),
+            ("=", RewriteTextFault::EmptyFrom),
+        ];
+        for (text, fault) in cases {
+            assert_eq!(parse_rewrite(text), Err(fault), "{text:?}");
+        }
     }
 
     #[test]
@@ -486,18 +494,10 @@ value_column = "value"
     }
 
     #[test]
-    fn test_config_refuses_an_empty_rewrite_prefix_as_the_file_does() {
-        let text = format!("={REWRITE_TO}");
-        let cli = parse(&["info", "--location", LOCATION, "--rewrite", &text]).unwrap();
-        let error = target(cli).config().unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CliError::Core(icetray_core::Error::Config(ConfigError::Invalid(
-                    ConfigViolation::EmptyRewritePrefix
-                )))
-            ),
-            "{error:?}"
-        );
+    fn test_try_parse_refuses_an_unusable_rewrite_as_usage() {
+        for text in ["no-separator", "=s3://b/", "s3://a/="] {
+            let error = parse(&["info", "--location", LOCATION, "--rewrite", text]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{text}: {error}");
+        }
     }
 }

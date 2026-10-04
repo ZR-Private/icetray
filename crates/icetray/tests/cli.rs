@@ -694,21 +694,32 @@ async fn test_a_command_line_rewrite_takes_precedence_over_the_file_s() -> TestR
     Ok(())
 }
 
-/// An empty `--rewrite` prefix is the same violation as an empty `from` in
-/// the file, refused before anything is opened with exit 1.
+/// A `--rewrite` rule that is not `FROM=TO` with both halves set is a
+/// usage error, refused before anything is opened with exit 64; the same
+/// rule in the file is the file's fault, exit 1.
 #[tokio::test]
-async fn test_an_empty_rewrite_prefix_exits_1() -> TestResult {
+async fn test_an_unusable_rewrite_is_usage_on_the_command_line_and_failure_in_the_file()
+-> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_empty", KeyType::Long)).await?;
-    let output = run(
-        &[
-            &["info"][..],
-            &location(&fixture),
-            &["--rewrite", "=file:///elsewhere/"],
-        ]
-        .concat(),
-        &[],
+    for rule in [
+        "=file:///elsewhere/",
+        "file:///elsewhere/=",
+        "file:///elsewhere/",
+    ] {
+        let output = run(
+            &[&["info"][..], &location(&fixture), &["--rewrite", rule]].concat(),
+            &[],
+        );
+        assert_exit(&output, EXIT_USAGE);
+        assert!(output.stdout.is_empty(), "{rule}: {}", stderr(&output));
+    }
+    let text = format!(
+        "[[storage.rewrite]]\nfrom = \"\"\nto = \"file:///elsewhere/\"\n\n{}",
+        toml_table(TABLE_A, &fixture)
     );
+    let config = write_file(dir.path(), "empty-from.toml", &text)?;
+    let output = run(&["info", "--config", &config], &[]);
     assert_exit(&output, EXIT_FAILURE);
     assert!(output.stdout.is_empty(), "{}", stderr(&output));
     Ok(())

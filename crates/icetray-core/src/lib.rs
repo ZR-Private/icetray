@@ -35,8 +35,8 @@ pub use check::{
 };
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
-    Residency, RewriteRule, S3Config, ServerConfig, SourceConfig, StandardField, StorageConfig,
-    TableConfig,
+    Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, StandardField,
+    StorageConfig, TableConfig,
 };
 pub use error::{Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};

@@ -315,11 +315,15 @@ pub enum ConfigViolation {
         /// The field later in `StandardField::ALL`.
         second: StandardField,
     },
-    /// A rewrite rule, from the file or the command line, whose `from` is
-    /// empty: every location starts with the empty prefix, so the rule would
-    /// rewrite all of them.
-    #[error("a rewrite rule has an empty from prefix")]
-    EmptyRewritePrefix,
+    /// The rewrite rule at `index` of `storage.rewrite` is one
+    /// `RewriteRule::fault` refuses.
+    #[error("storage.rewrite[{index}]: {fault}")]
+    Rewrite {
+        /// The rule's position in the file's list.
+        index: usize,
+        /// What is wrong with it.
+        fault: RewriteFault,
+    },
     /// A location, after rewriting, whose `scheme://authority/` prefix names
     /// no store the process has registered and none it can build (RFD 003:
     /// it builds `s3://`, `s3a://`, and `file://`).
@@ -485,16 +489,8 @@ impl Config {
     /// Reads the file, then `parse`s it; a file that cannot be read is
     /// `ConfigError::Read`.
     pub fn from_path(path: &Path) -> Result<Self> {
-        Self::from_path_unvalidated(path)?.validated()
-    }
-
-    /// `from_path` without `validated`, for a caller that adds settings of
-    /// its own before it validates the whole: the command line puts its
-    /// `--rewrite` rules ahead of the file's. The file must still parse; a
-    /// key the schema does not know fails here as it does in `from_path`.
-    pub fn from_path_unvalidated(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
-        Self::from_text(&text)
+        Self::parse(&text)
     }
 }
 
@@ -503,13 +499,14 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_bounds(&config.server, &config.storage)?;
     validate_hedge(&config.storage.hedge)?;
     validate_log(&config.server.log)?;
-    if config
+    if let Some((index, fault)) = config
         .storage
         .rewrite
         .iter()
-        .any(|rule| rule.from.is_empty())
+        .enumerate()
+        .find_map(|(index, rule)| rule.fault().map(|fault| (index, fault)))
     {
-        return Err(ConfigViolation::EmptyRewritePrefix);
+        return Err(ConfigViolation::Rewrite { index, fault });
     }
     if let Some(s3) = &config.storage.s3
         && s3.access_key_id.is_some() != s3.secret_access_key.is_some()
@@ -871,6 +868,34 @@ pub struct RewriteRule {
     pub from: String,
     /// The prefix to read from instead.
     pub to: String,
+}
+
+impl RewriteRule {
+    /// What makes the rule unusable, or `None`: the one check of a rule,
+    /// which a file's rules and the command line's both go through. An
+    /// empty `from` is a prefix of every location, so the rule would
+    /// rewrite all of them; an empty `to` turns every location it matches
+    /// into a relative path, which names no store.
+    pub fn fault(&self) -> Option<RewriteFault> {
+        if self.from.is_empty() {
+            Some(RewriteFault::EmptyFrom)
+        } else if self.to.is_empty() {
+            Some(RewriteFault::EmptyTo)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a rewrite rule is unusable (`RewriteRule::fault`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RewriteFault {
+    /// The `from` prefix is empty.
+    #[error("from is empty")]
+    EmptyFrom,
+    /// The `to` prefix is empty.
+    #[error("to is empty")]
+    EmptyTo,
 }
 
 /// The optional local directory (RFD 017, RFD 012): chunk files for disk
@@ -1777,11 +1802,25 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_parse_refuses_an_empty_rewrite_prefix() {
-        let text = format!(
-            "{TOML_MINIMAL}\n[[storage.rewrite]]\nfrom = \"\"\nto = \"s3://example-warehouse/\"\n"
-        );
-        assert_eq!(violation(&text), ConfigViolation::EmptyRewritePrefix);
+    fn test_parse_refuses_a_rewrite_rule_with_an_empty_prefix() {
+        let rule = |from: &str, to: &str| {
+            format!("\n[[storage.rewrite]]\nfrom = \"{from}\"\nto = \"{to}\"\n")
+        };
+        let usable = rule("s3://old/", "s3://new/");
+        let cases = [
+            (rule("", "s3://new/"), RewriteFault::EmptyFrom),
+            (rule("s3://old/", ""), RewriteFault::EmptyTo),
+            (rule("", ""), RewriteFault::EmptyFrom),
+        ];
+        for (unusable, fault) in cases {
+            let text = format!("{TOML_MINIMAL}{usable}{unusable}");
+            assert_eq!(
+                violation(&text),
+                ConfigViolation::Rewrite { index: 1, fault },
+                "{unusable}"
+            );
+        }
+        assert!(Config::parse(&format!("{TOML_MINIMAL}{usable}")).is_ok());
     }
 
     #[test]
@@ -1853,33 +1892,6 @@ locaton = "typo"
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(toml_full().as_bytes()).unwrap();
         assert_eq!(Config::from_path(file.path()).unwrap(), full_config());
-    }
-
-    #[test]
-    fn test_from_path_unvalidated_parses_and_leaves_the_rules_to_validated() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        let unnamed = TOML_MINIMAL.replace("name = \"kv\"", "name = \"\"");
-        file.write_all(unnamed.as_bytes()).unwrap();
-        let parsed = Config::from_path_unvalidated(file.path()).unwrap();
-        assert!(parsed.tables[0].name.is_empty());
-        let refused = parsed.validated();
-        assert!(
-            matches!(
-                refused,
-                Err(Error::Config(ConfigError::Invalid(
-                    ConfigViolation::EmptyTableName
-                )))
-            ),
-            "{refused:?}"
-        );
-        let mut typo = tempfile::NamedTempFile::new().unwrap();
-        typo.write_all(format!("{TOML_MINIMAL}\n[server]\nlisten_addr = \"x\"\n").as_bytes())
-            .unwrap();
-        let unknown = Config::from_path_unvalidated(typo.path());
-        assert!(
-            matches!(unknown, Err(Error::Config(ConfigError::Toml(_)))),
-            "{unknown:?}"
-        );
     }
 
     #[test]

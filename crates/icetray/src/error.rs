@@ -73,17 +73,21 @@ pub enum KeyTextFault {
 }
 
 /// Why `--rewrite` text is not a rule. clap reports it as a value
-/// validation failure, so the run ends with `EXIT_USAGE` before anything is
-/// opened; the messages carry the text as given. A rule that has the shape
-/// but breaks a configuration rule is refused with the configuration.
+/// validation failure with the flag and the text, so the run ends with
+/// `EXIT_USAGE` before anything is opened. The two empty halves are the
+/// faults `RewriteRule::fault` finds in a file's rule, named here by the
+/// halves of the flag's `FROM=TO`.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RewriteTextFault {
     /// No `=` separates `FROM` from `TO`.
-    #[error("rewrite {text} is not FROM=TO")]
-    NoSeparator {
-        /// The text as given.
-        text: String,
-    },
+    #[error("no = separates FROM from TO")]
+    NoSeparator,
+    /// `FROM` is empty, so the rule would rewrite every location.
+    #[error("FROM is empty")]
+    EmptyFrom,
+    /// `TO` is empty, so every location it matches would become relative.
+    #[error("TO is empty")]
+    EmptyTo,
 }
 
 /// Why a key from the wire is not a key of the table's type (RFD 010).
