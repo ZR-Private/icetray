@@ -13,7 +13,8 @@ use hyper::StatusCode;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::reload::{ConfigSource, Digest, Reading, Reload, ReloadResult};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
-use icetray::{ServeError, ServeOptions, Serving, telemetry};
+use icetray::telemetry::{self, Call, CodeLabel};
+use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, SourceConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
@@ -325,6 +326,13 @@ impl Stack {
     async fn http_get(&self, path: &str) -> Result<(StatusCode, String), BoxError> {
         http_get(self.serving.metrics_addr(), path).await
     }
+
+    /// One scrape of `/metrics`, which answers 200.
+    async fn scrape(&self) -> Result<String, BoxError> {
+        let (status, exposition) = self.http_get(METRICS_PATH).await?;
+        assert_eq!(status, StatusCode::OK);
+        Ok(exposition)
+    }
 }
 
 /// `key` as the wire carries it.
@@ -338,26 +346,29 @@ fn wire_key(key: &Key) -> v1::Key {
     v1::Key { key: Some(variant) }
 }
 
-/// The `requests_total` count of `call` in `exposition`: zero before the
-/// first call, when the series is not yet exposed.
-fn calls(exposition: &str, call: telemetry::Call) -> f64 {
+/// The `requests_total` count of `call` answering `code` in `exposition`:
+/// zero before the first such answer, when the series is not yet exposed.
+fn calls(exposition: &str, call: Call, code: Code) -> f64 {
     series_value(
         exposition,
         metric::REQUESTS_TOTAL,
-        &[(metric::LABEL_CALL, &call.to_string())],
+        &[
+            (metric::LABEL_CALL, &call.to_string()),
+            (metric::LABEL_CODE, &CodeLabel(code).to_string()),
+        ],
     )
     .unwrap_or(0.0)
 }
 
-/// Asserts that `after` counts `expected` more `call`s than `before`. A
-/// counter's integer is exact in the float the exposition carries it as,
-/// so the difference compares exactly.
-fn assert_counted(before: &str, after: &str, call: telemetry::Call, expected: u64) {
-    let added = calls(after, call) - calls(before, call);
+/// Asserts that `after` counts `expected` more `call`s answering `code`
+/// than `before`. A counter's integer is exact in the float the exposition
+/// carries it as, so the difference compares exactly.
+fn assert_counted(before: &str, after: &str, call: Call, code: Code, expected: u64) {
+    let added = calls(after, call, code) - calls(before, call, code);
     assert_eq!(
         added.to_bits(),
         approx::gauge(expected).to_bits(),
-        "{call}: {added} counted, {expected} expected"
+        "{call} {code:?}: {added} counted, {expected} expected"
     );
 }
 
@@ -571,6 +582,7 @@ async fn test_get_maps_a_missing_or_mismatched_key_to_invalid_argument() -> Test
     .await?;
     stack.serving.ready().await;
 
+    let scraped = stack.scrape().await?;
     let before = stack.stats.gets();
     assert_eq!(code_of(stack.get(TABLE, None).await), Code::InvalidArgument);
     assert_eq!(
@@ -592,6 +604,14 @@ async fn test_get_maps_a_missing_or_mismatched_key_to_invalid_argument() -> Test
         Code::InvalidArgument
     );
     assert_eq!(stack.stats.gets(), before, "a refused key issues no GET");
+    let refused_keys = 4;
+    assert_counted(
+        &scraped,
+        &stack.scrape().await?,
+        Call::Get,
+        Code::InvalidArgument,
+        refused_keys,
+    );
 
     let uuid_key = stack.fixtures[1].key(SAMPLE[1]);
     let Key::Uuid(bytes) = &uuid_key else {
@@ -612,6 +632,7 @@ async fn test_unknown_table_is_not_found() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::ready_small().await?;
     let key = stack.fixtures[0].key(SAMPLE[0]);
+    let before = stack.scrape().await?;
     assert_eq!(code_of(stack.table_info(NOBODY).await), Code::NotFound);
     assert_eq!(
         code_of(stack.get(NOBODY, Some(wire_key(&key))).await),
@@ -621,6 +642,11 @@ async fn test_unknown_table_is_not_found() -> TestResult {
         code_of(stack.multi_get(NOBODY, std::slice::from_ref(&key)).await),
         Code::NotFound
     );
+    let after = stack.scrape().await?;
+    for call in [Call::Get, Call::MultiGet, Call::TableInfo] {
+        assert_counted(&before, &after, call, Code::NotFound, 1);
+        assert_counted(&before, &after, call, Code::Ok, 0);
+    }
     Ok(())
 }
 
@@ -646,6 +672,7 @@ async fn test_storage_failure_is_unavailable_and_fails_a_batch_whole() -> TestRe
     assert_eq!(others.len(), BATCH_IDS, "the sample spans several files");
     std::fs::remove_file(object_file(&stack.s3, &doomed_path))?;
 
+    let before = stack.scrape().await?;
     assert_eq!(
         code_of(stack.get(TABLE, Some(wire_key(&doomed_key))).await),
         Code::Unavailable
@@ -657,6 +684,9 @@ async fn test_storage_failure_is_unavailable_and_fails_a_batch_whole() -> TestRe
         Code::Unavailable,
         "one failed read fails the batch"
     );
+    let after = stack.scrape().await?;
+    assert_counted(&before, &after, Call::Get, Code::Unavailable, 1);
+    assert_counted(&before, &after, Call::MultiGet, Code::Unavailable, 1);
     let answered = stack.multi_get(TABLE, &others).await?;
     assert_eq!(answered.results.len(), others.len());
     for (key, hit) in others.iter().zip(&answered.results) {
@@ -669,8 +699,7 @@ async fn test_storage_failure_is_unavailable_and_fails_a_batch_whole() -> TestRe
 async fn test_requests_total_counts_every_call() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::ready_small().await?;
-    let (status, before) = stack.http_get(METRICS_PATH).await?;
-    assert_eq!(status, StatusCode::OK);
+    let before = stack.scrape().await?;
 
     let key = stack.fixtures[0].key(SAMPLE[0]);
     for _ in 0..COUNTED_GETS {
@@ -679,11 +708,10 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     stack.multi_get(TABLE, std::slice::from_ref(&key)).await?;
     stack.table_info(TABLE).await?;
 
-    let (status, after) = stack.http_get(METRICS_PATH).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_counted(&before, &after, telemetry::Call::Get, COUNTED_GETS);
-    assert_counted(&before, &after, telemetry::Call::MultiGet, 1);
-    assert_counted(&before, &after, telemetry::Call::TableInfo, 1);
+    let after = stack.scrape().await?;
+    assert_counted(&before, &after, Call::Get, Code::Ok, COUNTED_GETS);
+    assert_counted(&before, &after, Call::MultiGet, Code::Ok, 1);
+    assert_counted(&before, &after, Call::TableInfo, Code::Ok, 1);
     let lookups = |exposition: &str| {
         series_sum(
             exposition,
@@ -1194,6 +1222,7 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
     })
     .await?;
 
+    let before = stack.scrape().await?;
     let (outcome, elapsed) = timed(stack.get(TABLE, Some(wire_key(&keys[2])))).await;
     assert_eq!(code_of(outcome), Code::ResourceExhausted);
     assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
@@ -1209,6 +1238,11 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
     for held in [held_get, held_batch] {
         let outcome = tokio::time::timeout(SHUTDOWN_WAIT, held).await??;
         assert_eq!(code_of(outcome), Code::DeadlineExceeded);
+    }
+    let after = stack.scrape().await?;
+    for call in [Call::Get, Call::MultiGet] {
+        assert_counted(&before, &after, call, Code::ResourceExhausted, 1);
+        assert_counted(&before, &after, call, Code::DeadlineExceeded, 1);
     }
     stack.s3.release();
     let response = stack.get(TABLE, Some(wire_key(&keys[2]))).await?;
@@ -1236,8 +1270,10 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
     stack.serving.ready().await;
     let keys = stack.fixtures[0].keys_at(&SAMPLE[..BATCH_IDS]);
     stack.s3.hold();
+    let before = stack.scrape().await?;
 
-    for (sent, key) in keys[..2].iter().enumerate() {
+    let timed_out = 2;
+    for (sent, key) in keys[..timed_out].iter().enumerate() {
         let mut get = tonic::Request::new(GetRequest {
             table: TABLE.to_string(),
             key: Some(wire_key(key)),
@@ -1259,6 +1295,15 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
         )
         .await?;
     }
+    // A call tonic dropped at its client's deadline was answered
+    // `CANCELLED` by tonic, and counts so.
+    assert_counted(
+        &before,
+        &stack.scrape().await?,
+        Call::Get,
+        Code::Cancelled,
+        approx::count(timed_out),
+    );
     Ok(())
 }
 

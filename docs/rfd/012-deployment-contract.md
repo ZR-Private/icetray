@@ -1,5 +1,8 @@
 # Deployment contract
 
+> Updated 2026-10-04: request counts carry the status code each call
+> answered.
+
 ## Problem
 
 icetray is open source and meant to be run by organizations other than
@@ -65,7 +68,9 @@ and static fields from configuration are added to every event.
 
 Metrics are Prometheus, and they cover:
 
-- request counts by call;
+- request counts by call and by the gRPC status code each call answered,
+  so errors show on the server's side; a call dropped before it answers,
+  as at its client's deadline, counts as cancelled;
 - GET counts, local read counts, and latency histograms by kind (load,
   lookup), read from the request counter of RFD 003 (One storage stack);
 - lookup latency by table and by result (cold hit, warm hit, miss);

@@ -1,6 +1,6 @@
 //! The binary's share of the metrics (blueprint section 7): the Prometheus
 //! recorder with the latency buckets, the `requests_total` counter with its
-//! `call` label, and the sampler for `generation_age_seconds`,
+//! `call` and `code` labels, and the sampler for `generation_age_seconds`,
 //! `process_rss_bytes`, and the allocator gauges. Core's modules emit every
 //! other series.
 
@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use icetray_core::{Opened, approx, metric, time};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tikv_jemalloc_ctl::{epoch, stats};
+use tonic::{Code, Status};
 
 use crate::error::ServeError;
 
@@ -75,9 +76,78 @@ impl fmt::Display for Call {
     }
 }
 
-/// Counts one request of `call` under `requests_total`.
-pub fn count(call: Call) {
-    metrics::counter!(metric::REQUESTS_TOTAL, metric::LABEL_CALL => call.to_string()).increment(1);
+/// A gRPC status code as the `code` label of `requests_total`. Display
+/// gives the code's name in the gRPC specification, in lower snake case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeLabel(pub Code);
+
+impl fmt::Display for CodeLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.0 {
+            Code::Ok => "ok",
+            Code::Cancelled => "cancelled",
+            Code::Unknown => "unknown",
+            Code::InvalidArgument => "invalid_argument",
+            Code::DeadlineExceeded => "deadline_exceeded",
+            Code::NotFound => "not_found",
+            Code::AlreadyExists => "already_exists",
+            Code::PermissionDenied => "permission_denied",
+            Code::ResourceExhausted => "resource_exhausted",
+            Code::FailedPrecondition => "failed_precondition",
+            Code::Aborted => "aborted",
+            Code::OutOfRange => "out_of_range",
+            Code::Unimplemented => "unimplemented",
+            Code::Internal => "internal",
+            Code::Unavailable => "unavailable",
+            Code::DataLoss => "data_loss",
+            Code::Unauthenticated => "unauthenticated",
+        };
+        f.write_str(name)
+    }
+}
+
+/// One request of a call being answered, counted under `requests_total`
+/// when it drops, with the code of the outcome `answer` was given. A call
+/// dropped before it answers counts as `CANCELLED`: tonic drops it at the
+/// client's `grpc-timeout` and answers `CANCELLED` itself, and a client
+/// that cancels is answered nothing.
+#[derive(Debug)]
+pub struct Answering {
+    call: Call,
+    code: Code,
+}
+
+impl Answering {
+    /// A request of `call`, not yet answered.
+    pub fn new(call: Call) -> Self {
+        Self {
+            call,
+            code: Code::Cancelled,
+        }
+    }
+
+    /// Passes `outcome` through as the call's answer, counted under its
+    /// code: `OK` for a response, the status's own code otherwise.
+    pub fn answer<T>(mut self, outcome: Result<T, Status>) -> Result<T, Status> {
+        self.code = outcome.as_ref().map_or_else(Status::code, |_| Code::Ok);
+        outcome
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        count(self.call, self.code);
+    }
+}
+
+/// Counts one request of `call` that answered `code` under `requests_total`.
+fn count(call: Call, code: Code) {
+    metrics::counter!(
+        metric::REQUESTS_TOTAL,
+        metric::LABEL_CALL => call.to_string(),
+        metric::LABEL_CODE => CodeLabel(code).to_string()
+    )
+    .increment(1);
 }
 
 /// The exposition a scrape of `/metrics` returns, with every table's lookup
@@ -163,6 +233,77 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_code_label_names_every_grpc_code() {
+        let cases = [
+            (Code::Ok, "ok"),
+            (Code::Cancelled, "cancelled"),
+            (Code::Unknown, "unknown"),
+            (Code::InvalidArgument, "invalid_argument"),
+            (Code::DeadlineExceeded, "deadline_exceeded"),
+            (Code::NotFound, "not_found"),
+            (Code::AlreadyExists, "already_exists"),
+            (Code::PermissionDenied, "permission_denied"),
+            (Code::ResourceExhausted, "resource_exhausted"),
+            (Code::FailedPrecondition, "failed_precondition"),
+            (Code::Aborted, "aborted"),
+            (Code::OutOfRange, "out_of_range"),
+            (Code::Unimplemented, "unimplemented"),
+            (Code::Internal, "internal"),
+            (Code::Unavailable, "unavailable"),
+            (Code::DataLoss, "data_loss"),
+            (Code::Unauthenticated, "unauthenticated"),
+        ];
+        for (code, name) in cases {
+            assert_eq!(CodeLabel(code).to_string(), name, "{code:?}");
+        }
+    }
+
+    /// The `requests_total` count of `call` answering `code` in the
+    /// recorder now, zero before the series exists.
+    fn requests(handle: &PrometheusHandle, call: Call, code: Code) -> f64 {
+        series_value(
+            &handle.render(),
+            metric::REQUESTS_TOTAL,
+            &[
+                (metric::LABEL_CALL, &call.to_string()),
+                (metric::LABEL_CODE, &CodeLabel(code).to_string()),
+            ],
+        )
+        .unwrap_or(0.0)
+    }
+
+    /// A request counts once, when it drops, under the code it answered:
+    /// a response's `OK`, a status's own code, and `CANCELLED` for one
+    /// dropped unanswered. `MultiGet` is the call no other test here
+    /// counts, so the differences are exact.
+    #[test]
+    fn test_answering_counts_the_code_answered_once_on_drop() {
+        let handle = install().unwrap();
+        let cases: [(Option<Result<(), Status>>, Code); 3] = [
+            (Some(Ok(())), Code::Ok),
+            (Some(Err(Status::unavailable("sample"))), Code::Unavailable),
+            (None, Code::Cancelled),
+        ];
+        for (outcome, code) in cases {
+            let before = requests(&handle, Call::MultiGet, code);
+            let answering = Answering::new(Call::MultiGet);
+            let pending = requests(&handle, Call::MultiGet, code);
+            assert_eq!(pending.to_bits(), before.to_bits(), "{code:?} before drop");
+            match outcome {
+                Some(outcome) => {
+                    let passed = answering
+                        .answer(outcome)
+                        .map_or_else(|status| status.code(), |()| Code::Ok);
+                    assert_eq!(passed, code, "the outcome passes through");
+                }
+                None => drop(answering),
+            }
+            let after = requests(&handle, Call::MultiGet, code);
+            assert_eq!((after - before).to_bits(), 1.0_f64.to_bits(), "{code:?}");
+        }
+    }
+
+    #[test]
     fn test_latency_buckets_strictly_increase_from_first_to_last() {
         assert!(
             LATENCY_BUCKETS
@@ -205,14 +346,15 @@ mod tests {
         // Two handles onto one recorder both see a count made through the
         // global recorder; the whole expositions are not compared, since
         // another test in this process may count between two renders.
-        count(Call::TableInfo);
+        count(Call::TableInfo, Code::Ok);
         let call = Call::TableInfo.to_string();
+        let code = CodeLabel(Code::Ok).to_string();
         for handle in [&first, &second] {
             let exposition = handle.render();
             let value = series_value(
                 &exposition,
                 metric::REQUESTS_TOTAL,
-                &[(metric::LABEL_CALL, &call)],
+                &[(metric::LABEL_CALL, &call), (metric::LABEL_CODE, &code)],
             )
             .unwrap_or_else(|| panic!("{call} in {exposition}"));
             assert!(value >= 1.0, "{value}");

@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-/// gRPC calls received, by `call`.
+/// gRPC calls answered, by `call` and by `code`, the status each answered.
 pub const REQUESTS_TOTAL: &str = "icetray_requests_total";
 /// Object-store GETs issued, by `kind`; a hedge is a GET and counts here too.
 pub const OBJECT_GETS_TOTAL: &str = "icetray_object_gets_total";
@@ -87,8 +87,9 @@ pub const LABEL_RESULT: &str = "result";
 /// The `reason` label: why a refresh failed, from `ErrorKind`, which gives
 /// the refusal's own name for a refusal.
 pub(crate) const LABEL_REASON: &str = "reason";
-/// The `code` label: the finding, from `FindingCode`.
-pub(crate) const LABEL_CODE: &str = "code";
+/// The `code` label: the finding, from `FindingCode`, or the gRPC status a
+/// request answered, in the gRPC specification's name in lower snake case.
+pub const LABEL_CODE: &str = "code";
 /// The `state` label: the table's lifecycle state, from `TableState`.
 pub const LABEL_STATE: &str = "state";
 

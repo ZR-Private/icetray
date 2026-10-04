@@ -1,7 +1,8 @@
 //! The gRPC service over the generated contract (RFD 010): `Get`,
 //! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
 //! read under the table's key type, and core's errors mapped to status codes
-//! by variant. Every call is counted under `requests_total`. `Get` and
+//! by variant. Every call is counted under `requests_total` by the code it
+//! answered (`telemetry::Answering`). `Get` and
 //! `MultiGet` run under the server's deadline for the method (RFD 013); a
 //! client's own deadline is tonic's, which drops the call at it. Together
 //! they hold at most `server.max_in_flight` slots, and a call that finds
@@ -27,7 +28,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
 use crate::error::{CallFault, WireKeyFault};
-use crate::telemetry::{self, Call};
+use crate::telemetry::{Answering, Call};
 
 /// The served tables and the bounds each call runs under. Clone: tonic
 /// hands one clone to every connection, and they share the tables and the
@@ -298,22 +299,20 @@ impl Service {
             snapshot_id: lookup.snapshot_id.0,
         }))
     }
-}
 
-#[tonic::async_trait]
-impl Icetray for Service {
-    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        telemetry::count(Call::Get);
+    /// `Get`, admitted and inside its deadline.
+    async fn answer_get(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let _slot = self.admit()?;
-        within(self.get_deadline, self.lookup(request.into_inner())).await
+        within(self.get_deadline, self.lookup(request)).await
     }
 
-    async fn multi_get(
+    /// `MultiGet`, held to `max_multi_get_keys`, admitted, and inside its
+    /// deadline.
+    async fn answer_multi_get(
         &self,
-        request: Request<MultiGetRequest>,
+        request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        telemetry::count(Call::MultiGet);
-        let keys = request.get_ref().keys.len();
+        let keys = request.keys.len();
         if keys > self.max_multi_get_keys {
             return Err(CallFault::TooManyKeys {
                 keys,
@@ -322,19 +321,14 @@ impl Icetray for Service {
             .into());
         }
         let _slot = self.admit()?;
-        within(
-            self.multi_get_deadline,
-            self.lookup_batch(request.into_inner()),
-        )
-        .await
+        within(self.multi_get_deadline, self.lookup_batch(request)).await
     }
 
-    async fn table_info(
+    /// `TableInfo`: the serving generation's description.
+    fn answer_table_info(
         &self,
-        request: Request<TableInfoRequest>,
+        request: TableInfoRequest,
     ) -> Result<Response<TableInfoResponse>, Status> {
-        telemetry::count(Call::TableInfo);
-        let request = request.into_inner();
         let tables = self.serving();
         let table = table(&tables, &request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
@@ -350,6 +344,30 @@ impl Icetray for Service {
             key_type: i32::from(key_type_wire(generation.layout.key_type)),
             index_bytes: approx::count(generation.index_bytes),
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl Icetray for Service {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let answering = Answering::new(Call::Get);
+        answering.answer(self.answer_get(request.into_inner()).await)
+    }
+
+    async fn multi_get(
+        &self,
+        request: Request<MultiGetRequest>,
+    ) -> Result<Response<MultiGetResponse>, Status> {
+        let answering = Answering::new(Call::MultiGet);
+        answering.answer(self.answer_multi_get(request.into_inner()).await)
+    }
+
+    async fn table_info(
+        &self,
+        request: Request<TableInfoRequest>,
+    ) -> Result<Response<TableInfoResponse>, Status> {
+        let answering = Answering::new(Call::TableInfo);
+        answering.answer(self.answer_table_info(request.into_inner()))
     }
 }
 
