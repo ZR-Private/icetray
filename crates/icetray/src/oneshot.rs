@@ -140,10 +140,11 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
 
 /// `get`: one `get` line per key from the table named by `only`, or the
 /// only configured table; several tables and no name is
-/// `CliError::TableNameRequired`. Every key is parsed under the served
-/// generation's key type before any lookup, so a key that does not parse
-/// is a usage error before anything is read. Each line carries the GETs
-/// the lookup issued and its elapsed time.
+/// `CliError::TableNameRequired`. Every key is parsed under the key type
+/// of the snapshot the ref names, read from the table's metadata before
+/// any data file (`Table::resolve_key_type`), so a key that does not parse
+/// is a usage error before the load, which on a large table takes minutes.
+/// Each line carries the GETs the lookup issued and its elapsed time.
 pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result<(), CliError> {
     let opened = open_tables(config, only).await?;
     let tables = opened.tables();
@@ -158,12 +159,12 @@ pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result
             });
         }
     };
-    table.load().await?;
-    let key_type = table.key_type()?;
+    let key_type = table.resolve_key_type().await?;
     let parsed = keys
         .iter()
         .map(|text| key_text::parse(text, key_type))
         .collect::<Result<Vec<_>, _>>()?;
+    table.load().await?;
     let stats = opened.storage.stats();
     for key in &parsed {
         let before = stats.gets();

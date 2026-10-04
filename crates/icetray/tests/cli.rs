@@ -528,14 +528,43 @@ async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
     Ok(())
 }
 
+/// Removes every Parquet data file under `dir`, so a load of a table there
+/// fails while its metadata still reads; returns how many it removed.
+fn remove_data_files(dir: &Path) -> Result<usize, BoxError> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            removed += remove_data_files(&path)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "parquet")
+        {
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// A key that does not parse under the table's key type is a usage error
+/// found from the metadata alone, before the load: with every data file
+/// gone, so a load fails with exit 1, a bad key still exits 64.
 #[tokio::test]
-async fn test_get_rejects_a_key_that_does_not_parse() -> TestResult {
+async fn test_get_rejects_a_key_that_does_not_parse_before_the_load() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_badkey", KeyType::Long)).await?;
     let output = run(&[&["get"][..], &location(&fixture), &["abc"]].concat(), &[]);
     assert_exit(&output, EXIT_USAGE);
     assert!(output.stdout.is_empty());
     assert!(assert_plain_error(&output), "the key's form is the hint");
+
+    assert!(remove_data_files(dir.path())? > 0);
+    let unloadable = run(&[&["get"][..], &location(&fixture), &["1"]].concat(), &[]);
+    assert_exit(&unloadable, EXIT_FAILURE);
+    let bad_key = run(&[&["get"][..], &location(&fixture), &["abc"]].concat(), &[]);
+    assert_exit(&bad_key, EXIT_USAGE);
+    assert!(bad_key.stdout.is_empty());
     Ok(())
 }
 

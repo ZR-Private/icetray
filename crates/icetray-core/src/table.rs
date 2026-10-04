@@ -29,6 +29,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
 use crate::local::LocalDir;
+use crate::manifest::TableLayout;
 use crate::metric::{self, LookupResult};
 use crate::shard::{self, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -647,8 +648,7 @@ impl Table {
     }
 
     /// The serving generation's key type, or `Error::NotReady`: the type a
-    /// caller reads a key from the wire or the command line under before
-    /// `get` or `multi_get`. Read through a `load` guard dropped before it
+    /// caller reads a key from the wire under before `get` or `multi_get`. Read through a `load` guard dropped before it
     /// returns, so it writes no reference count on the shared generation. A
     /// swap onto a generation of another key type between this and the
     /// lookup is refused by the lookup's own check, as `Error::KeyType`.
@@ -658,6 +658,32 @@ impl Table {
             .as_deref()
             .map(|generation| generation.layout.key_type)
             .ok_or_else(|| self.not_ready())
+    }
+
+    /// The key type of the snapshot the ref names now, from that snapshot's
+    /// own schema, with no data file read: a table root's version hint and
+    /// metadata file, a metadata file alone, or one catalog call. What a
+    /// caller parses command-line keys under before it pays for a `load`.
+    /// The schema and partition-spec faults a load would refuse are refused
+    /// here first, as the load refuses them. A load afterward resolves the
+    /// source again, and a key of a type its generation no longer has is
+    /// refused at lookup as `Error::KeyType`. Serialized with `load` and
+    /// `refresh`, and bounded as a load from nothing is.
+    pub async fn resolve_key_type(&self) -> Result<KeyType> {
+        let _serialized = self.serial.lock().await;
+        self.within_deadline(async {
+            let resolved = self.source.resolve(&self.storage).await?;
+            let snapshot = self.ref_snapshot(&resolved)?;
+            let layout = TableLayout::derive(
+                self.name(),
+                &resolved.metadata,
+                &snapshot,
+                &self.config.key_column,
+                &self.config.value_column,
+            )?;
+            Ok(layout.key_type)
+        })
+        .await
     }
 
     /// One lookup against the serving generation. `Error::NotReady` with no
@@ -1346,6 +1372,20 @@ mod tests {
             table.key_type().unwrap(),
             table.current().unwrap().layout.key_type
         );
+    }
+
+    /// The GETs resolving a table root costs: its version hint and the
+    /// metadata file the hint names.
+    const RESOLVE_GETS: u64 = 2;
+
+    #[tokio::test]
+    async fn test_resolve_key_type_reads_the_metadata_alone_and_loads_nothing() {
+        let (fixture, _) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        assert_eq!(table.resolve_key_type().await.unwrap(), KeyType::Long);
+        assert_eq!(fixture.gets(), RESOLVE_GETS, "no data file is read");
+        assert!(table.current().is_none());
+        assert!(matches!(table.state(), TableState::Loading));
     }
 
     #[tokio::test]
