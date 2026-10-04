@@ -19,7 +19,7 @@ use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::storage::Storage;
-use crate::table::{CallsInFlight, Table, TableHandles};
+use crate::table::{CallsInFlight, FindingLog, Table, TableHandles};
 
 /// Everything a process opened: the storage every read goes through, the
 /// one page cache every table shares, the local directory when configured,
@@ -316,13 +316,14 @@ impl Opened {
 /// Builds storage over the SDK's default chain, which it loads before its
 /// first S3 read and never for a process that reads none, one cache, one
 /// count of calls in flight, and every configured table in `Loading` over
-/// them; `only` narrows by name, and a name that
+/// them, each logging the doctor's findings as `findings` says; `only`
+/// narrows by name, and a name that
 /// matches no table yields `Ok` with empty `tables`, whose message and exit
 /// code are the caller's. Nothing is read from any table: `open` issues no
 /// GET.
-pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened> {
+pub async fn open(config: &Config, only: Option<&str>, findings: FindingLog) -> Result<Opened> {
     let storage = Arc::new(Storage::with_sdk_defaults(config.storage.clone()));
-    open_with(config, only, storage).await
+    open_with(config, only, storage, findings).await
 }
 
 /// `open` over a storage the caller built, for the testkit and embedders:
@@ -337,6 +338,7 @@ pub async fn open_with(
     config: &Config,
     only: Option<&str>,
     storage: Arc<Storage>,
+    findings: FindingLog,
 ) -> Result<Opened> {
     cache::check_capacity(config.server.page_cache_bytes)
         .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
@@ -354,6 +356,7 @@ pub async fn open_with(
         cache: cache.clone(),
         local: local.clone(),
         calls: CallsInFlight::new(),
+        findings,
     };
     let deadlines = Deadlines {
         load: config.server.load_deadline,
@@ -491,7 +494,7 @@ mod tests {
             named(SECOND_TABLE, &second, Residency::Full),
         ]);
         let storage = storage_for(&config);
-        let opened = open_with(&config, None, Arc::clone(&storage))
+        let opened = open_with(&config, None, Arc::clone(&storage), FindingLog::Events)
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE, SECOND_TABLE]);
@@ -515,7 +518,7 @@ mod tests {
         let two_shards = cache::min_memory_bytes(workers);
         let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
         config.server.page_cache_bytes = approx::length(one_shard);
-        let error = open_with(&config, None, storage_for(&config))
+        let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .err()
             .expect("a budget below two shards' minimum");
@@ -531,7 +534,7 @@ mod tests {
             "{error}"
         );
         config.server.page_cache_bytes = approx::length(two_shards);
-        let opened = open_with(&config, None, storage_for(&config))
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE]);
@@ -547,7 +550,7 @@ mod tests {
             named(FIRST_TABLE, &first, Residency::Full),
             named(SECOND_TABLE, &second, Residency::Full),
         ]);
-        let opened = open_with(&config, None, storage_for(&config))
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         let tables = opened.tables();
@@ -569,13 +572,23 @@ mod tests {
             named(FIRST_TABLE, &first, Residency::Full),
             named(SECOND_TABLE, &second, Residency::Full),
         ]);
-        let one = open_with(&config, Some(SECOND_TABLE), storage_for(&config))
-            .await
-            .unwrap();
+        let one = open_with(
+            &config,
+            Some(SECOND_TABLE),
+            storage_for(&config),
+            FindingLog::Events,
+        )
+        .await
+        .unwrap();
         assert_eq!(names(&one), [SECOND_TABLE]);
-        let none = open_with(&config, Some(NO_TABLE), storage_for(&config))
-            .await
-            .unwrap();
+        let none = open_with(
+            &config,
+            Some(NO_TABLE),
+            storage_for(&config),
+            FindingLog::Events,
+        )
+        .await
+        .unwrap();
         assert!(none.tables().is_empty());
     }
 
@@ -591,7 +604,7 @@ mod tests {
                 named(SECOND_TABLE, &second, Residency::Disk),
             ],
         );
-        let opened = open_with(&config, None, storage_for(&config))
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         let local = opened.local.as_ref().unwrap();
@@ -623,7 +636,7 @@ mod tests {
                 named(SECOND_TABLE, &fixture, Residency::Disk),
             ],
         );
-        let opened = open_with(&config, None, storage_for(&config))
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         for table in opened.tables().iter() {
@@ -671,7 +684,7 @@ mod tests {
                 named(SECOND_TABLE, &second, Residency::Disk),
             ],
         );
-        let every = open_with(&config, None, storage_for(&config))
+        let every = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         for table in every.tables().iter() {
@@ -681,9 +694,14 @@ mod tests {
         let second_files = every.tables()[1].current().unwrap().identities();
         drop(every);
 
-        let narrowed = open_with(&config, Some(FIRST_TABLE), storage_for(&config))
-            .await
-            .unwrap();
+        let narrowed = open_with(
+            &config,
+            Some(FIRST_TABLE),
+            storage_for(&config),
+            FindingLog::Events,
+        )
+        .await
+        .unwrap();
         assert!(!narrowed.complete);
         assert_eq!(names(&narrowed), [FIRST_TABLE]);
         narrowed.tables()[0].load().await.unwrap();
@@ -710,7 +728,7 @@ mod tests {
             vec![named(FIRST_TABLE, &fixture, Residency::Disk)],
         );
         let opened = Arc::new(
-            open_with(&config, None, storage_for(&config))
+            open_with(&config, None, storage_for(&config), FindingLog::Events)
                 .await
                 .unwrap(),
         );
@@ -732,7 +750,9 @@ mod tests {
 
     /// Opens `config` and loads every table.
     async fn loaded(config: &Config) -> Opened {
-        let opened = open_with(config, None, storage_for(config)).await.unwrap();
+        let opened = open_with(config, None, storage_for(config), FindingLog::Events)
+            .await
+            .unwrap();
         for table in opened.tables().iter() {
             table.load().await.unwrap();
         }
@@ -950,7 +970,7 @@ mod tests {
     async fn test_retain_without_local_directory_is_zero() {
         let fixture = two_file_fixture().await;
         let config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
-        let opened = open_with(&config, None, storage_for(&config))
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         opened.tables()[0].load().await.unwrap();

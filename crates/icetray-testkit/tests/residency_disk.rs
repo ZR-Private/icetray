@@ -17,7 +17,9 @@ use icetray_core::config::{
 };
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
-use icetray_core::{DataFileIdentity, Error, KeyType, LocalDir, RefusalReason, Storage, Value};
+use icetray_core::{
+    DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Storage, Value,
+};
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
 };
@@ -242,7 +244,7 @@ async fn test_retain_frees_only_what_no_table_serves() -> Result<()> {
         tables: vec![table(TABLE_A), table(TABLE_B)],
     };
     let storage = Arc::new(Storage::new(config.storage.clone()));
-    let opened = open_with(&config, None, storage).await?;
+    let opened = open_with(&config, None, storage, FindingLog::Events).await?;
     let local = opened.local.clone().unwrap();
     let tables = opened.tables();
     let (a, b) = (&tables[0], &tables[1]);

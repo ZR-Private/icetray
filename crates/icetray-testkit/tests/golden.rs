@@ -9,8 +9,8 @@ use std::sync::Arc;
 use iceberg::spec::{FormatVersion, TableMetadata};
 use icetray_core::check::Tier;
 use icetray_core::{
-    Error, Finding, FindingCode, Generation, Key, Serviceability, Storage, Table, Value, diagnose,
-    open,
+    Error, Finding, FindingCode, FindingLog, Generation, Key, Serviceability, Storage, Table,
+    Value, diagnose, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, WIDE_REPEATS,
@@ -56,7 +56,12 @@ impl Golden {
 
 async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
     let warehouse = golden::warehouse()?;
-    let opened = open(&golden::config(&warehouse, table, strict), None).await?;
+    let opened = open(
+        &golden::config(&warehouse, table, strict),
+        None,
+        FindingLog::Events,
+    )
+    .await?;
     let table = Arc::clone(&opened.tables()[0]);
     table.load().await?;
     table.serving()?.verify_buckets().await?;
@@ -284,6 +289,7 @@ async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {
     let opened = open(
         &golden::config(&warehouse, GoldenTable::DefaultLayout1m, true),
         None,
+        FindingLog::Events,
     )
     .await?;
     let error = opened.tables()[0].load().await.unwrap_err();

@@ -338,6 +338,17 @@ pub enum WriterProperty {
     SkewSplitting,
 }
 
+impl fmt::Display for Tier {
+    /// The lowercase name serde gives, so a log line's tier reads as the
+    /// doctor's JSON line's.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Advice => "advice",
+            Self::Inefficient => "inefficient",
+        })
+    }
+}
+
 impl fmt::Display for WriterProperty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let property = match self {
@@ -1595,6 +1606,16 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(property).unwrap(),
                 Json::String(property.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_tier_matches_display() {
+        for tier in [Tier::Advice, Tier::Inefficient] {
+            assert_eq!(
+                serde_json::to_value(tier).unwrap(),
+                Json::String(tier.to_string())
             );
         }
     }

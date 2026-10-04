@@ -19,7 +19,7 @@ use std::time::Duration;
 use futures::future::join_all;
 use icetray_core::config::{Config, ServerConfig};
 use icetray_core::open::open_with;
-use icetray_core::{ErrorKind, Opened, Storage, Table, open};
+use icetray_core::{ErrorKind, FindingLog, Opened, Storage, Table, open};
 use icetray_proto::v1::icetray_server::{IcetrayServer, SERVICE_NAME};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
@@ -125,7 +125,7 @@ impl Serving {
         options: ServeOptions,
     ) -> Result<Self, ServeError> {
         let listeners = Listeners::bind(&config.server).await?;
-        let opened = open(&config, None).await?;
+        let opened = open(&config, None, FindingLog::Events).await?;
         Ok(Self::start_serving(config, listeners, opened, handle, options).await)
     }
 
@@ -138,7 +138,7 @@ impl Serving {
         options: ServeOptions,
     ) -> Result<Self, ServeError> {
         let listeners = Listeners::bind(&config.server).await?;
-        let opened = open_with(&config, None, storage).await?;
+        let opened = open_with(&config, None, storage, FindingLog::Events).await?;
         Ok(Self::start_serving(config, listeners, opened, handle, options).await)
     }
 

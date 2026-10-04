@@ -11,8 +11,8 @@ use iceberg::Catalog;
 use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
-    CallsInFlight, Generation, Key, LocalDir, PageCache, Residency, Storage, Table, TableHandles,
-    TableSource, Value,
+    CallsInFlight, FindingLog, Generation, Key, LocalDir, PageCache, Residency, Storage, Table,
+    TableHandles, TableSource, Value,
 };
 
 use crate::error::{Precondition, Result};
@@ -94,6 +94,7 @@ pub async fn build(
         cache: cache.clone(),
         local,
         calls: CallsInFlight::new(),
+        findings: FindingLog::Events,
     };
     let server = ServerConfig::default();
     let table = Table::new(

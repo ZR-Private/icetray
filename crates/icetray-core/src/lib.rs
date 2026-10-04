@@ -51,4 +51,4 @@ pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Applied, Opened, Refused, Tables, open};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, Storage};
-pub use table::{CallsInFlight, Table, TableHandles, TableState};
+pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};

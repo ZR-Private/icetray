@@ -147,6 +147,21 @@ pub struct TableHandles {
     /// The calls in flight on every table holding this count, which a
     /// `multi_get` reads to decide whether to split.
     pub calls: CallsInFlight,
+    /// What the tables do with the doctor's findings on each generation
+    /// they admit.
+    pub findings: FindingLog,
+}
+
+/// What a table does with the doctor's findings on each generation it
+/// admits (RFD 016).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindingLog {
+    /// Each finding is a log event, inefficient at warn and advice at
+    /// info: the daemon's choice, whose findings reach no other output.
+    Events,
+    /// Each finding is a debug event: for a caller that prints the
+    /// findings as data, which a log line would only repeat.
+    Debug,
 }
 
 /// The `get` and `multi_get` calls in flight on every table built over a
@@ -229,6 +244,8 @@ pub struct Table {
     /// `serial` doing its work, from `server.refresh_deadline`.
     refresh_deadline: Duration,
     lookups: Arc<Lookups>,
+    /// Where the doctor's findings on an admitted generation go.
+    findings: FindingLog,
     /// What the table's state and generation gauges read, and whether it
     /// shows them. A table a reload loads beside the one serving under its
     /// name shows none until the reload swaps it in, so the serving table's
@@ -494,6 +511,7 @@ impl Table {
             cache,
             local,
             calls,
+            findings,
         } = handles;
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let lookups = Arc::new(Lookups {
@@ -514,6 +532,7 @@ impl Table {
             load_deadline,
             refresh_deadline,
             lookups,
+            findings,
             gauges: Mutex::new(Gauges {
                 shown: false,
                 generation: None,
@@ -909,8 +928,8 @@ impl Table {
     }
 
     /// The strict gate (RFD 007, RFD 016): the doctor's verdict on a built
-    /// generation before it is swapped in. Every finding is logged,
-    /// inefficient at warn and advice at info. Under `strict`, an
+    /// generation before it is swapped in. Every finding is logged as the
+    /// table's `FindingLog` says. Under `strict`, an
     /// inefficient generation is dropped, never swapped, with the
     /// `Error::Inefficient` that `check::admit` gives. `Ok` carries the admitted generation's findings per code, for the
     /// `findings` gauge; a refused generation's reach the logs and the
@@ -920,7 +939,7 @@ impl Table {
         let mut counts: BTreeMap<FindingCode, u64> = BTreeMap::new();
         for finding in &report.findings {
             *counts.entry(finding.code()).or_default() += 1;
-            log_finding(self.name(), finding);
+            log_finding(self.name(), finding, self.findings);
         }
         check::admit(&report, self.config.strict)?;
         Ok(counts)
@@ -1083,17 +1102,26 @@ impl fmt::Debug for Table {
     }
 }
 
-/// One finding as a log event: inefficient at warn, advice at info, with the
-/// table, code, tier, and file as fields and the finding's message as the
-/// event's.
-fn log_finding(table: &str, finding: &Finding) {
+/// One finding as a log event, with the table, code, tier, and file as
+/// fields, the code and tier in the names the doctor's JSON lines carry,
+/// and the finding's message as the event's: under `FindingLog::Events`
+/// inefficient at warn and advice at info, under `FindingLog::Debug` both
+/// at debug.
+fn log_finding(table: &str, finding: &Finding, log: FindingLog) {
     let message = finding.message();
     let code = finding.code();
     let tier = finding.tier();
     let file = finding.file();
-    match tier {
-        Tier::Inefficient => tracing::warn!(table, code = %code, tier = ?tier, file, "{message}"),
-        Tier::Advice => tracing::info!(table, code = %code, tier = ?tier, file, "{message}"),
+    match (log, tier) {
+        (FindingLog::Events, Tier::Inefficient) => {
+            tracing::warn!(table, code = %code, tier = %tier, file, "{message}");
+        }
+        (FindingLog::Events, Tier::Advice) => {
+            tracing::info!(table, code = %code, tier = %tier, file, "{message}");
+        }
+        (FindingLog::Debug, Tier::Inefficient | Tier::Advice) => {
+            tracing::debug!(table, code = %code, tier = %tier, file, "{message}");
+        }
     }
 }
 
@@ -1201,6 +1229,7 @@ mod tests {
             cache: cache().await,
             local: None,
             calls: CallsInFlight::new(),
+            findings: FindingLog::Events,
         }
     }
 

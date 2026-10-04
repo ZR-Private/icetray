@@ -9,17 +9,22 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use icetray_core::config::Config;
-use icetray_core::{Opened, Serviceability, Table, admit, diagnose, open, time};
+use icetray_core::{FindingLog, Opened, Serviceability, Table, admit, diagnose, open, time};
 
 use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
 use crate::key_text;
 use crate::output::{FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, emit};
 
-/// Opens every table of `config`, or the one named by `only`; a name no
+/// Opens every table of `config`, or the one named by `only`, logging the
+/// doctor's findings as `findings` says; a name no
 /// table is configured under is `CliError::NoTableMatched`. `config` is
 /// validated, so it names at least one table. Nothing is loaded.
-pub async fn open_tables(config: &Config, only: Option<&str>) -> Result<Opened, CliError> {
-    let opened = open(config, only).await?;
+pub async fn open_tables(
+    config: &Config,
+    only: Option<&str>,
+    findings: FindingLog,
+) -> Result<Opened, CliError> {
+    let opened = open(config, only, findings).await?;
     match only {
         Some(name) if opened.tables().is_empty() => Err(CliError::NoTableMatched {
             name: name.to_string(),
@@ -51,7 +56,8 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// its setting, and then judged by `admit` under its configured `strict`:
 /// an inefficient table that `serve` would refuse gets a `refusal` line
 /// after its findings (RFD 016). A `--location` table is never strict
-/// (`Target::config`). The exit code is `EXIT_FAILURE` when any table was
+/// (`Target::config`). The findings are the run's output, so the load
+/// logs them at debug alone. The exit code is `EXIT_FAILURE` when any table was
 /// refused, else `EXIT_INEFFICIENT` when any is inefficient, else
 /// `EXIT_OK`.
 pub async fn doctor(
@@ -63,7 +69,7 @@ pub async fn doctor(
     for table in &mut lenient.tables {
         table.strict = false;
     }
-    let opened = open_tables(&lenient, only).await?;
+    let opened = open_tables(&lenient, only, FindingLog::Debug).await?;
     let mut refused = false;
     let mut inefficient = false;
     for (table, outcome) in load_all(&opened).await {
@@ -122,7 +128,7 @@ fn configured_strict(config: &Config, name: &str) -> bool {
 /// `info`: one `table` line per table from the doctor's summary. A load
 /// that fails ends the run before any line is printed.
 pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
-    let opened = open_tables(config, only).await?;
+    let opened = open_tables(config, only, FindingLog::Events).await?;
     let mut loaded = Vec::with_capacity(opened.tables().len());
     for (table, outcome) in load_all(&opened).await {
         outcome?;
@@ -143,7 +149,7 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
 /// is a usage error before the load, which on a large table takes minutes.
 /// Each line carries the GETs the lookup issued and its elapsed time.
 pub async fn get(config: &Config, only: Option<&str>, keys: &[String]) -> Result<(), CliError> {
-    let opened = open_tables(config, only).await?;
+    let opened = open_tables(config, only, FindingLog::Events).await?;
     let tables = opened.tables();
     let table = match &tables[..] {
         [table] => table,

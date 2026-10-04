@@ -35,8 +35,8 @@ use icetray_core::config::{
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles, TableSource,
-    Value,
+    CallsInFlight, FindingLog, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles,
+    TableSource, Value,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
@@ -899,6 +899,7 @@ async fn serve(
         cache: cache.clone(),
         local,
         calls: CallsInFlight::new(),
+        findings: FindingLog::Events,
     };
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
@@ -1397,6 +1398,7 @@ async fn serve_together(
         cache: PageCache::new(WARM_CACHE_BYTES, None).await?,
         local,
         calls: CallsInFlight::new(),
+        findings: FindingLog::Events,
     };
     let mut tables = Vec::with_capacity(prepared.len());
     for table in prepared {
