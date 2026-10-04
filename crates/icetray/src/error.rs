@@ -18,7 +18,7 @@ use std::time::Duration;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{ErrorKind, KeyType};
 
-use crate::cli::ENV_CONFIG;
+use crate::cli::{ConfigPath, ENV_CONFIG};
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
 
@@ -37,7 +37,7 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
-/// target, a `--table` name no table is configured under, a table name
+/// configuration and no target, a `--table` name no table is configured under, a table name
 /// required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
@@ -211,10 +211,28 @@ pub enum CliError {
     /// A failure inside `icetray-core`: a load or a read.
     #[error(transparent)]
     Core(#[from] icetray_core::Error),
-    /// Neither `--config` nor `--location` was given and `ICETRAY_CONFIG` is
-    /// unset, so there is nothing to open.
-    #[error("pass --config or --location, or set {ENV_CONFIG}")]
+    /// A one-shot was given neither `--config` nor `--location`, and
+    /// `ICETRAY_CONFIG` is unset or empty, so there is nothing to open.
+    #[error("no configuration: pass --config or --location, or set {ENV_CONFIG}")]
     NoTarget,
+    /// `serve` was given no `--config`, and `ICETRAY_CONFIG` is unset or
+    /// empty.
+    #[error("no configuration: pass --config or set {ENV_CONFIG}")]
+    NoConfig,
+    /// The configuration file cannot be read. Its origin is named, since a
+    /// path from the environment is not on the command line the person is
+    /// looking at.
+    #[error(
+        "cannot read configuration file {} (from {}): {source}",
+        file.path.display(),
+        file.origin
+    )]
+    ConfigUnreadable {
+        /// The file and where its path came from.
+        file: ConfigPath,
+        /// The operating system's refusal.
+        source: std::io::Error,
+    },
     /// No table is configured under the name asked for with `--table`. A
     /// configuration with no table at all is `ConfigViolation::NoTables`,
     /// the file's fault rather than the command line's.
@@ -251,8 +269,13 @@ impl CliError {
     /// The exit code the process ends with for this failure.
     pub fn exit_code(&self) -> ExitCode {
         let code = match self {
-            Self::Core(_) | Self::Io(_) | Self::Json(_) | Self::Serve(_) => EXIT_FAILURE,
+            Self::Core(_)
+            | Self::ConfigUnreadable { .. }
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::Serve(_) => EXIT_FAILURE,
             Self::NoTarget
+            | Self::NoConfig
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
             | Self::Key(_) => EXIT_USAGE,
@@ -267,6 +290,7 @@ mod tests {
     use icetray_core::config::ServerConfig;
 
     use super::*;
+    use crate::cli::PathOrigin;
 
     /// A table name for the errors that carry one.
     const TABLE: &str = "kv";
@@ -295,6 +319,13 @@ mod tests {
             CliError::Serve(ServeError::DrainOverran {
                 after: ServerConfig::default().drain_deadline,
             }),
+            CliError::ConfigUnreadable {
+                file: ConfigPath {
+                    path: "icetray.toml".into(),
+                    origin: PathOrigin::Env,
+                },
+                source: std::io::Error::other("sample"),
+            },
         ];
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_FAILURE), "{error}");
@@ -305,6 +336,7 @@ mod tests {
     fn test_exit_code_usage_variants() {
         let cases = [
             CliError::NoTarget,
+            CliError::NoConfig,
             CliError::NoTableMatched {
                 name: TABLE.to_string(),
             },

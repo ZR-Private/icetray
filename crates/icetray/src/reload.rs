@@ -69,7 +69,8 @@ pub trait ConfigSource: Send + Sync {
     fn read(&self) -> io::Result<Reading>;
 }
 
-/// The configuration file `serve` was started from.
+/// A configuration file: the one `serve` was started from, which it reads
+/// again on every reload, or the one a one-shot reads once.
 #[derive(Clone, Debug)]
 pub struct ConfigFile {
     path: PathBuf,
@@ -87,7 +88,7 @@ impl ConfigFile {
 impl ConfigSource for ConfigFile {
     /// Reads the whole file, digests its bytes, and parses them as
     /// `Config::parse` does; bytes that are not UTF-8 are
-    /// `ConfigError::Read`, as `Config::from_path` reports them.
+    /// `ConfigError::Read`, naming the file.
     fn read(&self) -> io::Result<Reading> {
         let bytes = std::fs::read(&self.path)?;
         let digest = Digest::of(&bytes);

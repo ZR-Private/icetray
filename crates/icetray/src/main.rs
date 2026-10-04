@@ -10,10 +10,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser as _;
-use icetray::cli::{Cli, Command, Target};
+use icetray::cli::{Cli, Command, ConfigPath, Target};
 use icetray::error::{CliError, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use icetray::logging::{self, LogSink};
-use icetray::reload::{ConfigFile, ConfigSource as _, Reload};
+use icetray::reload::{ConfigFile, Reload};
 use icetray::serve::{ServeOptions, Serving};
 use icetray::{oneshot, telemetry};
 use icetray_core::config::Config;
@@ -57,7 +57,7 @@ fn main() -> ExitCode {
 /// Dispatches the parsed command line.
 async fn run(cli: Cli) -> ExitCode {
     match cli.command {
-        Command::Serve { config } => serve(&config).await,
+        Command::Serve { config } => serve(config.as_deref()).await,
         Command::Doctor {
             target,
             table,
@@ -132,22 +132,18 @@ fn finish(outcome: Result<ExitCode, CliError>) -> ExitCode {
     }
 }
 
-/// `serve`: the configuration from `path`, logging to stdout at `info`
-/// (twelve-factor: the log stream is stdout), jemalloc's background
-/// purging, then the daemon following `path` (RFD 018), whose outcome is
-/// finished into the exit code as a one-shot's is.
-async fn serve(path: &Path) -> ExitCode {
-    let file = ConfigFile::new(path);
+/// `serve`: the configuration from `--config`, given as `flag`, or from
+/// `ICETRAY_CONFIG`, logging to stdout at `info` (twelve-factor: the log
+/// stream is stdout), jemalloc's background purging, then the daemon
+/// following the file (RFD 018), whose outcome is finished into the exit
+/// code as a one-shot's is.
+async fn serve(flag: Option<&Path>) -> ExitCode {
+    let Some(file) = ConfigPath::resolve(flag) else {
+        return report(&CliError::NoConfig);
+    };
     let reading = match file.read() {
         Ok(reading) => reading,
-        Err(source) => {
-            return report(&CliError::Core(icetray_core::Error::Config(
-                icetray_core::config::ConfigError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                },
-            )));
-        }
+        Err(error) => return report(&error),
     };
     let config = match reading.config {
         Ok(config) => config,
@@ -161,7 +157,7 @@ async fn serve(path: &Path) -> ExitCode {
         tracing::warn!(%error, "jemalloc background purging is unavailable");
     }
     let reload = Reload {
-        source: Arc::new(file),
+        source: Arc::new(ConfigFile::new(&file.path)),
         started_from: reading.digest,
     };
     finish(daemon(config, reload).await)

@@ -607,6 +607,30 @@ async fn test_location_ignores_the_environment_and_a_bare_run_reads_it() -> Test
     Ok(())
 }
 
+/// With no `--config` and `ICETRAY_CONFIG` unset or empty, every command,
+/// `serve` and each one-shot, has no configuration: a usage error, exit 64,
+/// before anything is opened. A path that names no file is the file's
+/// failure, exit 1, whether the flag or the variable named it.
+#[test]
+fn test_every_command_treats_an_empty_config_variable_as_unset() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let missing = dir.path().join("missing.toml");
+    let missing = missing.to_str().expect("a utf-8 temporary path");
+    let commands: [&[&str]; 4] = [&["serve"], &["doctor"], &["info"], &["get", "1"]];
+    for args in commands {
+        for env in [&[][..], &[(ENV_CONFIG, "")]] {
+            let output = run(args, env);
+            assert_exit(&output, EXIT_USAGE);
+            assert!(output.stdout.is_empty(), "{args:?} {env:?}");
+        }
+        let from_env = run(args, &[(ENV_CONFIG, missing)]);
+        assert_exit(&from_env, EXIT_FAILURE);
+        let from_flag = run(&[args, &["--config", missing]].concat(), &[]);
+        assert_exit(&from_flag, EXIT_FAILURE);
+    }
+    Ok(())
+}
+
 /// A `--location` table runs full or bloom; `disk` is not among the
 /// residencies it offers, so clap refuses it as a usage error before
 /// anything is opened. A file's disk table with no local directory is the

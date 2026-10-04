@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -609,16 +609,6 @@ impl Config {
             .map(|(name, _)| name)
             .collect()
     }
-
-    /// Reads the file, then `parse`s it; a file that cannot be read is
-    /// `ConfigError::Read`.
-    pub fn from_path(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::parse(&text)
-    }
 }
 
 /// The first rule the configuration breaks, or `Ok` when it breaks none.
@@ -1215,8 +1205,6 @@ pub enum SourceConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use serde_path_to_error::Segment;
 
     use super::*;
@@ -2125,23 +2113,6 @@ locaton = "typo"
                 ..HedgeConfig::default()
             }
         );
-    }
-
-    #[test]
-    fn test_from_path_reads_then_parses() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(toml_full().as_bytes()).unwrap();
-        assert_eq!(Config::from_path(file.path()).unwrap(), full_config());
-    }
-
-    #[test]
-    fn test_from_path_missing_file_is_read_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = Config::from_path(&dir.path().join("missing.toml"));
-        assert!(matches!(
-            result,
-            Err(Error::Config(ConfigError::Read { path, .. })) if path == dir.path().join("missing.toml")
-        ));
     }
 
     #[test]

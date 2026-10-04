@@ -1,9 +1,12 @@
 //! The command line: `serve` takes only the configuration path, from a flag
 //! or the environment (RFD 012); `doctor`, `get`, and `info` share one
 //! target vocabulary, a configuration file or one table located directly,
-//! and open tables the same way `serve` does.
+//! and open tables the same way `serve` does. Every command finds and reads
+//! its configuration file through `ConfigPath`.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
@@ -13,12 +16,14 @@ use icetray_core::config::{
 };
 
 use crate::error::{CliError, RewriteTextFault};
+use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 
 /// The environment variable that names the configuration file when no flag
-/// does (RFD 012), so a pod passes no flags at all. `serve` reads it through
-/// clap, which prints it in the flag's help; a one-shot's `Target` reads it
-/// itself, since clap cannot tell an environment value from a flag and would
-/// count an exported variable as `--config` against `--location`.
+/// does (RFD 012), so a pod passes no flags at all. Every command reads it
+/// through `ConfigPath::resolve` rather than through clap: clap cannot tell
+/// an environment value from a flag, so it would count an exported variable
+/// as `--config` against `--location`, and it would take an empty value as
+/// a path.
 pub const ENV_CONFIG: &str = "ICETRAY_CONFIG";
 
 /// The name a `--location` table is opened and printed under.
@@ -60,9 +65,10 @@ pub struct Cli {
 pub enum Command {
     /// Run the daemon: the gRPC service, health, metrics, and readiness.
     Serve {
-        /// The configuration file, TOML or JSON; also read from `ICETRAY_CONFIG`.
-        #[arg(long, short, env = ENV_CONFIG)]
-        config: PathBuf,
+        /// The configuration file, TOML or JSON. With none, the file
+        /// `ICETRAY_CONFIG` names.
+        #[arg(long, short)]
+        config: Option<PathBuf>,
     },
     /// Diagnose tables: serviceability, inefficient findings with their
     /// penalties, and advice. Exits 2 when a table is inefficient, 1 when
@@ -147,6 +153,74 @@ pub struct Target {
     pub residency: Option<Residency>,
 }
 
+/// Where a configuration file's path came from, which a message about the
+/// file names: a mistyped variable is otherwise hard to tell from a
+/// mistyped flag. Display gives the flag or the variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathOrigin {
+    /// `--config`.
+    Flag,
+    /// `ICETRAY_CONFIG`.
+    Env,
+}
+
+impl fmt::Display for PathOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Flag => "--config",
+            Self::Env => ENV_CONFIG,
+        })
+    }
+}
+
+/// A configuration file's path and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigPath {
+    /// The file.
+    pub path: PathBuf,
+    /// The flag or the variable that named it.
+    pub origin: PathOrigin,
+}
+
+impl ConfigPath {
+    /// The file `--config` names, given as `flag`, or else the one
+    /// `ICETRAY_CONFIG` names in the process's environment; `None` with
+    /// neither. An empty variable is unset, as a shell's `ICETRAY_CONFIG=`
+    /// means.
+    pub fn resolve(flag: Option<&Path>) -> Option<Self> {
+        Self::resolve_with_env(flag, std::env::var_os(ENV_CONFIG))
+    }
+
+    /// `resolve` with the variable's value passed in, so a test needs no
+    /// process environment.
+    fn resolve_with_env(flag: Option<&Path>, env: Option<OsString>) -> Option<Self> {
+        match (flag, env) {
+            (Some(path), _) => Some(Self {
+                path: path.to_path_buf(),
+                origin: PathOrigin::Flag,
+            }),
+            (None, Some(path)) if !path.is_empty() => Some(Self {
+                path: PathBuf::from(path),
+                origin: PathOrigin::Env,
+            }),
+            (None, Some(_) | None) => None,
+        }
+    }
+
+    /// The file read once, as `serve` reads it at start and on every
+    /// reload: its digest and what its bytes parse and validate to. A file
+    /// that cannot be read is `CliError::ConfigUnreadable`, naming the path
+    /// and its origin.
+    pub fn read(&self) -> Result<Reading, CliError> {
+        ConfigFile::new(&self.path)
+            .read()
+            .map_err(|source| CliError::ConfigUnreadable {
+                file: self.clone(),
+                source,
+            })
+    }
+}
+
 /// `--residency`'s parser: the name of one of `LOCATED_RESIDENCIES`, read
 /// through `Residency`'s `FromStr`. Clap refuses any other word, `disk`
 /// included, as a usage error that lists the accepted names.
@@ -186,19 +260,23 @@ impl Target {
     /// of the file's in `storage.rewrite`, and storage applies the first
     /// rule that matches, so a command-line rule takes precedence over the
     /// file's for the same prefix. A violation names a file rule by its
-    /// index in the file. No flag and no variable is `NoTarget`.
+    /// index in the file. No flag and no variable, or an empty one, is
+    /// `NoTarget`.
     pub fn config(&self) -> Result<Config, CliError> {
-        self.config_with_env(std::env::var_os(ENV_CONFIG).map(PathBuf::from))
+        self.config_with_env(std::env::var_os(ENV_CONFIG))
     }
 
     /// `config` with the variable's value passed in, so a test needs no
     /// process environment.
-    fn config_with_env(&self, env_path: Option<PathBuf>) -> Result<Config, CliError> {
-        let mut config = match (&self.config, &self.location, env_path) {
-            (Some(path), _, _) => Config::from_path(path)?,
-            (None, Some(location), _) => self.location_config(location.clone()).validated()?,
-            (None, None, Some(path)) => Config::from_path(&path)?,
-            (None, None, None) => return Err(CliError::NoTarget),
+    fn config_with_env(&self, env: Option<OsString>) -> Result<Config, CliError> {
+        let mut config = match &self.location {
+            Some(location) => self.location_config(location.clone()).validated()?,
+            None => {
+                ConfigPath::resolve_with_env(self.config.as_deref(), env)
+                    .ok_or(CliError::NoTarget)?
+                    .read()?
+                    .config?
+            }
         };
         let from_file = std::mem::take(&mut config.storage.rewrite);
         config.storage.rewrite = self.rewrite.iter().cloned().chain(from_file).collect();
@@ -360,18 +438,35 @@ value_column = "value"
 
         let bare = target(parse(&["info"]).unwrap());
         let from_env = bare
-            .config_with_env(Some(file.path().to_path_buf()))
+            .config_with_env(Some(file.path().as_os_str().to_owned()))
             .unwrap();
         assert_eq!(from_env.tables[0].name, "kv");
-        let unset = bare.config_with_env(None).unwrap_err();
-        assert!(matches!(unset, CliError::NoTarget), "{unset:?}");
+        for unset in [None, Some(OsString::new())] {
+            let error = bare.config_with_env(unset.clone()).unwrap_err();
+            assert!(matches!(error, CliError::NoTarget), "{unset:?}: {error:?}");
+        }
+        let unreadable = bare
+            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &unreadable,
+                CliError::ConfigUnreadable { file, .. }
+                    if file.origin == PathOrigin::Env && file.path == missing
+            ),
+            "{unreadable:?}"
+        );
 
         let located = target(parse(&["info", "--location", LOCATION]).unwrap());
-        let ignoring_env = located.config_with_env(Some(missing.clone())).unwrap();
+        let ignoring_env = located
+            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .unwrap();
         assert_eq!(ignoring_env.tables[0].name, LOCATION_TABLE_NAME);
 
         let flagged = target(parse(&["info", "--config", file.path().to_str().unwrap()]).unwrap());
-        let from_flag = flagged.config_with_env(Some(missing)).unwrap();
+        let from_flag = flagged
+            .config_with_env(Some(missing.as_os_str().to_owned()))
+            .unwrap();
         assert_eq!(from_flag.tables[0].name, "kv");
     }
 
@@ -432,11 +527,38 @@ value_column = "value"
     }
 
     #[test]
+    fn test_resolve_with_env_prefers_the_flag_and_treats_an_empty_variable_as_unset() {
+        let flag = Path::new("flag.toml");
+        let env = || Some(OsString::from("env.toml"));
+        assert_eq!(
+            ConfigPath::resolve_with_env(Some(flag), env()),
+            Some(ConfigPath {
+                path: flag.to_path_buf(),
+                origin: PathOrigin::Flag,
+            })
+        );
+        assert_eq!(
+            ConfigPath::resolve_with_env(None, env()),
+            Some(ConfigPath {
+                path: PathBuf::from("env.toml"),
+                origin: PathOrigin::Env,
+            })
+        );
+        assert_eq!(
+            ConfigPath::resolve_with_env(None, Some(OsString::new())),
+            None
+        );
+        assert_eq!(ConfigPath::resolve_with_env(None, None), None);
+    }
+
+    #[test]
     fn test_try_parse_serve_takes_only_the_config() {
         let cli = parse(&["serve", "--config", "icetray.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Serve { config } if config.as_path() == std::path::Path::new("icetray.toml"))
+            matches!(cli.command, Command::Serve { config: Some(config) } if config.as_path() == Path::new("icetray.toml"))
         );
+        let bare = parse(&["serve"]).unwrap();
+        assert!(matches!(bare.command, Command::Serve { config: None }));
         let error =
             parse(&["serve", "--config", "icetray.toml", "--location", LOCATION]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{error}");
