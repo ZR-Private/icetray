@@ -87,7 +87,8 @@ fn footer() -> String {
     format!(
         "{heading}Environment:{heading:#}
   {ENV_CONFIG}  The configuration file when no --config or --location is given
-  RUST_LOG        Log filter, such as debug (default: info for serve, else warn)
+  RUST_LOG        Log filter, such as debug (default: info for serve, else warn;
+                  other crates warn)
 
 {heading}Exit status:{heading:#}
   {EXIT_OK:<3} Success; an absent key is an answer

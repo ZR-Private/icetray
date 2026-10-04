@@ -216,16 +216,47 @@ pub enum LogSink {
     Stderr,
 }
 
-/// Installs the process's subscriber: `RUST_LOG` when set and valid, else
-/// `default` as the level; JSON events through `JsonEvents` to `sink`.
+/// The crates whose events the default filter passes at the subcommand's
+/// own level: the binary and the library under it.
+const OWN_TARGETS: [&str; 2] = ["icetray", "icetray_core"];
+
+/// The level every other crate's events pass at by default. Below it a
+/// dependency narrates its own workings (foyer's engine choices at start,
+/// the SDK's client construction), which an operator has no use for unless
+/// they ask through `RUST_LOG`.
+const DEPENDENCY_LEVEL: Level = Level::WARN;
+
+/// Targets that pass only errors by default: the AWS SDK's profile-file
+/// parser, which warns once for every section of `~/.aws/config` it cannot
+/// use, and a laptop's file holds profiles for other tools that are no
+/// fault of icetray's.
+const QUIET_TARGETS: [&str; 1] = ["aws_runtime::env_config"];
+
+/// The filter with `RUST_LOG` unset or invalid: icetray's own events at
+/// `level`, every other crate's at `DEPENDENCY_LEVEL`, and
+/// `QUIET_TARGETS` at `error`.
+fn default_filter(level: Level) -> EnvFilter {
+    let own = OWN_TARGETS.iter().map(|target| format!("{target}={level}"));
+    let quiet = QUIET_TARGETS
+        .iter()
+        .map(|target| format!("{target}={}", Level::ERROR));
+    let directives: Vec<String> = std::iter::once(DEPENDENCY_LEVEL.to_string())
+        .chain(own)
+        .chain(quiet)
+        .collect();
+    EnvFilter::new(directives.join(","))
+}
+
+/// Installs the process's subscriber: `RUST_LOG` when set and valid, which
+/// replaces the default filter whole, else `default_filter` with `default`
+/// as icetray's own level; JSON events through `JsonEvents` to `sink`.
 /// A subscriber already installed keeps its place and is told so through
 /// itself; the binary installs once, so that is a test's situation.
 pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
     let format = JsonEvents::new(config);
     // intentional: an unset RUST_LOG, the common case, shares this Err with an
-    // invalid one, and the default level applies to both.
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default.to_string()));
+    // invalid one, and the default filter applies to both.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter(default));
     let writer = match sink {
         LogSink::Stdout => BoxMakeWriter::new(std::io::stdout),
         LogSink::Stderr => BoxMakeWriter::new(std::io::stderr),
@@ -449,6 +480,61 @@ mod tests {
         let line: Value = serde_json::from_str(&raw[0]).unwrap();
         assert_eq!(line["msg"], Value::String("from the event".to_string()));
         assert_eq!(line["service"], Value::String("other".to_string()));
+    }
+
+    /// The targets of the events `emit` wrote under `default_filter` of
+    /// `level`, in order.
+    fn passed_by_default(level: Level, emit: impl FnOnce()) -> Vec<String> {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(default_filter(level))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(JsonEvents::new(&LogConfig::default()))
+                    .with_writer(buffer.clone()),
+            );
+        tracing::subscriber::with_default(subscriber, emit);
+        buffer
+            .raw_lines()
+            .iter()
+            .map(|line| {
+                let line: Value = serde_json::from_str(line).unwrap();
+                line["message"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_default_filter_passes_own_events_at_the_level_and_dependencies_at_warn() {
+        let passed = passed_by_default(Level::INFO, || {
+            tracing::info!(target: "icetray", "own info");
+            tracing::debug!(target: "icetray", "own debug");
+            tracing::info!(target: "icetray_core::table", "core info");
+            tracing::info!(target: "foyer_storage::engine", "dependency info");
+            tracing::warn!(target: "foyer_storage::engine", "dependency warn");
+            tracing::warn!(target: "aws_runtime::env_config::normalize", "profile warn");
+            tracing::error!(target: "aws_runtime::env_config::normalize", "profile error");
+            tracing::warn!(target: "aws_config::meta::credentials::chain", "chain warn");
+        });
+        assert_eq!(
+            passed,
+            [
+                "own info",
+                "core info",
+                "dependency warn",
+                "profile error",
+                "chain warn"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_default_filter_at_warn_holds_own_info_back() {
+        let passed = passed_by_default(Level::WARN, || {
+            tracing::info!(target: "icetray_core::table", "core info");
+            tracing::warn!(target: "icetray_core::table", "core warn");
+        });
+        assert_eq!(passed, ["core warn"]);
     }
 
     #[test]
