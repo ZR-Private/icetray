@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod check;
 pub mod config;
 pub mod contract;
+pub mod descriptors;
 mod error;
 pub mod generation;
 mod index;

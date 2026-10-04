@@ -1,10 +1,11 @@
 //! The one binary. `serve` is the daemon: the gRPC service, the table
 //! lifecycle, the poll loop, and the twelve-factor surface of RFD 012.
 //! `doctor`, `get`, and `info` are one-shot subcommands that print JSON
-//! lines. This file parses the command line, builds the runtime, and turns
-//! the library's typed outcomes into exit codes; everything else is in the
-//! library.
+//! lines. This file parses the command line, raises the open-file limit,
+//! builds the runtime, and turns the library's typed outcomes into exit
+//! codes; everything else is in the library.
 
+use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use icetray::reload::{ConfigFile, Reload};
 use icetray::serve::{ServeOptions, Serving};
 use icetray::{oneshot, telemetry};
 use icetray_core::config::Config;
+use icetray_core::descriptors;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::Level;
 
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    let raised = descriptors::raise();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -54,19 +57,20 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    runtime.block_on(run(cli))
+    runtime.block_on(run(cli, raised))
 }
 
-/// Dispatches the parsed command line.
-async fn run(cli: Cli) -> ExitCode {
+/// Dispatches the parsed command line; `raised` is the open-file limit
+/// `descriptors::raise` left in force, or why it could not.
+async fn run(cli: Cli, raised: io::Result<u64>) -> ExitCode {
     match cli.command {
-        Command::Serve { config } => serve(config.as_deref()).await,
+        Command::Serve { config } => serve(config.as_deref(), raised).await,
         Command::Doctor {
             target,
             table,
             files,
         } => {
-            run_oneshot(&target, table, |config, table| async move {
+            run_oneshot(&target, table, raised, |config, table| async move {
                 oneshot::doctor(&config, table.as_deref(), files).await
             })
             .await
@@ -76,7 +80,7 @@ async fn run(cli: Cli) -> ExitCode {
             table,
             keys,
         } => {
-            run_oneshot(&target, table, |config, table| async move {
+            run_oneshot(&target, table, raised, |config, table| async move {
                 oneshot::get(&config, table.as_deref(), &keys)
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
@@ -84,7 +88,7 @@ async fn run(cli: Cli) -> ExitCode {
             .await
         }
         Command::Info { target, table } => {
-            run_oneshot(&target, table, |config, table| async move {
+            run_oneshot(&target, table, raised, |config, table| async move {
                 oneshot::info(&config, table.as_deref())
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
@@ -100,12 +104,13 @@ async fn run(cli: Cli) -> ExitCode {
 async fn run_oneshot<Fut>(
     target: &Target,
     table: Option<String>,
+    raised: io::Result<u64>,
     subcommand: impl FnOnce(Config, Option<String>) -> Fut,
 ) -> ExitCode
 where
     Fut: Future<Output = Result<ExitCode, CliError>>,
 {
-    match prepare(target, table.as_deref()) {
+    match prepare(target, table.as_deref(), raised) {
         Ok(config) => finish(subcommand(config, table).await),
         Err(code) => code,
     }
@@ -121,12 +126,48 @@ fn report(error: &CliError) -> ExitCode {
 
 /// The one-shot's configuration for a run that selects `table`, with
 /// logging to stderr at `warn` under its `server.log`, since a one-shot's
-/// stdout is data. A target that cannot be used is reported with its exit
-/// code.
-fn prepare(target: &Target, table: Option<&str>) -> Result<Config, ExitCode> {
+/// stdout is data, and the open-file limit `raised` logged at `debug`. A
+/// target that cannot be used is reported with its exit code.
+fn prepare(
+    target: &Target,
+    table: Option<&str>,
+    raised: io::Result<u64>,
+) -> Result<Config, ExitCode> {
     let config = target.config(table).map_err(|error| report(&error))?;
     logging::init(&config.server.log, LogSink::Stderr, Level::WARN);
+    log_descriptor_limit(raised, &config, Level::DEBUG);
     Ok(config)
+}
+
+/// Logs the open-file limit `raised` left in force, at `level` (`info` for
+/// `serve`, `debug` for a one-shot), or at `warn` why it could not be
+/// raised, and warns, with both numbers, when the limit is below the
+/// descriptors `config`'s disk level and a load need
+/// (`descriptors::needed_by`).
+fn log_descriptor_limit(raised: io::Result<u64>, config: &Config, level: Level) {
+    let limit = match raised {
+        Ok(limit) => {
+            if level == Level::INFO {
+                tracing::info!(limit, "open-file limit");
+            } else {
+                tracing::debug!(limit, "open-file limit");
+            }
+            limit
+        }
+        Err(error) => {
+            let limit = descriptors::limit();
+            tracing::warn!(%error, limit, "cannot raise the open-file limit");
+            limit
+        }
+    };
+    let needed = descriptors::needed_by(config);
+    if limit < needed {
+        tracing::warn!(
+            limit,
+            needed,
+            "the open-file limit is below the descriptors the page cache's disk level and loads need"
+        );
+    }
 }
 
 /// A one-shot's outcome as the exit code: a failure is reported as plain
@@ -152,9 +193,10 @@ fn finish_logged(outcome: Result<ExitCode, CliError>) -> ExitCode {
 
 /// `serve`: the configuration from `--config`, given as `flag`, or from
 /// `ICETRAY_CONFIG`, logging to stdout at `info` (twelve-factor: the log
-/// stream is stdout), jemalloc's background purging, then the daemon
-/// following the file (RFD 018), whose failure is logged.
-async fn serve(flag: Option<&Path>) -> ExitCode {
+/// stream is stdout), the open-file limit `raised` logged, jemalloc's
+/// background purging, then the daemon following the file (RFD 018), whose
+/// failure is logged.
+async fn serve(flag: Option<&Path>, raised: io::Result<u64>) -> ExitCode {
     let Some(file) = ConfigPath::resolve(flag) else {
         return report(&CliError::NoConfig);
     };
@@ -167,6 +209,7 @@ async fn serve(flag: Option<&Path>) -> ExitCode {
         Err(error) => return report(&CliError::Core(error)),
     };
     logging::init(&config.server.log, LogSink::Stdout, Level::INFO);
+    log_descriptor_limit(raised, &config, Level::INFO);
     if let Err(error) = tikv_jemalloc_ctl::background_thread::write(true) {
         // Background purging is a Linux feature of jemalloc, so only there
         // does its absence mean something is wrong; elsewhere freed memory

@@ -207,7 +207,9 @@ pub fn status_from(error: &Error) -> Status {
         Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }
         | Error::ObjectStore(_)
-        | Error::Cache(CacheError::Fetch(_) | CacheError::Backend(_))
+        | Error::Cache(
+            CacheError::Fetch(_) | CacheError::Backend(_) | CacheError::DescriptorLimit { .. },
+        )
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
         | Error::LoadDeadline { .. }

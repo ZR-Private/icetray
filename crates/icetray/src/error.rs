@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{ErrorKind, KeyType};
+use icetray_core::{CacheError, ErrorKind, KeyType};
 
 use crate::cli::{ConfigPath, ENV_CONFIG};
 use crate::serve::PeriodicTask;
@@ -77,6 +77,8 @@ pub enum Hint {
         /// The table's key type.
         key_type: KeyType,
     },
+    /// Raise the open-file limit, or shrink the disk level that needs it.
+    DescriptorLimit,
 }
 
 impl fmt::Display for Hint {
@@ -94,6 +96,9 @@ impl fmt::Display for Hint {
                 KeyType::Binary => "a binary key is two hex digits per byte, with or without 0x",
                 KeyType::Uuid => "a uuid key is hyphenated or 32 hex digits",
             }),
+            Self::DescriptorLimit => f.write_str(
+                "raise the hard open-file limit (ulimit -Hn, or the container runtime's nofile limit), or lower storage.local.page_cache_disk_bytes",
+            ),
         }
     }
 }
@@ -351,6 +356,9 @@ impl CliError {
                 key_type: fault.key_type(),
             }),
             Self::TableWithLocation => Some(Hint::TableOrLocation),
+            Self::Core(icetray_core::Error::Cache(CacheError::DescriptorLimit { .. })) => {
+                Some(Hint::DescriptorLimit)
+            }
             Self::Core(_)
             | Self::NoTarget
             | Self::NoConfig
@@ -481,6 +489,18 @@ mod tests {
                 Some(Hint::KeyForm { key_type })
             );
         }
+    }
+
+    #[test]
+    fn test_hint_for_a_descriptor_limit_is_to_raise_it() {
+        let (limit, needed) = (1_100, 3_328);
+        let limit = CliError::Core(icetray_core::Error::Cache(CacheError::DescriptorLimit {
+            limit,
+            needed,
+            source: std::io::Error::other("sample"),
+        }));
+        assert_eq!(limit.hint(), Some(Hint::DescriptorLimit));
+        assert_eq!(CliError::Core(core_error()).hint(), None);
     }
 
     #[test]

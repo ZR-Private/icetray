@@ -23,6 +23,7 @@ use metrics::Counter;
 use crate::approx;
 use crate::config::ConfigViolation;
 use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
+use crate::descriptors;
 use crate::error::{Error, Result};
 use crate::local::DiskLevel;
 use crate::metric;
@@ -116,6 +117,22 @@ pub enum CacheError {
     /// caller that matches on it.
     #[error("backend: {0}")]
     Backend(#[from] foyer::Error),
+    /// Opening the disk level ran out of file descriptors: the level holds
+    /// one open file per block, and the process's open-file limit is below
+    /// what the level and a load need. The operating system's error is kept;
+    /// foyer's own wrapping of it is not, since it names no cause.
+    #[error(
+        "open-file limit {limit} is below the {needed} descriptors the disk level and loads need: {source}"
+    )]
+    DescriptorLimit {
+        /// The limit in force when opening failed (`descriptors::limit`).
+        limit: u64,
+        /// The estimate for this disk level (`descriptors::needed`).
+        needed: u64,
+        /// The operating system's refusal: too many open files in the
+        /// process, or in the system.
+        source: io::Error,
+    },
 }
 
 /// A page's identity: the file it belongs to and the byte offset of its
@@ -282,8 +299,10 @@ impl PageCache {
     /// the local level of RFD 017: a page evicted from memory is written
     /// there, served back with a local read and no GET, and recovered when
     /// a new cache opens over the same directory, so it survives a restart.
-    /// Opening the level opens its files and reads back what they hold,
-    /// which is why this is async and can fail; a failure is
+    /// Opening the level opens its files, one per block and each held open
+    /// for the life of the cache, and reads back what they hold, which is
+    /// why this is async and can fail: running out of descriptors is
+    /// `CacheError::DescriptorLimit`, any other failure
     /// `CacheError::Backend`.
     pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self> {
         let level = match disk {
@@ -295,7 +314,9 @@ impl PageCache {
                     .build(),
             ),
             Some(disk) => Level::Hybrid {
-                cache: open_hybrid(capacity_bytes, &disk).await?,
+                cache: open_hybrid(capacity_bytes, &disk)
+                    .await
+                    .map_err(|error| open_error(error, &disk))?,
                 stats: Arc::clone(disk.stats()),
             },
         };
@@ -528,11 +549,10 @@ impl fmt::Debug for Hits {
 async fn open_hybrid(
     capacity_bytes: usize,
     disk: &DiskLevel,
-) -> Result<HybridCache<PageKey, PageValue>> {
+) -> foyer::Result<HybridCache<PageKey, PageValue>> {
     let device = FsDeviceBuilder::new(disk.dir())
         .with_capacity(approx::length(disk.capacity_bytes()))
-        .build()
-        .map_err(backend)?;
+        .build()?;
     HybridCacheBuilder::new()
         .with_name(CACHE_NAME)
         .with_policy(HybridCachePolicy::WriteOnEviction)
@@ -547,7 +567,38 @@ async fn open_hybrid(
         .with_recover_mode(RecoverMode::Quiet)
         .build()
         .await
-        .map_err(backend)
+}
+
+/// A failure to open `disk` as the crate's error: running out of
+/// descriptors is `CacheError::DescriptorLimit` with the limit and the
+/// estimate for the level, anything else the backend's error.
+fn open_error(error: foyer::Error, disk: &DiskLevel) -> Error {
+    match descriptors_exhausted(&error) {
+        Some(source) => Error::Cache(CacheError::DescriptorLimit {
+            limit: descriptors::limit(),
+            needed: descriptors::needed(disk.capacity_bytes()),
+            source,
+        }),
+        None => backend(error),
+    }
+}
+
+/// The operating system's error anywhere in `error`'s chain when it is
+/// `EMFILE` or `ENFILE`, too many open files in the process or in the
+/// system.
+fn descriptors_exhausted(error: &foyer::Error) -> Option<io::Error> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(code) = current
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .filter(|code| matches!(*code, libc::EMFILE | libc::ENFILE))
+        {
+            return Some(io::Error::from_raw_os_error(code));
+        }
+        cause = current.source();
+    }
+    None
 }
 
 /// What an entry costs the memory budget.
@@ -1292,5 +1343,101 @@ mod tests {
         assert_eq!(second.fetches(), 1);
         assert_eq!(second.hits(), 0);
         assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// A disk level of more blocks than `LOWERED_LIMIT` leaves descriptors
+    /// for, so opening it runs out partway.
+    const MANY_BLOCKS_BYTES: u64 = 128 * PAGE_CACHE_DISK_BLOCK_BYTES;
+
+    /// The soft limit the child test lowers itself to: room for the test
+    /// harness and a runtime, not for `MANY_BLOCKS_BYTES` of blocks.
+    const LOWERED_LIMIT: u64 = 64;
+
+    #[test]
+    fn test_open_error_out_of_descriptors_is_descriptor_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, _) = disk_level(dir.path());
+        for code in [libc::EMFILE, libc::ENFILE] {
+            let error = foyer::Error::io_error(io::Error::from_raw_os_error(code));
+            let Error::Cache(CacheError::DescriptorLimit {
+                limit,
+                needed,
+                source,
+            }) = open_error(error, &level)
+            else {
+                panic!("os error {code} is not a descriptor limit");
+            };
+            assert_eq!(limit, descriptors::limit());
+            assert_eq!(needed, descriptors::needed(DISK_BYTES));
+            assert_eq!(source.raw_os_error(), Some(code));
+        }
+    }
+
+    #[test]
+    fn test_open_error_finds_descriptors_under_a_wrapping_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, _) = disk_level(dir.path());
+        let inner = foyer::Error::io_error(io::Error::from_raw_os_error(libc::EMFILE));
+        let outer =
+            foyer::Error::new(ErrorKind::Recover, "recovering the level").with_source(inner);
+        assert!(matches!(
+            open_error(outer, &level),
+            Error::Cache(CacheError::DescriptorLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn test_open_error_other_failures_stay_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, _) = disk_level(dir.path());
+        let no_space = foyer::Error::io_error(io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(matches!(
+            open_error(no_space, &level),
+            Error::Cache(CacheError::Backend(_))
+        ));
+        let config = foyer::Error::new(ErrorKind::Config, "refused");
+        assert!(matches!(
+            open_error(config, &level),
+            Error::Cache(CacheError::Backend(_))
+        ));
+    }
+
+    /// Opening a real disk level under a soft limit below its blocks fails
+    /// as foyer runs out of descriptors, and that failure arrives as
+    /// `DescriptorLimit` with the limit in force. In a child process, since
+    /// the test lowers the process's own limit.
+    #[test]
+    fn test_new_with_too_few_descriptors_is_descriptor_limit() {
+        descriptors::testing::in_child(
+            "cache::tests::test_new_with_too_few_descriptors_is_descriptor_limit",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let config = LocalConfig {
+                    dir: dir.path().to_path_buf(),
+                    index_budget_bytes: None,
+                    page_cache_disk_bytes: MANY_BLOCKS_BYTES,
+                };
+                let local = LocalDir::open(&config, Arc::new(IoStats::default())).unwrap();
+                let level = local.page_cache_level().unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                descriptors::set(LOWERED_LIMIT, descriptors::current().rlim_max).unwrap();
+                let opened = runtime.block_on(PageCache::new(ROOMY_BYTES, Some(level)));
+                let Err(Error::Cache(CacheError::DescriptorLimit {
+                    limit,
+                    needed,
+                    source,
+                })) = opened
+                else {
+                    panic!("opened under {LOWERED_LIMIT} descriptors: {opened:?}");
+                };
+                assert_eq!(limit, LOWERED_LIMIT);
+                let expected = runtime.block_on(async { descriptors::needed(MANY_BLOCKS_BYTES) });
+                assert_eq!(needed, expected);
+                assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
+            },
+        );
     }
 }
