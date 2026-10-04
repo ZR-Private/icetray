@@ -1,4 +1,4 @@
-//! The binary's share of the metrics (blueprint section 7): the Prometheus
+//! The binary's share of the metrics (RFD 012): the Prometheus
 //! recorder with the latency buckets, the `requests_total` counter with its
 //! `call` and `code` labels, and the scrape, which writes every gauge a
 //! live table, the page cache, the service, the reload, and the process

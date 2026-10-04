@@ -42,8 +42,8 @@ pub mod thresholds {
     /// is advice: 1 MiB, `VALUE_PAGE_ADVICE_FACTOR` times
     /// `contract::VALUE_PAGE_BYTES`. The one value page a cold hit fetches
     /// is the bytes it transfers and decompresses, and that cost is linear
-    /// in the page's bytes with no step anywhere (the clean build against
-    /// real S3, results: 192 KB pages served at the same cold latency as 64
+    /// in the page's bytes with no step anywhere (icetray against real S3,
+    /// results: 192 KB pages served at the same cold latency as 64
     /// KiB ones), so the line is drawn where the transfer itself reaches
     /// the order of a round trip: at object-store bandwidth a megabyte
     /// takes tens of milliseconds, which shows in a cold hit, while a few

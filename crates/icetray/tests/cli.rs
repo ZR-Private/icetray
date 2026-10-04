@@ -1,5 +1,6 @@
 //! The built binary end to end (RFD 016's exit codes, the JSON lines of
-//! blueprint section 5, the twelve-factor start of RFD 012): fixtures on
+//! the output contract in `docs/configuration.md`, the twelve-factor start
+//! of RFD 012): fixtures on
 //! local disk, the binary run as a process, its stdout parsed line by line.
 
 use std::io::{BufRead as _, BufReader};
