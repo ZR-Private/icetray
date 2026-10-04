@@ -63,13 +63,13 @@ impl FileHandle {
     /// lookup reads this handle issues are hedged against that table's own
     /// latencies and never another's. Fails only when no store serves the
     /// location.
-    pub(crate) fn open(
+    pub(crate) async fn open(
         storage: Arc<Storage>,
         location: &str,
         size: u64,
         hedge: Arc<HedgeWindow>,
     ) -> Result<Self> {
-        let located = storage.locate(location)?;
+        let located = storage.locate(location).await?;
         Ok(Self {
             location: location.to_string(),
             located,
@@ -711,6 +711,7 @@ mod tests {
                 handle.size(),
                 window,
             )
+            .await
             .unwrap(),
         );
 

@@ -313,13 +313,15 @@ impl Opened {
     }
 }
 
-/// Builds storage from the SDK's default chain, one cache, one count of
-/// calls in flight, and every configured table in `Loading` over them; `only` narrows by name, and a name that
+/// Builds storage over the SDK's default chain, which it loads before its
+/// first S3 read and never for a process that reads none, one cache, one
+/// count of calls in flight, and every configured table in `Loading` over
+/// them; `only` narrows by name, and a name that
 /// matches no table yields `Ok` with empty `tables`, whose message and exit
 /// code are the caller's. Nothing is read from any table: `open` issues no
 /// GET.
 pub async fn open(config: &Config, only: Option<&str>) -> Result<Opened> {
-    let storage = Arc::new(Storage::with_sdk_defaults(config.storage.clone()).await);
+    let storage = Arc::new(Storage::with_sdk_defaults(config.storage.clone()));
     open_with(config, only, storage).await
 }
 

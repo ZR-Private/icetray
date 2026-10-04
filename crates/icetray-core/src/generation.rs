@@ -161,7 +161,7 @@ impl Generation {
         let entries =
             manifest::list_data_files(table, &resolved.metadata, snapshot, &layout, storage)
                 .await?;
-        let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge)?;
+        let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge).await?;
         let inspected = inspect_all(table, &layout, pending).await?;
         let reservation = check_budget(table, config, local, &reused, &inspected)?;
         let built = build_all(
@@ -465,8 +465,10 @@ type Pending = (DataFileEntry, Arc<FileHandle>);
 /// at the same size, reused as the same `Arc` (RFD 005; a data file is
 /// immutable, so a path whose size changed is another file and its index
 /// would be stale), and the rest, each opened as a `FileHandle` with the
-/// manifest's size and `hedge`. Opening sends nothing.
-fn reuse_or_open(
+/// manifest's size and `hedge`. Opening sends nothing to the store; the
+/// first S3 location a storage opens loads the SDK's defaults
+/// (`Storage::locate`).
+async fn reuse_or_open(
     entries: Vec<DataFileEntry>,
     previous: Option<&Generation>,
     storage: &Arc<Storage>,
@@ -495,7 +497,8 @@ fn reuse_or_open(
                 &entry.path,
                 entry.size,
                 Arc::clone(hedge),
-            )?;
+            )
+            .await?;
             pending.push((entry, Arc::new(handle)));
         }
     }
@@ -2888,6 +2891,7 @@ mod tests {
                         file.file_size_in_bytes(),
                         Arc::clone(&table.hedge),
                     )
+                    .await
                     .unwrap(),
                 );
                 total += FileIndex::inspect(TABLE, handle, KEY_COLUMN, VALUE_COLUMN, KeyType::Long)

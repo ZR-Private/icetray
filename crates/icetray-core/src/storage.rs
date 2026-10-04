@@ -1,8 +1,9 @@
 //! Every byte read from object storage (RFD 003): one store per
 //! `scheme://authority/` prefix, location rewriting before any request
 //! leaves the process, one counter for GETs, bytes, hedges, local reads and
-//! local bytes, the AWS SDK's credential chain bridged with a cached and
-//! coalesced refresh, and the hedged lookup read of RFD 013.
+//! local bytes, the AWS SDK's credential chain, loaded before the first S3
+//! store is built and bridged with a cached and coalesced refresh, and the
+//! hedged lookup read of RFD 013.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +26,7 @@ use object_store::path::Path;
 use object_store::{
     BackoffConfig, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, RetryConfig,
 };
+use tokio::sync::OnceCell;
 // Reads are timed on tokio's clock: a paused runtime (the simulation) advances
 // it virtually, so the hedge window and the timer that consults it agree; the
 // wall clock would feed the window real durations under a virtual timer.
@@ -265,7 +267,8 @@ enum CredentialSource<'a> {
         key_id: &'a str,
         secret_access_key: &'a str,
     },
-    /// The SDK's default chain, resolved once by `Storage::with_sdk_defaults`.
+    /// The SDK's default chain, loaded once by a `Storage` built with
+    /// `Storage::with_sdk_defaults`, before the first S3 store it builds.
     SdkChain(SharedCredentialsProvider),
     /// No credentials: requests go unsigned. Correct for public buckets and
     /// for a process that never sends a request to a store it built, such
@@ -292,11 +295,14 @@ impl fmt::Display for CredentialSource<'_> {
 #[derive(Debug)]
 pub struct Storage {
     config: StorageConfig,
-    /// The AWS SDK's resolved defaults, when the process asked for them.
+    /// The AWS SDK's defaults, when the process asked for them: loaded
+    /// the first time a location under an S3 prefix is located, and kept.
     /// `object_store` alone reads environment variables and instance
     /// metadata; the SDK adds profiles, SSO, `credential_process`, and web
-    /// identity.
-    sdk: Option<SdkConfig>,
+    /// identity. Loading reads the profile files and may probe the
+    /// instance metadata service for a region, which takes seconds off
+    /// EC2, so a process that reads no S3 location never loads them.
+    sdk: Option<OnceCell<SdkConfig>>,
     /// One store per `scheme://authority/` prefix. Tests register stores
     /// under synthetic prefixes; `s3://`, `s3a://`, and `file://` stores are
     /// built on first use.
@@ -318,15 +324,13 @@ impl Storage {
     }
 
     /// Builds from configuration with the AWS SDK's default region and
-    /// credential chain loaded once: profiles, SSO, `credential_process`,
-    /// web identity, and instance metadata. Configured static keys still win
-    /// for every S3 store.
-    pub(crate) async fn with_sdk_defaults(config: StorageConfig) -> Self {
-        let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await;
+    /// credential chain: profiles, SSO, `credential_process`, web identity,
+    /// and instance metadata, loaded once, when `locate` first meets a
+    /// location under an S3 prefix, and never for a process that reads
+    /// none. Configured static keys still win for every S3 store.
+    pub(crate) fn with_sdk_defaults(config: StorageConfig) -> Self {
         Self {
-            sdk: Some(sdk),
+            sdk: Some(OnceCell::new()),
             ..Self::new(config)
         }
     }
@@ -362,7 +366,18 @@ impl Storage {
         self.config.catalog_timeout
     }
 
-    /// Resolves a location to a store and a path: the configured rewrite
+    /// Resolves a location to a store and a path, as `locate_loaded` does,
+    /// once the SDK's defaults are loaded when the location, rewritten,
+    /// is under an S3 prefix and this storage was built with them; so an
+    /// S3 store is never built before the chain it signs with. Every
+    /// location the crate reads is located here.
+    pub(crate) async fn locate(&self, location: &str) -> Result<Located> {
+        self.load_sdk_for(location).await;
+        self.locate_loaded(location)
+    }
+
+    /// Resolves a location to a store and a path with the SDK's defaults
+    /// as far as they are loaded: the configured rewrite
     /// rules are applied in order and the first match wins, then the
     /// location is split into its `scheme://authority/` prefix and the rest
     /// (`file://` and a bare absolute path both name the local filesystem),
@@ -371,7 +386,7 @@ impl Storage {
     /// is a rewrite rule or a registered store:
     /// `ConfigViolation::NoStoreForLocation`, or
     /// `ConfigViolation::LocationNotAbsolute` for a relative path.
-    pub(crate) fn locate(&self, location: &str) -> Result<Located> {
+    fn locate_loaded(&self, location: &str) -> Result<Located> {
         let location = self.rewrite(location);
         let (prefix, rest) = split_location(&location)?;
         let store = self.store_for(&prefix, &location)?;
@@ -386,7 +401,7 @@ impl Storage {
     /// Reads a whole object. One load GET of the object's size, counted
     /// whatever the outcome.
     pub async fn read_all(&self, location: &str) -> Result<Bytes> {
-        let l = self.locate(location)?;
+        let l = self.locate(location).await?;
         observed(&self.stats, ReadKind::Load, self.get_all(&l)).await
     }
 
@@ -443,6 +458,31 @@ impl Storage {
             l.store.get_ranges(&l.path, ranges),
         )
         .await
+    }
+
+    /// Loads the SDK's defaults, once, when `sdk_to_load_for` names them.
+    /// Concurrent callers share the one load. The load's future is boxed:
+    /// it is several times the size of the rest of a read, and every
+    /// future that locates a location would carry it inline.
+    async fn load_sdk_for(&self, location: &str) {
+        if let Some(sdk) = self.sdk_to_load_for(location) {
+            sdk.get_or_init(|| {
+                Box::pin(aws_config::defaults(aws_config::BehaviorVersion::latest()).load())
+            })
+            .await;
+        }
+    }
+
+    /// The SDK's defaults still to load before `location` is located: when
+    /// this storage was built with them, they are not loaded yet, and the
+    /// location, rewritten, is under an S3 prefix.
+    fn sdk_to_load_for(&self, location: &str) -> Option<&OnceCell<SdkConfig>> {
+        let sdk = self.sdk.as_ref().filter(|sdk| !sdk.initialized())?;
+        let location = self.rewrite(location);
+        S3_SCHEMES
+            .iter()
+            .any(|scheme| location.starts_with(scheme))
+            .then_some(sdk)
     }
 
     /// The location with the first matching rewrite rule applied, or the
@@ -524,7 +564,7 @@ impl Storage {
         if let Some(endpoint) = s3.endpoint.as_deref() {
             builder = builder.with_endpoint(endpoint);
         }
-        let sdk_region = self.sdk.as_ref().and_then(SdkConfig::region);
+        let sdk_region = self.loaded_sdk().and_then(SdkConfig::region);
         let region: Option<&str> = s3
             .region
             .as_deref()
@@ -547,6 +587,11 @@ impl Storage {
         Ok(Arc::new(builder.build()?))
     }
 
+    /// The SDK's defaults, once loaded.
+    fn loaded_sdk(&self) -> Option<&SdkConfig> {
+        self.sdk.as_ref().and_then(OnceCell::get)
+    }
+
     /// The one credential source for every S3 store this storage builds:
     /// the configured static keys when both are present, otherwise the SDK
     /// chain when the storage was built with it, otherwise none.
@@ -560,8 +605,7 @@ impl Storage {
                 secret_access_key,
             };
         }
-        self.sdk
-            .as_ref()
+        self.loaded_sdk()
             .and_then(SdkConfig::credentials_provider)
             .map_or(CredentialSource::Unsigned, CredentialSource::SdkChain)
     }
@@ -986,7 +1030,11 @@ pub(crate) mod testing {
         ) -> Arc<FileHandle> {
             let size = crate::approx::count(bytes.len());
             self.put(location, bytes).await;
-            Arc::new(FileHandle::open(Arc::clone(&self.storage), location, size, window).unwrap())
+            Arc::new(
+                FileHandle::open(Arc::clone(&self.storage), location, size, window)
+                    .await
+                    .unwrap(),
+            )
         }
     }
 
@@ -1345,7 +1393,7 @@ mod tests {
         let storage = Storage::new(StorageConfig::default());
         storage.register(MEM_PREFIX, store);
         let located = storage
-            .locate(&format!("{MEM_PREFIX}{OBJECT_KEY}"))
+            .locate_loaded(&format!("{MEM_PREFIX}{OBJECT_KEY}"))
             .unwrap();
         (storage, located)
     }
@@ -1731,7 +1779,7 @@ mod tests {
     fn test_locate_unknown_scheme_refused() {
         let storage = Storage::new(StorageConfig::default());
         assert_eq!(
-            locate_violation(storage.locate("gs://bucket-a/x")),
+            locate_violation(storage.locate_loaded("gs://bucket-a/x")),
             ConfigViolation::NoStoreForLocation {
                 location: "gs://bucket-a/x".to_string()
             }
@@ -1748,13 +1796,13 @@ mod tests {
             ..StorageConfig::default()
         });
         assert_eq!(
-            locate_violation(storage.locate("gs://bucket-a/x")),
+            locate_violation(storage.locate_loaded("gs://bucket-a/x")),
             ConfigViolation::NoStoreForLocation {
                 location: "mem://none/x".to_string()
             }
         );
         assert_eq!(
-            locate_violation(storage.locate("relative/x")),
+            locate_violation(storage.locate_loaded("relative/x")),
             ConfigViolation::LocationNotAbsolute {
                 location: "relative/x".to_string()
             }
@@ -1787,7 +1835,7 @@ mod tests {
         storage.register("mem://b/", Arc::clone(&b));
         storage.register("mem://c/", Arc::clone(&c));
 
-        let located = storage.locate("s3://old-warehouse/deep/x").unwrap();
+        let located = storage.locate_loaded("s3://old-warehouse/deep/x").unwrap();
         assert!(Arc::ptr_eq(&located.store, &a), "the first rule wins");
         assert!(
             !Arc::ptr_eq(&located.store, &b),
@@ -1799,7 +1847,7 @@ mod tests {
         );
         assert_eq!(located.path, Path::from("deep/x"));
 
-        let untouched = storage.locate("mem://b/y").unwrap();
+        let untouched = storage.locate_loaded("mem://b/y").unwrap();
         assert!(Arc::ptr_eq(&untouched.store, &b));
         assert_eq!(untouched.path, Path::from("y"));
     }
@@ -1821,9 +1869,9 @@ mod tests {
             storage.credential_source(),
             CredentialSource::Static { .. }
         ));
-        let first = storage.locate("s3://bucket-a/x/y").unwrap();
-        let again = storage.locate("s3://bucket-a/z").unwrap();
-        let hadoop = storage.locate("s3a://bucket-a/x/y").unwrap();
+        let first = storage.locate_loaded("s3://bucket-a/x/y").unwrap();
+        let again = storage.locate_loaded("s3://bucket-a/z").unwrap();
+        let hadoop = storage.locate_loaded("s3a://bucket-a/x/y").unwrap();
         assert!(Arc::ptr_eq(&first.store, &again.store));
         assert!(!Arc::ptr_eq(&first.store, &hadoop.store));
         assert_eq!(first.path, Path::from("x/y"));
@@ -1837,8 +1885,77 @@ mod tests {
             storage.credential_source(),
             CredentialSource::Unsigned
         ));
-        let located = storage.locate("s3://bucket-a/x").unwrap();
+        let located = storage.locate_loaded("s3://bucket-a/x").unwrap();
         assert_eq!(located.path, Path::from("x"));
+    }
+
+    #[test]
+    fn test_sdk_to_load_for_s3_locations_as_rewritten() {
+        let storage = Storage::with_sdk_defaults(StorageConfig {
+            rewrite: vec![
+                RewriteRule {
+                    from: "file:///mirror/".to_string(),
+                    to: "s3://bucket-a/".to_string(),
+                },
+                RewriteRule {
+                    from: "s3://moved/".to_string(),
+                    to: "file:///local/".to_string(),
+                },
+            ],
+            ..StorageConfig::default()
+        });
+        assert!(storage.sdk_to_load_for("s3://bucket-a/x").is_some());
+        assert!(storage.sdk_to_load_for("s3a://bucket-a/x").is_some());
+        assert!(
+            storage.sdk_to_load_for("file:///mirror/x").is_some(),
+            "rewritten into S3"
+        );
+        assert!(storage.sdk_to_load_for("file:///warehouse/x").is_none());
+        assert!(storage.sdk_to_load_for("/warehouse/x").is_none());
+        assert!(
+            storage.sdk_to_load_for("s3://moved/x").is_none(),
+            "rewritten out of S3"
+        );
+    }
+
+    #[test]
+    fn test_sdk_to_load_for_nothing_without_the_sdk_or_once_loaded() {
+        let without = Storage::new(StorageConfig::default());
+        assert!(without.sdk_to_load_for("s3://bucket-a/x").is_none());
+        let loaded = Storage::with_sdk_defaults(StorageConfig::default());
+        loaded
+            .sdk
+            .as_ref()
+            .unwrap()
+            .set(SdkConfig::builder().build())
+            .unwrap();
+        assert!(loaded.sdk_to_load_for("s3://bucket-a/x").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_locate_a_local_location_leaves_the_sdk_unloaded() {
+        let storage = Storage::with_sdk_defaults(StorageConfig::default());
+        storage.locate("/warehouse/db/t/x").await.unwrap();
+        storage.locate("file:///warehouse/db/t/y").await.unwrap();
+        assert!(!storage.sdk.as_ref().unwrap().initialized());
+    }
+
+    #[tokio::test]
+    async fn test_locate_s3_signs_with_the_loaded_sdk_chain() {
+        let storage = Storage::with_sdk_defaults(StorageConfig::default());
+        assert!(matches!(
+            storage.credential_source(),
+            CredentialSource::Unsigned
+        ));
+        let sdk = SdkConfig::builder()
+            .credentials_provider(SharedCredentialsProvider::new(test_credentials(None)))
+            .build();
+        storage.sdk.as_ref().unwrap().set(sdk).unwrap();
+        storage.locate("s3://bucket-a/x").await.unwrap();
+        assert!(matches!(
+            storage.credential_source(),
+            CredentialSource::SdkChain(_)
+        ));
     }
 
     /// A storage whose S3 stores reach `endpoint` over plain HTTP, path
@@ -1955,8 +2072,10 @@ mod tests {
         assert_eq!(storage.stats().gets(), 2);
         assert_eq!(storage.stats().bytes(), payload_len() + payload_len());
 
-        let by_uri = storage.locate(&format!("{FILE_PREFIX}{bare}")).unwrap();
-        let by_path = storage.locate(bare).unwrap();
+        let by_uri = storage
+            .locate_loaded(&format!("{FILE_PREFIX}{bare}"))
+            .unwrap();
+        let by_path = storage.locate_loaded(bare).unwrap();
         assert!(Arc::ptr_eq(&by_uri.store, &by_path.store));
     }
 
