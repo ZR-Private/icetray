@@ -540,21 +540,31 @@ mod tests {
         }
     }
 
-    /// A rejected file's message names the file and where its path came
-    /// from, then the setting by its full path and the value.
+    /// A file that breaks a rule is rejected carrying the file, where its
+    /// path came from, and the violation with the setting's place and
+    /// value, which its message is rendered from.
     #[test]
-    fn test_fmt_config_rejected_names_the_file_and_the_setting() {
-        let rejected = ConfigRejected {
-            file: env_file(),
-            source: ConfigError::Invalid(ConfigViolation::DuplicateTableName {
-                index: 1,
-                name: TABLE.to_string(),
-            }),
+    fn test_read_rejects_a_file_carrying_its_path_origin_and_violation() {
+        let table = format!(
+            "[[tables]]\nname = \"{TABLE}\"\nsource = {{ type = \"static\", location = \"s3://warehouse/db/kv\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n"
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, format!("{table}{table}").as_bytes()).unwrap();
+        let named = ConfigPath {
+            path: file.path().to_path_buf(),
+            origin: PathOrigin::Env,
         };
-        assert_eq!(
-            rejected.to_string(),
-            "invalid configuration file icetray.toml (from ICETRAY_CONFIG): \
-             tables[1].name kv is configured more than once"
+        let Err(rejected) = named.read().unwrap().config else {
+            panic!("a file naming a table twice is rejected");
+        };
+        assert_eq!(rejected.file, named);
+        assert!(
+            matches!(
+                &rejected.source,
+                ConfigError::Invalid(ConfigViolation::DuplicateTableName { index: 1, name })
+                    if name == TABLE
+            ),
+            "{rejected:?}"
         );
     }
 
