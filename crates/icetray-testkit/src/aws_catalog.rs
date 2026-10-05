@@ -1,6 +1,6 @@
 //! A stand-in for the two AWS catalog operations icetray calls (RFD 019):
 //! Glue's `GetTable`, a JSON 1.1 POST that names the operation in its
-//! target header, and S3 Tables' `GetTableMetadataLocation`, a REST GET of
+//! `X-Amz-Target` header, and S3 Tables' `GetTableMetadataLocation`, a REST GET of
 //! `/tables/{arn}/{namespace}/{name}/metadata-location`. It serves HTTP/1
 //! on a loopback port from a thread of its own, so it answers a test on
 //! any runtime and a binary the test spawns alike, and a source reaches it
@@ -25,7 +25,10 @@ const END_OF_HEAD: &[u8] = b"\r\n\r\n";
 /// The header that gives a request body's length.
 const CONTENT_LENGTH: &str = "content-length";
 
-/// Glue's `GetTable` as a JSON 1.1 request's target header names it.
+/// The header a JSON 1.1 request names its operation in.
+const TARGET: &str = "X-Amz-Target";
+
+/// Glue's `GetTable` as the `TARGET` header names it.
 const GLUE_GET_TABLE: &str = "AWSGlue.GetTable";
 
 /// The header `SigV4` signs a request in.
@@ -149,11 +152,6 @@ impl Request {
             .map(|(_, value)| value.as_str())
     }
 
-    /// Whether some header has the value `value`.
-    fn has_header_value(&self, value: &str) -> bool {
-        self.headers.iter().any(|(_, found)| found == value)
-    }
-
     /// The access key id the request was signed with, or empty.
     fn key_id(&self) -> String {
         self.header(AUTHORIZATION)
@@ -184,7 +182,7 @@ fn route(
     request: &Request,
     tables: &HashMap<(String, String), CatalogEntry>,
 ) -> (&'static str, String) {
-    if request.method == "POST" && request.has_header_value(GLUE_GET_TABLE) {
+    if request.method == "POST" && request.header(TARGET) == Some(GLUE_GET_TABLE) {
         // intentional: a body that is not JSON names no table, and is
         // answered as a table the catalog does not hold.
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();

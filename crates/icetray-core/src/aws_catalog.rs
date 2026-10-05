@@ -439,7 +439,9 @@ mod tests {
     const OK: &str = "200 OK";
     /// What precedes the access key id in a `SigV4` `Authorization` header.
     const CREDENTIAL_FIELD: &str = "Credential=";
-    /// Glue's `GetTable` as a JSON 1.1 request's target header names it.
+    /// The header a JSON 1.1 request names its operation in.
+    const TARGET: &str = "X-Amz-Target";
+    /// Glue's `GetTable` as the `TARGET` header names it.
     const GLUE_GET_TABLE: &str = "AWSGlue.GetTable";
     /// The header `SigV4` signs a request in.
     const AUTHORIZATION: &str = "authorization";
@@ -535,13 +537,6 @@ mod tests {
             .filter_map(|line| line.split_once(':'))
             .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
             .map(|(_, value)| value.trim())
-    }
-
-    /// Whether some header of a request head has the value `value`.
-    fn has_header_value(head: &str, value: &str) -> bool {
-        head.lines()
-            .filter_map(|line| line.split_once(':'))
-            .any(|(_, found)| found.trim() == value)
     }
 
     /// The `SigV4` credential scope a request was signed under:
@@ -697,7 +692,7 @@ mod tests {
         assert_eq!(catalog.requests(), 1);
         assert_eq!(stats.gets(), 1, "the metadata file");
         let head = &catalog.heads()[0];
-        assert!(has_header_value(head, GLUE_GET_TABLE), "{head}");
+        assert_eq!(header(head, TARGET), Some(GLUE_GET_TABLE), "{head}");
 
         let unchanged = source
             .resolve_if_changed(&store.storage, Some(&resolved.location))
