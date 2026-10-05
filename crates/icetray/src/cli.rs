@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 
-use clap::builder::{PossibleValuesParser, Styles, TypedValueParser};
+use clap::builder::{NonEmptyStringValueParser, PossibleValuesParser, Styles, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
@@ -196,7 +196,9 @@ pub enum Command {
 /// Where the tables come from: a configuration file listing them, or one
 /// table located directly. At most one of the two; with neither, `config`
 /// reads the file `ICETRAY_CONFIG` names, and a `--location` run never
-/// reads the variable. The column, ref, and residency flags describe the
+/// reads the variable. An empty `--location`, which as a path would be the
+/// filesystem root, is refused by clap as a usage error. The column, ref,
+/// and residency flags describe the
 /// located table, so they both require `--location` and conflict with
 /// `--config`: clap waives a requirement whose argument conflicts with a
 /// present one, so `requires` alone would let `--config` and `--key-column`
@@ -226,6 +228,7 @@ pub struct Target {
     #[arg(
         long,
         value_name = "URI",
+        value_parser = NonEmptyStringValueParser::new(),
         conflicts_with = "config",
         help_heading = HEADING_TABLES
     )]
@@ -1049,6 +1052,12 @@ value_column = "value"
             ),
             "{rejected:?}"
         );
+    }
+
+    #[test]
+    fn test_try_parse_refuses_an_empty_location_as_usage() {
+        let error = parse(&["info", "--location", ""]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue, "{error}");
     }
 
     #[test]

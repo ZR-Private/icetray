@@ -874,6 +874,23 @@ fn test_a_location_no_store_serves_is_usage_on_the_command_line_and_failure_in_t
     Ok(())
 }
 
+/// An empty location, which as a path would be the filesystem root, is
+/// refused before anything is read: as `--location`, a usage error, exit
+/// 64; as a table's location in a file, the file's, exit 1.
+#[test]
+fn test_an_empty_location_is_usage_on_the_command_line_and_failure_in_the_file() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let located = run(&["info", "--location", ""], &[]);
+    assert_exit(&located, EXIT_USAGE);
+    assert!(located.stdout.is_empty(), "{}", stderr(&located));
+    let text = "[[tables]]\nname = \"kv\"\nsource = { type = \"static\", location = \"\" }\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n";
+    let config = write_file(dir.path(), "empty-location.toml", text)?;
+    let configured = run(&["info", "--config", &config], &[]);
+    assert_exit(&configured, EXIT_FAILURE);
+    assert!(!assert_plain_error(&configured), "{}", stderr(&configured));
+    Ok(())
+}
+
 /// A `--rewrite` rule for a prefix the file also maps is tried first, so it
 /// wins: the file's rule alone sends every read to a directory that does not
 /// exist, and the command line's rule for the same prefix keeps the reads

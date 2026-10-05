@@ -490,6 +490,13 @@ pub enum ConfigViolation {
         /// What is wrong with it.
         fault: RewriteFault,
     },
+    /// A static table's location is empty, which as a path would be the
+    /// filesystem root.
+    #[error("tables[{index}].source.location is empty")]
+    EmptyLocation {
+        /// The table's position in `tables`.
+        index: usize,
+    },
     /// A static table's location, after the file's rewrite rules, names no
     /// store the process builds (RFD 003). The locations a table's
     /// metadata names, and a catalog table's, are only known as it loads,
@@ -738,8 +745,8 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
 }
 
 /// Each table has a name of its own, a residency its settings fit, and,
-/// for a static source, a location some store this process builds serves
-/// once the file's rewrite rules apply (`StorageConfig::location_error`).
+/// for a static source, a location that is not empty and that some store
+/// this process builds serves once the file's rewrite rules apply (`StorageConfig::location_error`).
 /// Locations a command line's rules would rewrite are not taken into
 /// account: a file means the same whatever command reads it.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
@@ -774,6 +781,9 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
         }
         match &table.source {
             SourceConfig::Static { location } => {
+                if location.is_empty() {
+                    return Err(ConfigViolation::EmptyLocation { index });
+                }
                 if let Some(source) = config.storage.location_error(location) {
                     return Err(ConfigViolation::TableLocation { index, source });
                 }
@@ -2084,6 +2094,10 @@ locaton = "typo"
         assert_eq!(
             violation(&at("db/kv")),
             refused("db/kv", LocationFault::NotAbsolute)
+        );
+        assert_eq!(
+            violation(&at("")),
+            ConfigViolation::EmptyLocation { index: 0 }
         );
         let rule = |to: &str| format!("\n[[storage.rewrite]]\nfrom = \"gs://b/\"\nto = \"{to}\"\n");
         let to_s3 = format!("{}{}", at("gs://b/kv"), rule("s3://b/"));
