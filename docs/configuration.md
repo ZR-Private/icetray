@@ -16,6 +16,9 @@ read into the same schema.
   the file, where its path came from, and the setting by its full path,
   such as `invalid configuration file icetray.toml (from --config):
   server.poll_interval 0s is below the minimum of 1s`, and the run exits 1.
+  A file that is not valid TOML is reported in one line with the line and
+  column, such as
+  `` is not valid toml: line 1, column 10: unclosed array table, expected `]` ``.
 
 ### An example
 
@@ -72,11 +75,20 @@ table = "profiles"
   `"256MiB"` and floating-point numbers are refused.
 - **Addresses** are an IP address and a port: `"127.0.0.1:7433"`,
   `"0.0.0.0:7433"`, `"[::]:7433"`. A host name is refused.
-- **Locations** are URIs with the scheme `s3://`, `s3a://`, or `file://`,
-  or absolute local paths. A relative path in the file is refused when the
-  table opens: the file's locations are never resolved against a working
+- **Locations** are URIs with the scheme `s3://`, `s3a://`, or `file:`,
+  or absolute local paths. A `file:` URI is `file:///data/kv`,
+  `file://localhost/data/kv`, or `file:/data/kv`; one with a relative path
+  (`file:data/kv`) or another host (`file://otherhost/data/kv`) is
+  refused. A `static` table's location is checked when the file is
+  validated, after the file's own rewrite rules: an empty location, a
+  relative path, and a location no store serves, such as `gs://` with no
+  rule rewriting it, are refused there as `tables[0].source.location`,
+  with exit 1. A `--rewrite` on the command line does not rescue such a
+  location. The file's locations are never resolved against a working
   directory. (A relative `--location` on the command line is; see
-  [One table without a file](#one-table-without-a-file).)
+  [One table without a file](#one-table-without-a-file).) The locations a
+  table's metadata or catalog names are known only as it loads, and one
+  that no store serves fails the load with the error kind `location`.
 
 ### `[server]`
 
@@ -208,8 +220,8 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `value_column` | string | required | The value column. |
 | `source` | table | required | Where the table's metadata comes from, below. |
 | `strict` | boolean | `true` | Refuse the table when it is [inefficient](glossary.md). Off, it serves with its penalty reported. |
-| `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` needs `[storage.local]`. |
-| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it is refused as `over_budget` once the footers are read, before any key chunk is fetched. |
+| `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` needs `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
+| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it is refused as `over_budget` once the footers are read, before any key chunk is fetched. Set on a `disk` or `bloom` table, it makes the file invalid. |
 
 ### `[tables.source]`
 
@@ -346,13 +358,16 @@ in the error with where its path came from, `--config` or
 `ICETRAY_CONFIG`.
 
 A `--table` name that no configured table has exits 64, and so does
-`--table` given with `--location`. Both errors print a hint, and the first
-lists the configured names.
+`--table` given with `--location`. Both errors print a hint: the first
+lists the configured names, and the second says to drop `--table` or to
+pass `--config` instead of `--location`.
 
 ### One table without a file
 
 `--location` takes a table root or a metadata file, as a URI or as a
-local path. A relative path is resolved against the working directory, so
+local path. An empty `--location`, a `file:` URI with a relative path or
+another host, and a location no store serves exit 64. A relative local
+path is resolved against the working directory, so
 `--location target/golden-warehouse/db/long_2m` works from the repository
 root. The table is named after the table root's last directory: `kv` for
 `s3://warehouse/db/kv` and for
@@ -449,9 +464,9 @@ One per table, from `info` and from `doctor`:
 | `predicted.disk_memory` | Memory the `disk` residency would hold. |
 | `predicted.disk_bytes` | The chunk files the `disk` residency would write, as `index_budget_bytes` counts them. |
 | `predicted.bloom` | Memory the `bloom` residency would hold; `null` when a file has no key bloom filter. |
-| `predicted.bloom_bits_per_key` | Filter bits per row; `null` with `bloom`. |
+| `predicted.bloom_bits_per_key` | Filter bits per row; `null` when `predicted.bloom` is. |
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
-| `predicted.filter_bytes` | The key column's bloom filter bytes; `null` with `bloom`. |
+| `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
 | `inefficient` | The number of inefficient findings. |
 | `advice` | The number of advice findings. |
 
@@ -539,18 +554,21 @@ The same codes apply to every command; the root help's footer lists them.
 - **1**: the run failed. A configuration file that cannot be read, is not
   TOML or JSON, does not fit the schema (a key missing, unknown, or of the
   wrong type), or breaks a rule (no table listed, a rewrite rule with an
-  empty half, a bad log field mapping, and the rest); a relative path on
-  the command line with no readable working directory; a load or read
-  error; a table refused, which for the doctor is a `refusal` line and
-  takes precedence over 2; and for `serve`, a first load that failed, a
-  listener that would not bind, or a drain that passed its deadline.
+  empty half, an empty or unservable location, a bad log field mapping,
+  and the rest); a relative path on the command line with no readable
+  working directory; a load or read error; a table refused, which for the
+  doctor is a `refusal` line and takes precedence over 2; and for `serve`,
+  a first load that failed, a listener that would not bind, or a drain
+  that passed its deadline.
 - **2**: the doctor found an inefficient table that it did not refuse: a
   `--location` table, or a configured table with `strict = false`. A
   configured table with `strict` on is refused instead, exit 1, as `serve`
   would refuse it.
 - **64**: the command line could not be used: no configuration; both
-  `--config` and `--location`; a located-table flag without `--location`
-  or with `--config`; a `--residency` other than `full` or `bloom`; a
-  malformed `--rewrite`; `--table` with `--location`; a `--table` that no
-  configured table has; `get` without `--table` when several tables are
-  configured; or a key that does not parse.
+  `--config` and `--location`; a `--location` that is empty, a `file:` URI
+  with a relative path or another host, or one no store serves; a
+  located-table flag without `--location` or with `--config`; a
+  `--residency` other than `full` or `bloom`; a malformed `--rewrite`;
+  `--table` with `--location`; a `--table` that no configured table has;
+  `get` without `--table` when several tables are configured; or a key
+  that does not parse.
