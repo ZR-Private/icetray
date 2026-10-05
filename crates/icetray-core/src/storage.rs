@@ -2,8 +2,9 @@
 //! `scheme://authority/` prefix, location rewriting before any request
 //! leaves the process, one counter for GETs, bytes, hedges, local reads and
 //! local bytes, the AWS SDK's credential chain, loaded before the first S3
-//! store is built and bridged with a cached and coalesced refresh, and the
-//! hedged lookup read of RFD 013.
+//! store is built and bridged with a cached and coalesced refresh that
+//! every S3 store of a `Storage` shares, and the hedged lookup read of RFD
+//! 013.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -276,8 +277,9 @@ enum CredentialSource<'a> {
         secret_access_key: &'a str,
     },
     /// The SDK's default chain, loaded once by a `Storage` built with
-    /// `Storage::with_sdk_defaults`, before the first S3 store it builds.
-    SdkChain(SharedCredentialsProvider),
+    /// `Storage::with_sdk_defaults`, before the first S3 store it builds,
+    /// through the storage's one bridge (`Storage::sdk_credentials`).
+    SdkChain(Arc<SdkCredentials>),
     /// No credentials: requests go unsigned. Correct for public buckets and
     /// for a process that never sends a request to a store it built, such
     /// as a test that registered its own.
@@ -351,7 +353,7 @@ pub struct Storage {
     /// identity. Loading reads the profile files and may probe the
     /// instance metadata service for a region, which takes seconds off
     /// EC2, so a process that reads no S3 location never loads them.
-    sdk: Option<OnceCell<SdkConfig>>,
+    sdk: Option<OnceCell<LoadedSdk>>,
     /// One store per `scheme://authority/` prefix. Tests register stores
     /// under synthetic prefixes; `s3://`, `s3a://`, and `file://` stores are
     /// built on first use.
@@ -523,7 +525,13 @@ impl Storage {
     async fn load_sdk_for(&self, location: &str) {
         if let Some(sdk) = self.sdk_to_load_for(location) {
             sdk.get_or_init(|| {
-                Box::pin(aws_config::defaults(aws_config::BehaviorVersion::latest()).load())
+                Box::pin(async {
+                    LoadedSdk::new(
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .load()
+                            .await,
+                    )
+                })
             })
             .await;
         }
@@ -532,7 +540,7 @@ impl Storage {
     /// The SDK's defaults still to load before `location` is located: when
     /// this storage was built with them, they are not loaded yet, and the
     /// location, rewritten, is under an S3 prefix.
-    fn sdk_to_load_for(&self, location: &str) -> Option<&OnceCell<SdkConfig>> {
+    fn sdk_to_load_for(&self, location: &str) -> Option<&OnceCell<LoadedSdk>> {
         let sdk = self.sdk.as_ref().filter(|sdk| !sdk.initialized())?;
         let location = self.rewrite(location);
         S3_SCHEMES
@@ -608,7 +616,7 @@ impl Storage {
         if let Some(endpoint) = s3.endpoint.as_deref() {
             builder = builder.with_endpoint(endpoint);
         }
-        let sdk_region = self.loaded_sdk().and_then(SdkConfig::region);
+        let sdk_region = self.loaded_sdk().and_then(|sdk| sdk.config.region());
         let region: Option<&str> = s3
             .region
             .as_deref()
@@ -623,17 +631,25 @@ impl Storage {
             } => builder
                 .with_access_key_id(key_id)
                 .with_secret_access_key(secret_access_key),
-            CredentialSource::SdkChain(provider) => {
-                builder.with_credentials(Arc::new(SdkCredentials::new(provider)))
-            }
+            CredentialSource::SdkChain(bridge) => builder.with_credentials(bridge),
             CredentialSource::Unsigned => builder.with_skip_signature(true),
         };
         Ok(Arc::new(builder.build()?))
     }
 
     /// The SDK's defaults, once loaded.
-    fn loaded_sdk(&self) -> Option<&SdkConfig> {
+    fn loaded_sdk(&self) -> Option<&LoadedSdk> {
         self.sdk.as_ref().and_then(OnceCell::get)
+    }
+
+    /// The one bridge from the SDK's credential chain this storage signs
+    /// through, once the SDK's defaults are loaded and their chain
+    /// resolved a provider: every S3 store it builds holds this one, so
+    /// the chain is consulted once per credential lifetime for the
+    /// process rather than once per bucket (RFD 003), and anything else
+    /// that signs AWS requests for this storage takes it from here.
+    pub(crate) fn sdk_credentials(&self) -> Option<&Arc<SdkCredentials>> {
+        self.loaded_sdk().and_then(|sdk| sdk.credentials.as_ref())
     }
 
     /// The one credential source for every S3 store this storage builds:
@@ -649,9 +665,10 @@ impl Storage {
                 secret_access_key,
             };
         }
-        self.loaded_sdk()
-            .and_then(SdkConfig::credentials_provider)
-            .map_or(CredentialSource::Unsigned, CredentialSource::SdkChain)
+        self.sdk_credentials()
+            .map_or(CredentialSource::Unsigned, |bridge| {
+                CredentialSource::SdkChain(Arc::clone(bridge))
+            })
     }
 
     /// One whole-object GET, counted whatever its outcome: the bytes are the
@@ -934,6 +951,30 @@ fn nearest_rank(sorted: &[Duration], percentile: f64) -> Option<Duration> {
         .map(|(sample, _)| *sample)
 }
 
+/// The AWS SDK's defaults as a `Storage` loaded them, with the one
+/// credential bridge over their chain.
+#[derive(Debug)]
+struct LoadedSdk {
+    /// The defaults: the region and the credential chain.
+    config: SdkConfig,
+    /// The bridge over `config`'s chain, built once with it; `None` when
+    /// the chain resolved no provider.
+    credentials: Option<Arc<SdkCredentials>>,
+}
+
+impl LoadedSdk {
+    /// `config`, with the bridge over its chain.
+    fn new(config: SdkConfig) -> Self {
+        let credentials = config
+            .credentials_provider()
+            .map(|provider| Arc::new(SdkCredentials::new(provider)));
+        Self {
+            config,
+            credentials,
+        }
+    }
+}
+
 /// The last credential the SDK chain resolved and when it stops being handed
 /// out.
 #[derive(Debug)]
@@ -979,7 +1020,7 @@ impl CachedCredential {
 /// into one refresh: the first to take the lock refreshes, and each of the
 /// rest finds a fresh credential when its turn comes.
 #[derive(Debug)]
-struct SdkCredentials {
+pub(crate) struct SdkCredentials {
     provider: SharedCredentialsProvider,
     cached: tokio::sync::Mutex<Option<CachedCredential>>,
 }
@@ -2074,7 +2115,7 @@ mod tests {
             .sdk
             .as_ref()
             .unwrap()
-            .set(SdkConfig::builder().build())
+            .set(LoadedSdk::new(SdkConfig::builder().build()))
             .unwrap();
         assert!(loaded.sdk_to_load_for("s3://bucket-a/x").is_none());
     }
@@ -2097,12 +2138,62 @@ mod tests {
         let sdk = SdkConfig::builder()
             .credentials_provider(SharedCredentialsProvider::new(test_credentials(None)))
             .build();
-        storage.sdk.as_ref().unwrap().set(sdk).unwrap();
+        storage
+            .sdk
+            .as_ref()
+            .unwrap()
+            .set(LoadedSdk::new(sdk))
+            .unwrap();
         storage.locate("s3://bucket-a/x").await.unwrap();
         assert!(matches!(
             storage.credential_source(),
             CredentialSource::SdkChain(_)
         ));
+    }
+
+    /// Every S3 store a storage builds signs through its one bridge, so
+    /// reads from two buckets run the chain once between them, and the
+    /// bridge each store is built with is the storage's.
+    #[tokio::test]
+    async fn test_s3_stores_of_every_bucket_share_one_credential_bridge() {
+        let endpoint = LocalHttp::start(Reply::Status(UNAVAILABLE));
+        let storage = Storage::with_sdk_defaults(StorageConfig {
+            s3: Some(S3Config {
+                endpoint: Some(endpoint.url()),
+                allow_http: true,
+                path_style: true,
+                ..S3Config::default()
+            }),
+            max_retries: 0,
+            ..StorageConfig::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            answers: vec![test_credentials(None)],
+            calls: Arc::clone(&calls),
+        };
+        let sdk = SdkConfig::builder()
+            .credentials_provider(SharedCredentialsProvider::new(provider))
+            .build();
+        storage
+            .sdk
+            .as_ref()
+            .unwrap()
+            .set(LoadedSdk::new(sdk))
+            .unwrap();
+        let buckets = ["bucket-a", "bucket-b"];
+        for bucket in buckets {
+            let result = storage
+                .read_all(&format!("s3://{bucket}/{OBJECT_KEY}"))
+                .await;
+            assert!(matches!(result, Err(Error::ObjectStore(_))), "{result:?}");
+        }
+        assert_eq!(endpoint.requests(), buckets.len(), "each read was sent");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one chain run for both");
+        let CredentialSource::SdkChain(built_with) = storage.credential_source() else {
+            panic!("the storage signs through the SDK chain");
+        };
+        assert!(Arc::ptr_eq(&built_with, storage.sdk_credentials().unwrap()));
     }
 
     /// A storage whose S3 stores reach `endpoint` over plain HTTP, path
