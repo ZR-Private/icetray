@@ -63,7 +63,7 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
-Write a few small contract-shaped tables with the golden-table recipe,
+Write a small contract-shaped table with the golden-table recipe,
 [`dev/golden-tables.py`](dev/golden-tables.py). The wrapper script runs it
 with Spark 4.1.3 and Java 21 in the `apache/spark` container image, so the
 host needs only a Docker-compatible runtime and `python3`. On macOS,
@@ -72,7 +72,7 @@ distribution's Docker daemon.
 
 ```sh
 dev/runtime.sh up
-dev/golden-tables.sh --only contract
+dev/golden-tables.sh --only long_2m
 ```
 
 Without a container runtime, run the recipe with PySpark 4.1 and Java 17
@@ -80,14 +80,16 @@ or later on the host:
 
 ```sh
 pip install 'pyspark==4.1.*'
-python3 dev/golden-tables.py --only contract \
+python3 dev/golden-tables.py --only long_2m \
   --warehouse "file://$PWD/target/golden-warehouse"
 ```
 
 Either way the first run downloads the Iceberg Spark runtime from Maven
-Central. `--only contract` writes five tables, about 2.2 GB in all, most of
-it one table of 16 KiB values, under `target/golden-warehouse/db/`. Their
-keys are multiples of three, so 42 is present and 43 is absent.
+Central. `--only long_2m` writes one table of 2 million long keys and
+192-byte values, about 80 MB, under `target/golden-warehouse/db/long_2m`.
+Its keys are multiples of three, so 42 is present and 43 is absent.
+`--only contract` writes all five contract-shaped tables, about 2.2 GB, most
+of it one table of 16 KiB values.
 
 Look keys up. `get` opens the table at a path, loads it, and prints one
 JSON line per key (the value fields are shortened here):

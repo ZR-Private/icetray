@@ -9,6 +9,7 @@ directory; the tests locate the result through ICETRAY_GOLDEN_WAREHOUSE.
     pip install 'pyspark==4.1.*'
     python3 dev/golden-tables.py --warehouse s3a://bucket/prefix/warehouse
     python3 dev/golden-tables.py --warehouse file:///tmp/icetray-golden
+    python3 dev/golden-tables.py --only long_2m --warehouse file:///tmp/icetray-golden
 
 Without Spark on the host, dev/golden-tables.sh runs this script with Spark in
 a container against a warehouse under target/.
@@ -32,6 +33,7 @@ column whose physical type contradicts the schema.
 
 import argparse
 import time
+from typing import NamedTuple, Optional
 
 ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0"
 CATALOG = "golden"
@@ -177,70 +179,112 @@ def skew_splitting(spark, enabled):
     )
 
 
-def contract_tables(spark):
-    skew_splitting(spark, False)
-    fill(spark, create(spark, "long_2m", "BIGINT", FOUR_BUCKETS), ROWS_2M, LONG_KEY, CONTRACT_REPEATS)
-    fill(spark, create(spark, "str_2m", "STRING", FOUR_BUCKETS), ROWS_2M, STRING_KEY, CONTRACT_REPEATS)
-    fill(
-        spark,
-        create(spark, "bin16_500k", "BINARY", FOUR_BUCKETS),
-        ROWS_500K,
-        BIN16_KEY,
-        CONTRACT_REPEATS,
-    )
-    fill(
-        spark,
-        create(spark, "long_wide_250k", "BIGINT", TWO_BUCKETS, extra=WIDE),
+# Which group a table belongs to: the contract-shaped tables or the
+# off-contract layouts. `--only` takes a group or one table's name.
+CONTRACT_GROUP = "contract"
+OFF_CONTRACT_GROUP = "off-contract"
+
+
+class Golden(NamedTuple):
+    """One golden table: its name and group, and how it is written."""
+
+    name: str
+    group: str
+    key_type: str
+    buckets: int
+    rows: int
+    key_expr: str
+    repeats: int
+    extra: Optional[dict] = None
+    incompressible: bool = False
+    skew: bool = False
+
+
+# Every golden table, in the order a full run writes them.
+TABLES = [
+    Golden("long_2m", CONTRACT_GROUP, "BIGINT", FOUR_BUCKETS, ROWS_2M, LONG_KEY, CONTRACT_REPEATS),
+    Golden("str_2m", CONTRACT_GROUP, "STRING", FOUR_BUCKETS, ROWS_2M, STRING_KEY, CONTRACT_REPEATS),
+    Golden("bin16_500k", CONTRACT_GROUP, "BINARY", FOUR_BUCKETS, ROWS_500K, BIN16_KEY, CONTRACT_REPEATS),
+    Golden(
+        "long_wide_250k",
+        CONTRACT_GROUP,
+        "BIGINT",
+        TWO_BUCKETS,
         ROWS_250K,
         LONG_KEY,
         WIDE_REPEATS,
+        extra=WIDE,
         incompressible=True,
-    )
-    fill(
-        spark,
-        create(spark, "long_v3_50k", "BIGINT", FOUR_BUCKETS, extra=FORMAT_V3),
+    ),
+    Golden(
+        "long_v3_50k",
+        CONTRACT_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
         ROWS_50K,
         LONG_KEY,
         CONTRACT_REPEATS,
-    )
-
-
-def off_contract_tables(spark):
-    skew_splitting(spark, False)
+        extra=FORMAT_V3,
+    ),
     # The writer's defaults: large key pages misaligned with the value pages,
     # no bloom filter, dictionary-encoded columns where the data allows.
-    fill(spark, create(spark, "default_layout_1m", "BIGINT", FOUR_BUCKETS, extra={
-        "parquet.enable.dictionary": "true",
-        "write.parquet.page-row-limit": "20000",
-        "write.parquet.bloom-filter-enabled.column.key": "false",
-        "write.metadata.metrics.column.key": "truncate(16)",
-        "parquet.columnindex.truncate.length": "16",
-    }), ROWS_1M, LONG_KEY, CONTRACT_REPEATS)
+    Golden(
+        "default_layout_1m",
+        OFF_CONTRACT_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_1M,
+        LONG_KEY,
+        CONTRACT_REPEATS,
+        extra={
+            "parquet.enable.dictionary": "true",
+            "write.parquet.page-row-limit": "20000",
+            "write.parquet.bloom-filter-enabled.column.key": "false",
+            "write.metadata.metrics.column.key": "truncate(16)",
+            "parquet.columnindex.truncate.length": "16",
+        },
+    ),
     # No bucket partition: every file is a candidate, narrowed by key range.
-    fill(
-        spark,
-        create(spark, "unpartitioned_500k", "BIGINT", UNPARTITIONED),
+    Golden(
+        "unpartitioned_500k",
+        OFF_CONTRACT_GROUP,
+        "BIGINT",
+        UNPARTITIONED,
         ROWS_500K,
         LONG_KEY,
         CONTRACT_REPEATS,
-    )
+    ),
     # Overlapping files without duplicate keys: several sorted tasks per
     # bucket over keys uncorrelated with input order.
-    skew_splitting(spark, True)
-    fill(
-        spark,
-        create(spark, "overlap_250k", "BIGINT", TWO_BUCKETS, extra=WIDE),
+    Golden(
+        "overlap_250k",
+        OFF_CONTRACT_GROUP,
+        "BIGINT",
+        TWO_BUCKETS,
         ROWS_250K,
         PERMUTED_KEY,
         WIDE_REPEATS,
+        extra=WIDE,
         incompressible=True,
-    )
+        skew=True,
+    ),
+]
+
+
+def write(spark, table):
+    skew_splitting(spark, table.skew)
+    name = create(spark, table.name, table.key_type, table.buckets, extra=table.extra)
+    fill(spark, name, table.rows, table.key_expr, table.repeats, incompressible=table.incompressible)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--warehouse", required=True, help="s3a://bucket/prefix/warehouse or file:///path")
-    parser.add_argument("--only", choices=["contract", "off-contract"], help="write one group instead of both")
+    parser.add_argument(
+        "--only",
+        choices=[CONTRACT_GROUP, OFF_CONTRACT_GROUP, *(table.name for table in TABLES)],
+        help="write one group, or one table by name, instead of every table",
+    )
     parser.add_argument("--packages", default=ICEBERG_PACKAGE, help="Maven coordinates for the Iceberg runtime; empty if it is already on the classpath")
     parser.add_argument("--shuffle-partitions", type=int, default=64)
     args = parser.parse_args()
@@ -262,10 +306,9 @@ def main():
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.db")
     print(f"spark {spark.version}, warehouse {args.warehouse}", flush=True)
 
-    if args.only != "off-contract":
-        contract_tables(spark)
-    if args.only != "contract":
-        off_contract_tables(spark)
+    for table in TABLES:
+        if args.only in (None, table.group, table.name):
+            write(spark, table)
 
     print(f"\nset ICETRAY_GOLDEN_WAREHOUSE={args.warehouse} for the golden tests", flush=True)
     spark.stop()

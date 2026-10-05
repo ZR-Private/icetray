@@ -64,9 +64,10 @@ ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 (`iceberg-spark-runtime-4.1_2.13`) in the `apache/spark:4.1.3-python3`
 image, which carries Java 21, so the host needs a container runtime
 (`dev/runtime.sh up`) and `python3`. `--only contract` or `--only
-off-contract` writes one group. The recipe also runs on the host with
-PySpark 4.1 and Java 17 or later, and writes to any object store or local
-directory:
+off-contract` writes one group, and `--only` with a table's name writes
+that table alone: `--only long_2m` writes about 80 MB. The recipe also
+runs on the host with PySpark 4.1 and Java 17 or later, and writes to any
+object store or local directory:
 
 ```sh
 pip install 'pyspark==4.1.*'
