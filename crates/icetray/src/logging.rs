@@ -5,6 +5,7 @@
 //! formats stay out; spans are not formatted, since the binary opens none.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 
 use icetray_core::config::{LogConfig, StandardField};
@@ -247,17 +248,29 @@ fn default_filter(level: Level) -> EnvFilter {
     EnvFilter::new(directives.join(","))
 }
 
-/// Installs the process's subscriber: `RUST_LOG` when set and valid, which
-/// replaces the default filter whole, else `default_filter` with `default`
-/// as icetray's own level; JSON events through `JsonEvents` to `sink`,
+/// The filter for `RUST_LOG`'s value `env`: its directives when the value
+/// is set, holds one, and parses, replacing the default filter whole; else
+/// `default_filter` of `level`. A value of nothing but whitespace is unset,
+/// as a shell's `RUST_LOG=` means: `EnvFilter` would read it as no
+/// directive at all, which passes no event, errors included.
+fn filter_from(env: Option<OsString>, level: Level) -> EnvFilter {
+    env.and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+        // intentional: a value that does not parse gets the default filter,
+        // as an unset one does, so a typo never silences the errors.
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| default_filter(level))
+}
+
+/// Installs the process's subscriber: the filter `RUST_LOG` gives
+/// (`filter_from`), with `default` as icetray's own level when the
+/// variable gives none; JSON events through `JsonEvents` to `sink`,
 /// and an event the sink cannot take is dropped. A subscriber already
 /// installed keeps its place and is told so through itself; the binary
 /// installs once, so that is a test's situation.
 pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
     let format = JsonEvents::new(config);
-    // intentional: an unset RUST_LOG, the common case, shares this Err with an
-    // invalid one, and the default filter applies to both.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter(default));
+    let filter = filter_from(std::env::var_os(EnvFilter::DEFAULT_ENV), default);
     let writer = match sink {
         LogSink::Stdout => BoxMakeWriter::new(std::io::stdout),
         LogSink::Stderr => BoxMakeWriter::new(std::io::stderr),
@@ -487,17 +500,20 @@ mod tests {
         assert_eq!(line["service"], Value::String("other".to_string()));
     }
 
-    /// The targets of the events `emit` wrote under `default_filter` of
+    /// The messages of the events `emit` wrote under `default_filter` of
     /// `level`, in order.
     fn passed_by_default(level: Level, emit: impl FnOnce()) -> Vec<String> {
+        passed(default_filter(level), emit)
+    }
+
+    /// The messages of the events `emit` wrote under `filter`, in order.
+    fn passed(filter: EnvFilter, emit: impl FnOnce()) -> Vec<String> {
         let buffer = Buffer::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(default_filter(level))
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .event_format(JsonEvents::new(&LogConfig::default()))
-                    .with_writer(buffer.clone()),
-            );
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .event_format(JsonEvents::new(&LogConfig::default()))
+                .with_writer(buffer.clone()),
+        );
         tracing::subscriber::with_default(subscriber, emit);
         buffer
             .raw_lines()
@@ -531,6 +547,22 @@ mod tests {
                 "chain warn"
             ]
         );
+    }
+
+    /// An unset, empty, blank, or unparsable `RUST_LOG` gives the default
+    /// filter, which passes an error; a value with a directive replaces it.
+    #[test]
+    fn test_filter_from_treats_an_empty_variable_as_unset() {
+        let emit = || {
+            tracing::error!(target: "icetray", "own error");
+            tracing::debug!(target: "icetray", "own debug");
+        };
+        for env in [None, Some(""), Some("  "), Some("icetray=nonsense")] {
+            let filter = filter_from(env.map(OsString::from), Level::WARN);
+            assert_eq!(passed(filter, emit), ["own error"], "{env:?}");
+        }
+        let filter = filter_from(Some(OsString::from("debug")), Level::WARN);
+        assert_eq!(passed(filter, emit), ["own error", "own debug"]);
     }
 
     #[test]
