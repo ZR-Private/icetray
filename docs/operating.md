@@ -110,7 +110,7 @@ Counters and histograms:
 
 | Metric | Labels | Exposed from start | What it counts |
 |---|---|---|---|
-| `icetray_requests_total` | `call`, `code` | `code="ok"` for every call | gRPC calls answered, by the status each answered. A call dropped before it answers, as at its client's deadline, counts as `cancelled`. |
+| `icetray_requests_total` | `call`, `code` | every call and code | gRPC calls answered, each once, by the status its client received. |
 | `icetray_object_gets_total` | `kind` | every kind | Object-store GETs, hedges included. |
 | `icetray_object_bytes_total` | `kind` | every kind | Bytes those GETs requested. |
 | `icetray_local_reads_total` | | yes | Reads from the local directory. |
@@ -126,6 +126,15 @@ Counters and histograms:
 | `icetray_object_get_seconds` (histogram) | `kind` | every kind | Object-store GET latency. |
 
 The histograms' buckets run from 100 microseconds to 2 seconds.
+
+`icetray_requests_total` counts every call to `Get`, `MultiGet`, and
+`TableInfo`, including those the gRPC layer answers before icetray's
+handler runs: a body that does not decode (`internal`), a message over the
+4 MiB limit (`out_of_range`), and an encoding the server does not take
+(`unimplemented`). A call dropped before it answers, as when its client
+goes away or its `grpc-timeout` passes, counts as `cancelled`, and an
+answer whose body ends without a status counts as `unknown`. A call to a
+method outside the contract is not counted.
 
 Gauges, written at each scrape:
 
@@ -147,10 +156,11 @@ Gauges, written at each scrape:
 The label values:
 
 - `call`: `get`, `multi_get`, `table_info`.
-- `code`: the gRPC status in lower snake case. icetray answers `ok`,
-  `cancelled`, `invalid_argument`, `deadline_exceeded`, `not_found`,
-  `resource_exhausted`, `unavailable`, and `internal`; the label's type
-  covers the rest of the gRPC codes.
+- `code`: the gRPC status in lower snake case, every one of the 17 gRPC
+  codes. icetray's handlers answer `ok`, `invalid_argument`,
+  `deadline_exceeded`, `not_found`, `resource_exhausted`, `unavailable`,
+  and `internal`; the gRPC layer adds `cancelled`, `out_of_range`,
+  `unimplemented`, and `unknown`, as above.
 - `kind`: `load` (footers, key chunks, and metadata read while a
   generation is built) and `lookup` (value pages, and key pages under
   `bloom` residency).
@@ -170,11 +180,12 @@ The label values:
   `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,
   `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`),
   `inefficient`, or an error kind (`iceberg`, `parquet`, `object_store`,
-  `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`,
-  `file`, `not_ready`, `local`, `catalog_timeout`, `load_deadline`,
-  `refresh_deadline`, `verify_canceled`, `lookup_canceled`). There are too
-  many to expose for every table at start, so a series appears with its
-  first error; alert on `icetray_table_state{state="degraded"}` instead.
+  `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`,
+  `table`, `file`, `not_ready`, `local`, `catalog_timeout`,
+  `load_deadline`, `refresh_deadline`, `verify_canceled`,
+  `lookup_canceled`). There are too many to expose for every table at
+  start, so a series appears with its first error; alert on
+  `icetray_table_state{state="degraded"}` instead.
 
 A table a reload adds gets its series when it is added. A table a reload
 removes loses its gauges at the next scrape; its counters and histograms
@@ -193,11 +204,14 @@ adds its own, such as `table`, `snapshot_id`, or `error`.
 with the rest of the configuration, with exit 1.
 
 With `RUST_LOG` unset, the filter passes icetray's own events at `info`
-for `serve` and at `warn` for a one-shot, every other crate's at `warn`,
-and the AWS SDK's profile-file parser (`aws_runtime::env_config`) at
-`error`, since it warns about every profile it cannot use. A valid
-`RUST_LOG`, such as `debug` or `icetray_core=debug`, replaces the default
-filter whole; an invalid one is ignored.
+for `serve` and at `warn` for a one-shot, and every other crate's at
+`warn`, except the AWS SDK's profile normalizer
+(`aws_runtime::env_config::normalize`), held to `error` because it warns
+about every profile it cannot use. The SDK's warning that a file named by
+`AWS_CONFIG_FILE` or `AWS_SHARED_CREDENTIALS_FILE` does not exist still
+shows. A valid `RUST_LOG`, such as `debug` or `icetray_core=debug`,
+replaces the default filter whole; an empty, blank, or invalid one counts
+as unset.
 
 Events worth knowing:
 
@@ -217,7 +231,8 @@ Events worth knowing:
 
 The one-shots log the same JSON to stderr at `warn`, so their stdout stays
 data, and they report their final failure as plain text, `error:
-<message>` with an optional `  hint: <fix>` line. The doctor's findings
+<message>` with an optional `  hint: <fix>` line. A write to a closed
+stderr is dropped, and the run's exit code stands. The doctor's findings
 are its output and are not logged; `info` and `get` log a table's
 inefficient findings at `warn`.
 

@@ -1,8 +1,9 @@
 # Deployment contract
 
 > Updated 2026-10-04: request counts carry the status code each call
-> answered, the calls in flight show beside their bound, and the series an
-> alert keys on are exposed from the start.
+> answered, the gRPC layer's own answers included, the calls in flight
+> show beside their bound, and the series an alert keys on are exposed
+> from the start.
 
 ## Problem
 
@@ -70,8 +71,10 @@ and static fields from configuration are added to every event.
 Metrics are Prometheus, and they cover:
 
 - request counts by call and by the gRPC status code each call answered,
-  so errors show on the server's side; a call dropped before it answers,
-  as at its client's deadline, counts as cancelled;
+  so errors show on the server's side. The count is taken around the gRPC
+  service, so a call the gRPC layer answers before any handler runs, such
+  as one whose body does not decode, is counted too, once; a call dropped
+  before it answers, as at its client's deadline, counts as cancelled;
 - the calls in flight beside `server.max_in_flight`, the bound past which
   a call is refused, both as gauges, so saturation shows before the
   refusals do;
@@ -87,9 +90,9 @@ Metrics are Prometheus, and they cover:
 
 A series an alert keys on is exposed from the start, at zero for a
 counter, so the alert has data before the first event rather than only
-after it: request counts of every call answering OK, lookups of every table
-and result, swaps of every table, reloads of every result, the page
-cache's fetches, hits, and bytes, and the in-flight gauges. A table a
+after it: request counts of every call under every status code, lookups
+of every table and result, swaps of every table, reloads of every result,
+the page cache's fetches, hits, and bytes, and the in-flight gauges. A table a
 reload adds gets its series when it is added. Refresh errors are the
 exception: their reason has a value per error kind and refusal, too many to
 expose per table, so a refresh error's series appears with the first

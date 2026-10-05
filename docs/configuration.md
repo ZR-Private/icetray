@@ -503,7 +503,7 @@ for it:
 | Key | Value |
 |---|---|
 | `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`, `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`); `inefficient` for an inefficient table under `strict`; or `load_failed` when an error rather than a rule stopped the load. |
-| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
+| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
 `reason` and `error_kind` use the same names as the `reason` label of
