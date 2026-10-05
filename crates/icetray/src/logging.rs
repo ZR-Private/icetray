@@ -249,9 +249,10 @@ fn default_filter(level: Level) -> EnvFilter {
 
 /// Installs the process's subscriber: `RUST_LOG` when set and valid, which
 /// replaces the default filter whole, else `default_filter` with `default`
-/// as icetray's own level; JSON events through `JsonEvents` to `sink`.
-/// A subscriber already installed keeps its place and is told so through
-/// itself; the binary installs once, so that is a test's situation.
+/// as icetray's own level; JSON events through `JsonEvents` to `sink`,
+/// and an event the sink cannot take is dropped. A subscriber already
+/// installed keeps its place and is told so through itself; the binary
+/// installs once, so that is a test's situation.
 pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
     let format = JsonEvents::new(config);
     // intentional: an unset RUST_LOG, the common case, shares this Err with an
@@ -261,9 +262,13 @@ pub fn init(config: &LogConfig, sink: LogSink, default: Level) {
         LogSink::Stdout => BoxMakeWriter::new(std::io::stdout),
         LogSink::Stderr => BoxMakeWriter::new(std::io::stderr),
     };
+    // A write the sink refuses is dropped: reporting it would go to stderr,
+    // which for a one-shot is the sink, and a print to a closed stderr
+    // panics.
     let layer = tracing_subscriber::fmt::layer()
         .event_format(format)
-        .with_writer(writer);
+        .with_writer(writer)
+        .log_internal_errors(false);
     if let Err(error) = tracing_subscriber::registry()
         .with(filter)
         .with(layer)

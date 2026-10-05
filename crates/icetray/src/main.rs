@@ -5,7 +5,7 @@
 //! builds the runtime, and turns the library's typed outcomes into exit
 //! codes; everything else is in the library.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -50,10 +50,10 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprint!(
-                "{}",
-                render(&format_args!("cannot start the runtime: {error}"), None)
-            );
+            write_stderr(&render(
+                &format_args!("cannot start the runtime: {error}"),
+                None,
+            ));
             return ExitCode::from(EXIT_FAILURE);
         }
     };
@@ -120,8 +120,16 @@ where
 /// one-shot's every failure and of `serve`'s before its logging starts, and
 /// gives its exit code.
 fn report(error: &CliError) -> ExitCode {
-    eprint!("{}", render(error, error.hint().as_ref()));
+    write_stderr(&render(error, error.hint().as_ref()));
     error.exit_code()
+}
+
+/// Writes `text` to stderr. A write that fails is ignored, so the exit
+/// code stays the failure's own rather than a panic's.
+fn write_stderr(text: &str) {
+    // intentional: a write that fails has lost stderr, and there is
+    // nowhere left to report it.
+    let _ = io::stderr().lock().write_all(text.as_bytes());
 }
 
 /// The one-shot's configuration for a run that selects `table`, with

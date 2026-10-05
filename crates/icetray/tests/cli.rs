@@ -887,6 +887,33 @@ async fn test_broken_pipe_ends_the_run_with_exit_0() -> TestResult {
     Ok(())
 }
 
+/// A failure reported to a stderr whose reader is gone ends with the
+/// failure's own exit code: the usage code for a run with no target, the
+/// failure code for a location that cannot be read. The pipe's read end is
+/// closed before the binary starts, so every write to stderr fails.
+#[test]
+fn test_a_closed_stderr_keeps_the_failure_s_exit_code() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let missing = dir.path().join("missing").join("kv");
+    let missing = missing.to_str().expect("a utf-8 temporary path");
+    let cases: [(&[&str], u8); 2] = [
+        (&["info"], EXIT_USAGE),
+        (&["info", "--location", missing], EXIT_FAILURE),
+    ];
+    for (args, expected) in cases {
+        let (reader, writer) = std::io::pipe()?;
+        drop(reader);
+        let status = Command::new(BIN)
+            .args(args)
+            .env_remove(ENV_CONFIG)
+            .stdout(Stdio::null())
+            .stderr(writer)
+            .status()?;
+        assert_eq!(status.code(), Some(i32::from(expected)), "{args:?}");
+    }
+    Ok(())
+}
+
 /// One line of the daemon's log, checked for the configured field names.
 fn check_log_line(line: &Json) {
     let object = line.as_object().expect("a JSON object per line");
