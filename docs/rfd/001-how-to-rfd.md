@@ -3,6 +3,9 @@
 > Updated 2026-09-30: an RFD states its evidence as the conclusion it
 > supports; exact measurements stay in analyses and benchmarks.
 
+> Updated 2026-10-04: a plan is deleted once its work has landed, so
+> `docs/plans/` is often absent.
+
 ## Problem
 
 Decisions in a small project get made in conversation, often with an AI
@@ -112,8 +115,9 @@ belong in a plan.
 
 An analysis can exist without an RFD, because a survey that leads nowhere
 is still worth keeping. An RFD that rests on evidence states what it
-concluded from it and may link the analysis behind it. A plan cites the RFD it implements and can be
-deleted once the work has landed, while the RFD outlives it.
+concluded from it and may link the analysis behind it. A plan cites the
+RFD it implements and is deleted once the work has landed, while the RFD
+outlives it, so `docs/plans/` is often absent.
 
 ## When to write one
 
