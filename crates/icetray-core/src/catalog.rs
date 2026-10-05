@@ -20,7 +20,9 @@ use iceberg_catalog_rest::{
 use crate::config::SourceConfig;
 use crate::error::{Error, Result};
 use crate::snapshot::SnapshotId;
-use crate::storage::{PATH_SEPARATOR, SCHEME_SEPARATOR, Storage, split_location};
+use crate::storage::{
+    FILE_SCHEME, PATH_SEPARATOR, SCHEME_SEPARATOR, Storage, file_parts, split_location,
+};
 
 /// The file under a static table root that names the current metadata
 /// version, as the Hadoop catalog lays a table out. Its content is a bare
@@ -334,11 +336,16 @@ const RELATIVE_DIRS: [&str; 2] = [".", ".."];
 /// The name of the table a static `location` opens: the last component of
 /// its table root, `kv` for `s3://warehouse/db/kv/` and for
 /// `s3://warehouse/db/kv/metadata/v3.metadata.json`, whose root is the
-/// directory holding its `metadata/`. `None` when the root has no such
+/// directory holding its `metadata/`. A `file:` location is named by its
+/// path in every form, one storage refuses included, so a refusal names
+/// the table the location means. `None` when the root has no such
 /// component, as for a bucket alone or a path ending in `..`, or the
-/// location is not one `Storage` resolves.
+/// location is neither a `file:` URI nor one `Storage` resolves.
 pub fn table_root_name(location: &str) -> Option<String> {
-    let (_, path) = split_location(location).ok()?;
+    let path = match location.strip_prefix(FILE_SCHEME) {
+        Some(rest) => file_parts(rest).1.to_string(),
+        None => split_location(location).ok()?.1,
+    };
     let mut components = path
         .rsplit(PATH_SEPARATOR)
         .filter(|component| !component.is_empty());
@@ -897,6 +904,9 @@ mod tests {
             "s3://warehouse/db/kv/metadata/00001-6a3e.metadata.json",
             "s3://warehouse/kv/v3.metadata.json",
             "file:///data/kv",
+            "file://localhost/data/kv",
+            "file:/data/kv/metadata/v1.metadata.json",
+            "file:data/kv",
             "/data/kv//",
             "/data/kv/metadata/v1.metadata.json",
         ] {

@@ -43,10 +43,18 @@ use crate::time;
 /// one whose metadata records URIs read the same way.
 pub(crate) const FILE_PREFIX: &str = "file://";
 
-/// The local filesystem scheme with no authority, `file:/path`, the form
-/// Hadoop's `Path` records in the metadata of a table written to a local
-/// warehouse; it names the same absolute path as `file:///path`.
-const FILE_SCHEME: &str = "file:";
+/// The local filesystem scheme, which every `file:` URI starts with
+/// (RFC 8089): `file:///path` with an empty authority, `file://localhost/path`,
+/// and the authority-less `file:/path`, the form Hadoop's `Path` records
+/// in the metadata of a table written to a local warehouse, all name the
+/// same absolute path.
+pub(crate) const FILE_SCHEME: &str = "file:";
+
+/// What opens a URI's authority after its scheme's `:`.
+const AUTHORITY_OPENING: &str = "//";
+
+/// The one host a `file:` URI may name besides none: this one (RFC 8089).
+const LOCALHOST: &str = "localhost";
 
 /// What separates a URI's scheme from its authority.
 pub(crate) const SCHEME_SEPARATOR: &str = "://";
@@ -289,14 +297,26 @@ impl fmt::Display for CredentialSource<'_> {
 }
 
 /// Why a location names no store this process reads (RFD 003). Display
-/// reads after the location it is about. The remedy for either is a
-/// rewrite rule, so both are the configuration's fault, wherever the
-/// location came from.
+/// reads after the location it is about. The remedy is a rewrite rule or
+/// another location, so each is the configuration's fault, or the command
+/// line's, wherever the location came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LocationFault {
     /// Neither a URI nor an absolute path, so it names no store at all.
     #[error("is neither a uri nor an absolute path")]
     NotAbsolute,
+    /// A `file:` URI whose path is relative, as in `file:db/kv`: a URI
+    /// is never resolved against a working directory, so it names none.
+    #[error(
+        "is a file: uri with a relative path; a file: location takes an absolute path, as file:///data/kv does"
+    )]
+    FileRelative,
+    /// A `file:` URI naming a host other than this one, whose files no
+    /// store here reads.
+    #[error(
+        "is a file: uri naming another host; a file: location names this one, as file:///data/kv or file://localhost/data/kv"
+    )]
+    FileRemoteHost,
     /// A URI whose `scheme://authority/` prefix names no store: none is
     /// registered for it, and the process builds `s3://`, `s3a://`, and
     /// `file://` stores alone.
@@ -703,20 +723,15 @@ pub(crate) fn unbuildable(location: &str) -> Option<LocationFault> {
     }
 }
 
-/// A location's `scheme://authority/` prefix and the rest. `file://`, the
-/// authority-less `file:/path`, and a bare absolute path all give the
-/// `file://` prefix with the absolute path as the rest; a relative path is
-/// `LocationFault::NotAbsolute`.
+/// A location's `scheme://authority/` prefix and the rest. Every `file:`
+/// URI that names a path on this host (`file_path`) and a bare absolute
+/// path give the `file://` prefix with the absolute path as the rest; a
+/// relative path is `LocationFault::NotAbsolute`.
 pub(crate) fn split_location(
     location: &str,
 ) -> std::result::Result<(String, String), LocationFault> {
-    if let Some(path) = location.strip_prefix(FILE_PREFIX) {
-        return Ok((FILE_PREFIX.to_string(), path.to_string()));
-    }
-    if let Some(path) = location.strip_prefix(FILE_SCHEME)
-        && path.starts_with(PATH_SEPARATOR)
-    {
-        return Ok((FILE_PREFIX.to_string(), path.to_string()));
+    if let Some(rest) = location.strip_prefix(FILE_SCHEME) {
+        return file_path(rest).map(|path| (FILE_PREFIX.to_string(), path.to_string()));
     }
     if location.starts_with(PATH_SEPARATOR) {
         return Ok((FILE_PREFIX.to_string(), location.to_string()));
@@ -729,6 +744,35 @@ pub(crate) fn split_location(
         format!("{scheme}{SCHEME_SEPARATOR}{authority}{PATH_SEPARATOR}"),
         key.to_string(),
     ))
+}
+
+/// The absolute path a `file:` URI names on this host, from `rest`, the
+/// text after its scheme: an authority of nothing or `localhost`, or none,
+/// then an absolute path. Another host is `LocationFault::FileRemoteHost`,
+/// a path that is not absolute `LocationFault::FileRelative`.
+fn file_path(rest: &str) -> std::result::Result<&str, LocationFault> {
+    let (host, path) = file_parts(rest);
+    if host.is_some_and(|host| !host.is_empty() && host != LOCALHOST) {
+        return Err(LocationFault::FileRemoteHost);
+    }
+    if path.starts_with(PATH_SEPARATOR) {
+        Ok(path)
+    } else {
+        Err(LocationFault::FileRelative)
+    }
+}
+
+/// The authority and the path of a `file:` URI, from `rest`, the text
+/// after its scheme, neither checked: with `//`, the authority up to the
+/// next `/` and the path from it; without, no authority and `rest` whole.
+pub(crate) fn file_parts(rest: &str) -> (Option<&str>, &str) {
+    let Some(after) = rest.strip_prefix(AUTHORITY_OPENING) else {
+        return (None, rest);
+    };
+    match after.find(PATH_SEPARATOR) {
+        Some(at) => (Some(&after[..at]), &after[at..]),
+        None => (Some(after), ""),
+    }
 }
 
 /// The bytes a range asks for. An inverted range asks for nothing; the store
@@ -1797,6 +1841,44 @@ mod tests {
         );
     }
 
+    /// `file://localhost/` names this host as an empty authority does
+    /// (RFC 8089); another host, and a relative path after `file:`, name
+    /// no path here.
+    #[test]
+    fn test_split_location_file_uri_forms() {
+        for location in [
+            "file:///tmp/w/t",
+            "file://localhost/tmp/w/t",
+            "file:/tmp/w/t",
+        ] {
+            assert_eq!(
+                split_location(location),
+                Ok((FILE_PREFIX.to_string(), "/tmp/w/t".to_string())),
+                "{location}"
+            );
+        }
+        let refused = [
+            ("file://host-b/tmp/w/t", LocationFault::FileRemoteHost),
+            ("file:tmp/w/t", LocationFault::FileRelative),
+            ("file:", LocationFault::FileRelative),
+            ("file://", LocationFault::FileRelative),
+            ("file://localhost", LocationFault::FileRelative),
+        ];
+        for (location, fault) in refused {
+            assert_eq!(split_location(location), Err(fault), "{location}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_all_reads_a_file_localhost_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.bin");
+        std::fs::write(&file, PAYLOAD).unwrap();
+        let storage = Storage::new(StorageConfig::default());
+        let location = format!("file://localhost{}", file.to_str().unwrap());
+        assert_eq!(&storage.read_all(&location).await.unwrap()[..], PAYLOAD);
+    }
+
     #[test]
     fn test_split_location_bare_absolute_path() {
         assert_eq!(
@@ -1835,10 +1917,15 @@ mod tests {
             "s3a://bucket-a/x",
             "file:///data/x",
             "file:/data/x",
+            "file://localhost/data/x",
             "/data/x",
         ] {
             assert_eq!(unbuildable(location), None, "{location}");
         }
+        assert_eq!(
+            unbuildable("file:data/x"),
+            Some(LocationFault::FileRelative)
+        );
         assert_eq!(unbuildable("gs://bucket-a/x"), Some(LocationFault::NoStore));
         assert_eq!(unbuildable(MEM_PREFIX), Some(LocationFault::NoStore));
         assert_eq!(unbuildable("db/x"), Some(LocationFault::NotAbsolute));

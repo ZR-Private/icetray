@@ -272,6 +272,41 @@ async fn test_info_resolves_a_relative_location_but_not_a_file_s() -> TestResult
     Ok(())
 }
 
+/// A `file:` location names a path on this host in each RFC 8089 form,
+/// `file://localhost/` included, and the table after its root's last
+/// directory; `file:` before a relative path is a usage error, since a
+/// URI is never resolved against the working directory.
+#[tokio::test]
+async fn test_info_reads_a_localhost_file_uri_and_refuses_a_relative_one() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let name = "kv_file_uri";
+    let fixture = local_fixture(dir.path(), FixtureSpec::small(name, KeyType::Long)).await?;
+    let under_dir = format!("file://{}/", dir.path().display());
+    let relative = fixture
+        .metadata_location()
+        .strip_prefix(&under_dir)
+        .ok_or("the fixture lives under the directory")?;
+
+    let localhost = format!("file://localhost{}/{relative}", dir.path().display());
+    let output = run(&["info", "--location", &localhost], &[]);
+    assert_exit(&output, EXIT_OK);
+    assert_eq!(lines(&output.stdout)[0]["table"], name);
+
+    let scheme_relative = Command::new(BIN)
+        .args(["info", "--location", &format!("file:{relative}")])
+        .current_dir(dir.path())
+        .env_remove(ENV_CONFIG)
+        .output()?;
+    assert_exit(&scheme_relative, EXIT_USAGE);
+    assert!(scheme_relative.stdout.is_empty());
+    assert!(
+        !assert_plain_error(&scheme_relative),
+        "{}",
+        stderr(&scheme_relative)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_info_serializes_the_summary() -> TestResult {
     let dir = tempfile::tempdir()?;

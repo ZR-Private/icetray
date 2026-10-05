@@ -776,6 +776,24 @@ value_column = "value"
         );
     }
 
+    /// `file:` before a relative path is refused as the command line's
+    /// fault rather than resolved, and the table is named after the root
+    /// the path means all the same.
+    #[test]
+    fn test_config_refuses_a_file_uri_with_a_relative_path() {
+        let located = target(parse(&["info", "--location", "file:db/kv"]).unwrap());
+        let error = located.config_with_env(None, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Location(LocationError { location, fault: LocationFault::FileRelative })
+                    if location == "file:db/kv"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(table_root_name("file:db/kv").as_deref(), Some("kv"));
+    }
+
     #[test]
     fn test_config_refuses_a_table_name_with_a_location() {
         let located = target(parse(&["info", "--location", LOCATION]).unwrap());
