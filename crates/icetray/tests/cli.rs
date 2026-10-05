@@ -611,10 +611,13 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
     Ok(())
 }
 
+/// The `key` of a lookup line is the text `get` takes for that key: passed
+/// back to `get`, it looks up the same key, for every key type.
 #[tokio::test]
-async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
+async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
     let dir = tempfile::tempdir()?;
     let cases = [
+        ("kv_long", KeyType::Long),
         ("kv_str", KeyType::String),
         ("kv_bin", KeyType::Binary),
         ("kv_uuid", KeyType::Uuid),
@@ -622,22 +625,34 @@ async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
     for (name, key_type) in cases {
         let fixture = local_fixture(dir.path(), FixtureSpec::small(name, key_type)).await?;
         let key = fixture.key(SAMPLE[1]);
-        // A string key's Display is Debug-quoted; the command line takes the
-        // text itself. Every other type is passed as Display prints it.
         let text = match &key {
             Key::Str(text) => text.clone(),
             Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => key.to_string(),
         };
-        let output = run(&[&["get"][..], &location(&fixture), &[&text]].concat(), &[]);
-        assert_exit(&output, EXIT_OK);
-        let got = lines(&output.stdout);
-        assert_eq!(got.len(), 1, "{name}");
-        assert_eq!(got[0]["presence"], "present", "{name}");
-        assert_eq!(got[0]["key"], Json::String(key.to_string()), "{name}");
-        assert_eq!(got[0]["gets"], Json::from(1), "{name}");
+        let first = run(&[&["get"][..], &location(&fixture), &[&text]].concat(), &[]);
+        assert_exit(&first, EXIT_OK);
+        let first = lines(&first.stdout);
+        assert_eq!(first.len(), 1, "{name}");
+        assert_eq!(first[0]["presence"], "present", "{name}");
+        assert_eq!(first[0]["key"], Json::String(text.clone()), "{name}");
+        assert_eq!(first[0]["gets"], Json::from(1), "{name}");
+
+        let Json::String(printed) = &first[0]["key"] else {
+            panic!("{name}: the key is a JSON string in {}", first[0]);
+        };
+        let again = run(
+            &[&["get"][..], &location(&fixture), &[printed]].concat(),
+            &[],
+        );
+        assert_exit(&again, EXIT_OK);
+        let again = lines(&again.stdout);
+        assert_eq!(again.len(), 1, "{name}");
+        assert_eq!(again[0]["presence"], "present", "{name}");
+        assert_eq!(again[0]["key"], first[0]["key"], "{name}");
+        assert_eq!(again[0]["value_base64"], first[0]["value_base64"], "{name}");
 
         if let Key::Bytes(_) = &key {
-            let uppercase = key.to_string().trim_start_matches("0x").to_uppercase();
+            let uppercase = text.trim_start_matches("0x").to_uppercase();
             let output = run(
                 &[&["get"][..], &location(&fixture), &[&uppercase]].concat(),
                 &[],
@@ -645,7 +660,7 @@ async fn test_get_parses_every_key_type_as_display_prints_it() -> TestResult {
             assert_exit(&output, EXIT_OK);
             let got = lines(&output.stdout);
             assert_eq!(got[0]["presence"], "present");
-            assert_eq!(got[0]["key"], Json::String(key.to_string()));
+            assert_eq!(got[0]["key"], Json::String(text.clone()));
         }
     }
     Ok(())

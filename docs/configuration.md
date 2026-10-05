@@ -465,11 +465,13 @@ its rules come from the file.
 Keys are given in the form for the table's key type:
 
 - a long as its digits, with a leading `-` when negative;
-- a string as its text, without the double quotes a lookup line prints
-  around it;
+- a string as its text;
 - a binary or fixed key as hex, two digits per byte in either case, with
   or without the `0x` a lookup line prints;
 - a uuid hyphenated or as 32 hex digits.
+
+A [`lookup` line](#lookup)'s `key` is in this form, so passed back to
+`get` it looks up the same key.
 
 A key that starts with `-` and is not a number goes after `--`:
 `icetray get --location ... -- -abc`. `get` reads the key type from the
@@ -601,7 +603,7 @@ One per key, from `get`:
 
 | Key | Value |
 |---|---|
-| `key` | The key as icetray prints it: a long as its digits, a string in double quotes with escapes (`"\"abc\""`), a binary key as `0x` and lowercase hex, a uuid hyphenated. |
+| `key` | A string holding the key in the form `get` takes for it ([Keys](#keys)): a long as its digits, with a leading `-` when negative; a string as its text, with no escapes but JSON's own (`"abc"`, so `jq -r .key` gives `abc`); a binary key as `0x` and lowercase hex; a uuid hyphenated. Passed back to `get`, it looks up the same key. |
 | `presence` | `present`, `null` (the key is in the table with a null value), or `absent`. |
 | `value_base64` | The value in standard base64 with padding. Present only when `presence` is `present`. |
 | `value_utf8` | The value as text. Present only when the value is present and its bytes are UTF-8. |

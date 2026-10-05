@@ -14,6 +14,7 @@ use icetray_core::{ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotI
 use serde::Serialize;
 
 use crate::error::CliError;
+use crate::key_text;
 
 /// The kind of a line, its first key: the thing the line describes.
 /// Serialized as the lowercase name.
@@ -203,10 +204,12 @@ impl<'a> RefusalLine<'a> {
     }
 }
 
-/// One lookup of a `get` run, a `lookup` line: the key as `Display` prints it, the outcome,
-/// the value as standard base64 with padding and, when its bytes are UTF-8,
-/// as text, the snapshot answered from, the GETs the lookup issued, and the
-/// time it took. The value fields are absent for a null or absent key.
+/// One lookup of a `get` run, a `lookup` line: the key as the text `get`
+/// takes for it (`key_text::text`), so a `key` passed back to `get` looks
+/// up the same key, the outcome, the value as standard base64 with padding
+/// and, when its bytes are UTF-8, as text, the snapshot answered from, the
+/// GETs the lookup issued, and the time it took. The value fields are
+/// absent for a null or absent key.
 #[derive(Debug, Serialize)]
 pub struct LookupLine<'a> {
     kind: Kind,
@@ -234,7 +237,7 @@ impl<'a> LookupLine<'a> {
         Self {
             kind: Kind::Lookup,
             table,
-            key: key.to_string(),
+            key: key_text::text(key),
             presence: Presence::of(&lookup.value),
             value_base64: bytes
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -509,7 +512,7 @@ mod tests {
             serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
                 .unwrap();
         assert_eq!(line["kind"], Json::String("lookup".to_string()));
-        assert_eq!(line["key"], Json::String(key.to_string()));
+        assert_eq!(line["key"], Json::String("1".to_string()));
         assert_eq!(line["presence"], Json::String("present".to_string()));
         assert_eq!(
             line["value_base64"],
@@ -520,6 +523,49 @@ mod tests {
         assert_eq!(line["snapshot_id"], Json::String(SNAPSHOT.to_string()));
         assert_eq!(line["gets"], Json::from(GETS));
         assert_eq!(line["elapsed_micros"], Json::from(ELAPSED_MICROS));
+    }
+
+    /// A string key with a space, both quote characters, a backslash, and
+    /// non-ASCII text.
+    const AWKWARD_STRING: &str = "a \"quoted\" 'key' with a \\ in caf\u{e9} \u{1f9ca}";
+
+    #[test]
+    fn test_serialize_lookup_line_key_parses_back_to_the_key_for_every_type() {
+        let keys = [
+            Key::Long(-1),
+            Key::Str(AWKWARD_STRING.to_string()),
+            Key::Bytes(BINARY_VALUE.to_vec()),
+            Key::Uuid(*b"0123456789abcdef"),
+        ];
+        let absent = lookup(Value::Absent);
+        for key in keys {
+            let line =
+                serde_json::to_string(&LookupLine::new(TABLE, &key, &absent, 0, ELAPSED_MICROS))
+                    .unwrap();
+            let line: Json = serde_json::from_str(&line).unwrap();
+            let Json::String(printed) = &line["key"] else {
+                panic!("{key}: the key is a JSON string in {line}");
+            };
+            assert_eq!(
+                key_text::parse(printed, key.key_type()),
+                Ok(key.clone()),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_lookup_line_string_key_is_the_string_itself() {
+        let key = Key::Str(AWKWARD_STRING.to_string());
+        let line = serde_json::to_value(LookupLine::new(
+            TABLE,
+            &key,
+            &lookup(Value::Absent),
+            0,
+            ELAPSED_MICROS,
+        ))
+        .unwrap();
+        assert_eq!(line["key"], Json::String(AWKWARD_STRING.to_string()));
     }
 
     #[test]

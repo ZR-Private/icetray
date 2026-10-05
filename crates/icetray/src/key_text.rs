@@ -1,7 +1,8 @@
-//! A key from command-line text in the form for its key type (`parse`).
-//! The key type comes from the table's metadata, read before any data file
-//! is (`Table::resolve_key_type`); the text alone does not say whether `1`
-//! is a long or a string.
+//! A key from command-line text in the form for its key type (`parse`),
+//! and a key as that text (`text`), which `parse` reads back as the same
+//! key. The key type comes from the table's metadata, read before any data
+//! file is (`Table::resolve_key_type`); the text alone does not say whether
+//! `1` is a long or a string.
 
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType};
@@ -16,9 +17,8 @@ const HEX_PREFIXES: [&str; 2] = ["0x", "0X"];
 const HEX_RADIX: u32 = 16;
 
 /// Parses `text` as a key of `key_type`. A long is `i64::from_str`. A string
-/// is the text as given: the shell already removed its quoting, and `Key`'s
-/// `Display` quotes a string with `Debug` escaping, so a string key printed
-/// by `Display` is passed back without those quotes. A binary key is hex,
+/// is the text as given: the shell already removed its quoting, and quotes
+/// inside the text are part of the key. A binary key is hex,
 /// lowercase or uppercase, with or without a `0x` prefix, an even number of
 /// digits. A uuid is any form `uuid::Uuid::parse_str` reads, hyphenated or
 /// simple, into its sixteen bytes.
@@ -37,6 +37,19 @@ pub fn parse(text: &str, key_type: KeyType) -> Result<Key, KeyTextFault> {
             .map_err(|_| KeyTextFault::NotAUuid {
                 text: text.to_string(),
             }),
+    }
+}
+
+/// `key` in the form `parse` reads back as `key` under its own key type: a
+/// long as its digits, a string as its text with nothing added, a binary
+/// key as `0x` and lowercase hex, a uuid hyphenated. That is `Key`'s
+/// `Display` for every type but a string, whose `Display` adds `Debug`
+/// quotes and escapes to set it apart from a number in prose; a lookup line
+/// carries the key as a JSON string, which needs neither.
+pub fn text(key: &Key) -> String {
+    match key {
+        Key::Str(text) => text.clone(),
+        Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => key.to_string(),
     }
 }
 
@@ -87,11 +100,66 @@ mod tests {
         0xfe,
     ];
 
+    /// A string key with a space, both quote characters, a backslash, and a
+    /// tab, which `Debug` or a JSON string escapes, and non-ASCII text,
+    /// which the key's text carries unchanged.
+    const AWKWARD_STRING: &str = "a \"quoted\" 'key' with a \\ and a\ttab: caf\u{e9} \u{1f9ca}";
+
+    /// One key of every type and the edges of each: the text `text` gives
+    /// for each must parse back to it.
+    fn round_trip_keys() -> Vec<Key> {
+        vec![
+            Key::Long(SAMPLE_LONG),
+            Key::Long(0),
+            Key::Long(i64::MIN),
+            Key::Long(i64::MAX),
+            Key::Str(AWKWARD_STRING.to_string()),
+            Key::Str("user:0000000000000042".to_string()),
+            Key::Str("\"already quoted\"".to_string()),
+            Key::Str("-5".to_string()),
+            Key::Str(String::new()),
+            Key::Bytes(SAMPLE_BYTES.to_vec()),
+            Key::Bytes(Vec::new()),
+            Key::Uuid(SAMPLE_UUID),
+            Key::Uuid([0; UUID_BYTES]),
+        ]
+    }
+
     #[test]
-    fn test_parse_long_round_trips_display() {
-        let key = Key::Long(SAMPLE_LONG);
-        assert_eq!(parse(&key.to_string(), KeyType::Long), Ok(key));
+    fn test_text_parses_back_to_the_key_for_every_type() {
+        let keys = round_trip_keys();
+        for key_type in KeyType::ALL {
+            assert!(
+                keys.iter().any(|key| key.key_type() == key_type),
+                "no sample of {key_type}"
+            );
+        }
+        for key in keys {
+            assert_eq!(parse(&text(&key), key.key_type()), Ok(key.clone()), "{key}");
+        }
+    }
+
+    #[test]
+    fn test_text_of_a_string_is_the_string_itself() {
+        let key = Key::Str(AWKWARD_STRING.to_string());
+        assert_eq!(text(&key), AWKWARD_STRING);
+        assert_ne!(text(&key), key.to_string());
+    }
+
+    #[test]
+    fn test_text_of_a_long_binary_and_uuid_key_is_its_documented_form() {
+        assert_eq!(text(&Key::Long(SAMPLE_LONG)), "-1234567890123");
+        assert_eq!(text(&Key::Bytes(SAMPLE_BYTES.to_vec())), "0x004babff");
+        assert_eq!(
+            text(&Key::Uuid(SAMPLE_UUID)),
+            "01234567-89ab-cdef-1032-547698badcfe"
+        );
+    }
+
+    #[test]
+    fn test_parse_long_accepts_its_digits() {
         assert_eq!(parse("0", KeyType::Long), Ok(Key::Long(0)));
+        assert_eq!(parse("-5", KeyType::Long), Ok(Key::Long(-5)));
         assert_eq!(
             parse(&i64::MAX.to_string(), KeyType::Long),
             Ok(Key::Long(i64::MAX))
@@ -122,18 +190,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_binary_round_trips_display() {
-        let key = Key::Bytes(SAMPLE_BYTES.to_vec());
-        let displayed = key.to_string();
-        assert!(displayed.starts_with("0x"));
-        assert_eq!(parse(&displayed, KeyType::Binary), Ok(key));
-    }
-
-    #[test]
     fn test_parse_binary_accepts_uppercase_and_no_prefix() {
         let key = Key::Bytes(SAMPLE_BYTES.to_vec());
-        let displayed = key.to_string();
-        let bare = displayed.trim_start_matches("0x");
+        let printed = text(&key);
+        assert!(printed.starts_with("0x"));
+        let bare = printed.trim_start_matches("0x");
         assert_eq!(parse(bare, KeyType::Binary), Ok(key.clone()));
         assert_eq!(
             parse(&bare.to_uppercase(), KeyType::Binary),
@@ -173,9 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_uuid_round_trips_display_and_simple_form() {
+    fn test_parse_uuid_accepts_the_simple_form() {
         let key = Key::Uuid(SAMPLE_UUID);
-        let hyphenated = key.to_string();
+        let hyphenated = text(&key);
         assert_eq!(parse(&hyphenated, KeyType::Uuid), Ok(key.clone()));
         let simple: String = hyphenated.chars().filter(|c| *c != '-').collect();
         assert_eq!(parse(&simple, KeyType::Uuid), Ok(key.clone()));
