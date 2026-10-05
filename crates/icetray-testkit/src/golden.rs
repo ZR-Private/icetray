@@ -163,13 +163,18 @@ pub fn warehouse() -> Result<String> {
 }
 
 /// The root of `table` under `warehouse`: `{warehouse}/db/{name}`, as the
-/// Hadoop catalog lays it out; a `Static` source follows it through its
-/// version hint.
+/// Hadoop catalog lays it out; a `Static` source, and so `--location`,
+/// follows it through its version hint.
+pub fn location(warehouse: &str, table: GoldenTable) -> String {
+    format!("{warehouse}/{NAMESPACE}/{table}")
+}
+
+/// `table` under `warehouse` as a `Static` source at its `location`.
 pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableConfig {
     TableConfig {
         name: table.to_string(),
         source: SourceConfig::Static {
-            location: format!("{warehouse}/{NAMESPACE}/{table}"),
+            location: location(warehouse, table),
         },
         r#ref: BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
