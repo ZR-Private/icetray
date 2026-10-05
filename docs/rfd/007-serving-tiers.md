@@ -1,5 +1,9 @@
 # Serving tiers
 
+> Updated 2026-10-04: the middle tier, once called cost, is called
+> inefficient, the word the doctor's serviceability already used; the
+> tiers and their contents are unchanged.
+
 > Updated 2026-10-04: the doctor honors each configured table's `strict`,
 > as the load does. See RFD 016.
 

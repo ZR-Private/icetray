@@ -1,5 +1,9 @@
 # Doctor
 
+> Updated 2026-10-04: cost findings are called inefficient findings, as
+> RFD 007 now names their tier, and a finding line's `tier` reads
+> `inefficient`.
+
 > Updated 2026-10-04: the doctor judges a configured table under its
 > configured `strict`, so a table `serve` would refuse is reported
 > refused, with exit 1, after its findings.
