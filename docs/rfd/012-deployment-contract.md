@@ -1,5 +1,9 @@
 # Deployment contract
 
+> Updated 2026-10-04: disk residency without a local directory is
+> refused with the configuration, and the doctor runs as a pod of its own
+> from the serving image rather than inside a serving pod.
+
 > Updated 2026-10-04: request counts carry the status code each call
 > answered, the gRPC layer's own answers included, the calls in flight
 > show beside their bound, and the series an alert keys on are exposed
@@ -46,8 +50,10 @@ the file's tables without a restart (RFD 018 (Configuration reload)).
 `icetray serve` runs the server; `doctor` (RFD 016 (Doctor)), `get`, and
 `info` are subcommands of the same binary with the same flags for where
 tables come from. The image a deployer runs therefore carries the tool that
-explains a refusal, and an operator can run it inside the pod against the
-daemon's own configuration and credentials.
+explains a refusal. An operator runs it as a pod of its own from that
+image, with the daemon's configuration and credentials, rather than inside
+a serving pod, where a full load would compete with the server for CPU and
+memory and share its local directory.
 
 Credentials come from the platform's default chain or from mounted files,
 and the storage layer of RFD 003 (One storage stack) resolves and caches
@@ -60,9 +66,10 @@ credential stores, and access policy to that layer.
 
 A deployer may mount a local directory; what lives in it, and why it needs
 no backup, is RFD 017 (Residency tiers). A replica without one can serve
-only the in-memory tiers. A table configured for disk residency then fails
-to load with a named reason, and the start-or-fail rule of RFD 005
-(Generations and refresh) applies.
+only the in-memory tiers. A configuration that sets a table to disk
+residency without one is invalid under RFD 011 (Configuration): `serve`
+refuses it before anything is opened, and a reload refuses it whole
+(RFD 018 (Configuration reload)).
 
 Logs are JSON events. A field-name map in configuration renames the
 standard fields (time, level, message, target) to the deployer's schema,
