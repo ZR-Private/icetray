@@ -36,6 +36,7 @@ tikv-jemallocator = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal"] }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
+tower.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

@@ -2,7 +2,7 @@
 //! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
 //! read under the table's key type, and core's errors mapped to status codes
 //! by variant. Every call is counted under `requests_total` by the code it
-//! answered (`telemetry::Answering`). `Get` and
+//! answered around the service, not in it (`counted::Counted`). `Get` and
 //! `MultiGet` run under the server's deadline for the method (RFD 013); a
 //! client's own deadline is tonic's, which drops the call at it. Together
 //! they hold at most `server.max_in_flight` slots, and a call that finds
@@ -28,7 +28,6 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
 use crate::error::{CallFault, WireKeyFault};
-use crate::telemetry::{Answering, Call, Requests};
 
 /// The in-flight slots `Get` and `MultiGet` hold together, at most
 /// `server.max_in_flight`: what admits a call, and what
@@ -90,14 +89,11 @@ pub struct Service {
     slots: Slots,
     /// The most keys one `MultiGet` may carry.
     max_multi_get_keys: usize,
-    /// `requests_total`, one handle per call and code.
-    requests: Requests,
 }
 
 impl Service {
     /// The service over the tables `opened` serves, by configured name,
-    /// under `server`'s request bounds, with `requests_total` of every call
-    /// and code registered at zero (`Requests::register`).
+    /// under `server`'s request bounds.
     pub fn new(opened: &Arc<Opened>, server: &ServerConfig) -> Self {
         Self {
             opened: Arc::clone(opened),
@@ -105,7 +101,6 @@ impl Service {
             multi_get_deadline: server.multi_get_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_keys: server.max_multi_get_keys,
-            requests: Requests::register(),
         }
     }
 
@@ -388,24 +383,21 @@ impl Service {
 #[tonic::async_trait]
 impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let answering = Answering::new(&self.requests, Call::Get);
-        answering.answer(self.answer_get(request.into_inner()).await)
+        self.answer_get(request.into_inner()).await
     }
 
     async fn multi_get(
         &self,
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        let answering = Answering::new(&self.requests, Call::MultiGet);
-        answering.answer(self.answer_multi_get(request.into_inner()).await)
+        self.answer_multi_get(request.into_inner()).await
     }
 
     async fn table_info(
         &self,
         request: Request<TableInfoRequest>,
     ) -> Result<Response<TableInfoResponse>, Status> {
-        let answering = Answering::new(&self.requests, Call::TableInfo);
-        answering.answer(self.answer_table_info(request.into_inner()))
+        self.answer_table_info(request.into_inner())
     }
 }
 

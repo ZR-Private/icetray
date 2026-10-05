@@ -2593,6 +2593,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-health",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

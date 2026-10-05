@@ -818,6 +818,55 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     Ok(())
 }
 
+/// A request body that is no gRPC message: its first byte, the
+/// compression flag, is neither 0 nor 1, so tonic answers `INTERNAL`
+/// before any handler runs, as `curl --http2-prior-knowledge` sending it
+/// is answered.
+const MALFORMED_BODY: &[u8] = b"\xff\xff\xff";
+
+/// A request tonic answers before its handler runs, a body that is no gRPC
+/// message, is counted under the status the client received, and a valid
+/// request beside it under `OK`: each exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_requests_total_counts_a_request_answered_before_its_handler() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_small().await?;
+    let before = stack.scrape().await?;
+
+    let mut channel = Channel::from_shared(format!("http://{}", stack.serving.listen_addr()))?
+        .connect()
+        .await?;
+    let malformed = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(format!("/{SERVICE_NAME}/{}", Call::Get.method()))
+        .header(hyper::header::CONTENT_TYPE, "application/grpc")
+        .header(hyper::header::TE, "trailers")
+        .body(tonic::body::Body::new(http_body_util::Full::new(
+            bytes::Bytes::from_static(MALFORMED_BODY),
+        )))?;
+    std::future::poll_fn(|cx| tower::Service::poll_ready(&mut channel, cx)).await?;
+    let response = tower::Service::call(&mut channel, malformed).await?;
+    let answered = response
+        .headers()
+        .get("grpc-status")
+        .map(|code| Code::from_bytes(code.as_bytes()));
+    assert_eq!(answered, Some(Code::Internal), "{:?}", response.headers());
+
+    let key = stack.fixtures[0].key(SAMPLE[0]);
+    stack.get(TABLE, Some(wire_key(&key))).await?;
+
+    let after = stack.scrape().await?;
+    assert_counted(&before, &after, Call::Get, Code::Internal, 1);
+    assert_counted(&before, &after, Call::Get, Code::Ok, 1);
+    let total = |exposition: &str| series_sum(exposition, metric::REQUESTS_TOTAL, &[]);
+    assert_eq!(
+        (total(&after) - total(&before)).to_bits(),
+        2.0_f64.to_bits(),
+        "nothing else is counted"
+    );
+    Ok(())
+}
+
 /// Every series an alert keys on is exposed once the server serves, before
 /// any call, swap, or reload: a new table's counters at zero, each call's
 /// `OK` count, each reload result, the page cache's counters and bytes,

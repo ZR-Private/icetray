@@ -31,11 +31,12 @@ use tonic::transport::server::TcpIncoming;
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
+use crate::counted::Counted;
 use crate::error::ServeError;
 use crate::listen::serve_http;
 use crate::reload::{Pending, Reload, Reloader};
 use crate::service::Service;
-use crate::telemetry::Scrape;
+use crate::telemetry::{Requests, Scrape};
 
 /// How long a first-load failure stays visible on the health service before
 /// the process exits: long enough for an orchestrator's probe, at the usual
@@ -169,7 +170,10 @@ impl Serving {
         let grpc = tokio::spawn(
             Server::builder()
                 .add_service(health_service)
-                .add_service(IcetrayServer::new(service))
+                .add_service(Counted::new(
+                    IcetrayServer::new(service),
+                    Requests::register(),
+                ))
                 .serve_with_incoming_shutdown(
                     grpc_incoming(listeners.grpc),
                     stop(shutdown.subscribe()),

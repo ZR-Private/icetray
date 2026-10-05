@@ -9,6 +9,7 @@
 //! daemon in-process and the binary from outside.
 
 pub mod cli;
+pub mod counted;
 pub mod error;
 pub mod key_text;
 pub mod listen;

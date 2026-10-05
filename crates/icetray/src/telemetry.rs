@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use icetray_core::{Opened, Tables, approx, metric, time};
+use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use metrics::Counter;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 use tikv_jemalloc_ctl::{epoch, stats};
-use tonic::{Code, Status};
+use tonic::Code;
 
 use crate::error::ServeError;
 use crate::reload::Pending;
@@ -74,6 +75,10 @@ pub fn install() -> Result<PrometheusHandle, ServeError> {
     Ok(HANDLE.get_or_init(|| handle).clone())
 }
 
+/// What separates the parts of a gRPC request's path,
+/// `/<service>/<method>`.
+const PATH_SEPARATOR: char = '/';
+
 /// The RPC a request was: the `call` label of `requests_total`. Display
 /// gives the label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -98,6 +103,26 @@ impl Call {
             Self::MultiGet => 1,
             Self::TableInfo => 2,
         }
+    }
+
+    /// The method's name in the contract, the last part of its path.
+    pub const fn method(self) -> &'static str {
+        match self {
+            Self::Get => "Get",
+            Self::MultiGet => "MultiGet",
+            Self::TableInfo => "TableInfo",
+        }
+    }
+
+    /// The call a request's `path` names, `/<service>/<method>`; `None`
+    /// for a path of another service or a method the contract does not
+    /// have, which is not a call.
+    pub fn of_path(path: &str) -> Option<Self> {
+        let method = path
+            .strip_prefix(PATH_SEPARATOR)?
+            .strip_prefix(SERVICE_NAME)?
+            .strip_prefix(PATH_SEPARATOR)?;
+        Self::ALL.into_iter().find(|call| call.method() == method)
     }
 }
 
@@ -194,42 +219,6 @@ impl Requests {
     /// Counts one request of `call` that answered `code`.
     pub fn count(&self, call: Call, code: Code) {
         self.counters[call.index()][code_index(code)].increment(1);
-    }
-}
-
-/// One request of a call being answered, counted in `requests` when it
-/// drops, with the code of the outcome `answer` was given. A call dropped
-/// before it answers counts as `CANCELLED`: tonic drops it at the client's
-/// `grpc-timeout` and answers `CANCELLED` itself, and a client that
-/// cancels is answered nothing.
-#[derive(Debug)]
-pub struct Answering {
-    requests: Requests,
-    call: Call,
-    code: Code,
-}
-
-impl Answering {
-    /// A request of `call`, not yet answered, to count in `requests`.
-    pub fn new(requests: &Requests, call: Call) -> Self {
-        Self {
-            requests: requests.clone(),
-            call,
-            code: Code::Cancelled,
-        }
-    }
-
-    /// Passes `outcome` through as the call's answer, counted under its
-    /// code: `OK` for a response, the status's own code otherwise.
-    pub fn answer<T>(mut self, outcome: Result<T, Status>) -> Result<T, Status> {
-        self.code = outcome.as_ref().map_or_else(Status::code, |_| Code::Ok);
-        outcome
-    }
-}
-
-impl Drop for Answering {
-    fn drop(&mut self) {
-        self.requests.count(self.call, self.code);
     }
 }
 
@@ -404,52 +393,6 @@ mod tests {
         }
     }
 
-    /// The `requests_total` count of `call` answering `code` in the
-    /// recorder now, zero before the series exists.
-    fn requests(handle: &PrometheusHandle, call: Call, code: Code) -> f64 {
-        series_value(
-            &render_after(handle, || {}),
-            metric::REQUESTS_TOTAL,
-            &[
-                (metric::LABEL_CALL, &call.to_string()),
-                (metric::LABEL_CODE, &CodeLabel(code).to_string()),
-            ],
-        )
-        .unwrap_or(0.0)
-    }
-
-    /// A request counts once, when it drops, under the code it answered:
-    /// a response's `OK`, a status's own code, and `CANCELLED` for one
-    /// dropped unanswered. `MultiGet` is the call no other test here
-    /// counts, so the differences are exact.
-    #[test]
-    fn test_answering_counts_the_code_answered_once_on_drop() {
-        let handle = install().unwrap();
-        let registered = Requests::register();
-        let cases: [(Option<Result<(), Status>>, Code); 3] = [
-            (Some(Ok(())), Code::Ok),
-            (Some(Err(Status::unavailable("sample"))), Code::Unavailable),
-            (None, Code::Cancelled),
-        ];
-        for (outcome, code) in cases {
-            let before = requests(&handle, Call::MultiGet, code);
-            let answering = Answering::new(&registered, Call::MultiGet);
-            let pending = requests(&handle, Call::MultiGet, code);
-            assert_eq!(pending.to_bits(), before.to_bits(), "{code:?} before drop");
-            match outcome {
-                Some(outcome) => {
-                    let passed = answering
-                        .answer(outcome)
-                        .map_or_else(|status| status.code(), |()| Code::Ok);
-                    assert_eq!(passed, code, "the outcome passes through");
-                }
-                None => drop(answering),
-            }
-            let after = requests(&handle, Call::MultiGet, code);
-            assert_eq!((after - before).to_bits(), 1.0_f64.to_bits(), "{code:?}");
-        }
-    }
-
     /// Once registered, every call's series of every code is exposed,
     /// before any request of it.
     #[test]
@@ -470,6 +413,22 @@ mod tests {
                     "{call} {code} in {exposition}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_of_path_names_the_contract_s_calls_alone() {
+        for call in Call::ALL {
+            let path = format!("/{SERVICE_NAME}/{}", call.method());
+            assert_eq!(Call::of_path(&path), Some(call), "{path}");
+        }
+        for path in [
+            format!("/{SERVICE_NAME}/Nothing"),
+            format!("/{SERVICE_NAME}/Get/more"),
+            "/grpc.health.v1.Health/Check".to_string(),
+            format!("{SERVICE_NAME}/Get"),
+        ] {
+            assert_eq!(Call::of_path(&path), None, "{path}");
         }
     }
 
