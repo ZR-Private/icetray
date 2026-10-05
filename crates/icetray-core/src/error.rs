@@ -394,8 +394,8 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         } => format!(
             "{reason} (file {path}, key {key} hashes to bucket {computed}, the manifest records bucket {recorded})"
         ),
-        RefusalReason::OverBudget { needed, budget } => {
-            format!("{reason} (needed {needed} bytes, budget {budget} bytes)")
+        RefusalReason::OverBudget { of, needed, budget } => {
+            format!("{reason} (needed {needed} bytes, {of} {budget} bytes)")
         }
         RefusalReason::KeyTypeUnsupported | RefusalReason::DeleteFiles => reason.to_string(),
     }
@@ -496,6 +496,8 @@ pub enum RefusalReason {
     /// resident-bytes budget, or the local directory's chunk-file budget
     /// shared by every disk-residency table.
     OverBudget {
+        /// Which of the two budgets it is held to.
+        of: Budget,
         /// The bytes the load would need: the table's resident bytes for
         /// full residency; for disk, the bytes `index/` would hold, other
         /// loads' reservations included.
@@ -510,6 +512,27 @@ pub enum RefusalReason {
         /// The row group without a filter.
         row_group: usize,
     },
+}
+
+/// The budget an `OverBudget` refusal is held to (RFD 017). Display gives
+/// the setting that sets it, for a log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Budget {
+    /// A full-residency table's `resident_budget_bytes`, the table's own.
+    Resident,
+    /// The local directory's `index_budget_bytes`, shared by every
+    /// disk-residency table.
+    Index,
+}
+
+impl fmt::Display for Budget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Resident => "resident_budget_bytes",
+            Self::Index => "index_budget_bytes",
+        };
+        f.write_str(name)
+    }
 }
 
 impl fmt::Display for RefusalReason {
@@ -600,6 +623,7 @@ mod tests {
             ),
             (
                 RefusalReason::OverBudget {
+                    of: Budget::Resident,
                     needed: 1,
                     budget: 0,
                 },

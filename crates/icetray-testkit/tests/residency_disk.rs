@@ -18,7 +18,7 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{
-    DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Storage, Value,
+    Budget, DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Storage, Value,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
@@ -200,7 +200,10 @@ async fn test_disk_over_budget_is_refused_before_any_chunk_is_written() -> Resul
         matches!(
             error,
             TestkitError::Core(Error::Refused {
-                reason: RefusalReason::OverBudget { .. },
+                reason: RefusalReason::OverBudget {
+                    of: Budget::Index,
+                    ..
+                },
                 ..
             })
         ),

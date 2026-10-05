@@ -41,7 +41,7 @@ pub use config::{
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
     StandardField, StorageConfig, TableConfig,
 };
-pub use error::{Error, ErrorKind, RefusalReason, Result};
+pub use error::{Budget, Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
 pub use index::{
     ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, PageHeaderFault, PageRef,

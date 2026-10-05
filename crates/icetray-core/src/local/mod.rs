@@ -39,7 +39,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::approx;
 use crate::config::LocalConfig;
-use crate::error::{Error, RefusalReason, Result};
+use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::key::KeyType;
 use crate::storage::IoStats;
 
@@ -347,6 +347,7 @@ impl LocalDir {
             Some(_) | None => Err(Error::refused(
                 table,
                 RefusalReason::OverBudget {
+                    of: Budget::Index,
                     needed: total.unwrap_or(u64::MAX),
                     budget,
                 },
@@ -838,6 +839,7 @@ mod tests {
         assert_eq!(
             refusal_of(local.reserve(TABLE, one_load)),
             RefusalReason::OverBudget {
+                of: Budget::Index,
                 needed: in_use + 2 * one_load,
                 budget,
             }
@@ -851,6 +853,7 @@ mod tests {
         assert_eq!(
             refusal_of(local.reserve(TABLE, 1)),
             RefusalReason::OverBudget {
+                of: Budget::Index,
                 needed: budget + 1,
                 budget,
             }

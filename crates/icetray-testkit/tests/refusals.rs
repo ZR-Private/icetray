@@ -16,7 +16,7 @@ use icetray_core::approx::count;
 use icetray_core::config::{ConfigError, ConfigViolation, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
-    Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState, bucket,
+    Budget, Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, STRAY_IDS, TINY_BUDGET,
@@ -410,7 +410,12 @@ async fn test_full_tier_over_budget_is_refused_at_the_footer_stage() -> Result<(
         fixture.config_with_budget(Residency::Full, true, Some(TINY_BUDGET)),
     )
     .await?;
-    let RefusalReason::OverBudget { needed, budget } = refused.reason else {
+    let RefusalReason::OverBudget {
+        of: Budget::Resident,
+        needed,
+        budget,
+    } = refused.reason
+    else {
         panic!("{:?}", refused.reason);
     };
     assert_eq!(budget, TINY_BUDGET);

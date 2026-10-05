@@ -20,7 +20,7 @@ use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::config::{Residency, TableConfig};
-use crate::error::{Error, RefusalReason, Result};
+use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
 use crate::local::{DataFileIdentity, LocalDir, Reservation};
@@ -590,7 +590,11 @@ fn check_budget(
                 if needed > budget {
                     return Err(Error::refused(
                         table,
-                        RefusalReason::OverBudget { needed, budget },
+                        RefusalReason::OverBudget {
+                            of: Budget::Resident,
+                            needed,
+                            budget,
+                        },
                     ));
                 }
             }
@@ -2873,8 +2877,11 @@ mod tests {
     async fn test_load_full_budget_refuses_at_the_footer_stage() {
         let (table, _) = two_bucket_table().await;
         let config = table.config(Residency::Full, Some(TINY_BUDGET));
-        let RefusalReason::OverBudget { needed, budget } =
-            refusal_of(table.load(&config, None, None).await)
+        let RefusalReason::OverBudget {
+            of: Budget::Resident,
+            needed,
+            budget,
+        } = refusal_of(table.load(&config, None, None).await)
         else {
             panic!("expected an over-budget refusal");
         };
@@ -2914,8 +2921,11 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let config = table.config(Residency::Disk, None);
         let tight = local_dir(scratch.path(), table.storage.stats(), Some(TINY_BUDGET));
-        let RefusalReason::OverBudget { needed, budget } =
-            refusal_of(table.load(&config, Some(&tight), None).await)
+        let RefusalReason::OverBudget {
+            of: Budget::Index,
+            needed,
+            budget,
+        } = refusal_of(table.load(&config, Some(&tight), None).await)
         else {
             panic!("expected an over-budget refusal");
         };
