@@ -224,7 +224,9 @@ Events worth knowing:
   on every load and refresh.
 - A finding on a load, with `code`, `tier`, and `file`: at `warn` for an
   inefficient finding and at `info` for advice.
-- `configuration reload refused`, at `warn`, with the `reason`.
+- `configuration reload refused`, at `warn`, with the `reason`, after a
+  `table failed to load for a reload` for each table that failed
+  ([Refresh and reload](#refresh-and-reload)).
 - `draining`, when a signal starts the drain.
 - `run failed`, at `error`, with the `error` that ended the run.
 - `jemalloc background purging is unavailable`, a warning on Linux only.
@@ -336,10 +338,18 @@ SIGHUP. A change to its tables applies without a restart
 - A reload is refused whole when any of those tables fails to load, when
   the file does not parse or validate (a file that lists no table among
   them), or when any setting outside `[[tables]]` changed; those apply on
-  restart only. The refusal is logged with the configuration error as its
-  `reason`, naming the file and the setting by its full path, and
-  counted, and `icetray_config_pending` reads 1 until the file and the
-  server agree.
+  restart only. The refusal is logged as `configuration reload refused`
+  and counted, and `icetray_config_pending` reads 1 until the file and
+  the server agree. Its `reason` names what to fix:
+  - for a file that does not parse or validate, the error, naming the file
+    and the setting by its full path;
+  - for a restart-only change, the setting, as in
+    `server.listen changed, which only a restart applies`;
+  - for tables that failed to load, their names, as in
+    `tables failed to load: kv`. Each table's own error is logged just
+    before, as `table failed to load for a reload` with `table`, `reason`,
+    and `error`.
+
   The server keeps serving. The poll retries once the file changes; SIGHUP
   retries at once.
 - Readiness does not change on a reload.
