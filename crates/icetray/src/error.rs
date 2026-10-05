@@ -90,7 +90,7 @@ impl fmt::Display for Hint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TableOrLocation => f.write_str(
-                "drop --table to open the location, or pass --config to select a configured table",
+                "drop --table to open the location, or pass --config instead of --location to select a configured table",
             ),
             Self::PassTable { tables } => {
                 write!(f, "pass --table with one of: {}", tables.join(", "))
