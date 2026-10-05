@@ -177,9 +177,10 @@ pub enum ConfigError {
         /// The operating system's refusal, or the decoding failure.
         source: std::io::Error,
     },
-    /// The text is not TOML.
+    /// The text is not TOML; boxed, since a TOML error is large and every
+    /// result that can fail on configuration carries the variant.
     #[error("configuration is not valid toml: {0}")]
-    Toml(toml::de::Error),
+    Toml(Box<TomlSyntax>),
     /// The text is not JSON.
     #[error("configuration is not valid json: {0}")]
     Json(serde_json::Error),
@@ -199,6 +200,63 @@ pub enum ConfigError {
     /// The configuration parsed but breaks a rule.
     #[error("invalid configuration: {0}")]
     Invalid(#[from] ConfigViolation),
+}
+
+/// Why a text is not TOML, on one line: the parser's message after the
+/// line and column it stopped at. The parser's own `Display` prints the
+/// source excerpt over several lines, which a report of one line per
+/// failure cannot hold.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", syntax_detail(*.at, .source))]
+pub struct TomlSyntax {
+    /// Where the parser stopped, when it says.
+    pub at: Option<TextPosition>,
+    /// The parser's error.
+    pub source: toml::de::Error,
+}
+
+impl TomlSyntax {
+    /// `source`, raised while parsing `text`, with the place it names.
+    fn new(text: &str, source: toml::de::Error) -> Self {
+        Self {
+            at: source.span().map(|span| TextPosition::of(text, span.start)),
+            source,
+        }
+    }
+}
+
+/// `TomlSyntax`'s message: `at` as `line L, column C: `, then the parser's
+/// message.
+fn syntax_detail(at: Option<TextPosition>, source: &toml::de::Error) -> String {
+    match at {
+        Some(TextPosition { line, column }) => {
+            format!("line {line}, column {column}: {}", source.message())
+        }
+        None => source.message().to_string(),
+    }
+}
+
+/// A place in a text, as an editor counts it: the line from one, and the
+/// column from one in characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPosition {
+    /// The line, from one.
+    pub line: usize,
+    /// The character in the line, from one.
+    pub column: usize,
+}
+
+impl TextPosition {
+    /// The place of byte `offset` in `text`; an offset past the end or
+    /// inside a character is taken as the end of the text.
+    fn of(text: &str, offset: usize) -> Self {
+        let before = text.get(..offset).unwrap_or(text);
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        Self {
+            line: before.matches('\n').count() + 1,
+            column: before[line_start..].chars().count() + 1,
+        }
+    }
 }
 
 /// What in a document does not fit the schema, in the syntax's own words.
@@ -503,7 +561,8 @@ impl Config {
             document.end().map_err(ConfigError::Json)?;
             Ok(config)
         } else {
-            let document = toml::Deserializer::parse(text).map_err(ConfigError::Toml)?;
+            let document = toml::Deserializer::parse(text)
+                .map_err(|error| ConfigError::Toml(Box::new(TomlSyntax::new(text, error))))?;
             Ok(
                 serde_path_to_error::deserialize(document).map_err(|error| {
                     ConfigError::Schema {
@@ -1677,6 +1736,25 @@ locaton = "typo"
     }
 
     #[test]
+    fn test_text_position_of_counts_lines_and_characters_from_one() {
+        let text = "ab\nçd\n";
+        let cases = [
+            (0, 1, 1),
+            (2, 1, 3),
+            (3, 2, 1),
+            (5, 2, 2),
+            (text.len(), 3, 1),
+        ];
+        for (offset, line, column) in cases {
+            assert_eq!(
+                TextPosition::of(text, offset),
+                TextPosition { line, column },
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
     fn test_place_spells_a_setting_as_the_file_does() {
         let text = TOML_MINIMAL.replace("ref = \"main\"\n", "ref = \"main\"\nstrict = 1\n");
         let Err(ConfigError::Schema { at, .. }) = Config::parse(&text) else {
@@ -1694,6 +1772,17 @@ locaton = "typo"
     fn test_parse_reports_malformed_text_as_its_syntax_s_error() {
         let toml = Config::parse("[[tables]\n");
         assert!(matches!(toml, Err(ConfigError::Toml(_))), "{toml:?}");
+        let unquoted = Config::parse("[server]\nlisten = \n");
+        let Err(ConfigError::Toml(syntax)) = unquoted else {
+            panic!("expected a toml syntax error, got {unquoted:?}");
+        };
+        assert_eq!(
+            syntax.at,
+            Some(TextPosition {
+                line: 2,
+                column: 10
+            })
+        );
         for json in [
             "{\"tables\": [",
             "{\"tables\": []} trailing",

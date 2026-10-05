@@ -803,6 +803,20 @@ async fn test_a_bad_log_field_mapping_exits_1() -> TestResult {
     Ok(())
 }
 
+/// A file that is not TOML is the file's failure, exit 1, reported as one
+/// plain error line like every other: the parser's place and message, not
+/// its excerpt of the file over several lines.
+#[test]
+fn test_a_toml_syntax_error_is_one_error_line() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = write_file(dir.path(), "broken.toml", "[server]\nlisten = \n")?;
+    let output = run(&["info", "--config", &config], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    assert!(output.stdout.is_empty(), "{}", stderr(&output));
+    assert!(!assert_plain_error(&output), "{}", stderr(&output));
+    Ok(())
+}
+
 /// A `--rewrite` rule for a prefix the file also maps is tried first, so it
 /// wins: the file's rule alone sends every read to a directory that does not
 /// exist, and the command line's rule for the same prefix keeps the reads
