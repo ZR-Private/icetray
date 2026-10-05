@@ -51,9 +51,9 @@ Credentials come from the SDK's default chain (profiles, single sign-on,
 external credential helpers, pod identity), bridged into the object-store
 client. The bridge caches what the chain resolves until shortly before it
 expires. There is one bridge for the storage layer: every S3 store it
-builds, one per bucket, signs through it, and so would the catalog
-clients of RFD 019 (AWS catalog sources), so the chain is consulted once
-per credential lifetime for the whole process. Explicit
+builds, one per bucket, signs through it, and so do the catalog clients
+of RFD 019 (AWS catalog sources), so the chain is consulted once per
+credential lifetime for the whole process. Explicit
 static keys in configuration take precedence over the chain, and they are
 the path for S3-compatible endpoints and for tests.
 
