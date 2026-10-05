@@ -1,6 +1,7 @@
 //! A key from command-line text in the form for its key type (`parse`).
-//! The key type comes from the served generation; the text alone does not
-//! say whether `1` is a long or a string.
+//! The key type comes from the table's metadata, read before any data file
+//! is (`Table::resolve_key_type`); the text alone does not say whether `1`
+//! is a long or a string.
 
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType};
