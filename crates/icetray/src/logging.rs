@@ -228,10 +228,12 @@ const OWN_TARGETS: [&str; 2] = ["icetray", "icetray_core"];
 const DEPENDENCY_LEVEL: Level = Level::WARN;
 
 /// Targets that pass only errors by default: the AWS SDK's profile-file
-/// parser, which warns once for every section of `~/.aws/config` it cannot
-/// use, and a laptop's file holds profiles for other tools that are no
-/// fault of icetray's.
-const QUIET_TARGETS: [&str; 1] = ["aws_runtime::env_config"];
+/// normalizer, which warns once for every section or key of `~/.aws/config`
+/// it ignores, and a laptop's file holds profiles for other tools that are
+/// no fault of icetray's. The SDK's warning that a file named by
+/// `AWS_CONFIG_FILE` or `AWS_SHARED_CREDENTIALS_FILE` is missing or
+/// unreadable comes from `aws_runtime::env_config::source`, and passes.
+const QUIET_TARGETS: [&str; 1] = ["aws_runtime::env_config::normalize"];
 
 /// The filter with `RUST_LOG` unset or invalid: icetray's own events at
 /// `level`, every other crate's at `DEPENDENCY_LEVEL`, and
@@ -535,6 +537,7 @@ mod tests {
             tracing::warn!(target: "foyer_storage::engine", "dependency warn");
             tracing::warn!(target: "aws_runtime::env_config::normalize", "profile warn");
             tracing::error!(target: "aws_runtime::env_config::normalize", "profile error");
+            tracing::warn!(target: "aws_runtime::env_config::source", "file warn");
             tracing::warn!(target: "aws_config::meta::credentials::chain", "chain warn");
         });
         assert_eq!(
@@ -544,6 +547,7 @@ mod tests {
                 "core info",
                 "dependency warn",
                 "profile error",
+                "file warn",
                 "chain warn"
             ]
         );
