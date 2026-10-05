@@ -168,12 +168,14 @@ pub enum Command {
         /// The table to read; needed when more than one is configured.
         #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
-        /// Keys to look up, in the form icetray prints them.
+        /// Keys to look up, each as text of the table's key type.
         ///
-        /// A long is its digits, a negative one included; a string is its
-        /// text; a binary key is hex, with or without 0x; a uuid is
-        /// hyphenated or 32 hex digits. A key that starts with - and is not
-        /// a number goes after --.
+        /// A long is its digits, with a leading - when negative. A string
+        /// is its text as given, without the double quotes a lookup line
+        /// prints around it. A binary key is hex, two digits per byte in
+        /// either case, with or without the 0x a lookup line prints. A uuid
+        /// is hyphenated or 32 hex digits. A key that starts with - and is
+        /// not a number goes after --.
         #[arg(value_name = "KEY", required = true, allow_negative_numbers = true)]
         keys: Vec<String>,
     },

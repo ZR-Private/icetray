@@ -1,7 +1,6 @@
-//! A key from command-line text, in the form `Key`'s `Display` prints, so
-//! what one subcommand prints another accepts. The key type comes from the
-//! served generation; the text alone does not say whether `1` is a long or
-//! a string.
+//! A key from command-line text in the form for its key type (`parse`).
+//! The key type comes from the served generation; the text alone does not
+//! say whether `1` is a long or a string.
 
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
 use icetray_core::{Key, KeyType};

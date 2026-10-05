@@ -383,8 +383,10 @@ its rules come from the file.
 Keys are given in the form for the table's key type:
 
 - a long as its digits, with a leading `-` when negative;
-- a string as its text;
-- a binary or fixed key as hex, two digits per byte, with or without `0x`;
+- a string as its text, without the double quotes a lookup line prints
+  around it;
+- a binary or fixed key as hex, two digits per byte in either case, with
+  or without the `0x` a lookup line prints;
 - a uuid hyphenated or as 32 hex digits.
 
 A key that starts with `-` and is not a number goes after `--`:
