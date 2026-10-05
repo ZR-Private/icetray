@@ -367,7 +367,10 @@ needs is a setting, a mounted file, or an environment variable.
   container image, `ghcr.io/<owner>/icetray:<version>`, for both: the
   release binary on Ubuntu 24.04, running as the image's `ubuntu` user,
   uid 1000, with `icetray serve` as its command. The image carries
-  `doctor`, `get`, and `info` too.
+  `doctor`, `get`, and `info` too. In the image's name, `<owner>` is the
+  GitHub owner of the repository that publishes the release, in lower
+  case, and `<version>` is the release's tag without its `v`, such as
+  `0.1.0`.
 - The configuration path comes from `ICETRAY_CONFIG`, so a pod passes no
   flags. TOML and JSON read into the same schema. The default listeners
   are loopback, so a container's file sets `listen` and `metrics_listen`.
@@ -439,8 +442,9 @@ the lookup rate both scale with it.
 
 ## Kubernetes
 
-A pod spec that follows the advice above. The resource sizes are
-placeholders; the sections below say how to choose them.
+A pod spec that follows the advice above. The image is the placeholder
+[Deploying](#deploying) explains, and the resource sizes are placeholders
+too; the sections below say how to choose them.
 
 ```yaml
 spec:
