@@ -150,8 +150,8 @@ fn prepare(
 /// Logs the open-file limit `raised` left in force, at `level` (`info` for
 /// `serve`, `debug` for a one-shot), or at `warn` why it could not be
 /// raised, and warns, with both numbers, when the limit is below the
-/// descriptors `config`'s disk level and a load need
-/// (`descriptors::needed_by`).
+/// descriptors `config`'s disk level and a load of each of its tables at
+/// once need (`descriptors::needed_by`).
 fn log_descriptor_limit(raised: io::Result<u64>, config: &Config, level: Level) {
     let limit = match raised {
         Ok(limit) => {

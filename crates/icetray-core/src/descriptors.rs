@@ -3,7 +3,8 @@
 //! running out explains a failure. The page cache's disk level holds one
 //! descriptor per block for the life of the process, and a load keeps one
 //! read in flight per file, each a descriptor for a local table and a
-//! socket for S3. A pod has no limit setting of its own, so the process
+//! socket for S3; every table loads at once at start, each with its own
+//! concurrency. A pod has no limit setting of its own, so the process
 //! takes what its hard limit allows and says when that is still short.
 
 use std::io;
@@ -13,26 +14,28 @@ use crate::config::Config;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::generation::load_concurrency;
 
-/// Descriptors beside the disk level's blocks and one load's reads: the two
+/// Descriptors beside the disk level's blocks and the loads' reads: the two
 /// listeners and their connections, the object store's and the catalog's
 /// connection pools, the standard streams, and the chunk file retention
 /// opens. Headroom for an estimate, not a measured bound.
 pub const DESCRIPTOR_MARGIN: u64 = 256;
 
 /// The descriptors a process whose disk level is `page_cache_disk_bytes`
-/// needs: one per block of the level
-/// (`contract::PAGE_CACHE_DISK_BLOCK_BYTES`), one per file a load keeps in
-/// flight on this runtime, and `DESCRIPTOR_MARGIN`. A disk-tier table's
+/// and that runs `loads` loads at once needs: one per block of the level
+/// (`contract::PAGE_CACHE_DISK_BLOCK_BYTES`), one per file each load keeps
+/// in flight on this runtime (`generation::load_concurrency`, which every
+/// load runs on its own), and `DESCRIPTOR_MARGIN`. A disk-tier table's
 /// chunk files, one per data file, come on top and are not known before
 /// its load.
-pub fn needed(page_cache_disk_bytes: u64) -> u64 {
+pub fn needed(page_cache_disk_bytes: u64, loads: usize) -> u64 {
     page_cache_disk_bytes / PAGE_CACHE_DISK_BLOCK_BYTES
-        + approx::count(load_concurrency())
+        + approx::count(loads).saturating_mul(approx::count(load_concurrency()))
         + DESCRIPTOR_MARGIN
 }
 
-/// `needed` for the disk level `config` sets; none without a local
-/// directory.
+/// `needed` for the disk level `config` sets, none without a local
+/// directory, and one load per configured table: the start loads every
+/// table at once.
 pub fn needed_by(config: &Config) -> u64 {
     needed(
         config
@@ -40,6 +43,7 @@ pub fn needed_by(config: &Config) -> u64 {
             .local
             .as_ref()
             .map_or(0, |local| local.page_cache_disk_bytes),
+        config.tables.len(),
     )
 }
 
@@ -139,7 +143,9 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LocalConfig, ServerConfig, StorageConfig};
+    use crate::config::{
+        LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    };
 
     /// The disk level the pre-launch review measured at 8 GiB.
     const EIGHT_GIB: u64 = 8 * 1024 * 1024 * 1024;
@@ -151,39 +157,60 @@ mod tests {
     const THIRTY_TWO_GIB_BLOCKS: u64 = 8_192;
 
     #[test]
-    fn test_needed_without_a_disk_level_is_one_load_and_the_margin() {
+    fn test_needed_without_a_disk_level_is_each_load_and_the_margin() {
+        assert_eq!(needed(0, 0), DESCRIPTOR_MARGIN);
         assert_eq!(
-            needed(0),
+            needed(0, 1),
             approx::count(load_concurrency()) + DESCRIPTOR_MARGIN
+        );
+        let loads = 3;
+        assert_eq!(
+            needed(0, loads),
+            approx::count(loads) * approx::count(load_concurrency()) + DESCRIPTOR_MARGIN
         );
     }
 
     #[test]
     fn test_needed_counts_one_descriptor_per_block() {
-        assert_eq!(needed(EIGHT_GIB) - needed(0), EIGHT_GIB_BLOCKS);
-        assert_eq!(needed(4 * EIGHT_GIB) - needed(0), THIRTY_TWO_GIB_BLOCKS);
+        assert_eq!(needed(EIGHT_GIB, 1) - needed(0, 1), EIGHT_GIB_BLOCKS);
+        assert_eq!(
+            needed(4 * EIGHT_GIB, 1) - needed(0, 1),
+            THIRTY_TWO_GIB_BLOCKS
+        );
     }
 
     #[test]
     fn test_needed_does_not_count_a_partial_block() {
         let one_and_a_half = PAGE_CACHE_DISK_BLOCK_BYTES + PAGE_CACHE_DISK_BLOCK_BYTES / 2;
-        assert_eq!(needed(one_and_a_half) - needed(0), 1);
+        assert_eq!(needed(one_and_a_half, 1) - needed(0, 1), 1);
     }
 
     #[test]
-    fn test_needed_by_reads_the_configured_disk_level() {
+    fn test_needed_by_reads_the_disk_level_and_counts_a_load_per_table() {
+        let table = TableConfig {
+            name: "kv".to_string(),
+            source: SourceConfig::Static {
+                location: "s3://warehouse/db/kv".to_string(),
+            },
+            r#ref: "main".to_string(),
+            key_column: "key".to_string(),
+            value_column: "value".to_string(),
+            strict: true,
+            residency: Residency::Full,
+            resident_budget_bytes: None,
+        };
         let mut config = Config {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
-            tables: Vec::new(),
+            tables: vec![table.clone(), table],
         };
-        assert_eq!(needed_by(&config), needed(0));
+        assert_eq!(needed_by(&config), needed(0, 2));
         config.storage.local = Some(LocalConfig {
             dir: "/var/lib/icetray".into(),
             index_budget_bytes: None,
             page_cache_disk_bytes: EIGHT_GIB,
         });
-        assert_eq!(needed_by(&config), needed(EIGHT_GIB));
+        assert_eq!(needed_by(&config), needed(EIGHT_GIB, 2));
     }
 
     /// A soft limit the child lowers itself to, below any hard limit a

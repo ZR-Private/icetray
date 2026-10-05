@@ -119,15 +119,18 @@ pub enum CacheError {
     Backend(#[from] foyer::Error),
     /// Opening the disk level ran out of file descriptors: the level holds
     /// one open file per block, and the process's open-file limit is below
-    /// what the level and a load need. The operating system's error is kept;
-    /// foyer's own wrapping of it is not, since it names no cause.
+    /// what the level needs. No load runs while the level opens, so the
+    /// estimate is the level's alone; the start's warning counts the loads
+    /// too. The operating system's error is kept; foyer's own wrapping of
+    /// it is not, since it names no cause.
     #[error(
-        "open-file limit {limit} is below the {needed} descriptors the disk level and loads need: {source}"
+        "open-file limit {limit} is below the {needed} descriptors the disk level needs: {source}"
     )]
     DescriptorLimit {
         /// The limit in force when opening failed (`descriptors::limit`).
         limit: u64,
-        /// The estimate for this disk level (`descriptors::needed`).
+        /// The estimate for this disk level with no load running
+        /// (`descriptors::needed`).
         needed: u64,
         /// The operating system's refusal: too many open files in the
         /// process, or in the system.
@@ -602,7 +605,7 @@ fn open_error(error: foyer::Error, disk: &DiskLevel) -> Error {
     match descriptors_exhausted(&error) {
         Some(source) => Error::Cache(CacheError::DescriptorLimit {
             limit: descriptors::limit(),
-            needed: descriptors::needed(disk.capacity_bytes()),
+            needed: descriptors::needed(disk.capacity_bytes(), 0),
             source,
         }),
         None => backend(error),
@@ -1444,7 +1447,7 @@ mod tests {
                 panic!("os error {code} is not a descriptor limit");
             };
             assert_eq!(limit, descriptors::limit());
-            assert_eq!(needed, descriptors::needed(DISK_BYTES));
+            assert_eq!(needed, descriptors::needed(DISK_BYTES, 0));
             assert_eq!(source.raw_os_error(), Some(code));
         }
     }
@@ -1510,7 +1513,8 @@ mod tests {
                     panic!("opened under {LOWERED_LIMIT} descriptors: {opened:?}");
                 };
                 assert_eq!(limit, LOWERED_LIMIT);
-                let expected = runtime.block_on(async { descriptors::needed(MANY_BLOCKS_BYTES) });
+                let expected =
+                    runtime.block_on(async { descriptors::needed(MANY_BLOCKS_BYTES, 0) });
                 assert_eq!(needed, expected);
                 assert_eq!(source.raw_os_error(), Some(libc::EMFILE));
             },
