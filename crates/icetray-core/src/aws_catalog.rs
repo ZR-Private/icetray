@@ -13,7 +13,7 @@ use std::time::Duration;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_glue::config::IdentityCache;
-use aws_sdk_glue::error::{DisplayErrorContext, SdkError};
+use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::get_table::GetTableError;
 use aws_sdk_s3tables::operation::get_table_metadata_location::GetTableMetadataLocationError;
 use tokio::sync::OnceCell;
@@ -83,17 +83,39 @@ pub(crate) fn table_bucket_region(arn: &str) -> Option<&str> {
     valid.then_some(region)
 }
 
+/// What joins an error's text to its cause's in `causes`.
+const CAUSE_SEPARATOR: &str = ": ";
+
 /// Why an AWS catalog call failed: the SDK's error for the one operation
 /// each source makes, whole, so a caller can match the service's error
-/// code. Display carries the SDK's full chain of causes.
+/// code. Display carries the SDK's chain of causes on one line (`causes`).
 #[derive(Debug, thiserror::Error)]
 pub enum AwsCatalogError {
     /// Glue's `GetTable` failed.
-    #[error("glue GetTable failed: {}", DisplayErrorContext(.0.as_ref()))]
+    #[error("glue GetTable failed: {}", causes(.0.as_ref()))]
     Glue(Box<SdkError<GetTableError>>),
     /// S3 Tables' `GetTableMetadataLocation` failed.
-    #[error("s3 tables GetTableMetadataLocation failed: {}", DisplayErrorContext(.0.as_ref()))]
+    #[error("s3 tables GetTableMetadataLocation failed: {}", causes(.0.as_ref()))]
     S3Tables(Box<SdkError<GetTableMetadataLocationError>>),
+}
+
+/// `error` and each of its causes, joined by `CAUSE_SEPARATOR`. A cause
+/// whose text the line already ends with is left out: the SDK wraps a
+/// service's error in an operation error that displays the same code and
+/// message, and its own context display would print both and a debug dump
+/// after them.
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut line = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let text = next.to_string();
+        if !text.is_empty() && !line.ends_with(&text) {
+            line.push_str(CAUSE_SEPARATOR);
+            line.push_str(&text);
+        }
+        cause = next.source();
+    }
+    line
 }
 
 /// A table in an AWS catalog (RFD 019), with the client that asks for it.
@@ -435,6 +457,8 @@ mod tests {
     const TEST_CATALOG_TIMEOUT: Duration = Duration::from_millis(200);
     /// The status line of a request the catalog refuses.
     const BAD_REQUEST: &str = "400 Bad Request";
+    /// The error code Glue answers a table it does not hold with.
+    const NOT_FOUND_CODE: &str = "EntityNotFoundException";
     /// The status line of a request the catalog answers.
     const OK: &str = "200 OK";
     /// What precedes the access key id in a `SigV4` `Authorization` header.
@@ -779,7 +803,7 @@ mod tests {
         let catalog = LocalHttp::start(Reply::Json {
             status: BAD_REQUEST,
             body: serde_json::json!({
-                "__type": "EntityNotFoundException",
+                "__type": NOT_FOUND_CODE,
                 "Message": "table not found",
             })
             .to_string(),
@@ -807,7 +831,56 @@ mod tests {
                 .is_some_and(GetTableError::is_entity_not_found_exception),
             "{error:?}"
         );
+        let shown = AwsCatalogError::Glue(error).to_string();
+        assert_eq!(
+            shown.matches(NOT_FOUND_CODE).count(),
+            1,
+            "the service's code shown once: {shown}"
+        );
         assert_eq!(catalog.requests(), 1, "a refusal is not retried");
+    }
+
+    /// An error whose display is `text`, caused by `cause`.
+    #[derive(Debug)]
+    struct Chained {
+        text: &'static str,
+        cause: Option<Box<Chained>>,
+    }
+
+    impl std::fmt::Display for Chained {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Chained {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_deref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chained(texts: &[&'static str]) -> Chained {
+        let (first, rest) = texts.split_first().expect("a text");
+        Chained {
+            text: first,
+            cause: (!rest.is_empty()).then(|| Box::new(chained(rest))),
+        }
+    }
+
+    /// A cause that repeats the text the line ends with is left out, and a
+    /// cause that adds to it is joined on, so a service error's code and
+    /// message appear once.
+    #[test]
+    fn test_causes_leaves_out_a_cause_the_line_already_ends_with() {
+        const OUTER: &str = "service error";
+        const OPERATION: &str = "NotFound (no such table)";
+        const DETAIL: &str = "status 400";
+        let line = causes(&chained(&[OUTER, OPERATION, OPERATION, DETAIL]));
+        assert_eq!(line.matches(OPERATION).count(), 1, "{line}");
+        assert_eq!(line.matches(CAUSE_SEPARATOR).count(), 2, "{line}");
+        assert!(line.starts_with(OUTER) && line.ends_with(DETAIL), "{line}");
     }
 
     #[tokio::test]
