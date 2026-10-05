@@ -24,8 +24,8 @@ Snapshots whose data files are the whole truth (appends and copy-on-write
 upserts) will be served, re-indexing only the files that changed; snapshots
 carrying delete files or deletion vectors (merge-on-read) will be refused
 in the first version, with a compaction-advanced serving ref as the
-recommended pattern and native merge-on-read reads as a later inefficient
-finding.
+recommended pattern, and native merge-on-read reads to come later, served
+as inefficient.
 
 Whole-truth snapshots need nothing new. Under RFD 005 (Generations and
 refresh) a refresh already pays only for the files that changed, so an
