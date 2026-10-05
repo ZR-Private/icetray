@@ -144,7 +144,7 @@ service = "icetray"
 |---|---|---|---|
 | `max_retries` | count | `2` | Retries of a failed S3 request. Zero tries each request once. |
 | `connect_timeout` | duration | `"1s"` | The longest an S3 connection may take to open. |
-| `catalog_timeout` | duration | `"30s"` | The longest one catalog call may run before the poll or load that made it fails. |
+| `catalog_timeout` | duration | `"30s"` | The longest one catalog call may run before the poll or load that made it fails: a `rest` table load, a `glue` `GetTable`, or an `s3tables` `GetTableMetadataLocation`. |
 | `s3` | table | absent | Explicit S3 client settings, below. |
 | `rewrite` | array of tables | empty | Location prefix rewrites, below. |
 | `hedge` | table | hedging on | Hedging of lookup GETs, below. |
@@ -156,13 +156,17 @@ Without this table, S3 requests are signed with credentials from the AWS
 SDK's default chain: environment variables, profiles and single sign-on,
 credential helpers, web identity, and container or instance roles. The
 chain and the region are loaded only when some location, after rewriting,
-is `s3://` or `s3a://`; a run over `file://` tables reads no AWS
-configuration and never contacts the instance metadata service.
+is `s3://` or `s3a://`, or when a table has a `glue` or `s3tables`
+source; a run over `file://` tables from `static` or `rest` sources reads
+no AWS configuration and never contacts the instance metadata service.
+Calls to Glue and S3 Tables are signed with the same credentials as S3
+requests: the static keys here when they are set, otherwise the chain,
+which is resolved once for both.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `endpoint` | string | AWS | The endpoint URL, for S3-compatible stores. |
-| `region` | string | the SDK's | The region. |
+| `region` | string | the SDK's | The region. A `glue` or `s3tables` source that names no region of its own uses it too. |
 | `access_key_id` | string | none | A static access key id. Set with `secret_access_key` or not at all. Static keys win over the chain. |
 | `secret_access_key` | string | none | The static secret key. It is never printed. |
 | `allow_http` | boolean | `false` | Permit a plain HTTP endpoint. |
@@ -233,6 +237,8 @@ new [generation](glossary.md) when the ref names a new snapshot.
 |---|---|---|
 | `"static"` | `location`, required: a table root or a metadata file | A table root is followed through its `metadata/version-hint.text`, as the Hadoop catalog writes it; an unchanged hint costs that one read. A location ending in `.metadata.json` names one metadata file, which never changes, so the table never advances. |
 | `"rest"` | `uri`, required: the catalog's base URI; `warehouse`, optional; `namespace`, required, its levels separated by dots (`"db.schema"`); `table`, required | Each poll loads the table from the catalog, one call within `storage.catalog_timeout`, and follows the metadata location the catalog returns. |
+| `"glue"` | `database` and `table`, required; `catalog_id`, `region`, and `endpoint`, optional; [below](#glue) | Each poll calls Glue's `GetTable`, one call within `storage.catalog_timeout`, and follows the table's `metadata_location` parameter. An unchanged location costs that call and no read. |
+| `"s3tables"` | `table_bucket_arn`, `namespace`, and `table`, required; `region` and `endpoint`, optional; [below](#s3tables) | Each poll calls S3 Tables' `GetTableMetadataLocation`, one call within `storage.catalog_timeout`, and follows the location it returns. An unchanged location costs that call and no read. |
 
 The `rest` source sends no credentials. Its requests carry no
 `Authorization` header, so a catalog that requires a bearer token, OAuth2
@@ -242,6 +248,67 @@ adds them. A catalog that answers an unauthenticated request with 401
 fails the table's first load, and the server exits 1. Credentials a
 catalog vends for storage are not used either: every object read goes
 through `[storage]` and its credentials.
+
+The `glue` and `s3tables` sources ask their catalog for the location of
+the table's current metadata file and nothing else. The metadata file and
+every file it names are read through `[storage]`, its rewrite rules
+included, as a `static` table's are. Their calls are signed with the
+credentials `[storage.s3]` describes, and a call the catalog refuses or
+that fails fails the load or poll with the error kind `catalog`; one that
+runs past `storage.catalog_timeout` fails it with `catalog_timeout`.
+
+The region of either source is its own `region` when set, else
+`storage.s3.region`, else, for `s3tables`, the region the table bucket's
+ARN names. A `glue` source that none of these names follows the SDK's own
+region resolution: `AWS_REGION`, the profile, or the instance metadata
+service.
+
+#### `glue`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `database` | string | required | The Glue database. Not empty. |
+| `table` | string | required | The table in the database. Not empty. |
+| `catalog_id` | string | the caller's account | The id of the catalog to read, for a table in another account's catalog. Not empty when set. |
+| `region` | string | as above | The region of the Glue endpoint. Not empty when set. |
+| `endpoint` | string | AWS | An `http://` or `https://` endpoint URL, for a Glue-compatible service or a VPC endpoint. |
+
+The table must be an Iceberg table: its `table_type` parameter is
+`ICEBERG`, in any case, and its `metadata_location` parameter names the
+current metadata file. A table of another type is refused with the error
+kind `table`, as is one without a `metadata_location`.
+
+```toml
+[tables.source]
+type = "glue"
+database = "db"
+table = "kv"
+```
+
+#### `s3tables`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `table_bucket_arn` | string | required | The table bucket's ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>`. Any other ARN makes the file invalid, as `tables[0].source.table_bucket_arn ... is not a table bucket arn`. |
+| `namespace` | string | required | The namespace in the bucket. Not empty. |
+| `table` | string | required | The table in the namespace. Not empty. |
+| `region` | string | as above | The region of the S3 Tables endpoint. Not empty when set. |
+| `endpoint` | string | AWS | An `http://` or `https://` endpoint URL, for an S3 Tables-compatible service or a VPC endpoint. |
+
+A table the service holds no metadata location for, such as one created
+and never written, is refused with the error kind `table`.
+
+```toml
+[tables.source]
+type = "s3tables"
+table_bucket_arn = "arn:aws:s3tables:us-east-1:111122223333:bucket/warehouse"
+namespace = "db"
+table = "kv"
+```
+
+A required key left out, or a key the source kind does not take, is
+refused at `tables[0].source`; an empty value is refused by the setting's
+full path, as `tables[0].source.database is empty`.
 
 ## Choosing a residency
 
@@ -518,7 +585,7 @@ for it:
 | Key | Value |
 |---|---|
 | `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`, `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`); `inefficient` for an inefficient table under `strict`; or `load_failed` when an error rather than a rule stopped the load. |
-| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
+| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
 `reason` and `error_kind` use the same names as the `reason` label of
