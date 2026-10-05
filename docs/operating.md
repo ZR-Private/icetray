@@ -1,7 +1,9 @@
 # Operating icetray
 
 Terms such as generation, residency, and degraded are defined in the
-[glossary](glossary.md).
+[glossary](glossary.md). The trade-offs behind the sizing on this page,
+and the settings that move them, are in
+[Performance and tuning](performance.md).
 
 ## Starting and stopping
 
