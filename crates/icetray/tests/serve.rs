@@ -4,6 +4,7 @@
 //! poll interval, the drain, the start-or-fail rule of RFD 005, and the
 //! configuration reload of RFD 018.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{Config, Residency, ServerConfig, SourceConfig, TableConfig};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::metric::{self, LookupResult};
+use icetray_core::metric::{self, Kind, LookupResult};
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
@@ -62,6 +63,9 @@ const NOBODY: &str = "nobody";
 
 /// A table no other test serves, so its counters read this test's alone.
 const FRESH_TABLE: &str = "kv_fresh";
+
+/// A table no other test serves, so its gauges are this test's alone.
+const SCRAPED_TABLE: &str = "kv_scraped";
 
 /// Loopback with an OS-assigned port, for both listeners.
 const LOOPBACK_ANY_PORT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -871,6 +875,82 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         Some(0.0)
     );
     Ok(())
+}
+
+/// Two scrapes with nothing between them expose the same gauges: every
+/// series of a described gauge the first exposed, the second exposes too.
+/// The recorder drops a gauge no scrape wrote since the scrape before, so a
+/// gauge set once on an event instead of on the scrape path fails here. The
+/// server serves a table and follows its configuration, so the first
+/// scrape holds every described gauge, and the test checks that it does: a
+/// gauge this server does not expose would pass the comparison unheld.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult {
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(SCRAPED_TABLE, KeyType::Long)],
+        async |setup| {
+            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+    let first = stack.scrape().await?;
+    let second = stack.scrape().await?;
+
+    let first_series = gauge_series(&first, SCRAPED_TABLE);
+    for (name, kind, _) in metric::DESCRIPTIONS {
+        if kind == Kind::Gauge {
+            assert!(
+                first_series.iter().any(|series| series.name == name),
+                "{name} in {first}"
+            );
+        }
+    }
+    let second_series = gauge_series(&second, SCRAPED_TABLE);
+    let dropped: Vec<_> = first_series.difference(&second_series).collect();
+    assert!(
+        dropped.is_empty(),
+        "gauges the second scrape dropped: {dropped:?}"
+    );
+    Ok(())
+}
+
+/// One sample line's series: its metric name and its label text.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Series<'a> {
+    name: &'a str,
+    labels: &'a str,
+}
+
+/// The series of every gauge `metric::DESCRIPTIONS` names in `exposition`,
+/// leaving out those labeled with a table other than `table`, which belong
+/// to another test's server.
+fn gauge_series<'a>(exposition: &'a str, table: &str) -> BTreeSet<Series<'a>> {
+    let gauges: Vec<&str> = metric::DESCRIPTIONS
+        .iter()
+        .filter(|(_, kind, _)| *kind == Kind::Gauge)
+        .map(|(name, ..)| *name)
+        .collect();
+    exposition
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let (series, _value) = line.rsplit_once(' ')?;
+            let (name, labels) = series.split_once('{').map_or((series, ""), |(name, rest)| {
+                (name, rest.trim_end_matches('}'))
+            });
+            Some(Series { name, labels })
+        })
+        .filter(|series| gauges.contains(&series.name))
+        .filter(|series| {
+            series.labels.split(',').all(|pair| {
+                pair.split_once('=').is_none_or(|(label, quoted)| {
+                    label != metric::LABEL_TABLE || quoted.trim_matches('"') == table
+                })
+            })
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]

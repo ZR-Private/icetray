@@ -39,6 +39,13 @@ pub const LOOKUP_SECONDS: &str = "icetray_lookup_seconds";
 /// Object-store GET latency in seconds, by `kind`.
 pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
 
+// Every gauge below is written on the scrape path (the binary's
+// `Scrape::publish`, through `Table::publish_gauges` and the like), never
+// only set once on an event. The binary's recorder drops a gauge no scrape wrote
+// since the scrape before, so a gauge set on an event reads in one scrape
+// and is gone from the next. `test_scrape_keeps_every_gauge_the_scrape_before_exposed`
+// in `crates/icetray/tests/serve.rs` scrapes twice and fails on such a gauge.
+
 /// The resident index's live bytes, by `table`: what a residency tier sheds,
 /// which process memory does not show on every platform.
 pub const INDEX_BYTES: &str = "icetray_index_bytes";
@@ -86,7 +93,7 @@ pub const MAX_IN_FLIGHT: &str = "icetray_max_in_flight";
 pub enum Kind {
     /// A count that only rises.
     Counter,
-    /// A value that is set.
+    /// A value that is set, by every scrape (see the gauge constants).
     Gauge,
     /// A distribution of samples, in buckets.
     Histogram,
