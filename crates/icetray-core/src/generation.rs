@@ -1081,6 +1081,10 @@ pub(crate) mod testing {
     pub(crate) const FIRST_SEQUENCE: i64 = 1;
     pub(crate) const SECOND_SEQUENCE: i64 = 2;
     pub(crate) const THIRD_SEQUENCE: i64 = 3;
+    /// The GETs a poll of a static table root costs when the version hint
+    /// names the metadata location the table knows: the hint alone (RFD
+    /// 005).
+    pub(crate) const POLL_GETS: u64 = 1;
     /// The metadata versions of the end-to-end snapshots.
     pub(crate) const FIRST_VERSION: u64 = 1;
     pub(crate) const SECOND_VERSION: u64 = 2;
@@ -1469,8 +1473,8 @@ pub(crate) mod testing {
         md: TableMetadata,
         /// The default spec, which `add_file` writes under.
         spec_id: i32,
-        /// Every data file written so far with the spec it was written
-        /// under: its entry for the next manifest.
+        /// Every data file written and delete file recorded so far with the
+        /// spec it was written under: its entry for the next manifest.
         pub(crate) files: Vec<(DataFile, i32)>,
     }
 
@@ -1561,6 +1565,27 @@ pub(crate) mod testing {
             .await;
         }
 
+        /// Records a position-delete file `name` in `bucket` for the next
+        /// snapshot, listed in a delete manifest, as a merge-on-read writer
+        /// leaves one (RFD 009). Nothing is written at its path: a live
+        /// delete entry is refused from the manifest alone.
+        pub(crate) fn add_position_delete(&mut self, name: &str, bucket: u32) {
+            let records = 1;
+            let bytes = 1;
+            self.files.push((
+                manifest_testing::data_file(
+                    &self.path_of(name),
+                    self.spec_id,
+                    manifest_testing::partition(Partition::Bucket(bucket)),
+                    records,
+                    bytes,
+                    None,
+                    DataContentType::PositionDeletes,
+                ),
+                self.spec_id,
+            ));
+        }
+
         /// Drops the recorded file `name`, so the next snapshot no longer
         /// lists it or lists another file added under the same name.
         pub(crate) fn remove_file(&mut self, name: &str) {
@@ -1602,9 +1627,10 @@ pub(crate) mod testing {
             self.spec_id = self.md.default_partition_spec_id();
         }
 
-        /// Commits every file added so far as snapshot `id`, one manifest
-        /// per spec the files were written under, and writes the metadata
-        /// as `version`, pointing the hint at it.
+        /// Commits every file added so far as snapshot `id`, one data
+        /// manifest per spec the data files were written under and one
+        /// delete manifest per spec the delete files were, and writes the
+        /// metadata as `version`, pointing the hint at it.
         pub(crate) async fn commit(
             &mut self,
             id: i64,
@@ -1612,20 +1638,28 @@ pub(crate) mod testing {
             sequence: i64,
             version: u64,
         ) {
-            let mut by_spec: BTreeMap<i32, Vec<(DataFile, ManifestStatus)>> = BTreeMap::new();
+            let mut by_spec: BTreeMap<(i32, bool), Vec<(DataFile, ManifestStatus)>> =
+                BTreeMap::new();
             for (file, spec_id) in &self.files {
+                let deletes = file.content_type() != DataContentType::Data;
                 by_spec
-                    .entry(*spec_id)
+                    .entry((*spec_id, deletes))
                     .or_default()
                     .push((file.clone(), ManifestStatus::Added));
             }
             let manifests = by_spec
                 .into_iter()
-                .map(|(spec_id, entries)| manifest_testing::ManifestSpec {
-                    spec_id,
-                    content: ManifestContentType::Data,
-                    entries,
-                })
+                .map(
+                    |((spec_id, deletes), entries)| manifest_testing::ManifestSpec {
+                        spec_id,
+                        content: if deletes {
+                            ManifestContentType::Deletes
+                        } else {
+                            ManifestContentType::Data
+                        },
+                        entries,
+                    },
+                )
                 .collect();
             let snapshot = manifest_testing::write_snapshot(
                 &self.md,

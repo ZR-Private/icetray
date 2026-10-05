@@ -420,10 +420,13 @@ mod tests {
         ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig,
         TableConfig,
     };
+    use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
-        FIRST_SNAPSHOT, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TWO, Table as Fixture,
+        E2E_KEYS, FIRST_SNAPSHOT, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
+        SECOND_VERSION, TWO, Table as Fixture, bucketing, keys_from, keys_in_bucket,
         two_bucket_table,
     };
+    use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::STALL;
     use crate::table::TableState;
@@ -825,6 +828,97 @@ mod tests {
         assert!(!Arc::ptr_eq(&after, &before));
         assert_eq!(after.config(), &changed);
         assert!(after.current().is_some());
+    }
+
+    /// One poll of `table` whose source still names the location of a
+    /// snapshot it refused over budget: the version hint alone is read
+    /// through `opened`'s storage, nothing is swapped, and the table stays
+    /// degraded for the refusal.
+    async fn poll_held_back(opened: &Opened, table: &Table) {
+        let stats = opened.storage.stats();
+        let before = stats.gets();
+        assert!(!table.refresh().await.unwrap());
+        assert_eq!(stats.gets(), before + POLL_GETS, "the version hint alone");
+        assert!(
+            matches!(
+                table.state(),
+                TableState::Degraded {
+                    reason: ErrorKind::Refused(RefusalReason::OverBudget { .. }),
+                    ..
+                }
+            ),
+            "{:?}",
+            table.state()
+        );
+    }
+
+    /// A refusal that depends on the table's entry, here its resident
+    /// budget, is remembered by the table that made it, and a reload that
+    /// leaves the entry as it is keeps that table and what it remembers; a
+    /// reload that changes the entry builds the refused snapshot again
+    /// under the new one.
+    #[tokio::test]
+    async fn test_apply_tries_a_remembered_refusal_again_under_a_changed_entry() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let unbounded = named(FIRST_TABLE, &fixture, Residency::Full);
+        let opened = loaded(&config(vec![unbounded.clone()])).await;
+        let first_bytes = table_named(&opened, FIRST_TABLE)
+            .unwrap()
+            .current()
+            .unwrap()
+            .index_bytes;
+        let bounded = TableConfig {
+            resident_budget_bytes: Some(approx::count(first_bytes)),
+            ..unbounded.clone()
+        };
+        opened.apply(std::slice::from_ref(&bounded)).await.unwrap();
+        let table = table_named(&opened, FIRST_TABLE).unwrap();
+        let above = keys_from(all.last().unwrap() + KEY_STEP, E2E_KEYS);
+        let appended = keys_in_bucket(&above, bucketing(TWO), 0);
+        fixture.add_long_file("f2", &appended, 0).await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+
+        let error = table.refresh().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Refused {
+                    reason: RefusalReason::OverBudget {
+                        of: Budget::Resident,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        poll_held_back(&opened, &table).await;
+
+        let applied = opened.apply(std::slice::from_ref(&bounded)).await.unwrap();
+        assert_eq!(applied.kept, 1);
+        assert!(Arc::ptr_eq(
+            &table_named(&opened, FIRST_TABLE).unwrap(),
+            &table
+        ));
+        poll_held_back(&opened, &table).await;
+
+        let applied = opened
+            .apply(std::slice::from_ref(&unbounded))
+            .await
+            .unwrap();
+        assert_eq!(names_of(&applied.started), [FIRST_TABLE]);
+        let replaced = table_named(&opened, FIRST_TABLE).unwrap();
+        assert_eq!(
+            replaced.current().unwrap().snapshot_id,
+            SnapshotId(SECOND_SNAPSHOT)
+        );
     }
 
     /// A table that fails its first load refuses the whole reload: the set

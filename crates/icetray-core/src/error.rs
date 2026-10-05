@@ -317,6 +317,58 @@ pub enum ErrorKind {
     LookupCanceled,
 }
 
+impl ErrorKind {
+    /// Whether a refresh that failed this way would fail the same way
+    /// again over the same metadata location, before the table's entry
+    /// changes: what decides if a table remembers the failure and stops
+    /// building the snapshot there (RFD 005). The one classification of
+    /// every kind; a new kind is classified here or does not compile.
+    pub(crate) fn recurrence(&self) -> Recurrence {
+        match self {
+            Self::Refused(reason) => reason.recurrence(),
+            // The doctor's verdict on a built generation is a function of
+            // the generation, and `strict` is the table's own setting.
+            Self::Inefficient => Recurrence::Deterministic,
+            Self::Iceberg
+            | Self::Parquet
+            | Self::ObjectStore
+            | Self::ObjectStorePath
+            | Self::Json
+            | Self::Config
+            | Self::Location
+            | Self::Cache
+            | Self::KeyType
+            | Self::Table
+            | Self::File
+            | Self::NotReady
+            | Self::Local
+            | Self::CatalogTimeout
+            | Self::Catalog
+            | Self::LoadDeadline
+            | Self::RefreshDeadline
+            | Self::VerifyCanceled
+            | Self::LookupCanceled => Recurrence::Transient,
+        }
+    }
+}
+
+/// Whether a failure can end otherwise when the same work is tried again
+/// (RFD 005).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recurrence {
+    /// A function of the snapshot and the table's configuration alone: a
+    /// metadata file and the files it names are immutable, so building the
+    /// snapshot again under the same entry fails the same way, and costs
+    /// its reads and a log line each time.
+    Deterministic,
+    /// May succeed on another try: a store, catalog, cache, or local
+    /// directory failure, a timeout, a deadline, or a cancellation. Every
+    /// kind that is neither a rule refusal nor the strict gate is classed
+    /// here, a table or file fault included, so it is tried again on every
+    /// poll.
+    Transient,
+}
+
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -514,6 +566,37 @@ pub enum RefusalReason {
     },
 }
 
+impl RefusalReason {
+    /// `ErrorKind::recurrence` of a refusal for this reason. Every rule
+    /// but one reads only the snapshot's metadata and files and the
+    /// table's configuration (its columns, residency, and resident budget)
+    /// against fixed contract limits. The local directory's index budget
+    /// is shared: whether a load fits depends on the chunk files and
+    /// reservations of every other table, which change without this
+    /// table's source moving.
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            Self::Unsorted { .. }
+            | Self::NullKeys { .. }
+            | Self::DuplicateKeys { .. }
+            | Self::KeyOutsideBucket { .. }
+            | Self::KeyTypeMismatch { .. }
+            | Self::KeyTypeUnsupported
+            | Self::ValueTypeUnsupported { .. }
+            | Self::DeleteFiles
+            | Self::KeyTooLong { .. }
+            | Self::NoBloomFilter { .. }
+            | Self::OverBudget {
+                of: Budget::Resident,
+                ..
+            } => Recurrence::Deterministic,
+            Self::OverBudget {
+                of: Budget::Index, ..
+            } => Recurrence::Transient,
+        }
+    }
+}
+
 /// The budget an `OverBudget` refusal is held to (RFD 017). Display gives
 /// the setting that sets it, for a log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -564,9 +647,10 @@ mod tests {
     /// A synthetic data file location for the reasons that name one.
     const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
 
-    #[test]
-    fn test_fmt_refusal_reason_snake_case_names() {
-        let cases = [
+    /// One reason of every variant, each beside its name; an over-budget
+    /// one is held to the table's own budget.
+    fn reason_cases() -> Vec<(RefusalReason, &'static str)> {
+        vec![
             (
                 RefusalReason::Unsorted {
                     path: FILE_PATH.to_string(),
@@ -636,9 +720,59 @@ mod tests {
                 },
                 "no_bloom_filter",
             ),
-        ];
-        for (reason, name) in cases {
+        ]
+    }
+
+    #[test]
+    fn test_fmt_refusal_reason_snake_case_names() {
+        for (reason, name) in reason_cases() {
             assert_eq!(reason.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn test_recurrence_is_deterministic_for_rule_refusals_and_the_strict_gate_alone() {
+        for (reason, name) in reason_cases() {
+            assert_eq!(
+                ErrorKind::Refused(reason).recurrence(),
+                Recurrence::Deterministic,
+                "{name}"
+            );
+        }
+        let shared = RefusalReason::OverBudget {
+            of: Budget::Index,
+            needed: 1,
+            budget: 0,
+        };
+        assert_eq!(
+            ErrorKind::Refused(shared).recurrence(),
+            Recurrence::Transient,
+            "the shared index budget frees as other tables change"
+        );
+        for (error, name) in wrapped_cases().into_iter().chain(raised_cases()) {
+            let expected = match &error {
+                Error::Refused { .. } | Error::Inefficient { .. } => Recurrence::Deterministic,
+                Error::Iceberg(_)
+                | Error::Parquet(_)
+                | Error::ObjectStore(_)
+                | Error::ObjectStorePath(_)
+                | Error::Json(_)
+                | Error::Config(_)
+                | Error::Location { .. }
+                | Error::Cache(_)
+                | Error::KeyType { .. }
+                | Error::Table { .. }
+                | Error::File { .. }
+                | Error::NotReady { .. }
+                | Error::Local { .. }
+                | Error::CatalogTimeout { .. }
+                | Error::Catalog { .. }
+                | Error::LoadDeadline { .. }
+                | Error::RefreshDeadline { .. }
+                | Error::VerifyCanceled { .. }
+                | Error::LookupCanceled { .. } => Recurrence::Transient,
+            };
+            assert_eq!(error.kind().recurrence(), expected, "{name}");
         }
     }
 

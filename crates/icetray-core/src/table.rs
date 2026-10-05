@@ -25,7 +25,7 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode, Tier};
 use crate::config::TableConfig;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{Error, ErrorKind, Recurrence, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
 use crate::local::LocalDir;
@@ -225,14 +225,19 @@ pub struct Table {
     current: ArcSwapOption<Generation>,
     /// Never held across an `await`.
     state: Mutex<TableState>,
-    /// The metadata location the table last resolved and admitted, or found
-    /// unchanged in snapshot; what `refresh` compares the source against,
-    /// so a metadata change that did not move the followed ref does not
-    /// make every later poll read the metadata again. A failed build does
-    /// not advance it: the next poll reads the metadata again and retries,
-    /// so a transient failure recovers and a refusal is counted per poll.
-    /// `None` until the first successful resolve.
-    known: Mutex<Option<String>>,
+    /// The metadata location a poll compares the source against: the one
+    /// the table last admitted or found its serving snapshot at, so a
+    /// metadata change that did not move the followed ref does not make
+    /// every later poll read the metadata again, or the one whose snapshot
+    /// a poll over a serving generation was refused for deterministically
+    /// (`Recurrence::Deterministic`), so that snapshot is not built again
+    /// until the source names another location. A transient failure does
+    /// not advance it: the next poll reads the metadata again and retries.
+    /// `None` until the first successful build. A reload that changes the
+    /// table's entry builds a new `Table`, which remembers nothing, so a
+    /// refusal that depended on the old entry is tried again under the new
+    /// one (RFD 018).
+    known: Mutex<Option<Known>>,
     /// Serializes `load` and `refresh`; `Opened::retain` takes every
     /// table's in turn, and nothing else ever takes two.
     serial: tokio::sync::Mutex<()>,
@@ -257,6 +262,29 @@ pub struct Table {
     /// written, so a withdrawal and a publish never interleave; never held
     /// across an `await`.
     gauges: Mutex<Gauges>,
+}
+
+/// The metadata location a table's polls compare their source against,
+/// and whether the snapshot the ref names there was refused.
+#[derive(Clone, Debug)]
+struct Known {
+    /// The metadata file's location.
+    location: String,
+    /// The deterministic refusal of the snapshot the ref names at
+    /// `location`; `None` when the table serves that snapshot.
+    refused: Option<Refusal>,
+}
+
+/// A refusal a table remembers until its source names another metadata
+/// location.
+#[derive(Clone, Debug)]
+struct Refusal {
+    /// The snapshot refused.
+    snapshot_id: SnapshotId,
+    /// Why, as the failure's kind.
+    reason: ErrorKind,
+    /// When the refusal was made.
+    since: Instant,
 }
 
 /// A table's gauges: whether they are shown, and what its serving
@@ -619,6 +647,12 @@ impl Table {
     /// the table `Degraded`, and counts one `refresh_errors_total` with the
     /// error's kind as its reason; `Ok(false)` after such a failure ends
     /// the `Degraded` state, since the table is in step with its ref again.
+    /// A deterministic failure over a serving generation is the exception
+    /// (`Recurrence::Deterministic`): the table remembers it, and while the
+    /// source names the same metadata location each poll costs only the
+    /// small read, returns `Ok(false)`, counts nothing, and leaves the table
+    /// `Degraded` for that refusal. A transient failure is tried again on
+    /// the next poll.
     /// The poll runs within the refresh deadline, or with no generation
     /// serving within the load deadline; past it the poll is dropped as
     /// `Error::RefreshDeadline` or `Error::LoadDeadline`, a failure like any
@@ -872,7 +906,8 @@ impl Table {
 
     /// One poll over `current`: the source is asked whether its metadata
     /// moved from the known location, and only a snapshot with another id
-    /// is built.
+    /// is built. A build refused deterministically is remembered against
+    /// its location, so an unchanged source then builds nothing.
     async fn poll(&self, current: &Arc<Generation>) -> Result<bool> {
         let known = self
             .known
@@ -882,20 +917,35 @@ impl Table {
             .expect("a serving generation was admitted, which recorded its metadata location");
         let Some(resolved) = self
             .source
-            .resolve_if_changed(&self.storage, Some(&known))
+            .resolve_if_changed(&self.storage, Some(&known.location))
             .await?
         else {
-            self.in_step(current);
+            match &known.refused {
+                Some(refusal) => self.held_back(refusal),
+                None => self.in_step(current),
+            }
             return Ok(false);
         };
         let snapshot = self.ref_snapshot(&resolved)?;
-        if SnapshotId(snapshot.snapshot_id()) == current.snapshot_id {
-            self.remember(&resolved.location);
+        let snapshot_id = SnapshotId(snapshot.snapshot_id());
+        if snapshot_id == current.snapshot_id {
+            self.remember(&resolved.location, None);
             self.in_step(current);
             return Ok(false);
         }
         self.build_and_admit(&resolved, &snapshot, Some(current))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                let reason = error.kind();
+                if reason.recurrence() == Recurrence::Deterministic {
+                    let refusal = Refusal {
+                        snapshot_id,
+                        reason,
+                        since: Instant::now(),
+                    };
+                    self.remember(&resolved.location, Some(refusal));
+                }
+            })?;
         Ok(true)
     }
 
@@ -924,7 +974,7 @@ impl Table {
         .await?;
         let findings = self.gate(&generation)?;
         self.swap(generation, previous, &findings);
-        self.remember(&resolved.location);
+        self.remember(&resolved.location, None);
         Ok(())
     }
 
@@ -1022,9 +1072,51 @@ impl Table {
         error
     }
 
-    /// Records the metadata location the table is now in step with.
-    fn remember(&self, location: &str) {
-        *self.known.lock().unwrap_or_else(PoisonError::into_inner) = Some(location.to_string());
+    /// The poll found the source still naming the location whose snapshot
+    /// `refusal` refused, so the table stays `Degraded` for that refusal.
+    /// The state is set again when it names another reason: a transient
+    /// failure of a poll since the refusal replaced it.
+    fn held_back(&self, refusal: &Refusal) {
+        let degraded_for_it = matches!(
+            self.state(),
+            TableState::Degraded { ref reason, .. } if *reason == refusal.reason
+        );
+        if !degraded_for_it {
+            self.set_state(TableState::Degraded {
+                serving: self.current().map(|generation| generation.snapshot_id),
+                reason: refusal.reason.clone(),
+                since: refusal.since,
+            });
+        }
+    }
+
+    /// Records the metadata location the table is now in step with, or
+    /// whose snapshot `refused` refused. Replacing a remembered refusal
+    /// with another location logs, once, that the source moved past it.
+    fn remember(&self, location: &str, refused: Option<Refusal>) {
+        let next = Known {
+            location: location.to_string(),
+            refused,
+        };
+        let previous = self
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(next);
+        if let Some(Known {
+            location: was,
+            refused: Some(past),
+        }) = previous
+            && was != location
+        {
+            tracing::info!(
+                table = self.name(),
+                snapshot_id = %past.snapshot_id,
+                reason = %past.reason,
+                location,
+                "source moved past a refused snapshot"
+            );
+        }
     }
 
     /// Replaces the state and publishes it.
@@ -1164,10 +1256,10 @@ mod tests {
     use crate::error::{ErrorKind, RefusalReason};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
-        FIRST_VERSION, FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
-        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table as Fixture,
-        WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys, parquet,
-        two_bucket_table, value_for, values_of,
+        FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
+        SECOND_VERSION, TABLE, THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO,
+        Table as Fixture, WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys,
+        parquet, two_bucket_table, value_for, values_of,
     };
     use crate::index::testing::with_dictionary_one_entry_short;
     use crate::index::{DecodedPart, FileFault};
@@ -1177,8 +1269,6 @@ mod tests {
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
 
-    /// The GETs an unchanged poll costs: the version hint (RFD 005).
-    const POLL_GETS: u64 = 1;
     /// The positions in bucket 0's key list that the duplicate file
     /// repeats.
     const DUP_KEYS: Range<usize> = 1..3;
@@ -2014,6 +2104,46 @@ mod tests {
         );
     }
 
+    /// A refresh onto a new data file that cannot be read fails transiently,
+    /// and the next poll builds the snapshot again rather than remembering
+    /// the failure; once the file reads, the snapshot is swapped in.
+    #[tokio::test]
+    async fn test_refresh_tries_a_transient_failure_again_on_the_next_poll() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
+        let location = fixture.path_of("f2");
+        let on_disk = location.strip_prefix(FILE_PREFIX).unwrap();
+        let written = std::fs::read(on_disk).unwrap();
+        std::fs::remove_file(on_disk).unwrap();
+
+        let unreadable = |error: &Error| {
+            matches!(
+                error,
+                Error::ObjectStore(object_store::Error::NotFound { .. })
+            )
+        };
+        let error = table.refresh().await.unwrap_err();
+        assert!(unreadable(&error), "{error:?}");
+        assert_eq!(error.kind().recurrence(), Recurrence::Transient);
+        let before = fixture.gets();
+        let error = table.refresh().await.unwrap_err();
+        assert!(unreadable(&error), "{error:?}");
+        assert!(
+            fixture.gets() > before + POLL_GETS,
+            "the poll read the snapshot's metadata and manifests again"
+        );
+        assert_eq!(
+            degraded(&table),
+            (Some(SnapshotId(FIRST_SNAPSHOT)), ErrorKind::ObjectStore)
+        );
+
+        std::fs::write(on_disk, written).unwrap();
+        assert!(table.refresh().await.unwrap());
+        assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
+    }
+
     /// String keys for `ids`, each written `repeats` times in a row.
     fn string_keys(ids: Range<usize>, repeats: usize) -> Vec<Key> {
         ids.flat_map(|id| std::iter::repeat_n(Key::Str(format!("key:{id:06}")), repeats))
@@ -2469,6 +2599,92 @@ mod tests {
                 ]
             ),
             1
+        );
+    }
+
+    /// A snapshot refused for a delete file (RFD 009) is remembered against
+    /// its metadata location: while the version hint names that location
+    /// each poll reads the hint alone, counts no error, and leaves the
+    /// table degraded for the refusal, a transient failure in between
+    /// included; once the hint names another location, its snapshot is
+    /// built.
+    #[test]
+    fn test_refresh_does_not_build_a_refused_snapshot_again_until_its_location_moves() {
+        let refused = ErrorKind::Refused(RefusalReason::DeleteFiles);
+        let serving = Some(SnapshotId(FIRST_SNAPSHOT));
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let deletes = "deletes";
+            fixture.add_position_delete(deletes, 0);
+            fixture
+                .commit(
+                    SECOND_SNAPSHOT,
+                    Some(FIRST_SNAPSHOT),
+                    SECOND_SEQUENCE,
+                    SECOND_VERSION,
+                )
+                .await;
+
+            let before = fixture.gets();
+            let error = table.refresh().await.unwrap_err();
+            assert_eq!(error.kind(), refused, "{error:?}");
+            assert!(
+                fixture.gets() > before + POLL_GETS,
+                "the first poll reads the snapshot's metadata and manifests"
+            );
+            let polls_while_unchanged = 3;
+            for _ in 0..polls_while_unchanged {
+                let before = fixture.gets();
+                assert!(!table.refresh().await.unwrap());
+                assert_eq!(fixture.gets(), before + POLL_GETS, "the version hint alone");
+                assert_eq!(degraded(&table), (serving, refused.clone()));
+            }
+
+            fixture.remove_hint();
+            let error = table.refresh().await.unwrap_err();
+            assert!(matches!(error, Error::ObjectStore(_)), "{error:?}");
+            assert_eq!(degraded(&table), (serving, ErrorKind::ObjectStore));
+            fixture.restore_hint(SECOND_VERSION).await;
+            let before = fixture.gets();
+            assert!(!table.refresh().await.unwrap());
+            assert_eq!(fixture.gets(), before + POLL_GETS);
+            assert_eq!(degraded(&table), (serving, refused.clone()));
+            assert_eq!(
+                table.get(&Key::Long(all[0])).await.unwrap(),
+                Lookup {
+                    value: present(all[0]),
+                    snapshot_id: SnapshotId(FIRST_SNAPSHOT),
+                }
+            );
+
+            fixture.remove_file(deletes);
+            fixture
+                .commit(
+                    THIRD_SNAPSHOT,
+                    Some(SECOND_SNAPSHOT),
+                    THIRD_SEQUENCE,
+                    THIRD_VERSION,
+                )
+                .await;
+            assert!(table.refresh().await.unwrap());
+            assert_eq!(serving_id(&table), SnapshotId(THIRD_SNAPSHOT));
+            let before = fixture.gets();
+            assert!(!table.refresh().await.unwrap());
+            assert_eq!(fixture.gets(), before + POLL_GETS);
+        });
+        let errors = |reason: &ErrorKind| {
+            series.counter(
+                metric::REFRESH_ERRORS_TOTAL,
+                &[table_label(), (metric::LABEL_REASON, reason.to_string())],
+            )
+        };
+        assert_eq!(errors(&refused), 1, "counted once, when made");
+        assert_eq!(errors(&ErrorKind::ObjectStore), 1);
+        assert_eq!(
+            state_gauge(&series, TABLE, StateName::Serving).to_bits(),
+            approx::gauge(1).to_bits()
         );
     }
 
