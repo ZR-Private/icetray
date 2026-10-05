@@ -76,7 +76,10 @@ metrics = "0.24.6"
 # The binary serves `/metrics` and `/ready` from one hyper listener of its
 # own, so the exporter's own HTTP listener and push gateway stay out.
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-metrics-util = "0.20.4"
+# The binary takes only `MetricKindMask`, which no feature gates, so the
+# debugging recorder and the layers stay out of the release graph; the
+# core's tests turn `debugging` on for themselves.
+metrics-util = { version = "0.20.4", default-features = false }
 murmur3 = "0.5.2"
 object_store = { version = "0.14.1", features = ["aws"] }
 parquet = { version = "58", features = ["async"] }

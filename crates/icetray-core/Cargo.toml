@@ -37,7 +37,7 @@ zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 arrow = { workspace = true }
-metrics-util = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
