@@ -84,8 +84,9 @@ table whose resident bytes exceed its `resident_budget_bytes`, or a load of
 `disk` tables whose chunk files would exceed
 `storage.local.index_budget_bytes`, is refused as `over_budget` before any
 key chunk is fetched. `disk` residency without a local directory is a
-configuration error. Both settings are in
-[Configuration](configuration.md#tables).
+configuration error. `resident_budget_bytes` is in
+[`[[tables]]`](configuration.md#tables) and `index_budget_bytes` in
+[`[storage.local]`](configuration.md#storagelocal).
 
 A per-column property in a finding's `property` field is printed as its
 prefix up to the column name, such as
