@@ -71,6 +71,7 @@ impl Inspected {
                     Error::Config(ConfigError::Invalid(
                         ConfigViolation::DiskResidencyWithoutLocalDir {
                             table: to_verify.table.clone(),
+                            index: None,
                         },
                     ))
                 })?;

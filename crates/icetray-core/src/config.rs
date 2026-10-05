@@ -341,20 +341,27 @@ pub enum ConfigViolation {
     )]
     IncompleteStaticKeys,
     /// A resident-bytes budget on a table whose residency has nothing to budget.
-    #[error("table {table}: resident_budget_bytes is set, but {residency} residency takes none")]
+    #[error(
+        "tables[{index}].resident_budget_bytes {bytes} is set, but tables[{index}].residency {residency} takes none"
+    )]
     BudgetWithoutResidency {
-        /// The table's name.
-        table: String,
+        /// The table's position in `tables`.
+        index: usize,
+        /// The configured budget.
+        bytes: u64,
         /// Its residency.
         residency: Residency,
     },
     /// Disk residency with no local directory to write chunk files to.
-    /// Raised by validation and again by a load, which knows the table by
-    /// name alone.
-    #[error("table {table}: disk residency needs a local directory under storage.local")]
+    /// Raised by validation, which names the setting by the table's place
+    /// in `tables`, and again by a load, which knows the table by name
+    /// alone.
+    #[error("{}", disk_without_local_dir(table, *index))]
     DiskResidencyWithoutLocalDir {
         /// The table's name.
         table: String,
+        /// The table's position in `tables`, when validation found it.
+        index: Option<usize>,
     },
     /// The memory budget of the page cache cannot hold one value page in
     /// every shard of its memory level, so the cache would keep a page per
@@ -509,6 +516,21 @@ pub enum ConfigViolation {
         /// The text as given.
         text: String,
     },
+}
+
+/// `ConfigViolation::DiskResidencyWithoutLocalDir`'s message: the setting
+/// by its full path when the table's place is known, else the table by name.
+fn disk_without_local_dir(table: &str, index: Option<usize>) -> String {
+    match index {
+        Some(index) => format!(
+            "tables[{index}].residency {} needs a local directory under storage.local",
+            Residency::Disk
+        ),
+        None => format!(
+            "table {table}: {} residency needs a local directory under storage.local",
+            Residency::Disk
+        ),
+    }
 }
 
 /// The whole configuration: the server, storage, and the tables it serves.
@@ -729,9 +751,10 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         match table.residency {
             Residency::Full => {}
             Residency::Disk | Residency::Bloom => {
-                if table.resident_budget_bytes.is_some() {
+                if let Some(bytes) = table.resident_budget_bytes {
                     return Err(ConfigViolation::BudgetWithoutResidency {
-                        table: table.name.clone(),
+                        index,
+                        bytes,
                         residency: table.residency,
                     });
                 }
@@ -740,6 +763,7 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         if table.residency == Residency::Disk && config.storage.local.is_none() {
             return Err(ConfigViolation::DiskResidencyWithoutLocalDir {
                 table: table.name.clone(),
+                index: Some(index),
             });
         }
     }
@@ -1922,7 +1946,8 @@ locaton = "typo"
         assert_eq!(
             violation(&bloom),
             ConfigViolation::BudgetWithoutResidency {
-                table: "kv".to_string(),
+                index: 0,
+                bytes: 1,
                 residency: Residency::Bloom,
             }
         );
@@ -1934,7 +1959,8 @@ locaton = "typo"
         assert_eq!(
             violation(&disk),
             ConfigViolation::BudgetWithoutResidency {
-                table: "kv".to_string(),
+                index: 0,
+                bytes: 1,
                 residency: Residency::Disk,
             }
         );
@@ -2003,6 +2029,7 @@ locaton = "typo"
             violation(&text),
             ConfigViolation::DiskResidencyWithoutLocalDir {
                 table: "kv".to_string(),
+                index: Some(0),
             }
         );
     }
