@@ -11,7 +11,8 @@
 
 > Updated 2026-10-04: the descriptor rule counts the page cache's disk
 > level, one descriptor per 4 MiB block, apart from the headroom, and
-> counts a load's concurrent reads; icetray raises its soft open-file
+> counts one load's concurrent reads for each configured table, since
+> every table loads at once at start; icetray raises its soft open-file
 > limit to the hard limit at start.
 
 ## Problem
@@ -165,16 +166,18 @@ its generation, and twice that while a refresh that rewrote the table
 loads beside the serving generation. The page cache's disk level holds one
 descriptor per 4 MiB block for the life of the process, 2,048 for an 8 GiB
 level, and a load keeps up to 128 reads in flight per worker thread, at
-most 1,024, each a descriptor. A deployment therefore sizes its
-descriptor limit to at least twice its disk-tier data files, plus
-`page_cache_disk_bytes` / 4 MiB, plus the load's concurrent reads up to
-1,024, plus a headroom for sockets and the one chunk file that retention
-opens at a time. The disk level is a term of its own rather than part of
-the headroom, because at a few gigabytes it alone exceeds any fixed
-headroom. icetray
+most 1,024, each a descriptor. Every configured table loads at once at
+start, and each load keeps its own reads in flight. A deployment
+therefore sizes its descriptor limit to at least twice its disk-tier data
+files, plus `page_cache_disk_bytes` / 4 MiB, plus one load's concurrent
+reads, up to 1,024, for each configured table, plus a headroom for
+sockets and the one chunk file that retention opens at a time. The disk
+level is a term of its own rather than part of the headroom, because at a
+few gigabytes it alone exceeds any fixed headroom, and so is each table's
+load, because a configuration of many tables multiplies it. icetray
 raises its soft limit to the hard limit at start, so the hard limit is the
 one a deployment sets, and the server warns at start when that limit is
-below what the disk level and a load need.
+below what the disk level and a load of every table need.
 
 Load peaks differ by tier. The disk tier holds one overlap group's chunks
 at a time, since a group is verified by reading pages back from the chunk

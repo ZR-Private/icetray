@@ -263,26 +263,29 @@ A replica holds these open at once:
 - one descriptor per 4 MiB block of the page cache's disk level, for the
   life of the process: `page_cache_disk_bytes` / 4 MiB, 2,048 for 8 GiB;
 - up to 128 reads per worker thread, at most 1,024, for each table that is
-  loading, each read a local file or an S3 socket;
+  loading, each read a local file or an S3 socket. Every configured table
+  loads at once at start, so the start holds that many for each table;
 - client connections, the object store's and the catalog's connection
   pools, the standard streams, and the one chunk file retention opens at a
   time.
 
 Size the limit to at least twice the data files of `disk` tables, plus
-`page_cache_disk_bytes` / 4 MiB, plus 1,024 for a load, plus headroom for
-the connections. At start icetray raises its soft limit to the hard limit,
-so the hard limit is the one to set: `ulimit -Hn`, systemd's
+`page_cache_disk_bytes` / 4 MiB, plus one load's reads (1,024 on a machine
+of eight or more worker threads) for each configured table, plus headroom
+for the connections. At start icetray raises its soft limit to the hard
+limit, so the hard limit is the one to set: `ulimit -Hn`, systemd's
 `LimitNOFILE`, or the container runtime's `nofile` limit. Kubernetes has no
 per-pod setting, so the container runtime's or the node's limit applies.
 
 `serve` logs the limit in force at start. It warns, with `limit` and
-`needed`, when the limit is below what the disk level and one load need
-(those two terms plus 256); the chunk files of `disk` tables come on top
-and are not known until their tables load. A limit too low for the disk
-level fails when the cache opens, with exit 1:
+`needed`, when the limit is below what the disk level and a load of every
+configured table need (those terms plus 256); the chunk files of `disk`
+tables come on top and are not known until their tables load. The page
+cache opens before any table loads, so a limit too low for the disk level
+alone (its blocks plus 256) fails there, with exit 1:
 
 ```
-page cache: open-file limit 1500 is below the 3328 descriptors the disk level and loads need: Too many open files (os error 24)
+page cache: open-file limit 1500 is below the 2304 descriptors the disk level needs: Too many open files (os error 24)
 ```
 
 ## Refresh and reload
