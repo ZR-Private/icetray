@@ -213,8 +213,10 @@ pub enum SchemaFault {
     Json(serde_json::Error),
 }
 
-/// A schema fault prefixed by where it is, unless it is at the root.
-fn schema_detail(at: &serde_path_to_error::Path, fault: &SchemaFault) -> String {
+/// A schema fault prefixed by where it is, unless it is at the root: what
+/// `ConfigError::Schema` displays after its framing, for a caller that
+/// frames it with the file the text came from.
+pub fn schema_detail(at: &serde_path_to_error::Path, fault: &SchemaFault) -> String {
     let place = place(at);
     if place.is_empty() {
         fault.to_string()
@@ -471,16 +473,20 @@ pub struct Config {
 impl Config {
     /// Parses TOML or JSON, decided by content: a first non-whitespace `{`
     /// is JSON. The result is validated once, so the two syntaxes cannot
-    /// disagree on what is accepted.
-    pub fn parse(text: &str) -> Result<Self> {
-        Self::from_text(text)?.validated()
+    /// disagree on what is accepted. The error is a `ConfigError` alone,
+    /// so a caller that read the text from a file can name the file beside
+    /// it.
+    pub fn parse(text: &str) -> std::result::Result<Self, ConfigError> {
+        let config = Self::from_text(text)?;
+        validate(&config)?;
+        Ok(config)
     }
 
     /// The text as either syntax reads it, not yet validated. The syntax
     /// is checked apart from the schema, so a document that parses is never
     /// reported as malformed TOML or JSON: TOML is parsed whole before it is
     /// deserialized, and a JSON error is sorted by `serde_json`'s category.
-    fn from_text(text: &str) -> Result<Self> {
+    fn from_text(text: &str) -> std::result::Result<Self, ConfigError> {
         if text.trim_start().starts_with(JSON_OPENING) {
             let mut document = serde_json::Deserializer::from_str(text);
             let config = serde_path_to_error::deserialize(&mut document).map_err(|error| {
@@ -1524,7 +1530,7 @@ value_column = "value"
     /// The violation `text` parses to; anything else fails the test.
     fn violation(text: &str) -> ConfigViolation {
         let result = Config::parse(text);
-        let Err(Error::Config(ConfigError::Invalid(violation))) = &result else {
+        let Err(ConfigError::Invalid(violation)) = &result else {
             panic!("expected a configuration violation, got {result:?}");
         };
         violation.clone()
@@ -1601,7 +1607,7 @@ value_column = "value"
     /// Anything but a schema fault fails the test.
     fn schema_fault_at(text: &str) -> Vec<At> {
         match Config::parse(text) {
-            Err(Error::Config(ConfigError::Schema { at, .. })) => at
+            Err(ConfigError::Schema { at, .. }) => at
                 .iter()
                 .map(|segment| match segment {
                     Segment::Map { key } => At::Key(key.clone()),
@@ -1673,12 +1679,12 @@ locaton = "typo"
     #[test]
     fn test_place_spells_a_setting_as_the_file_does() {
         let text = TOML_MINIMAL.replace("ref = \"main\"\n", "ref = \"main\"\nstrict = 1\n");
-        let Err(Error::Config(ConfigError::Schema { at, .. })) = Config::parse(&text) else {
+        let Err(ConfigError::Schema { at, .. }) = Config::parse(&text) else {
             panic!("strict = 1 is the wrong type");
         };
         assert_eq!(place(&at), "tables[0].strict");
         let log = format!("{TOML_MINIMAL}\n[server.log.fields]\ntimestamp = \"ts\"\n");
-        let Err(Error::Config(ConfigError::Schema { at, .. })) = Config::parse(&log) else {
+        let Err(ConfigError::Schema { at, .. }) = Config::parse(&log) else {
             panic!("timestamp names no standard field");
         };
         assert_eq!(place(&at), "server.log.fields");
@@ -1687,10 +1693,7 @@ locaton = "typo"
     #[test]
     fn test_parse_reports_malformed_text_as_its_syntax_s_error() {
         let toml = Config::parse("[[tables]\n");
-        assert!(
-            matches!(toml, Err(Error::Config(ConfigError::Toml(_)))),
-            "{toml:?}"
-        );
+        assert!(matches!(toml, Err(ConfigError::Toml(_))), "{toml:?}");
         for json in [
             "{\"tables\": [",
             "{\"tables\": []} trailing",
@@ -1698,7 +1701,7 @@ locaton = "typo"
         ] {
             let result = Config::parse(json);
             assert!(
-                matches!(result, Err(Error::Config(ConfigError::Json(_)))),
+                matches!(result, Err(ConfigError::Json(_))),
                 "{json}: {result:?}"
             );
         }
@@ -1759,15 +1762,9 @@ locaton = "typo"
         let inline = Config::from_text("storage = { rewrite = [] }\n").unwrap();
         assert!(inline.storage.rewrite.is_empty());
         let malformed_json = Config::from_text(" { not json");
-        assert!(matches!(
-            malformed_json,
-            Err(Error::Config(ConfigError::Json(_)))
-        ));
+        assert!(matches!(malformed_json, Err(ConfigError::Json(_))));
         let malformed_toml = Config::from_text("not = toml = either");
-        assert!(matches!(
-            malformed_toml,
-            Err(Error::Config(ConfigError::Toml(_)))
-        ));
+        assert!(matches!(malformed_toml, Err(ConfigError::Toml(_))));
     }
 
     #[test]

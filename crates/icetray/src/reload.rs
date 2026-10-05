@@ -11,7 +11,6 @@
 
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -22,6 +21,8 @@ use metrics::Counter;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
+use crate::cli::ConfigPath;
+use crate::error::ConfigRejected;
 use crate::serve::{retain, ticker};
 
 /// Bytes in a configuration digest: SHA-256's output.
@@ -60,8 +61,9 @@ impl fmt::Debug for Digest {
 pub struct Reading {
     /// The digest of the bytes read.
     pub digest: Digest,
-    /// The configuration the bytes hold, or why they hold none.
-    pub config: icetray_core::Result<Config>,
+    /// The configuration the bytes hold, or why they hold none, naming the
+    /// file.
+    pub config: Result<Config, ConfigRejected>,
 }
 
 /// Where a running server reads its configuration again. `ConfigFile` is
@@ -76,33 +78,34 @@ pub trait ConfigSource: Send + Sync {
 /// again on every reload, or the one a one-shot reads once.
 #[derive(Clone, Debug)]
 pub struct ConfigFile {
-    path: PathBuf,
+    file: ConfigPath,
 }
 
 impl ConfigFile {
-    /// The file at `path`.
-    pub fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-        }
+    /// The file `file` names.
+    pub fn new(file: ConfigPath) -> Self {
+        Self { file }
     }
 }
 
 impl ConfigSource for ConfigFile {
     /// Reads the whole file, digests its bytes, and parses them as
     /// `Config::parse` does; bytes that are not UTF-8 are
-    /// `ConfigError::Read`, naming the file.
+    /// `ConfigError::Read`. Every fault is a `ConfigRejected` naming the
+    /// file and where its path came from.
     fn read(&self) -> io::Result<Reading> {
-        let bytes = std::fs::read(&self.path)?;
+        let bytes = std::fs::read(&self.file.path)?;
         let digest = Digest::of(&bytes);
         let config = std::str::from_utf8(&bytes)
-            .map_err(|error| {
-                icetray_core::Error::Config(ConfigError::Read {
-                    path: self.path.clone(),
-                    source: io::Error::new(io::ErrorKind::InvalidData, error),
-                })
+            .map_err(|error| ConfigError::Read {
+                path: self.file.path.clone(),
+                source: io::Error::new(io::ErrorKind::InvalidData, error),
             })
-            .and_then(Config::parse);
+            .and_then(Config::parse)
+            .map_err(|source| ConfigRejected {
+                file: self.file.clone(),
+                source,
+            });
         Ok(Reading { digest, config })
     }
 }
@@ -129,7 +132,7 @@ impl fmt::Debug for Reload {
 #[derive(Debug)]
 pub enum ReloadRefusal {
     /// The bytes do not parse or validate.
-    Invalid(icetray_core::Error),
+    Invalid(ConfigRejected),
     /// Settings outside the tables changed, by their names in the file.
     Restart(Vec<&'static str>),
     /// A table failed to open or load.
@@ -410,9 +413,12 @@ fn names(tables: &[Arc<Table>]) -> Vec<&str> {
 mod tests {
     use std::io::Write as _;
 
+    use std::path::Path;
+
     use icetray_core::config::ConfigViolation;
 
     use super::*;
+    use crate::cli::PathOrigin;
 
     /// A configuration `Config::parse` accepts: one static table.
     const ONE_TABLE: &str = r#"
@@ -426,6 +432,14 @@ type = "static"
 location = "s3://warehouse/kv"
 "#;
 
+    /// The configuration file at `path`, as `--config` names it.
+    fn flag_file(path: &Path) -> ConfigPath {
+        ConfigPath {
+            path: path.to_path_buf(),
+            origin: PathOrigin::Flag,
+        }
+    }
+
     fn file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
@@ -435,7 +449,7 @@ location = "s3://warehouse/kv"
     #[test]
     fn test_config_file_reads_the_digest_and_the_configuration() {
         let file = file_with(ONE_TABLE.as_bytes());
-        let reading = ConfigFile::new(file.path()).read().unwrap();
+        let reading = ConfigFile::new(flag_file(file.path())).read().unwrap();
         assert_eq!(reading.digest, Digest::of(ONE_TABLE.as_bytes()));
         let config = reading.config.unwrap();
         assert_eq!(config.tables[0].name, "kv");
@@ -445,37 +459,42 @@ location = "s3://warehouse/kv"
     fn test_config_file_digests_bytes_that_do_not_parse() {
         let bytes = b"[[tables]\n";
         let file = file_with(bytes);
-        let reading = ConfigFile::new(file.path()).read().unwrap();
+        let reading = ConfigFile::new(flag_file(file.path())).read().unwrap();
         assert_eq!(reading.digest, Digest::of(bytes));
         assert!(reading.config.is_err());
     }
 
     #[test]
-    fn test_config_file_reads_a_file_with_no_table_as_invalid() {
+    fn test_config_file_reads_a_file_with_no_table_as_invalid_naming_the_file() {
         let file = file_with(b"[server]\npoll_interval = \"30s\"\n");
-        let reading = ConfigFile::new(file.path()).read().unwrap();
+        let reading = ConfigFile::new(flag_file(file.path())).read().unwrap();
+        let Err(rejected) = reading.config else {
+            panic!("a file with no table is invalid");
+        };
+        assert_eq!(rejected.file, flag_file(file.path()));
         assert!(matches!(
-            reading.config,
-            Err(icetray_core::Error::Config(ConfigError::Invalid(
-                ConfigViolation::NoTables
-            )))
+            rejected.source,
+            ConfigError::Invalid(ConfigViolation::NoTables)
         ));
     }
 
     #[test]
     fn test_config_file_reads_bytes_that_are_not_utf8_as_a_read_error() {
         let file = file_with(&[0xff, 0xfe]);
-        let reading = ConfigFile::new(file.path()).read().unwrap();
+        let reading = ConfigFile::new(flag_file(file.path())).read().unwrap();
         assert!(matches!(
             reading.config,
-            Err(icetray_core::Error::Config(ConfigError::Read { .. }))
+            Err(ConfigRejected {
+                source: ConfigError::Read { .. },
+                ..
+            })
         ));
     }
 
     #[test]
     fn test_config_file_that_is_gone_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = ConfigFile::new(&dir.path().join("missing.toml"));
+        let missing = ConfigFile::new(flag_file(&dir.path().join("missing.toml")));
         assert!(missing.read().is_err());
     }
 

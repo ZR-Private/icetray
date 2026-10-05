@@ -13,8 +13,9 @@ read into the same schema.
 - A key the schema does not know is an error, and the message lists the
   keys that section accepts.
 - The whole file is validated before anything is opened. An error names
-  the setting by its full path, such as
-  `server.poll_interval 0s is below the minimum of 1s`, and the run exits 1.
+  the file, where its path came from, and the setting by its full path,
+  such as `invalid configuration file icetray.toml (from --config):
+  server.poll_interval 0s is below the minimum of 1s`, and the run exits 1.
 
 ### An example
 
@@ -340,8 +341,9 @@ nor `--location`, from the `ICETRAY_CONFIG` environment variable. An empty
 configuration file, not even one the variable names. With no flag and no
 variable, the run exits 64 with
 `no configuration: pass --config or --location, or set ICETRAY_CONFIG`.
-A file that cannot be read is named in the error with where its path came
-from, `--config` or `ICETRAY_CONFIG`.
+A file that cannot be read, or that does not parse or validate, is named
+in the error with where its path came from, `--config` or
+`ICETRAY_CONFIG`.
 
 A `--table` name that no configured table has exits 64, and so does
 `--table` given with `--location`. Both errors print a hint, and the first

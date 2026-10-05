@@ -1,5 +1,7 @@
 //! The binary's failures and the exit codes they become. `CliError` is every
-//! failure a subcommand can end with, `serve`'s included; `ServeError` every
+//! failure a subcommand can end with, `serve`'s included; `ConfigRejected`
+//! a configuration file whose bytes make no configuration, as a one-shot,
+//! `serve` at start, and a refused reload report it; `ServeError` every
 //! failure of the daemon once its configuration and logging are in place,
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
 //! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
@@ -17,6 +19,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use icetray_core::config::{ConfigError, schema_detail};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{CacheError, ErrorKind, KeyType};
 
@@ -307,6 +310,10 @@ pub enum CliError {
         /// The operating system's refusal.
         source: std::io::Error,
     },
+    /// The configuration file was read, and its bytes make no
+    /// configuration.
+    #[error(transparent)]
+    ConfigRejected(#[from] ConfigRejected),
     /// No table is configured under the name asked for with `--table`. A
     /// configuration with no table at all is `ConfigViolation::NoTables`,
     /// the file's fault rather than the command line's.
@@ -367,6 +374,44 @@ pub enum CliError {
     Serve(#[from] ServeError),
 }
 
+/// A configuration file whose bytes make no configuration: not UTF-8, not
+/// TOML or JSON, not of the schema, or breaking a rule. Display names the
+/// file and where its path came from, as `CliError::ConfigUnreadable`
+/// does, since a path from the environment is not on the command line the
+/// person is looking at, then the setting by its full path and the value
+/// as `ConfigError` gives them.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", rejection(file, source))]
+pub struct ConfigRejected {
+    /// The file and where its path came from.
+    pub file: ConfigPath,
+    /// What the bytes get wrong.
+    pub source: ConfigError,
+}
+
+/// `ConfigRejected`'s message: `source`'s detail framed with `file`.
+fn rejection(file: &ConfigPath, source: &ConfigError) -> String {
+    let (path, origin) = (file.path.display(), file.origin);
+    match source {
+        ConfigError::Read { source, .. } => {
+            format!("cannot read configuration file {path} (from {origin}): {source}")
+        }
+        ConfigError::Toml(error) => {
+            format!("configuration file {path} (from {origin}) is not valid toml: {error}")
+        }
+        ConfigError::Json(error) => {
+            format!("configuration file {path} (from {origin}) is not valid json: {error}")
+        }
+        ConfigError::Schema { at, fault } => format!(
+            "invalid configuration file {path} (from {origin}): {}",
+            schema_detail(at, fault)
+        ),
+        ConfigError::Invalid(violation) => {
+            format!("invalid configuration file {path} (from {origin}): {violation}")
+        }
+    }
+}
+
 impl CliError {
     /// How to fix this failure, when the failure alone makes it plain.
     pub fn hint(&self) -> Option<Hint> {
@@ -387,6 +432,7 @@ impl CliError {
             | Self::NoTarget
             | Self::NoConfig
             | Self::ConfigUnreadable { .. }
+            | Self::ConfigRejected(_)
             | Self::WorkingDirectory { .. }
             | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Io(_)
@@ -401,6 +447,7 @@ impl CliError {
         let code = match self {
             Self::Core(_)
             | Self::ConfigUnreadable { .. }
+            | Self::ConfigRejected(_)
             | Self::WorkingDirectory { .. }
             | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Io(_)
@@ -421,6 +468,8 @@ impl CliError {
 #[cfg(test)]
 mod tests {
     use icetray_core::config::ServerConfig;
+
+    use icetray_core::config::ConfigViolation;
 
     use super::*;
     use crate::cli::PathOrigin;
@@ -453,12 +502,13 @@ mod tests {
                 after: ServerConfig::default().drain_deadline,
             }),
             CliError::ConfigUnreadable {
-                file: ConfigPath {
-                    path: "icetray.toml".into(),
-                    origin: PathOrigin::Env,
-                },
+                file: env_file(),
                 source: std::io::Error::other("sample"),
             },
+            CliError::ConfigRejected(ConfigRejected {
+                file: env_file(),
+                source: ConfigError::Invalid(ConfigViolation::NoTables),
+            }),
             CliError::WorkingDirectory {
                 location: TABLE.to_string(),
                 source: std::io::Error::other("sample"),
@@ -471,6 +521,32 @@ mod tests {
         for error in cases {
             assert_eq!(error.exit_code(), ExitCode::from(EXIT_FAILURE), "{error}");
         }
+    }
+
+    /// A configuration file named by `ICETRAY_CONFIG`.
+    fn env_file() -> ConfigPath {
+        ConfigPath {
+            path: "icetray.toml".into(),
+            origin: PathOrigin::Env,
+        }
+    }
+
+    /// A rejected file's message names the file and where its path came
+    /// from, then the setting by its full path and the value.
+    #[test]
+    fn test_fmt_config_rejected_names_the_file_and_the_setting() {
+        let rejected = ConfigRejected {
+            file: env_file(),
+            source: ConfigError::Invalid(ConfigViolation::DuplicateTableName {
+                index: 1,
+                name: TABLE.to_string(),
+            }),
+        };
+        assert_eq!(
+            rejected.to_string(),
+            "invalid configuration file icetray.toml (from ICETRAY_CONFIG): \
+             tables[1].name kv is configured more than once"
+        );
     }
 
     #[test]

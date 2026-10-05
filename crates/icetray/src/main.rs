@@ -206,7 +206,7 @@ async fn serve(flag: Option<&Path>, raised: io::Result<u64>) -> ExitCode {
     };
     let config = match reading.config {
         Ok(config) => config,
-        Err(error) => return report(&CliError::Core(error)),
+        Err(rejected) => return report(&CliError::from(rejected)),
     };
     logging::init(&config.server.log, LogSink::Stdout, Level::INFO);
     log_descriptor_limit(raised, &config, Level::INFO);
@@ -221,7 +221,7 @@ async fn serve(flag: Option<&Path>, raised: io::Result<u64>) -> ExitCode {
         }
     }
     let reload = Reload {
-        source: Arc::new(ConfigFile::new(&file.path)),
+        source: Arc::new(ConfigFile::new(file)),
         started_from: reading.digest,
     };
     finish_logged(daemon(config, reload).await)

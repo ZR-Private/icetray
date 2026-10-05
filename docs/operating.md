@@ -18,12 +18,13 @@ the file ([Configuration](configuration.md)).
   `no configuration: pass --config or set ICETRAY_CONFIG`.
 - A file that cannot be read, or that does not validate (as a file that
   lists no table does not), is reported on stderr as plain text, and
-  `serve` exits 1 before anything is opened. An unreadable file's message
-  names its path and whether the path came from `--config` or
-  `ICETRAY_CONFIG`; an invalid file's names the setting by its full path:
+  `serve` exits 1 before anything is opened. Either message names the
+  file and whether its path came from `--config` or `ICETRAY_CONFIG`, and
+  an invalid file's also names the setting by its full path and the value
+  given:
 
   ```
-  error: invalid configuration: server.poll_interval 0s is below the minimum of 1s
+  error: invalid configuration file /etc/icetray/icetray.toml (from ICETRAY_CONFIG): server.poll_interval 0s is below the minimum of 1s
   ```
 - Once the file is read, logging starts. Every later failure is logged as
   a JSON event on stdout with the message `run failed` and the error in
@@ -315,8 +316,9 @@ SIGHUP. A change to its tables applies without a restart
   the file does not parse or validate (a file that lists no table among
   them), or when any setting outside `[[tables]]` changed; those apply on
   restart only. The refusal is logged with the configuration error as its
-  `reason`, naming the setting by its full path, and counted, and
-  `icetray_config_pending` reads 1 until the file and the server agree.
+  `reason`, naming the file and the setting by its full path, and
+  counted, and `icetray_config_pending` reads 1 until the file and the
+  server agree.
   The server keeps serving. The poll retries once the file changes; SIGHUP
   retries at once.
 - Readiness does not change on a reload.

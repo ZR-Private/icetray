@@ -343,9 +343,10 @@ impl ConfigPath {
     /// The file read once, as `serve` reads it at start and on every
     /// reload: its digest and what its bytes parse and validate to. A file
     /// that cannot be read is `CliError::ConfigUnreadable`, naming the path
-    /// and its origin.
+    /// and its origin; bytes that make no configuration are a
+    /// `ConfigRejected` in the reading, naming both as well.
     pub fn read(&self) -> Result<Reading, CliError> {
-        ConfigFile::new(&self.path)
+        ConfigFile::new(self.clone())
             .read()
             .map_err(|source| CliError::ConfigUnreadable {
                 file: self.clone(),
@@ -506,8 +507,10 @@ impl Target {
 mod tests {
     use clap::CommandFactory as _;
     use clap::error::ErrorKind;
+    use icetray_core::config::{ConfigError, ConfigViolation};
 
     use super::*;
+    use crate::error::ConfigRejected;
 
     /// A table root for the location tests.
     const LOCATION: &str = "s3://warehouse/db/kv";
@@ -678,6 +681,28 @@ value_column = "value"
             .config_with_env(None, Some(missing.as_os_str().to_owned()))
             .unwrap();
         assert_eq!(from_flag.tables[0].name, "kv");
+    }
+
+    /// A file that parses and breaks a rule is rejected naming the file
+    /// and where its path came from, as an unreadable one is.
+    #[test]
+    fn test_config_with_env_rejects_an_invalid_file_naming_it() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"[server]\n").unwrap();
+        let bare = target(parse(&["info"]).unwrap());
+        let rejected = bare
+            .config_with_env(None, Some(file.path().as_os_str().to_owned()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &rejected,
+                CliError::ConfigRejected(ConfigRejected {
+                    file: named,
+                    source: ConfigError::Invalid(ConfigViolation::NoTables),
+                }) if named.origin == PathOrigin::Env && named.path == file.path()
+            ),
+            "{rejected:?}"
+        );
     }
 
     #[test]
