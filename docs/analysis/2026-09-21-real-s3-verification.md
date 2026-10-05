@@ -67,9 +67,11 @@ plus 79.4 MB on disk for the disk tier, and 31.9 MB for the bloom tier, whose
 
 Two of the findings describe the recipe rather than the table. The 192-byte
 tables' value pages decompress to 160 to 196 KB, above the doctor's 128 KiB
-advice threshold, because the recipe bounds pages by 1,000 rows and leaves
-the byte bound at 8 MiB for small values; the same advice appears on the
-golden tables written by the checked-in recipe. The prototype's four
+advice threshold of that date, because the recipe bounds pages by 1,000
+rows and leaves the byte bound at 8 MiB for small values; the same advice
+appeared then on the golden tables written by the checked-in recipe. The
+threshold is 1 MiB now ([RFD 016](../rfd/016-doctor.md)), and pages of
+this size draw no advice. The prototype's four
 append files on `long_2m`, of 1,225 rows each, carry the writer's fixed 1
 MiB filters, or about 6,600 bits per key. Neither affects a lookup's cost.
 
