@@ -181,7 +181,7 @@ The label values:
   `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`),
   `inefficient`, or an error kind (`iceberg`, `parquet`, `object_store`,
   `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`,
-  `table`, `file`, `not_ready`, `local`, `catalog_timeout`,
+  `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`,
   `load_deadline`, `refresh_deadline`, `verify_canceled`,
   `lookup_canceled`). There are too many to expose for every table at
   start, so a series appears with its first error; alert on
@@ -320,6 +320,17 @@ reads depends on the table's source
 - A refresh that fails leaves the last good generation serving, counts
   `icetray_refresh_errors_total`, and moves the table to degraded.
   Readiness is unchanged.
+- A `glue` or `s3tables` call that the catalog refuses or that fails, for
+  a missing permission, a table that does not exist, throttling, or an
+  endpoint that cannot be reached, is a `refresh failed` event at `warn`
+  with `reason` `catalog` and an `error` that names the table as the
+  catalog does (`db.kv`, or `ns.kv in <table bucket ARN>`) and carries the
+  service's error code. A call that runs past `storage.catalog_timeout`
+  has `reason` `catalog_timeout`. Each is counted under its reason in
+  `icetray_refresh_errors_total`. A Glue table that is not Iceberg, or a
+  table without a metadata location, has `reason` `table`. The same
+  failure on a first load ends `serve` with `run failed` and exit 1, and
+  refuses a reload.
 - Snapshot expiry removes a snapshot by its age, and a replica still
   serving an expired snapshot reads data files that are gone. Keep the
   retention on the served ref longer than the largest
@@ -383,8 +394,20 @@ needs is a setting, a mounted file, or an environment variable.
   keys in `storage.s3` win over the chain and are the path for
   S3-compatible endpoints, with `endpoint`, `allow_http`, and
   `path_style`. icetray has no secret format of its own.
-- A REST catalog is called without credentials
+- Calls to Glue and S3 Tables are signed with the same credentials as S3
+  requests, from the same cache, so the chain is not run again for them.
+  A REST catalog is called without credentials
   ([Configuration](configuration.md#tablessource)).
+- The credentials need `s3:GetObject` on every location a table reads:
+  its metadata files, manifest lists, manifests, and data files. A `glue`
+  source also needs `glue:GetTable` on the catalog, the database, and the
+  table; for a table in another account's catalog, that catalog's resource
+  policy must grant it as well. An `s3tables` source needs
+  `s3tables:GetTableMetadataLocation` on the table, and its files are read
+  under `s3tables:GetTableData` on the table, which S3 Tables checks for
+  reads of a table bucket's objects. Credentials a catalog or Lake
+  Formation vends are not used, so the role's own permissions must allow
+  every read.
 
 ### Memory
 
