@@ -119,7 +119,7 @@ Counters and histograms:
 | `icetray_page_cache_hits_total` | | yes | Value pages served from the page cache. |
 | `icetray_page_cache_fetches_total` | | yes | Value-page fetches the cache ran, after coalescing. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups answered. |
-| `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. A refusal the table remembers is counted once, when made ([Refresh and reload](#refresh-and-reload)). |
+| `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. A failure the table remembers is counted once, when met ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
 | `icetray_lookup_seconds` (histogram) | `table`, `result` | every table and result | Lookup latency. |
@@ -186,7 +186,7 @@ The label values:
   `lookup_canceled`). There are too many to expose for every table at
   start, so a series appears with its first error; alert on
   `icetray_table_state{state="degraded"}` instead. A table stuck behind a
-  refused snapshot counts the refusal once, so its rate falls to zero
+  refused snapshot counts the failure once, so its rate falls to zero
   while the table stays degraded.
 
 A table a reload adds gets its series when it is added. A table a reload
@@ -322,26 +322,34 @@ reads depends on the table's source
 - A refresh that fails leaves the last good generation serving, counts
   `icetray_refresh_errors_total`, logs `refresh failed` at `warn`, and
   moves the table to degraded. Readiness is unchanged.
-- A refusal of the snapshot itself is remembered: any refusal reason,
-  except `over_budget` against `storage.local.index_budget_bytes`, and
-  `inefficient` under `strict`. These depend only on the snapshot and the
-  table's entry, so trying again cannot help. The refusal is counted and
-  logged once, when it is made, and the table does not build that
-  snapshot again while its source names the same metadata location: each
-  poll costs only the one read or catalog call above, counts nothing,
-  logs nothing, and the table stays degraded. When the source names another
-  metadata location, its snapshot is built. Once the table serves it, or
-  refuses it in turn, `source moved past a refused snapshot` is logged at
-  `info` with the refused `snapshot_id` and `reason`. A reload that
-  changes the table's entry loads the table anew under the new entry, the
-  refused snapshot included, so raising `resident_budget_bytes` or turning
-  `strict` off takes effect without waiting for a new snapshot; if the
-  snapshot is still refused, the reload is refused.
+- A failure of the snapshot itself is remembered. That is any refusal
+  reason, except `over_budget` against `storage.local.index_budget_bytes`,
+  and `inefficient` under `strict`. It is a `table` fault of the
+  snapshot's metadata: a ref, schema, partition spec, or column it lacks,
+  zero buckets, or a data file with no usable bucket value or one out of
+  range. It is a `file` fault that a data file's footer or bloom filters
+  show. These depend only on the snapshot and the table's entry, so trying
+  again cannot help. The failure is counted and logged once, when it is
+  met, and the table does not build that snapshot again while its source
+  names the same metadata location: each poll costs only the one read or
+  catalog call above, counts nothing, logs nothing, and the table stays
+  degraded. When the source names another metadata location, its snapshot
+  is built. Once the table serves it, or refuses it in turn, `source moved
+  past a refused snapshot` is logged at `info` with the `reason` and, when
+  the ref named one, the refused `snapshot_id`. A reload that changes the
+  table's entry loads the table anew under the new entry, the refused
+  snapshot included, so fixing `ref` or a column name, raising
+  `resident_budget_bytes`, or turning `strict` off takes effect without
+  waiting for a new snapshot; if the snapshot is still refused, the reload
+  is refused.
 - Every other failure is tried again on every poll and is counted and
   logged each time: a store, catalog, cache, or local-directory error, a
   timeout or deadline, `over_budget` against the shared
-  `index_budget_bytes`, which other tables' chunk files also decide, and a
-  `table` or `file` fault.
+  `index_budget_bytes`, which other tables' chunk files also decide, a
+  version hint or catalog record that names no usable metadata, a
+  `parquet` or `iceberg` library error, and a `file` fault met decoding a
+  data file's pages, which a `disk` table may read from its local chunk
+  file rather than the data file.
 - A `glue` or `s3tables` call that the catalog refuses or that fails, for
   a missing permission, a table that does not exist, throttling, or an
   endpoint that cannot be reached, is a `refresh failed` event at `warn`

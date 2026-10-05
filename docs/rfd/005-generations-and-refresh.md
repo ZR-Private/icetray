@@ -1,13 +1,14 @@
 # Generations and refresh
 
-> Updated 2026-10-05: a refresh refused for a reason that is a function of
-> the snapshot and the table's configuration alone is remembered against
-> the metadata location it was read from, and the table does not build
-> that snapshot again until its source names another location or a reload
-> changes the table's entry. A refusal like that cannot succeed on retry,
-> and retrying it on every poll re-read the snapshot's metadata and
-> manifests and logged and counted the same refusal each time. Transient
-> failures are still retried on every poll.
+> Updated 2026-10-05: a refresh failure that is a function of the snapshot
+> and the table's configuration alone, a refusal or a fault of the
+> snapshot's metadata or data files, is remembered against the metadata
+> location it was read from, and the table does not build that snapshot
+> again until its source names another location or a reload changes the
+> table's entry. A failure like that cannot succeed on retry, and retrying
+> it on every poll re-read the snapshot's metadata and manifests and
+> logged and counted the same failure each time. Transient failures are
+> still retried on every poll.
 
 ## Problem
 
@@ -60,20 +61,33 @@ refusal. Overlap without duplicates is an inefficient finding, measured under
 RFD 007 (Serving tiers).
 
 When a refresh fails, the last good generation keeps serving and the
-failure is reported. A failure that is a function of the snapshot and the
-table's configuration alone is deterministic: the strict gate, and every
-refusal reason of RFD 007 (Serving tiers) but one, a disk load over the
-local directory's index budget, which every disk table shares, so other
-tables' chunk files decide it too. The table remembers a deterministic failure against the metadata
-location it read, reports it once, and stays degraded. While the source
-names that location, each poll costs its one read and builds nothing.
-A new location is tried, and a reload that changes the table's entry
-builds a new table that remembers nothing, so a refusal its old
-configuration caused is tried under the new one. Every other failure (a
-store, catalog, cache, or local-directory error, a timeout, a deadline, a
-cancellation, or a table or file fault) is transient and retried on the
-next poll. Only a refresh over a serving generation remembers: at boot
-there is no generation to keep, and a refusal fails the start.
+failure is reported. A failure that is a function of the snapshot's
+metadata and data files and the table's configuration alone is
+deterministic. That covers the strict gate, and every refusal reason of
+RFD 007 (Serving tiers) but one, a disk load over the local directory's
+index budget, which every disk table shares, so other tables' chunk files
+decide it too. It covers a fault of the snapshot's metadata or manifests:
+a ref, schema, partition spec, or column the metadata lacks, a bucket
+transform of zero buckets, a data file whose bucket value is missing or out
+of range, or a snapshot timestamp outside the range a timestamp holds.
+It covers a fault of a data file that its footer or bloom filters show.
+The table remembers a deterministic failure against the metadata location
+it read, reports it once, and stays degraded. While the source names that
+location, each poll costs its one read and builds nothing. A new location
+is tried, and a reload that changes the table's entry builds a new table
+that remembers nothing, so a failure its old configuration caused is
+tried under the new one. Every other failure is transient and retried on
+the next poll: a store, catalog, cache, or local-directory error, a
+timeout, a deadline, or a cancellation; a version hint or catalog record
+that names no usable metadata, since a commit or the catalog changes it;
+a library error, which does not say whether it met bad bytes or a failed
+read; and a fault met decoding a data file's pages, since a page may be
+the local directory's copy of it rather than the file. When a failure
+cannot tell which it is, it is transient: retrying a deterministic one
+costs a poll's reads, while remembering a transient one leaves the table
+behind until its source moves. Only a refresh over a serving generation
+remembers: at boot there is no generation to keep, and a refusal fails
+the start.
 
 A server refuses to start if any configured table fails to open. A table
 that goes silently missing does more harm than a crash at boot, while a

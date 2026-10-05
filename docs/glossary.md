@@ -8,10 +8,10 @@ See [the table contract](table-contract.md).
 
 **Degraded.** The state of a table whose last refresh failed. The last
 good generation keeps serving, `icetray_table_state{state="degraded"}`
-reads 1, and the next poll tries again, except after a refusal of the
-snapshot itself, which is tried again once the table's metadata location
-moves. Readiness does not change. See
-[Refresh and reload](operating.md#refresh-and-reload).
+reads 1, and the next poll tries again, except after a failure of the
+snapshot itself, a refusal or a fault of its metadata or data files, which
+is tried again once the table's metadata location moves. Readiness does
+not change. See [Refresh and reload](operating.md#refresh-and-reload).
 
 **Fence array.** The first key of every key page of a data file, held in
 memory for every residency. A lookup binary-searches it to pick the one key
