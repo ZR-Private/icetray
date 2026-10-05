@@ -20,7 +20,7 @@ use iceberg_catalog_rest::{
 
 use crate::aws_catalog::AwsSource;
 use crate::config::SourceConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::snapshot::SnapshotId;
 use crate::storage::{FILE_SCHEME, PATH_SEPARATOR, Storage, file_parts, split_location};
 
@@ -149,6 +149,33 @@ pub enum TableFault {
         /// The snapshot whose timestamp it is.
         snapshot_id: SnapshotId,
     },
+}
+
+/// A fault of the snapshot's metadata or manifests, or of a configured name
+/// they lack, is fixed for that snapshot under the table's entry; one of the
+/// pointer to the metadata or of the catalog's record is not.
+impl Recurs for TableFault {
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            // The ref and the columns are the table's entry, checked against
+            // the metadata file the source named, which never changes.
+            Self::RefNotFound { .. }
+            | Self::ColumnMissing { .. }
+            | Self::SchemaMissing { .. }
+            | Self::SpecMissing { .. }
+            | Self::ZeroBuckets { .. }
+            | Self::BucketValueMissing { .. }
+            | Self::BucketValueOutOfRange { .. }
+            | Self::SnapshotTimestampOutOfRange { .. } => Recurrence::Deterministic,
+            // The version hint is rewritten in place by every commit, and the
+            // catalog's record is the catalog's to change: neither is part of
+            // a snapshot.
+            Self::VersionHintEmpty { .. }
+            | Self::VersionHintMalformed { .. }
+            | Self::MetadataLocationUnknown
+            | Self::NotIceberg { .. } => Recurrence::Transient,
+        }
+    }
 }
 
 /// The current metadata and the location it was read from; the location is

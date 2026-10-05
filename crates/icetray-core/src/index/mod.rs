@@ -34,7 +34,7 @@ use parquet::schema::types::ColumnDescPtr;
 use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::config::Residency;
-use crate::error::{Error, Result};
+use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{DataFileIdentity, DiskChunks};
 use crate::parquet_io::{FileHandle, Segments};
@@ -199,6 +199,46 @@ pub enum FileFault {
         /// decides on it.
         message: String,
     },
+}
+
+/// A fault the footer shows, or a bloom filter read from the data file,
+/// is fixed for the file. A fault met decoding a page is not known to be:
+/// the page may be a key chunk the Disk tier reads back from its chunk
+/// file, for the overlap check or a lookup, with no checksum on that read,
+/// and a chunk file changed on disk is not the data file. The fault does
+/// not say which bytes it met.
+impl Recurs for FileFault {
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            Self::MissingColumn(_)
+            | Self::MissingPageIndex
+            | Self::NoRows
+            | Self::InconsistentRowCounts
+            | Self::InconsistentOffsetIndex { .. }
+            | Self::UnplaceableBloomFilter { .. }
+            | Self::ValuePhysicalType { .. }
+            | Self::ZeroWidthValue
+            // Bloom filters are read from the data file at every load and
+            // never kept on local disk.
+            | Self::CorruptBloomFilter { .. }
+            // Parquet panics on the same bytes the same way, and the footer
+            // and bloom filters are always the data file's own bytes.
+            | Self::DecoderPanicked {
+                part: DecodedPart::Footer | DecodedPart::BloomFilter { .. },
+                ..
+            } => Recurrence::Deterministic,
+            Self::PageRowsMismatch { .. }
+            | Self::MalformedPageHeader { .. }
+            | Self::PageHeaderOverBound { .. }
+            | Self::KeyNotUtf8 { .. }
+            | Self::DecoderPanicked {
+                part: DecodedPart::Pages { .. },
+                ..
+            }
+            // A row a key page found, and that page may be a local copy.
+            | Self::PageOutOfRange { .. } => Recurrence::Transient,
+        }
+    }
 }
 
 /// The part of a file parquet was decoding when it panicked.

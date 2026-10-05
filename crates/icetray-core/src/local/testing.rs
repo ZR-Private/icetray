@@ -186,6 +186,13 @@ pub(crate) fn edit_verification(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
     rewrite(path, |_, verification| edit(verification));
 }
 
+/// Where the key chunks of the chunk file at `path` begin: past its
+/// envelope, header, and verification record.
+pub(crate) fn chunks_offset(path: &Path) -> u64 {
+    let (_, _, chunks) = split(path);
+    fs::metadata(path).unwrap().len() - approx::count(chunks.len())
+}
+
 /// The header, the verification record, and the chunks of the chunk file
 /// at `path`, which this build wrote.
 fn split(path: &Path) -> (ChunkFileHeader, Vec<u8>, Vec<u8>) {

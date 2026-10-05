@@ -39,7 +39,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::approx;
 use crate::config::LocalConfig;
-use crate::error::{Budget, Error, RefusalReason, Result};
+use crate::error::{Budget, Error, Recurrence, Recurs, RefusalReason, Result};
 use crate::key::KeyType;
 use crate::storage::IoStats;
 
@@ -157,6 +157,29 @@ pub enum LocalFault {
     /// resumed on the caller instead, never turned into an error.
     #[error("blocking task was canceled: {0}")]
     Join(tokio::task::JoinError),
+}
+
+/// The local directory is the process's, rebuilt from object storage, so a
+/// fault of it is tried again, unless the data file alone decides it.
+impl Recurs for LocalFault {
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            // The header holds the data file's identity and one span per
+            // row group of its footer, so its length is the file's.
+            Self::HeaderTooLarge { .. }
+            // The spans are the key chunk ranges the footer bounds.
+            | Self::ChunkOverlap { .. } => Recurrence::Deterministic,
+            // A chunk's bytes are what the store returned for its range,
+            // and the fault does not say whether the range or the bytes
+            // came up short.
+            Self::ChunkLengthMismatch { .. }
+            // A caller's read outside the spans it was handed: the
+            // process's fault, not the snapshot's.
+            | Self::RangeNotResident { .. }
+            | Self::Io(_)
+            | Self::Join(_) => Recurrence::Transient,
+        }
+    }
 }
 
 /// The local directory, opened once per process and shared by every table

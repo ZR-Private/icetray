@@ -24,7 +24,7 @@ use crate::approx;
 use crate::config::ConfigViolation;
 use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::descriptors;
-use crate::error::{Error, Result};
+use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::local::DiskLevel;
 use crate::metric;
 use crate::shard::{self, Sharded};
@@ -136,6 +136,17 @@ pub enum CacheError {
         /// process, or in the system.
         source: io::Error,
     },
+}
+
+impl Recurs for CacheError {
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            Self::Fetch(error) => error.recurrence(),
+            Self::FetchDeadline { .. } | Self::Backend(_) | Self::DescriptorLimit { .. } => {
+                Recurrence::Transient
+            }
+        }
+    }
 }
 
 /// A page's identity: the file it belongs to and the byte offset of its

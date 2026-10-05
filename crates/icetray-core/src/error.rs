@@ -1,5 +1,7 @@
-//! The one error type of the crate, and the refusal reasons that travel with
-//! it into logs and metric labels.
+//! The one error type of the crate, the refusal reasons that travel with it
+//! into logs and metric labels, and `Recurs`, the one way to ask any failure
+//! whether it is fixed for the snapshot or can succeed on another try (RFD
+//! 005).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -317,56 +319,72 @@ pub enum ErrorKind {
     LookupCanceled,
 }
 
-impl ErrorKind {
-    /// Whether a refresh that failed this way would fail the same way
-    /// again over the same metadata location, before the table's entry
-    /// changes: what decides if a table remembers the failure and stops
-    /// building the snapshot there (RFD 005). The one classification of
-    /// every kind; a new kind is classified here or does not compile.
-    pub(crate) fn recurrence(&self) -> Recurrence {
-        match self {
-            Self::Refused(reason) => reason.recurrence(),
-            // The doctor's verdict on a built generation is a function of
-            // the generation, and `strict` is the table's own setting.
-            Self::Inefficient => Recurrence::Deterministic,
-            Self::Iceberg
-            | Self::Parquet
-            | Self::ObjectStore
-            | Self::ObjectStorePath
-            | Self::Json
-            | Self::Config
-            | Self::Location
-            | Self::Cache
-            | Self::KeyType
-            | Self::Table
-            | Self::File
-            | Self::NotReady
-            | Self::Local
-            | Self::CatalogTimeout
-            | Self::Catalog
-            | Self::LoadDeadline
-            | Self::RefreshDeadline
-            | Self::VerifyCanceled
-            | Self::LookupCanceled => Recurrence::Transient,
-        }
-    }
+/// A failure that says whether it is fixed for the snapshot it was met on
+/// (RFD 005): the one question a refresh asks of a failure before it
+/// decides to remember it. Every error type whose variants differ in the
+/// answer implements it beside its variants, as one exhaustive match, so a
+/// new variant does not compile until it is classified; a variant that
+/// holds such a type asks the one it holds.
+pub(crate) trait Recurs {
+    /// Whether the same work over the same snapshot, under the same table
+    /// entry, fails this way again.
+    fn recurrence(&self) -> Recurrence;
 }
 
 /// Whether a failure can end otherwise when the same work is tried again
 /// (RFD 005).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Recurrence {
-    /// A function of the snapshot and the table's configuration alone: a
-    /// metadata file and the files it names are immutable, so building the
-    /// snapshot again under the same entry fails the same way, and costs
-    /// its reads and a log line each time.
+    /// A pure function of the snapshot's metadata and data files and the
+    /// table's configuration entry: a metadata file and the files it names
+    /// are immutable, so building the snapshot again under the same entry
+    /// fails the same way, and costs its reads and a log line each time.
     Deterministic,
-    /// May succeed on another try: a store, catalog, cache, or local
-    /// directory failure, a timeout, a deadline, or a cancellation. Every
-    /// kind that is neither a rule refusal nor the strict gate is classed
-    /// here, a table or file fault included, so it is tried again on every
-    /// poll.
+    /// May succeed on another try: the failure depends on I/O, on another
+    /// table, on the clock, on the process, or on anything else a retry
+    /// could find changed, or it cannot tell whether it does. A failure
+    /// classed here wrongly costs a poll's reads; one classed
+    /// `Deterministic` wrongly leaves the table behind until its source
+    /// moves.
     Transient,
+}
+
+impl Recurs for Error {
+    fn recurrence(&self) -> Recurrence {
+        match self {
+            Self::Refused { reason, .. } => reason.recurrence(),
+            Self::Table { fault, .. } => fault.recurrence(),
+            Self::File { fault, .. } => fault.recurrence(),
+            Self::Local { fault, .. } => fault.recurrence(),
+            Self::Cache(error) => error.recurrence(),
+            // The doctor's verdict on a built generation is a function of
+            // the generation, and `strict` is the table's own setting.
+            Self::Inefficient { .. } => Recurrence::Deterministic,
+            // A library's error does not say whether it met malformed
+            // bytes or a read that failed under it.
+            Self::Iceberg(_)
+            | Self::Parquet(_)
+            | Self::Json(_)
+            // Whether a location names a store, and the path it names
+            // there, follow the rewrite rules and stores of the process's
+            // storage settings, not the table's entry.
+            | Self::ObjectStorePath(_)
+            | Self::Location { .. }
+            // The configuration document and the process's settings, which
+            // a reload or a restart reads again.
+            | Self::Config(_)
+            // A lookup's own key, never a build's.
+            | Self::KeyType { .. }
+            | Self::ObjectStore(_)
+            | Self::NotReady { .. }
+            | Self::CatalogTimeout { .. }
+            | Self::Catalog { .. }
+            | Self::LoadDeadline { .. }
+            | Self::RefreshDeadline { .. }
+            | Self::VerifyCanceled { .. }
+            | Self::LookupCanceled { .. } => Recurrence::Transient,
+        }
+    }
 }
 
 impl fmt::Display for ErrorKind {
@@ -566,14 +584,10 @@ pub enum RefusalReason {
     },
 }
 
-impl RefusalReason {
-    /// `ErrorKind::recurrence` of a refusal for this reason. Every rule
-    /// but one reads only the snapshot's metadata and files and the
-    /// table's configuration (its columns, residency, and resident budget)
-    /// against fixed contract limits. The local directory's index budget
-    /// is shared: whether a load fits depends on the chunk files and
-    /// reservations of every other table, which change without this
-    /// table's source moving.
+/// Every rule but one reads only the snapshot's metadata and files and the
+/// table's configuration (its columns, residency, and resident budget)
+/// against fixed contract limits.
+impl Recurs for RefusalReason {
     fn recurrence(&self) -> Recurrence {
         match self {
             Self::Unsorted { .. }
@@ -590,6 +604,9 @@ impl RefusalReason {
                 of: Budget::Resident,
                 ..
             } => Recurrence::Deterministic,
+            // The local directory's index budget is shared: whether a load
+            // fits depends on the chunk files and reservations of every
+            // other table, which change without this table's source moving.
             Self::OverBudget {
                 of: Budget::Index, ..
             } => Recurrence::Transient,
@@ -639,13 +656,21 @@ impl fmt::Display for RefusalReason {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::ConfigViolation;
     use crate::generation::testing::TABLE;
+    use crate::index::{ChunkPage, DecodedPart, HeaderField, PageHeaderFault};
+    use crate::snapshot::SnapshotId;
     use crate::storage::LocationFault;
 
     /// A synthetic data file location for the reasons that name one.
     const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
+    /// A synthetic table root for the version hint faults.
+    const TABLE_ROOT: &str = "mem://w/db/kv";
+    /// A synthetic chunk file path for the local directory faults.
+    const CHUNK_PATH: &str = "/var/lib/icetray/index/f0";
 
     /// One reason of every variant, each beside its name; an over-budget
     /// one is held to the table's own budget.
@@ -730,49 +755,331 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recurrence_is_deterministic_for_rule_refusals_and_the_strict_gate_alone() {
-        for (reason, name) in reason_cases() {
-            assert_eq!(
-                ErrorKind::Refused(reason).recurrence(),
-                Recurrence::Deterministic,
-                "{name}"
-            );
+    /// A refusal for `reason` of the fixture table.
+    fn refused(reason: RefusalReason) -> Error {
+        Error::refused(TABLE, reason)
+    }
+
+    /// A table fault of the fixture table.
+    fn table(fault: TableFault) -> Error {
+        Error::table_fault(TABLE, fault)
+    }
+
+    /// A file fault of the synthetic data file.
+    fn file(fault: FileFault) -> Error {
+        Error::File {
+            path: FILE_PATH.to_string(),
+            fault,
         }
-        let shared = RefusalReason::OverBudget {
-            of: Budget::Index,
-            needed: 1,
-            budget: 0,
+    }
+
+    /// A local directory fault on a synthetic chunk file.
+    fn local(fault: LocalFault) -> Error {
+        Error::Local {
+            path: PathBuf::from(CHUNK_PATH),
+            fault,
+        }
+    }
+
+    /// A refusal of every reason under the table's own budget and one under
+    /// the shared one, and the strict gate, beside their classification.
+    fn refusal_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        let mut cases: Vec<(Error, Recurrence)> = reason_cases()
+            .into_iter()
+            .map(|(reason, _)| (refused(reason), Deterministic))
+            .collect();
+        cases.extend([
+            (
+                refused(RefusalReason::OverBudget {
+                    of: Budget::Index,
+                    needed: 1,
+                    budget: 0,
+                }),
+                Transient,
+            ),
+            (
+                Error::Inefficient {
+                    table: TABLE.to_string(),
+                    findings: vec![FindingCode::DictionaryEncodedValue],
+                },
+                Deterministic,
+            ),
+        ]);
+        cases
+    }
+
+    /// One table fault of every variant beside its classification.
+    fn table_fault_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        vec![
+            (
+                table(TableFault::RefNotFound {
+                    ref_name: "main".to_string(),
+                }),
+                Deterministic,
+            ),
+            (
+                table(TableFault::SchemaMissing { schema_id: 1 }),
+                Deterministic,
+            ),
+            (table(TableFault::SpecMissing { spec_id: 1 }), Deterministic),
+            (
+                table(TableFault::ColumnMissing {
+                    column: "k".to_string(),
+                }),
+                Deterministic,
+            ),
+            (table(TableFault::ZeroBuckets { spec_id: 0 }), Deterministic),
+            (
+                table(TableFault::BucketValueMissing {
+                    path: FILE_PATH.to_string(),
+                    spec_id: 0,
+                }),
+                Deterministic,
+            ),
+            (
+                table(TableFault::BucketValueOutOfRange {
+                    path: FILE_PATH.to_string(),
+                    spec_id: 0,
+                    bucket: 2,
+                    count: 2,
+                }),
+                Deterministic,
+            ),
+            (
+                table(TableFault::SnapshotTimestampOutOfRange {
+                    snapshot_id: SnapshotId(1),
+                }),
+                Deterministic,
+            ),
+            (
+                table(TableFault::VersionHintEmpty {
+                    root: TABLE_ROOT.to_string(),
+                }),
+                Transient,
+            ),
+            (
+                table(TableFault::VersionHintMalformed {
+                    root: TABLE_ROOT.to_string(),
+                    hint: "1 2".to_string(),
+                }),
+                Transient,
+            ),
+            (table(TableFault::MetadataLocationUnknown), Transient),
+            (
+                table(TableFault::NotIceberg { table_type: None }),
+                Transient,
+            ),
+        ]
+    }
+
+    /// One file fault of every variant, a decoder panic over every part,
+    /// beside its classification.
+    fn file_fault_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        let row_group = 0;
+        vec![
+            (
+                file(FileFault::MissingColumn("k".to_string())),
+                Deterministic,
+            ),
+            (file(FileFault::MissingPageIndex), Deterministic),
+            (file(FileFault::NoRows), Deterministic),
+            (file(FileFault::InconsistentRowCounts), Deterministic),
+            (
+                file(FileFault::InconsistentOffsetIndex { row_group }),
+                Deterministic,
+            ),
+            (
+                file(FileFault::UnplaceableBloomFilter { row_group }),
+                Deterministic,
+            ),
+            (
+                file(FileFault::ValuePhysicalType {
+                    got: parquet::basic::Type::INT64,
+                }),
+                Deterministic,
+            ),
+            (file(FileFault::ZeroWidthValue), Deterministic),
+            (
+                file(FileFault::CorruptBloomFilter { row_group }),
+                Deterministic,
+            ),
+            (
+                file(FileFault::PageRowsMismatch { row_group, page: 0 }),
+                Transient,
+            ),
+            (
+                file(FileFault::MalformedPageHeader {
+                    row_group,
+                    page: ChunkPage::Data(0),
+                    fault: PageHeaderFault::Truncated,
+                }),
+                Transient,
+            ),
+            (
+                file(FileFault::PageHeaderOverBound {
+                    row_group,
+                    page: ChunkPage::Data(0),
+                    field: HeaderField::UncompressedPageSize,
+                    declared: 2,
+                    allowed: 1,
+                }),
+                Transient,
+            ),
+            (file(FileFault::KeyNotUtf8 { row_group }), Transient),
+            (
+                file(FileFault::PageOutOfRange { row: 1, row_group }),
+                Transient,
+            ),
+            (
+                file(FileFault::DecoderPanicked {
+                    part: DecodedPart::Footer,
+                    message: "sample".to_string(),
+                }),
+                Deterministic,
+            ),
+            (
+                file(FileFault::DecoderPanicked {
+                    part: DecodedPart::BloomFilter { row_group },
+                    message: "sample".to_string(),
+                }),
+                Deterministic,
+            ),
+            (
+                file(FileFault::DecoderPanicked {
+                    part: DecodedPart::Pages {
+                        row_group,
+                        page: None,
+                    },
+                    message: "sample".to_string(),
+                }),
+                Transient,
+            ),
+        ]
+    }
+
+    /// One local directory fault of every variant beside its
+    /// classification.
+    fn local_fault_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        vec![
+            (local(LocalFault::HeaderTooLarge { len: 1 }), Deterministic),
+            (
+                local(LocalFault::ChunkOverlap { start: 0, end: 1 }),
+                Deterministic,
+            ),
+            (
+                local(LocalFault::ChunkLengthMismatch {
+                    start: 0,
+                    end: 2,
+                    len: 1,
+                }),
+                Transient,
+            ),
+            (
+                local(LocalFault::RangeNotResident { start: 0, end: 1 }),
+                Transient,
+            ),
+            (
+                local(LocalFault::Io(std::io::Error::other("sample"))),
+                Transient,
+            ),
+            (local(LocalFault::Join(canceled_task())), Transient),
+        ]
+    }
+
+    /// One cache failure of every variant, a fetch failure of either class
+    /// among them, beside its classification.
+    fn cache_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        vec![
+            (
+                Error::Cache(CacheError::Fetch(Arc::new(Error::NotReady {
+                    table: TABLE.to_string(),
+                }))),
+                Transient,
+            ),
+            (
+                Error::Cache(CacheError::Fetch(Arc::new(refused(
+                    RefusalReason::DeleteFiles,
+                )))),
+                Deterministic,
+            ),
+            (
+                Error::Cache(CacheError::FetchDeadline {
+                    path: FILE_PATH.to_string(),
+                    offset: 0,
+                    after: Duration::ZERO,
+                }),
+                Transient,
+            ),
+            (
+                Error::Cache(CacheError::Backend(foyer::Error::io_error(
+                    std::io::Error::other("sample"),
+                ))),
+                Transient,
+            ),
+            (
+                Error::Cache(CacheError::DescriptorLimit {
+                    limit: 1,
+                    needed: 2,
+                    source: std::io::Error::other("sample"),
+                }),
+                Transient,
+            ),
+        ]
+    }
+
+    /// One failure of every variant of every type that answers `Recurs`,
+    /// each beside its classification: a refusal of every reason and of
+    /// both budgets, the strict gate, every table, file, local, and cache
+    /// failure, and every other variant of `Error`, all transient.
+    fn recurrence_cases() -> Vec<(Error, Recurrence)> {
+        let mut cases = refusal_recurrence_cases();
+        cases.extend(table_fault_recurrence_cases());
+        cases.extend(file_fault_recurrence_cases());
+        cases.extend(local_fault_recurrence_cases());
+        cases.extend(cache_recurrence_cases());
+        let classified_above = |error: &Error| match error {
+            Error::Refused { .. }
+            | Error::Inefficient { .. }
+            | Error::Table { .. }
+            | Error::File { .. }
+            | Error::Local { .. }
+            | Error::Cache(_) => true,
+            Error::Iceberg(_)
+            | Error::Parquet(_)
+            | Error::ObjectStore(_)
+            | Error::ObjectStorePath(_)
+            | Error::Json(_)
+            | Error::Config(_)
+            | Error::Location { .. }
+            | Error::KeyType { .. }
+            | Error::NotReady { .. }
+            | Error::CatalogTimeout { .. }
+            | Error::Catalog { .. }
+            | Error::LoadDeadline { .. }
+            | Error::RefreshDeadline { .. }
+            | Error::VerifyCanceled { .. }
+            | Error::LookupCanceled { .. } => false,
         };
-        assert_eq!(
-            ErrorKind::Refused(shared).recurrence(),
-            Recurrence::Transient,
-            "the shared index budget frees as other tables change"
+        cases.extend(
+            wrapped_cases()
+                .into_iter()
+                .chain(raised_cases())
+                .map(|(error, _)| error)
+                .filter(|error| !classified_above(error))
+                .map(|error| (error, Recurrence::Transient)),
         );
-        for (error, name) in wrapped_cases().into_iter().chain(raised_cases()) {
-            let expected = match &error {
-                Error::Refused { .. } | Error::Inefficient { .. } => Recurrence::Deterministic,
-                Error::Iceberg(_)
-                | Error::Parquet(_)
-                | Error::ObjectStore(_)
-                | Error::ObjectStorePath(_)
-                | Error::Json(_)
-                | Error::Config(_)
-                | Error::Location { .. }
-                | Error::Cache(_)
-                | Error::KeyType { .. }
-                | Error::Table { .. }
-                | Error::File { .. }
-                | Error::NotReady { .. }
-                | Error::Local { .. }
-                | Error::CatalogTimeout { .. }
-                | Error::Catalog { .. }
-                | Error::LoadDeadline { .. }
-                | Error::RefreshDeadline { .. }
-                | Error::VerifyCanceled { .. }
-                | Error::LookupCanceled { .. } => Recurrence::Transient,
-            };
-            assert_eq!(error.kind().recurrence(), expected, "{name}");
+        cases
+    }
+
+    #[test]
+    fn test_recurrence_classifies_every_variant() {
+        for (error, expected) in recurrence_cases() {
+            assert_eq!(error.recurrence(), expected, "{error:?}");
         }
     }
 
@@ -922,6 +1229,13 @@ mod tests {
                     source: canceled_task(),
                 },
                 "verify_canceled",
+            ),
+            (
+                Error::LookupCanceled {
+                    table: TABLE.to_string(),
+                    source: canceled_task(),
+                },
+                "lookup_canceled",
             ),
         ]
     }

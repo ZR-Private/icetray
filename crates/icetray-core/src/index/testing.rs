@@ -653,6 +653,17 @@ pub(crate) fn with_dictionary_one_entry_short(file: &Bytes, leaf: usize) -> (Byt
     (patched, num_values)
 }
 
+/// `chunk`, the bytes of a column chunk that starts with a data page, with
+/// that page's header claiming `claimed` values, in a varint as wide as the
+/// one it replaces, so no byte after it moves.
+pub(crate) fn with_first_page_claiming(chunk: &[u8], claimed: i32) -> Vec<u8> {
+    let varint = header_varint(chunk, HeaderField::NumValues);
+    let width = varint.len();
+    let mut patched = chunk.to_vec();
+    patched.splice(varint, zigzag_varint(claimed, width));
+    patched
+}
+
 /// `loaded` with the header of `page` of row group 0's `leaf` chunk grown
 /// by `grown` bytes: the page, the chunk, and every later page of the
 /// chunk moved in the footer by it.

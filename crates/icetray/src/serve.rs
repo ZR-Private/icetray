@@ -694,9 +694,10 @@ pub(crate) fn ticker(period: Duration) -> tokio::time::Interval {
 /// Polls `table`'s ref every `poll_interval` (RFD 005): a swap is logged and
 /// followed by retention; a failure is logged with the snapshot still
 /// served, which core keeps serving and counts under `refresh_errors_total`.
-/// A deterministic refusal fails one poll, so it is logged once: core
-/// remembers it, and the polls after it return `Ok(false)` until the
-/// source names another metadata location.
+/// A failure fixed for the snapshot, a refusal or a table or file fault of
+/// it, fails one poll, so it is logged once: core remembers it, and the
+/// polls after it return `Ok(false)` until the source names another
+/// metadata location.
 /// The poll's outcome is bound before anything else awaits, so the finished
 /// poll future is dropped first and the loop stays `Send`.
 async fn refresh_loop(

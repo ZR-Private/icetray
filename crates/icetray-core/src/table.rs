@@ -25,7 +25,7 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode, Tier};
 use crate::config::TableConfig;
-use crate::error::{Error, ErrorKind, Recurrence, Result};
+use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
 use crate::local::LocalDir;
@@ -228,11 +228,13 @@ pub struct Table {
     /// The metadata location a poll compares the source against: the one
     /// the table last admitted or found its serving snapshot at, so a
     /// metadata change that did not move the followed ref does not make
-    /// every later poll read the metadata again, or the one whose snapshot
-    /// a poll over a serving generation was refused for deterministically
-    /// (`Recurrence::Deterministic`), so that snapshot is not built again
-    /// until the source names another location. A transient failure does
-    /// not advance it: the next poll reads the metadata again and retries.
+    /// every later poll read the metadata again, or the one where a poll
+    /// over a serving generation met a failure fixed for the snapshot
+    /// (`Recurrence::Deterministic`): a refusal, the strict gate, or a
+    /// table or file fault of the metadata or a data file. That snapshot is
+    /// not built again until the source names another location. A
+    /// transient failure does not advance it: the next poll reads the
+    /// metadata again and retries.
     /// `None` until the first successful build. A reload that changes the
     /// table's entry builds a new `Table`, which remembers nothing, so a
     /// refusal that depended on the old entry is tried again under the new
@@ -265,22 +267,24 @@ pub struct Table {
 }
 
 /// The metadata location a table's polls compare their source against,
-/// and whether the snapshot the ref names there was refused.
+/// and whether the ref there was refused.
 #[derive(Clone, Debug)]
 struct Known {
     /// The metadata file's location.
     location: String,
-    /// The deterministic refusal of the snapshot the ref names at
-    /// `location`; `None` when the table serves that snapshot.
+    /// The failure fixed for the snapshot the ref names at `location`, or
+    /// for the ref itself when it names none there; `None` when the table
+    /// serves that snapshot.
     refused: Option<Refusal>,
 }
 
-/// A refusal a table remembers until its source names another metadata
-/// location.
+/// A failure fixed for the snapshot that a table remembers until its source
+/// names another metadata location.
 #[derive(Clone, Debug)]
 struct Refusal {
-    /// The snapshot refused.
-    snapshot_id: SnapshotId,
+    /// The snapshot refused; `None` when the metadata lacks the ref
+    /// (`TableFault::RefNotFound`), so no snapshot was named.
+    snapshot_id: Option<SnapshotId>,
     /// Why, as the failure's kind.
     reason: ErrorKind,
     /// When the refusal was made.
@@ -647,12 +651,12 @@ impl Table {
     /// the table `Degraded`, and counts one `refresh_errors_total` with the
     /// error's kind as its reason; `Ok(false)` after such a failure ends
     /// the `Degraded` state, since the table is in step with its ref again.
-    /// A deterministic failure over a serving generation is the exception
-    /// (`Recurrence::Deterministic`): the table remembers it, and while the
-    /// source names the same metadata location each poll costs only the
-    /// small read, returns `Ok(false)`, counts nothing, and leaves the table
-    /// `Degraded` for that refusal. A transient failure is tried again on
-    /// the next poll.
+    /// A failure over a serving generation that is fixed for the snapshot
+    /// is the exception (`Recurrence::Deterministic`): the table remembers
+    /// it, and while the source names the same metadata location each poll
+    /// costs only the small read, returns `Ok(false)`, counts nothing, and
+    /// leaves the table `Degraded` for that failure. A transient failure is
+    /// tried again on the next poll.
     /// The poll runs within the refresh deadline, or with no generation
     /// serving within the load deadline; past it the poll is dropped as
     /// `Error::RefreshDeadline` or `Error::LoadDeadline`, a failure like any
@@ -905,9 +909,10 @@ impl Table {
     }
 
     /// One poll over `current`: the source is asked whether its metadata
-    /// moved from the known location, and only a snapshot with another id
-    /// is built. A build refused deterministically is remembered against
-    /// its location, so an unchanged source then builds nothing.
+    /// moved from the known location, and the table advances to what the
+    /// ref names there (`advance`). A failure of that step fixed for the
+    /// snapshot is remembered against the location, so an unchanged source
+    /// then builds nothing.
     async fn poll(&self, current: &Arc<Generation>) -> Result<bool> {
         let known = self
             .known
@@ -926,26 +931,33 @@ impl Table {
             }
             return Ok(false);
         };
-        let snapshot = self.ref_snapshot(&resolved)?;
-        let snapshot_id = SnapshotId(snapshot.snapshot_id());
-        if snapshot_id == current.snapshot_id {
+        self.advance(&resolved, current).await.inspect_err(|error| {
+            if error.recurrence() == Recurrence::Deterministic {
+                let refusal = Refusal {
+                    snapshot_id: resolved
+                        .metadata
+                        .snapshot_for_ref(&self.config.r#ref)
+                        .map(|snapshot| SnapshotId(snapshot.snapshot_id())),
+                    reason: error.kind(),
+                    since: Instant::now(),
+                };
+                self.remember(&resolved.location, Some(refusal));
+            }
+        })
+    }
+
+    /// Moves the table onto the snapshot the ref names in `resolved`: only
+    /// a snapshot with another id than `current`'s is built. `Ok(true)`
+    /// when one was swapped in.
+    async fn advance(&self, resolved: &Resolved, current: &Arc<Generation>) -> Result<bool> {
+        let snapshot = self.ref_snapshot(resolved)?;
+        if SnapshotId(snapshot.snapshot_id()) == current.snapshot_id {
             self.remember(&resolved.location, None);
             self.in_step(current);
             return Ok(false);
         }
-        self.build_and_admit(&resolved, &snapshot, Some(current))
-            .await
-            .inspect_err(|error| {
-                let reason = error.kind();
-                if reason.recurrence() == Recurrence::Deterministic {
-                    let refusal = Refusal {
-                        snapshot_id,
-                        reason,
-                        since: Instant::now(),
-                    };
-                    self.remember(&resolved.location, Some(refusal));
-                }
-            })?;
+        self.build_and_admit(resolved, &snapshot, Some(current))
+            .await?;
         Ok(true)
     }
 
@@ -1072,8 +1084,8 @@ impl Table {
         error
     }
 
-    /// The poll found the source still naming the location whose snapshot
-    /// `refusal` refused, so the table stays `Degraded` for that refusal.
+    /// The poll found the source still naming the location where `refusal`
+    /// was met, so the table stays `Degraded` for that refusal.
     /// The state is set again when it names another reason: a transient
     /// failure of a poll since the refusal replaced it.
     fn held_back(&self, refusal: &Refusal) {
@@ -1091,8 +1103,9 @@ impl Table {
     }
 
     /// Records the metadata location the table is now in step with, or
-    /// whose snapshot `refused` refused. Replacing a remembered refusal
-    /// with another location logs, once, that the source moved past it.
+    /// where `refused` was met. Replacing a remembered refusal with another
+    /// location logs, once, that the source moved past it, with the
+    /// refused snapshot when the ref named one.
     fn remember(&self, location: &str, refused: Option<Refusal>) {
         let next = Known {
             location: location.to_string(),
@@ -1111,7 +1124,7 @@ impl Table {
         {
             tracing::info!(
                 table = self.name(),
-                snapshot_id = %past.snapshot_id,
+                snapshot_id = past.snapshot_id.map(tracing::field::display),
                 reason = %past.reason,
                 location,
                 "source moved past a refused snapshot"
@@ -1252,18 +1265,20 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
     use super::*;
+    use crate::catalog::TableFault;
     use crate::config::{Residency, ServerConfig};
     use crate::error::{ErrorKind, RefusalReason};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
         SECOND_VERSION, TABLE, THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO,
-        Table as Fixture, WriterLayout, bucketing, cache, keys_from, keys_in_bucket, long_keys,
-        parquet, two_bucket_table, value_for, values_of,
+        Table as Fixture, WriterLayout, bucketing, cache, keys_from, keys_in_bucket, local_dir,
+        long_keys, parquet, two_bucket_table, value_for, values_of,
     };
-    use crate::index::testing::with_dictionary_one_entry_short;
+    use crate::index::testing::{with_dictionary_one_entry_short, with_first_page_claiming};
     use crate::index::{DecodedPart, FileFault};
     use crate::key::KeyType;
+    use crate::local::testing::{chunks_offset, overwrite};
     use crate::manifest::testing::{self as manifest_testing, Partition};
     use crate::metric::LookupResult;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
@@ -2126,7 +2141,7 @@ mod tests {
         };
         let error = table.refresh().await.unwrap_err();
         assert!(unreadable(&error), "{error:?}");
-        assert_eq!(error.kind().recurrence(), Recurrence::Transient);
+        assert_eq!(error.recurrence(), Recurrence::Transient);
         let before = fixture.gets();
         let error = table.refresh().await.unwrap_err();
         assert!(unreadable(&error), "{error:?}");
@@ -2140,6 +2155,96 @@ mod tests {
         );
 
         std::fs::write(on_disk, written).unwrap();
+        assert!(table.refresh().await.unwrap());
+        assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
+    }
+
+    /// A key chunk changed on disk under a Disk-tier table is a file fault
+    /// of the local directory's copy, not of the data file: the overlap
+    /// check meets it reading the chunk back, the next poll builds the
+    /// snapshot again rather than remembering the fault, and once the chunk
+    /// file holds the data file's bytes again the snapshot is swapped in.
+    #[tokio::test]
+    async fn test_refresh_tries_a_file_fault_of_a_local_chunk_file_again_on_the_next_poll() {
+        let mut fixture = Fixture::bucketed(1);
+        let first = keys_from(0, FILE_KEYS);
+        fixture.add_long_file("f0", &first, 0).await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), fixture.storage.stats(), None);
+        let handles = TableHandles {
+            local: Some(Arc::clone(&local)),
+            ..handles_over(&fixture).await
+        };
+        // Overlapping files are an inefficient finding, which strict refuses.
+        let config = TableConfig {
+            strict: false,
+            ..fixture.config(Residency::Disk, None)
+        };
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            &fixture,
+            config,
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        table.load().await.unwrap();
+        let identity = table
+            .current()
+            .unwrap()
+            .identities()
+            .into_iter()
+            .next()
+            .unwrap();
+        let chunk_file = local.chunk_path(&identity);
+        let at = chunks_offset(&chunk_file);
+        let held = std::fs::read(&chunk_file).unwrap()[approx::length(at)..].to_vec();
+        let more_than_the_file_holds = i32::try_from(FILE_KEYS + 1).unwrap();
+        overwrite(
+            &chunk_file,
+            at,
+            &with_first_page_claiming(&held, more_than_the_file_holds),
+        );
+        let interleaved: Vec<i64> = first.iter().map(|key| key + 1).collect();
+        fixture.add_long_file("f1", &interleaved, 0).await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+
+        let changed = fixture.path_of("f0");
+        let of_the_copy = |error: &Error| {
+            matches!(
+                error,
+                Error::File {
+                    path,
+                    fault: FileFault::PageRowsMismatch { .. },
+                } if *path == changed
+            )
+        };
+        let error = table.refresh().await.unwrap_err();
+        assert!(of_the_copy(&error), "{error:?}");
+        assert_eq!(error.recurrence(), Recurrence::Transient);
+        let before = fixture.gets();
+        let error = table.refresh().await.unwrap_err();
+        assert!(of_the_copy(&error), "{error:?}");
+        assert!(
+            fixture.gets() > before + POLL_GETS,
+            "the poll read the snapshot's metadata and manifests again"
+        );
+        assert_eq!(
+            degraded(&table),
+            (Some(SnapshotId(FIRST_SNAPSHOT)), ErrorKind::File)
+        );
+
+        overwrite(&chunk_file, at, &held);
         assert!(table.refresh().await.unwrap());
         assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
     }
@@ -2686,6 +2791,64 @@ mod tests {
             state_gauge(&series, TABLE, StateName::Serving).to_bits(),
             approx::gauge(1).to_bits()
         );
+    }
+
+    /// A ref the metadata does not have is a table fault fixed for that
+    /// metadata file, and is remembered against its location like a
+    /// refusal: while the version hint names it each poll reads the hint
+    /// alone, counts no error, and leaves the table degraded for the
+    /// fault; once the hint names metadata holding the ref again, its
+    /// snapshot is built.
+    #[test]
+    fn test_refresh_does_not_read_metadata_lacking_the_ref_again_until_its_location_moves() {
+        let faulted = ErrorKind::Table;
+        let serving = Some(SnapshotId(FIRST_SNAPSHOT));
+        let ((), series) = recorded(async {
+            let (mut fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            fixture.drop_main(SECOND_VERSION).await;
+
+            let before = fixture.gets();
+            let error = table.refresh().await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    Error::Table {
+                        fault: TableFault::RefNotFound { .. },
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert!(
+                fixture.gets() > before + POLL_GETS,
+                "the first poll reads the metadata file"
+            );
+            let polls_while_unchanged = 3;
+            for _ in 0..polls_while_unchanged {
+                let before = fixture.gets();
+                assert!(!table.refresh().await.unwrap());
+                assert_eq!(fixture.gets(), before + POLL_GETS, "the version hint alone");
+                assert_eq!(degraded(&table), (serving, faulted.clone()));
+            }
+
+            fixture
+                .commit(
+                    SECOND_SNAPSHOT,
+                    Some(FIRST_SNAPSHOT),
+                    SECOND_SEQUENCE,
+                    THIRD_VERSION,
+                )
+                .await;
+            assert!(table.refresh().await.unwrap());
+            assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
+        });
+        let errors = series.counter(
+            metric::REFRESH_ERRORS_TOTAL,
+            &[table_label(), (metric::LABEL_REASON, faulted.to_string())],
+        );
+        assert_eq!(errors, 1, "counted once, when met");
     }
 
     /// The `findings` gauge of `code` for the table `table`.

@@ -1610,6 +1610,21 @@ pub(crate) mod testing {
             .await;
         }
 
+        /// Writes the metadata as `version` without the main branch,
+        /// pointing the hint at it, as a writer that dropped the branch
+        /// leaves it; the next `commit` sets the branch again.
+        pub(crate) async fn drop_main(&mut self, version: u64) {
+            self.md = self
+                .md
+                .clone()
+                .into_builder(None)
+                .remove_ref(MAIN)
+                .build()
+                .unwrap()
+                .metadata;
+            manifest_testing::write_metadata(&self.md, version).await;
+        }
+
         /// Evolves the partition spec to `buckets` buckets; files added
         /// from here on are written under the new spec.
         pub(crate) fn evolve(&mut self, buckets: u32) {
