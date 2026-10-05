@@ -241,7 +241,8 @@ inefficient findings at `warn`.
 `storage.local.dir` names an optional local directory. It holds:
 
 - The chunk files of tables with `residency = "disk"`: each data file's
-  key chunks, with only the fence array in memory.
+  key chunks, while its footer, page indexes, and fence array stay in
+  memory.
 - The disk level of the value-page cache, bounded by
   `storage.local.page_cache_disk_bytes`. Zero turns the level off; any
   other value is at least one 4 MiB block.

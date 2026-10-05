@@ -48,7 +48,7 @@ staleness.
 `full`, the default, is RFD 004 as stated: one GET per hit, none per miss,
 and a few bytes of memory per key. `disk` writes the chunks to a file in a
 local directory as they stream through verification, and keeps the
-routing set in memory without any key bytes. A lookup reads one key page
+routing set in memory without the key chunks. A lookup reads one key page
 from local disk, a hit still costs one GET and a miss none, and memory per
 key falls to the fence array, a fraction of a byte. `bloom` keeps the
 routing set and the key column's bloom filters and needs no local disk. A

@@ -40,8 +40,8 @@ like), the table cannot be held the way its residency requires, or it is
 inefficient while `strict` is on.
 
 **Residency.** Where a table keeps its key chunks: `full` (in memory),
-`disk` (in a file in the local directory, with only the fence array in
-memory), or `bloom` (bloom filters in memory instead). See
+`disk` (in a file in the local directory, with footers, page indexes,
+and the fence array in memory), or `bloom` (bloom filters in memory instead). See
 [Choosing a residency](configuration.md#choosing-a-residency).
 
 **Strict.** A per-table setting, on by default, that refuses an
