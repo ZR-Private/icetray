@@ -28,7 +28,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
 use crate::error::{CallFault, WireKeyFault};
-use crate::telemetry::{self, Answering, Call};
+use crate::telemetry::{Answering, Call, Requests};
 
 /// The in-flight slots `Get` and `MultiGet` hold together, at most
 /// `server.max_in_flight`: what admits a call, and what
@@ -90,20 +90,22 @@ pub struct Service {
     slots: Slots,
     /// The most keys one `MultiGet` may carry.
     max_multi_get_keys: usize,
+    /// `requests_total`, one handle per call and code.
+    requests: Requests,
 }
 
 impl Service {
     /// The service over the tables `opened` serves, by configured name,
     /// under `server`'s request bounds, with `requests_total` of every call
-    /// answering `OK` registered at zero (`telemetry::register_requests`).
+    /// and code registered at zero (`Requests::register`).
     pub fn new(opened: &Arc<Opened>, server: &ServerConfig) -> Self {
-        telemetry::register_requests();
         Self {
             opened: Arc::clone(opened),
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_keys: server.max_multi_get_keys,
+            requests: Requests::register(),
         }
     }
 
@@ -386,7 +388,7 @@ impl Service {
 #[tonic::async_trait]
 impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let answering = Answering::new(Call::Get);
+        let answering = Answering::new(&self.requests, Call::Get);
         answering.answer(self.answer_get(request.into_inner()).await)
     }
 
@@ -394,7 +396,7 @@ impl Icetray for Service {
         &self,
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        let answering = Answering::new(Call::MultiGet);
+        let answering = Answering::new(&self.requests, Call::MultiGet);
         answering.answer(self.answer_multi_get(request.into_inner()).await)
     }
 
@@ -402,7 +404,7 @@ impl Icetray for Service {
         &self,
         request: Request<TableInfoRequest>,
     ) -> Result<Response<TableInfoResponse>, Status> {
-        let answering = Answering::new(Call::TableInfo);
+        let answering = Answering::new(&self.requests, Call::TableInfo);
         answering.answer(self.answer_table_info(request.into_inner()))
     }
 }

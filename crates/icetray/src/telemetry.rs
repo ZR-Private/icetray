@@ -1,6 +1,7 @@
 //! The binary's share of the metrics (RFD 012): the Prometheus
 //! recorder with the latency buckets, the `requests_total` counter with its
-//! `call` and `code` labels, and the scrape, which writes every gauge a
+//! `call` and `code` labels, registered once as one handle per pair, and
+//! the scrape, which writes every gauge a
 //! live table, the page cache, the service, the reload, and the process
 //! hold before it renders, so the recorder drops the gauges of a table no
 //! longer served. Core's modules emit every other series.
@@ -86,8 +87,18 @@ pub enum Call {
 }
 
 impl Call {
-    /// Every call, for the series registered at start.
+    /// Every call, for the series registered at start, each at its
+    /// `index`.
     pub const ALL: [Self; 3] = [Self::Get, Self::MultiGet, Self::TableInfo];
+
+    /// The call's place in `ALL`.
+    const fn index(self) -> usize {
+        match self {
+            Self::Get => 0,
+            Self::MultiGet => 1,
+            Self::TableInfo => 2,
+        }
+    }
 }
 
 impl fmt::Display for Call {
@@ -99,6 +110,34 @@ impl fmt::Display for Call {
         };
         f.write_str(name)
     }
+}
+
+/// Every gRPC status code, each at the place of its number, so a code's
+/// number indexes it (`code_index`).
+const CODES: [Code; 17] = [
+    Code::Ok,
+    Code::Cancelled,
+    Code::Unknown,
+    Code::InvalidArgument,
+    Code::DeadlineExceeded,
+    Code::NotFound,
+    Code::AlreadyExists,
+    Code::PermissionDenied,
+    Code::ResourceExhausted,
+    Code::FailedPrecondition,
+    Code::Aborted,
+    Code::OutOfRange,
+    Code::Unimplemented,
+    Code::Internal,
+    Code::Unavailable,
+    Code::DataLoss,
+    Code::Unauthenticated,
+];
+
+/// `code`'s place in `CODES`: its number, which the gRPC specification
+/// fixes from 0 to 16.
+fn code_index(code: Code) -> usize {
+    usize::try_from(i32::from(code)).expect("a gRPC status code's number is not negative")
 }
 
 /// A gRPC status code as the `code` label of `requests_total`. Display
@@ -131,21 +170,50 @@ impl fmt::Display for CodeLabel {
     }
 }
 
-/// One request of a call being answered, counted under `requests_total`
-/// when it drops, with the code of the outcome `answer` was given. A call
-/// dropped before it answers counts as `CANCELLED`: tonic drops it at the
-/// client's `grpc-timeout` and answers `CANCELLED` itself, and a client
-/// that cancels is answered nothing.
+/// The `requests_total` series of every call answering every code,
+/// registered once with the recorder current then, so counting a request
+/// formats no label, builds no label list, and looks up no series. Every
+/// series is exposed from the start, at zero until its first request. A
+/// process installs its recorder (`install`) before it registers these:
+/// series registered earlier record to no recorder. Clone shares the
+/// handles.
+#[derive(Clone, Debug)]
+pub struct Requests {
+    /// By `Call::index`, then by `code_index`.
+    counters: Arc<[[Counter; CODES.len()]; Call::ALL.len()]>,
+}
+
+impl Requests {
+    /// Registers every call's series of every code.
+    pub fn register() -> Self {
+        Self {
+            counters: Arc::new(Call::ALL.map(|call| CODES.map(|code| requests_total(call, code)))),
+        }
+    }
+
+    /// Counts one request of `call` that answered `code`.
+    pub fn count(&self, call: Call, code: Code) {
+        self.counters[call.index()][code_index(code)].increment(1);
+    }
+}
+
+/// One request of a call being answered, counted in `requests` when it
+/// drops, with the code of the outcome `answer` was given. A call dropped
+/// before it answers counts as `CANCELLED`: tonic drops it at the client's
+/// `grpc-timeout` and answers `CANCELLED` itself, and a client that
+/// cancels is answered nothing.
 #[derive(Debug)]
 pub struct Answering {
+    requests: Requests,
     call: Call,
     code: Code,
 }
 
 impl Answering {
-    /// A request of `call`, not yet answered.
-    pub fn new(call: Call) -> Self {
+    /// A request of `call`, not yet answered, to count in `requests`.
+    pub fn new(requests: &Requests, call: Call) -> Self {
         Self {
+            requests: requests.clone(),
             call,
             code: Code::Cancelled,
         }
@@ -161,30 +229,17 @@ impl Answering {
 
 impl Drop for Answering {
     fn drop(&mut self) {
-        count(self.call, self.code);
+        self.requests.count(self.call, self.code);
     }
 }
 
-/// Counts one request of `call` that answered `code` under `requests_total`.
-fn count(call: Call, code: Code) {
-    requests_total(call, code).increment(1);
-}
-
-/// The `requests_total` series of `call` answering `code`.
+/// The `requests_total` series of `call` answering `code`, registered.
 fn requests_total(call: Call, code: Code) -> Counter {
     metrics::counter!(
         metric::REQUESTS_TOTAL,
         metric::LABEL_CALL => call.to_string(),
         metric::LABEL_CODE => CodeLabel(code).to_string()
     )
-}
-
-/// Registers `requests_total` of every call answering `OK`, so each reads
-/// 0 from the start rather than appearing at its first call.
-pub fn register_requests() {
-    for call in Call::ALL {
-        requests_total(call, Code::Ok).increment(0);
-    }
 }
 
 /// What a scrape of `/metrics` reads: the recorder, the tables and page
@@ -370,6 +425,7 @@ mod tests {
     #[test]
     fn test_answering_counts_the_code_answered_once_on_drop() {
         let handle = install().unwrap();
+        let registered = Requests::register();
         let cases: [(Option<Result<(), Status>>, Code); 3] = [
             (Some(Ok(())), Code::Ok),
             (Some(Err(Status::unavailable("sample"))), Code::Unavailable),
@@ -377,7 +433,7 @@ mod tests {
         ];
         for (outcome, code) in cases {
             let before = requests(&handle, Call::MultiGet, code);
-            let answering = Answering::new(Call::MultiGet);
+            let answering = Answering::new(&registered, Call::MultiGet);
             let pending = requests(&handle, Call::MultiGet, code);
             assert_eq!(pending.to_bits(), before.to_bits(), "{code:?} before drop");
             match outcome {
@@ -394,25 +450,37 @@ mod tests {
         }
     }
 
-    /// After `register_requests`, every call's `OK` series is exposed,
+    /// Once registered, every call's series of every code is exposed,
     /// before any request of it.
     #[test]
-    fn test_register_requests_exposes_every_call_answering_ok() {
+    fn test_register_exposes_every_call_answering_every_code() {
         let handle = install().unwrap();
-        register_requests();
+        Requests::register();
         let exposition = render_after(&handle, || {});
-        let ok = CodeLabel(Code::Ok).to_string();
         for call in Call::ALL {
-            let call = call.to_string();
-            assert!(
-                series_value(
-                    &exposition,
-                    metric::REQUESTS_TOTAL,
-                    &[(metric::LABEL_CALL, &call), (metric::LABEL_CODE, &ok)],
-                )
-                .is_some(),
-                "{call} in {exposition}"
-            );
+            for code in CODES {
+                let (call, code) = (call.to_string(), CodeLabel(code).to_string());
+                assert!(
+                    series_value(
+                        &exposition,
+                        metric::REQUESTS_TOTAL,
+                        &[(metric::LABEL_CALL, &call), (metric::LABEL_CODE, &code)],
+                    )
+                    .is_some(),
+                    "{call} {code} in {exposition}"
+                );
+            }
+        }
+    }
+
+    /// Each call and each code has a place of its own in the handles.
+    #[test]
+    fn test_index_and_code_index_are_each_one_s_place() {
+        for (place, call) in Call::ALL.into_iter().enumerate() {
+            assert_eq!(call.index(), place, "{call}");
+        }
+        for (place, code) in CODES.into_iter().enumerate() {
+            assert_eq!(code_index(code), place, "{code:?}");
         }
     }
 
@@ -481,7 +549,7 @@ mod tests {
         // Two handles onto one recorder both see a count made through the
         // global recorder; the whole expositions are not compared, since
         // another test in this process may count between two renders.
-        count(Call::TableInfo, Code::Ok);
+        Requests::register().count(Call::TableInfo, Code::Ok);
         let call = Call::TableInfo.to_string();
         let code = CodeLabel(Code::Ok).to_string();
         for handle in [&first, &second] {
