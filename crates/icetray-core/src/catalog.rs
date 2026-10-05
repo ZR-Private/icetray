@@ -20,9 +20,7 @@ use iceberg_catalog_rest::{
 use crate::config::SourceConfig;
 use crate::error::{Error, Result};
 use crate::snapshot::SnapshotId;
-use crate::storage::{
-    FILE_SCHEME, PATH_SEPARATOR, SCHEME_SEPARATOR, Storage, file_parts, split_location,
-};
+use crate::storage::{FILE_SCHEME, PATH_SEPARATOR, Storage, file_parts, split_location};
 
 /// The file under a static table root that names the current metadata
 /// version, as the Hadoop catalog lays a table out. Its content is a bare
@@ -419,7 +417,11 @@ impl VersionHint {
 }
 
 /// The hint the version-hint file under `root` carries: its content
-/// trimmed, which must be one token of UTF-8 text. Nothing but whitespace
+/// trimmed, which must be one token of UTF-8 text. A hint that names a URI
+/// scheme or starts at the root is a full location, whatever follows the
+/// scheme: `file:/data/kv/...`, the form Hadoop's `Path` writes, as much as
+/// `file:///...` or `s3://...`; only a relative path is a file name under
+/// `metadata/` (`is_relative_path`). Nothing but whitespace
 /// is `TableFault::VersionHintEmpty`; bytes that are not UTF-8, or text
 /// with whitespace or control characters inside, are
 /// `TableFault::VersionHintMalformed`.
@@ -454,10 +456,10 @@ fn parse_hint(root: &str, bytes: &[u8]) -> Result<VersionHint> {
     if let Ok(version) = text.parse::<u64>() {
         return Ok(VersionHint::Version(version));
     }
-    if text.contains(SCHEME_SEPARATOR) || text.starts_with(PATH_SEPARATOR) {
-        return Ok(VersionHint::Location(text.to_string()));
+    if is_relative_path(text) {
+        return Ok(VersionHint::FileName(text.to_string()));
     }
-    Ok(VersionHint::FileName(text.to_string()))
+    Ok(VersionHint::Location(text.to_string()))
 }
 
 #[cfg(test)]
@@ -626,6 +628,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved.location, expected);
+    }
+
+    #[test]
+    fn test_parse_hint_reads_every_absolute_form_as_a_location() {
+        for hint in [
+            "file:/data/kv/metadata/v2.metadata.json",
+            "file:///data/kv/metadata/v2.metadata.json",
+            "file://localhost/data/kv/metadata/v2.metadata.json",
+            "s3://warehouse/db/kv/metadata/v2.metadata.json",
+            "s3a://warehouse/db/kv/metadata/v2.metadata.json",
+            "/data/kv/metadata/v2.metadata.json",
+        ] {
+            assert_eq!(
+                parse_hint(&root(), hint.as_bytes()).unwrap(),
+                VersionHint::Location(hint.to_string()),
+                "{hint}"
+            );
+        }
+        let name = "00002-6a3e.metadata.json";
+        assert_eq!(
+            parse_hint(&root(), name.as_bytes()).unwrap(),
+            VersionHint::FileName(name.to_string())
+        );
+    }
+
+    /// A Hadoop-written hint holds `file:/abs/...`, with no authority; the
+    /// table resolves the metadata file it names, not a file of that name
+    /// under `metadata/`.
+    #[tokio::test]
+    async fn test_resolve_follows_a_hadoop_file_hint_to_its_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_root = dir.path().join("kv");
+        let metadata_dir = table_root.join(METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let file = metadata_dir.join(format!("v{SECOND_VERSION}{METADATA_SUFFIX}"));
+        std::fs::write(&file, serde_json::to_vec(&second_metadata()).unwrap()).unwrap();
+        let hadoop_location = format!("{FILE_SCHEME}{}", file.to_str().unwrap());
+        std::fs::write(table_root.join(VERSION_HINT), hadoop_location.as_bytes()).unwrap();
+        let storage = Storage::new(StorageConfig::default());
+        let resolved = TableSource::Static {
+            location: table_root.to_str().unwrap().to_string(),
+        }
+        .resolve(&storage)
+        .await
+        .unwrap();
+        assert_eq!(resolved.location, hadoop_location);
+        assert_eq!(
+            resolved.metadata.current_snapshot_id(),
+            Some(SECOND_SNAPSHOT)
+        );
     }
 
     #[tokio::test]
