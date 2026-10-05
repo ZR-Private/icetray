@@ -1,5 +1,12 @@
 # Writes between builds
 
+> Updated 2026-10-05: a snapshot refused for its delete files is
+> remembered against its metadata location, and is not read again until
+> the table's source names another location. The refusal cannot
+> succeed on retry, and retrying it on every poll re-read the snapshot's
+> metadata and manifests and logged and counted the refusal each time.
+> See RFD 005 (Generations and refresh).
+
 ## Problem
 
 The tables icetray serves are rebuilt on a schedule and change between
@@ -41,8 +48,11 @@ contains a delete file.
 A delete file in the followed snapshot is a named refusal reason under
 RFD 007 (Serving tiers). What is refused is the snapshot. The last good
 generation keeps serving, and the table advances again once the ref moves
-to a snapshot without delete files. At boot there is no generation to keep,
-so RFD 005's start-or-fail rule applies.
+to a snapshot without delete files. The refusal is reported once and
+remembered: until the source names another metadata location, a poll reads
+only what tells it whether the location moved, and the refused snapshot's
+metadata and manifests are not read again. At boot there is no generation
+to keep, so RFD 005's start-or-fail rule applies.
 
 Native merge-on-read would apply deletion vectors and equality deletes
 newest file first, an inefficient finding measured by uncompacted deltas
@@ -90,7 +100,9 @@ Open questions:
   per-table lifecycle states with a health surface as an open question,
   and a stuck table is a natural state in that model. Short of that, the
   named refusal reason in logs and metrics, together with the age of the
-  served snapshot, may be all an operator needs.
+  served snapshot, may be all an operator needs. The refusal is logged and
+  counted once, when it is made, so its count does not grow while the
+  table waits.
 - Whether the recommended serving ref is a tag or a branch. A tag is the
   simpler pointer and cannot receive writes by accident. A branch carries
   its own snapshot retention, which is one answer to the expiration hazard

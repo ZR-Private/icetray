@@ -1,5 +1,14 @@
 # Generations and refresh
 
+> Updated 2026-10-05: a refresh refused for a reason that is a function of
+> the snapshot and the table's configuration alone is remembered against
+> the metadata location it was read from, and the table does not build
+> that snapshot again until its source names another location or a reload
+> changes the table's entry. A refusal like that cannot succeed on retry,
+> and retrying it on every poll re-read the snapshot's metadata and
+> manifests and logged and counted the same refusal each time. Transient
+> failures are still retried on every poll.
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -51,10 +60,24 @@ refusal. Overlap without duplicates is an inefficient finding, measured under
 RFD 007 (Serving tiers).
 
 When a refresh fails, the last good generation keeps serving and the
-failure is reported. A server refuses to start if any configured table
-fails to open. A table that goes silently missing does more harm than a
-crash at boot, while a stale table still answers, which is better than
-having none. A running server applies a change to its configured tables
+failure is reported. A failure that is a function of the snapshot and the
+table's configuration alone is deterministic: the strict gate, and every
+refusal reason of RFD 007 (Serving tiers) but one, a disk load over the
+local directory's index budget, which every disk table shares, so other
+tables' chunk files decide it too. The table remembers a deterministic failure against the metadata
+location it read, reports it once, and stays degraded. While the source
+names that location, each poll costs its one read and builds nothing.
+A new location is tried, and a reload that changes the table's entry
+builds a new table that remembers nothing, so a refusal its old
+configuration caused is tried under the new one. Every other failure (a
+store, catalog, cache, or local-directory error, a timeout, a deadline, a
+cancellation, or a table or file fault) is transient and retried on the
+next poll. Only a refresh over a serving generation remembers: at boot
+there is no generation to keep, and a refusal fails the start.
+
+A server refuses to start if any configured table fails to open. A table
+that goes silently missing does more harm than a crash at boot, while a
+stale table still answers, which is better than having none. A running server applies a change to its configured tables
 under the same all-or-nothing rule (RFD 018 (Configuration reload)).
 Refreshes of one table are serialized.
 
@@ -89,7 +112,9 @@ appended table pays it only for the buckets that grew.
 
 A delete file on the followed ref stops the table advancing while the last
 good generation serves. RFD 009 (Writes between builds) gives the pattern
-that avoids it.
+that avoids it. The refusal is reported once, not once per poll, so a
+table stuck behind it is seen through its degraded state and the age of
+its snapshot rather than a rising error count.
 
 Open question: per-table lifecycle states (loading, serving, degraded)
 behind a health surface, or start-or-fail as the only model. Start-or-fail
