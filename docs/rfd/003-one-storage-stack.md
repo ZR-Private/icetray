@@ -1,5 +1,9 @@
 # One storage stack
 
+> Updated 2026-10-04: one credential bridge serves every S3 store the
+> storage layer builds, so the chain runs once per credential lifetime
+> for the process rather than once per bucket.
+
 ## Problem
 
 icetray reads five kinds of bytes: table metadata, manifest lists,
@@ -46,7 +50,10 @@ The hedges of RFD 013 (Tail latency) are issued and counted there as well.
 Credentials come from the SDK's default chain (profiles, single sign-on,
 external credential helpers, pod identity), bridged into the object-store
 client. The bridge caches what the chain resolves until shortly before it
-expires, so the chain is consulted once per credential lifetime. Explicit
+expires. There is one bridge for the storage layer: every S3 store it
+builds, one per bucket, signs through it, and so would the catalog
+clients of RFD 019 (AWS catalog sources), so the chain is consulted once
+per credential lifetime for the whole process. Explicit
 static keys in configuration take precedence over the chain, and they are
 the path for S3-compatible endpoints and for tests.
 
