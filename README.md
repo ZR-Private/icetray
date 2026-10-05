@@ -37,17 +37,26 @@ costs one range GET.
 
 ## Performance
 
-| | |
-|---|---|
-| Warm hit, in-process | 12.8 µs |
-| Warm hits, in-process, eleven tasks | 497,000 a second |
-| Cold hit, S3 in-region, median | 81 ms, 0.5 ms of it in icetray |
-| First load, 1.2 billion rows in 32,768 files, four cores | 79 s |
+icetray is built to answer lookups quickly on tables with very many keys.
+How many a replica can serve, and at what cost per lookup, follows from a
+few relationships:
 
-Methods and machines are in the
-[performance sweep](docs/analysis/2026-09-26-performance-sweep.md), the
-[cold range-GET analysis](docs/analysis/2026-09-29-cold-range-get-latency.md),
-and [RFD 013](docs/rfd/013-tail-latency.md).
+- Memory grows with the key count, at a rate the table's
+  [residency](docs/configuration.md#choosing-a-residency) sets. `full`
+  keeps the compressed key column in memory, from about a byte per key for
+  keys that compress well to over a dozen for random ones such as UUIDs.
+  `disk` keeps a fraction of a byte per key in memory and the key chunks
+  on local disk. `bloom` keeps the writer's bloom filters, some bits per
+  key, and pays extra GETs instead.
+- A cold hit costs one GET under `full` and `disk`, and two under
+  `bloom`. A warm hit, served from the page cache, costs none, and so does
+  a miss, except under `bloom` when the filter passes an absent key.
+- A lookup whose pages are in memory takes microseconds, and a cold read
+  from object storage takes tens of milliseconds, so a table's latency
+  follows the share of hits its page cache answers.
+
+[Performance and tuning](docs/performance.md) covers the trade-offs and
+the settings that control them.
 
 ## Try it locally
 
@@ -67,8 +76,10 @@ Write a small contract-shaped table with the golden-table recipe,
 [`dev/golden-tables.py`](dev/golden-tables.py). The wrapper script runs it
 with Spark 4.1.3 and Java 21 in the `apache/spark` container image, so the
 host needs only a Docker-compatible runtime and `python3`. On macOS,
-`dev/runtime.sh up` starts one with colima; on Linux, start your
-distribution's Docker daemon.
+`dev/runtime.sh up` starts one with colima, which it expects installed
+with the docker client; `flox activate` puts both on PATH
+([Building and testing](docs/development.md#the-development-environment)).
+On Linux, start your distribution's Docker daemon.
 
 ```sh
 dev/runtime.sh up
@@ -92,7 +103,8 @@ Its keys are multiples of three, so 42 is present and 43 is absent.
 of it one table of 16 KiB values.
 
 Look keys up. `get` opens the table at a path, loads it, and prints one
-JSON line per key (the value fields are shortened here):
+JSON line per key. The value fields are shortened here, and your snapshot
+ids and timings will differ:
 
 ```sh
 icetray get --location target/golden-warehouse/db/long_2m 42 43
@@ -138,7 +150,8 @@ icetray serve --config target/icetray.toml
 The server logs JSON to stdout, listens for gRPC on `127.0.0.1:7433`, and
 answers `/ready` and `/metrics` on `127.0.0.1:9433`. From another
 terminal in the repository, with
-[grpcurl](https://github.com/fullstorydev/grpcurl):
+[grpcurl](https://github.com/fullstorydev/grpcurl) (the value is shortened,
+and the snapshot id is your table's):
 
 ```sh
 grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
@@ -271,6 +284,7 @@ to alert on.
 - [The table contract](docs/table-contract.md)
 - [Configuration and the command line](docs/configuration.md)
 - [Operating icetray](docs/operating.md)
+- [Performance and tuning](docs/performance.md)
 - [Glossary](docs/glossary.md)
 - [Building and testing](docs/development.md)
 - [Design decisions](docs/rfd/README.md) and the
