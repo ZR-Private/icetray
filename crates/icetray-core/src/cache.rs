@@ -1000,12 +1000,6 @@ mod tests {
         assert_eq!(single.block_on(async { check_capacity(below) }), Ok(()));
     }
 
-    /// Hits spread over a multi-thread runtime's workers reach
-    /// `page_cache_hits_total` at `publish_hit_counts`, each once, and the
-    /// last clone of the cache dropped publishes the rest, while `hits`
-    /// reads each as it is counted. A snapshot of the debugging recorder
-    /// takes the counter's value and resets it, so each snapshot reads what
-    /// was published since the one before.
     /// A cache's counters are registered at zero when it opens, before
     /// any lookup, and a fetch counts in `page_cache_fetches_total` as it
     /// runs; `publish_usage` sets `page_cache_bytes` to what memory holds.
@@ -1057,6 +1051,12 @@ mod tests {
         });
     }
 
+    /// Hits spread over a multi-thread runtime's workers reach
+    /// `page_cache_hits_total` at `publish_hit_counts`, each once, and the
+    /// last clone of the cache dropped publishes the rest, while `hits`
+    /// reads each as it is counted. A snapshot of the debugging recorder
+    /// takes the counter's value and resets it, so each snapshot reads what
+    /// was published since the one before.
     #[test]
     fn test_publish_hit_counts_moves_every_thread_count_once() {
         let workers = 4;
