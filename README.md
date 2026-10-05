@@ -252,7 +252,9 @@ icetray get --location s3://warehouse/db/kv 42
   belong to a mesh, a sidecar, or a private network.
 - **Your REST catalog needs credentials.** The `rest` source sends none,
   so it serves catalogs that need none or that sit behind a proxy that
-  adds them. Catalog-vended storage credentials are not supported.
+  adds them. Tables in AWS Glue and S3 Tables are read through their own
+  `glue` and `s3tables` sources, which sign with the S3 credentials.
+  Catalog-vended storage credentials are not supported.
 - **You need a release binary for macOS or Windows.** Releases are Linux
   binaries for x86-64 and arm64 and a container image; other systems build
   from source.
@@ -265,8 +267,8 @@ icetray get --location s3://warehouse/db/kv 42
   `ICETRAY_CONFIG`. Changes to its tables apply on the next poll or on
   SIGHUP.
 - S3 credentials come from the AWS SDK's default chain, or from static
-  keys in the file for S3-compatible stores. A REST catalog is called
-  without credentials.
+  keys in the file for S3-compatible stores, and sign calls to Glue and
+  S3 Tables too. A REST catalog is called without credentials.
 - Logs are JSON on stdout; metrics are Prometheus on the metrics port, with
   `/ready` and gRPC health for the orchestrator.
 - The gRPC port speaks plaintext; put it on a private network or behind a
