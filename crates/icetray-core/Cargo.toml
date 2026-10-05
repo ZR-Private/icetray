@@ -12,6 +12,8 @@ workspace = true
 arc-swap = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = { workspace = true }
+aws-sdk-glue = { version = "1.174.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3tables = { version = "1.71.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 bytes = { workspace = true }
 crc32c = { workspace = true }
 foyer = { workspace = true }

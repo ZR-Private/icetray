@@ -4,6 +4,7 @@
 //! and the testkit build on this crate; it depends on neither.
 
 pub mod approx;
+mod aws_catalog;
 mod blocking;
 mod bucket;
 mod cache;
@@ -27,6 +28,7 @@ mod storage;
 mod table;
 pub mod time;
 
+pub use aws_catalog::{AwsCatalogError, AwsSource};
 pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
@@ -36,8 +38,8 @@ pub use check::{
 };
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
-    Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, StandardField,
-    StorageConfig, TableConfig,
+    Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
+    StandardField, StorageConfig, TableConfig,
 };
 pub use error::{Error, ErrorKind, RefusalReason, Result};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};

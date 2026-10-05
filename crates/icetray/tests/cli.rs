@@ -24,6 +24,7 @@ use icetray_core::metric::{
     LABEL_RESULT, LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE,
 };
 use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
+use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{
     IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS, TWO_BUCKETS,
     UNPARTITIONED_FILE_BYTES,
@@ -332,6 +333,54 @@ async fn test_info_serializes_the_summary() -> TestResult {
     );
     assert_eq!(info[0]["serviceability"], "efficient");
     assert_eq!(info[0]["residency"], "full");
+    Ok(())
+}
+
+/// `info` on a Glue source runs end to end against the stand-in catalog:
+/// the binary asks Glue for the table's metadata location through the
+/// source's endpoint, signed with `[storage.s3]`'s keys, and reads the
+/// table from the local warehouse the location names. The AWS
+/// configuration files point nowhere and the instance metadata service is
+/// off, so the run reads nothing of the host's AWS setup.
+#[tokio::test]
+async fn test_info_reads_a_glue_table_through_its_catalog() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_glue", KeyType::Long)).await?;
+    let catalog = FakeAwsCatalog::start()?;
+    let name = fixture.ident().name();
+    catalog.set(
+        NAMESPACE,
+        name,
+        CatalogEntry::Iceberg(fixture.metadata_location().to_string()),
+    );
+    let key_id = "AKIAICETRAYCLI";
+    let text = format!(
+        "[storage.s3]\naccess_key_id = \"{key_id}\"\nsecret_access_key = \"icetray-cli-secret\"\n\n[[tables]]\nname = \"{name}\"\nsource = {{ type = \"glue\", database = \"{NAMESPACE}\", table = \"{name}\", region = \"us-test-1\", endpoint = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n",
+        catalog.url()
+    );
+    let config = write_file(dir.path(), "glue.toml", &text)?;
+    let nowhere = dir.path().join("no-aws-config");
+    let nowhere = nowhere.to_str().expect("a temporary path is UTF-8");
+    let output = run(
+        &["info", "--config", &config],
+        &[
+            ("AWS_CONFIG_FILE", nowhere),
+            ("AWS_SHARED_CREDENTIALS_FILE", nowhere),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ],
+    );
+    assert_exit(&output, EXIT_OK);
+    let info = lines(&output.stdout);
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0]["table"], name);
+    assert_eq!(info[0]["file_count"], Json::from(SMALL_BUCKETS));
+    assert_eq!(
+        info[0]["records"],
+        Json::from(SMALL_IDS.end - SMALL_IDS.start)
+    );
+    let key_ids = catalog.key_ids();
+    assert!(!key_ids.is_empty(), "the binary asked the catalog");
+    assert!(key_ids.iter().all(|seen| seen == key_id), "{key_ids:?}");
     Ok(())
 }
 

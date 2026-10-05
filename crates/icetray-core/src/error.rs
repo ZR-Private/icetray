@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::aws_catalog::AwsCatalogError;
 use crate::cache::CacheError;
 use crate::catalog::TableFault;
 use crate::check::FindingCode;
@@ -121,6 +122,17 @@ pub enum Error {
         /// The timeout that passed.
         after: Duration,
     },
+    /// An AWS catalog refused or failed the call that asks for a table's
+    /// metadata location (RFD 019), so the poll or load that made it
+    /// failed.
+    #[error("catalog call for table {table} failed: {source}")]
+    Catalog {
+        /// The table as its catalog names it: the source, since no table
+        /// has been named while the source resolves.
+        table: String,
+        /// The SDK's error.
+        source: AwsCatalogError,
+    },
     /// A build from no serving generation, a first load or a retry after
     /// one failed, did not finish within `server.load_deadline`, so it was
     /// dropped and failed (RFD 013).
@@ -209,6 +221,7 @@ impl Error {
             | Self::NotReady { .. }
             | Self::Local { .. }
             | Self::CatalogTimeout { .. }
+            | Self::Catalog { .. }
             | Self::LoadDeadline { .. }
             | Self::RefreshDeadline { .. }
             | Self::VerifyCanceled { .. }
@@ -244,6 +257,7 @@ impl Error {
             Self::NotReady { .. } => ErrorKind::NotReady,
             Self::Local { .. } => ErrorKind::Local,
             Self::CatalogTimeout { .. } => ErrorKind::CatalogTimeout,
+            Self::Catalog { .. } => ErrorKind::Catalog,
             Self::LoadDeadline { .. } => ErrorKind::LoadDeadline,
             Self::RefreshDeadline { .. } => ErrorKind::RefreshDeadline,
             Self::VerifyCanceled { .. } => ErrorKind::VerifyCanceled,
@@ -291,6 +305,8 @@ pub enum ErrorKind {
     Local,
     /// `Error::CatalogTimeout`.
     CatalogTimeout,
+    /// `Error::Catalog`.
+    Catalog,
     /// `Error::LoadDeadline`.
     LoadDeadline,
     /// `Error::RefreshDeadline`.
@@ -320,6 +336,7 @@ impl fmt::Display for ErrorKind {
             Self::NotReady => "not_ready",
             Self::Local => "local",
             Self::CatalogTimeout => "catalog_timeout",
+            Self::Catalog => "catalog",
             Self::LoadDeadline => "load_deadline",
             Self::RefreshDeadline => "refresh_deadline",
             Self::VerifyCanceled => "verify_canceled",
@@ -717,6 +734,15 @@ mod tests {
                     after: Duration::ZERO,
                 },
                 "catalog_timeout",
+            ),
+            (
+                Error::Catalog {
+                    table: TABLE.to_string(),
+                    source: AwsCatalogError::Glue(Box::new(
+                        aws_sdk_glue::error::SdkError::timeout_error("sample"),
+                    )),
+                },
+                "catalog",
             ),
             (
                 Error::LoadDeadline {

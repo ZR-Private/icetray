@@ -150,6 +150,7 @@ impl RefusalCode {
             | ErrorKind::NotReady
             | ErrorKind::Local
             | ErrorKind::CatalogTimeout
+            | ErrorKind::Catalog
             | ErrorKind::LoadDeadline
             | ErrorKind::RefreshDeadline
             | ErrorKind::VerifyCanceled

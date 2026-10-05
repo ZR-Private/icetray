@@ -228,7 +228,8 @@ async fn within<T>(
 /// deadline and its fetch's pass moments apart, and the call answers one
 /// code whichever passes first; a read the caller can
 /// retry (no generation yet, an object-store, cache, or local-directory
-/// failure, a catalog or load that did not answer in time, a load's key
+/// failure, a catalog call that failed, a catalog or load that did not
+/// answer in time, a load's key
 /// verification or a batch's lookup task canceled as the runtime shut
 /// down) is
 /// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
@@ -245,6 +246,7 @@ pub fn status_from(error: &Error) -> Status {
         )
         | Error::Local { .. }
         | Error::CatalogTimeout { .. }
+        | Error::Catalog { .. }
         | Error::LoadDeadline { .. }
         | Error::RefreshDeadline { .. }
         | Error::VerifyCanceled { .. }

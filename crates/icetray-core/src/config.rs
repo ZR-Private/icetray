@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
 
 use crate::approx;
+use crate::aws_catalog;
 use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::Result;
@@ -160,6 +161,9 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// nobody waits on, so it is patient, but a catalog that never answers must
 /// not hold a poll forever.
 const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The schemes an AWS source's `endpoint` may start with.
+const HTTP_SCHEMES: [&str; 2] = ["http://", "https://"];
 
 /// What `S3Config`'s `Debug` prints in place of the secret access key.
 const SECRET_PLACEHOLDER: &str = "[redacted]";
@@ -490,12 +494,36 @@ pub enum ConfigViolation {
         /// What is wrong with it.
         fault: RewriteFault,
     },
-    /// A static table's location is empty, which as a path would be the
-    /// filesystem root.
-    #[error("tables[{index}].source.location is empty")]
-    EmptyLocation {
+    /// A source setting is empty: a static location, which as a path would
+    /// be the filesystem root, or an AWS source's database, namespace,
+    /// table, table bucket ARN, or an optional setting that is present but
+    /// names nothing.
+    #[error("tables[{index}].source.{setting} is empty")]
+    EmptySourceSetting {
         /// The table's position in `tables`.
         index: usize,
+        /// The setting.
+        setting: SourceSetting,
+    },
+    /// An AWS source's `endpoint` is not an `http://` or `https://` URL,
+    /// so no request could be sent to it.
+    #[error("tables[{index}].source.endpoint {endpoint} is not an http:// or https:// url")]
+    SourceEndpoint {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The endpoint as configured.
+        endpoint: String,
+    },
+    /// An `s3tables` source's `table_bucket_arn` is not a table bucket
+    /// ARN, so it names no bucket and no region.
+    #[error(
+        "tables[{index}].source.table_bucket_arn {arn} is not a table bucket arn, as arn:aws:s3tables:us-east-1:111122223333:bucket/name is"
+    )]
+    TableBucketArn {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The ARN as configured.
+        arn: String,
     },
     /// A static table's location, after the file's rewrite rules, names no
     /// store the process builds (RFD 003). The locations a table's
@@ -744,11 +772,8 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_tables(config)
 }
 
-/// Each table has a name of its own, a residency its settings fit, and,
-/// for a static source, a location that is not empty and that some store
-/// this process builds serves once the file's rewrite rules apply (`StorageConfig::location_error`).
-/// Locations a command line's rules would rewrite are not taken into
-/// account: a file means the same whatever command reads it.
+/// Each table has a name of its own, a residency its settings fit, and a
+/// source whose settings `validate_source` accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
@@ -779,19 +804,116 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
                 index: Some(index),
             });
         }
-        match &table.source {
-            SourceConfig::Static { location } => {
-                if location.is_empty() {
-                    return Err(ConfigViolation::EmptyLocation { index });
-                }
-                if let Some(source) = config.storage.location_error(location) {
-                    return Err(ConfigViolation::TableLocation { index, source });
-                }
-            }
-            SourceConfig::Rest { .. } => {}
-        }
+        validate_source(index, &table.source, &config.storage)?;
     }
     Ok(())
+}
+
+/// A static source's location is not empty and some store this process
+/// builds serves it once the file's rewrite rules apply
+/// (`StorageConfig::location_error`); locations a command line's rules
+/// would rewrite are not taken into account, since a file means the same
+/// whatever command reads it. An AWS source's required settings are not
+/// empty, its optional ones are not empty when present, its endpoint is an
+/// HTTP URL, and an `s3tables` source's ARN is a table bucket's
+/// (`aws_catalog::table_bucket_region`). A REST source is checked when its
+/// catalog first answers.
+fn validate_source(
+    index: usize,
+    source: &SourceConfig,
+    storage: &StorageConfig,
+) -> std::result::Result<(), ConfigViolation> {
+    let (required, optional, table_bucket_arn, endpoint) = match source {
+        SourceConfig::Static { location } => {
+            not_empty(index, &[(SourceSetting::Location, location)], &[])?;
+            return match storage.location_error(location) {
+                Some(source) => Err(ConfigViolation::TableLocation { index, source }),
+                None => Ok(()),
+            };
+        }
+        SourceConfig::Rest { .. } => return Ok(()),
+        SourceConfig::Glue {
+            database,
+            table,
+            catalog_id,
+            region,
+            endpoint,
+        } => (
+            vec![
+                (SourceSetting::Database, database),
+                (SourceSetting::Table, table),
+            ],
+            vec![
+                (SourceSetting::CatalogId, catalog_id),
+                (SourceSetting::Region, region),
+                (SourceSetting::Endpoint, endpoint),
+            ],
+            None,
+            endpoint,
+        ),
+        SourceConfig::S3Tables {
+            table_bucket_arn,
+            namespace,
+            table,
+            region,
+            endpoint,
+        } => (
+            vec![
+                (SourceSetting::TableBucketArn, table_bucket_arn),
+                (SourceSetting::Namespace, namespace),
+                (SourceSetting::Table, table),
+            ],
+            vec![
+                (SourceSetting::Region, region),
+                (SourceSetting::Endpoint, endpoint),
+            ],
+            Some(table_bucket_arn),
+            endpoint,
+        ),
+    };
+    not_empty(index, &required, &optional)?;
+    if let Some(arn) = table_bucket_arn
+        && aws_catalog::table_bucket_region(arn).is_none()
+    {
+        return Err(ConfigViolation::TableBucketArn {
+            index,
+            arn: arn.clone(),
+        });
+    }
+    match endpoint {
+        Some(endpoint)
+            if !HTTP_SCHEMES
+                .iter()
+                .any(|scheme| endpoint.starts_with(scheme)) =>
+        {
+            Err(ConfigViolation::SourceEndpoint {
+                index,
+                endpoint: endpoint.clone(),
+            })
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// The first of `required`, or of `optional` where present, that is empty,
+/// as `ConfigViolation::EmptySourceSetting`.
+fn not_empty(
+    index: usize,
+    required: &[(SourceSetting, &String)],
+    optional: &[(SourceSetting, &Option<String>)],
+) -> std::result::Result<(), ConfigViolation> {
+    let present = optional
+        .iter()
+        .filter_map(|(setting, value)| value.as_ref().map(|value| (*setting, value)));
+    match required
+        .iter()
+        .copied()
+        .chain(present)
+        .find(|(_, value)| value.is_empty())
+    {
+        Some((setting, _)) => Err(ConfigViolation::EmptySourceSetting { index, setting }),
+        None => Ok(()),
+    }
 }
 
 /// The poll interval is within `MIN_POLL_INTERVAL..=MAX_POLL_INTERVAL`,
@@ -1320,7 +1442,7 @@ impl std::str::FromStr for Residency {
 }
 
 /// Where a table's current metadata is read from (RFD 005). Tagged by a
-/// `type` key in the file: `static` or `rest`.
+/// `type` key in the file: `static`, `rest`, `glue`, or `s3tables`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
@@ -1341,6 +1463,74 @@ pub enum SourceConfig {
         /// The table name within the namespace.
         table: String,
     },
+    /// A table in AWS Glue (RFD 019).
+    Glue {
+        /// The Glue database.
+        database: String,
+        /// The table within the database.
+        table: String,
+        /// The id of another account's catalog; the caller's own when
+        /// absent.
+        catalog_id: Option<String>,
+        /// The region of the Glue endpoint, over `[storage.s3]`'s and the
+        /// SDK's.
+        region: Option<String>,
+        /// The endpoint URL, for a Glue-compatible service other than AWS's.
+        endpoint: Option<String>,
+    },
+    /// A table in an S3 Tables table bucket (RFD 019).
+    #[serde(rename = "s3tables")]
+    S3Tables {
+        /// The table bucket's ARN.
+        table_bucket_arn: String,
+        /// The namespace within the bucket.
+        namespace: String,
+        /// The table within the namespace.
+        table: String,
+        /// The region of the S3 Tables endpoint, over `[storage.s3]`'s and
+        /// the ARN's.
+        region: Option<String>,
+        /// The endpoint URL, for an S3 Tables-compatible service other than
+        /// AWS's.
+        endpoint: Option<String>,
+    },
+}
+
+/// A setting of a table's source, by its key in the file, for a violation
+/// that names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceSetting {
+    /// `location`, of a `static` source.
+    Location,
+    /// `database`, of a `glue` source.
+    Database,
+    /// `table`, of a `glue` or `s3tables` source.
+    Table,
+    /// `catalog_id`, of a `glue` source.
+    CatalogId,
+    /// `table_bucket_arn`, of an `s3tables` source.
+    TableBucketArn,
+    /// `namespace`, of an `s3tables` source.
+    Namespace,
+    /// `region`, of a `glue` or `s3tables` source.
+    Region,
+    /// `endpoint`, of a `glue` or `s3tables` source.
+    Endpoint,
+}
+
+impl fmt::Display for SourceSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Location => "location",
+            Self::Database => "database",
+            Self::Table => "table",
+            Self::CatalogId => "catalog_id",
+            Self::TableBucketArn => "table_bucket_arn",
+            Self::Namespace => "namespace",
+            Self::Region => "region",
+            Self::Endpoint => "endpoint",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1403,10 +1593,37 @@ mod tests {
     const HEDGE_RANGE_TOP: f64 = 1.0;
     /// The bottom of the ceiling's range, which is inside it.
     const MAX_RATE_BOTTOM: f64 = 0.0;
+    /// The table bucket the full fixture's `s3tables` table is in.
+    const FIXTURE_TABLE_BUCKET_ARN: &str =
+        "arn:aws:s3tables:us-example-1:111122223333:bucket/example";
 
-    /// One complete configuration: every optional section present and two
-    /// tables, one per source kind. `json_full` is the same document. Every
-    /// number is a `FIXTURE_*` constant, so the value has one home.
+    /// `TOML_MINIMAL`'s table with `source` as its inline source table.
+    fn minimal_with_source(source: &str) -> String {
+        TOML_MINIMAL.replace(
+            r#"{ type = "static", location = "s3://example-warehouse/db/kv" }"#,
+            source,
+        )
+    }
+
+    /// A Glue source with only its required keys, then `extra`.
+    fn glue_source(extra: &str) -> String {
+        minimal_with_source(&format!(
+            r#"{{ type = "glue", database = "db", table = "kv"{extra} }}"#
+        ))
+    }
+
+    /// An S3 Tables source with only its required keys, the ARN `arn`,
+    /// then `extra`.
+    fn s3tables_source(arn: &str, extra: &str) -> String {
+        minimal_with_source(&format!(
+            r#"{{ type = "s3tables", table_bucket_arn = "{arn}", namespace = "db", table = "kv"{extra} }}"#
+        ))
+    }
+
+    /// One complete configuration: every optional section present and four
+    /// tables, one per source kind, each with every key it takes. `json_full`
+    /// is the same document. Every number is a `FIXTURE_*` constant, so the
+    /// value has one home.
     fn toml_full() -> String {
         format!(
             r#"
@@ -1484,6 +1701,34 @@ uri = "http://catalog.example:8181"
 warehouse = "example"
 namespace = "db"
 table = "profiles"
+
+[[tables]]
+name = "sessions"
+ref = "main"
+key_column = "id"
+value_column = "payload"
+
+[tables.source]
+type = "glue"
+database = "db"
+table = "sessions"
+catalog_id = "111122223333"
+region = "us-example-1"
+endpoint = "https://glue.example"
+
+[[tables]]
+name = "events"
+ref = "main"
+key_column = "id"
+value_column = "payload"
+
+[tables.source]
+type = "s3tables"
+table_bucket_arn = "{FIXTURE_TABLE_BUCKET_ARN}"
+namespace = "db"
+table = "events"
+region = "us-example-1"
+endpoint = "https://s3tables.example"
 "#
         )
     }
@@ -1533,37 +1778,70 @@ table = "profiles"
                     "page_cache_disk_bytes": FIXTURE_PAGE_CACHE_DISK_BYTES
                 }
             },
-            "tables": [
-                {
-                    "name": "orders",
-                    "source": {
-                        "type": "static",
-                        "location": "s3://example-warehouse/db/orders/metadata/v3.metadata.json"
-                    },
-                    "ref": "main",
-                    "key_column": "id",
-                    "value_column": "payload",
-                    "strict": false,
-                    "residency": "full",
-                    "resident_budget_bytes": FIXTURE_RESIDENT_BUDGET_BYTES
-                },
-                {
-                    "name": "profiles",
-                    "source": {
-                        "type": "rest",
-                        "uri": "http://catalog.example:8181",
-                        "warehouse": "example",
-                        "namespace": "db",
-                        "table": "profiles"
-                    },
-                    "ref": "serving",
-                    "key_column": "user_id",
-                    "value_column": "vector",
-                    "residency": "disk"
-                }
-            ]
+            "tables": json_tables()
         })
         .to_string()
+    }
+
+    /// The tables of `json_full`, one per source kind.
+    fn json_tables() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "name": "orders",
+                "source": {
+                    "type": "static",
+                    "location": "s3://example-warehouse/db/orders/metadata/v3.metadata.json"
+                },
+                "ref": "main",
+                "key_column": "id",
+                "value_column": "payload",
+                "strict": false,
+                "residency": "full",
+                "resident_budget_bytes": FIXTURE_RESIDENT_BUDGET_BYTES
+            },
+            {
+                "name": "profiles",
+                "source": {
+                    "type": "rest",
+                    "uri": "http://catalog.example:8181",
+                    "warehouse": "example",
+                    "namespace": "db",
+                    "table": "profiles"
+                },
+                "ref": "serving",
+                "key_column": "user_id",
+                "value_column": "vector",
+                "residency": "disk"
+            },
+            {
+                "name": "sessions",
+                "source": {
+                    "type": "glue",
+                    "database": "db",
+                    "table": "sessions",
+                    "catalog_id": "111122223333",
+                    "region": "us-example-1",
+                    "endpoint": "https://glue.example"
+                },
+                "ref": "main",
+                "key_column": "id",
+                "value_column": "payload"
+            },
+            {
+                "name": "events",
+                "source": {
+                    "type": "s3tables",
+                    "table_bucket_arn": FIXTURE_TABLE_BUCKET_ARN,
+                    "namespace": "db",
+                    "table": "events",
+                    "region": "us-example-1",
+                    "endpoint": "https://s3tables.example"
+                },
+                "ref": "main",
+                "key_column": "id",
+                "value_column": "payload"
+            }
+        ])
     }
 
     /// The smallest valid configuration: one table, everything else defaulted.
@@ -1629,37 +1907,74 @@ value_column = "value"
                 connect_timeout: FIXTURE_CONNECT_TIMEOUT,
                 catalog_timeout: FIXTURE_CATALOG_TIMEOUT,
             },
-            tables: vec![
-                TableConfig {
-                    name: "orders".to_string(),
-                    source: SourceConfig::Static {
-                        location: "s3://example-warehouse/db/orders/metadata/v3.metadata.json"
-                            .to_string(),
-                    },
-                    r#ref: "main".to_string(),
-                    key_column: "id".to_string(),
-                    value_column: "payload".to_string(),
-                    strict: false,
-                    residency: Residency::Full,
-                    resident_budget_bytes: Some(FIXTURE_RESIDENT_BUDGET_BYTES),
-                },
-                TableConfig {
-                    name: "profiles".to_string(),
-                    source: SourceConfig::Rest {
-                        uri: "http://catalog.example:8181".to_string(),
-                        warehouse: Some("example".to_string()),
-                        namespace: "db".to_string(),
-                        table: "profiles".to_string(),
-                    },
-                    r#ref: "serving".to_string(),
-                    key_column: "user_id".to_string(),
-                    value_column: "vector".to_string(),
-                    strict: DEFAULT_STRICT,
-                    residency: Residency::Disk,
-                    resident_budget_bytes: None,
-                },
-            ],
+            tables: full_tables(),
         }
+    }
+
+    /// The tables of `full_config`, one per source kind.
+    fn full_tables() -> Vec<TableConfig> {
+        vec![
+            TableConfig {
+                name: "orders".to_string(),
+                source: SourceConfig::Static {
+                    location: "s3://example-warehouse/db/orders/metadata/v3.metadata.json"
+                        .to_string(),
+                },
+                r#ref: "main".to_string(),
+                key_column: "id".to_string(),
+                value_column: "payload".to_string(),
+                strict: false,
+                residency: Residency::Full,
+                resident_budget_bytes: Some(FIXTURE_RESIDENT_BUDGET_BYTES),
+            },
+            TableConfig {
+                name: "profiles".to_string(),
+                source: SourceConfig::Rest {
+                    uri: "http://catalog.example:8181".to_string(),
+                    warehouse: Some("example".to_string()),
+                    namespace: "db".to_string(),
+                    table: "profiles".to_string(),
+                },
+                r#ref: "serving".to_string(),
+                key_column: "user_id".to_string(),
+                value_column: "vector".to_string(),
+                strict: DEFAULT_STRICT,
+                residency: Residency::Disk,
+                resident_budget_bytes: None,
+            },
+            TableConfig {
+                name: "sessions".to_string(),
+                source: SourceConfig::Glue {
+                    database: "db".to_string(),
+                    table: "sessions".to_string(),
+                    catalog_id: Some("111122223333".to_string()),
+                    region: Some("us-example-1".to_string()),
+                    endpoint: Some("https://glue.example".to_string()),
+                },
+                r#ref: "main".to_string(),
+                key_column: "id".to_string(),
+                value_column: "payload".to_string(),
+                strict: DEFAULT_STRICT,
+                residency: DEFAULT_RESIDENCY,
+                resident_budget_bytes: None,
+            },
+            TableConfig {
+                name: "events".to_string(),
+                source: SourceConfig::S3Tables {
+                    table_bucket_arn: FIXTURE_TABLE_BUCKET_ARN.to_string(),
+                    namespace: "db".to_string(),
+                    table: "events".to_string(),
+                    region: Some("us-example-1".to_string()),
+                    endpoint: Some("https://s3tables.example".to_string()),
+                },
+                r#ref: "main".to_string(),
+                key_column: "id".to_string(),
+                value_column: "payload".to_string(),
+                strict: DEFAULT_STRICT,
+                residency: DEFAULT_RESIDENCY,
+                resident_budget_bytes: None,
+            },
+        ]
     }
 
     /// The violation `text` parses to; anything else fails the test.
@@ -2078,6 +2393,135 @@ locaton = "typo"
     /// built store serves is refused at its setting with the location as
     /// rewritten, and a rule that moves it to a store makes it pass.
     #[test]
+    fn test_parse_reads_aws_sources_with_their_optional_keys_absent() {
+        let glue = Config::parse(&glue_source("")).unwrap();
+        assert_eq!(
+            glue.tables[0].source,
+            SourceConfig::Glue {
+                database: "db".to_string(),
+                table: "kv".to_string(),
+                catalog_id: None,
+                region: None,
+                endpoint: None,
+            }
+        );
+        let s3tables = Config::parse(&s3tables_source(FIXTURE_TABLE_BUCKET_ARN, "")).unwrap();
+        assert_eq!(
+            s3tables.tables[0].source,
+            SourceConfig::S3Tables {
+                table_bucket_arn: FIXTURE_TABLE_BUCKET_ARN.to_string(),
+                namespace: "db".to_string(),
+                table: "kv".to_string(),
+                region: None,
+                endpoint: None,
+            }
+        );
+    }
+
+    /// A required key missing, a key the kind does not take, and a key of
+    /// another kind are all schema faults at the source; a kind no source
+    /// has is one at its `type`.
+    #[test]
+    fn test_parse_refuses_aws_sources_missing_or_unknown_keys() {
+        let at_source = [key("tables"), At::Index(0), key("source")];
+        for text in [
+            minimal_with_source(r#"{ type = "glue", table = "kv" }"#),
+            minimal_with_source(r#"{ type = "glue", database = "db" }"#),
+            glue_source(r#", catalog = "111122223333""#),
+            glue_source(r#", namespace = "db""#),
+            minimal_with_source(&format!(
+                r#"{{ type = "s3tables", table_bucket_arn = "{FIXTURE_TABLE_BUCKET_ARN}", table = "kv" }}"#
+            )),
+            minimal_with_source(r#"{ type = "s3tables", namespace = "db", table = "kv" }"#),
+            s3tables_source(FIXTURE_TABLE_BUCKET_ARN, r#", catalog_id = "111122223333""#),
+            s3tables_source(FIXTURE_TABLE_BUCKET_ARN, r#", database = "db""#),
+        ] {
+            assert_eq!(schema_fault_at(&text), at_source, "{text}");
+        }
+        let misspelled =
+            minimal_with_source(r#"{ type = "s3_tables", namespace = "db", table = "kv" }"#);
+        assert_eq!(
+            schema_fault_at(&misspelled),
+            [key("tables"), At::Index(0), key("source"), key("type")]
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_an_empty_aws_source_setting_by_its_path() {
+        let empty = |setting| ConfigViolation::EmptySourceSetting { index: 0, setting };
+        let cases = [
+            (
+                minimal_with_source(r#"{ type = "glue", database = "", table = "kv" }"#),
+                SourceSetting::Database,
+            ),
+            (
+                minimal_with_source(r#"{ type = "glue", database = "db", table = "" }"#),
+                SourceSetting::Table,
+            ),
+            (
+                glue_source(r#", catalog_id = """#),
+                SourceSetting::CatalogId,
+            ),
+            (glue_source(r#", region = """#), SourceSetting::Region),
+            (glue_source(r#", endpoint = """#), SourceSetting::Endpoint),
+            (s3tables_source("", ""), SourceSetting::TableBucketArn),
+            (
+                minimal_with_source(&format!(
+                    r#"{{ type = "s3tables", table_bucket_arn = "{FIXTURE_TABLE_BUCKET_ARN}", namespace = "", table = "kv" }}"#
+                )),
+                SourceSetting::Namespace,
+            ),
+            (
+                s3tables_source(FIXTURE_TABLE_BUCKET_ARN, r#", region = """#),
+                SourceSetting::Region,
+            ),
+        ];
+        for (text, setting) in cases {
+            assert_eq!(violation(&text), empty(setting), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_parse_refuses_an_s3tables_source_whose_arn_is_not_a_table_bucket_s() {
+        for arn in [
+            "warehouse",
+            "arn:aws:s3:::warehouse",
+            "arn:aws:s3tables:us-east-1:111122223333:table/warehouse",
+            "arn:aws:s3tables:us-east-1:1111:bucket/warehouse",
+        ] {
+            assert_eq!(
+                violation(&s3tables_source(arn, "")),
+                ConfigViolation::TableBucketArn {
+                    index: 0,
+                    arn: arn.to_string(),
+                },
+                "{arn}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_refuses_an_aws_source_endpoint_that_is_not_http() {
+        for endpoint in ["glue.example", "s3://glue.example", "ftp://glue.example"] {
+            let expected = ConfigViolation::SourceEndpoint {
+                index: 0,
+                endpoint: endpoint.to_string(),
+            };
+            let extra = format!(r#", endpoint = "{endpoint}""#);
+            assert_eq!(violation(&glue_source(&extra)), expected, "{endpoint}");
+            assert_eq!(
+                violation(&s3tables_source(FIXTURE_TABLE_BUCKET_ARN, &extra)),
+                expected,
+                "{endpoint}"
+            );
+        }
+        for endpoint in ["http://127.0.0.1:4566", "https://glue.example"] {
+            let extra = format!(r#", endpoint = "{endpoint}""#);
+            assert!(Config::parse(&glue_source(&extra)).is_ok(), "{endpoint}");
+        }
+    }
+
+    #[test]
     fn test_parse_refuses_a_static_location_no_built_store_serves() {
         let at = |location: &str| TOML_MINIMAL.replace("s3://example-warehouse/db/kv", location);
         let refused = |location: &str, fault| ConfigViolation::TableLocation {
@@ -2097,7 +2541,10 @@ locaton = "typo"
         );
         assert_eq!(
             violation(&at("")),
-            ConfigViolation::EmptyLocation { index: 0 }
+            ConfigViolation::EmptySourceSetting {
+                index: 0,
+                setting: SourceSetting::Location,
+            }
         );
         let rule = |to: &str| format!("\n[[storage.rewrite]]\nfrom = \"gs://b/\"\nto = \"{to}\"\n");
         let to_s3 = format!("{}{}", at("gs://b/kv"), rule("s3://b/"));

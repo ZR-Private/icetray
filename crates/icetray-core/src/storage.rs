@@ -2,9 +2,9 @@
 //! `scheme://authority/` prefix, location rewriting before any request
 //! leaves the process, one counter for GETs, bytes, hedges, local reads and
 //! local bytes, the AWS SDK's credential chain, loaded before the first S3
-//! store is built and bridged with a cached and coalesced refresh that
-//! every S3 store of a `Storage` shares, and the hedged lookup read of RFD
-//! 013.
+//! store or AWS catalog client is built and bridged with a cached and
+//! coalesced refresh that every S3 store and catalog client of a `Storage`
+//! shares, and the hedged lookup read of RFD 013.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aws_config::SdkConfig;
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_credential_types::Credentials;
+use aws_credential_types::provider::error::CredentialsError;
+use aws_credential_types::provider::{self, ProvideCredentials, SharedCredentialsProvider};
 use bytes::Bytes;
 use futures::future::{Either, select};
 use metrics::{Counter, Histogram};
@@ -70,6 +72,10 @@ const S3_SCHEMES: [&str; 2] = ["s3://", "s3a://"];
 /// The store name `object_store`'s own S3 errors carry, so an error from the
 /// credential bridge reads like one from the client it serves.
 const S3_STORE_NAME: &str = "S3";
+
+/// The provider name the static keys of `[storage.s3]` carry when an AWS
+/// catalog client signs with them; the SDK records it in its own logs.
+const STATIC_KEYS_PROVIDER: &str = "storage.s3";
 
 /// How long before its expiry a cached credential stops being handed out.
 /// Two minutes is longer than any one S3 request with its retries can take,
@@ -347,7 +353,8 @@ pub struct LocationError {
 pub struct Storage {
     config: StorageConfig,
     /// The AWS SDK's defaults, when the process asked for them: loaded
-    /// the first time a location under an S3 prefix is located, and kept.
+    /// the first time a location under an S3 prefix is located or an AWS
+    /// catalog client is built (`aws_sdk_config`), and kept.
     /// `object_store` alone reads environment variables and instance
     /// metadata; the SDK adds profiles, SSO, `credential_process`, and web
     /// identity. Loading reads the profile files and may probe the
@@ -519,22 +526,48 @@ impl Storage {
     }
 
     /// Loads the SDK's defaults, once, when `sdk_to_load_for` names them.
-    /// Concurrent callers share the one load. The load's future is boxed:
-    /// it is several times the size of the rest of a read, and every
-    /// future that locates a location would carry it inline.
     async fn load_sdk_for(&self, location: &str) {
         if let Some(sdk) = self.sdk_to_load_for(location) {
-            sdk.get_or_init(|| {
-                Box::pin(async {
-                    LoadedSdk::new(
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .load()
-                            .await,
-                    )
-                })
-            })
-            .await;
+            load_sdk(sdk).await;
         }
+    }
+
+    /// The SDK's defaults an AWS catalog client starts from (RFD 019),
+    /// loaded first if this storage was built with them and has not loaded
+    /// them yet, so the client is built after the chain it signs with, as
+    /// an S3 store is; `None` for a storage built without them.
+    pub(crate) async fn aws_sdk_config(&self) -> Option<&SdkConfig> {
+        let sdk = self.sdk.as_ref()?;
+        Some(&load_sdk(sdk).await.config)
+    }
+
+    /// The credentials an AWS catalog client signs with (RFD 019): the
+    /// ones every S3 store of this storage signs with (`credential_source`),
+    /// so a catalog call never consults a chain of its own. `None` when
+    /// S3 requests go unsigned.
+    pub(crate) fn aws_credentials(&self) -> Option<SharedCredentialsProvider> {
+        match self.credential_source() {
+            CredentialSource::Static {
+                key_id,
+                secret_access_key,
+            } => Some(SharedCredentialsProvider::new(Credentials::new(
+                key_id,
+                secret_access_key,
+                None,
+                None,
+                STATIC_KEYS_PROVIDER,
+            ))),
+            CredentialSource::SdkChain(bridge) => {
+                let bridge: Arc<dyn ProvideCredentials> = bridge;
+                Some(SharedCredentialsProvider::new(bridge))
+            }
+            CredentialSource::Unsigned => None,
+        }
+    }
+
+    /// The region `[storage.s3]` names, if any.
+    pub(crate) fn s3_region(&self) -> Option<&str> {
+        self.config.s3.as_ref().and_then(|s3| s3.region.as_deref())
     }
 
     /// The SDK's defaults still to load before `location` is located: when
@@ -644,17 +677,18 @@ impl Storage {
 
     /// The one bridge from the SDK's credential chain this storage signs
     /// through, once the SDK's defaults are loaded and their chain
-    /// resolved a provider: every S3 store it builds holds this one, so
-    /// the chain is consulted once per credential lifetime for the
-    /// process rather than once per bucket (RFD 003), and anything else
-    /// that signs AWS requests for this storage takes it from here.
+    /// resolved a provider: every S3 store it builds holds this one, and
+    /// so does every AWS catalog client (`aws_credentials`), so the chain
+    /// is consulted once per credential lifetime for the process rather
+    /// than once per bucket or catalog (RFD 003).
     pub(crate) fn sdk_credentials(&self) -> Option<&Arc<SdkCredentials>> {
         self.loaded_sdk().and_then(|sdk| sdk.credentials.as_ref())
     }
 
-    /// The one credential source for every S3 store this storage builds:
-    /// the configured static keys when both are present, otherwise the SDK
-    /// chain when the storage was built with it, otherwise none.
+    /// The one credential source for every S3 store and AWS catalog client
+    /// this storage builds: the configured static keys when both are
+    /// present, otherwise the SDK chain when the storage was built with it,
+    /// otherwise none.
     fn credential_source(&self) -> CredentialSource<'_> {
         if let Some(s3) = &self.config.s3
             && let (Some(key_id), Some(secret_access_key)) =
@@ -717,6 +751,23 @@ impl Storage {
         };
         (answer, true)
     }
+}
+
+/// The SDK's defaults in `sdk`, loaded once. Concurrent callers share the
+/// one load. The load's future is boxed: it is several times the size of
+/// the rest of a read, and every future that locates a location would
+/// carry it inline.
+async fn load_sdk(sdk: &OnceCell<LoadedSdk>) -> &LoadedSdk {
+    sdk.get_or_init(|| {
+        Box::pin(async {
+            LoadedSdk::new(
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .load()
+                    .await,
+            )
+        })
+    })
+    .await
 }
 
 /// The bucket an `s3://` or `s3a://` prefix names, or `None` for a prefix
@@ -975,22 +1026,29 @@ impl LoadedSdk {
     }
 }
 
-/// The last credential the SDK chain resolved and when it stops being handed
-/// out.
+/// The last credential the SDK chain resolved, in the form `object_store`
+/// signs with and as the chain answered it, which the SDK's own catalog
+/// clients sign with, and when it stops being handed out.
 #[derive(Debug)]
 struct CachedCredential {
     credential: Arc<AwsCredential>,
+    resolved: Credentials,
     /// `None` for a credential without an expiry, which is usable indefinitely.
     usable_until: Option<SystemTime>,
 }
 
 impl CachedCredential {
-    /// A credential resolved at `now`. It is handed out until
+    /// The chain's answer `resolved` at `now`. It is handed out until
     /// `CREDENTIAL_REFRESH_MARGIN` before its expiry, or for
     /// `CREDENTIAL_MIN_REUSE` when the expiry is nearer than that, and never
     /// past the expiry itself.
-    fn new(credential: Arc<AwsCredential>, expiry: Option<SystemTime>, now: SystemTime) -> Self {
-        let usable_until = expiry.map(|expiry| {
+    fn new(resolved: Credentials, now: SystemTime) -> Self {
+        let credential = Arc::new(AwsCredential {
+            key_id: resolved.access_key_id().to_string(),
+            secret_key: resolved.secret_access_key().to_string(),
+            token: resolved.session_token().map(str::to_string),
+        });
+        let usable_until = resolved.expiry().map(|expiry| {
             let floor = now
                 .checked_add(CREDENTIAL_MIN_REUSE)
                 .map_or(expiry, |floor| floor.min(expiry));
@@ -1000,6 +1058,7 @@ impl CachedCredential {
         });
         Self {
             credential,
+            resolved,
             usable_until,
         }
     }
@@ -1010,15 +1069,16 @@ impl CachedCredential {
     }
 }
 
-/// The AWS SDK's credential chain presented to `object_store`, with the
-/// resolved credential cached until `CREDENTIAL_REFRESH_MARGIN` before its
-/// expiry, or for `CREDENTIAL_MIN_REUSE` when the chain answered with one
-/// already inside that margin. Without the cache every GET would run the
-/// chain, and a chain backed by `credential_process` spawns a process per
-/// run (RFD 003). The cache lives behind a tokio mutex held across the
-/// chain's own await, so concurrent callers that all find it stale collapse
-/// into one refresh: the first to take the lock refreshes, and each of the
-/// rest finds a fresh credential when its turn comes.
+/// The AWS SDK's credential chain presented to `object_store` and to the
+/// SDK's own catalog clients, with the resolved credential cached until
+/// `CREDENTIAL_REFRESH_MARGIN` before its expiry, or for
+/// `CREDENTIAL_MIN_REUSE` when the chain answered with one already inside
+/// that margin. Without the cache every GET would run the chain, and a
+/// chain backed by `credential_process` spawns a process per run (RFD 003).
+/// The cache lives behind a tokio mutex held across the chain's own await,
+/// so concurrent callers that all find it stale collapse into one refresh:
+/// the first to take the lock refreshes, and each of the rest finds a fresh
+/// credential when its turn comes.
 #[derive(Debug)]
 pub(crate) struct SdkCredentials {
     provider: SharedCredentialsProvider,
@@ -1033,35 +1093,46 @@ impl SdkCredentials {
         }
     }
 
-    /// The cached credential while it is fresh, otherwise the chain's
-    /// answer, cached. The lock is held across the chain's await on purpose.
-    async fn current(&self) -> object_store::Result<Arc<AwsCredential>> {
+    /// `pick` of the cached credential while it is fresh, otherwise of the
+    /// chain's answer, cached. The lock is held across the chain's await on
+    /// purpose.
+    async fn fresh<T>(
+        &self,
+        pick: impl FnOnce(&CachedCredential) -> T,
+    ) -> std::result::Result<T, CredentialsError> {
         let mut cached = self.cached.lock().await;
         if let Some(entry) = cached
             .as_ref()
             .filter(|entry| entry.is_fresh(time::system_now()))
         {
-            return Ok(Arc::clone(&entry.credential));
+            return Ok(pick(entry));
         }
-        let resolved = self
-            .provider
-            .provide_credentials()
+        let resolved = self.provider.provide_credentials().await?;
+        Ok(pick(cached.insert(CachedCredential::new(
+            resolved,
+            time::system_now(),
+        ))))
+    }
+
+    /// The credential an S3 store signs with.
+    async fn current(&self) -> object_store::Result<Arc<AwsCredential>> {
+        self.fresh(|entry| Arc::clone(&entry.credential))
             .await
             .map_err(|source| object_store::Error::Generic {
                 store: S3_STORE_NAME,
                 source: Box::new(source),
-            })?;
-        let credential = Arc::new(AwsCredential {
-            key_id: resolved.access_key_id().to_string(),
-            secret_key: resolved.secret_access_key().to_string(),
-            token: resolved.session_token().map(str::to_string),
-        });
-        *cached = Some(CachedCredential::new(
-            Arc::clone(&credential),
-            resolved.expiry(),
-            time::system_now(),
-        ));
-        Ok(credential)
+            })
+    }
+}
+
+impl ProvideCredentials for SdkCredentials {
+    /// The credential an AWS catalog client signs with, from the same
+    /// cache as every S3 store's.
+    fn provide_credentials<'a>(&'a self) -> provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        provider::future::ProvideCredentials::new(self.fresh(|entry| entry.resolved.clone()))
     }
 }
 
@@ -1089,10 +1160,13 @@ pub(crate) mod testing {
     use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use aws_config::SdkConfig;
+    use aws_credential_types::Credentials;
+    use aws_credential_types::provider::{ProvideCredentials, future};
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -1103,7 +1177,7 @@ pub(crate) mod testing {
     };
     use tokio::sync::watch;
 
-    use super::{HedgeWindow, Storage};
+    use super::{HedgeWindow, LoadedSdk, Storage};
     use crate::config::StorageConfig;
     use crate::parquet_io::FileHandle;
 
@@ -1318,10 +1392,17 @@ pub(crate) mod testing {
     }
 
     /// What the local HTTP endpoint does with every request it reads.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub(crate) enum Reply {
         /// Answers with this status line and an empty body, then closes.
         Status(&'static str),
+        /// Answers with this status line and this JSON body, then closes.
+        Json {
+            /// The status line.
+            status: &'static str,
+            /// The body.
+            body: String,
+        },
         /// Keeps the connection open and never answers, as a wedged store
         /// or catalog does.
         Never,
@@ -1329,37 +1410,62 @@ pub(crate) mod testing {
 
     /// An HTTP endpoint on a loopback port, served by a thread of its own
     /// so it answers whatever runtime the test runs on, that counts the
-    /// requests it reads. The thread outlives the test; the process ends it.
+    /// requests it reads and keeps each one's head. Every request is read
+    /// whole, its body by its `content-length`, before it is answered, so
+    /// the client never meets a connection closed under a body it is still
+    /// sending. The thread outlives the test; the process ends it.
     pub(crate) struct LocalHttp {
         /// The endpoint's address.
         pub(crate) addr: SocketAddr,
         requests: Arc<AtomicUsize>,
+        reply: Arc<Mutex<Reply>>,
+        heads: Arc<Mutex<Vec<String>>>,
     }
 
     impl LocalHttp {
-        /// Binds a loopback port and serves every connection with `reply`.
+        /// Binds a loopback port and serves every connection with `reply`
+        /// until `set_reply` names another.
         pub(crate) fn start(reply: Reply) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&requests);
+            let reply = Arc::new(Mutex::new(reply));
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let (counted, replies, kept) = (
+                Arc::clone(&requests),
+                Arc::clone(&reply),
+                Arc::clone(&heads),
+            );
             std::thread::spawn(move || {
                 let mut held = Vec::new();
                 for stream in listener.incoming() {
                     let mut stream = stream.unwrap();
-                    read_head(&mut stream);
+                    let request = read_request(&mut stream);
+                    kept.lock().unwrap().push(request);
                     counted.fetch_add(1, Ordering::SeqCst);
+                    let reply = replies.lock().unwrap().clone();
                     match reply {
                         Reply::Status(line) => write!(
                             stream,
                             "HTTP/1.1 {line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         )
                         .unwrap(),
+                        Reply::Json { status, body } => write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap(),
                         Reply::Never => held.push(stream),
                     }
                 }
             });
-            Self { addr, requests }
+            Self {
+                addr,
+                requests,
+                reply,
+                heads,
+            }
         }
 
         /// `http://` and the endpoint's address.
@@ -1371,16 +1477,91 @@ pub(crate) mod testing {
         pub(crate) fn requests(&self) -> usize {
             self.requests.load(Ordering::SeqCst)
         }
+
+        /// What every request read from now on is answered with.
+        pub(crate) fn set_reply(&self, reply: Reply) {
+            *self.reply.lock().unwrap() = reply;
+        }
+
+        /// The head of every request read so far, in order: the request
+        /// line and the headers, as sent.
+        pub(crate) fn heads(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
+        }
     }
 
-    /// Reads one request's head, through the blank line that ends it, or
-    /// to the end of the stream. The requests the tests send carry no body.
-    fn read_head(stream: &mut TcpStream) {
+    /// The header that gives a request body's length, in the lowercase
+    /// HTTP/1.1 header names compare equal to.
+    const CONTENT_LENGTH: &str = "content-length";
+
+    /// Reads one request whole: its head, through the blank line that ends
+    /// it, or to the end of the stream, then as many body bytes as its
+    /// `content-length` names. Returns the head.
+    fn read_request(stream: &mut TcpStream) -> String {
         let end_of_head = b"\r\n\r\n";
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(end_of_head) && stream.read(&mut byte).unwrap() == 1 {
             head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let body_len = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case(CONTENT_LENGTH))
+            .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).unwrap();
+        head
+    }
+
+    /// A credential provider that counts its calls and yields once before
+    /// answering, so concurrent callers overlap and a refresh that is not
+    /// coalesced shows up as more than one call. It answers from `answers`
+    /// in call order and repeats the last.
+    #[derive(Debug)]
+    pub(crate) struct CountingProvider {
+        pub(crate) answers: Vec<Credentials>,
+        pub(crate) calls: Arc<AtomicUsize>,
+    }
+
+    impl ProvideCredentials for CountingProvider {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            future::ProvideCredentials::new(async move {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                let answer = self
+                    .answers
+                    .get(call)
+                    .or_else(|| self.answers.last())
+                    .unwrap();
+                Ok(answer.clone())
+            })
+        }
+    }
+
+    /// A storage built with the SDK's defaults, `sdk` set as though they
+    /// had just loaded, so an S3 store or AWS catalog client it builds
+    /// signs through the bridge over `sdk`'s chain without reading any AWS
+    /// configuration from the host; with an in-memory store under
+    /// `MEM_PREFIX`.
+    pub(crate) fn with_loaded_sdk(config: StorageConfig, sdk: SdkConfig) -> MemStore {
+        let storage = Storage::with_sdk_defaults(config);
+        storage
+            .sdk
+            .as_ref()
+            .expect("built with the SDK's defaults")
+            .set(LoadedSdk::new(sdk))
+            .expect("nothing has loaded them yet");
+        let store = Arc::new(InMemory::new());
+        let registered: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&store);
+        storage.register(MEM_PREFIX, registered);
+        MemStore {
+            storage: Arc::new(storage),
+            store,
         }
     }
 }
@@ -1389,8 +1570,6 @@ pub(crate) mod testing {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use aws_credential_types::Credentials;
-    use aws_credential_types::provider::future;
     use futures::future::join_all;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -1401,7 +1580,7 @@ mod tests {
     };
     use tokio::sync::Notify;
 
-    use super::testing::{LocalHttp, MEM_PREFIX, Reply};
+    use super::testing::{CountingProvider, LocalHttp, MEM_PREFIX, Reply};
     use super::*;
     use crate::config::RewriteRule;
 
@@ -1779,34 +1958,6 @@ mod tests {
         }
     }
 
-    /// A credential provider that counts its calls and yields once before
-    /// answering, so concurrent callers overlap and a refresh that is not
-    /// coalesced shows up as more than one call. It answers from `answers`
-    /// in call order and repeats the last.
-    #[derive(Debug)]
-    struct CountingProvider {
-        answers: Vec<Credentials>,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl ProvideCredentials for CountingProvider {
-        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
-        where
-            Self: 'a,
-        {
-            future::ProvideCredentials::new(async move {
-                let call = self.calls.fetch_add(1, Ordering::Relaxed);
-                tokio::task::yield_now().await;
-                let answer = self
-                    .answers
-                    .get(call)
-                    .or_else(|| self.answers.last())
-                    .unwrap();
-                Ok(answer.clone())
-            })
-        }
-    }
-
     /// An `SdkCredentials` over a counting provider of `answers`, and the
     /// counter.
     fn counting_credentials(answers: Vec<Credentials>) -> (SdkCredentials, Arc<AtomicUsize>) {
@@ -1834,12 +1985,7 @@ mod tests {
     /// A cached credential resolved at `now` with `expiry`; its contents do
     /// not matter to the freshness rule.
     fn cached_at(now: SystemTime, expiry: Option<SystemTime>) -> CachedCredential {
-        let credential = Arc::new(AwsCredential {
-            key_id: TEST_KEY_ID.to_string(),
-            secret_key: TEST_SECRET.to_string(),
-            token: None,
-        });
-        CachedCredential::new(credential, expiry, now)
+        CachedCredential::new(test_credentials(expiry), now)
     }
 
     #[test]
@@ -2725,6 +2871,73 @@ mod tests {
             assert!(Arc::ptr_eq(first, answer.as_ref().unwrap()));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_provide_credentials_answers_from_the_cache_s3_stores_sign_from() {
+        let (bridge, calls) = counting_credentials(vec![test_credentials(None)]);
+        let signed = bridge.get_credential().await.unwrap();
+        let catalog = bridge.provide_credentials().await.unwrap();
+        assert_eq!(catalog.access_key_id(), signed.key_id);
+        assert_eq!(catalog.session_token(), signed.token.as_deref());
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one chain run for both");
+    }
+
+    /// A catalog client signs with what the storage's S3 stores sign with:
+    /// the static keys when set, the one bridge otherwise, and nothing for
+    /// a storage that signs nothing.
+    #[tokio::test]
+    async fn test_aws_credentials_are_the_ones_s3_stores_sign_with() {
+        let unsigned = Storage::new(StorageConfig::default());
+        assert!(unsigned.aws_credentials().is_none());
+
+        let keyed = Storage::new(StorageConfig {
+            s3: Some(S3Config {
+                access_key_id: Some(TEST_KEY_ID.to_string()),
+                secret_access_key: Some(TEST_SECRET.to_string()),
+                ..S3Config::default()
+            }),
+            ..StorageConfig::default()
+        });
+        let keys = keyed
+            .aws_credentials()
+            .unwrap()
+            .provide_credentials()
+            .await
+            .unwrap();
+        assert_eq!(keys.access_key_id(), TEST_KEY_ID);
+        assert_eq!(keys.secret_access_key(), TEST_SECRET);
+
+        let chained = Storage::with_sdk_defaults(StorageConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sdk = SdkConfig::builder()
+            .credentials_provider(SharedCredentialsProvider::new(CountingProvider {
+                answers: vec![test_credentials(None)],
+                calls: Arc::clone(&calls),
+            }))
+            .build();
+        chained
+            .sdk
+            .as_ref()
+            .unwrap()
+            .set(LoadedSdk::new(sdk))
+            .unwrap();
+        let catalog = chained.aws_credentials().unwrap();
+        catalog.provide_credentials().await.unwrap();
+        catalog.provide_credentials().await.unwrap();
+        chained
+            .sdk_credentials()
+            .unwrap()
+            .get_credential()
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "one chain run for all");
+    }
+
+    #[tokio::test]
+    async fn test_aws_sdk_config_is_none_without_the_sdk() {
+        let storage = Storage::new(StorageConfig::default());
+        assert!(storage.aws_sdk_config().await.is_none());
     }
 
     #[tokio::test]

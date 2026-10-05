@@ -1,9 +1,10 @@
 //! Where a table's current metadata comes from (RFD 005): a static table
 //! root followed through its version hint, a metadata file named directly,
-//! or a catalog, the REST catalog included. A poll that finds nothing moved
-//! costs one small read: the version hint, or one table load from the
-//! catalog. Every byte of object storage goes through `Storage` (RFD 003);
-//! a catalog client speaks to its catalog over HTTP and never to object
+//! a catalog, the REST catalog included, or an AWS catalog, Glue or S3
+//! Tables (RFD 019). A poll that finds nothing moved costs one small read:
+//! the version hint, one table load from the catalog, or one AWS catalog
+//! call. Every byte of object storage goes through `Storage` (RFD 003); a
+//! catalog client speaks to its catalog over HTTP and never to object
 //! storage.
 
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
 
+use crate::aws_catalog::AwsSource;
 use crate::config::SourceConfig;
 use crate::error::{Error, Result};
 use crate::snapshot::SnapshotId;
@@ -130,6 +132,16 @@ pub enum TableFault {
     /// there is nothing to compare a poll against.
     #[error("the catalog holds no metadata location for the table")]
     MetadataLocationUnknown,
+    /// The Glue table's `table_type` parameter is not `ICEBERG` in any
+    /// case, so the table is not an Iceberg table (RFD 019).
+    #[error(
+        "the catalog's table is not an iceberg table: its table_type parameter is {}",
+        table_type.as_deref().unwrap_or("absent")
+    )]
+    NotIceberg {
+        /// The parameter as the catalog holds it; `None` when absent.
+        table_type: Option<String>,
+    },
     /// The snapshot's timestamp is outside the range a `jiff::Timestamp`
     /// represents, so its age cannot be measured.
     #[error("snapshot {snapshot_id} has a timestamp outside the representable range")]
@@ -183,13 +195,18 @@ pub enum TableSource {
         /// The table within it.
         ident: TableIdent,
     },
+    /// A table in Glue or S3 Tables, asked for its metadata location with
+    /// one call; the metadata file is read through `Storage` (RFD 019).
+    Aws(AwsSource),
 }
 
 impl TableSource {
     /// Builds the source a configuration names. A REST source becomes a
     /// `RestCatalog` over its URI and warehouse; this is the only place a
     /// catalog client is constructed. Constructing one sends nothing: the
-    /// client first speaks to the catalog when a table is loaded.
+    /// client first speaks to the catalog when a table is loaded. An AWS
+    /// source's client is built on its first call, over the storage it is
+    /// resolved through.
     pub async fn from_config(cfg: &SourceConfig) -> Result<Self> {
         match cfg {
             SourceConfig::Static { location } => Ok(Self::Static {
@@ -222,12 +239,39 @@ impl TableSource {
                     ident: TableIdent::new(namespace, table.clone()),
                 })
             }
+            SourceConfig::Glue {
+                database,
+                table,
+                catalog_id,
+                region,
+                endpoint,
+            } => Ok(Self::Aws(AwsSource::glue(
+                database,
+                table,
+                catalog_id.as_deref(),
+                region.as_deref(),
+                endpoint.as_deref(),
+            ))),
+            SourceConfig::S3Tables {
+                table_bucket_arn,
+                namespace,
+                table,
+                region,
+                endpoint,
+            } => Ok(Self::Aws(AwsSource::s3tables(
+                table_bucket_arn,
+                namespace,
+                table,
+                region.as_deref(),
+                endpoint.as_deref(),
+            ))),
         }
     }
 
     /// The current metadata. A static root costs two reads, the version
     /// hint and the metadata file; a static metadata file one; a catalog
-    /// source one table load from the catalog and no object-storage read.
+    /// source one table load from the catalog and no object-storage read;
+    /// an AWS source one catalog call and the metadata file.
     pub(crate) async fn resolve(&self, storage: &Storage) -> Result<Resolved> {
         Ok(self
             .resolve_if_changed(storage, None)
@@ -239,9 +283,10 @@ impl TableSource {
     /// with no `known`, the metadata. When nothing moved this costs one
     /// small read: a static root reads its version hint and parses no
     /// metadata; a catalog source costs one table load, whose metadata the
-    /// client parses either way, within `Storage::catalog_timeout`. A
-    /// static source that names a metadata file directly reads nothing and
-    /// never advances.
+    /// client parses either way, within `Storage::catalog_timeout`; an AWS
+    /// source costs one catalog call within the same bound and reads no
+    /// object. A static source that names a metadata file directly reads
+    /// nothing and never advances.
     pub(crate) async fn resolve_if_changed(
         &self,
         storage: &Storage,
@@ -258,6 +303,16 @@ impl TableSource {
             Self::Catalog { catalog, ident } => {
                 let resolved = load_from_catalog(catalog, ident, storage.catalog_timeout()).await?;
                 Ok((known != Some(resolved.location.as_str())).then_some(resolved))
+            }
+            Self::Aws(source) => {
+                // Boxed: the SDK's call future is large and deeply nested,
+                // and every future that resolves any source, a static one
+                // included, would otherwise carry its layout inline.
+                let file = Box::pin(source.metadata_location(storage)).await?;
+                if known == Some(file.as_str()) {
+                    return Ok(None);
+                }
+                read_metadata(storage, file).await.map(Some)
             }
         }
     }
