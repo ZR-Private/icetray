@@ -24,4 +24,4 @@ an RFD and implies nothing about order.
 | [016](016-doctor.md) | Doctor | A `doctor` command and the same check at every load report serviceability, inefficient findings with penalties, and advice with the writer property to change. |
 | [017](017-residency-tiers.md) | Residency tiers | Where a table keeps its key chunks (`full`, `disk`, or `bloom`) is an explicit per-table setting chosen by the owner, with a local directory for the disk files and the page cache's disk level. |
 | [018](018-configuration-reload.md) | Configuration reload | A change to the file's tables is applied to a running server by loading the changed tables beside the serving ones and swapping the whole set, or refused whole. |
-| [019](019-aws-catalog-sources.md) | AWS catalog sources | Tables in Glue and S3 Tables are to be resolved through the AWS SDK with the storage credentials, a decision the current release does not implement. |
+| [019](019-aws-catalog-sources.md) | AWS catalog sources | Tables in Glue and S3 Tables are resolved to their metadata location through the AWS SDK with the storage credentials, and their metadata is read through the one storage layer. |

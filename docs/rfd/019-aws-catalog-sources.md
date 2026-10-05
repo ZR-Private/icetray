@@ -23,7 +23,7 @@ location by asking the catalog directly through the AWS SDK, with the same
 credentials storage uses, and their metadata will be read through the one
 storage layer like any other table's.
 
-Two source kinds will join `static` and `rest`:
+Two source kinds join `static` and `rest`:
 
 - `glue`: a database and a table. The source asks Glue for the table and
   takes the location from its `metadata_location` parameter, refusing a
@@ -31,17 +31,22 @@ Two source kinds will join `static` and `rest`:
   another account's catalog, and optional region and endpoint settings
   override the defaults.
 - `s3tables`: a table bucket ARN, a namespace, and a table. The source asks
-  S3 Tables for the table's metadata location.
+  S3 Tables for the table's metadata location. Optional region and
+  endpoint settings override the defaults, and when neither the source
+  nor `storage.s3` names a region, the ARN's region is used, since that is
+  where the bucket is.
 
 Credentials are the ones storage already has: the SDK's default chain, or
 the static keys in `storage.s3` when they are set. Catalog and storage
 resolve them once and share the cache RFD 003 requires, so a catalog call
-never spawns a credential helper of its own.
+never spawns a credential helper of its own. The SDK's defaults load
+before a catalog's first call, as they do before the first S3 read.
 
-Both kinds will refresh the way every source does (RFD 005, Generations and
+Both kinds refresh the way every source does (RFD 005, Generations and
 refresh): each poll makes one catalog call, compares the location with the
 one the table holds, and stops when they match. A catalog call is bounded
-by `storage.catalog_timeout`.
+by `storage.catalog_timeout`, and a call the catalog refuses fails the
+poll or load with an error of its own kind, `catalog`.
 
 ## Alternatives Considered
 
@@ -65,21 +70,20 @@ through, reading secret values from the environment or a file rather than
 the configuration file, and renewing OAuth2 tokens, which the client keeps
 until they expire. It waits because Glue and S3 Tables cover the AWS
 deployments this RFD addresses, and because it adds the one configuration
-section icetray could not validate. It is additive when someone needs it. Until then the REST source
-serves catalogs that need no credentials, or that sit behind a proxy that
-adds them.
+section icetray could not validate. It is additive when someone needs it.
+Until then the REST source serves catalogs that need no credentials, or
+that sit behind a proxy that adds them.
 
 **Hive Metastore and other catalog protocols.** Left out until someone
 needs one.
 
 ## Consequences
 
-icetray will gain the AWS SDK's Glue and S3 Tables clients as
-dependencies. Each is used for one call, and both share the SDK
-configuration icetray already resolves. A deployer will grant
-`glue:GetTable` or `s3tables:GetTableMetadataLocation` beside the S3 read
-permissions, and the operating docs will list them once the sources are
-built.
+icetray depends on the AWS SDK's Glue and S3 Tables clients. Each is used
+for one call, and both share the SDK configuration icetray already
+resolves. A deployer grants `glue:GetTable` or
+`s3tables:GetTableMetadataLocation` beside the S3 read permissions, and
+the operating docs list them.
 
 A source is part of a table's entry, so moving a table between sources
 applies on reload under RFD 018 (Configuration reload).
@@ -90,5 +94,5 @@ the source is described.
 Credentials vended by a catalog stay out of scope. The open question RFD
 003 records is unchanged.
 
-RFD 011 (Configuration) lists a table's source among its settings; its
-list of source kinds grows to four when this is built.
+RFD 011 (Configuration) lists a table's source among its settings, and
+the four source kinds with it.
