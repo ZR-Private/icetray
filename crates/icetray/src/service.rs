@@ -257,6 +257,7 @@ pub fn status_from(error: &Error) -> Status {
         | Error::ObjectStorePath(_)
         | Error::Json(_)
         | Error::Config(_)
+        | Error::Location { .. }
         | Error::Refused { .. }
         | Error::Inefficient { .. }
         | Error::Table { .. }

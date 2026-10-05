@@ -817,6 +817,28 @@ fn test_a_toml_syntax_error_is_one_error_line() -> TestResult {
     Ok(())
 }
 
+/// A location no store serves, one under a scheme icetray builds no store
+/// for, is the command line's fault as `--location`, exit 64, and the
+/// file's as a table's location, exit 1; both reported before anything is
+/// read, as one plain error line.
+#[test]
+fn test_a_location_no_store_serves_is_usage_on_the_command_line_and_failure_in_the_file()
+-> TestResult {
+    let dir = tempfile::tempdir()?;
+    let unserved = "gs://bucket/db/kv";
+    let located = run(&["info", "--location", unserved], &[]);
+    assert_exit(&located, EXIT_USAGE);
+    assert!(!assert_plain_error(&located), "{}", stderr(&located));
+    let text = format!(
+        "[[tables]]\nname = \"kv\"\nsource = {{ type = \"static\", location = \"{unserved}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n"
+    );
+    let config = write_file(dir.path(), "unserved.toml", &text)?;
+    let configured = run(&["info", "--config", &config], &[]);
+    assert_exit(&configured, EXIT_FAILURE);
+    assert!(!assert_plain_error(&configured), "{}", stderr(&configured));
+    Ok(())
+}
+
 /// A `--rewrite` rule for a prefix the file also maps is tried first, so it
 /// wins: the file's rule alone sends every read to a directory that does not
 /// exist, and the command line's rule for the same prefix keeps the reads

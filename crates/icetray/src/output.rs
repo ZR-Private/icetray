@@ -142,6 +142,7 @@ impl RefusalCode {
             | ErrorKind::ObjectStorePath
             | ErrorKind::Json
             | ErrorKind::Config
+            | ErrorKind::Location
             | ErrorKind::Cache
             | ErrorKind::KeyType
             | ErrorKind::Table

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use icetray_core::config::{ConfigError, schema_detail};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{CacheError, ErrorKind, KeyType};
+use icetray_core::{CacheError, ErrorKind, KeyType, LocationError};
 
 use crate::cli::{ConfigPath, ENV_CONFIG};
 use crate::serve::PeriodicTask;
@@ -44,8 +44,9 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_INEFFICIENT: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
-/// configuration and no target, `--table` with `--location`, a `--table` name no table is configured under, a table name
-/// required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
+/// configuration and no target, a `--location` no store serves, `--table`
+/// with `--location`, a `--table` name no table is configured under, a
+/// table name required, a key that does not parse. `sysexits.h`'s `EX_USAGE`, chosen so that 2 means one thing;
 /// clap's default usage code of 2 is never used.
 pub const EXIT_USAGE: u8 = 64;
 
@@ -346,6 +347,11 @@ pub enum CliError {
         /// The working directory.
         path: std::path::PathBuf,
     },
+    /// A `--location` that, after the `--rewrite` rules, names no store
+    /// the process builds: a usage error, since the remedy is on the
+    /// command line, a rewrite rule or another location.
+    #[error("--location {} {}", .0.location, .0.fault)]
+    Location(LocationError),
     /// `--table` with `--location`: the one selects among the tables a
     /// configuration lists, the other opens one table without any.
     #[error("--table selects a configured table and --location opens one table directly")]
@@ -435,6 +441,7 @@ impl CliError {
             | Self::ConfigRejected(_)
             | Self::WorkingDirectory { .. }
             | Self::WorkingDirectoryNotUtf8 { .. }
+            | Self::Location(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::BrokenPipe
@@ -456,6 +463,7 @@ impl CliError {
             Self::NoTarget
             | Self::NoConfig
             | Self::TableWithLocation
+            | Self::Location(_)
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
             | Self::Key(_) => EXIT_USAGE,
@@ -469,6 +477,7 @@ impl CliError {
 mod tests {
     use icetray_core::config::ServerConfig;
 
+    use icetray_core::LocationFault;
     use icetray_core::config::ConfigViolation;
 
     use super::*;
@@ -555,6 +564,10 @@ mod tests {
             CliError::NoTarget,
             CliError::NoConfig,
             CliError::TableWithLocation,
+            CliError::Location(LocationError {
+                location: "gs://b/kv".to_string(),
+                fault: LocationFault::NoStore,
+            }),
             CliError::NoTableMatched {
                 name: TABLE.to_string(),
                 tables: vec!["a".to_string()],

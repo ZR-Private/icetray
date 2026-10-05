@@ -2,6 +2,7 @@
 //! structure and validated once, so no setting is accepted in one syntax
 //! and refused in the other.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,6 +16,7 @@ use crate::approx;
 use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::Result;
+use crate::storage::{self, LocationError};
 use crate::time;
 
 /// The first non-whitespace character of a JSON document; a file that
@@ -309,10 +311,7 @@ fn place(at: &serde_path_to_error::Path) -> String {
 }
 
 /// A rule a parsed configuration breaks. The set is closed; a rule not
-/// listed here is not checked. The two location rules are checked when a
-/// location is resolved rather than when the file is parsed, because
-/// locations arrive from table metadata; they are configuration faults all
-/// the same, since the remedy is a rewrite rule or a registered store.
+/// listed here is not checked.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ConfigViolation {
     /// No table is configured: a server would serve nothing and report
@@ -491,22 +490,20 @@ pub enum ConfigViolation {
         /// What is wrong with it.
         fault: RewriteFault,
     },
-    /// A location, after rewriting, whose `scheme://authority/` prefix names
-    /// no store the process has registered and none it can build (RFD 003:
-    /// it builds `s3://`, `s3a://`, and `file://`).
+    /// A static table's location, after the file's rewrite rules, names no
+    /// store the process builds (RFD 003). The locations a table's
+    /// metadata names, and a catalog table's, are only known as it loads,
+    /// and are refused there as `Error::Location`.
     #[error(
-        "no object store for location {location}; add a rewrite rule or register a store for its prefix"
+        "tables[{index}].source.location {} {}",
+        source.location,
+        source.fault
     )]
-    NoStoreForLocation {
-        /// The location as the process tried to resolve it.
-        location: String,
-    },
-    /// A location, after rewriting, that is neither a URI nor an absolute
-    /// path, so it names no store at all.
-    #[error("location {location} is neither a uri nor an absolute path")]
-    LocationNotAbsolute {
-        /// The location as the process tried to resolve it.
-        location: String,
+    TableLocation {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The location as rewritten, and why no store serves it.
+        source: LocationError,
     },
     /// Text that names no residency tier; raised by `Residency`'s `FromStr`.
     /// The command line reads the names it offers back through it, and
@@ -737,6 +734,15 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     if config.tables.is_empty() {
         return Err(ConfigViolation::NoTables);
     }
+    validate_tables(config)
+}
+
+/// Each table has a name of its own, a residency its settings fit, and,
+/// for a static source, a location some store this process builds serves
+/// once the file's rewrite rules apply (`StorageConfig::location_error`).
+/// Locations a command line's rules would rewrite are not taken into
+/// account: a file means the same whatever command reads it.
+fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
         if table.name.is_empty() {
@@ -765,6 +771,14 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
                 table: table.name.clone(),
                 index: Some(index),
             });
+        }
+        match &table.source {
+            SourceConfig::Static { location } => {
+                if let Some(source) = config.storage.location_error(location) {
+                    return Err(ConfigViolation::TableLocation { index, source });
+                }
+            }
+            SourceConfig::Rest { .. } => {}
         }
     }
     Ok(())
@@ -1155,6 +1169,33 @@ pub struct StorageConfig {
     pub catalog_timeout: Duration,
 }
 
+impl StorageConfig {
+    /// `location` with the first rule of `rewrite` whose `from` it starts
+    /// with applied, or `location` itself. A rewritten location is not
+    /// rewritten again.
+    pub fn rewritten<'a>(&self, location: &'a str) -> Cow<'a, str> {
+        self.rewrite
+            .iter()
+            .find_map(|rule| {
+                location
+                    .strip_prefix(rule.from.as_str())
+                    .map(|rest| Cow::Owned(format!("{}{rest}", rule.to)))
+            })
+            .unwrap_or(Cow::Borrowed(location))
+    }
+
+    /// Why no store this process builds serves `location` once rewritten,
+    /// with the rewritten location; `None` when one does. What a static
+    /// table's location is checked against before anything is read.
+    pub fn location_error(&self, location: &str) -> Option<LocationError> {
+        let rewritten = self.rewritten(location);
+        storage::unbuildable(&rewritten).map(|fault| LocationError {
+            location: rewritten.into_owned(),
+            fault,
+        })
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -1299,6 +1340,7 @@ mod tests {
     use super::*;
     use crate::contract::VALUE_PAGE_BYTES;
     use crate::error::Error;
+    use crate::storage::LocationFault;
 
     /// The gRPC listener the full fixture names.
     const FIXTURE_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7433);
@@ -2020,6 +2062,37 @@ locaton = "typo"
         );
         let no_level = Config::parse(&with_disk_level(0)).unwrap();
         assert_eq!(no_level.storage.local.unwrap().page_cache_disk_bytes, 0);
+    }
+
+    /// A static location is checked after the file's rewrite rules: one no
+    /// built store serves is refused at its setting with the location as
+    /// rewritten, and a rule that moves it to a store makes it pass.
+    #[test]
+    fn test_parse_refuses_a_static_location_no_built_store_serves() {
+        let at = |location: &str| TOML_MINIMAL.replace("s3://example-warehouse/db/kv", location);
+        let refused = |location: &str, fault| ConfigViolation::TableLocation {
+            index: 0,
+            source: LocationError {
+                location: location.to_string(),
+                fault,
+            },
+        };
+        assert_eq!(
+            violation(&at("gs://b/kv")),
+            refused("gs://b/kv", LocationFault::NoStore)
+        );
+        assert_eq!(
+            violation(&at("db/kv")),
+            refused("db/kv", LocationFault::NotAbsolute)
+        );
+        let rule = |to: &str| format!("\n[[storage.rewrite]]\nfrom = \"gs://b/\"\nto = \"{to}\"\n");
+        let to_s3 = format!("{}{}", at("gs://b/kv"), rule("s3://b/"));
+        assert!(Config::parse(&to_s3).is_ok());
+        let to_nothing = format!("{}{}", at("gs://b/kv"), rule("mem://x/"));
+        assert_eq!(
+            violation(&to_nothing),
+            refused("mem://x/kv", LocationFault::NoStore)
+        );
     }
 
     #[test]

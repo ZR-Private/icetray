@@ -33,7 +33,7 @@ use tokio::sync::OnceCell;
 use tokio::time::Instant;
 
 use crate::approx;
-use crate::config::{ConfigError, ConfigViolation, HedgeConfig, S3Config, StorageConfig};
+use crate::config::{HedgeConfig, S3Config, StorageConfig};
 use crate::error::{Error, Result};
 use crate::metric::{self, ReadKind};
 use crate::time;
@@ -288,6 +288,35 @@ impl fmt::Display for CredentialSource<'_> {
     }
 }
 
+/// Why a location names no store this process reads (RFD 003). Display
+/// reads after the location it is about. The remedy for either is a
+/// rewrite rule, so both are the configuration's fault, wherever the
+/// location came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LocationFault {
+    /// Neither a URI nor an absolute path, so it names no store at all.
+    #[error("is neither a uri nor an absolute path")]
+    NotAbsolute,
+    /// A URI whose `scheme://authority/` prefix names no store: none is
+    /// registered for it, and the process builds `s3://`, `s3a://`, and
+    /// `file://` stores alone.
+    #[error(
+        "names no object store; icetray reads s3://, s3a://, and file:// locations, so add a rewrite rule to one of them"
+    )]
+    NoStore,
+}
+
+/// A location no store serves, as storage tried to resolve it: after
+/// rewriting, which is the text a store would have been asked for.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("location {location} {fault}")]
+pub struct LocationError {
+    /// The location after the first matching rewrite rule.
+    pub location: String,
+    /// Why no store serves it.
+    pub fault: LocationFault,
+}
+
 /// Resolves Iceberg locations to stores and reads bytes through them.
 /// Every read the crate makes from object storage goes through one of the
 /// `read_*` methods, so rewriting, counting, credentials, and hedging happen
@@ -382,14 +411,21 @@ impl Storage {
     /// location is split into its `scheme://authority/` prefix and the rest
     /// (`file://` and a bare absolute path both name the local filesystem),
     /// then the store is taken from the registry or built on first use. A
-    /// location no store serves is a configuration fault, since the remedy
-    /// is a rewrite rule or a registered store:
-    /// `ConfigViolation::NoStoreForLocation`, or
-    /// `ConfigViolation::LocationNotAbsolute` for a relative path.
+    /// location no store serves is `Error::Location`, naming no table:
+    /// the table whose load read it names itself (`Error::for_table`).
     fn locate_loaded(&self, location: &str) -> Result<Located> {
         let location = self.rewrite(location);
-        let (prefix, rest) = split_location(&location)?;
-        let store = self.store_for(&prefix, &location)?;
+        let unserved = |fault| Error::Location {
+            table: None,
+            source: LocationError {
+                location: location.to_string(),
+                fault,
+            },
+        };
+        let (prefix, rest) = split_location(&location).map_err(unserved)?;
+        let store = self
+            .store_for(&prefix)?
+            .ok_or_else(|| unserved(LocationFault::NoStore))?;
         let path = if prefix == FILE_PREFIX {
             Path::from_absolute_path(&rest)?
         } else {
@@ -486,48 +522,36 @@ impl Storage {
     }
 
     /// The location with the first matching rewrite rule applied, or the
-    /// location itself. A rewritten location is not rewritten again.
+    /// location itself (`StorageConfig::rewritten`).
     fn rewrite<'a>(&self, location: &'a str) -> Cow<'a, str> {
-        self.config
-            .rewrite
-            .iter()
-            .find_map(|rule| {
-                location
-                    .strip_prefix(rule.from.as_str())
-                    .map(|rest| Cow::Owned(format!("{}{rest}", rule.to)))
-            })
-            .unwrap_or(Cow::Borrowed(location))
+        self.config.rewritten(location)
     }
 
     /// The store registered for `prefix`, or the one built for it and kept
-    /// for the next location under it. `location` is for the error.
-    fn store_for(&self, prefix: &str, location: &str) -> Result<Arc<dyn ObjectStore>> {
+    /// for the next location under it; `None` for a prefix nothing is
+    /// registered for and no store is built for.
+    fn store_for(&self, prefix: &str) -> Result<Option<Arc<dyn ObjectStore>>> {
         let mut stores = self.stores.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = stores.get(prefix) {
-            return Ok(Arc::clone(store));
+            return Ok(Some(Arc::clone(store)));
         }
-        let store = self.build_store(prefix, location)?;
+        let Some(store) = self.build_store(prefix)? else {
+            return Ok(None);
+        };
         stores.insert(prefix.to_string(), Arc::clone(&store));
-        Ok(store)
+        Ok(Some(store))
     }
 
     /// The store for a prefix nothing registered: the local filesystem for
-    /// `file://`, an S3 client for `s3://` and `s3a://`, and a configuration
-    /// fault for anything else.
-    fn build_store(&self, prefix: &str, location: &str) -> Result<Arc<dyn ObjectStore>> {
+    /// `file://`, an S3 client for `s3://` and `s3a://`, and `None` for
+    /// anything else.
+    fn build_store(&self, prefix: &str) -> Result<Option<Arc<dyn ObjectStore>>> {
         if prefix == FILE_PREFIX {
-            return Ok(Arc::new(LocalFileSystem::new()));
+            return Ok(Some(Arc::new(LocalFileSystem::new())));
         }
-        let bucket = S3_SCHEMES
-            .iter()
-            .find_map(|scheme| prefix.strip_prefix(scheme))
-            .map(|authority| authority.trim_end_matches(PATH_SEPARATOR));
-        match bucket {
-            Some(bucket) => self.s3_store(bucket),
-            None => Err(violation(ConfigViolation::NoStoreForLocation {
-                location: location.to_string(),
-            })),
-        }
+        s3_bucket(prefix)
+            .map(|bucket| self.s3_store(bucket))
+            .transpose()
     }
 
     /// An S3 client for one bucket. Endpoint, region, `allow_http`, and
@@ -658,11 +682,34 @@ impl Storage {
     }
 }
 
+/// The bucket an `s3://` or `s3a://` prefix names, or `None` for a prefix
+/// of another scheme.
+fn s3_bucket(prefix: &str) -> Option<&str> {
+    S3_SCHEMES
+        .iter()
+        .find_map(|scheme| prefix.strip_prefix(scheme))
+        .map(|authority| authority.trim_end_matches(PATH_SEPARATOR))
+}
+
+/// Why `location`, as given, names no store this process builds, or
+/// `None` when it names one: the check a configuration's locations get
+/// before any is read. Stores registered on a `Storage` are not consulted,
+/// since nothing in a configuration registers one.
+pub(crate) fn unbuildable(location: &str) -> Option<LocationFault> {
+    match split_location(location) {
+        Err(fault) => Some(fault),
+        Ok((prefix, _)) => (prefix != FILE_PREFIX && s3_bucket(&prefix).is_none())
+            .then_some(LocationFault::NoStore),
+    }
+}
+
 /// A location's `scheme://authority/` prefix and the rest. `file://`, the
 /// authority-less `file:/path`, and a bare absolute path all give the
-/// `file://` prefix with the absolute path as the rest; a relative path is a
-/// configuration fault.
-pub(crate) fn split_location(location: &str) -> Result<(String, String)> {
+/// `file://` prefix with the absolute path as the rest; a relative path is
+/// `LocationFault::NotAbsolute`.
+pub(crate) fn split_location(
+    location: &str,
+) -> std::result::Result<(String, String), LocationFault> {
     if let Some(path) = location.strip_prefix(FILE_PREFIX) {
         return Ok((FILE_PREFIX.to_string(), path.to_string()));
     }
@@ -675,20 +722,13 @@ pub(crate) fn split_location(location: &str) -> Result<(String, String)> {
         return Ok((FILE_PREFIX.to_string(), location.to_string()));
     }
     let Some((scheme, rest)) = location.split_once(SCHEME_SEPARATOR) else {
-        return Err(violation(ConfigViolation::LocationNotAbsolute {
-            location: location.to_string(),
-        }));
+        return Err(LocationFault::NotAbsolute);
     };
     let (authority, key) = rest.split_once(PATH_SEPARATOR).unwrap_or((rest, ""));
     Ok((
         format!("{scheme}{SCHEME_SEPARATOR}{authority}{PATH_SEPARATOR}"),
         key.to_string(),
     ))
-}
-
-/// A location fault as the crate's error.
-fn violation(violation: ConfigViolation) -> Error {
-    Error::Config(ConfigError::Invalid(violation))
 }
 
 /// The bytes a range asks for. An inverted range asks for nothing; the store
@@ -1423,12 +1463,16 @@ mod tests {
         .expect("the hedge releases the stalled request")
     }
 
-    /// The configuration violation a `locate` refused with.
-    fn locate_violation(result: Result<Located>) -> ConfigViolation {
-        let Err(Error::Config(ConfigError::Invalid(violation))) = result else {
-            panic!("expected a configuration violation");
+    /// The location error a `locate` refused with.
+    fn locate_violation(result: Result<Located>) -> LocationError {
+        let Err(Error::Location {
+            table: None,
+            source,
+        }) = result
+        else {
+            panic!("expected a location error naming no table");
         };
-        violation
+        source
     }
 
     /// When one GET of a `Scripted` store answers, relative to the other GET
@@ -1763,15 +1807,9 @@ mod tests {
 
     #[test]
     fn test_split_location_relative_path_refused() {
-        let Err(Error::Config(ConfigError::Invalid(violation))) = split_location("relative/path")
-        else {
-            panic!("expected a configuration violation");
-        };
         assert_eq!(
-            violation,
-            ConfigViolation::LocationNotAbsolute {
-                location: "relative/path".to_string()
-            }
+            split_location("relative/path"),
+            Err(LocationFault::NotAbsolute)
         );
     }
 
@@ -1780,10 +1818,30 @@ mod tests {
         let storage = Storage::new(StorageConfig::default());
         assert_eq!(
             locate_violation(storage.locate_loaded("gs://bucket-a/x")),
-            ConfigViolation::NoStoreForLocation {
-                location: "gs://bucket-a/x".to_string()
+            LocationError {
+                location: "gs://bucket-a/x".to_string(),
+                fault: LocationFault::NoStore,
             }
         );
+    }
+
+    /// A location builds a store when it is `file://`, `s3://`, or
+    /// `s3a://`, or a bare absolute path; any other URI names none and a
+    /// relative path names nothing at all.
+    #[test]
+    fn test_unbuildable_names_what_no_built_store_serves() {
+        for location in [
+            "s3://bucket-a/x",
+            "s3a://bucket-a/x",
+            "file:///data/x",
+            "file:/data/x",
+            "/data/x",
+        ] {
+            assert_eq!(unbuildable(location), None, "{location}");
+        }
+        assert_eq!(unbuildable("gs://bucket-a/x"), Some(LocationFault::NoStore));
+        assert_eq!(unbuildable(MEM_PREFIX), Some(LocationFault::NoStore));
+        assert_eq!(unbuildable("db/x"), Some(LocationFault::NotAbsolute));
     }
 
     #[test]
@@ -1797,14 +1855,16 @@ mod tests {
         });
         assert_eq!(
             locate_violation(storage.locate_loaded("gs://bucket-a/x")),
-            ConfigViolation::NoStoreForLocation {
-                location: "mem://none/x".to_string()
+            LocationError {
+                location: "mem://none/x".to_string(),
+                fault: LocationFault::NoStore,
             }
         );
         assert_eq!(
             locate_violation(storage.locate_loaded("relative/x")),
-            ConfigViolation::LocationNotAbsolute {
-                location: "relative/x".to_string()
+            LocationError {
+                location: "relative/x".to_string(),
+                fault: LocationFault::NotAbsolute,
             }
         );
     }

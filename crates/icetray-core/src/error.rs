@@ -12,6 +12,7 @@ use crate::config::ConfigError;
 use crate::index::FileFault;
 use crate::key::{Key, KeyType};
 use crate::local::LocalFault;
+use crate::storage::LocationError;
 
 /// Every failure a caller of this crate can observe. A caller decides what
 /// to do by matching the variant; the message is for a person reading a log.
@@ -35,6 +36,19 @@ pub enum Error {
     /// Configuration that cannot be read or acted on.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// A location the read needed names no store this process reads (RFD
+    /// 003): one a table's metadata or catalog named, found as the table
+    /// loads. A static table's own location is checked before, as
+    /// `ConfigViolation::TableLocation`.
+    #[error("{}", location_detail(table.as_deref(), source))]
+    Location {
+        /// The table whose load read the location: `None` as storage
+        /// raises it, since storage reads for no table in particular, and
+        /// set by the table's load (`Error::for_table`).
+        table: Option<String>,
+        /// The location as rewritten, and why no store serves it.
+        source: LocationError,
+    },
     /// The page cache could not produce a page.
     #[error("page cache: {0}")]
     Cache(#[from] CacheError),
@@ -168,6 +182,40 @@ impl Error {
         }
     }
 
+    /// This error raised while `table` loaded: an `Error::Location` that
+    /// names no table names it; every other error is as it was.
+    pub(crate) fn for_table(self, table: &str) -> Self {
+        match self {
+            Self::Location {
+                table: None,
+                source,
+            } => Self::Location {
+                table: Some(table.to_string()),
+                source,
+            },
+            other @ (Self::Iceberg(_)
+            | Self::Parquet(_)
+            | Self::ObjectStore(_)
+            | Self::ObjectStorePath(_)
+            | Self::Json(_)
+            | Self::Config(_)
+            | Self::Location { .. }
+            | Self::Cache(_)
+            | Self::Refused { .. }
+            | Self::Inefficient { .. }
+            | Self::KeyType { .. }
+            | Self::Table { .. }
+            | Self::File { .. }
+            | Self::NotReady { .. }
+            | Self::Local { .. }
+            | Self::CatalogTimeout { .. }
+            | Self::LoadDeadline { .. }
+            | Self::RefreshDeadline { .. }
+            | Self::VerifyCanceled { .. }
+            | Self::LookupCanceled { .. }) => other,
+        }
+    }
+
     /// `Error::Table` for `table`.
     pub(crate) fn table_fault(table: &str, fault: TableFault) -> Self {
         Self::Table {
@@ -186,6 +234,7 @@ impl Error {
             Self::ObjectStorePath(_) => ErrorKind::ObjectStorePath,
             Self::Json(_) => ErrorKind::Json,
             Self::Config(_) => ErrorKind::Config,
+            Self::Location { .. } => ErrorKind::Location,
             Self::Cache(_) => ErrorKind::Cache,
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
             Self::Inefficient { .. } => ErrorKind::Inefficient,
@@ -222,6 +271,8 @@ pub enum ErrorKind {
     Json,
     /// `Error::Config`.
     Config,
+    /// `Error::Location`.
+    Location,
     /// `Error::Cache`.
     Cache,
     /// `Error::Refused`, with its reason.
@@ -260,6 +311,7 @@ impl fmt::Display for ErrorKind {
             Self::ObjectStorePath => "object_store_path",
             Self::Json => "json",
             Self::Config => "config",
+            Self::Location => "location",
             Self::Cache => "cache",
             Self::Inefficient => "inefficient",
             Self::KeyType => "key_type",
@@ -283,6 +335,15 @@ impl serde::Serialize for ErrorKind {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         serializer.collect_str(self)
+    }
+}
+
+/// `Error::Location`'s message: the location and its fault, after the
+/// table that read it when one is named.
+fn location_detail(table: Option<&str>, source: &LocationError) -> String {
+    match table {
+        Some(table) => format!("table {table}: {source}"),
+        None => source.to_string(),
     }
 }
 
@@ -458,6 +519,7 @@ mod tests {
     use super::*;
     use crate::config::ConfigViolation;
     use crate::generation::testing::TABLE;
+    use crate::storage::LocationFault;
 
     /// A synthetic data file location for the reasons that name one.
     const FILE_PATH: &str = "mem://w/db/kv/data/f0.parquet";
@@ -576,6 +638,16 @@ mod tests {
                     index: 0,
                 })),
                 "config",
+            ),
+            (
+                Error::Location {
+                    table: Some(TABLE.to_string()),
+                    source: LocationError {
+                        location: FILE_PATH.to_string(),
+                        fault: LocationFault::NoStore,
+                    },
+                },
+                "location",
             ),
             (
                 Error::Cache(CacheError::Fetch(std::sync::Arc::new(Error::NotReady {

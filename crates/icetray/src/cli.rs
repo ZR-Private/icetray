@@ -442,7 +442,10 @@ impl Target {
     /// among configured tables, so with `--location` it is
     /// `TableWithLocation`. A `--location` and a `--rewrite` TO that are
     /// relative local paths are made absolute first (`absolute_location`);
-    /// the file's own locations are left as written.
+    /// the file's own locations are left as written. A `--location` that,
+    /// once the `--rewrite` rules apply, names no store the process builds
+    /// is `CliError::Location`, a usage error, before the synthesized table
+    /// is validated, so the run never calls it a configuration's fault.
     pub fn config(&self, table: Option<&str>) -> Result<Config, CliError> {
         self.config_with_env(table, std::env::var_os(ENV_CONFIG))
     }
@@ -457,18 +460,6 @@ impl Target {
         if table.is_some() && self.location.is_some() {
             return Err(CliError::TableWithLocation);
         }
-        let mut config = match &self.location {
-            Some(location) => self
-                .location_config(absolute_location(location)?)
-                .validated()?,
-            None => {
-                ConfigPath::resolve_with_env(self.config.as_deref(), env)
-                    .ok_or(CliError::NoTarget)?
-                    .read()?
-                    .config?
-            }
-        };
-        let from_file = std::mem::take(&mut config.storage.rewrite);
         let given = self
             .rewrite
             .iter()
@@ -479,17 +470,33 @@ impl Target {
                 })
             })
             .collect::<Result<Vec<_>, CliError>>()?;
-        config.storage.rewrite = given.into_iter().chain(from_file).collect();
-        Ok(config)
+        let Some(location) = &self.location else {
+            let mut config = ConfigPath::resolve_with_env(self.config.as_deref(), env)
+                .ok_or(CliError::NoTarget)?
+                .read()?
+                .config?;
+            let from_file = std::mem::take(&mut config.storage.rewrite);
+            config.storage.rewrite = given.into_iter().chain(from_file).collect();
+            return Ok(config);
+        };
+        let storage = StorageConfig {
+            rewrite: given,
+            ..StorageConfig::default()
+        };
+        let location = absolute_location(location)?;
+        if let Some(error) = storage.location_error(&location) {
+            return Err(CliError::Location(error));
+        }
+        Ok(self.location_config(location, storage).validated()?)
     }
 
-    /// The configuration of one table at `location` under this target's
-    /// column, ref, and residency flags or their defaults, named after its
-    /// table root.
-    fn location_config(&self, location: String) -> Config {
+    /// The configuration of one table at `location` over `storage`, under
+    /// this target's column, ref, and residency flags or their defaults,
+    /// named after its table root.
+    fn location_config(&self, location: String, storage: StorageConfig) -> Config {
         Config {
             server: ServerConfig::default(),
-            storage: StorageConfig::default(),
+            storage,
             tables: vec![TableConfig {
                 name: table_root_name(&location)
                     .unwrap_or_else(|| LOCATION_FALLBACK_TABLE_NAME.to_string()),
@@ -510,6 +517,7 @@ mod tests {
     use clap::CommandFactory as _;
     use clap::error::ErrorKind;
     use icetray_core::config::{ConfigError, ConfigViolation};
+    use icetray_core::{LocationError, LocationFault};
 
     use super::*;
     use crate::error::ConfigRejected;
@@ -717,6 +725,55 @@ value_column = "value"
             let config = target(cli).config(None).unwrap();
             assert_eq!(config.tables[0].name, name, "{location}");
         }
+    }
+
+    /// A `--location` no built store serves is refused as the command
+    /// line's fault, with the location as the rules rewrote it, and a
+    /// `--rewrite` that moves it to a store makes it open; the same
+    /// location in a file is the file's violation at its setting.
+    #[test]
+    fn test_config_refuses_a_location_no_store_serves() {
+        let unserved = "gs://b/db/kv";
+        let located = target(parse(&["info", "--location", unserved]).unwrap());
+        let error = located.config_with_env(None, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CliError::Location(LocationError { location, fault: LocationFault::NoStore })
+                    if location == unserved
+            ),
+            "{error:?}"
+        );
+        let rewritten = target(
+            parse(&[
+                "info",
+                "--location",
+                unserved,
+                "--rewrite",
+                "gs://b/=s3://b/",
+            ])
+            .unwrap(),
+        );
+        let config = rewritten.config_with_env(None, None).unwrap();
+        assert_eq!(config.tables[0].name, "kv");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let text = TOML_ONE_TABLE.replace(LOCATION, unserved);
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        let bare = target(parse(&["info"]).unwrap());
+        let rejected = bare
+            .config_with_env(None, Some(file.path().as_os_str().to_owned()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &rejected,
+                CliError::ConfigRejected(ConfigRejected {
+                    source: ConfigError::Invalid(ConfigViolation::TableLocation { index: 0, .. }),
+                    ..
+                })
+            ),
+            "{rejected:?}"
+        );
     }
 
     #[test]
@@ -945,23 +1002,34 @@ value_column = "value"
         });
     }
 
-    /// A configuration file's relative location is left as written, for
-    /// storage to refuse: a file reads the same from any directory.
+    /// A configuration file's relative location is not resolved against
+    /// the working directory but refused as the file's violation at its
+    /// setting: a file reads the same from any directory.
     #[test]
-    fn test_config_leaves_a_file_s_relative_location_as_written() {
+    fn test_config_refuses_a_file_s_relative_location() {
         let relative = "db/kv";
         let text = TOML_ONE_TABLE.replace(LOCATION, relative);
         let mut file = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
         let path = file.path().to_str().unwrap();
-        let config = target(parse(&["info", "--config", path]).unwrap())
+        let rejected = target(parse(&["info", "--config", path]).unwrap())
             .config(None)
-            .unwrap();
-        assert_eq!(
-            config.tables[0].source,
-            SourceConfig::Static {
-                location: relative.to_string(),
-            }
+            .unwrap_err();
+        assert!(
+            matches!(
+                &rejected,
+                CliError::ConfigRejected(ConfigRejected {
+                    source: ConfigError::Invalid(ConfigViolation::TableLocation {
+                        index: 0,
+                        source: LocationError {
+                            location,
+                            fault: LocationFault::NotAbsolute,
+                        },
+                    }),
+                    ..
+                }) if location == relative
+            ),
+            "{rejected:?}"
         );
     }
 

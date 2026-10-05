@@ -50,5 +50,5 @@ pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Applied, Opened, Refused, Tables, open};
 pub use snapshot::{SequenceNumber, SnapshotId};
-pub use storage::{IoStats, Storage};
+pub use storage::{IoStats, LocationError, LocationFault, Storage};
 pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};

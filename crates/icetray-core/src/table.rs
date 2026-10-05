@@ -836,20 +836,28 @@ impl Table {
     /// work is dropped at the deadline, which cancels its reads and
     /// releases what it reserved, so the caller returns, and releases
     /// `serial`, once the deadline passes, and the next poll or
-    /// `Opened::retain` can take it.
+    /// `Opened::retain` can take it. A location error from the work is
+    /// given the table's name (`Error::for_table`).
     async fn within_deadline<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
-        let table = self.config.name.clone();
-        if self.current().is_none() {
+        let table = &self.config.name;
+        let outcome = if self.current().is_none() {
             let after = self.load_deadline;
             tokio::time::timeout(after, work)
                 .await
-                .map_err(|_elapsed| Error::LoadDeadline { table, after })?
+                .map_err(|_elapsed| Error::LoadDeadline {
+                    table: table.clone(),
+                    after,
+                })?
         } else {
             let after = self.refresh_deadline;
             tokio::time::timeout(after, work)
                 .await
-                .map_err(|_elapsed| Error::RefreshDeadline { table, after })?
-        }
+                .map_err(|_elapsed| Error::RefreshDeadline {
+                    table: table.clone(),
+                    after,
+                })?
+        };
+        outcome.map_err(|error| error.for_table(table))
     }
 
     /// Resolves the source and builds the snapshot the ref names over the
@@ -1166,8 +1174,8 @@ mod tests {
     use crate::key::KeyType;
     use crate::manifest::testing::{self as manifest_testing, Partition};
     use crate::metric::LookupResult;
-    use crate::storage::FILE_PREFIX;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
+    use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
 
     /// The GETs an unchanged poll costs: the version hint (RFD 005).
     const POLL_GETS: u64 = 1;
@@ -1385,6 +1393,38 @@ mod tests {
             panic!("expected Degraded, got {:?}", table.state());
         };
         (serving, reason)
+    }
+
+    /// A location no store serves, met as the table loads, is refused
+    /// naming the table, which storage alone cannot.
+    #[tokio::test]
+    async fn test_load_names_the_table_of_a_location_no_store_serves() {
+        let (fixture, _) = two_bucket_table().await;
+        let defaults = ServerConfig::default();
+        let table = Table::new(
+            fixture.config(Residency::Full, None),
+            TableSource::Static {
+                location: "gs://bucket-a/db/kv".to_string(),
+            },
+            handles_over(&fixture).await,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+            defaults.get_deadline,
+        );
+        let error = table.load().await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::Location {
+                    table: Some(name),
+                    source: LocationError {
+                        fault: LocationFault::NoStore,
+                        ..
+                    },
+                } if name == TABLE
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
