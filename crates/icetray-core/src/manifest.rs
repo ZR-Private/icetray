@@ -961,13 +961,26 @@ pub(crate) mod testing {
         partition: Struct,
         spec: DeleteSpec,
     ) -> DataFile {
+        sized_delete_file(path, spec_id, partition, spec, DELETE_RECORDS, DELETE_BYTES)
+    }
+
+    /// `delete_file` recording `records` rows and `bytes` bytes, for a
+    /// delete file written at `path`.
+    pub(crate) fn sized_delete_file(
+        path: &str,
+        spec_id: i32,
+        partition: Struct,
+        spec: DeleteSpec,
+        records: u64,
+        bytes: u64,
+    ) -> DataFile {
         let mut builder = DataFileBuilder::default();
         builder
             .file_path(path.to_string())
             .partition(partition)
             .partition_spec_id(spec_id)
-            .record_count(DELETE_RECORDS)
-            .file_size_in_bytes(DELETE_BYTES);
+            .record_count(records)
+            .file_size_in_bytes(bytes);
         match spec {
             DeleteSpec::Positions(format) => {
                 builder

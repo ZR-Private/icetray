@@ -278,7 +278,7 @@ pub(super) mod testing {
     }
 
     /// `position_file_of` under the spec's columns, no row null.
-    pub(in crate::deletes) fn position_file(rows: &[(&str, i64)]) -> Vec<u8> {
+    pub(crate) fn position_file(rows: &[(&str, i64)]) -> Vec<u8> {
         let rows: Vec<(Option<&str>, Option<i64>)> = rows
             .iter()
             .map(|&(path, at)| (Some(path), Some(at)))

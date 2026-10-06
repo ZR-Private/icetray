@@ -95,6 +95,22 @@ pub const TABLE_GETS_PER_MISS: &str = "icetray_table_gets_per_miss";
 /// Files one lookup probes at most on the serving generation, by `table`
 /// (`LookupCost::files_probed`).
 pub const TABLE_FILES_PROBED_PER_LOOKUP: &str = "icetray_table_files_probed_per_lookup";
+/// Rows the serving generation's deletes remove, by `table` (RFD 021,
+/// `DeleteSummary::rows`).
+pub const TABLE_DELETED_ROWS: &str = "icetray_table_deleted_rows";
+/// Those rows over the serving snapshot's data rows, by `table`
+/// (`DeleteSummary::fraction`).
+pub const TABLE_DELETED_FRACTION: &str = "icetray_table_deleted_fraction";
+/// Live position delete files and deletion vectors whose rows the serving
+/// generation applies, by `table` (`DeleteSummary::files`).
+pub const TABLE_DELETE_FILES: &str = "icetray_table_delete_files";
+/// Bytes the serving generation's delete state holds, also counted in
+/// `INDEX_BYTES`, by `table` (`DeleteSummary::state_bytes`).
+pub const TABLE_DELETE_STATE_BYTES: &str = "icetray_table_delete_state_bytes";
+/// Seconds from the commit of the snapshot that committed the oldest
+/// applying delete to now, 0 with none, by `table`
+/// (`Generation::oldest_delete_committed`).
+pub const TABLE_OLDEST_DELETE_AGE_SECONDS: &str = "icetray_table_oldest_delete_age_seconds";
 /// 1 while the configuration file differs from the configuration the
 /// server applied, 0 once they match (RFD 018).
 pub const CONFIG_PENDING: &str = "icetray_config_pending";
@@ -118,7 +134,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 36] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 41] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -283,6 +299,31 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 36] = [
         TABLE_FILES_PROBED_PER_LOOKUP,
         Kind::Gauge,
         "Files one lookup probes at most on the serving generation's layout, by table.",
+    ),
+    (
+        TABLE_DELETED_ROWS,
+        Kind::Gauge,
+        "Rows the serving generation's deletes remove from the data files it holds, by table.",
+    ),
+    (
+        TABLE_DELETED_FRACTION,
+        Kind::Gauge,
+        "Rows the serving generation's deletes remove over the rows of its data files, by table.",
+    ),
+    (
+        TABLE_DELETE_FILES,
+        Kind::Gauge,
+        "Position delete files and deletion vectors whose rows the serving generation applies, by table.",
+    ),
+    (
+        TABLE_DELETE_STATE_BYTES,
+        Kind::Gauge,
+        "Bytes the serving generation's delete state holds, also counted in icetray_index_bytes, by table.",
+    ),
+    (
+        TABLE_OLDEST_DELETE_AGE_SECONDS,
+        Kind::Gauge,
+        "Seconds since the snapshot that committed the oldest applying delete, 0 with none, by table.",
     ),
     (
         CONFIG_PENDING,

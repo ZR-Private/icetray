@@ -30,8 +30,8 @@ use icetray_proto::v1::{
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
-    Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3,
-    write_fixture,
+    DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture,
+    memory_catalog_s3, write_fixture,
 };
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -67,6 +67,9 @@ const FRESH_TABLE: &str = "kv_fresh";
 
 /// A table no other test serves, so its gauges are this test's alone.
 const SCRAPED_TABLE: &str = "kv_scraped";
+
+/// A table served with deletes beside `TABLE`.
+const DELETED_TABLE: &str = "kv_deleted";
 
 /// Loopback with an OS-assigned port, for both listeners.
 const LOOPBACK_ANY_PORT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -815,6 +818,60 @@ async fn test_requests_total_counts_every_call() -> TestResult {
     assert!(
         age >= 0.0,
         "the snapshot was committed before the scrape: {age}"
+    );
+    Ok(())
+}
+
+/// The scrape samples each table's oldest applying delete's age beside its
+/// generation's: 0 on a table with no deletes; on one whose deletes were
+/// committed in two snapshots, the later served, above 0 and no less than
+/// the generation's age, since the oldest delete's snapshot is no newer
+/// than the one served.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scrape_samples_the_oldest_delete_age_beside_the_generation_age() -> TestResult {
+    /// The ids deleted, the first in one snapshot, the second in the next.
+    const DELETED_IDS: [u64; 2] = [SAMPLE[0], SAMPLE[1]];
+    let _serial = SERIAL.lock().await;
+    let specs = vec![
+        FixtureSpec::small(TABLE, KeyType::Long),
+        FixtureSpec::small(DELETED_TABLE, KeyType::Long),
+    ];
+    let mut stack = Stack::start_with(specs, async |setup| {
+        let fixture = &mut setup.fixtures[1];
+        fixture
+            .delete(&DELETED_IDS[..1], DeleteForm::ScopedPositions, "first")
+            .await?;
+        fixture
+            .delete(&DELETED_IDS[1..], DeleteForm::ScopedPositions, "second")
+            .await?;
+        setup.config.tables[1] = fixture.config(Residency::Full, false);
+        Ok(())
+    })
+    .await?;
+    stack.serving.ready().await;
+    let scrape = stack.scrape().await?;
+    let gauge = |name: &str, table: &str| {
+        series_value(&scrape, name, &[(metric::LABEL_TABLE, table)])
+            .unwrap_or_else(|| panic!("{name} of {table} is sampled"))
+    };
+    assert_eq!(
+        gauge(metric::TABLE_OLDEST_DELETE_AGE_SECONDS, TABLE).to_bits(),
+        approx::gauge(0).to_bits(),
+        "no delete applies"
+    );
+    let oldest = gauge(metric::TABLE_OLDEST_DELETE_AGE_SECONDS, DELETED_TABLE);
+    let generation = gauge(metric::GENERATION_AGE_SECONDS, DELETED_TABLE);
+    assert!(
+        oldest > 0.0,
+        "the deletes were committed before the scrape: {oldest}"
+    );
+    assert!(
+        oldest >= generation,
+        "the oldest delete is no newer than the served snapshot: {oldest} < {generation}"
+    );
+    assert_eq!(
+        gauge(metric::TABLE_DELETED_ROWS, DELETED_TABLE).to_bits(),
+        approx::gauge_len(DELETED_IDS.len()).to_bits()
     );
     Ok(())
 }
@@ -1853,7 +1910,7 @@ async fn test_reload_adds_and_removes_tables_on_request() -> TestResult {
 }
 
 /// Every gauge a serving table exports under its name.
-const TABLE_GAUGES: [&str; 12] = [
+const TABLE_GAUGES: [&str; 17] = [
     metric::TABLE_STATE,
     metric::INDEX_BYTES,
     metric::FINDINGS,
@@ -1866,6 +1923,11 @@ const TABLE_GAUGES: [&str; 12] = [
     metric::TABLE_GETS_PER_HIT,
     metric::TABLE_GETS_PER_MISS,
     metric::TABLE_FILES_PROBED_PER_LOOKUP,
+    metric::TABLE_DELETED_ROWS,
+    metric::TABLE_DELETED_FRACTION,
+    metric::TABLE_DELETE_FILES,
+    metric::TABLE_DELETE_STATE_BYTES,
+    metric::TABLE_OLDEST_DELETE_AGE_SECONDS,
 ];
 
 /// A changed file is found on the poll, with no request.

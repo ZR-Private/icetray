@@ -298,11 +298,13 @@ fn render_after(handle: &PrometheusHandle, publish: impl FnOnce()) -> String {
     handle.render()
 }
 
-/// Samples the gauges the binary owns: `generation_age_seconds` for every
-/// one of `tables` serving a generation, from the snapshot's own timestamp
-/// against now, `process_rss_bytes` when the platform reports a resident
-/// set size, and the allocator gauges. A gauge left unsampled drops out of
-/// the exposition.
+/// Samples the gauges the binary owns: for every one of `tables` serving a
+/// generation, `generation_age_seconds` from the snapshot's own timestamp
+/// against now and `table_oldest_delete_age_seconds` from the commit of
+/// the oldest applying delete's snapshot, 0 with none;
+/// `process_rss_bytes` when the platform reports a resident set size; and
+/// the allocator gauges. A gauge left unsampled drops out of the
+/// exposition.
 fn sample(tables: &Tables) {
     for table in tables.iter() {
         if let Some(generation) = table.current() {
@@ -311,6 +313,15 @@ fn sample(tables: &Tables) {
                 metric::LABEL_TABLE => table.name().to_string()
             )
             .set(time::age_seconds(generation.snapshot_timestamp));
+            metrics::gauge!(
+                metric::TABLE_OLDEST_DELETE_AGE_SECONDS,
+                metric::LABEL_TABLE => table.name().to_string()
+            )
+            .set(
+                generation
+                    .oldest_delete_committed
+                    .map_or(0.0, time::age_seconds),
+            );
         }
     }
     if let Some(stats) = memory_stats::memory_stats() {

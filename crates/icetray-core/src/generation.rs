@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
-use iceberg::spec::Snapshot;
+use iceberg::spec::{Snapshot, TableMetadata};
 
 use crate::approx;
 use crate::blocking;
@@ -24,7 +24,7 @@ use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::check::{self, Caps, FileView, FindingCode, LayoutView, LookupCost};
 use crate::config::{Residency, TableConfig};
-use crate::deletes::{self, DataTarget, DeleteFault, FileDeletes};
+use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition};
 use crate::key::Key;
@@ -106,6 +106,14 @@ pub struct Generation {
     /// The snapshot's own timestamp, when the writer committed it; what
     /// `generation_age_seconds` measures against now.
     pub snapshot_timestamp: jiff::Timestamp,
+    /// When the snapshot that committed the oldest applying delete was
+    /// committed (RFD 021, Measurements): the snapshot whose sequence
+    /// number is the least data sequence number of any delete in a file's
+    /// applied rows, else, when it has expired from the metadata, the
+    /// earliest listed snapshot after it, which understates the age
+    /// (`committed_at`); `None` where no delete applies. What
+    /// `table_oldest_delete_age_seconds` measures against now.
+    pub oldest_delete_committed: Option<jiff::Timestamp>,
     /// The level the snapshot's layout achieves in `residency` (RFD 020),
     /// measured once as the generation is assembled (`check::layout_caps`);
     /// what the level gauges and a reload judge the generation by.
@@ -197,6 +205,7 @@ impl Generation {
             config: config.clone(),
             snapshot: snapshot.clone(),
             snapshot_timestamp,
+            metadata: Arc::clone(&resolved.metadata),
             metadata_location: resolved.location.clone(),
             layout,
             storage: Arc::clone(storage),
@@ -339,6 +348,7 @@ impl Generation {
             index_bytes,
             loaded_at: Instant::now(),
             snapshot_timestamp,
+            oldest_delete_committed: None,
             level: caps.level,
             lookup_cost: caps.cost,
             capping: caps.codes(),
@@ -354,6 +364,13 @@ impl Generation {
     /// for a table that declares `declared`.
     pub(crate) fn judge(&self, declared: Level, strict: bool) -> Result<()> {
         check::judge(&self.table, self.level, &self.capping, declared, strict)
+    }
+
+    /// What the generation's delete state comes to (RFD 021): the rows its
+    /// deletes remove, the deletes they came from, their share of
+    /// `records`, and the bytes they hold, which `index_bytes` counts.
+    pub(crate) fn delete_summary(&self) -> DeleteSummary {
+        DeleteSummary::of(&self.deletes, &self.delete_reads, self.records)
     }
 
     /// The files that may hold `key`, in probe order: under every bucketing
@@ -574,6 +591,9 @@ pub(crate) struct Planned {
     config: TableConfig,
     snapshot: Snapshot,
     snapshot_timestamp: jiff::Timestamp,
+    /// The metadata the snapshot was read from, whose snapshots date the
+    /// oldest applying delete.
+    metadata: Arc<TableMetadata>,
     metadata_location: String,
     layout: TableLayout,
     /// What the deletes are read through.
@@ -790,6 +810,9 @@ impl Planned {
             .collect();
         generation.delete_reads = applied.known.reindexed(&moved_to);
         generation.index_bytes += approx::length(generation.delete_reads.resident_bytes());
+        generation.oldest_delete_committed = applied.oldest.and_then(|sequence| {
+            committed_at(self.metadata.snapshots().map(Arc::as_ref), sequence)
+        });
         Ok(generation)
     }
 }
@@ -1056,6 +1079,41 @@ fn snapshot_timestamp(table: &str, snapshot: &Snapshot) -> Result<jiff::Timestam
             },
         )
     })
+}
+
+/// When the deletes at `sequence` were committed, from the metadata's
+/// `snapshots`: the earliest, by timestamp then id, of those whose sequence
+/// number it is; else, once those have expired, the earliest of those
+/// whose sequence number is greater, which committed after the deletes and
+/// so dates them no earlier than they were, a lower bound on their age.
+/// A snapshot whose timestamp jiff cannot represent is passed over, since
+/// it dates a gauge and never decides a load. `None` where no listed
+/// snapshot qualifies.
+fn committed_at<'a>(
+    snapshots: impl IntoIterator<Item = &'a Snapshot>,
+    sequence: SequenceNumber,
+) -> Option<jiff::Timestamp> {
+    let dated: Vec<(SequenceNumber, jiff::Timestamp, i64)> = snapshots
+        .into_iter()
+        .filter_map(|snapshot| {
+            // intentional: an unrepresentable timestamp leaves the snapshot
+            // out of the dating, never the load.
+            let at = time::timestamp_from_millis(snapshot.timestamp_ms()).ok()?;
+            Some((
+                SequenceNumber(snapshot.sequence_number()),
+                at,
+                snapshot.snapshot_id(),
+            ))
+        })
+        .collect();
+    let earliest = |keep: &dyn Fn(SequenceNumber) -> bool| {
+        dated
+            .iter()
+            .filter(|(at, ..)| keep(*at))
+            .min_by_key(|&&(_, committed, id)| (committed, id))
+            .map(|&(_, committed, _)| committed)
+    };
+    earliest(&|at| at == sequence).or_else(|| earliest(&|at| at > sequence))
 }
 
 /// A file the previous generation does not hold, open for inspection.
@@ -2310,6 +2368,60 @@ pub(crate) mod testing {
             ));
         }
 
+        /// Writes a Parquet position delete file `name` in `bucket` that
+        /// deletes `positions` of data file `data` and records it for the
+        /// next snapshot, its entry naming `data` as its referenced data
+        /// file; `data` need not be a file the table holds.
+        pub(crate) async fn add_position_delete(
+            &mut self,
+            name: &str,
+            data: &str,
+            positions: &[i64],
+            bucket: u32,
+        ) {
+            let path = self.path_of(name);
+            let data = self.path_of(data);
+            let rows: Vec<(&str, i64)> = positions
+                .iter()
+                .map(|&position| (data.as_str(), position))
+                .collect();
+            let bytes = crate::deletes::position_file(&rows);
+            let size = count(bytes.len());
+            manifest_testing::write_file(&FileIO::new_with_fs(), &path, Bytes::from(bytes)).await;
+            self.files.push((
+                manifest_testing::sized_delete_file(
+                    &path,
+                    self.spec_id,
+                    manifest_testing::partition(Partition::Bucket(bucket)),
+                    manifest_testing::DeleteSpec::ScopedPositions(DataFileFormat::Parquet, data),
+                    count(positions.len()),
+                    size,
+                ),
+                self.spec_id,
+            ));
+        }
+
+        /// Removes snapshot `id` from the metadata and writes it as
+        /// `version`, pointing the hint at it, as a writer's snapshot
+        /// expiry leaves it.
+        pub(crate) async fn expire(&mut self, id: i64, version: u64) {
+            self.md = self
+                .md
+                .clone()
+                .into_builder(None)
+                .remove_snapshots(&[id])
+                .build()
+                .unwrap()
+                .metadata;
+            manifest_testing::write_metadata(&self.md, version).await;
+        }
+
+        /// When snapshot `id` was committed, as its metadata records it.
+        pub(crate) fn committed(&self, id: i64) -> jiff::Timestamp {
+            let millis = self.md.snapshot_by_id(id).unwrap().timestamp_ms();
+            crate::time::timestamp_from_millis(millis).unwrap()
+        }
+
         /// Drops the recorded file `name`, so the next snapshot no longer
         /// lists it or lists another file added under the same name.
         pub(crate) fn remove_file(&mut self, name: &str) {
@@ -2527,6 +2639,51 @@ mod tests {
         DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID, unpartitioned,
     };
     use crate::storage::testing::{MEM_PREFIX, MemStore};
+
+    /// Snapshot `id` at `sequence` committed at `millis`, for
+    /// `committed_at`, which reads nothing else of it.
+    fn dated_snapshot(id: i64, sequence: i64, millis: i64) -> Snapshot {
+        Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_sequence_number(sequence)
+            .with_timestamp_ms(millis)
+            .with_manifest_list(format!("{MEM_PREFIX}db/kv/metadata/snap-{id}.avro"))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build()
+    }
+
+    /// Deletes are dated by the earliest snapshot at their sequence number;
+    /// once those expire, by the earliest at a greater one, never by an
+    /// older snapshot; and a timestamp jiff cannot represent is passed over.
+    #[test]
+    fn test_committed_at_dates_by_the_sequence_else_the_earliest_later_snapshot() {
+        let deletes = SequenceNumber(SECOND_SEQUENCE);
+        let (oldest, early, late) = (1_000, 2_000, 3_000);
+        let unrepresentable = i64::MAX;
+        let at = |millis| Some(time::timestamp_from_millis(millis).unwrap());
+        let both_at_sequence = [
+            dated_snapshot(FIRST_SNAPSHOT, SECOND_SEQUENCE, late),
+            dated_snapshot(SECOND_SNAPSHOT, SECOND_SEQUENCE, early),
+            dated_snapshot(THIRD_SNAPSHOT, THIRD_SEQUENCE, oldest),
+        ];
+        assert_eq!(committed_at(&both_at_sequence, deletes), at(early));
+        let expired = [
+            dated_snapshot(FIRST_SNAPSHOT, FIRST_SEQUENCE, oldest),
+            dated_snapshot(SECOND_SNAPSHOT, THIRD_SEQUENCE, late),
+            dated_snapshot(THIRD_SNAPSHOT, THIRD_SEQUENCE + 1, early),
+        ];
+        assert_eq!(committed_at(&expired, deletes), at(early));
+        let out_of_range = [
+            dated_snapshot(SECOND_SNAPSHOT, SECOND_SEQUENCE, unrepresentable),
+            dated_snapshot(THIRD_SNAPSHOT, THIRD_SEQUENCE, late),
+        ];
+        assert_eq!(committed_at(&out_of_range, deletes), at(late));
+        let older_only = [dated_snapshot(FIRST_SNAPSHOT, FIRST_SEQUENCE, oldest)];
+        assert_eq!(committed_at(&older_only, deletes), None);
+    }
 
     /// The metadata location the assembled generations claim.
     fn mem_metadata() -> String {

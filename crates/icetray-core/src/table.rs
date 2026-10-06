@@ -26,6 +26,7 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode, LookupCost};
 use crate::config::TableConfig;
+use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
@@ -389,6 +390,7 @@ struct GenerationGauges {
     sequence_number: SequenceNumber,
     swapped_at: f64,
     lookup_cost: LookupCost,
+    deletes: DeleteSummary,
 }
 
 /// What a lookup needs beside its generation: the table's page cache
@@ -1234,8 +1236,9 @@ impl Table {
     /// Makes `generation` the serving one. The generation gauges it sets,
     /// `index_bytes`, `findings` from `findings`,
     /// `generation_sequence_number`, `generation_swapped_at_seconds` from
-    /// the clock, and the lookup-cost gauges from its `lookup_cost`, are
-    /// kept and written while the table shows them
+    /// the clock, the lookup-cost gauges from its `lookup_cost`, and the
+    /// delete gauges from its `delete_summary`, are kept and written while
+    /// the table shows them
     /// (`write_generation`), and the level gauges take the generation's
     /// level against `declared`.
     fn swap(
@@ -1268,6 +1271,7 @@ impl Table {
             sequence_number: generation.sequence_number,
             swapped_at: time::unix_seconds(time::now()),
             lookup_cost: generation.lookup_cost,
+            deletes: generation.delete_summary(),
         };
         let level = LevelGauges {
             measured: generation.level,
@@ -1502,6 +1506,27 @@ impl Table {
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge_len(cost.files_probed));
+        let deletes = generation.deletes;
+        metrics::gauge!(
+            metric::TABLE_DELETED_ROWS,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(deletes.rows));
+        metrics::gauge!(
+            metric::TABLE_DELETED_FRACTION,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(deletes.fraction);
+        metrics::gauge!(
+            metric::TABLE_DELETE_FILES,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(deletes.files));
+        metrics::gauge!(
+            metric::TABLE_DELETE_STATE_BYTES,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge_len(deletes.state_bytes));
     }
 
     /// Writes the level gauges from `level`; called with the gauges' lock
@@ -2713,6 +2738,20 @@ mod tests {
     /// dictionary-encoded and whose keys interleave with bucket 0's file's,
     /// committed as `SECOND_SNAPSHOT`.
     async fn append_dictionary_overlap(fixture: &mut Fixture) {
+        add_dictionary_overlap(fixture).await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+    }
+
+    /// Records in `fixture` the file `append_dictionary_overlap` commits,
+    /// for the next snapshot.
+    async fn add_dictionary_overlap(fixture: &mut Fixture) {
         let interleaved = keys_in_bucket(&keys_from(1, E2E_KEYS), bucketing(TWO), 0);
         let keys = long_keys(&interleaved);
         fixture
@@ -2727,14 +2766,6 @@ mod tests {
                     ..WriterLayout::contract()
                 },
             })
-            .await;
-        fixture
-            .commit(
-                SECOND_SNAPSHOT,
-                Some(FIRST_SNAPSHOT),
-                SECOND_SEQUENCE,
-                SECOND_VERSION,
-            )
             .await;
     }
 
@@ -3394,6 +3425,194 @@ mod tests {
         );
     }
 
+    /// The rows of `two_bucket_table`'s bucket 0 file that `commit_deletes`
+    /// deletes.
+    const F0_DELETED: [i64; 2] = [0, 1];
+    /// The rows of its bucket 1 file that `commit_deletes` deletes.
+    const F1_DELETED: [i64; 1] = [0];
+    /// The position delete files of `commit_deletes` that apply.
+    const APPLYING_DELETE_FILES: u64 = 2;
+
+    /// Commits to `two_bucket_table`'s `fixture`, as `SECOND_SNAPSHOT`, a
+    /// position delete file per data file deleting `F0_DELETED` and
+    /// `F1_DELETED`, and a dangling one naming a file the table never held.
+    async fn commit_deletes(fixture: &mut Fixture) {
+        fixture
+            .add_position_delete("d0", "f0", &F0_DELETED, 0)
+            .await;
+        fixture
+            .add_position_delete("d1", "f1", &F1_DELETED, 1)
+            .await;
+        fixture
+            .add_position_delete("dangling", "gone", &F1_DELETED, 1)
+            .await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+    }
+
+    /// The delete gauges of `table`, as bits: deleted rows, deleted
+    /// fraction, delete files, and delete state bytes.
+    fn delete_gauges(series: &Series) -> [u64; 4] {
+        let labels = [table_label()];
+        DELETE_GAUGES.map(|name| series.gauge(name, &labels).to_bits())
+    }
+
+    /// The gauges a swap writes from `Generation::delete_summary`.
+    const DELETE_GAUGES: [&str; 4] = [
+        metric::TABLE_DELETED_ROWS,
+        metric::TABLE_DELETED_FRACTION,
+        metric::TABLE_DELETE_FILES,
+        metric::TABLE_DELETE_STATE_BYTES,
+    ];
+
+    /// What `delete_gauges` reads for `summary`.
+    fn delete_bits(summary: DeleteSummary) -> [u64; 4] {
+        [
+            approx::gauge(summary.rows).to_bits(),
+            summary.fraction.to_bits(),
+            approx::gauge(summary.files).to_bits(),
+            approx::gauge_len(summary.state_bytes).to_bits(),
+        ]
+    }
+
+    /// The delete summary of `generation` is what `commit_deletes` applies:
+    /// its rows, of the snapshot's rows, from the two files that name a
+    /// data file the snapshot holds and not the dangling one, holding the
+    /// bytes `index_bytes` counts past the file indexes.
+    fn assert_commit_deletes_applied(generation: &Generation) -> DeleteSummary {
+        let summary = generation.delete_summary();
+        let deleted = approx::count(F0_DELETED.len() + F1_DELETED.len());
+        assert_eq!(summary.rows, deleted);
+        assert_eq!(summary.files, APPLYING_DELETE_FILES);
+        assert_eq!(
+            summary.fraction.to_bits(),
+            approx::ratio(deleted, generation.records).to_bits()
+        );
+        let file_bytes: usize = generation
+            .files
+            .iter()
+            .map(|file| file.index.resident_bytes())
+            .sum();
+        assert!(summary.state_bytes > 0);
+        assert_eq!(generation.index_bytes, file_bytes + summary.state_bytes);
+        summary
+    }
+
+    /// The delete gauges appear with the first swap, at zero on a snapshot
+    /// with no deletes, and follow the swaps: a snapshot with deletes
+    /// writes what its applying deletes come to, a dangling delete counted
+    /// in none.
+    #[test]
+    fn test_metrics_delete_gauges_appear_at_first_swap_and_count_applying_deletes() {
+        let ((), before) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            fixture.remove_hint();
+            table.load().await.unwrap_err();
+        });
+        for name in DELETE_GAUGES {
+            assert_eq!(before.named(name), 0, "{name} before any swap");
+        }
+        let ((first, summary), after) = recorded_with(|snapshotter| async move {
+            let (mut fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let generation = table.current().unwrap();
+            assert_eq!(generation.delete_summary(), DeleteSummary::default());
+            assert_eq!(generation.oldest_delete_committed, None);
+            let first = Series(snapshotter.snapshot().into_vec());
+            commit_deletes(&mut fixture).await;
+            assert!(table.refresh().await.unwrap());
+            let summary = assert_commit_deletes_applied(&table.current().unwrap());
+            (first, summary)
+        });
+        assert_eq!(delete_gauges(&first), delete_bits(DeleteSummary::default()));
+        assert_eq!(delete_gauges(&after), delete_bits(summary));
+    }
+
+    /// A strict table held on a snapshot below its level keeps the serving
+    /// generation's delete gauges, though the held snapshot deletes more.
+    #[test]
+    fn test_metrics_delete_gauges_are_the_serving_generations_while_held() {
+        let (summary, series) = recorded(async {
+            let (mut fixture, _) = two_bucket_table().await;
+            commit_deletes(&mut fixture).await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let summary = assert_commit_deletes_applied(&table.current().unwrap());
+            add_dictionary_overlap(&mut fixture).await;
+            fixture.add_position_delete("d2", "f1", &[1], 1).await;
+            fixture
+                .commit(
+                    THIRD_SNAPSHOT,
+                    Some(SECOND_SNAPSHOT),
+                    THIRD_SEQUENCE,
+                    THIRD_VERSION,
+                )
+                .await;
+            table.refresh().await.unwrap_err();
+            assert_eq!(
+                held(&table),
+                (
+                    SnapshotId(SECOND_SNAPSHOT),
+                    SnapshotId(THIRD_SNAPSHOT),
+                    Level::Permissive
+                )
+            );
+            table.publish_gauges();
+            summary
+        });
+        assert_eq!(delete_gauges(&series), delete_bits(summary));
+    }
+
+    /// The oldest applying delete is dated by the snapshot that committed
+    /// it, found by its data sequence number; once that snapshot has
+    /// expired, by the earliest later snapshot, never by an older one that
+    /// predates the delete.
+    #[tokio::test]
+    async fn test_load_dates_the_oldest_delete_by_its_snapshot_or_the_next_listed() {
+        let (mut fixture, _) = two_bucket_table().await;
+        commit_deletes(&mut fixture).await;
+        fixture
+            .commit(
+                THIRD_SNAPSHOT,
+                Some(SECOND_SNAPSHOT),
+                THIRD_SEQUENCE,
+                THIRD_VERSION,
+            )
+            .await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let generation = table.current().unwrap();
+        assert_eq!(generation.snapshot_id, SnapshotId(THIRD_SNAPSHOT));
+        assert_eq!(
+            generation.oldest_delete_committed,
+            Some(fixture.committed(SECOND_SNAPSHOT))
+        );
+
+        let expired_version = THIRD_VERSION + 1;
+        fixture.expire(SECOND_SNAPSHOT, expired_version).await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let generation = table.current().unwrap();
+        assert_commit_deletes_applied(&generation);
+        assert_ne!(
+            fixture.committed(FIRST_SNAPSHOT),
+            fixture.committed(THIRD_SNAPSHOT),
+            "the older snapshot would date the delete otherwise"
+        );
+        assert_eq!(
+            generation.oldest_delete_committed,
+            Some(fixture.committed(THIRD_SNAPSHOT))
+        );
+    }
+
     /// A retune of a lenient table's `lookups` declares the new level at
     /// once, before any poll: a table serving a balanced snapshot reads
     /// below its declared `optimal`, and retuned to `balanced` reads at its
@@ -3965,6 +4184,10 @@ mod tests {
             metric::TABLE_GETS_PER_HIT,
             metric::TABLE_GETS_PER_MISS,
             metric::TABLE_FILES_PROBED_PER_LOOKUP,
+            metric::TABLE_DELETED_ROWS,
+            metric::TABLE_DELETED_FRACTION,
+            metric::TABLE_DELETE_FILES,
+            metric::TABLE_DELETE_STATE_BYTES,
         ];
         for name in gauges {
             assert_eq!(loading.named(name), 0, "{name}");
@@ -3989,6 +4212,7 @@ mod tests {
             level_bits(0, Level::Optimal, Level::Optimal)
         );
         assert_eq!(cost_gauges(&shown), cost_bits(CONTRACT_COST));
+        assert_eq!(delete_gauges(&shown), delete_bits(DeleteSummary::default()));
     }
 
     /// A withdrawn table writes no gauge: a refresh that fails after the

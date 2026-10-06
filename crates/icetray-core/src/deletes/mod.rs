@@ -35,6 +35,8 @@ use iceberg::puffin::CompressionCodec;
 use roaring::RoaringTreemap;
 
 pub(crate) use bound::bound;
+#[cfg(test)]
+pub(crate) use position::testing::position_file;
 pub use position::{FILE_PATH_COLUMN, FILE_PATH_FIELD_ID, POS_COLUMN, POS_FIELD_ID};
 pub use puffin::{CARDINALITY_PROPERTY, REFERENCED_DATA_FILE_PROPERTY};
 
@@ -381,6 +383,54 @@ impl FileDeletes {
     }
 }
 
+/// What a generation's delete state comes to (RFD 021, Measurements):
+/// what the delete gauges show while it serves and the doctor's summary
+/// reports. Every count is of deletes that apply to a data file the
+/// generation holds, so the dangling deletes a compaction leaves behind
+/// count in none of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct DeleteSummary {
+    /// Rows the deletes remove, each once however many deletes name it.
+    pub rows: u64,
+    /// Live position delete files and deletion vectors whose rows are in a
+    /// data file's applied rows; a position delete file masked by a
+    /// deletion vector is not.
+    pub files: u64,
+    /// `rows` over the rows of the snapshot's data files; 0 for a snapshot
+    /// with none.
+    pub fraction: f64,
+    /// Bytes the delete state holds: every data file's applied rows and the
+    /// deletes they came from, and what the deletes keep for the next load;
+    /// counted in the generation's `index_bytes` too.
+    pub state_bytes: usize,
+}
+
+impl DeleteSummary {
+    /// The summary of the applied rows `rows` of a generation of `records`
+    /// data rows, beside `known`, what its deletes keep for the next load.
+    pub(crate) fn of(rows: &[Option<Arc<FileDeletes>>], known: &Known, records: u64) -> Self {
+        let applied: Vec<&FileDeletes> = rows.iter().flatten().map(Arc::as_ref).collect();
+        let deleted = applied
+            .iter()
+            .map(|file| file.rows.len())
+            .fold(0, u64::saturating_add);
+        let sources: HashSet<&DeleteSource> = applied
+            .iter()
+            .flat_map(|file| file.sources.iter())
+            .collect();
+        let bytes = applied
+            .iter()
+            .map(|file| file.resident_bytes())
+            .fold(known.resident_bytes(), u64::saturating_add);
+        Self {
+            rows: deleted,
+            files: approx::count(sources.len()),
+            fraction: approx::ratio(deleted, records),
+            state_bytes: approx::length(bytes),
+        }
+    }
+}
+
 #[cfg(test)]
 impl FileDeletes {
     /// `rows` deleted by no source, for a test that assembles a generation
@@ -521,6 +571,9 @@ pub(crate) struct Applied {
     pub(crate) shrank: Vec<bool>,
     /// What the next load need not read again, `named` by data target.
     pub(crate) known: Known,
+    /// The least data sequence number of the deletes in any target's
+    /// applied rows; `None` where no delete applies.
+    pub(crate) oldest: Option<SequenceNumber>,
 }
 
 /// One data file of a snapshot as the deletes see it.
@@ -754,6 +807,11 @@ pub(crate) async fn load(
             Plan::of(at, &context, sources, previous)
         })
         .collect();
+    let oldest = plans
+        .iter()
+        .flat_map(|plan| &plan.sources)
+        .map(|&(_, at)| context.sorted.entry(at).sequence)
+        .min();
     let fresh = read_needed(&context, &plans, &previous.known, &mut read).await?;
     let footers = retained_footers(&context, &plans, &fresh, &previous.known);
     let mut named: Vec<Named> = named
@@ -780,6 +838,7 @@ pub(crate) async fn load(
             named: named.into_boxed_slice(),
             footers,
         },
+        oldest,
     })
 }
 
