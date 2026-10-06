@@ -140,6 +140,9 @@ pub struct Generation {
     /// What the next load's deletes need not read again, by index into
     /// `files`.
     delete_reads: deletes::Known,
+    /// The bound on the bytes the delete state takes, from the manifests
+    /// alone (`deletes::bound`), which the budget was checked against.
+    delete_bound: u64,
 }
 
 /// Positions in a generation's files by bucketing and bucket. `None`
@@ -357,6 +360,7 @@ impl Generation {
             verified_groups: to_verify.len(),
             deletes,
             delete_reads: deletes::Known::default(),
+            delete_bound: 0,
         })
     }
 
@@ -371,6 +375,13 @@ impl Generation {
     /// `records`, and the bytes they hold, which `index_bytes` counts.
     pub(crate) fn delete_summary(&self) -> DeleteSummary {
         DeleteSummary::of(&self.deletes, &self.delete_reads, self.records)
+    }
+
+    /// The bound on the bytes the delete state takes, from the manifests
+    /// alone, as the budget check counted it (RFD 021, Delete state); at
+    /// least `delete_summary`'s `state_bytes`.
+    pub(crate) fn delete_bound(&self) -> u64 {
+        self.delete_bound
     }
 
     /// The files that may hold `key`, in probe order: under every bucketing
@@ -810,6 +821,7 @@ impl Planned {
             .collect();
         generation.delete_reads = applied.known.reindexed(&moved_to);
         generation.index_bytes += approx::length(generation.delete_reads.resident_bytes());
+        generation.delete_bound = self.delete_bound;
         generation.oldest_delete_committed = applied.oldest.and_then(|sequence| {
             committed_at(self.metadata.snapshots().map(Arc::as_ref), sequence)
         });

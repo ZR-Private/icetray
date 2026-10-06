@@ -194,7 +194,7 @@ The label values:
   `bounds_missing`, `column_index_truncated`, `large_value_pages`,
   `value_pages_over_ceiling`, `long_keys`, `large_file`,
   `many_files_per_bucket`, `no_bloom_filter`, `bloom_oversized`,
-  `bloom_undersized`.
+  `bloom_undersized`, `deletes_pending`.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
   `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,

@@ -1,10 +1,10 @@
-//! The doctor (RFD 007, RFD 016, RFD 020): the finding codes, the levels
-//! they cap, penalties, and thresholds by which a table is classified,
-//! applied identically at every load and in the `doctor` subcommand.
-//! `diagnose` is a pure function of a loaded `Generation` and the table's
-//! declared level: it reads the footers, page indexes, fences, and manifest
-//! entries the generation holds and nothing else, so the same generation
-//! always gets the same report.
+//! The doctor (RFD 007, RFD 016, RFD 020, RFD 021): the finding codes, the
+//! levels they cap, penalties, and thresholds by which a table is
+//! classified, applied identically at every load and in the `doctor`
+//! subcommand. `diagnose` is a pure function of a loaded `Generation` and
+//! the table's declared level: it reads the footers, page indexes, fences,
+//! manifest entries, and applied delete state the generation holds and
+//! nothing else, so the same generation always gets the same report.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -16,6 +16,7 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use crate::approx;
 use crate::config::Residency;
 use crate::contract;
+use crate::deletes::DeleteSummary;
 use crate::error::{Error, RefusalReason, Result};
 use crate::generation::{Generation, LoadedFile};
 use crate::index::{
@@ -231,6 +232,10 @@ pub enum FindingCode {
     /// The key bloom filter has fewer bits per key than the minimum; the
     /// Bloom tier's miss cost rises.
     BloomUndersized,
+    /// Deletes remove rows of the snapshot's data files (RFD 021); a
+    /// compaction would remove them and their delete files, and the state
+    /// they hold.
+    DeletesPending,
 }
 
 impl FindingCode {
@@ -239,7 +244,7 @@ impl FindingCode {
     /// admitted generation, so a code the generation does not raise reads
     /// zero. Complete: a successor match over every variant, which a new
     /// variant fails to compile, is compared to this list in tests.
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
@@ -254,6 +259,7 @@ impl FindingCode {
         Self::NoBloomFilter,
         Self::BloomOversized,
         Self::BloomUndersized,
+        Self::DeletesPending,
     ];
 
     /// The level a finding of this code caps a table at (RFD 020), `None`
@@ -272,7 +278,8 @@ impl FindingCode {
             | Self::ManyFilesPerBucket
             | Self::NoBloomFilter
             | Self::BloomOversized
-            | Self::BloomUndersized => None,
+            | Self::BloomUndersized
+            | Self::DeletesPending => None,
         }
     }
 }
@@ -294,6 +301,7 @@ impl fmt::Display for FindingCode {
             Self::NoBloomFilter => "no_bloom_filter",
             Self::BloomOversized => "bloom_oversized",
             Self::BloomUndersized => "bloom_undersized",
+            Self::DeletesPending => "deletes_pending",
         };
         f.write_str(code)
     }
@@ -562,7 +570,9 @@ pub struct TableSummary {
     /// Bytes resident across every file index, in the loaded tier.
     pub index_bytes: usize,
     /// Every tier's resident bytes, from the footers alone (RFD 017), so an
-    /// owner chooses a tier from one run.
+    /// owner chooses a tier from one run; each tier's memory counts the
+    /// delete state at its bound from the manifests (RFD 021), as the
+    /// `full` budget does.
     pub predicted: ResidentBytes,
     /// The level the layout achieves in every tier that can load the
     /// table: its findings' dearest cap and the tier's best level together,
@@ -573,6 +583,9 @@ pub struct TableSummary {
     /// What one cold lookup pays at worst in the loaded tier, from the same
     /// measurement as `level`.
     pub lookup_cost: LookupCost,
+    /// What the snapshot's deletes come to (RFD 021), from the delete state
+    /// the load applied: what the delete gauges show while it serves.
+    pub deletes: DeleteSummary,
     /// Capping findings, the count of those whose `caps` is set.
     pub capping: usize,
     /// Advice findings, the count of those whose `caps` is `None`.
@@ -607,12 +620,14 @@ impl TableReport {
 /// from the footers. No I/O and no metrics.
 pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
     let caps = layout_caps(&LayoutView::of(g));
+    let deletes = g.delete_summary();
     let facts: Vec<FileFacts> = g
         .files
         .iter()
         .map(|file| measure(file, &g.layout))
         .collect();
     let buckets = by_bucket(&facts);
+    let pending = deletes_pending(g, &caps, deletes);
     let mut findings = caps.findings;
     findings.extend(
         facts
@@ -620,8 +635,9 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
             .flat_map(|file| file_advice_findings(file, &g.layout)),
     );
     findings.extend(many_files_findings(&buckets));
+    findings.extend(pending);
     sort_findings(&mut findings);
-    let predicted = predicted_total(&facts);
+    let predicted = with_deletes(predicted_total(&facts), g.delete_bound());
     let capping = findings
         .iter()
         .filter(|finding| finding.caps().is_some())
@@ -641,6 +657,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         predicted,
         level_by_residency: level_by_residency(caps.layout, &predicted),
         lookup_cost: caps.cost,
+        deletes,
         capping,
         advice: findings.len() - capping,
     };
@@ -1365,6 +1382,64 @@ fn many_files_findings(buckets: &Buckets<'_>) -> Vec<Finding> {
     findings
 }
 
+/// `deletes_pending` (RFD 021) when `deletes`, `g`'s delete summary,
+/// removes a row: the rows and delete files a compaction would remove and,
+/// where updates overlap, the level a compaction restores
+/// (`compacted_level`).
+fn deletes_pending(g: &Generation, caps: &Caps, deletes: DeleteSummary) -> Option<Finding> {
+    if deletes.rows == 0 {
+        return None;
+    }
+    let rows = deletes.rows;
+    let files = deletes.files;
+    let bytes = deletes.state_bytes;
+    let restored = compacted_level(g, caps).map_or_else(String::new, |level| {
+        format!("; files overlap, and with none overlapping the table reaches {level}")
+    });
+    Some(Finding::advice(
+        FindingCode::DeletesPending,
+        None,
+        format!(
+            "deletes remove {rows} rows through {files} position delete files and deletion vectors, holding {bytes} bytes of delete state{restored} (a compaction rewrites the data files without the deleted rows and drops the position delete files and deletion vectors)",
+        ),
+        None,
+    ))
+}
+
+/// Where `caps`, `g`'s layout caps, hold `overlapping_files`, the level
+/// `layout_caps` gives `g` in its residency with no files overlapping,
+/// which a compaction that rewrites the overlapping files restores, when it
+/// is better than `caps`' level; `None` where no files overlap or another
+/// cap holds the level where it is.
+fn compacted_level(g: &Generation, caps: &Caps) -> Option<Level> {
+    caps.findings
+        .iter()
+        .any(|finding| finding.code() == FindingCode::OverlappingFiles)
+        .then(|| {
+            layout_caps(&LayoutView {
+                overlapping: &BTreeMap::new(),
+                ..LayoutView::of(g)
+            })
+            .level
+        })
+        .filter(|&compacted| compacted < caps.level)
+}
+
+/// `predicted` with each tier's memory grown by `delete_bound`, the bound on
+/// the delete state's bytes, which every tier holds in memory beside its
+/// index (RFD 021): a `full` table is budgeted for it, and `disk` and
+/// `bloom` report it here. Saturates as the sums do.
+fn with_deletes(predicted: ResidentBytes, delete_bound: u64) -> ResidentBytes {
+    ResidentBytes {
+        full: predicted.full.saturating_add(delete_bound),
+        disk_memory: predicted.disk_memory.saturating_add(delete_bound),
+        bloom: predicted
+            .bloom
+            .map(|bloom| bloom.saturating_add(delete_bound)),
+        ..predicted
+    }
+}
+
 /// Capping before advice, then the finding table's order, then by file in
 /// generation order, which is the order the findings were raised in and
 /// the stable sort keeps, so two runs over one generation print the same
@@ -1410,10 +1485,12 @@ mod tests {
         VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
+    use crate::config::TableConfig;
     use crate::error::Error;
     use crate::generation::testing::{
         self, Bloom, Bounds, Dictionary, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
-        FileSpec, KEY_STEP, TABLE, TWO, Table, WriterLayout,
+        FileSpec, KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, TWO, Table,
+        WriterLayout,
     };
     use crate::index::{FileFault, HeaderField};
     use crate::local::LocalDir;
@@ -1535,6 +1612,7 @@ mod tests {
         (FindingCode::NoBloomFilter, "no_bloom_filter"),
         (FindingCode::BloomOversized, "bloom_oversized"),
         (FindingCode::BloomUndersized, "bloom_undersized"),
+        (FindingCode::DeletesPending, "deletes_pending"),
     ];
 
     /// `rows` values of `len` bytes each, none null.
@@ -1788,7 +1866,8 @@ mod tests {
             FindingCode::ManyFilesPerBucket => Some(FindingCode::NoBloomFilter),
             FindingCode::NoBloomFilter => Some(FindingCode::BloomOversized),
             FindingCode::BloomOversized => Some(FindingCode::BloomUndersized),
-            FindingCode::BloomUndersized => None,
+            FindingCode::BloomUndersized => Some(FindingCode::DeletesPending),
+            FindingCode::DeletesPending => None,
         }
     }
 
@@ -2822,6 +2901,214 @@ mod tests {
         (table, report, json)
     }
 
+    /// The rows of `deleted_file_table`'s file `f` its delete removes.
+    const DELETED_ROWS: [i64; 2] = [1, 3];
+
+    /// A one-bucket table holding one file `f` of `FILE_KEYS` long keys,
+    /// committed as `FIRST_SNAPSHOT`, then as `SECOND_SNAPSHOT` beside a
+    /// position delete file removing `DELETED_ROWS` of `f`, a dangling one
+    /// naming a file the table never held, and `update`, when given, a
+    /// file of the deleted rows' keys written again; each snapshot loaded
+    /// in `residency` with `strict` off, the second over the first, the
+    /// Disk tier's chunk files under `scratch`.
+    async fn deleted_file_table(
+        residency: Residency,
+        update: bool,
+        scratch: &std::path::Path,
+    ) -> (Table, Generation, Generation) {
+        let mut table = Table::bucketed(ONE);
+        let local = testing::local_dir(scratch, table.storage.stats(), None);
+        let local = (residency == Residency::Disk).then_some(&local);
+        let keys = testing::long_keys(&testing::keys_from(0, FILE_KEYS));
+        table
+            .add_file(file(
+                "f",
+                &keys,
+                Partition::Bucket(0),
+                WriterLayout::contract(),
+            ))
+            .await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let config = TableConfig {
+            strict: false,
+            ..table.config(residency, None)
+        };
+        let before = table.load(&config, local, None).await.unwrap();
+        table.add_position_delete("d", "f", &DELETED_ROWS, 0).await;
+        table
+            .add_position_delete("dangling", "gone", &DELETED_ROWS, 0)
+            .await;
+        let updated: Vec<Key> = DELETED_ROWS
+            .iter()
+            .map(|&row| keys[approx::length(u64::try_from(row).unwrap())].clone())
+            .collect();
+        if update {
+            table
+                .add_file(file(
+                    "u",
+                    &updated,
+                    Partition::Bucket(0),
+                    WriterLayout::contract(),
+                ))
+                .await;
+        }
+        table
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+        let after = table.load(&config, local, Some(&before)).await.unwrap();
+        (table, before, after)
+    }
+
+    /// The `deletes_pending` findings of `report`.
+    fn pending(report: &TableReport) -> Vec<&Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.code() == FindingCode::DeletesPending)
+            .collect()
+    }
+
+    /// Deletes that remove rows raise one `deletes_pending`, advice of the
+    /// table, and the summary gives what the load applied: the rows and
+    /// the one delete file that names a held file, not the dangling one.
+    /// A snapshot with none raises none.
+    #[tokio::test]
+    async fn test_diagnose_deletes_pending_reports_the_applied_deletes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (_table, before, after) =
+            deleted_file_table(Residency::Full, false, scratch.path()).await;
+        let clean = diagnose(&before, Level::Optimal);
+        assert!(pending(&clean).is_empty());
+        assert_eq!(clean.summary.deletes, DeleteSummary::default());
+
+        let report = diagnose(&after, Level::Optimal);
+        let findings = pending(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].caps(), None);
+        assert_eq!(findings[0].penalty(), None);
+        assert_eq!(findings[0].file(), None);
+        assert_eq!(report.summary.level, Level::Optimal, "deletes cap nothing");
+        assert_eq!(report.summary.advice, report.findings.len());
+        let deletes = report.summary.deletes;
+        assert_eq!(deletes, after.delete_summary());
+        assert_eq!(deletes.rows, approx::count(DELETED_ROWS.len()));
+        let applying_delete_files = 1;
+        assert_eq!(deletes.files, applying_delete_files, "not the dangling one");
+        assert_eq!(
+            deletes.fraction.to_bits(),
+            approx::ratio(deletes.rows, after.records).to_bits()
+        );
+        assert!(deletes.state_bytes > 0);
+        assert_eq!(
+            compacted_level(&after, &layout_caps(&LayoutView::of(&after))),
+            None
+        );
+    }
+
+    /// Every tier's predicted memory counts the delete state at its bound,
+    /// which holds what the load applied; the chunk files on disk do not.
+    #[tokio::test]
+    async fn test_diagnose_predicted_memory_counts_the_delete_bound() {
+        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+            let scratch = tempfile::tempdir().unwrap();
+            let (_table, before, after) =
+                deleted_file_table(residency, false, scratch.path()).await;
+            let bound = after.delete_bound();
+            assert!(bound >= approx::count(after.delete_summary().state_bytes));
+            assert_eq!(before.delete_bound(), 0);
+            let without = diagnose(&before, Level::Optimal).summary.predicted;
+            let with = diagnose(&after, Level::Optimal).summary.predicted;
+            assert_eq!(with.full, without.full + bound, "{residency}");
+            assert_eq!(with.disk_memory, without.disk_memory + bound, "{residency}");
+            assert_eq!(
+                with.bloom,
+                without.bloom.map(|bloom| bloom + bound),
+                "{residency}"
+            );
+            assert_eq!(with.disk_bytes, without.disk_bytes, "{residency}");
+        }
+    }
+
+    /// An update, a newer file of the deleted rows' keys, overlaps the file
+    /// it updates and caps the level at `permissive`; `deletes_pending`
+    /// then names the level a compaction restores, the residency's best.
+    #[tokio::test]
+    async fn test_diagnose_deletes_pending_names_the_level_a_compaction_restores() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (_table, _, after) = deleted_file_table(Residency::Full, true, scratch.path()).await;
+        let caps = layout_caps(&LayoutView::of(&after));
+        assert_eq!(caps.level, Level::Permissive);
+        assert_eq!(caps.codes(), [FindingCode::OverlappingFiles]);
+        assert_eq!(compacted_level(&after, &caps), Some(Level::Optimal));
+        let report = diagnose(&after, Level::Optimal);
+        assert_eq!(pending(&report).len(), 1);
+        assert_eq!(
+            report.summary.deletes.rows,
+            approx::count(DELETED_ROWS.len())
+        );
+    }
+
+    /// An update beside an unbucketed file: with no files overlapping,
+    /// `no_bucket_partition` still caps the table at `permissive`, so a
+    /// compaction of the overlap restores no level and `deletes_pending`
+    /// names none.
+    #[tokio::test]
+    async fn test_diagnose_deletes_pending_names_no_level_where_another_cap_remains() {
+        let mut table = Table::new(KeyType::Long, unpartitioned());
+        let stray = testing::long_keys(&testing::keys_from(EVOLVED_KEYS_START, FILE_KEYS));
+        table
+            .add_file(file("s", &stray, Partition::None, WriterLayout::contract()))
+            .await;
+        table.evolve(ONE);
+        let keys = testing::long_keys(&testing::keys_from(0, FILE_KEYS));
+        let updated: Vec<Key> = DELETED_ROWS
+            .iter()
+            .map(|&row| keys[approx::length(u64::try_from(row).unwrap())].clone())
+            .collect();
+        for (name, keys) in [("f", &keys), ("u", &updated)] {
+            table
+                .add_file(file(
+                    name,
+                    keys,
+                    Partition::Bucket(0),
+                    WriterLayout::contract(),
+                ))
+                .await;
+        }
+        table.add_position_delete("d", "f", &DELETED_ROWS, 0).await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let config = TableConfig {
+            strict: false,
+            ..table.config(Residency::Full, None)
+        };
+        let generation = table.load(&config, None, None).await.unwrap();
+        let caps = layout_caps(&LayoutView::of(&generation));
+        assert_eq!(caps.level, Level::Permissive);
+        assert_eq!(
+            caps.codes(),
+            [
+                FindingCode::NoBucketPartition,
+                FindingCode::OverlappingFiles
+            ]
+        );
+        assert_eq!(compacted_level(&generation, &caps), None);
+        let report = diagnose(&generation, Level::Optimal);
+        assert_eq!(pending(&report).len(), 1);
+        assert_eq!(
+            report.summary.deletes.rows,
+            approx::count(DELETED_ROWS.len())
+        );
+    }
+
     #[tokio::test]
     async fn test_serialize_table_summary_snake_case_fields_with_display_strings() {
         let (_table, report, json) = dictionary_value_report().await;
@@ -2844,9 +3131,15 @@ mod tests {
                 "predicted",
                 "level_by_residency",
                 "lookup_cost",
+                "deletes",
                 "capping",
                 "advice",
             ])
+        );
+        assert_eq!(
+            summary["deletes"],
+            serde_json::json!({"rows": 0, "files": 0, "fraction": 0.0, "state_bytes": 0}),
+            "a snapshot with no deletes"
         );
         assert_eq!(
             summary["lookup_cost"],

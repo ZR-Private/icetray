@@ -43,7 +43,7 @@ pub use config::{
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
     StandardField, StorageConfig, TableConfig,
 };
-pub use deletes::{BlobFraming, DeleteFault};
+pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
 pub use index::{

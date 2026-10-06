@@ -31,7 +31,9 @@ use icetray_testkit::fixture::{
 };
 use icetray_testkit::layout::Layout;
 use icetray_testkit::verify::series_value;
-use icetray_testkit::{Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture};
+use icetray_testkit::{
+    DeleteForm, Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture,
+};
 use serde_json::Value as Json;
 use tonic::transport::Channel;
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -402,6 +404,47 @@ async fn test_doctor_reports_the_contract_fixture_at_optimal() -> TestResult {
         report.iter().filter(|line| line["kind"] == "file").count(),
         approx::length(SMALL_BUCKETS)
     );
+    Ok(())
+}
+
+/// The doctor reports the deletes its load applied (RFD 021): the table
+/// line's `deletes`, the rows and one delete file per data file touched,
+/// and one `deletes_pending` advice finding, which leaves the level and the
+/// exit code as they were.
+#[tokio::test]
+async fn test_doctor_reports_the_deletes_its_load_applied() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut fixture =
+        local_fixture(dir.path(), FixtureSpec::small("kv_deletes", KeyType::Long)).await?;
+    let deleted_ids = 3;
+    let deleted = &SAMPLE[..deleted_ids];
+    fixture
+        .delete(deleted, DeleteForm::ScopedPositions, "deletes")
+        .await?;
+    let touched: std::collections::BTreeSet<u32> = deleted
+        .iter()
+        .map(|&id| bucket(&fixture.key(id), SMALL_BUCKETS))
+        .collect();
+    let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    assert_eq!(report[0]["kind"], "table");
+    assert_eq!(report[0]["level"], "optimal");
+    let summary = &report[0]["deletes"];
+    assert_eq!(summary["rows"], Json::from(deleted.len()));
+    assert_eq!(summary["files"], Json::from(touched.len()));
+    assert!(
+        summary["state_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(report[0]["advice"], Json::from(1));
+    let pending: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "finding" && line["code"] == "deletes_pending")
+        .collect();
+    assert_eq!(pending.len(), 1, "{report:?}");
+    assert_eq!(pending[0]["caps"], Json::Null);
     Ok(())
 }
 

@@ -301,7 +301,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use icetray_core::{
-        FindingCode, KeyType, Level, LookupCost, Residency, ResidentBytes, TableFault,
+        DeleteSummary, FindingCode, KeyType, Level, LookupCost, Residency, ResidentBytes,
+        TableFault,
     };
     use serde_json::Value as Json;
 
@@ -369,6 +370,12 @@ mod tests {
                 gets_per_hit: 1,
                 gets_per_miss: 0,
                 files_probed: 1,
+            },
+            deletes: DeleteSummary {
+                rows: 1,
+                files: 1,
+                fraction: 1.0,
+                state_bytes: 1,
             },
             capping: 0,
             advice: 0,
@@ -463,6 +470,10 @@ mod tests {
         assert_eq!(
             line["lookup_cost"],
             serde_json::json!({"gets_per_hit": 1, "gets_per_miss": 0, "files_probed": 1})
+        );
+        assert_eq!(
+            line["deletes"],
+            serde_json::json!({"rows": 1, "files": 1, "fraction": 1.0, "state_bytes": 1})
         );
     }
 
