@@ -18,10 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use icetray_core::config::{Config, ServerConfig};
+use icetray_core::config::{Config, Residency, ServerConfig};
+use icetray_core::memory::{self, MemoryLimit};
 use icetray_core::open::open_with;
 use icetray_core::{
-    ErrorKind, FindingLog, Opened, PAGE_CACHE_SAMPLE_INTERVAL, Storage, Table, open,
+    ErrorKind, FindingLog, Opened, PAGE_CACHE_SAMPLE_INTERVAL, Storage, Table, approx, open,
 };
 use icetray_proto::v1::icetray_server::{IcetrayServer, SERVICE_NAME};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -517,6 +518,7 @@ impl Run {
         }
 
         retain(&self.opened).await;
+        warn_memory_room(&self.opened);
         set_health(&self.health, ServingStatus::Serving).await;
         self.ready.send_modify(|ready| *ready = true);
 
@@ -552,6 +554,9 @@ impl Run {
                     tokio::select! {
                         () = retain(&self.opened) => {}
                         () = stop(self.shutdown.subscribe()) => break None,
+                    }
+                    if starts_a_disk_table(&applied.started) {
+                        warn_memory_room(&self.opened);
                     }
                 }
             }
@@ -693,6 +698,100 @@ pub(crate) async fn retain(opened: &Opened) {
     }
 }
 
+/// What the memory-room check found (`room`).
+#[derive(Debug, PartialEq, Eq)]
+enum Room {
+    /// Nothing needs the kernel's page cache: no chunk file is served and
+    /// there is no disk level.
+    NotNeeded,
+    /// No memory limit, or no resident set, to compare with.
+    Unknown {
+        /// The bytes needed.
+        needed: u64,
+    },
+    /// What is needed fits.
+    Fits,
+    /// It does not.
+    Short {
+        /// The bytes needed.
+        needed: u64,
+        /// The limit compared with.
+        limit: MemoryLimit,
+        /// The resident set beside it.
+        rss: u64,
+        /// What does not fit.
+        missing_bytes: u64,
+    },
+}
+
+/// Whether `needed` bytes of page cache fit under the memory limit `limit`
+/// reads beside the resident set `rss` reads. Neither is read when nothing
+/// is needed.
+fn room(
+    needed: u64,
+    limit: impl FnOnce() -> Option<MemoryLimit>,
+    rss: impl FnOnce() -> Option<u64>,
+) -> Room {
+    if needed == 0 {
+        return Room::NotNeeded;
+    }
+    let (Some(limit), Some(rss)) = (limit(), rss()) else {
+        return Room::Unknown { needed };
+    };
+    match memory::shortfall(needed, limit.bytes, rss) {
+        Some(missing_bytes) => Room::Short {
+            needed,
+            limit,
+            rss,
+            missing_bytes,
+        },
+        None => Room::Fits,
+    }
+}
+
+/// Warns when the page cache's disk level and the chunk files of every
+/// table served, each counted once (`Opened::page_cache_needed_bytes`),
+/// need more of the kernel's page cache than the memory limit leaves
+/// beside the process's resident set (RFD 020), so an undersized
+/// deployment is told at start, before a sample finds its `disk` tables
+/// short of the page cache. The run calls it once the first loads have
+/// served and retention has run, and after a reload that started a `disk`
+/// table (`starts_a_disk_table`). A resident set measured right after
+/// loads can include memory the allocator has freed and not yet returned,
+/// so the warning can overstate what is missing. Without a resident set or
+/// a limit to compare, nothing is checked, and that is logged at debug.
+fn warn_memory_room(opened: &Opened) {
+    let rss = || memory_stats::memory_stats().map(|stats| approx::count(stats.physical_mem));
+    match room(opened.page_cache_needed_bytes(), memory::limit, rss) {
+        Room::NotNeeded | Room::Fits => {}
+        Room::Unknown { needed } => tracing::debug!(
+            needed,
+            "no memory limit or resident set to check the page cache's room against"
+        ),
+        Room::Short {
+            needed,
+            limit,
+            rss,
+            missing_bytes,
+        } => tracing::warn!(
+            needed,
+            limit = limit.bytes,
+            limit_source = %limit.of,
+            rss,
+            missing_bytes,
+            "the chunk files and the page cache's disk level need more page cache than the memory limit leaves beside the process"
+        ),
+    }
+}
+
+/// Whether a reload that swapped in `started` added a `disk` table, which
+/// the memory-room check then runs again for.
+fn starts_a_disk_table(started: &[Arc<Table>]) -> bool {
+    started
+        .iter()
+        .any(|table| table.config().residency == Residency::Disk)
+}
+
 /// An interval of `period` whose first tick is one period from now, not at
 /// once, and which delays rather than bursts after a missed tick.
 pub(crate) fn ticker(period: Duration) -> tokio::time::Interval {
@@ -789,6 +888,9 @@ async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
 
 #[cfg(test)]
 mod tests {
+    use icetray_core::config::{SourceConfig, StorageConfig, TableConfig};
+    use icetray_core::memory::LimitSource;
+    use icetray_core::{CallsInFlight, PageCache, TableHandles, TableSource};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -817,6 +919,90 @@ mod tests {
             .expect("the listener yields the connection")
             .expect("the connection is accepted");
         assert!(accepted.nodelay().expect("TCP_NODELAY reads back"));
+    }
+
+    /// A limit of a gibibyte, from the cgroup.
+    const GIB: MemoryLimit = MemoryLimit {
+        bytes: 1 << 30,
+        of: LimitSource::Cgroup,
+    };
+
+    /// Nothing needed is never short and reads neither the limit nor the
+    /// resident set; with either unread the room is unknown; otherwise
+    /// what does not fit beside the resident set is short.
+    #[test]
+    fn test_room_skips_nothing_needed_and_names_what_is_missing() {
+        let unread_limit = || -> Option<MemoryLimit> { panic!("the limit was read") };
+        let unread_rss = || -> Option<u64> { panic!("the resident set was read") };
+        assert_eq!(room(0, unread_limit, unread_rss), Room::NotNeeded);
+        let half = GIB.bytes / 2;
+        assert_eq!(
+            room(half, || None, || Some(half)),
+            Room::Unknown { needed: half }
+        );
+        assert_eq!(
+            room(half, || Some(GIB), || None),
+            Room::Unknown { needed: half }
+        );
+        assert_eq!(room(half, || Some(GIB), || Some(half)), Room::Fits);
+        assert_eq!(
+            room(GIB.bytes, || Some(GIB), || Some(half)),
+            Room::Short {
+                needed: GIB.bytes,
+                limit: GIB,
+                rss: half,
+                missing_bytes: half,
+            }
+        );
+    }
+
+    /// A table in `residency`, never loaded.
+    async fn table_in(residency: Residency) -> Arc<Table> {
+        let server = ServerConfig::default();
+        let source = SourceConfig::Static {
+            location: "file:///nowhere".to_string(),
+        };
+        let config = TableConfig {
+            name: TABLE.to_string(),
+            source: source.clone(),
+            r#ref: "main".to_string(),
+            key_column: "key".to_string(),
+            value_column: "value".to_string(),
+            strict: false,
+            lookups: None,
+            residency,
+            resident_budget_bytes: None,
+        };
+        let handles = TableHandles {
+            storage: Arc::new(Storage::new(StorageConfig::default())),
+            cache: PageCache::new(server.page_cache_bytes, None).await.unwrap(),
+            local: None,
+            calls: CallsInFlight::new(),
+            findings: FindingLog::Debug,
+        };
+        Arc::new(Table::new(
+            config,
+            TableSource::from_config(&source).await.unwrap(),
+            handles,
+            server.load_deadline,
+            server.refresh_deadline,
+            server.get_deadline,
+        ))
+    }
+
+    /// A reload checks the memory room again when it starts a `disk`
+    /// table, and only then.
+    #[tokio::test]
+    async fn test_starts_a_disk_table_only_for_a_disk_table_started() {
+        let full = table_in(Residency::Full).await;
+        let bloom = table_in(Residency::Bloom).await;
+        let disk = table_in(Residency::Disk).await;
+        assert!(!starts_a_disk_table(&[]));
+        assert!(!starts_a_disk_table(&[
+            Arc::clone(&full),
+            Arc::clone(&bloom)
+        ]));
+        assert!(starts_a_disk_table(&[full, disk]));
     }
 
     /// A task that has already panicked when the shutdown aborts the set is

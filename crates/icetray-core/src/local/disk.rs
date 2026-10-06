@@ -127,6 +127,12 @@ impl DiskChunks {
         &self.shared.path
     }
 
+    /// Where the key chunks lie in the chunk file; the range ends at the
+    /// file's length when it was parsed.
+    pub(crate) fn chunks(&self) -> Range<u64> {
+        self.shared.chunks()
+    }
+
     /// What the file's verification record was computed under, as its
     /// header says.
     pub(crate) fn verified_under(&self) -> VerifiedUnder {
@@ -580,7 +586,8 @@ mod tests {
         let path = chunk_file(&local);
         let start = chunks_offset(&path);
         let end = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(disk.shared.chunks(), start..end);
+        assert_eq!(disk.chunks(), start..end);
+        assert_eq!(disk.path(), path);
         let page = super::residency::page_bytes().unwrap();
         let pages = end.div_ceil(page) - start / page;
         assert_eq!(

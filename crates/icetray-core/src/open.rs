@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -169,6 +170,27 @@ impl Opened {
         let tables = self.tables();
         let tables: Vec<&Table> = tables.iter().map(Arc::as_ref).collect();
         table::sample_page_cache(&tables).await;
+    }
+
+    /// The bytes the kernel's page cache must hold for every served `disk`
+    /// table to read its key pages at memory speed (RFD 020): every chunk
+    /// file a served table's generation reads, whole, since the kernel
+    /// caches its header too, each counted once however many tables share
+    /// it, as two entries over one Iceberg table do; plus the page cache's
+    /// disk level, whose files are read through the kernel's cache too.
+    pub fn page_cache_needed_bytes(&self) -> u64 {
+        let mut files: HashMap<PathBuf, u64> = HashMap::new();
+        for generation in self.tables().iter().filter_map(|table| table.current()) {
+            for (path, chunks) in generation.chunk_files() {
+                files.insert(path.to_path_buf(), chunks.end);
+            }
+        }
+        let disk_level = self
+            .local
+            .as_ref()
+            .and_then(|local| local.page_cache_level())
+            .map_or(0, |level| level.capacity_bytes());
+        files.values().sum::<u64>().saturating_add(disk_level)
     }
 
     /// Replaces the tables served with `configs`, all or nothing (RFD
@@ -485,6 +507,7 @@ mod tests {
         ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig,
         StorageConfig, TableConfig,
     };
+    use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
     use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
         E2E_KEYS, FIRST_SNAPSHOT, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
@@ -502,6 +525,9 @@ mod tests {
     const SECOND_TABLE: &str = "b";
     /// A name no table is configured under.
     const NO_TABLE: &str = "nobody";
+    /// A third table's name, for one served in the Full tier beside two
+    /// in the Disk tier.
+    const FULL_TABLE: &str = "c";
 
     /// Two contract files in two buckets, committed as `FIRST_SNAPSHOT`.
     async fn two_file_fixture() -> Fixture {
@@ -692,6 +718,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two entries over one table read the same chunk files, which the
+    /// page cache holds once, so they count once: as much as the one
+    /// table's, which is everything `index/` holds, beside the disk level.
+    #[tokio::test]
+    async fn test_page_cache_needed_bytes_counts_a_file_two_entries_share_once() {
+        let fixture = two_file_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_local(
+            dir.path(),
+            vec![
+                named(FIRST_TABLE, &fixture, Residency::Disk),
+                named(SECOND_TABLE, &fixture, Residency::Disk),
+                named(FULL_TABLE, &fixture, Residency::Full),
+            ],
+        );
+        let disk_level = PAGE_CACHE_DISK_BLOCK_BYTES;
+        config.storage.local.as_mut().unwrap().page_cache_disk_bytes = disk_level;
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .unwrap();
+        assert_eq!(
+            opened.page_cache_needed_bytes(),
+            disk_level,
+            "nothing loaded"
+        );
+        for table in opened.tables().iter() {
+            table.load().await.unwrap();
+        }
+        let one_table: u64 = table_named(&opened, FIRST_TABLE)
+            .unwrap()
+            .current()
+            .unwrap()
+            .chunk_files()
+            .map(|(_, chunks)| chunks.end)
+            .sum();
+        assert!(one_table > 0);
+        assert_eq!(opened.page_cache_needed_bytes(), one_table + disk_level);
+        let local = opened.local.as_ref().unwrap();
+        assert_eq!(one_table, local.index_bytes_in_use().unwrap());
     }
 
     #[tokio::test]

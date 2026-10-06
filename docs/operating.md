@@ -544,6 +544,19 @@ needs is a setting, a mounted file, or an environment variable.
   cache the kernel reclaims under pressure, not memory the process holds:
   a scheduler's reservation, such as a Kubernetes memory request, can stay
   at the sum above.
+- Once the tables serve, and after a reload that adds a `disk` table, the
+  server compares the room under its memory limit, less its resident set,
+  with what the page cache needs: every `disk` table's chunk files, each
+  file counted once however many tables read it, plus
+  `storage.local.page_cache_disk_bytes`, whose files the kernel caches
+  too. The limit is the smaller of the container's cgroup limit, read
+  from cgroup v2's `memory.max` or v1's `memory.limit_in_bytes`, and the
+  host's memory. A shortfall is a warning with `needed`, `limit`,
+  `limit_source` (`cgroup` or `host`), `rss`, and `missing_bytes`. The
+  resident set right after loads can include memory the allocator has
+  freed and not yet returned to the system, so the warning can overstate
+  what is missing; `icetray_table_chunk_resident_fraction` shows whether
+  the chunk files actually stay cached.
 - Load refuses a key page header, and a lookup a value page header, that
   declares more than its page can hold or more than a 64 MiB ceiling, and
   a panic inside parquet's decoding refuses the file. The lengths inside a

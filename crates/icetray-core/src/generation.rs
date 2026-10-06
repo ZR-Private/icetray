@@ -11,7 +11,8 @@
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -592,6 +593,16 @@ impl Generation {
             .iter()
             .map(|file| index::identity_of(file.index.handle()))
             .collect()
+    }
+
+    /// Every file's chunk file, with where its key chunks lie in it; the
+    /// range ends at the file's length. A Full or Bloom generation has
+    /// none.
+    pub fn chunk_files(&self) -> impl Iterator<Item = (&Path, Range<u64>)> {
+        self.files
+            .iter()
+            .filter_map(|file| file.index.disk_chunks())
+            .map(|disk| (disk.path(), disk.chunks()))
     }
 
     /// What the operating system's page cache holds of every file's key
@@ -5052,6 +5063,25 @@ mod tests {
         assert_eq!(sampled.len(), first.files.len());
     }
 
+    /// A Disk generation has one chunk file per data file, its key chunks
+    /// lying after its header and ending at the file's end.
+    #[tokio::test]
+    async fn test_chunk_files_of_a_disk_load_end_at_each_file_s_end() {
+        let (table, _) = two_bucket_table().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        let disk = table
+            .load(&table.config(Residency::Disk, None), Some(&local), None)
+            .await
+            .unwrap();
+        let files: Vec<(&Path, Range<u64>)> = disk.chunk_files().collect();
+        assert_eq!(files.len(), disk.files.len());
+        for (path, chunks) in files {
+            assert_eq!(chunks.start, local_testing::chunks_offset(path));
+            assert_eq!(chunks.end, std::fs::metadata(path).unwrap().len());
+        }
+    }
+
     /// A Full generation has no chunk file and counts no page.
     #[tokio::test]
     async fn test_chunk_residency_of_a_full_load_counts_no_page() {
@@ -5060,6 +5090,7 @@ mod tests {
             .load(&table.config(Residency::Full, None), None, None)
             .await
             .unwrap();
+        assert_eq!(full.chunk_files().count(), 0);
         assert_eq!(full.chunk_residency().unwrap(), ResidentPages::default());
     }
 

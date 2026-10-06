@@ -216,6 +216,15 @@ extra is cache the kernel can reclaim, so a scheduler's reservation, such
 as a Kubernetes memory request, can stay at the process's own size
 ([Memory](operating.md#memory)).
 
+The server checks both ends of this. At start it warns when the chunk
+files and the disk level need more than the limit leaves beside the
+process. While it serves, it samples how much of each `disk` table's
+chunk files the page cache holds, `icetray_table_chunk_resident_fraction`.
+Below 0.95 the table reads as `balanced`, below an `optimal` declaration,
+since about one lookup in twenty then waits on the device; it recovers
+above 0.99. These thresholds are provisional until a measurement of
+latency against residency sets them.
+
 The local directory belongs on a mounted volume with a filesystem such as
 ext4. A container's overlay filesystem cannot serve a cached read without
 blocking, so every local read there moves to another thread

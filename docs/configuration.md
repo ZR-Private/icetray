@@ -359,8 +359,8 @@ stated in what a lookup costs, so it means the same on every table:
 - `optimal`: a hit costs one GET and a miss none, and a lookup probes one
   file and decodes one key page of ordinary size.
 - `balanced`: a lookup still probes one file, with a fixed extra cost: an
-  extra GET per hit, a GET for a miss the bloom filter passes, or larger
-  key pages.
+  extra GET per hit, a GET for a miss the bloom filter passes, larger key
+  pages, or key pages read from the device instead of the page cache.
 - `permissive`: any snapshot icetray serves correctly, including one where
   a lookup probes more than one file.
 
@@ -370,7 +370,11 @@ or any of its findings caps it at. `bloom` residency caps it at
 [the table contract](table-contract.md#requirements). Advice caps
 nothing. The doctor prints the level as `level`, and under `level_by_residency` the
 level each residency would reach with the same files, beside what each
-costs under `predicted`.
+costs under `predicted`. A serving `disk` table also falls to `balanced`
+while the kernel's page cache holds too little of its chunk files
+([Metrics](operating.md#metrics)). That depends on the server's memory,
+not on the snapshot, so the doctor does not report it and `strict` never
+acts on it.
 
 The line between `balanced` and `permissive` is the one that matters for
 operations. A cost within one file follows from how the files are written
