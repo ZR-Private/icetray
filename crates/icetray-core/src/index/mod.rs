@@ -27,7 +27,7 @@ use bytes::Bytes;
 use parquet::basic::Type as PhysicalType;
 use parquet::bloom_filter::Sbbf;
 use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType};
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::ColumnDescPtr;
 
@@ -611,6 +611,10 @@ pub struct FileIndex {
     fences: Vec<Vec<Key>>,
     /// Ascending by first key; how a lookup chooses its row group.
     groups: Vec<GroupRange>,
+    /// Per row group, the position in the file of its first row: the rows
+    /// of every earlier row group, summed once at build so that `position`
+    /// is one addition.
+    group_starts: Vec<RowPosition>,
     /// The exact first and last key of the file.
     key_range: (Key, Key),
     max_key_bytes: usize,
@@ -948,14 +952,19 @@ impl FileIndex {
         })
     }
 
+    /// The position in the file of the first row of key page `page` of
+    /// `row_group`, which is below `page_count(row_group)`.
+    pub(crate) fn key_page_start(&self, row_group: usize, page: usize) -> RowPosition {
+        self.position(RowRef {
+            row_group,
+            row: self.key_column().group(row_group).page_rows(page).start,
+        })
+    }
+
     /// The position of `row` in the file: the rows of every earlier row
     /// group, then the row within its own.
     pub(crate) fn position(&self, row: RowRef) -> RowPosition {
-        let before: i64 = self.metadata.row_groups()[..row.row_group]
-            .iter()
-            .map(RowGroupMetaData::num_rows)
-            .sum();
-        RowPosition(approx::count(row_index(before + row.row)))
+        RowPosition(self.group_starts[row.row_group].0 + approx::count(row_index(row.row)))
     }
 
     /// The key column of `row_group` decoded from `chunks`, or one page of
@@ -1329,6 +1338,21 @@ fn page_range(location: &PageLocation) -> Range<u64> {
     let len = u64::try_from(location.compressed_page_size)
         .expect("page sizes were checked non-negative at build");
     start..start + len
+}
+
+/// Per row group of `metadata`, the position in the file of its first row,
+/// for `FileIndex::position`. Inspect checked every row count non-negative
+/// and their sum within `i64`, so no sum overflows.
+fn group_starts(metadata: &ParquetMetaData) -> Vec<RowPosition> {
+    metadata
+        .row_groups()
+        .iter()
+        .scan(0, |before, group| {
+            let start = RowPosition(*before);
+            *before += approx::count(row_index(group.num_rows()));
+            Some(start)
+        })
+        .collect()
 }
 
 /// A row count or row position as the reader takes it; build checked every

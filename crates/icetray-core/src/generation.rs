@@ -23,7 +23,7 @@ use crate::catalog::{Resolved, TableFault};
 use crate::check::{self, Caps, FileView, FindingCode, LayoutView, LookupCost};
 use crate::config::{Residency, TableConfig};
 use crate::error::{Budget, Error, RefusalReason, Result};
-use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
+use crate::index::{self, FileIndex, Inspected, Keys, PageRef, RowPosition};
 use crate::key::Key;
 use crate::level::Level;
 use crate::local::{DataFileIdentity, LocalDir, Reservation};
@@ -227,7 +227,7 @@ impl Generation {
             let members = gather_members(&files, group).await?;
             let first = files[group[0]].index.handle().location.clone();
             let owned_table = table.to_string();
-            blocking::on_blocking_pool(move || refuse_duplicates(&owned_table, &members))
+            blocking::on_blocking_pool(move || refuse_duplicates(&owned_table, &members, None))
                 .await
                 .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
         }
@@ -1318,38 +1318,86 @@ async fn gather_members(files: &[Arc<LoadedFile>], group: &[usize]) -> Result<Ve
         .await
 }
 
-/// A cursor over one file's keys in file order, one key page decoded at a
-/// time, so a merge holds one page per file and never a row group.
+/// Which rows a merge passes over as deleted (RFD 021): `true` for the row
+/// at a position in the file at a position in the generation's files.
+type DeletedRows = dyn Fn(usize, RowPosition) -> bool + Send + Sync;
+
+/// A cursor over one file's live keys in file order, one key page decoded
+/// at a time, so a merge holds one page per file and never a row group.
+/// It knows each key's position in the file, counted from the file's first
+/// row as Iceberg's deletes count it, and passes over the rows `deleted`
+/// names.
 struct KeyCursor<'a> {
     /// The file's position in the generation's files.
     at: usize,
     file: &'a LoadedFile,
     chunks: &'a Arc<Segments>,
+    deleted: Option<&'a DeletedRows>,
     row_group: usize,
+    /// The next key page to decode in `row_group`.
     page: usize,
     keys: Keys,
-    position: usize,
+    /// The position in the file of the first of `keys`.
+    page_start: RowPosition,
+    /// The head's index in `keys`.
+    offset: usize,
 }
 
 impl<'a> KeyCursor<'a> {
-    /// A cursor on the first key of `member`'s file; `None` for a file
-    /// with no key page, which `FileIndex::build` does not produce.
-    fn open(member: &'a GroupMember) -> Result<Option<Self>> {
+    /// A cursor on the first live key of `member`'s file; `None` for a
+    /// file with no live key, or no key page, which `FileIndex::build` does
+    /// not produce.
+    fn open(member: &'a GroupMember, deleted: Option<&'a DeletedRows>) -> Result<Option<Self>> {
         let mut cursor = Self {
             at: member.at,
             file: &member.file,
             chunks: &member.chunks,
+            deleted,
             row_group: 0,
             page: 0,
             keys: Keys::Long(Vec::new()),
-            position: 0,
+            page_start: RowPosition(0),
+            offset: 0,
         };
-        Ok(cursor.fill()?.then_some(cursor))
+        let more = cursor.fill()?;
+        Ok(cursor.past_deleted(more)?.then_some(cursor))
     }
 
     /// The key under the cursor.
     fn head(&self) -> Key {
-        self.keys.get(self.position)
+        self.keys.get(self.offset)
+    }
+
+    /// The position in the file of the row under the cursor.
+    fn head_position(&self) -> RowPosition {
+        RowPosition(self.page_start.0 + approx::count(self.offset))
+    }
+
+    /// Moves to the next live key; `false` once the file is exhausted.
+    fn advance(&mut self) -> Result<bool> {
+        let more = self.step()?;
+        self.past_deleted(more)
+    }
+
+    /// Steps over deleted rows from the head while `more` holds; whether
+    /// a live key is under the cursor.
+    fn past_deleted(&mut self, mut more: bool) -> Result<bool> {
+        if let Some(deleted) = self.deleted {
+            while more && deleted(self.at, self.head_position()) {
+                more = self.step()?;
+            }
+        }
+        Ok(more)
+    }
+
+    /// Moves to the next key, deleted or not; `false` once the file is
+    /// exhausted.
+    fn step(&mut self) -> Result<bool> {
+        self.offset += 1;
+        if self.offset < self.keys.len() {
+            return Ok(true);
+        }
+        self.fill()
     }
 
     /// Decodes the next key page that holds a key; `false` once the file
@@ -1363,22 +1411,14 @@ impl<'a> KeyCursor<'a> {
                 continue;
             }
             self.keys = index.decode_keys(self.row_group, Some(self.page), self.chunks)?;
+            self.page_start = index.key_page_start(self.row_group, self.page);
             self.page += 1;
-            self.position = 0;
+            self.offset = 0;
             if !self.keys.is_empty() {
                 return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    /// Moves to the next key; `false` once the file is exhausted.
-    fn advance(&mut self) -> Result<bool> {
-        self.position += 1;
-        if self.position < self.keys.len() {
-            return Ok(true);
-        }
-        self.fill()
     }
 }
 
@@ -1386,20 +1426,26 @@ impl<'a> KeyCursor<'a> {
 fn head_order(cursors: &[KeyCursor<'_>], a: usize, b: usize) -> Ordering {
     cursors[a]
         .keys
-        .cmp_at(cursors[a].position, &cursors[b].keys, cursors[b].position)
+        .cmp_at(cursors[a].offset, &cursors[b].keys, cursors[b].offset)
 }
 
-/// Merges the sorted key runs of a group's `members` and refuses the first
-/// key two files share. Every file is sorted and free of duplicates on its own
-/// (`FileIndex::build` checked), so two equal heads at the front of the
-/// merge are exactly a key in two files. The cursors are kept in a vector
-/// ordered by head; each step takes the least, advances it, and reinserts
-/// it by binary search. The refusal names the key and the later of the two
-/// files in file order (RFD 007).
-fn refuse_duplicates(table: &str, members: &[GroupMember]) -> Result<()> {
+/// Merges the sorted runs of live keys of a group's `members` and refuses
+/// the first key two files share; a row `deleted` names is not live, so a
+/// key whose other copies are all deleted is no duplicate (RFD 021). Every
+/// file is sorted and free of duplicates on its own (`FileIndex::build`
+/// checked), so two equal heads at the front of the merge are exactly a key
+/// in two files. The cursors are kept in a vector ordered by head; each
+/// step takes the least, advances it, and reinserts it by binary search.
+/// The refusal names the key and the later of the two files in file order
+/// (RFD 007).
+fn refuse_duplicates(
+    table: &str,
+    members: &[GroupMember],
+    deleted: Option<&DeletedRows>,
+) -> Result<()> {
     let mut cursors: Vec<KeyCursor<'_>> = members
         .iter()
-        .filter_map(|member| KeyCursor::open(member).transpose())
+        .filter_map(|member| KeyCursor::open(member, deleted).transpose())
         .collect::<Result<_>>()?;
     let mut order: Vec<usize> = (0..cursors.len()).collect();
     order.sort_by(|&a, &b| head_order(&cursors, a, b));
@@ -2348,22 +2394,18 @@ mod tests {
             format!("{MEM_PREFIX}db/kv/{DATA_DIR}/{name}.parquet")
         }
 
-        /// Writes `keys` with `values` as file `name` and indexes it in the
-        /// Full tier, filed under `bucketing` and `bucket`.
+        /// Writes `keys` with `values` as file `name` laid out as `layout`
+        /// and indexes it in the Full tier, filed under `bucketing` and
+        /// `bucket`.
         async fn file(
             &self,
             name: &str,
             keys: &[i64],
             values: &[Option<Vec<u8>>],
-            bucketing: Option<Bucketing>,
-            bucket: u32,
+            (bucketing, bucket): (Option<Bucketing>, u32),
+            layout: &WriterLayout,
         ) -> Arc<LoadedFile> {
-            let bytes = testing::parquet(
-                KeyType::Long,
-                &testing::long_keys(keys),
-                values,
-                &WriterLayout::contract(),
-            );
+            let bytes = testing::parquet(KeyType::Long, &testing::long_keys(keys), values, layout);
             let handle = self
                 .store
                 .open(&Self::location(name), bytes, Arc::clone(&self.hedge))
@@ -2404,8 +2446,14 @@ mod tests {
             bucketing: Option<Bucketing>,
             bucket: u32,
         ) -> Arc<LoadedFile> {
-            self.file(name, keys, &values_of(keys), bucketing, bucket)
-                .await
+            self.file(
+                name,
+                keys,
+                &values_of(keys),
+                (bucketing, bucket),
+                &WriterLayout::contract(),
+            )
+            .await
         }
     }
 
@@ -2761,7 +2809,13 @@ mod tests {
             .map(|key| (*key != null_key).then(|| value_for(*key)))
             .collect();
         let file = mem
-            .file("f", &keys, &values, None, manifest::UNBUCKETED)
+            .file(
+                "f",
+                &keys,
+                &values,
+                (None, manifest::UNBUCKETED),
+                &WriterLayout::contract(),
+            )
             .await;
         let generation = assemble(vec![file], layout(None)).await.unwrap();
         assert_eq!(generation.snapshot_id, SnapshotId(FIRST_SNAPSHOT));
@@ -3192,6 +3246,118 @@ mod tests {
                 key: Key::Long(duplicate),
             }
         );
+    }
+
+    /// Rows per page of the files the merge tests write: small, so a row
+    /// group holds several key pages and a cursor crosses page boundaries.
+    const SPLIT_PAGE_ROWS: usize = 4;
+    /// Rows per row group of those files: four pages of `SPLIT_PAGE_ROWS`.
+    const SPLIT_GROUP_ROWS: usize = 16;
+    /// Keys in a merge test's file: two full row groups of
+    /// `SPLIT_GROUP_ROWS` and a partial third, so a row of the third counts
+    /// the rows of two earlier groups.
+    const SPLIT_KEYS: i64 = 40;
+
+    /// A file of `keys` in pages of `SPLIT_PAGE_ROWS` and row groups of
+    /// `SPLIT_GROUP_ROWS`, as the merge member at position `at`.
+    async fn split_member(mem: &Mem, name: &str, keys: &[i64], at: usize) -> GroupMember {
+        let layout = WriterLayout {
+            page_rows: SPLIT_PAGE_ROWS,
+            row_group_rows: Some(SPLIT_GROUP_ROWS),
+            ..WriterLayout::contract()
+        };
+        let file = mem
+            .file(
+                name,
+                keys,
+                &values_of(keys),
+                (None, manifest::UNBUCKETED),
+                &layout,
+            )
+            .await;
+        let chunks = file.index.key_chunks_for_verification().await.unwrap();
+        GroupMember { at, file, chunks }
+    }
+
+    /// Every live key under a cursor over `member`, with its position.
+    fn walk(member: &GroupMember, deleted: Option<&DeletedRows>) -> Vec<(Key, RowPosition)> {
+        let mut seen = Vec::new();
+        let Some(mut cursor) = KeyCursor::open(member, deleted).unwrap() else {
+            return seen;
+        };
+        loop {
+            seen.push((cursor.head(), cursor.head_position()));
+            if !cursor.advance().unwrap() {
+                return seen;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_key_cursor_counts_positions_from_the_files_first_row_and_skips_deleted_rows() {
+        let mem = Mem::new();
+        let keys = keys_from(0, SPLIT_KEYS);
+        let member = split_member(&mem, "a", &keys, 0).await;
+        assert_eq!(
+            member.file.index.metadata().num_row_groups(),
+            3,
+            "two full row groups and a partial third"
+        );
+        let positions = |range: std::ops::Range<usize>| -> Vec<(Key, RowPosition)> {
+            range
+                .map(|row| (Key::Long(keys[row]), RowPosition(approx::count(row))))
+                .collect()
+        };
+        assert_eq!(walk(&member, None), positions(0..keys.len()));
+        // The first row, a row inside the second row group, and the last.
+        let gone =
+            [0, SPLIT_GROUP_ROWS + 1, keys.len() - 1].map(|row| RowPosition(approx::count(row)));
+        let deleted = move |at: usize, position: RowPosition| at == 0 && gone.contains(&position);
+        let live: Vec<(Key, RowPosition)> = positions(0..keys.len())
+            .into_iter()
+            .filter(|(_, position)| !gone.contains(position))
+            .collect();
+        assert_eq!(walk(&member, Some(&deleted)), live);
+        let everything = |_: usize, _: RowPosition| true;
+        assert_eq!(walk(&member, Some(&everything)), []);
+    }
+
+    #[tokio::test]
+    async fn test_refuse_duplicates_passes_a_key_whose_other_copy_is_deleted() {
+        let mem = Mem::new();
+        let older = keys_from(0, SPLIT_KEYS);
+        // A row of the third row group, so its position spans two others.
+        let row = 2 * SPLIT_GROUP_ROWS + 1;
+        let shared = older[row];
+        let newer = [shared - 1, shared, older.last().unwrap() + KEY_STEP];
+        let members = [
+            split_member(&mem, "older", &older, 0).await,
+            split_member(&mem, "newer", &newer, 1).await,
+        ];
+        let refusal = RefusalReason::DuplicateKeys {
+            path: Mem::location("newer"),
+            key: Key::Long(shared),
+        };
+        assert_eq!(
+            refusal_of(refuse_duplicates(TABLE, &members, None)),
+            refusal
+        );
+        let older_copy = RowPosition(approx::count(row));
+        let deleted = move |at: usize, position: RowPosition| at == 0 && position == older_copy;
+        refuse_duplicates(TABLE, &members, Some(&deleted)).unwrap();
+        // The row before it deleted instead leaves both copies live.
+        let neighbor = RowPosition(older_copy.0 - 1);
+        let wrong_row = move |at: usize, position: RowPosition| at == 0 && position == neighbor;
+        assert_eq!(
+            refusal_of(refuse_duplicates(TABLE, &members, Some(&wrong_row))),
+            refusal
+        );
+        // The newer copy deleted serves the older one.
+        let newer_row = newer.iter().position(|&key| key == shared).unwrap();
+        let newer_copy = RowPosition(approx::count(newer_row));
+        let deleted_newer =
+            move |at: usize, position: RowPosition| at == 1 && position == newer_copy;
+        refuse_duplicates(TABLE, &members, Some(&deleted_newer)).unwrap();
     }
 
     #[tokio::test]

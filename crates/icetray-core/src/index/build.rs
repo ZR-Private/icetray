@@ -26,7 +26,7 @@ use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, file_fault, identity_of, row_index, unless_panicked,
+    KeyShape, Keys, file_fault, group_starts, identity_of, row_index, unless_panicked,
 };
 use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
@@ -90,6 +90,7 @@ impl Inspected {
             }
         };
         let rows = metadata.file_metadata().num_rows();
+        let group_starts = group_starts(&metadata);
         Ok(FileIndex {
             handle,
             metadata,
@@ -100,6 +101,7 @@ impl Inspected {
             keys,
             fences: verified.fences,
             groups: verified.groups,
+            group_starts,
             key_range: verified.key_range,
             max_key_bytes: verified.max_key_bytes,
             rows,
