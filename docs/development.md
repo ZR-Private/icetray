@@ -91,6 +91,25 @@ loads them, and times lookups and a refresh:
 cargo run -p icetray-testkit --example scale --release
 ```
 
+## Residency sweep
+
+An example program that measures how `disk` lookups slow as the kernel's
+page cache drops a table's chunk files, the measurement behind the
+thresholds of the page-cache condition in
+[RFD 020](rfd/020-lookup-levels.md). It runs on Linux only, with its
+directories on ext4 or xfs, and first prepares the benchmark program's
+scattered table, several gigabytes, under `target/bench/tables`:
+
+```sh
+dev/residency-sweep.sh
+```
+
+`ICETRAY_RESIDENCY_TABLES` moves the table's directory and
+`ICETRAY_RESIDENCY_LOCAL` the chunk files' (default
+`target/residency/local`); keep each on a local ext4 or xfs filesystem.
+Arguments after the script's name go to the sweep, as
+`--resident-per-mille 1000,950,900` narrows it.
+
 ## Releases
 
 A release is a tag. Set `version` under `[workspace.package]` in

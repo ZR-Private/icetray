@@ -4,15 +4,14 @@
 
 use std::time::Duration;
 
+use icetray_core::{PER_MILLE, approx};
+
 /// The percentiles reported, in thousandths.
 pub const P50: usize = 500;
 /// The 90th percentile, in thousandths.
 pub const P90: usize = 900;
 /// The 99th percentile, in thousandths.
 pub const P99: usize = 990;
-
-/// Thousandths in the whole.
-const PER_MILLE: usize = 1_000;
 
 /// One microsecond, the unit latencies are written to JSON in.
 const MICROSECOND: Duration = Duration::from_micros(1);
@@ -43,7 +42,7 @@ impl Latencies {
     /// The nearest-rank percentile at `per_mille` thousandths; zero for no
     /// samples.
     pub fn percentile(&self, per_mille: usize) -> Duration {
-        let rank = (self.sorted.len() * per_mille).div_ceil(PER_MILLE);
+        let rank = (self.sorted.len() * per_mille).div_ceil(approx::length(PER_MILLE));
         self.sorted
             .get(rank.saturating_sub(1))
             .copied()
