@@ -18,6 +18,13 @@
 > poll builds the ref's snapshot again and a snapshot refused for another
 > reason is refused once more. See RFD 020 (Lookup levels).
 
+> Updated 2026-10-06: a data file is reused only when its path, size, and
+> data sequence number all match, since merge-on-read deletes apply by
+> sequence number and a path committed again at another one is another
+> file to them. An overlap group is verified again when a member's
+> deletes shrank, and a delete file no longer stops the table advancing
+> unless it is one RFD 021 (Merge-on-read) refuses.
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -54,9 +61,9 @@ table's current schema and default spec play no part
 ([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
 
 A data file that the new snapshot still references by the same path, at
-the same size, keeps its resident index from the previous generation, and
-only new files are loaded. Because load work is per file and unchanged
-files are reused, a refresh costs its delta
+the same size and data sequence number, keeps its resident index from the
+previous generation, and only new files are loaded. Because load work is
+per file and unchanged files are reused, a refresh costs its delta
 ([prototype findings, finding 3](../analysis/2026-09-10-prototype-findings.md#3-load-time)).
 In simulation a small build takes well under one dependent round trip per
 file; how that depth grows with more files is open
@@ -78,8 +85,11 @@ index budget, which every disk table shares, so other tables' chunk files
 decide it too. It covers a fault of the snapshot's metadata or manifests:
 a ref, schema, partition spec, or column the metadata lacks, a bucket
 transform of zero buckets, a data file whose bucket value is missing or out
-of range, or a snapshot timestamp outside the range a timestamp holds.
-It covers a fault of a data file that its footer or bloom filters show.
+of range, a manifest entry with no data sequence number to inherit, a
+deletion vector entry that does not place its blob, or a snapshot
+timestamp outside the range a timestamp holds.
+It covers a fault of a data file that its footer or bloom filters show,
+and a fault a delete file shows against the manifests (RFD 021).
 The table remembers a deterministic failure against the metadata location
 it read, reports it once, and stays degraded. While the source names that
 location, each poll costs its one read and builds nothing. A new location
@@ -130,14 +140,16 @@ on the serving ref must exceed the longest lag a replica can have. icetray
 cannot enforce that; it can only tell table owners and expose how far a
 replica lags.
 
-The duplicate-key merge is paid once per group that gained a file, so an
-appended table pays it only for the buckets that grew.
+The duplicate-key merge is paid once per group that gained a file or
+whose deletes shrank, so an appended table pays it only for the buckets
+that grew.
 
-A delete file on the followed ref stops the table advancing while the last
-good generation serves. RFD 009 (Writes between builds) gives the pattern
-that avoids it. The refusal is reported once, not once per poll, so a
-table stuck behind it is seen through its degraded state and the age of
-its snapshot rather than a rising error count.
+A delete file on the followed ref that RFD 021 (Merge-on-read) refuses
+stops the table advancing while the last good generation serves. RFD 009
+(Writes between builds) gives the pattern that avoids it. The refusal is
+reported once, not once per poll, so a table stuck behind it is seen
+through its degraded state and the age of its snapshot rather than a
+rising error count.
 
 Open question: per-table lifecycle states (loading, serving, degraded)
 behind a health surface, or start-or-fail as the only model. Start-or-fail

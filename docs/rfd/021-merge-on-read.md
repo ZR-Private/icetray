@@ -1,13 +1,9 @@
 # Merge-on-read
 
-> Updated 2026-10-06: corrected against the code before it was built. The
-> bitmap's memory bound gains a per-block overhead that dominates for
-> scattered deletes; a Puffin file's footer is read and costs GETs; icetray
-> inherits data sequence numbers itself; the oldest-delete age can read
-> high as well as low; a position delete file that names no data file is
-> read once to learn it applies to nothing; and a malformed blob is
-> transient because a damaged read cannot be told from a damaged file,
-> not because of a local copy, which delete reads never use.
+> Updated 2026-10-06: the memory bound, the delete faults and their
+> classes, the rules for position deletes that name no data file or that
+> a deletion vector masks, and the oldest-delete dating now state what
+> icetray does.
 
 ## Problem
 
@@ -38,11 +34,11 @@ delete of the old row plus an insert of the new one in a new data file.
 
 ## Decision
 
-Snapshots carrying deletion vectors or position deletes will be served,
-with each data file's deleted rows held in memory and checked before a
-lookup reads a value page; equality deletes will stay refused; and a
-merge-on-read snapshot's level will follow from RFD 020's rules with no
-cap of its own.
+Snapshots carrying deletion vectors or Parquet position deletes will be
+served, with each data file's deleted rows held in memory and checked
+before a lookup reads a value page; equality deletes will stay refused;
+and a merge-on-read snapshot's level will follow from RFD 020's rules
+with no cap of its own.
 
 ### Delete state
 
@@ -53,67 +49,134 @@ stack (RFD 003), and follows Iceberg's rules:
 
 - A deletion vector or position delete applies to the data file it names
   when that file's data sequence number is no greater than the delete's,
-  so a delete committed with its data file applies to it.
-- A data file has at most one deletion vector. Where one applies, position
-  delete files naming that data file are ignored, as the spec requires.
+  so a delete committed with its data file applies to it. A position
+  delete file whose entry names no data file applies under the same rule
+  to the data files of its own partition, the same partition spec and
+  tuple, as the spec's scan planning requires; a row naming a file of
+  another partition deletes nothing. A deletion vector is served whatever
+  format version the table records, since its manifest entry and its
+  Puffin footer say what it is.
+- A data file has at most one deletion vector, and two that apply to one
+  file are a fault of the snapshot. Where one applies, position delete
+  files naming that data file are ignored, as the spec requires.
 - A delete that applies to no data file the snapshot holds is ignored:
   a position delete or deletion vector naming a file compacted away, or
   an equality delete whose data sequence number is no greater than that
   of every data file in the snapshot, which the manifests decide without
   working out the delete's partition scope. Compaction leaves such
-  dangling deletes behind, and they change no answer. A position delete
-  file that does not name its data file must be read once to learn that
-  it applies to nothing; it is then remembered by its path, like any
-  delete already read.
+  dangling deletes behind, and they change no answer. An Avro or ORC
+  position delete file that the same test shows applies to nothing is
+  ignored as well, since knowing that takes no read of it; only one that
+  may apply is refused.
+- A position delete file whose entry names no data file must be read to
+  learn which files it names. It is read only when it may apply to a data
+  file of its partition that no deletion vector masks. The files it named
+  are kept for the next load, by index rather than by path, and it is
+  read again only when its partition gains a data file it may apply to,
+  since its rows naming a file the snapshot did not hold were not kept.
 - Liveness and data sequence numbers come from the current snapshot's
   manifests every generation, never from a delete read before. A
   manifest entry may leave its sequence number unset and inherit its
   manifest's, and icetray applies that inheritance itself, since the
   Iceberg library offers it only through a reader of its own outside the
-  storage stack. An entry that has no sequence number to inherit is a
-  deterministic fault of the snapshot.
+  storage stack: an entry inherits when its manifest's own commit added
+  it, or when the manifest predates sequence numbers. An entry that has
+  no sequence number to inherit, or a deletion vector entry that does not
+  place its blob in its Puffin file, is a deterministic fault of the
+  snapshot.
 
 A deletion vector is identified by its Puffin file's path, offset, and
-length, and a position delete file by its path, so a refresh reuses what
-the previous generation read and reads only what is new. A new Puffin
-file's footer is read once, at one or two GETs, so that every vector the
-manifests name can be checked against it; then only the blobs the
-manifests list as live are read, since a Puffin file may still hold
-vectors a later commit replaced.
+length, and a position delete file by its path, each with the rows its
+manifest entry records, so a refresh reuses what the previous generation
+read and reads only what is new. A data file's deleted rows are reused
+whole while the deletes that apply to it are unchanged, extended with the
+rows of new ones, and rebuilt from the remaining ones, which are read
+again, when one drops away. A Puffin file's footer is read, at one or two
+GETs, when a load reads a vector in it, and every vector the load reads is
+checked against it; then only the blobs the manifests list as live are
+read, since a Puffin file may still hold vectors a later commit replaced.
+Of a footer, a load keeps only the checked entries of the vectors its
+file lists that no data file takes, so a later load that reads one needs
+no footer GET; a footer whose listed vectors all apply is dropped.
 
-A bitmap keeps its rows in blocks of 65,536. A block costs at most two
-bytes per deleted row in it and never more than 8 KiB, plus a fixed
-overhead of a few tens of bytes, so dense deletes cost about two bytes a
-row and scattered deletes, one to a block, cost tens of bytes a row. For
-a data file with D deleted rows in n blocks the bound is the lesser of
-2·D and 8 KiB·n, plus the block overhead times the lesser of D and n,
-plus a fixed overhead per file. Every term follows from the manifests'
-record counts, so the delete state is counted in the table's resident
-bytes as that upper bound before any delete file is read, and a `full` table whose deletes would exceed its
+A bitmap keeps a data file's rows in blocks of 65,536, grouped in
+segments of 2^32 rows, so a file under four billion rows has one segment.
+A data file's delete state is bounded by
+
+```text
+bytes ≤ min(2·D, 8 KiB·n) + C·min(D, n) + F·min(D, b) + Σ (S + path)
+```
+
+where r is the file's rows; n its blocks, r / 65,536 rounded up; b its
+segments, r / 2^32 rounded up; and D its deleted rows, the record counts
+of its deletion vector, or else of the position delete files that name
+it, summed and at most r. A block costs at most two bytes per deleted row
+in it and never more than 8 KiB, plus a fixed overhead C of a few tens
+of bytes, and a segment costs a fixed overhead F of a few hundred bytes,
+so dense deletes cost about two bytes a row and scattered deletes, one to
+a block, cost tens of bytes a row. The sum runs over the deletes that
+apply to the file: each adds a slot S in the file's list of sources and
+its path, counted for every data file it applies to although a load
+holds one copy of it.
+
+A position delete file that names no data file may put its rows in any
+unmasked file of its partition it applies to, so those rows are bounded
+together per partition: each costs at most 2 + C + F bytes, and together
+they cost no more than deleting every row of those files would add to
+what their own deletes bound. Such a file is a source of at most as many
+of them as it has rows. What a load keeps for the next is bounded beside:
+per position delete file that names no data file, its path and an index
+per data file of its partition it may apply to, at most one per row; and
+per Puffin file that lists a vector no data file takes, its path and each
+such vector's checked entry with the path that entry names. C, F, and S
+are named constants in the code, measured from the bitmap library's own
+allocations.
+
+Every term follows from the manifests' record counts, so the delete state
+is counted in the table's resident bytes as that upper bound before any
+delete file is read, and a `full` table whose deletes would exceed its
 resident budget (RFD 017, Residency tiers) is refused as `over_budget`
 before the reads, as its keys would be. `disk` and `bloom` have no memory
 budget under RFD 017, and their delete state is reported in the doctor's
 predicted memory and in the gauges below.
 
-Three conditions are refused, each deterministic for its snapshot and
+Three conditions stop a snapshot, each deterministic for it and
 remembered as RFD 005 (Generations and refresh) describes:
 
-- An equality delete that applies to a data file the snapshot holds, as
-  `equality_deletes`.
-- A delete icetray cannot read, as `delete_kind_unsupported`: position
-  deletes in Avro or ORC, or a Puffin blob of a type other than a deletion
-  vector.
-- A delete that contradicts the snapshot: a deletion vector whose
-  `referenced-data-file` is not the data file its manifest entry names,
-  or whose cardinality, as its blob property or as decoded, differs from
-  the entry's record count; or a position at or past its data file's
-  record count, which the spec does not forbid but icetray refuses, since
-  a writer that wrote it has misread the file. These are deterministic
-  faults of the snapshot's files, like its other file faults. A blob whose
-  length, magic, or checksum is wrong is not judged: icetray cannot tell
-  a damaged read from a damaged file, so under RFD 005 it is a transient
-  fault, and only a blob that passes those checks can be refused for
-  what it says.
+- An equality delete newer than the snapshot's oldest data file, which
+  may apply to one, refused as `equality_deletes`.
+- A delete icetray cannot read, refused as `delete_kind_unsupported`:
+  position deletes in Avro or ORC that may apply, a Puffin blob of a type
+  other than a deletion vector, or a Puffin footer that is compressed,
+  which icetray does not decompress, or that sets a flag the spec
+  reserves, which no writer icetray knows of sets.
+- A delete that contradicts the snapshot, a fault of the snapshot's
+  files like its other file faults: a deletion vector the footer does not
+  list where its entry places it, that the footer places before the end
+  of the file's opening magic or past the footer's start, that is
+  compressed, which the spec forbids, whose `referenced-data-file` is not
+  the data file its entry names, or that passes its checksum but is not a
+  portable 64-bit roaring bitmap filling its blob; two manifest entries of
+  one Puffin file that record different file sizes, so its footer cannot
+  be placed; a position delete file without the spec's `file_path` and
+  `pos` columns, with a null in either, or with a row naming another data
+  file than its entry names; a deletion vector whose cardinality, as its
+  blob property or as decoded, or a position delete file whose decoded
+  rows, differ from its entry's record count; a negative position; a
+  position at or past its data file's record count, which the spec does
+  not forbid but icetray refuses, since a writer that wrote it has
+  misread the file; and a data file with deletes whose manifest entry
+  records another row count than its footer, since every position is
+  checked against the manifest's.
+
+A Puffin file whose framing is wrong is not judged: a footer whose magics
+or length do not hold or whose payload is not its JSON, or a blob whose
+length, magic, or checksum is wrong. icetray cannot tell a damaged read
+from a damaged file, so under RFD 005 it is a transient fault, and only a
+file whose framing holds can be refused for what it says. A footer's
+magics and length are checked before its flags are judged, and its
+payload is read as JSON only once its flags are ones icetray reads, so a
+footer with a reserved flag set is refused before its payload is parsed.
 
 ### Lookups
 
@@ -158,8 +221,8 @@ previous generation applied. Deletes accumulate as a table moves forward,
 but a ref moved backward or a rolled-back branch can drop a deletion
 vector and bring a deleted copy back to life, and the check must see it.
 Comparing two bitmaps is cheap. A commit that only deletes reuses every
-data file, rebuilds the delete state, and verifies nothing unless deletes
-shrank.
+data file, reads only its new deletes, and verifies nothing unless
+deletes shrank.
 
 A compaction arrives as new data files that replace the old ones; the
 deletes that named the old files are ignored from then on.
@@ -187,32 +250,32 @@ behavior reached through RFD 020 rather than a refusal of its own.
 ### Measurements
 
 The measurements RFD 020 leaves to this RFD are per-table gauges, each
-usable alone as an alert:
-
-Each counts only deletes that apply to a data file the generation holds,
-so dangling deletes left by a compaction do not keep an alert firing.
+usable alone as an alert. The row, file, and age gauges count only
+deletes that apply to a data file the generation holds, so dangling
+deletes left by a compaction do not keep an alert firing; the bytes
+gauge also counts what a load keeps for the next:
 
 - `icetray_table_deleted_rows{table}`: rows the delete state removes.
 - `icetray_table_deleted_fraction{table}`: those rows over the rows of the
   snapshot's data files, so one threshold fits tables of any size.
 - `icetray_table_delete_files{table}`: live position delete files and
-  deletion vectors.
+  deletion vectors whose rows a data file's deleted rows hold, so a
+  position delete file a deletion vector masks is not counted.
 - `icetray_table_oldest_delete_age_seconds{table}`: the age of the
   snapshot that committed the oldest applying delete, found by its data
-  sequence number, which grows while compaction stalls. 0 with no applying
-  delete. When that snapshot has expired from the metadata, the oldest
-  snapshot still listed is used, which understates the age, and a
-  compaction that keeps its starting sequence number maps a delete to an
-  older snapshot than the one that wrote it, which overstates it. The
-  gauge shows compaction stalling; it is not an exact age.
+  sequence number, which grows while compaction stalls; 0 with no
+  applying delete, or when no listed snapshot dates it. It is not an
+  exact age, and [Operating icetray](../operating.md#metrics) says when
+  it reads high or low.
 - `icetray_table_delete_state_bytes{table}`: the delete state's memory,
   also counted in `icetray_index_bytes`.
 
 The files a lookup may probe per bucket, which RFD 020 already exports,
 is the uncompacted depth per bucket. The doctor reports the same counts
-and gains the advice finding `deletes_pending`, naming the deleted rows
-and delete files a compaction would remove and, where updates overlap,
-the level it would restore.
+and gains the advice finding `deletes_pending`, naming the deleted rows,
+the delete files, and the delete state's bytes a compaction would remove
+and, where files overlap, the level the table would reach with none
+overlapping.
 
 Before release, three measurements are made on the testkit's contract
 tables, and their results go into `docs/performance.md` and the doctor's
@@ -277,8 +340,9 @@ file, and a live key appears in at most one file. RFD 020's
 A generation now owns state that is not per file. RFD 005 reuses a data
 file's index across generations by sharing it; the delete state is rebuilt
 per generation from reused and new deletes, and a reused file's index is
-unchanged by it. Overlap verification gains a second trigger, deletes that
-shrank.
+unchanged by it. A data file is reused only when its data sequence number
+is unchanged too, since deletes apply by it. Overlap verification gains
+a second trigger, deletes that shrank.
 
 The lookup gains a step and a probe order. The cost tests of RFD 006,
 which count GETs per lookup, gain cases with deleted rows at every

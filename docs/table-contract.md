@@ -35,9 +35,16 @@ For values of kilobytes per key, the recipe lowers
 `write.parquet.row-group-check-min-record-count` and
 `write.parquet.row-group-check-max-record-count` to small values, so the
 byte bound takes effect. Iceberg's default write mode for `DELETE`,
-`UPDATE`, and `MERGE` is copy-on-write, which the contract needs; a table
-that sets any of them to merge-on-read writes delete files. Compaction
-must carry the same file-size target, or it undoes the layout.
+`UPDATE`, and `MERGE` is copy-on-write. A table that sets any of them to
+merge-on-read writes delete files, which icetray serves when they are
+deletion vectors or Parquet position deletes
+([RFD 021](rfd/021-merge-on-read.md)). A delete adds no GET to a lookup
+under `full` and `disk`; under `bloom` a miss on a deleted key pays the
+key-page GET a bloom filter's false positive does. An update writes the
+new row to a new data file whose key range overlaps the older file's,
+which caps the table at `permissive` through `overlapping_files` until a
+compaction rewrites the bucket. Compaction must carry the same file-size
+target, or it undoes the layout.
 
 ## Requirements
 
@@ -64,9 +71,11 @@ doctor's output and the metrics spell it.
 | One key column of Iceberg type `long`, `string`, `binary`, `fixed` (served as binary), or `uuid` | Refused: `key_type_unsupported`; a key column whose Parquet type contradicts the schema is `key_type_mismatch` | Declare the key with one of those types. A composite key is the caller's encoding into one column. |
 | Keys of at most 4,096 bytes | Refused: `key_too_long`. Keys over 128 bytes draw advice, `long_keys` | A shorter key encoding |
 | No null keys | Refused: `null_keys` | Filter nulls before the write |
-| Every key once in the snapshot | Refused: `duplicate_keys` | Deduplicate before the write, or upsert with `MERGE` |
+| A key at most once within a data file, deleted rows included | Refused: `duplicate_keys` | Deduplicate before the write |
+| A live key in at most one data file: a row a delete removes is not live | Refused: `duplicate_keys` | Deduplicate before the write, or upsert with `MERGE`, which rewrites the older row or deletes it |
 | One value column of type `binary`, `fixed`, or `string`; nulls allowed | Refused: `value_type_unsupported` | Pack the columns a caller needs into one binary value at write time, such as a serialized protobuf. A second column would cost a second GET per hit. |
-| No equality deletes, and only deletes icetray reads | Deletion vectors and Parquet position deletes are served (RFD 021). Refused: an equality delete newer than the snapshot's oldest data file is `equality_deletes`; a position delete file in Avro or ORC, a Puffin blob other than a deletion vector, or a compressed Puffin footer is `delete_kind_unsupported`. An equality delete no data file is older than applies to nothing and is ignored. | Merge-on-read writers that write deletion vectors or Parquet position deletes. A table whose writer leaves equality deletes can be served from a tag or branch that a compaction moves after rewriting them into data files. |
+| No equality delete that may apply to a data file | Refused: `equality_deletes`, for an equality delete newer than the snapshot's oldest data file, which may apply to one (RFD 021). An equality delete no data file is older than changes no answer and is ignored. | A table whose writer leaves equality deletes can be served from a tag or branch that a compaction moves after rewriting them into data files. |
+| Only deletes icetray reads: deletion vectors and Parquet position deletes | Served (RFD 021). Refused: `delete_kind_unsupported`, for a position delete file in Avro or ORC that may apply to a data file, a Puffin blob other than a deletion vector, or a Puffin footer that is compressed or sets reserved flags. An Avro or ORC position delete file that applies to no data file the snapshot holds changes no answer and is ignored. | Merge-on-read writers that write deletion vectors or Parquet position deletes |
 | Each data file sorted by key | Refused: `unsorted` | `ALTER TABLE ... WRITE LOCALLY ORDERED BY key`. A global sort is not needed. |
 | Every key in the bucket its file's manifest entry records | Refused: `key_outside_bucket` | Let Iceberg's bucket transform assign files; never register files under a partition by hand |
 | `bucket(N, key)` partitioning, and no other partition field | Caps at `permissive`: `no_bucket_partition`, files probed per lookup | `PARTITIONED BY (bucket(N, key))`, then rewrite the files written without it. See [Choosing the bucket count](#choosing-the-bucket-count). |
@@ -78,6 +87,7 @@ doctor's output and the metrics spell it.
 | A full-length column index on the key | Advice: `column_index_truncated` | `'parquet.columnindex.truncate.length'` at least the key length, such as `'256'` |
 | A bloom filter on the key | Advice: `no_bloom_filter`. Under `bloom` residency the table is refused with the same name | `'write.parquet.bloom-filter-enabled.column.key' = 'true'` |
 | A bloom filter sized for its keys | Advice above 4 bytes per key, `bloom_oversized`, or below 8 bits per key, `bloom_undersized` | `write.parquet.bloom-filter-max-bytes` and `write.parquet.bloom-filter-ndv.column.key`, which Iceberg honors from 1.11 |
+| Deletes compacted into the data files | Advice while deletes remove rows: `deletes_pending`, with the rows, delete files, and delete state a compaction would remove and, where files overlap, the level the table reaches once none do | A compaction that rewrites the data files the deletes apply to |
 | Data files of 32 to 64 MiB | Advice above 128 MiB, `large_file`; and when a bucket holds more than twice the files its bytes explain at 64 MiB each, `many_files_per_bucket` | `'write.target-file-size-bytes' = '67108864'`, and the same target in compaction |
 | zstd compression | Not checked | `'write.parquet.compression-codec' = 'zstd'` |
 
@@ -85,8 +95,9 @@ Two refusals come from configuration rather than from the files. A `full`
 table whose resident bytes exceed its `resident_budget_bytes`, or a load of
 `disk` tables whose chunk files would exceed
 `storage.local.index_budget_bytes`, is refused as `over_budget` before any
-key chunk is fetched. `disk` residency without a local directory is a
-configuration error. `resident_budget_bytes` is in
+key chunk or delete is fetched. A `full` table's resident bytes count its
+delete state at a bound taken from the manifests. `disk` residency without
+a local directory is a configuration error. `resident_budget_bytes` is in
 [`[[tables]]`](configuration.md#tables) and `index_budget_bytes` in
 [`[storage.local]`](configuration.md#storagelocal).
 
@@ -125,7 +136,8 @@ and output are in [Configuration and the command line](configuration.md).
 The decisions behind the contract:
 [RFD 002](rfd/002-serving-layout-contract.md) (the contract),
 [RFD 007](rfd/007-serving-tiers.md) (refusals, costs, and advice, with
-their penalties), [RFD 009](rfd/009-writes-between-builds.md) (delete
-files), [RFD 016](rfd/016-doctor.md) (the doctor), and
-[RFD 020](rfd/020-lookup-levels.md) (lookup levels). Terms such as
+their penalties), [RFD 009](rfd/009-writes-between-builds.md) (writes
+between builds), [RFD 016](rfd/016-doctor.md) (the doctor),
+[RFD 020](rfd/020-lookup-levels.md) (lookup levels), and
+[RFD 021](rfd/021-merge-on-read.md) (delete files). Terms such as
 residency, level, and strict are in the [glossary](glossary.md).

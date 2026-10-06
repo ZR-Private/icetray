@@ -155,7 +155,7 @@ Gauges, written at each scrape:
 | `icetray_table_deleted_fraction` | `table` | Those rows over the rows of the serving snapshot's data files, so one threshold fits tables of any size. |
 | `icetray_table_delete_files` | `table` | Live position delete files and deletion vectors whose rows the serving generation applies. A position delete file a deletion vector masks is not counted. |
 | `icetray_table_delete_state_bytes` | `table` | Bytes the serving generation's delete state holds: each data file's deleted rows and the deletes they came from, and what the deletes keep for the next refresh. Also counted in `icetray_index_bytes`. |
-| `icetray_table_oldest_delete_age_seconds` | `table` | Seconds since the snapshot that committed the oldest applying delete was committed, found by the delete's data sequence number; 0 with no applying delete. It grows while compaction stalls. When that snapshot has expired, the earliest listed snapshot after it dates the delete, which understates the age, and a compaction that keeps its starting sequence number dates a delete to an older snapshot, which overstates it. A snapshot whose timestamp cannot be read is passed over. |
+| `icetray_table_oldest_delete_age_seconds` | `table` | Seconds since the snapshot that committed the oldest applying delete was committed, found by the delete's data sequence number; 0 with no applying delete. It grows while compaction stalls. When that snapshot has expired, the earliest listed snapshot with a greater sequence number dates the delete, which understates the age, and a compaction that keeps its starting sequence number dates a delete to an older snapshot, which overstates it. A snapshot whose timestamp cannot be read is passed over, and the gauge reads 0 when no listed snapshot dates the delete. |
 | `icetray_generation_age_seconds` | `table` | Seconds since the serving snapshot was committed, by its timestamp. A table written once a day reads up to a day between writes; it is not a replication lag. |
 | `icetray_generation_sequence_number` | `table` | The serving snapshot's sequence number. |
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
@@ -369,8 +369,21 @@ reads depends on the table's source
   to inherit, a deletion vector entry that does not place its blob in its
   Puffin file, or a snapshot timestamp outside the range icetray can
   represent. It is a `file` fault that a data file's footer or bloom
-  filters show. These depend only on the snapshot and the table's entry,
-  so trying again cannot help. The failure is counted and logged once,
+  filters show, or that a delete file shows against the manifests
+  ([RFD 021](rfd/021-merge-on-read.md)): a deletion vector its Puffin
+  footer does not list where its entry places it, that the footer places
+  before the end of the file's opening magic or past the footer's start,
+  that is compressed, that names another data file or another row count
+  than its entry, or that passes its checksum but is not a portable
+  64-bit roaring bitmap filling its blob; two manifest entries of one
+  Puffin file that record different file sizes; two deletion vectors that
+  apply to one data file; a position delete file without the `file_path`
+  and `pos` columns, with a null in either, with a row naming another
+  data file than its entry, or with another row count than its entry; a
+  negative position, or one at or past its data file's row count; or a
+  data file with deletes whose manifest entry records another row count
+  than its footer. These depend only on the snapshot and the table's
+  entry, so trying again cannot help. The failure is counted and logged once,
   when it is met, and the table does not build that snapshot again while
   its source names the same metadata location: each poll costs only the
   one read or catalog call above, counts nothing, logs nothing, and the
@@ -394,9 +407,13 @@ reads depends on the table's source
   timeout or deadline, `over_budget` against the shared
   `index_budget_bytes`, which other tables' chunk files also decide, a
   version hint or catalog record that names no usable metadata, a
-  `parquet` or `iceberg` library error, and a `file` fault met decoding a
+  `parquet` or `iceberg` library error, a `file` fault met decoding a
   data file's pages, which a `disk` table may read from its local chunk
-  file rather than the data file.
+  file rather than the data file, and a delete file whose framing does not
+  hold, since a damaged read cannot be told from a damaged file: a Puffin
+  footer whose magics or length are wrong or whose payload is not its
+  JSON, a deletion vector blob whose length, magic, or checksum is wrong,
+  or a position delete file's page header that overstates its page.
 - A `glue` or `s3tables` call that the catalog refuses or that fails, for
   a missing permission, a table that does not exist, throttling, or an
   endpoint that cannot be reached, is a `refresh failed` event at `warn`

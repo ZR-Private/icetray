@@ -226,7 +226,7 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
 | `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` needs `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
-| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it is refused as `over_budget` once the footers are read, before any key chunk is fetched. Set on a `disk` or `bloom` table, it makes the file invalid. |
+| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it, its delete state counted at a bound taken from the manifests, is refused as `over_budget` once the footers are read, before any key chunk or delete is fetched. Set on a `disk` or `bloom` table, it makes the file invalid. |
 
 ### `[tables.source]`
 

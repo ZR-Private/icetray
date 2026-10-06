@@ -95,10 +95,10 @@ skip count says how much less.
 Golden tables are large and live outside the repository. A contributor
 without them runs a smaller suite, and the output says so.
 
-The delete-file refusal of RFD 009 (Writes between builds) depends on a
-fixture the prototype lacked, a snapshot carrying a delete file
+The delete refusals of RFD 021 (Merge-on-read) depend on a fixture the
+prototype lacked, a snapshot carrying a delete file
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)).
-That refusal counts as proven only once a test produces such a snapshot.
+Each refusal counts as proven only once a test produces such a snapshot.
 
 Each change to a cost path needs a second reader, and that reader's time
 is a cost the project accepts.

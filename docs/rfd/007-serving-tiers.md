@@ -14,6 +14,10 @@
 > the open question below. The refusals, the penalty units, and advice
 > are unchanged.
 
+> Updated 2026-10-06: the refusal of delete files narrows to equality
+> deletes and unreadable deletes that may apply. See RFD 021
+> (Merge-on-read).
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -34,13 +38,14 @@ deviation costs, and the two must agree on one classification.
 A table icetray cannot serve correctly (unsorted files, null or duplicate
 keys, keys outside their file's recorded bucket, a key column whose
 physical type does not match the schema, a value column that is not
-binary, fixed, or string, delete files, keys over 4,096 bytes, and the
-residency refusals of RFD 017 (Residency tiers)) will be refused at load
-with a named reason; a table it can serve only inefficiently (a
-dictionary-encoded value column, key pages over 2,000 rows, no bucket
-partition, overlapping files in a bucket) will be served with its penalty
-measured and reported, and each such finding caps the table's lookup
-level (RFD 020); tuning advice will never affect whether a table serves.
+binary, fixed, or string, equality deletes and unreadable deletes that
+may apply, keys over 4,096 bytes, and the residency refusals of RFD 017
+(Residency tiers)) will be refused at load with a named reason; a table it
+can serve only inefficiently (a dictionary-encoded value column, key pages
+over 2,000 rows, no bucket partition, overlapping files in a bucket) will
+be served with its penalty measured and reported, and each such finding
+caps the table's lookup level (RFD 020); tuning advice will never affect
+whether a table serves.
 
 The tiers are refusal, inefficient, and advice, and the line between them
 is what a client could observe. A refusal means icetray cannot serve the
@@ -91,8 +96,9 @@ Placements settled elsewhere:
   the wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)). A typed column has no defined encoding there, and any answer
   would be a guess. RFD 002 (Serving layout contract) states the clause.
-- Delete files are refused; RFD 009 (Writes between builds) defers
-  merge-on-read snapshots.
+- Equality deletes and unreadable deletes that may apply are refused;
+  RFD 021 (Merge-on-read) serves deletion vectors and Parquet position
+  deletes and says why the rest stay refused.
 - Two refusals belong to RFD 017 (Residency tiers) and are named there: a
   full-tier load over its resident-bytes budget, and bloom residency on a
   table whose files carry no key bloom filter. Disk residency with no

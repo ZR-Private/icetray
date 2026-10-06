@@ -7,6 +7,12 @@
 > metadata and manifests and logged and counted the refusal each time.
 > See RFD 005 (Generations and refresh).
 
+> Updated 2026-10-06: RFD 021 (Merge-on-read) replaces the refusal of
+> every delete file. Deletion vectors and Parquet position deletes are
+> served; equality deletes stay refused unless they apply to no data
+> file; and the serving ref behind compaction stays the pattern for a
+> table that wants `optimal`.
+
 ## Problem
 
 The tables icetray serves are rebuilt on a schedule and change between

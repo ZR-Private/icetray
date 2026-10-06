@@ -14,6 +14,17 @@ is tried again once the table's metadata location moves. Readiness does
 not change. A strict table refused for its level is held instead. See
 [Refresh and reload](operating.md#refresh-and-reload).
 
+**Delete state.** The rows a generation's deletion vectors and position
+delete files remove from each data file it holds, kept in memory for
+every residency and checked before a lookup reads a value page. Its bytes
+count toward `icetray_index_bytes`, and a `full` table's resident budget
+counts it at a bound taken from the manifests. See
+[RFD 021](rfd/021-merge-on-read.md).
+
+**Deletion vector.** A bitmap of the deleted row positions of one data
+file, stored as a blob in a Puffin file, which Iceberg format v3 writers
+use in place of position delete files. icetray serves them.
+
 **Fence array.** The first key of every key page of a data file, held in
 memory for every residency. A lookup binary-searches it to pick the one key
 page that can hold its key.
@@ -50,9 +61,10 @@ See [Choosing a level](configuration.md#choosing-a-level).
 See [the command line](configuration.md#the-command-line).
 
 **Refused.** A snapshot icetray will not serve, for a named reason: an
-answer could be wrong (unsorted files, duplicate keys, delete files, and
-the like), the table cannot be held the way its residency requires, or,
-under `strict`, its layout is below the table's level (`below_level`).
+answer could be wrong (unsorted files, duplicate keys, equality deletes,
+and the like), the table cannot be held the way its residency requires,
+or, under `strict`, its layout is below the table's level
+(`below_level`).
 
 **Residency.** Where a table keeps its key chunks: `full` (in memory),
 `disk` (in a file in the local directory, with footers, page indexes,

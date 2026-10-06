@@ -15,10 +15,10 @@ accepts.
 
 The trade-off sharpens once a table's cost can change between commits.
 Today every inefficient finding is a property of how the table was
-written. Writers that append small files, and merge-on-read writers once
-RFD 021 serves them, add cost with every commit until a compaction removes
-it, so a table can be served correctly while its lookups grow more
-expensive week by week, and nothing in the current vocabulary says so.
+written. Writers that append small files, and the merge-on-read writers
+RFD 021 serves, add cost with every commit until a compaction removes it,
+so a table can be served correctly while its lookups grow more expensive
+week by week, and nothing in the current vocabulary says so.
 
 ## Decision
 

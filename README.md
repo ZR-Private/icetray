@@ -242,10 +242,11 @@ icetray get --location s3://warehouse/db/kv 42
 
 ## Not a fit if
 
-- **Your tables are written merge-on-read.** A snapshot with delete files
-  or deletion vectors is refused. Copy-on-write tables serve, and a
-  merge-on-read table can be served from a tag or branch that a compaction
-  moves.
+- **Your writers leave equality deletes.** Deletion vectors and Parquet
+  position deletes are served, so merge-on-read tables written by Spark
+  serve; a snapshot with an equality delete that may apply is refused.
+  Such a table can be served from a tag or branch that a compaction moves
+  after rewriting the deletes into data files.
 - **A key needs more than one value column.** icetray serves one value
   column per table; several fields are packed into one binary value at
   write time.
