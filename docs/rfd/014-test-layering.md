@@ -1,5 +1,10 @@
 # Test layering
 
+> Updated 2026-10-06: a fixture value is a function of its key and of the
+> version that wrote it. Under merge-on-read (RFD 021) a key's deleted
+> copy and its live copy sit in different files, and a value of the key
+> alone would let a lookup that answered from the deleted copy pass.
+
 ## Problem
 
 icetray's value is a set of cost promises: one GET per cold hit, none per
@@ -26,8 +31,9 @@ as the oracle; container-gated catalog tests; and golden tables produced
 by real writers), every cost promise will get a counting test, and every
 change to a cost path will get an adversarial review before merge.
 
-Every fixture value is a function of its key, so any answer can be checked
-without a stored oracle
+Every fixture value is a function of its key and of the version that
+wrote it, so any answer can be checked without a stored oracle, and a test
+can tell a live row from a deleted copy of the same key
 ([prototype findings, method](../analysis/2026-09-10-prototype-findings.md#verifiable-answers)).
 
 The in-process S3 server is driven by the real client, so the tests

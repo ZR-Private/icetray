@@ -1,5 +1,14 @@
 # Merge-on-read
 
+> Updated 2026-10-06: corrected against the code before it was built. The
+> bitmap's memory bound gains a per-block overhead that dominates for
+> scattered deletes; a Puffin file's footer is read and costs GETs; icetray
+> inherits data sequence numbers itself; the oldest-delete age can read
+> high as well as low; a position delete file that names no data file is
+> read once to learn it applies to nothing; and a malformed blob is
+> transient because a damaged read cannot be told from a damaged file,
+> not because of a local copy, which delete reads never use.
+
 ## Problem
 
 RFD 009 (Writes between builds) refuses every snapshot that carries a
@@ -51,22 +60,36 @@ stack (RFD 003), and follows Iceberg's rules:
   a position delete or deletion vector naming a file compacted away, or
   an equality delete whose data sequence number is no greater than that
   of every data file in the snapshot, which the manifests decide without
-  working out the delete's partition scope. Compaction
-  leaves such dangling deletes behind, and they change no answer.
+  working out the delete's partition scope. Compaction leaves such
+  dangling deletes behind, and they change no answer. A position delete
+  file that does not name its data file must be read once to learn that
+  it applies to nothing; it is then remembered by its path, like any
+  delete already read.
 - Liveness and data sequence numbers come from the current snapshot's
-  manifests every generation, never from a delete read before.
+  manifests every generation, never from a delete read before. A
+  manifest entry may leave its sequence number unset and inherit its
+  manifest's, and icetray applies that inheritance itself, since the
+  Iceberg library offers it only through a reader of its own outside the
+  storage stack. An entry that has no sequence number to inherit is a
+  deterministic fault of the snapshot.
 
 A deletion vector is identified by its Puffin file's path, offset, and
 length, and a position delete file by its path, so a refresh reuses what
-the previous generation read and reads only what is new. Only the blobs
-the manifests list as live are read; a Puffin file may still hold vectors
-a later commit replaced.
+the previous generation read and reads only what is new. A new Puffin
+file's footer is read once, at one or two GETs, so that every vector the
+manifests name can be checked against it; then only the blobs the
+manifests list as live are read, since a Puffin file may still hold
+vectors a later commit replaced.
 
-A bitmap costs at most two bytes per deleted row, and never more than
-8 KiB per 65,536 rows of its data file, plus a small fixed overhead per
-file. Both bounds follow from the manifests' record counts, so the delete
-state is counted in the table's resident bytes as that upper bound before
-any delete file is read, and a `full` table whose deletes would exceed its
+A bitmap keeps its rows in blocks of 65,536. A block costs at most two
+bytes per deleted row in it and never more than 8 KiB, plus a fixed
+overhead of a few tens of bytes, so dense deletes cost about two bytes a
+row and scattered deletes, one to a block, cost tens of bytes a row. For
+a data file with D deleted rows in n blocks the bound is the lesser of
+2·D and 8 KiB·n, plus the block overhead times the lesser of D and n,
+plus a fixed overhead per file. Every term follows from the manifests'
+record counts, so the delete state is counted in the table's resident
+bytes as that upper bound before any delete file is read, and a `full` table whose deletes would exceed its
 resident budget (RFD 017, Residency tiers) is refused as `over_budget`
 before the reads, as its keys would be. `disk` and `bloom` have no memory
 budget under RFD 017, and their delete state is reported in the doctor's
@@ -87,9 +110,10 @@ remembered as RFD 005 (Generations and refresh) describes:
   record count, which the spec does not forbid but icetray refuses, since
   a writer that wrote it has misread the file. These are deterministic
   faults of the snapshot's files, like its other file faults. A blob whose
-  length, magic, or checksum is wrong is not judged: it may be a damaged
-  local copy, so it is a transient fault, and only a blob that passes
-  those checks can be refused for what it says.
+  length, magic, or checksum is wrong is not judged: icetray cannot tell
+  a damaged read from a damaged file, so under RFD 005 it is a transient
+  fault, and only a blob that passes those checks can be refused for
+  what it says.
 
 ### Lookups
 
@@ -177,7 +201,10 @@ so dangling deletes left by a compaction do not keep an alert firing.
   snapshot that committed the oldest applying delete, found by its data
   sequence number, which grows while compaction stalls. 0 with no applying
   delete. When that snapshot has expired from the metadata, the oldest
-  snapshot still listed is used, which understates the age.
+  snapshot still listed is used, which understates the age, and a
+  compaction that keeps its starting sequence number maps a delete to an
+  older snapshot than the one that wrote it, which overstates it. The
+  gauge shows compaction stalling; it is not an exact age.
 - `icetray_table_delete_state_bytes{table}`: the delete state's memory,
   also counted in `icetray_index_bytes`.
 
@@ -261,6 +288,7 @@ fails a test.
 Open questions:
 
 - Whether a `disk` table's delete state should move to the local
-  directory once it is large, as its key chunks do. At up to two bytes per
-  deleted row it can exceed the memory `disk` keeps per key, and the
+  directory once it is large, as its key chunks do. At about two bytes
+  per deleted row when deletes are dense, and tens of bytes when they are
+  scattered, it can exceed the memory `disk` keeps per key, and the
   delete-state measurements decide whether that happens on real tables.
