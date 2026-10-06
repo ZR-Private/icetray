@@ -17,7 +17,7 @@ use icetray_core::config::{ConfigError, ConfigViolation, LocalConfig, Residency,
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
     Budget, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason, Storage,
-    TableSource, TableState, UnsupportedDelete, bucket,
+    TableSource, TableState, UnsupportedDelete, Value, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -27,8 +27,8 @@ use icetray_testkit::fixture::{
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
 use icetray_testkit::{
-    Bloom, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, Order, RawFile, Result,
-    TestkitError, value_for, write_fixture,
+    Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, Order,
+    RawFile, Result, TestkitError, value_for, write_fixture,
 };
 
 /// The long keys of a raw file, ascending, and the same values as their
@@ -362,6 +362,7 @@ async fn test_avro_position_delete_is_refused_as_an_unsupported_kind() -> Result
         DELETE_RECORDS,
         DELETE_BYTES,
         DataFileFormat::Avro,
+        None,
     )?;
     commit_deletes(&mut fixture, vec![delete]).await?;
     let refused = refused_through_root(&fixture).await?;
@@ -377,6 +378,78 @@ async fn test_avro_position_delete_is_refused_as_an_unsupported_kind() -> Result
         verify::HINT_POLL_GETS + verify::METADATA_FILE_GETS + DELETE_SNAPSHOT_MANIFEST_GETS,
         "refused from the manifests alone"
     );
+    Ok(())
+}
+
+/// A deletion vector that applies to a data file masks the file's position
+/// deletes, so an Avro one naming a masked file, and one naming no file in
+/// a partition whose every file is masked, apply to nothing: the table
+/// serves, each key as the vectors leave it.
+#[tokio::test]
+async fn test_avro_position_deletes_a_vector_masks_are_ignored() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = unpartitioned_fixture(&catalog, "kv_masked_avro").await?;
+    let oracle = MergeOracle::read(&fixture).await?;
+    let one_per_file: Vec<u64> = fixture
+        .files()
+        .iter()
+        .map(|file| {
+            fixture
+                .ids()
+                .find(|&id| oracle.copies(&fixture.key(id))[0].path == file.file_path())
+                .expect("each file holds a key")
+        })
+        .collect();
+    fixture
+        .delete(&one_per_file, DeleteForm::Vectors, "vectors")
+        .await?;
+    let spec_id = fixture.metadata().default_partition_spec_id();
+    let mut deletes = fixture.deletes().to_vec();
+    assert_eq!(
+        deletes.len(),
+        fixture.files().len(),
+        "a vector masks every file"
+    );
+    let named = Some(fixture.files()[0].file_path().to_string());
+    for (name, referenced) in [("scoped.avro", named), ("unscoped.avro", None)] {
+        deletes.push(position_delete_file(
+            &delete_path(&fixture, name),
+            spec_id,
+            Struct::empty(),
+            DELETE_RECORDS,
+            DELETE_BYTES,
+            DataFileFormat::Avro,
+            referenced,
+        )?);
+    }
+    commit_deletes(&mut fixture, deletes).await?;
+    let source = fixture.root_source();
+    let served = verify::serve(
+        TableConfig {
+            source: source.clone(),
+            ..fixture.config(Residency::Full, false)
+        },
+        TableSource::from_config(&source).await?,
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    assert_eq!(
+        Some(served.current().snapshot_id.0),
+        fixture.snapshot_id(),
+        "the snapshot with the Avro deletes serves"
+    );
+    for id in fixture.ids() {
+        let key = fixture.key(id);
+        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+    }
+    for id in one_per_file {
+        let key = fixture.key(id);
+        assert_eq!(
+            served.table.get(&key).await?.value,
+            Value::Absent,
+            "id {id}"
+        );
+    }
     Ok(())
 }
 

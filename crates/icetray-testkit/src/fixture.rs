@@ -1608,9 +1608,10 @@ fn data_file(
 }
 
 /// A position-delete file entry at `path` in `format` under `spec_id` with
-/// `partition` as its tuple, for `HandSnapshot::deletes`, with nothing
-/// written there: for a format icetray refuses from the manifest alone,
-/// Avro or ORC. A Parquet one is read, and `delete_files` writes it.
+/// `partition` as its tuple, naming `referenced` as its referenced data
+/// file when given, for `HandSnapshot::deletes`, with nothing written
+/// there: for a format icetray refuses from the manifest alone, Avro or
+/// ORC. A Parquet one is read, and `delete_files` writes it.
 pub fn position_delete_file(
     path: &str,
     spec_id: i32,
@@ -1618,13 +1619,14 @@ pub fn position_delete_file(
     records: u64,
     size: u64,
     format: DataFileFormat,
+    referenced: Option<String>,
 ) -> Result<DataFile> {
     delete_file(
         path,
         spec_id,
         partition,
         (records, size),
-        DataContentType::PositionDeletes,
+        (DataContentType::PositionDeletes, referenced),
         format,
     )
 }
@@ -1644,24 +1646,26 @@ pub fn equality_delete_file(
         spec_id,
         partition,
         (records, size),
-        DataContentType::EqualityDeletes,
+        (DataContentType::EqualityDeletes, None),
         DataFileFormat::Parquet,
     )
 }
 
-/// A delete file entry of `content` in `format` with `(records, size)`;
-/// an equality delete is on the key column.
+/// A delete file entry of `content` in `format` with `(records, size)`,
+/// naming `referenced` as its referenced data file when given; an
+/// equality delete is on the key column.
 fn delete_file(
     path: &str,
     spec_id: i32,
     partition: Struct,
     (records, size): (u64, u64),
-    content: DataContentType,
+    (content, referenced): (DataContentType, Option<String>),
     format: DataFileFormat,
 ) -> Result<DataFile> {
     let mut builder = DataFileBuilder::default();
     builder
         .content(content)
+        .referenced_data_file(referenced)
         .file_path(path.to_string())
         .file_format(format)
         .partition(partition)

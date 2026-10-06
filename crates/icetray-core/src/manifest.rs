@@ -19,6 +19,7 @@ use iceberg::spec::{
 
 use crate::bucket;
 use crate::catalog::TableFault;
+use crate::deletes::{Sorted, oldest_by_partition};
 use crate::error::{Error, RefusalReason, Result, UnsupportedDelete};
 use crate::key::{Key, KeyType};
 use crate::snapshot::SequenceNumber;
@@ -357,12 +358,12 @@ pub(crate) struct SnapshotFiles {
 /// Refused, after every manifest is read so that the verdict is the same
 /// for the same manifests in any order: first the position delete file in
 /// Avro or ORC with the least path among those that may apply to a data
-/// file of the snapshot (`Listed::applying_unsupported`; one that provably
-/// applies to none is dropped), as
-/// `RefusalReason::DeleteKindUnsupported`; then the equality delete with
-/// the least path among those above the least data sequence number of the
-/// snapshot's data files, which may delete rows of that file, as
-/// `RefusalReason::EqualityDeletes`. An equality delete at or below every
+/// file of the snapshot no deletion vector masks
+/// (`Listed::applying_unsupported`; one that provably applies to none is
+/// dropped), as `RefusalReason::DeleteKindUnsupported`; then the equality
+/// delete with the least path among those above the least data sequence
+/// number of the snapshot's data files, which may delete rows of that
+/// file, as `RefusalReason::EqualityDeletes`. An equality delete at or below every
 /// data file's sequence number applies to nothing and is dropped, as one
 /// is when the snapshot has no data file.
 ///
@@ -501,25 +502,33 @@ impl Listed {
     }
 
     /// Of the unreadable position deletes that may apply to a data file of
-    /// the snapshot, the one with the least path. One that names a data
-    /// file applies only to that file, when the snapshot lists it at a
-    /// sequence number no greater than its own; one that names none, only
-    /// to a file of its partition at such a number. Any other provably
-    /// applies to nothing and is dropped, as a dangling readable delete
-    /// is never read.
+    /// the snapshot, the one with the least path. Only a data file no
+    /// deletion vector masks (`Sorted::masks`) counts, since the spec
+    /// ignores a file's position deletes where a vector applies to it. One
+    /// that names a data file applies only to that file, when the snapshot
+    /// lists it unmasked at a sequence number no greater than its own; one
+    /// that names none, only to an unmasked file of its partition at such
+    /// a number. Any other provably applies to nothing and is dropped, as
+    /// a dangling or masked readable delete is never read.
     fn applying_unsupported(&mut self) -> Option<Unsupported> {
-        let by_path: HashMap<&str, SequenceNumber> = self
+        if self.unsupported.is_empty() {
+            return None;
+        }
+        let sorted = Sorted::of(&self.deletes);
+        let unmasked: Vec<&DataFileEntry> = self
             .data
+            .iter()
+            .filter(|entry| !sorted.masks(&entry.path, entry.sequence))
+            .collect();
+        let by_path: HashMap<&str, SequenceNumber> = unmasked
             .iter()
             .map(|entry| (entry.path.as_str(), entry.sequence))
             .collect();
-        let mut oldest: HashMap<&Partition, SequenceNumber> = HashMap::new();
-        for entry in &self.data {
-            oldest
-                .entry(&entry.partition)
-                .and_modify(|held| *held = (*held).min(entry.sequence))
-                .or_insert(entry.sequence);
-        }
+        let oldest = oldest_by_partition(
+            unmasked
+                .iter()
+                .map(|entry| (&entry.partition, entry.sequence)),
+        );
         let least = self
             .unsupported
             .iter()
@@ -1761,15 +1770,15 @@ mod tests {
         paths
     }
 
-    /// An unpartitioned snapshot `SNAPSHOT_B` at `SEQUENCE_B` listing
-    /// `data` in a data manifest and then each of `delete_manifests` in a
-    /// delete manifest of its own, with its metadata.
+    /// `md` with a snapshot `SNAPSHOT_B` at `SEQUENCE_B` listing `data` in
+    /// a data manifest and then each of `delete_manifests` in a delete
+    /// manifest of its own, all under `md`'s default spec, and the
+    /// snapshot.
     async fn with_deletes(
-        root: &str,
+        md: TableMetadata,
         data: Vec<(iceberg::spec::DataFile, Written)>,
         delete_manifests: Vec<Vec<(iceberg::spec::DataFile, Written)>>,
     ) -> (TableMetadata, Snapshot) {
-        let md = testing::metadata(root, testing::long_schema(), testing::unpartitioned());
         let spec_id = md.default_partition_spec_id();
         let data_manifest = testing::ManifestSpec {
             spec_id,
@@ -1809,13 +1818,24 @@ mod tests {
         listed_across(root, data, vec![deletes]).await
     }
 
-    /// `list_files` of `with_deletes`'s snapshot.
+    /// `list_files` of `with_deletes`'s snapshot of unpartitioned
+    /// metadata.
     async fn listed_across(
         root: &str,
         data: Vec<(iceberg::spec::DataFile, Written)>,
         delete_manifests: Vec<Vec<(iceberg::spec::DataFile, Written)>>,
     ) -> Result<SnapshotFiles> {
-        let (md, snapshot) = with_deletes(root, data, delete_manifests).await;
+        let md = testing::metadata(root, testing::long_schema(), testing::unpartitioned());
+        listed_under(md, data, delete_manifests).await
+    }
+
+    /// `list_files` of `with_deletes`'s snapshot of `md`.
+    async fn listed_under(
+        md: TableMetadata,
+        data: Vec<(iceberg::spec::DataFile, Written)>,
+        delete_manifests: Vec<Vec<(iceberg::spec::DataFile, Written)>>,
+    ) -> Result<SnapshotFiles> {
+        let (md, snapshot) = with_deletes(md, data, delete_manifests).await;
         let layout = derive(&md, &snapshot).unwrap();
         list_files(TABLE, &md, &snapshot, &layout, &storage()).await
     }
@@ -2024,6 +2044,113 @@ mod tests {
             refusal_of(listed(&root, data(), applying).await),
             RefusalReason::DeleteKindUnsupported {
                 path: data_path(&root, "same"),
+                kind: UnsupportedDelete::AvroPositions,
+            }
+        );
+    }
+
+    /// A deletion vector that applies to a data file masks the file's
+    /// position deletes, so an Avro or ORC one naming only that file
+    /// applies to nothing and is dropped, the vector kept. Where no vector
+    /// applies to the file, one older than it or one naming another file,
+    /// the position delete may apply and is refused.
+    #[tokio::test]
+    async fn test_list_files_drops_an_unreadable_position_delete_a_vector_masks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let target = data_path(&root, "target");
+        let vector = |referenced: &str, written| {
+            let spec = DeleteSpec::Vector {
+                referenced: Some(data_path(&root, referenced)),
+                offset: Some(0),
+                length: Some(1),
+            };
+            (unpartitioned_delete(&root, "vector", spec), written)
+        };
+        let deletes = |vector| {
+            let spec = DeleteSpec::ScopedPositions(DataFileFormat::Avro, target.clone());
+            vec![
+                vector,
+                (unpartitioned_delete(&root, "avro", spec), Written::Added),
+            ]
+        };
+        let data = |written| {
+            vec![
+                (unpartitioned_data(&root, "target"), written),
+                (unpartitioned_data(&root, "other"), Written::Added),
+            ]
+        };
+        let masked = deletes(vector("target", Written::Added));
+        let files = listed(&root, data(Written::Existing(SEQUENCE_A)), masked)
+            .await
+            .unwrap();
+        assert_eq!(delete_paths(&files), [data_path(&root, "vector")]);
+        let refused = RefusalReason::DeleteKindUnsupported {
+            path: data_path(&root, "avro"),
+            kind: UnsupportedDelete::AvroPositions,
+        };
+        let older = deletes(vector("target", Written::Existing(SEQUENCE_A)));
+        assert_eq!(
+            refusal_of(listed(&root, data(Written::Added), older).await),
+            refused,
+            "a vector older than the file does not apply to it"
+        );
+        let elsewhere = deletes(vector("other", Written::Added));
+        assert_eq!(
+            refusal_of(listed(&root, data(Written::Existing(SEQUENCE_A)), elsewhere).await),
+            refused,
+            "a vector of another file does not mask this one"
+        );
+    }
+
+    /// An Avro position delete that names no data file applies only where
+    /// a data file of its partition at a sequence number it reaches is one
+    /// no deletion vector masks. A masked file it reaches, an unmasked one
+    /// newer than it, and an unmasked one of another partition leave it
+    /// applying to nothing; an unmasked file of its partition it reaches
+    /// gets it refused.
+    #[tokio::test]
+    async fn test_list_files_drops_an_unreadable_unscoped_delete_whose_partition_is_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
+        let spec_id = md.default_partition_spec_id();
+        let (own, other) = (0, 1);
+        let data = |name: &str, bucket: u32, written: Written| {
+            (live(&root, name, spec_id, Some(bucket), None).0, written)
+        };
+        let delete = |name: &str, bucket: u32, spec: DeleteSpec, written: Written| {
+            let partition = testing::partition(testing::Partition::Bucket(bucket));
+            let entry = testing::delete_file(&data_path(&root, name), spec_id, partition, spec);
+            (entry, written)
+        };
+        let vector = |name: &str, bucket: u32| {
+            let spec = DeleteSpec::Vector {
+                referenced: Some(data_path(&root, name)),
+                offset: Some(0),
+                length: Some(1),
+            };
+            delete(&format!("{name}_vector"), bucket, spec, Written::Added)
+        };
+        let avro = || {
+            let spec = DeleteSpec::Positions(DataFileFormat::Avro);
+            delete("avro", own, spec, Written::Existing(SEQUENCE_A))
+        };
+        let mut files = vec![
+            data("masked", own, Written::Existing(SEQUENCE_A)),
+            data("newer", own, Written::Added),
+            data("elsewhere", other, Written::Existing(SEQUENCE_A)),
+        ];
+        let deletes = vec![avro(), vector("masked", own)];
+        let listed = listed_under(md.clone(), files.clone(), vec![deletes.clone()])
+            .await
+            .unwrap();
+        assert_eq!(delete_paths(&listed), [data_path(&root, "masked_vector")]);
+        files.push(data("unmasked", own, Written::Existing(SEQUENCE_A)));
+        assert_eq!(
+            refusal_of(listed_under(md, files, vec![deletes]).await),
+            RefusalReason::DeleteKindUnsupported {
+                path: data_path(&root, "avro"),
                 kind: UnsupportedDelete::AvroPositions,
             }
         );

@@ -657,9 +657,17 @@ impl<'a> Sorted<'a> {
             .filter(move |&at| applies(self.entry(at), sequence))
     }
 
-    /// The deletion vectors that apply to `target`.
-    fn vectors_of(&self, target: &DataTarget) -> impl Iterator<Item = u32> + '_ {
-        self.applying(self.vectors.get(target.path.as_str()), target.sequence)
+    /// The deletion vectors that apply to the data file at `path` of
+    /// data sequence number `sequence`.
+    fn vectors_of(&self, path: &str, sequence: SequenceNumber) -> impl Iterator<Item = u32> + '_ {
+        self.applying(self.vectors.get(path), sequence)
+    }
+
+    /// Whether a deletion vector applies to the data file at `path` of
+    /// data sequence number `sequence`, which masks every position delete
+    /// of that file, readable or not.
+    pub(crate) fn masks(&self, path: &str, sequence: SequenceNumber) -> bool {
+        self.vectors_of(path, sequence).next().is_some()
     }
 
     /// The position delete files that name `target` and apply to it.
@@ -673,7 +681,8 @@ impl<'a> Sorted<'a> {
     fn masking(&self, data: &[DataTarget]) -> Result<Vec<Option<u32>>> {
         data.iter()
             .map(|target| {
-                let mut applying: Vec<u32> = self.vectors_of(target).collect();
+                let mut applying: Vec<u32> =
+                    self.vectors_of(&target.path, target.sequence).collect();
                 applying.sort_by_key(|&at| {
                     let entry = self.entry(at);
                     (&entry.path, vector_range(entry))
@@ -721,18 +730,17 @@ fn vector_range(entry: &DeleteFileEntry) -> (u64, u64) {
     }
 }
 
-/// Per partition, the least sequence number of the data targets `picked`
-/// takes.
-fn oldest_by_partition(
-    data: &[DataTarget],
-    picked: impl Fn(usize) -> bool,
-) -> HashMap<&Partition, SequenceNumber> {
+/// Per partition, the least data sequence number of `files`, each a data
+/// file's partition and data sequence number.
+pub(crate) fn oldest_by_partition<'p>(
+    files: impl IntoIterator<Item = (&'p Partition, SequenceNumber)>,
+) -> HashMap<&'p Partition, SequenceNumber> {
     let mut oldest: HashMap<&Partition, SequenceNumber> = HashMap::new();
-    for (_, target) in data.iter().enumerate().filter(|&(at, _)| picked(at)) {
+    for (partition, sequence) in files {
         oldest
-            .entry(&target.partition)
-            .and_modify(|held| *held = (*held).min(target.sequence))
-            .or_insert(target.sequence);
+            .entry(partition)
+            .and_modify(|held| *held = (*held).min(sequence))
+            .or_insert(sequence);
     }
     oldest
 }
@@ -877,8 +885,17 @@ async fn named_by_unscoped(
         by_path,
         ..
     } = context;
-    let unmasked = oldest_by_partition(data, |at| masking[at].is_none());
-    let uncovered = oldest_by_partition(data, |at| at >= previous.applied.len());
+    let unmasked = oldest_by_partition(
+        data.iter()
+            .zip(masking)
+            .filter(|(_, vector)| vector.is_none())
+            .map(|(target, _)| (&target.partition, target.sequence)),
+    );
+    let uncovered = oldest_by_partition(
+        data.iter()
+            .skip(previous.applied.len())
+            .map(|target| (&target.partition, target.sequence)),
+    );
     let reaches = |oldest: &HashMap<&Partition, SequenceNumber>, delete: &DeleteFileEntry| {
         oldest
             .get(&delete.partition)

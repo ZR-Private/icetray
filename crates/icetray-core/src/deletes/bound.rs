@@ -149,7 +149,7 @@ pub(crate) fn bound(sorted: &Sorted<'_>, data: &[DataTarget]) -> u64 {
     let mut total: u64 = 0;
     let mut reach: HashMap<&Partition, Reach> = HashMap::new();
     for target in data {
-        let vectors: Vec<u32> = sorted.vectors_of(target).collect();
+        let vectors: Vec<u32> = sorted.vectors_of(&target.path, target.sequence).collect();
         let masked = !vectors.is_empty();
         let sources = if masked {
             vectors

@@ -67,7 +67,11 @@ stack (RFD 003), and follows Iceberg's rules:
   dangling deletes behind, and they change no answer. An Avro or ORC
   position delete file that the same test shows applies to nothing is
   ignored as well, since knowing that takes no read of it; only one that
-  may apply is refused.
+  may apply is refused. A deletion vector masks the position deletes of
+  its data file, so such a file applies to nothing when every data file
+  it may apply to is masked: one naming a masked file, or one naming no
+  file whose partition holds no unmasked file it reaches by sequence
+  number.
 - A position delete file whose entry names no data file must be read to
   learn which files it names. It is read only when it may apply to a data
   file of its partition that no deletion vector masks. The files it named
