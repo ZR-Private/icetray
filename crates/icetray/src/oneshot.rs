@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::future::join_all;
-use icetray_core::config::Config;
-use icetray_core::{FindingLog, Opened, Serviceability, Table, admit, diagnose, open, time};
+use icetray_core::config::{Config, TableConfig};
+use icetray_core::{FindingLog, Opened, Table, diagnose, judge, open, time};
 
-use crate::error::{CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK};
+use crate::error::{CliError, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK};
 use crate::key_text;
 use crate::output::{FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, emit};
 
@@ -51,15 +51,16 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// (`Generation::verify_buckets`, which decodes and hashes every key and
 /// which no load or refresh runs) finds a key outside its file's recorded
 /// bucket or cannot finish: that table would answer a present key absent,
-/// so it is a refusal, not an inefficiency or advice (RFD 007). Every
-/// table is loaded with `strict` off, so its findings are reported whatever
-/// its setting, and then judged by `admit` under its configured `strict`:
-/// an inefficient table that `serve` would refuse gets a `refusal` line
-/// after its findings (RFD 016). A `--location` table is never strict
-/// (`Target::config`). The findings are the run's output, so the load
-/// logs them at debug alone. The exit code is `EXIT_FAILURE` when any table was
-/// refused, else `EXIT_INEFFICIENT` when any is inefficient, else
-/// `EXIT_OK`.
+/// so it is a refusal, not a cap or advice (RFD 007). Every table is
+/// loaded with `strict` off, so its findings are reported whatever its
+/// setting, diagnosed against its configured `lookups`, and then judged by
+/// `judge` under its configured `strict`: a table below its level that
+/// `serve` would refuse gets a `refusal` line after its findings (RFD 016,
+/// RFD 020). A `--location` table declares its residency's best level and
+/// is never strict (`Target::config`). The findings are the run's output,
+/// so the load logs them at debug alone. The exit code is `EXIT_FAILURE`
+/// when any table was refused, else `EXIT_BELOW_LEVEL` when any is below
+/// its declared level, else `EXIT_OK`.
 pub async fn doctor(
     config: &Config,
     only: Option<&str>,
@@ -71,7 +72,7 @@ pub async fn doctor(
     }
     let opened = open_tables(&lenient, only, FindingLog::Debug).await?;
     let mut refused = false;
-    let mut inefficient = false;
+    let mut below_level = false;
     for (table, outcome) in load_all(&opened).await {
         match outcome {
             Ok(()) => {
@@ -81,7 +82,8 @@ pub async fn doctor(
                     refused = true;
                     continue;
                 }
-                let report = diagnose(&generation);
+                let configured = configured(config, table.name());
+                let report = diagnose(&generation, configured.lookups());
                 emit(&SummaryLine::new(&report.summary))?;
                 for finding in &report.findings {
                     emit(&FindingLine::new(table.name(), finding))?;
@@ -91,11 +93,18 @@ pub async fn doctor(
                         emit(&FileLine::new(table.name(), file))?;
                     }
                 }
-                if let Err(error) = admit(&report, configured_strict(config, table.name())) {
+                let summary = &report.summary;
+                if let Err(error) = judge(
+                    table.name(),
+                    summary.level,
+                    &report.capping_codes(),
+                    summary.lookups,
+                    configured.strict,
+                ) {
                     emit(&RefusalLine::new(table.name(), &error))?;
                     refused = true;
-                } else if report.summary.serviceability == Serviceability::Inefficient {
-                    inefficient = true;
+                } else if !summary.level.meets(summary.lookups) {
+                    below_level = true;
                 }
             }
             Err(error) => {
@@ -106,23 +115,22 @@ pub async fn doctor(
     }
     let code = if refused {
         EXIT_FAILURE
-    } else if inefficient {
-        EXIT_INEFFICIENT
+    } else if below_level {
+        EXIT_BELOW_LEVEL
     } else {
         EXIT_OK
     };
     Ok(ExitCode::from(code))
 }
 
-/// The `strict` that `config` gives the table named `name`, which `open`
-/// opened from it, so the name is configured.
-fn configured_strict(config: &Config, name: &str) -> bool {
+/// The entry `config` gives the table named `name`, which `open` opened
+/// from it, so the name is configured.
+fn configured<'a>(config: &'a Config, name: &str) -> &'a TableConfig {
     config
         .tables
         .iter()
         .find(|table| table.name == name)
         .expect("every opened table is configured")
-        .strict
 }
 
 /// `info`: one `table` line per table from the doctor's summary. A load
@@ -136,7 +144,8 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     }
     for table in loaded {
         let generation = table.serving()?;
-        emit(&SummaryLine::new(&diagnose(&generation).summary))?;
+        let report = diagnose(&generation, table.config().lookups());
+        emit(&SummaryLine::new(&report.summary))?;
     }
     Ok(())
 }

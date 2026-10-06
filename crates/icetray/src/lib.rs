@@ -21,5 +21,5 @@ pub mod serve;
 pub mod service;
 pub mod telemetry;
 
-pub use error::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE, ServeError};
+pub use error::{EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, ServeError};
 pub use serve::{PeriodicTask, ServeOptions, Serving};

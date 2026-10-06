@@ -1,11 +1,11 @@
-//! The doctor (RFD 007, RFD 016): the tiers, finding codes, penalties, and
-//! thresholds by which a table is classified, applied identically at every
-//! load and in the `doctor` subcommand. `diagnose` is a pure function of a
-//! loaded `Generation`: it reads the footers, page indexes, fences, and
-//! manifest entries the generation holds and nothing else, so the same
-//! generation always gets the same report.
+//! The doctor (RFD 007, RFD 016, RFD 020): the finding codes, the levels
+//! they cap, penalties, and thresholds by which a table is classified,
+//! applied identically at every load and in the `doctor` subcommand.
+//! `diagnose` is a pure function of a loaded `Generation` and the table's
+//! declared level: it reads the footers, page indexes, fences, and manifest
+//! entries the generation holds and nothing else, so the same generation
+//! always gets the same report.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -16,10 +16,11 @@ use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use crate::approx;
 use crate::config::Residency;
 use crate::contract;
-use crate::error::{Error, Result};
+use crate::error::{Error, RefusalReason, Result};
 use crate::generation::{Generation, LoadedFile};
 use crate::index::{FileIndex, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all};
 use crate::key::{Key, KeyType};
+use crate::level::Level;
 use crate::manifest::{DataFileEntry, TableLayout};
 use crate::snapshot::SnapshotId;
 
@@ -29,14 +30,14 @@ use crate::snapshot::SnapshotId;
 pub mod thresholds {
     use crate::contract;
 
-    /// Key page rows above which `large_key_pages` is inefficient: twice
+    /// Key page rows above which `large_key_pages` caps the level: twice
     /// `contract::PAGE_ROWS`. A lookup decodes one key page, so its rows
     /// set the CPU a lookup spends (prototype findings, finding 1: the
     /// writer's default 17,900-row pages served at the same GET count and
     /// cost CPU per lookup instead). The slack up to twice the contract is a
     /// chosen margin, so a writer whose page rounding overshoots the
     /// contract draws no finding (RFD 016, consequences).
-    pub const KEY_PAGE_ROWS_INEFFICIENT: i64 = 2 * contract::PAGE_ROWS;
+    pub const KEY_PAGE_ROWS_LARGE: i64 = 2 * contract::PAGE_ROWS;
 
     /// Mean uncompressed value page bytes above which `large_value_pages`
     /// is advice: 1 MiB, `VALUE_PAGE_ADVICE_FACTOR` times
@@ -120,48 +121,8 @@ const MIN_EXPLAINED_FILES: u64 = 1;
 /// `column_index_truncated`.
 const DISTINCT_MINS_UNOBSERVABLE: f64 = 1.0;
 
-/// What a finding bears on (RFD 007). `Inefficient`: every answer is right
-/// and some lookups do more work, with the penalty measured; `Advice`:
-/// memory, load time, or tuning, and never a wrong answer. Serde gives the
-/// lowercase name. The derived order puts `Advice` first; the report sorts
-/// by its reverse, inefficient findings first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tier {
-    /// Tuning the writer could do; no lookup's answer is wrong for it.
-    Advice,
-    /// Served correctly with a measured penalty per lookup; a refusal when
-    /// the table is `strict`.
-    Inefficient,
-}
-
-/// Whether the generation serves with the contract's work per lookup.
-/// `Inefficient` iff any `Tier::Inefficient` finding, which `strict` turns
-/// into a refusal; advice never changes it. Serde gives the lowercase name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Serviceability {
-    /// One GET per cold hit, none per miss, one contract-sized key page
-    /// decoded, one file probed.
-    Efficient,
-    /// At least one inefficient finding.
-    Inefficient,
-}
-
-impl Serviceability {
-    /// The verdict `inefficient` inefficient findings give: `Inefficient`
-    /// for any.
-    fn from_inefficient(inefficient: usize) -> Self {
-        if inefficient > 0 {
-            Self::Inefficient
-        } else {
-            Self::Efficient
-        }
-    }
-}
-
-/// An inefficient finding's penalty per lookup over the contract layout,
-/// in RFD 007's three units; a unit the finding does not affect is `None`.
+/// A capping finding's penalty per lookup over the contract layout, in RFD
+/// 007's three units; a unit the finding does not affect is `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Penalty {
     /// GETs a hit makes beyond the one value page.
@@ -174,7 +135,7 @@ pub struct Penalty {
 
 impl Penalty {
     /// A penalty in files probed per lookup alone, the unit every
-    /// table-level inefficiency is measured in.
+    /// table-level cap is measured in.
     pub(crate) fn files_probed(files: usize) -> Self {
         Self {
             files_probed_per_lookup: Some(files),
@@ -186,7 +147,7 @@ impl Penalty {
 /// A finding's code (RFD 016). Display and serde give the `snake_case` code
 /// that appears in the doctor's output and the `code` metric label; code
 /// never compares the strings. The derived order is the finding table's
-/// order, which the report sorts by within a tier.
+/// order, which the report sorts by after putting capping findings first.
 // The serde names and Display are the same strings;
 // `test_serialize_finding_code_matches_display` holds them together.
 #[derive(
@@ -197,8 +158,8 @@ pub enum FindingCode {
     /// The value column is dictionary-encoded; its dictionary page costs one
     /// extra GET per hit.
     DictionaryEncodedValue,
-    /// Key pages hold more rows than the inefficient threshold; a lookup
-    /// decodes them all.
+    /// Key pages hold more rows than `thresholds::KEY_PAGE_ROWS_LARGE`;
+    /// a lookup decodes them all.
     LargeKeyPages,
     /// No bucket transform on the key and more than one file; a lookup
     /// probes every file.
@@ -258,6 +219,26 @@ impl FindingCode {
         Self::BloomOversized,
         Self::BloomUndersized,
     ];
+
+    /// The level a finding of this code caps a table at (RFD 020), `None`
+    /// for advice, which caps nothing. A cost within one file caps it at
+    /// `balanced`; more than one file probed, at `permissive`.
+    pub fn cap(self) -> Option<Level> {
+        match self {
+            Self::DictionaryEncodedValue | Self::LargeKeyPages => Some(Level::Balanced),
+            Self::NoBucketPartition | Self::OverlappingFiles => Some(Level::Permissive),
+            Self::BoundsMissing
+            | Self::ColumnIndexTruncated
+            | Self::LargeValuePages
+            | Self::ValuePagesOverCeiling
+            | Self::LongKeys
+            | Self::LargeFile
+            | Self::ManyFilesPerBucket
+            | Self::NoBloomFilter
+            | Self::BloomOversized
+            | Self::BloomUndersized => None,
+        }
+    }
 }
 
 impl fmt::Display for FindingCode {
@@ -338,17 +319,6 @@ pub enum WriterProperty {
     SkewSplitting,
 }
 
-impl fmt::Display for Tier {
-    /// The lowercase name serde gives, so a log line's tier reads as the
-    /// doctor's JSON line's.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Advice => "advice",
-            Self::Inefficient => "inefficient",
-        })
-    }
-}
-
 impl fmt::Display for WriterProperty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let property = match self {
@@ -370,17 +340,18 @@ impl fmt::Display for WriterProperty {
     }
 }
 
-/// One observation about a generation: its tier and code decide what it
-/// means, the message carries the numbers for a reader, and the property
-/// names what a writer changes; `penalty` is `Some` exactly for
-/// `Tier::Inefficient`. The fields are private and `inefficient` and
-/// `advice` are the only constructors, so the tier and the penalty cannot
-/// disagree: an inefficient finding always carries one and advice never
-/// does. Serializes with the field names of
-/// its getters.
+/// One observation about a generation: its code decides what it means and
+/// the level it caps, the message carries the numbers for a reader, and the
+/// property names what a writer changes; `penalty` is `Some` exactly when
+/// `caps` is. The fields are private and `cost` and `advice` are the only
+/// constructors: `cost` takes `caps` from the code (`FindingCode::cap`)
+/// with a penalty, `advice` sets neither, and each debug-asserts that its
+/// code is one it builds, so a capping code's finding is a cost and every
+/// other is advice. Serializes with the field names of its getters, `caps`
+/// as null for advice.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
-    tier: Tier,
+    caps: Option<Level>,
     code: FindingCode,
     message: String,
     file: Option<String>,
@@ -389,17 +360,18 @@ pub struct Finding {
 }
 
 impl Finding {
-    /// An inefficient finding, served with `penalty`; `file` names the
-    /// data file, `None` for a table-level one.
-    pub(crate) fn inefficient(
+    /// A capping finding, served with `penalty`; `file` names the data
+    /// file, `None` for a table-level one.
+    pub(crate) fn cost(
         code: FindingCode,
         file: Option<&str>,
         message: String,
         penalty: Penalty,
         property: Option<WriterProperty>,
     ) -> Self {
+        debug_assert!(code.cap().is_some(), "{code} caps no level");
         Self {
-            tier: Tier::Inefficient,
+            caps: code.cap(),
             code,
             message,
             file: file.map(str::to_string),
@@ -409,18 +381,18 @@ impl Finding {
     }
 
     /// An advice finding: no answer is wrong and no lookup does more work,
-    /// so there is no penalty.
-    /// Public so a crate that renders findings can build one in its tests;
-    /// `inefficient` is crate-private, since only the diagnosis measures a
-    /// penalty.
+    /// so it caps no level and carries no penalty. Public so a crate that
+    /// renders findings can build one in its tests; `cost` is crate-private,
+    /// since only the diagnosis measures a penalty.
     pub fn advice(
         code: FindingCode,
         file: Option<&str>,
         message: String,
         property: Option<WriterProperty>,
     ) -> Self {
+        debug_assert!(code.cap().is_none(), "{code} caps a level");
         Self {
-            tier: Tier::Advice,
+            caps: None,
             code,
             message,
             file: file.map(str::to_string),
@@ -429,9 +401,9 @@ impl Finding {
         }
     }
 
-    /// Inefficient or advice.
-    pub fn tier(&self) -> Tier {
-        self.tier
+    /// The level the finding caps the table at; `None` for advice.
+    pub fn caps(&self) -> Option<Level> {
+        self.caps
     }
 
     /// The finding's code.
@@ -450,7 +422,7 @@ impl Finding {
         self.file.as_deref()
     }
 
-    /// The measured penalty; `Some` exactly for an inefficient finding.
+    /// The measured penalty; `Some` exactly when `caps` is.
     pub fn penalty(&self) -> Option<Penalty> {
         self.penalty
     }
@@ -533,8 +505,11 @@ pub struct TableSummary {
     pub table: String,
     /// The snapshot diagnosed.
     pub snapshot_id: SnapshotId,
-    /// Efficient or inefficient.
-    pub serviceability: Serviceability,
+    /// The level the snapshot's layout achieves in the loaded tier: the
+    /// dearest cap any finding or the residency sets (RFD 020).
+    pub level: Level,
+    /// The level the table declares (`TableConfig::lookups`).
+    pub lookups: Level,
     /// The tier the generation was loaded in.
     pub residency: Residency,
     /// Live data files in the snapshot.
@@ -553,52 +528,68 @@ pub struct TableSummary {
     /// Every tier's resident bytes, from the footers alone (RFD 017), so an
     /// owner chooses a tier from one run.
     pub predicted: ResidentBytes,
-    /// Inefficient findings, the count of `Tier::Inefficient`.
-    pub inefficient: usize,
-    /// Advice findings, the count of `Tier::Advice`.
+    /// The level the layout achieves in every tier: its findings' dearest
+    /// cap and the tier's best level together, so an owner sees which tiers
+    /// reach a level beside what each costs in `predicted`.
+    pub level_by_residency: BTreeMap<Residency, Level>,
+    /// Capping findings, the count of those whose `caps` is set.
+    pub capping: usize,
+    /// Advice findings, the count of those whose `caps` is `None`.
     pub advice: usize,
 }
 
-/// The whole report: the summary, the findings inefficient first, and one
+/// The whole report: the summary, the capping findings first, and one
 /// report per file in generation order.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct TableReport {
     /// The verdict and the table-level numbers.
     pub summary: TableSummary,
-    /// Every finding, `Inefficient` before `Advice`, then in the finding
-    /// table's order, then by file in generation order.
+    /// Every finding, capping before advice, then in the finding table's
+    /// order, then by file in generation order.
     pub findings: Vec<Finding>,
     /// One report per file, in generation order.
     pub files: Vec<FileReport>,
 }
 
-/// Diagnoses `g` (RFD 016): measures every file from what the generation
-/// holds, raises each finding of the finding table whose trigger the
-/// measurements meet, and sums every tier's predicted resident bytes from
-/// the footers. No I/O and no metrics; `Serviceability::Inefficient` iff a
-/// `Tier::Inefficient` finding was raised.
-pub fn diagnose(g: &Generation) -> TableReport {
+impl TableReport {
+    /// The distinct codes of the capping findings, in the report's order:
+    /// what `judge` chooses a `below_level` refusal's codes from.
+    pub fn capping_codes(&self) -> Vec<FindingCode> {
+        capping_codes(&self.findings)
+    }
+}
+
+/// Diagnoses `g` (RFD 016) for a table that declares `lookups`: measures
+/// every file from what the generation holds, raises each finding of the
+/// finding table whose trigger the measurements meet, the capping ones
+/// through `layout_caps`, and sums every tier's predicted resident bytes
+/// from the footers. No I/O and no metrics.
+pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
+    let caps = layout_caps(&LayoutView::of(g));
     let facts: Vec<FileFacts> = g
         .files
         .iter()
         .map(|file| measure(file, &g.layout))
         .collect();
     let buckets = by_bucket(&facts);
-    let mut findings: Vec<Finding> = facts
-        .iter()
-        .flat_map(|file| file_findings(file, &g.layout))
-        .collect();
-    findings.extend(table_findings(g, &buckets));
+    let mut findings = caps.findings;
+    findings.extend(
+        facts
+            .iter()
+            .flat_map(|file| file_advice_findings(file, &g.layout)),
+    );
+    findings.extend(many_files_findings(&buckets));
     sort_findings(&mut findings);
-    let inefficient = findings
+    let predicted = predicted_total(&facts);
+    let capping = findings
         .iter()
-        .filter(|finding| finding.tier() == Tier::Inefficient)
+        .filter(|finding| finding.caps().is_some())
         .count();
-    let serviceability = Serviceability::from_inefficient(inefficient);
     let summary = TableSummary {
         table: g.table.clone(),
         snapshot_id: g.snapshot_id,
-        serviceability,
+        level: caps.level,
+        lookups,
         residency: g.residency,
         file_count: g.files.len(),
         buckets: g.layout.bucketing.map(|bucketing| bucketing.count),
@@ -606,9 +597,10 @@ pub fn diagnose(g: &Generation) -> TableReport {
         max_files_per_bucket: buckets.values().map(Vec::len).max().unwrap_or(0),
         records: g.records,
         index_bytes: g.index_bytes,
-        predicted: predicted_total(&facts),
-        inefficient,
-        advice: findings.len() - inefficient,
+        predicted,
+        level_by_residency: level_by_residency(caps.layout, &predicted),
+        capping,
+        advice: findings.len() - capping,
     };
     TableReport {
         summary,
@@ -617,30 +609,55 @@ pub fn diagnose(g: &Generation) -> TableReport {
     }
 }
 
-/// The strict gate's verdict on `report` (RFD 007, RFD 016):
-/// `Error::Inefficient`, with the distinct inefficient codes in the
-/// report's order, when the report is inefficient and `strict` is on; `Ok`
-/// otherwise, since advice never bears on admission. The load decides
-/// whether a generation is swapped in through it, and the doctor whether a
-/// configured table is reported refused, so the two cannot disagree.
-pub fn admit(report: &TableReport, strict: bool) -> Result<()> {
-    match report.summary.serviceability {
-        Serviceability::Inefficient if strict => Err(Error::Inefficient {
-            table: report.summary.table.clone(),
-            findings: inefficient_codes(&report.findings),
-        }),
-        Serviceability::Inefficient | Serviceability::Efficient => Ok(()),
+/// The level `layout` achieves in each tier that can load the table, with
+/// that tier's best level: a tier `predicted` holds no figure for (bloom,
+/// when a row group lacks a filter) is left out.
+fn level_by_residency(layout: Level, predicted: &ResidentBytes) -> BTreeMap<Residency, Level> {
+    Residency::ALL
+        .into_iter()
+        .filter(|residency| predicted.in_tier(*residency).is_some())
+        .map(|residency| (residency, layout.max(residency.best_level())))
+        .collect()
+}
+
+/// The level gate (RFD 020): `RefusalReason::BelowLevel` under `table`
+/// when `level` does not meet `declared` and `strict` is on; `Ok`
+/// otherwise, since a table below its level that is not strict is flagged
+/// and served. The refusal names those of the capping `codes` whose cap
+/// does not meet `declared`, never one the declared level accepts. The load
+/// decides whether a snapshot is swapped in through it, and the doctor
+/// whether a configured table is reported refused, so the two cannot
+/// disagree.
+pub fn judge(
+    table: &str,
+    level: Level,
+    codes: &[FindingCode],
+    declared: Level,
+    strict: bool,
+) -> Result<()> {
+    if strict && !level.meets(declared) {
+        Err(Error::refused(
+            table,
+            RefusalReason::BelowLevel {
+                declared,
+                achieved: level,
+                findings: codes
+                    .iter()
+                    .copied()
+                    .filter(|code| code.cap().is_some_and(|cap| !cap.meets(declared)))
+                    .collect(),
+            },
+        ))
+    } else {
+        Ok(())
     }
 }
 
-/// The distinct codes of the inefficient findings, in the order the report
-/// gives them: what `Error::Inefficient` carries.
-fn inefficient_codes(findings: &[Finding]) -> Vec<FindingCode> {
+/// The distinct codes of the capping findings, in the order `findings`
+/// gives them.
+fn capping_codes(findings: &[Finding]) -> Vec<FindingCode> {
     let mut codes = Vec::new();
-    for finding in findings
-        .iter()
-        .filter(|finding| finding.tier() == Tier::Inefficient)
-    {
+    for finding in findings.iter().filter(|finding| finding.caps().is_some()) {
         if !codes.contains(&finding.code()) {
             codes.push(finding.code());
         }
@@ -648,14 +665,92 @@ fn inefficient_codes(findings: &[Finding]) -> Vec<FindingCode> {
     codes
 }
 
-/// Everything measured about one file: its report, and what the findings
-/// need beyond it (the manifest's size, the rows as a count, whether the
-/// value column is dictionary-encoded, and the footer's prediction).
+/// What a snapshot's level for its layout is judged from (RFD 020): the
+/// table's layout and residency, each file's manifest entry and footer, and
+/// per bucket the widest overlap group touching it. A built generation
+/// gives every part exactly (`LayoutView::of`); none needs a key chunk.
+pub(crate) struct LayoutView<'a> {
+    pub(crate) layout: &'a TableLayout,
+    pub(crate) residency: Residency,
+    pub(crate) files: Vec<FileView<'a>>,
+    /// Per bucket, the widest overlap group touching it, as
+    /// `Generation::overlapping_buckets` gives it.
+    pub(crate) overlapping: &'a BTreeMap<u32, usize>,
+}
+
+/// One file as a level is judged from it: its manifest entry and footer,
+/// with the key and value columns' leaf positions in the footer's schema.
+pub(crate) struct FileView<'a> {
+    pub(crate) entry: &'a DataFileEntry,
+    pub(crate) metadata: &'a ParquetMetaData,
+    pub(crate) key_leaf: usize,
+    pub(crate) value_leaf: usize,
+}
+
+impl<'a> LayoutView<'a> {
+    /// The view of a built generation.
+    pub(crate) fn of(g: &'a Generation) -> Self {
+        Self {
+            layout: &g.layout,
+            residency: g.residency,
+            files: g
+                .files
+                .iter()
+                .map(|file| FileView {
+                    entry: &file.entry,
+                    metadata: file.index.metadata(),
+                    key_leaf: file.index.key_leaf(),
+                    value_leaf: file.index.value_leaf(),
+                })
+                .collect(),
+            overlapping: g.overlapping_buckets(),
+        }
+    }
+}
+
+/// A snapshot's level for its layout and the findings that set it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Caps {
+    /// The level in the view's residency: the dearest of `layout` and the
+    /// residency's best level.
+    pub(crate) level: Level,
+    /// The dearest cap the findings set, whatever the residency; `optimal`
+    /// for none.
+    pub(crate) layout: Level,
+    /// The capping findings, files in view order then the table's.
+    pub(crate) findings: Vec<Finding>,
+}
+
+/// The capping findings `view` raises and the level they and its residency
+/// allow (RFD 020): the one function the doctor's report and the load's
+/// level gate both judge a level by, so the two cannot disagree. Per file,
+/// a dictionary-encoded value column and large key pages; per table, files
+/// written with no bucket partition and overlapping files. No `f64`
+/// enters.
+pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
+    let mut findings = Vec::new();
+    for file in &view.files {
+        file_capping_findings(file, view.layout, &mut findings);
+    }
+    table_capping_findings(view, &mut findings);
+    let layout = findings
+        .iter()
+        .filter_map(Finding::caps)
+        .fold(Level::Optimal, Level::max);
+    Caps {
+        level: layout.max(view.residency.best_level()),
+        layout,
+        findings,
+    }
+}
+
+/// Everything measured about one file: its report, and what the advice
+/// findings need beyond it (the manifest's size, the rows as a count, and
+/// the footer's prediction).
 struct FileFacts {
     report: FileReport,
     size: u64,
     rows: u64,
-    value_dictionary: bool,
     predicted: ResidentBytes,
     bloom_by_row_group: Option<BloomExtremes>,
 }
@@ -760,7 +855,6 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
         },
         size: file.entry.size,
         rows: rows_of(index),
-        value_dictionary: chunks.value_dictionary,
         predicted,
         bloom_by_row_group: bloom_extremes(metadata, index.key_leaf()),
     }
@@ -907,24 +1001,24 @@ fn bounds_intact(entry: &DataFileEntry, (first, last): (&Key, &Key)) -> bool {
     }
 }
 
-/// Every finding of the finding table that one file's measurements
-/// trigger, in the table's order.
-fn file_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
+/// Every advice finding of the finding table that one file's
+/// measurements trigger, in the table's order.
+fn file_advice_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
     let mut findings = Vec::new();
-    file_inefficient_findings(facts, layout, &mut findings);
-    file_advice_findings(facts, layout, &mut findings);
+    file_layout_advice(facts, layout, &mut findings);
     bloom_findings(facts, layout, &mut findings);
     findings
 }
 
-/// The per-file inefficient findings: a dictionary-encoded value column
-/// and large key pages. `f64` never enters.
-fn file_inefficient_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
-    let report = &facts.report;
-    if facts.value_dictionary {
-        findings.push(Finding::inefficient(
+/// The per-file capping findings, from the file's footer and manifest
+/// entry alone: a dictionary-encoded value column and large key pages.
+fn file_capping_findings(file: &FileView<'_>, layout: &TableLayout, findings: &mut Vec<Finding>) {
+    let path = &file.entry.path;
+    let chunks = chunk_facts(file.metadata, file.key_leaf, file.value_leaf);
+    if chunks.value_dictionary {
+        findings.push(Finding::cost(
             FindingCode::DictionaryEncodedValue,
-            Some(&report.path),
+            Some(path),
             format!(
                 "value column {value} is dictionary-encoded; a hit fetches its dictionary page besides the value page, {gets} extra GET ({property}=false)",
                 value = layout.value_column,
@@ -938,19 +1032,19 @@ fn file_inefficient_findings(facts: &FileFacts, layout: &TableLayout, findings: 
             Some(WriterProperty::EnableDictionary),
         ));
     }
-    if report.max_key_page_rows > thresholds::KEY_PAGE_ROWS_INEFFICIENT {
-        findings.push(Finding::inefficient(
+    let rows = page_facts(file.metadata, file.key_leaf, file.value_leaf).max_key_page_rows;
+    if rows > thresholds::KEY_PAGE_ROWS_LARGE {
+        findings.push(Finding::cost(
             FindingCode::LargeKeyPages,
-            Some(&report.path),
+            Some(path),
             format!(
                 "key pages hold up to {rows} rows, above {limit}; a lookup decodes that many keys ({property}={contract_rows})",
-                rows = report.max_key_page_rows,
-                limit = thresholds::KEY_PAGE_ROWS_INEFFICIENT,
+                limit = thresholds::KEY_PAGE_ROWS_LARGE,
                 property = WriterProperty::PageRowLimit,
                 contract_rows = contract::PAGE_ROWS,
             ),
             Penalty {
-                keys_decoded_per_lookup: Some(report.max_key_page_rows),
+                keys_decoded_per_lookup: Some(rows),
                 ..Penalty::default()
             },
             Some(WriterProperty::PageRowLimit),
@@ -963,7 +1057,7 @@ fn file_inefficient_findings(facts: &FileFacts, layout: &TableLayout, findings: 
 /// length, file size. The one `f64` comparison is on
 /// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
 /// a zero denominator), so a plain comparison is total.
-fn file_advice_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
+fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if !report.bounds_present {
         findings.push(Finding::advice(
@@ -1098,35 +1192,34 @@ fn bloom_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Fi
     }
 }
 
-/// The table-level findings: no bucket partition, overlapping files per
-/// bucket, and many files per bucket.
-fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    let key = &g.layout.key_column;
+/// The table-level capping findings: files written with no bucket
+/// partition, and overlapping files per bucket.
+fn table_capping_findings(view: &LayoutView<'_>, findings: &mut Vec<Finding>) {
+    let key = &view.layout.key_column;
+    let total = view.files.len();
     // Every file written under a spec with no bucket on the key is a
     // candidate for every lookup; a bucketed file joins them only for the
     // bucket the key hashes to. The default spec says nothing about which
     // files those are after a spec evolution.
-    let unbucketed = g
+    let unbucketed = view
         .files
         .iter()
         .filter(|file| file.entry.bucketing.is_none())
         .count();
-    if unbucketed > 0 && g.files.len() > 1 {
-        let probed = unbucketed + usize::from(unbucketed < g.files.len());
-        findings.push(Finding::inefficient(
+    if unbucketed > 0 && total > 1 {
+        let probed = unbucketed + usize::from(unbucketed < total);
+        findings.push(Finding::cost(
             FindingCode::NoBucketPartition,
             None,
             format!(
                 "{unbucketed} of {total} files were written under a spec with no bucket transform on {key}; a lookup probes every one of them whose key range covers the key, plus the bucketed file its key hashes to (partition by bucket(N, {key}) and rewrite the unbucketed files)",
-                total = g.files.len(),
             ),
             Penalty::files_probed(probed),
             None,
         ));
     }
-    for (&bucket, &probed) in g.overlapping_buckets() {
-        findings.push(Finding::inefficient(
+    for (&bucket, &probed) in view.overlapping {
+        findings.push(Finding::cost(
             FindingCode::OverlappingFiles,
             None,
             format!(
@@ -1137,6 +1230,11 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
             Some(WriterProperty::SkewSplitting),
         ));
     }
+}
+
+/// The table-level advice: many files per bucket.
+fn many_files_findings(buckets: &Buckets<'_>) -> Vec<Finding> {
+    let mut findings = Vec::new();
     for (&bucket, files) in buckets {
         let bytes: u64 = files.iter().map(|file| file.size).sum();
         let explained = bytes
@@ -1158,12 +1256,12 @@ fn table_findings(g: &Generation, buckets: &Buckets<'_>) -> Vec<Finding> {
     findings
 }
 
-/// Inefficient before advice, then the finding table's order, then by file in
+/// Capping before advice, then the finding table's order, then by file in
 /// generation order, which is the order the findings were raised in and
 /// the stable sort keeps, so two runs over one generation print the same
 /// report.
 fn sort_findings(findings: &mut [Finding]) {
-    findings.sort_by_key(|finding| (Reverse(finding.tier()), finding.code()));
+    findings.sort_by_key(|finding| (finding.caps().is_none(), finding.code()));
 }
 
 /// Every tier's resident bytes for the table, from the footers alone: each
@@ -1199,8 +1297,8 @@ mod tests {
 
     use super::thresholds::{
         BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
-        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_INEFFICIENT,
-        MOST_VALUE_PAGE_BYTES, VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
+        FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
+        VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
     use crate::error::Error;
@@ -1221,8 +1319,8 @@ mod tests {
     const CONTRACT_KEYS: i64 = 96;
     const MIN_BUCKET_KEYS: usize = 16;
     /// Rows of the large-key-page fixture: one page just above the
-    /// inefficient threshold.
-    const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_INEFFICIENT + 1;
+    /// threshold where large key pages cap the level.
+    const LARGE_PAGE_ROWS: i64 = KEY_PAGE_ROWS_LARGE + 1;
     /// How many advice thresholds the large-value-page fixture's one page
     /// spans: two, so its mean is above the line and not at it.
     const LARGE_VALUE_PAGE_FACTOR: u64 = 2;
@@ -1459,7 +1557,7 @@ mod tests {
     /// A finding as the tests assert it: everything but the message.
     type Shape = (
         FindingCode,
-        Tier,
+        Option<Level>,
         Option<Penalty>,
         Option<WriterProperty>,
         Option<String>,
@@ -1471,7 +1569,7 @@ mod tests {
             .map(|finding| {
                 (
                     finding.code(),
-                    finding.tier(),
+                    finding.caps(),
                     finding.penalty(),
                     finding.property(),
                     finding.file().map(str::to_string),
@@ -1480,25 +1578,26 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `report` raised exactly `expected`, in order, that every
-    /// inefficient finding and no advice carries a penalty, and that the summary's
-    /// counts and serviceability follow them.
+    /// Asserts `report` raised exactly `expected`, in order, that a finding
+    /// carries a penalty exactly when it caps the level, and that the
+    /// summary's counts and level follow them in the loaded tier.
     fn assert_findings(report: &TableReport, expected: &[Shape]) {
         assert_eq!(shapes_of(&report.findings), expected);
-        let inefficient = expected
+        let capping = expected
             .iter()
-            .filter(|(_, tier, ..)| *tier == Tier::Inefficient)
+            .filter(|(_, caps, ..)| caps.is_some())
             .count();
-        assert_eq!(report.summary.inefficient, inefficient);
-        assert_eq!(report.summary.advice, expected.len() - inefficient);
-        assert_eq!(
-            report.summary.serviceability,
-            Serviceability::from_inefficient(inefficient)
-        );
+        assert_eq!(report.summary.capping, capping);
+        assert_eq!(report.summary.advice, expected.len() - capping);
+        let dearest = expected
+            .iter()
+            .filter_map(|(_, caps, ..)| *caps)
+            .fold(report.summary.residency.best_level(), Level::max);
+        assert_eq!(report.summary.level, dearest);
         for finding in &report.findings {
             assert_eq!(
                 finding.penalty().is_some(),
-                finding.tier() == Tier::Inefficient,
+                finding.caps().is_some(),
                 "{:?}",
                 finding.code
             );
@@ -1506,20 +1605,25 @@ mod tests {
     }
 
     #[test]
-    fn test_from_inefficient_is_inefficient_for_any_inefficient_finding() {
+    fn test_cap_of_every_code_is_the_rfd_table() {
+        let capped: Vec<(FindingCode, Level)> = FindingCode::ALL
+            .into_iter()
+            .filter_map(|code| code.cap().map(|cap| (code, cap)))
+            .collect();
         assert_eq!(
-            Serviceability::from_inefficient(0),
-            Serviceability::Efficient
-        );
-        assert_eq!(
-            Serviceability::from_inefficient(1),
-            Serviceability::Inefficient
+            capped,
+            [
+                (FindingCode::DictionaryEncodedValue, Level::Balanced),
+                (FindingCode::LargeKeyPages, Level::Balanced),
+                (FindingCode::NoBucketPartition, Level::Permissive),
+                (FindingCode::OverlappingFiles, Level::Permissive),
+            ]
         );
     }
 
     #[test]
     fn test_thresholds_derive_from_contract() {
-        assert_eq!(KEY_PAGE_ROWS_INEFFICIENT, 2 * contract::PAGE_ROWS);
+        assert_eq!(KEY_PAGE_ROWS_LARGE, 2 * contract::PAGE_ROWS);
         assert_eq!(
             VALUE_PAGE_BYTES_ADVICE,
             VALUE_PAGE_ADVICE_FACTOR * contract::VALUE_PAGE_BYTES
@@ -1611,36 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_tier_matches_display() {
-        for tier in [Tier::Advice, Tier::Inefficient] {
-            assert_eq!(
-                serde_json::to_value(tier).unwrap(),
-                Json::String(tier.to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn test_serialize_tier_and_serviceability_snake_case() {
-        assert_eq!(
-            serde_json::to_value(Tier::Advice).unwrap(),
-            Json::String("advice".to_string())
-        );
-        assert_eq!(
-            serde_json::to_value(Tier::Inefficient).unwrap(),
-            Json::String("inefficient".to_string())
-        );
-        assert_eq!(
-            serde_json::to_value(Serviceability::Efficient).unwrap(),
-            Json::String("efficient".to_string())
-        );
-        assert_eq!(
-            serde_json::to_value(Serviceability::Inefficient).unwrap(),
-            Json::String("inefficient".to_string())
-        );
-    }
-
-    #[test]
     fn test_bounds_intact_requires_both_bounds_at_least_as_long_as_the_exact_keys() {
         let keys = string_keys(FILE_KEYS);
         let (first, last) = (&keys[0], keys.last().unwrap());
@@ -1682,12 +1756,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_contract_fixture_is_efficient_with_no_findings() {
+    async fn test_diagnose_contract_fixture_is_optimal_with_no_findings() {
         let mut table = contract_table().await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(&report, &[]);
         let summary = &report.summary;
+        assert_eq!(summary.level, Level::Optimal);
         assert_eq!(summary.table, TABLE);
         assert_eq!(summary.snapshot_id, SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(summary.residency, Residency::Full);
@@ -1725,18 +1800,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_dictionary_encoded_value_is_inefficient_by_one_extra_get() {
+    async fn test_diagnose_dictionary_encoded_value_caps_balanced_by_one_extra_get() {
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::DictionaryEncodedValue,
-                Tier::Inefficient,
+                Some(Level::Balanced),
                 Some(Penalty {
                     extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
                     ..Penalty::default()
@@ -1755,7 +1830,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(layout).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].dictionary_columns, [KEY_COLUMN]);
     }
@@ -1771,12 +1846,15 @@ mod tests {
         table
             .add_file(file("f", &keys, Partition::Bucket(0), layout))
             .await;
-        let report = diagnose(&load(&mut table, Residency::Full, None).await);
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
         assert_findings(
             &report,
             &[(
                 FindingCode::LargeKeyPages,
-                Tier::Inefficient,
+                Some(Level::Balanced),
                 Some(Penalty {
                     keys_decoded_per_lookup: Some(LARGE_PAGE_ROWS),
                     ..Penalty::default()
@@ -1793,12 +1871,15 @@ mod tests {
     async fn test_diagnose_no_bucket_partition_penalty_is_every_file_probed() {
         let mut table = Table::new(KeyType::Long, unpartitioned());
         two_disjoint_files(&mut table, Partition::None, WriterLayout::contract()).await;
-        let report = diagnose(&load(&mut table, Residency::Full, None).await);
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
         assert_findings(
             &report,
             &[(
                 FindingCode::NoBucketPartition,
-                Tier::Inefficient,
+                Some(Level::Permissive),
                 Some(Penalty::files_probed(2)),
                 None,
                 None,
@@ -1822,12 +1903,15 @@ mod tests {
             .collect();
         assert!(!in_bucket_one.is_empty());
         table.add_long_file("g1", &in_bucket_one, 1).await;
-        let report = diagnose(&load(&mut table, Residency::Full, None).await);
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
         assert_findings(
             &report,
             &[(
                 FindingCode::NoBucketPartition,
-                Tier::Inefficient,
+                Some(Level::Permissive),
                 Some(Penalty::files_probed(3)),
                 None,
                 None,
@@ -1904,7 +1988,7 @@ mod tests {
             bloom_shapes(&facts, &generation.layout),
             [(
                 FindingCode::BloomUndersized,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::BloomFilterNdvColumn),
                 Some(facts.report.path.clone()),
@@ -1919,7 +2003,7 @@ mod tests {
             bloom_shapes(&facts, &generation.layout),
             [(
                 FindingCode::BloomOversized,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::BloomFilterMaxBytes),
                 Some(facts.report.path.clone()),
@@ -1943,12 +2027,12 @@ mod tests {
         table.add_long_file("b", &interleaved, 0).await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 1);
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::OverlappingFiles,
-                Tier::Inefficient,
+                Some(Level::Permissive),
                 Some(Penalty::files_probed(2)),
                 Some(WriterProperty::SkewSplitting),
                 None,
@@ -1968,12 +2052,12 @@ mod tests {
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.files[0].entry.key_min, None);
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::BoundsMissing,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::MetricsColumn),
                 Some(table.path_of("f")),
@@ -1994,12 +2078,12 @@ mod tests {
         let entry = &generation.files[0].entry;
         assert!(entry.key_min.is_some() && entry.key_max.is_some());
         assert_eq!(generation.layout.key_type, KeyType::String);
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::BoundsMissing,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::MetricsColumn),
                 Some(table.path_of("f")),
@@ -2017,7 +2101,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, whole) = one_string_file(&keys, Bounds::Exact, small_pages).await;
-        let report = diagnose(&whole);
+        let report = diagnose(&whole, Level::Optimal);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].key_pages, pages);
         assert_eq!(
@@ -2030,12 +2114,12 @@ mod tests {
             ..small_pages
         };
         let (table, generation) = one_string_file(&keys, Bounds::Exact, truncated).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::ColumnIndexTruncated,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::ColumnIndexTruncateLength),
                 Some(table.path_of("f")),
@@ -2074,12 +2158,15 @@ mod tests {
                 ..file("f", &keys, Partition::Bucket(0), WriterLayout::contract())
             })
             .await;
-        let report = diagnose(&load(&mut table, Residency::Full, None).await);
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
         assert_findings(
             &report,
             &[(
                 FindingCode::LargeValuePages,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::PageSizeBytes),
                 Some(table.path_of("f")),
@@ -2107,21 +2194,21 @@ mod tests {
             })
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         let path = Some(table.path_of("f"));
         assert_findings(
             &report,
             &[
                 (
                     FindingCode::LargeValuePages,
-                    Tier::Advice,
+                    None,
                     None,
                     Some(WriterProperty::PageSizeBytes),
                     path.clone(),
                 ),
                 (
                     FindingCode::ValuePagesOverCeiling,
-                    Tier::Advice,
+                    None,
                     None,
                     Some(WriterProperty::PageSizeBytes),
                     path,
@@ -2157,12 +2244,12 @@ mod tests {
             .collect();
         let (table, generation) =
             one_string_file(&keys, Bounds::Exact, WriterLayout::contract()).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::LongKeys,
-                Tier::Advice,
+                None,
                 None,
                 None,
                 Some(table.path_of("f")),
@@ -2172,21 +2259,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_findings_large_file_above_the_advice_size() {
+    async fn test_file_advice_findings_large_file_above_the_advice_size() {
         let (_table, generation) = one_file(WriterLayout::contract()).await;
         let mut facts = measure(&generation.files[0], &generation.layout);
-        assert!(file_findings(&facts, &generation.layout).is_empty());
+        assert!(file_advice_findings(&facts, &generation.layout).is_empty());
         facts.size = FILE_BYTES_ADVICE;
         assert!(
-            file_findings(&facts, &generation.layout).is_empty(),
+            file_advice_findings(&facts, &generation.layout).is_empty(),
             "the threshold itself passes"
         );
         facts.size = FILE_BYTES_ADVICE + 1;
         assert_eq!(
-            shapes_of(&file_findings(&facts, &generation.layout)),
+            shapes_of(&file_advice_findings(&facts, &generation.layout)),
             [(
                 FindingCode::LargeFile,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::TargetFileSizeBytes),
                 Some(facts.report.path.clone()),
@@ -2205,16 +2292,10 @@ mod tests {
         }
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 0);
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
-            &[(
-                FindingCode::ManyFilesPerBucket,
-                Tier::Advice,
-                None,
-                None,
-                None,
-            )],
+            &[(FindingCode::ManyFilesPerBucket, None, None, None, None)],
         );
         assert_eq!(report.summary.buckets_with_files, 1);
         assert_eq!(
@@ -2230,12 +2311,12 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::NoBloomFilter,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::BloomFilterEnabled),
                 Some(table.path_of("f")),
@@ -2254,12 +2335,12 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_findings(
             &report,
             &[(
                 FindingCode::BloomOversized,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::BloomFilterMaxBytes),
                 Some(table.path_of("f")),
@@ -2281,12 +2362,15 @@ mod tests {
         table
             .add_file(file("f", &keys, Partition::Bucket(0), layout))
             .await;
-        let report = diagnose(&load(&mut table, Residency::Full, None).await);
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
         assert_findings(
             &report,
             &[(
                 FindingCode::BloomUndersized,
-                Tier::Advice,
+                None,
                 None,
                 Some(WriterProperty::BloomFilterNdvColumn),
                 Some(table.path_of("f")),
@@ -2296,7 +2380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_orders_inefficient_before_advice_then_code_then_file() {
+    async fn test_diagnose_orders_capping_before_advice_then_code_then_file() {
         let mut table = Table::new(KeyType::Long, unpartitioned());
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
@@ -2314,7 +2398,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [a.clone(), b.clone()]
         );
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         let dictionary = Some(Penalty {
             extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
             ..Penalty::default()
@@ -2324,35 +2408,35 @@ mod tests {
             &[
                 (
                     FindingCode::DictionaryEncodedValue,
-                    Tier::Inefficient,
+                    Some(Level::Balanced),
                     dictionary,
                     Some(WriterProperty::EnableDictionary),
                     Some(a.clone()),
                 ),
                 (
                     FindingCode::DictionaryEncodedValue,
-                    Tier::Inefficient,
+                    Some(Level::Balanced),
                     dictionary,
                     Some(WriterProperty::EnableDictionary),
                     Some(b.clone()),
                 ),
                 (
                     FindingCode::NoBucketPartition,
-                    Tier::Inefficient,
+                    Some(Level::Permissive),
                     Some(Penalty::files_probed(2)),
                     None,
                     None,
                 ),
                 (
                     FindingCode::NoBloomFilter,
-                    Tier::Advice,
+                    None,
                     None,
                     Some(WriterProperty::BloomFilterEnabled),
                     Some(a),
                 ),
                 (
                     FindingCode::NoBloomFilter,
-                    Tier::Advice,
+                    None,
                     None,
                     Some(WriterProperty::BloomFilterEnabled),
                     Some(b),
@@ -2362,49 +2446,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_serviceability_follows_inefficient_findings_only() {
+    async fn test_diagnose_level_is_the_dearest_cap() {
         let advice_only = WriterLayout {
             bloom: Bloom::Off,
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation);
-        assert_eq!(report.summary.serviceability, Serviceability::Efficient);
-        assert_eq!((report.summary.inefficient, report.summary.advice), (0, 1));
+        let report = diagnose(&generation, Level::Optimal);
+        assert_eq!(report.summary.level, Level::Optimal, "advice caps nothing");
+        assert_eq!((report.summary.capping, report.summary.advice), (0, 1));
 
-        let inefficient = WriterLayout {
+        let dictionary = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        let (_table, generation) = one_file(inefficient).await;
-        let report = diagnose(&generation);
-        assert_eq!(report.summary.serviceability, Serviceability::Inefficient);
-        assert_eq!((report.summary.inefficient, report.summary.advice), (1, 0));
+        let (_table, generation) = one_file(dictionary).await;
+        let report = diagnose(&generation, Level::Optimal);
+        assert_eq!(report.summary.level, Level::Balanced);
+        assert_eq!((report.summary.capping, report.summary.advice), (1, 0));
+
+        let mut table = Table::new(KeyType::Long, unpartitioned());
+        two_disjoint_files(&mut table, Partition::None, dictionary).await;
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Optimal,
+        );
+        assert_eq!(
+            report.capping_codes(),
+            [
+                FindingCode::DictionaryEncodedValue,
+                FindingCode::NoBucketPartition
+            ]
+        );
+        assert_eq!(
+            report.summary.level,
+            Level::Permissive,
+            "a balanced cap and a permissive one leave the table permissive"
+        );
     }
 
     #[tokio::test]
-    async fn test_admit_refuses_an_inefficient_report_only_under_strict() {
+    async fn test_diagnose_bloom_residency_caps_balanced_with_no_finding() {
+        let mut table = contract_table().await;
+        let report = diagnose(
+            &load(&mut table, Residency::Bloom, None).await,
+            Level::Balanced,
+        );
+        assert_findings(&report, &[]);
+        assert_eq!(report.summary.level, Level::Balanced);
+        assert_eq!(
+            report.summary.level_by_residency,
+            BTreeMap::from([
+                (Residency::Full, Level::Optimal),
+                (Residency::Disk, Level::Optimal),
+                (Residency::Bloom, Level::Balanced),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_level_by_residency_combines_the_layout_with_each_tier() {
         let (_table, report, _json) = dictionary_value_report().await;
-        admit(&report, false).unwrap();
-        let error = admit(&report, true).unwrap_err();
-        let Error::Inefficient {
-            table: name,
-            findings,
-        } = error
-        else {
-            panic!("expected Inefficient, got {error:?}");
+        assert_eq!(
+            report.summary.level_by_residency,
+            BTreeMap::from([
+                (Residency::Full, Level::Balanced),
+                (Residency::Disk, Level::Balanced),
+                (Residency::Bloom, Level::Balanced),
+            ])
+        );
+        assert_eq!(report.summary.lookups, Level::Optimal);
+        assert_eq!(
+            diagnose(
+                &one_file(WriterLayout::contract()).await.1,
+                Level::Permissive
+            )
+            .summary
+            .lookups,
+            Level::Permissive,
+            "the declared level is reported as given"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_level_by_residency_omits_a_tier_that_cannot_load() {
+        let no_filter = WriterLayout {
+            bloom: Bloom::Off,
+            ..WriterLayout::contract()
         };
-        assert_eq!(name, TABLE);
-        assert_eq!(findings, [FindingCode::DictionaryEncodedValue]);
+        let (_table, generation) = one_file(no_filter).await;
+        let report = diagnose(&generation, Level::Optimal);
+        assert_eq!(report.summary.predicted.bloom, None);
+        assert_eq!(
+            report.summary.level_by_residency,
+            BTreeMap::from([
+                (Residency::Full, Level::Optimal),
+                (Residency::Disk, Level::Optimal),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_judge_refuses_below_level_only_under_strict() {
+        let (_table, report, _json) = dictionary_value_report().await;
+        let summary = &report.summary;
+        let codes = report.capping_codes();
+        judge(TABLE, summary.level, &codes, Level::Optimal, false).unwrap();
+        let reason = testing::refusal_of(judge(TABLE, summary.level, &codes, Level::Optimal, true));
+        assert_eq!(
+            reason,
+            RefusalReason::BelowLevel {
+                declared: Level::Optimal,
+                achieved: Level::Balanced,
+                findings: vec![FindingCode::DictionaryEncodedValue],
+            }
+        );
+        for declared in [Level::Balanced, Level::Permissive] {
+            judge(TABLE, summary.level, &codes, declared, true).unwrap();
+        }
 
         let advice_only = WriterLayout {
             bloom: Bloom::Off,
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         assert_eq!(report.summary.advice, 1);
-        admit(&report, true).unwrap();
+        judge(
+            TABLE,
+            report.summary.level,
+            &report.capping_codes(),
+            Level::Optimal,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_judge_names_only_the_codes_the_declared_level_refuses() {
+        let mut table = Table::bucketed(ONE);
+        let first = testing::keys_from(0, FILE_KEYS);
+        let interleaved: Vec<i64> = first.iter().map(|key| key + 1).collect();
+        let layout = WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        };
+        for (name, keys) in [("a", &first), ("b", &interleaved)] {
+            let typed = testing::long_keys(keys);
+            table
+                .add_file(file(name, &typed, Partition::Bucket(0), layout))
+                .await;
+        }
+        let report = diagnose(
+            &load(&mut table, Residency::Full, None).await,
+            Level::Balanced,
+        );
+        assert_eq!(
+            report.capping_codes(),
+            [
+                FindingCode::DictionaryEncodedValue,
+                FindingCode::OverlappingFiles
+            ]
+        );
+        let reason = testing::refusal_of(judge(
+            TABLE,
+            report.summary.level,
+            &report.capping_codes(),
+            Level::Balanced,
+            true,
+        ));
+        assert_eq!(
+            reason,
+            RefusalReason::BelowLevel {
+                declared: Level::Balanced,
+                achieved: Level::Permissive,
+                findings: vec![FindingCode::OverlappingFiles],
+            }
+        );
     }
 
     #[tokio::test]
@@ -2415,7 +2633,7 @@ mod tests {
             let local = testing::local_dir(scratch.path(), table.storage.stats(), None);
             let local = (residency == Residency::Disk).then_some(&local);
             let generation = load(&mut table, residency, local).await;
-            let report = diagnose(&generation);
+            let report = diagnose(&generation, Level::Optimal);
             assert_eq!(report.summary.residency, residency);
             assert_eq!(report.summary.index_bytes, generation.index_bytes);
             let predicted = report.summary.predicted;
@@ -2480,15 +2698,15 @@ mod tests {
     }
 
     /// The report of a one-file table whose value column is
-    /// dictionary-encoded, so it carries exactly one inefficient finding, with the
-    /// JSON it serializes to.
+    /// dictionary-encoded, so it carries exactly one capping finding, with
+    /// the JSON it serializes to.
     async fn dictionary_value_report() -> (Table, TableReport, Json) {
         let layout = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         let json = serde_json::to_value(&report).unwrap();
         (table, report, json)
     }
@@ -2503,7 +2721,8 @@ mod tests {
             BTreeSet::from([
                 "table",
                 "snapshot_id",
-                "serviceability",
+                "level",
+                "lookups",
                 "residency",
                 "file_count",
                 "buckets",
@@ -2512,7 +2731,8 @@ mod tests {
                 "records",
                 "index_bytes",
                 "predicted",
-                "inefficient",
+                "level_by_residency",
+                "capping",
                 "advice",
             ])
         );
@@ -2521,16 +2741,18 @@ mod tests {
             summary["snapshot_id"],
             Json::String(FIRST_SNAPSHOT.to_string())
         );
+        assert_eq!(summary["level"], Json::String(Level::Balanced.to_string()));
+        assert_eq!(summary["lookups"], Json::String(Level::Optimal.to_string()));
         assert_eq!(
-            summary["serviceability"],
-            Json::String("inefficient".to_string())
+            summary["level_by_residency"][Residency::Bloom.name()],
+            Json::String(Level::Balanced.to_string())
         );
         assert_eq!(
             summary["residency"],
             Json::String(Residency::Full.to_string())
         );
         assert_eq!(summary["buckets"], Json::from(ONE));
-        assert_eq!(summary["inefficient"], Json::from(1));
+        assert_eq!(summary["capping"], Json::from(1));
         assert_eq!(summary["advice"], Json::from(0));
         assert_eq!(
             summary["predicted"]["full"],
@@ -2547,7 +2769,7 @@ mod tests {
     async fn test_serialize_finding_snake_case_fields_with_display_strings() {
         let (table, _report, json) = dictionary_value_report().await;
         let finding = &json["findings"][0];
-        assert_eq!(finding["tier"], Json::String("inefficient".to_string()));
+        assert_eq!(finding["caps"], Json::String(Level::Balanced.to_string()));
         assert_eq!(
             finding["code"],
             Json::String(FindingCode::DictionaryEncodedValue.to_string())
@@ -2563,6 +2785,8 @@ mod tests {
         assert_eq!(finding["penalty"]["files_probed_per_lookup"], Json::Null);
         assert_eq!(finding["file"], Json::String(table.path_of("f")));
         assert!(finding["message"].is_string());
+        let advice = Finding::advice(FindingCode::LongKeys, None, String::new(), None);
+        assert_eq!(serde_json::to_value(&advice).unwrap()["caps"], Json::Null);
     }
 
     #[tokio::test]

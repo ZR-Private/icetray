@@ -258,7 +258,6 @@ pub fn status_from(error: &Error) -> Status {
         | Error::Config(_)
         | Error::Location { .. }
         | Error::Refused { .. }
-        | Error::Inefficient { .. }
         | Error::Table { .. }
         | Error::File { .. } => Status::internal(message),
     }
@@ -410,7 +409,7 @@ mod tests {
 
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
-    use icetray_core::{FileFault, FindingCode, LocalFault, RefusalReason, Storage, TableFault};
+    use icetray_core::{FileFault, LocalFault, RefusalReason, Storage, TableFault};
     use tonic::Code;
 
     use super::*;
@@ -655,13 +654,6 @@ mod tests {
                 Error::Refused {
                     table: TABLE.to_string(),
                     reason: RefusalReason::DeleteFiles,
-                },
-                Code::Internal,
-            ),
-            (
-                Error::Inefficient {
-                    table: TABLE.to_string(),
-                    findings: vec![FindingCode::DictionaryEncodedValue],
                 },
                 Code::Internal,
             ),

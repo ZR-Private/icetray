@@ -595,6 +595,7 @@ impl Fixture {
             key_column: KEY_COLUMN.to_string(),
             value_column: VALUE_COLUMN.to_string(),
             strict,
+            lookups: None,
             residency,
             resident_budget_bytes: budget,
         }

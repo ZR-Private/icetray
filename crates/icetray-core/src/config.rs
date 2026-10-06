@@ -17,6 +17,7 @@ use crate::aws_catalog;
 use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::Result;
+use crate::level::Level;
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -67,8 +68,9 @@ const DEFAULT_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// (`cache::check_capacity`).
 const PARSE_CACHE_SHARDS: usize = 1;
 
-/// `strict` when a table says nothing: on. A table that is inefficient is
-/// refused until its owner turns strict off with one line (RFD 007).
+/// `strict` when a table says nothing: on. A snapshot whose layout puts the
+/// table below its `lookups` level is refused until its owner turns strict
+/// off with one line (RFD 020).
 const DEFAULT_STRICT: bool = true;
 
 /// Residency when a table says nothing: `full`, RFD 017's fastest tier, one
@@ -366,6 +368,21 @@ pub enum ConfigViolation {
         /// The table's position in `tables`, when validation found it.
         index: Option<usize>,
     },
+    /// A `lookups` level the table's residency cannot reach (RFD 020):
+    /// every snapshot would be below it. Raised by validation, which names
+    /// the setting by the table's place in `tables`, and again by a load,
+    /// which knows the table by name alone.
+    #[error("{}", lookups_unreachable(table, *index, *lookups, *residency))]
+    LookupsUnreachable {
+        /// The table's name.
+        table: String,
+        /// The table's position in `tables`, when validation found it.
+        index: Option<usize>,
+        /// The declared level.
+        lookups: Level,
+        /// Its residency.
+        residency: Residency,
+    },
     /// The memory budget of the page cache cannot hold one value page in
     /// every shard of its memory level, so the cache would keep a page per
     /// shard however small the budget, and the budget would bound nothing
@@ -561,6 +578,26 @@ fn disk_without_local_dir(table: &str, index: Option<usize>) -> String {
         None => format!(
             "table {table}: {} residency needs a local directory under storage.local",
             Residency::Disk
+        ),
+    }
+}
+
+/// `ConfigViolation::LookupsUnreachable`'s message: the setting by its full
+/// path when the table's place is known, else the table by name, and the
+/// best level the residency reaches.
+fn lookups_unreachable(
+    table: &str,
+    index: Option<usize>,
+    lookups: Level,
+    residency: Residency,
+) -> String {
+    let best = residency.best_level();
+    match index {
+        Some(index) => format!(
+            "tables[{index}].lookups {lookups} is above what tables[{index}].residency {residency} reaches; {residency} reaches {best} at best"
+        ),
+        None => format!(
+            "table {table}: lookups {lookups} is above what {residency} residency reaches; {residency} reaches {best} at best"
         ),
     }
 }
@@ -772,8 +809,9 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_tables(config)
 }
 
-/// Each table has a name of its own, a residency its settings fit, and a
-/// source whose settings `validate_source` accepts.
+/// Each table has a name of its own, a residency its settings fit, a
+/// `lookups` level its residency reaches, and a source whose settings
+/// `validate_source` accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
@@ -804,6 +842,7 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
                 index: Some(index),
             });
         }
+        table.check_lookups(Some(index))?;
         validate_source(index, &table.source, &config.storage)?;
     }
     Ok(())
@@ -1342,8 +1381,10 @@ impl Default for StorageConfig {
     }
 }
 
-/// One served table.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// One served table. Two entries are equal when every setting is, `lookups`
+/// compared as `TableConfig::lookups` resolves it, so an entry that spells
+/// out the default equals one that leaves it out.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableConfig {
     /// The name clients use in requests; unique and non-empty.
@@ -1356,9 +1397,13 @@ pub struct TableConfig {
     pub key_column: String,
     /// The value column; Iceberg binary, fixed, or string.
     pub value_column: String,
-    /// Refuse a generation the doctor finds inefficient (RFD 007).
+    /// Refuse a snapshot whose layout puts the table below its `lookups`
+    /// level (RFD 020).
     #[serde(default = "default_strict")]
     pub strict: bool,
+    /// The lookup level the table declares it accepts (RFD 020); `None`
+    /// takes the best its residency reaches (`TableConfig::lookups`).
+    pub lookups: Option<Level>,
     /// Where the key chunks live (RFD 017).
     #[serde(default = "default_residency")]
     pub residency: Residency,
@@ -1366,6 +1411,61 @@ pub struct TableConfig {
     /// that tier takes one.
     pub resident_budget_bytes: Option<u64>,
 }
+
+impl TableConfig {
+    /// The declared lookup level: `lookups` when set, else the best level
+    /// the residency reaches (`Residency::best_level`).
+    pub fn lookups(&self) -> Level {
+        self.lookups.unwrap_or_else(|| self.residency.best_level())
+    }
+
+    /// `ConfigViolation::LookupsUnreachable` when `lookups` is a level the
+    /// residency cannot reach; `index` is the table's place in `tables`
+    /// when validation asks, `None` when a load does.
+    pub(crate) fn check_lookups(
+        &self,
+        index: Option<usize>,
+    ) -> std::result::Result<(), ConfigViolation> {
+        let lookups = self.lookups();
+        if self.residency.best_level().meets(lookups) {
+            Ok(())
+        } else {
+            Err(ConfigViolation::LookupsUnreachable {
+                table: self.name.clone(),
+                index,
+                lookups,
+                residency: self.residency,
+            })
+        }
+    }
+}
+
+impl PartialEq for TableConfig {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            name,
+            source,
+            r#ref,
+            key_column,
+            value_column,
+            strict,
+            lookups: _,
+            residency,
+            resident_budget_bytes,
+        } = self;
+        *name == other.name
+            && *source == other.source
+            && *r#ref == other.r#ref
+            && *key_column == other.key_column
+            && *value_column == other.value_column
+            && *strict == other.strict
+            && self.lookups() == other.lookups()
+            && *residency == other.residency
+            && *resident_budget_bytes == other.resident_budget_bytes
+    }
+}
+
+impl Eq for TableConfig {}
 
 fn default_strict() -> bool {
     DEFAULT_STRICT
@@ -1381,7 +1481,7 @@ fn default_residency() -> Residency {
 /// logs.
 // The serde names and Display are the same strings;
 // `test_serialize_residency_matches_display` holds them together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Residency {
     /// Key chunks in memory: one GET per hit, none per miss.
@@ -1415,6 +1515,16 @@ impl Residency {
             Self::Full => "full",
             Self::Disk => "disk",
             Self::Bloom => "bloom",
+        }
+    }
+
+    /// The best lookup level the tier reaches (RFD 020): `optimal` for
+    /// `full` and `disk`; `balanced` for `bloom`, whose hit fetches its key
+    /// page besides the value page.
+    pub(crate) const fn best_level(self) -> Level {
+        match self {
+            Self::Full | Self::Disk => Level::Optimal,
+            Self::Bloom => Level::Balanced,
         }
     }
 }
@@ -1681,6 +1791,7 @@ ref = "main"
 key_column = "id"
 value_column = "payload"
 strict = false
+lookups = "balanced"
 residency = "full"
 resident_budget_bytes = {FIXTURE_RESIDENT_BUDGET_BYTES}
 
@@ -1796,6 +1907,7 @@ endpoint = "https://s3tables.example"
                 "key_column": "id",
                 "value_column": "payload",
                 "strict": false,
+                "lookups": "balanced",
                 "residency": "full",
                 "resident_budget_bytes": FIXTURE_RESIDENT_BUDGET_BYTES
             },
@@ -1924,6 +2036,7 @@ value_column = "value"
                 key_column: "id".to_string(),
                 value_column: "payload".to_string(),
                 strict: false,
+                lookups: Some(Level::Balanced),
                 residency: Residency::Full,
                 resident_budget_bytes: Some(FIXTURE_RESIDENT_BUDGET_BYTES),
             },
@@ -1939,6 +2052,7 @@ value_column = "value"
                 key_column: "user_id".to_string(),
                 value_column: "vector".to_string(),
                 strict: DEFAULT_STRICT,
+                lookups: None,
                 residency: Residency::Disk,
                 resident_budget_bytes: None,
             },
@@ -1955,6 +2069,7 @@ value_column = "value"
                 key_column: "id".to_string(),
                 value_column: "payload".to_string(),
                 strict: DEFAULT_STRICT,
+                lookups: None,
                 residency: DEFAULT_RESIDENCY,
                 resident_budget_bytes: None,
             },
@@ -1971,6 +2086,7 @@ value_column = "value"
                 key_column: "id".to_string(),
                 value_column: "payload".to_string(),
                 strict: DEFAULT_STRICT,
+                lookups: None,
                 residency: DEFAULT_RESIDENCY,
                 resident_budget_bytes: None,
             },
@@ -2023,6 +2139,8 @@ value_column = "value"
         assert_eq!(config.storage.local, None);
         assert_eq!(config.tables.len(), 1);
         assert!(config.tables[0].strict);
+        assert_eq!(config.tables[0].lookups, None);
+        assert_eq!(config.tables[0].lookups(), Level::Optimal);
         assert_eq!(config.tables[0].residency, Residency::Full);
         assert_eq!(config.tables[0].resident_budget_bytes, None);
     }
@@ -2302,6 +2420,83 @@ locaton = "typo"
             violation(&secret_only),
             ConfigViolation::IncompleteStaticKeys
         );
+    }
+
+    #[test]
+    fn test_parse_lookups_defaults_to_the_best_level_of_its_residency() {
+        let with =
+            |residency: &str| format!("{}\nresidency = \"{residency}\"\n", TOML_MINIMAL.trim_end());
+        let local = format!(
+            "\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {PAGE_CACHE_DISK_BLOCK_BYTES}\n"
+        );
+        for residency in Residency::ALL {
+            let text = format!("{}{local}", with(residency.name()));
+            let config = Config::parse(&text).unwrap();
+            assert_eq!(config.tables[0].lookups, None);
+            assert_eq!(
+                config.tables[0].lookups(),
+                residency.best_level(),
+                "{residency}"
+            );
+        }
+        let declared = format!("{}\nlookups = \"permissive\"\n", TOML_MINIMAL.trim_end());
+        let config = Config::parse(&declared).unwrap();
+        assert_eq!(config.tables[0].lookups(), Level::Permissive);
+    }
+
+    #[test]
+    fn test_best_level_is_optimal_but_for_bloom() {
+        assert_eq!(Residency::Full.best_level(), Level::Optimal);
+        assert_eq!(Residency::Disk.best_level(), Level::Optimal);
+        assert_eq!(Residency::Bloom.best_level(), Level::Balanced);
+    }
+
+    #[test]
+    fn test_parse_refuses_lookups_its_residency_cannot_reach() {
+        let text = format!(
+            "{}\nresidency = \"bloom\"\nlookups = \"optimal\"\n",
+            TOML_MINIMAL.trim_end()
+        );
+        assert_eq!(
+            violation(&text),
+            ConfigViolation::LookupsUnreachable {
+                table: "kv".to_string(),
+                index: Some(0),
+                lookups: Level::Optimal,
+                residency: Residency::Bloom,
+            }
+        );
+        for lookups in [Level::Balanced, Level::Permissive] {
+            let text = format!(
+                "{}\nresidency = \"bloom\"\nlookups = \"{lookups}\"\n",
+                TOML_MINIMAL.trim_end()
+            );
+            assert_eq!(Config::parse(&text).unwrap().tables[0].lookups(), lookups);
+        }
+    }
+
+    #[test]
+    fn test_eq_table_config_compares_the_lookups_it_resolves() {
+        let config = Config::parse(TOML_MINIMAL).unwrap();
+        let absent = config.tables[0].clone();
+        let spelled_out = TableConfig {
+            lookups: Some(absent.residency.best_level()),
+            ..absent.clone()
+        };
+        assert_eq!(
+            absent, spelled_out,
+            "the default spelled out is the default"
+        );
+        let other = TableConfig {
+            lookups: Some(Level::Permissive),
+            ..absent.clone()
+        };
+        assert_ne!(absent, other);
+        let lenient = TableConfig {
+            strict: !absent.strict,
+            ..absent.clone()
+        };
+        assert_ne!(absent, lenient);
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! The table lifecycle (RFD 005, RFD 007): a `Table` follows one ref,
-//! builds each new snapshot as a `Generation` beside the one it serves,
-//! runs the doctor on the new generation and refuses an inefficient one under
-//! `strict`, then swaps it in atomically. Loads and refreshes of one table
-//! are serialized; a failed one leaves the last generation serving and the
-//! table `Degraded`. A lookup takes one generation and answers from it
-//! alone, so a swap during a batch cannot mix snapshots.
+//! The table lifecycle (RFD 005, RFD 007, RFD 020): a `Table` follows one
+//! ref, builds each new snapshot as a `Generation` beside the one it
+//! serves, runs the doctor on the new generation and refuses one below the
+//! table's level under `strict`, then swaps it in atomically. Loads and
+//! refreshes of one table are serialized; a failed one leaves the last
+//! generation serving and the table `Degraded`. A lookup takes one
+//! generation and answers from it alone, so a swap during a batch cannot
+//! mix snapshots.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,11 +24,12 @@ use tokio::task::JoinSet;
 use crate::approx;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
-use crate::check::{self, Finding, FindingCode, Tier};
+use crate::check::{self, Finding, FindingCode};
 use crate::config::TableConfig;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
+use crate::level::Level;
 use crate::local::LocalDir;
 use crate::manifest::TableLayout;
 use crate::metric::{self, LookupResult};
@@ -74,7 +76,7 @@ pub enum TableState {
         /// The snapshot still serving, or `None` after a failed first load.
         serving: Option<SnapshotId>,
         /// Why the load or refresh failed, as the failure's kind: a refusal
-        /// with its reason, the strict gate, a table or file fault, or the
+        /// with its reason, a table or file fault, or the
         /// library or local-directory failure's variant. The failure itself
         /// went to the caller of `load` or `refresh`, which logs it; `Error`
         /// is not `Clone`, and the kind is what a reader of the state acts on.
@@ -156,8 +158,9 @@ pub struct TableHandles {
 /// admits (RFD 016).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FindingLog {
-    /// Each finding is a log event, inefficient at warn and advice at
-    /// info: the daemon's choice, whose findings reach no other output.
+    /// Each finding is a log event, at warn when it caps the table below
+    /// its declared level and at info otherwise: the daemon's choice, whose
+    /// findings reach no other output.
     Events,
     /// Each finding is a debug event: for a caller that prints the
     /// findings as data, which a log line would only repeat.
@@ -230,11 +233,10 @@ pub struct Table {
     /// metadata change that did not move the followed ref does not make
     /// every later poll read the metadata again, or the one where a poll
     /// over a serving generation met a failure fixed for the snapshot
-    /// (`Recurrence::Deterministic`): a refusal, the strict gate, or a
-    /// table or file fault of the metadata or a data file. That snapshot is
-    /// not built again until the source names another location. A
-    /// transient failure does not advance it: the next poll reads the
-    /// metadata again and retries.
+    /// (`Recurrence::Deterministic`): a refusal, or a table or file fault of
+    /// the metadata or a data file. That snapshot is not built again until
+    /// the source names another location. A transient failure does not
+    /// advance it: the next poll reads the metadata again and retries.
     /// `None` until the first successful build. A reload that changes the
     /// table's entry builds a new `Table`, which remembers nothing, so a
     /// refusal that depended on the old entry is tried again under the new
@@ -1009,21 +1011,29 @@ impl Table {
         });
     }
 
-    /// The strict gate (RFD 007, RFD 016): the doctor's verdict on a built
+    /// The level gate (RFD 016, RFD 020): the doctor's verdict on a built
     /// generation before it is swapped in. Every finding is logged as the
-    /// table's `FindingLog` says. Under `strict`, an
-    /// inefficient generation is dropped, never swapped, with the
-    /// `Error::Inefficient` that `check::admit` gives. `Ok` carries the admitted generation's findings per code, for the
-    /// `findings` gauge; a refused generation's reach the logs and the
-    /// error and never the gauge, which describes the serving generation.
+    /// table's `FindingLog` says. Under `strict`, a generation below the
+    /// table's `lookups` is dropped, never swapped, with the
+    /// `RefusalReason::BelowLevel` that `check::judge` gives. `Ok` carries
+    /// the admitted generation's findings per code, for the `findings`
+    /// gauge; a refused generation's reach the logs and the error and never
+    /// the gauge, which describes the serving generation.
     fn gate(&self, generation: &Generation) -> Result<BTreeMap<FindingCode, u64>> {
-        let report = check::diagnose(generation);
+        let declared = self.config.lookups();
+        let report = check::diagnose(generation, declared);
         let mut counts: BTreeMap<FindingCode, u64> = BTreeMap::new();
         for finding in &report.findings {
             *counts.entry(finding.code()).or_default() += 1;
-            log_finding(self.name(), finding, self.findings);
+            log_finding(self.name(), finding, self.findings, declared);
         }
-        check::admit(&report, self.config.strict)?;
+        check::judge(
+            self.name(),
+            report.summary.level,
+            &report.capping_codes(),
+            declared,
+            self.config.strict,
+        )?;
         Ok(counts)
     }
 
@@ -1227,25 +1237,27 @@ impl fmt::Debug for Table {
     }
 }
 
-/// One finding as a log event, with the table, code, tier, and file as
-/// fields, the code and tier in the names the doctor's JSON lines carry,
-/// and the finding's message as the event's: under `FindingLog::Events`
-/// inefficient at warn and advice at info, under `FindingLog::Debug` both
-/// at debug.
-fn log_finding(table: &str, finding: &Finding, log: FindingLog) {
+/// One finding as a log event, with the table, code, cap, and file as
+/// fields, the code and cap in the names the doctor's JSON lines carry
+/// (`caps` absent for advice), and the finding's message as the event's:
+/// under `FindingLog::Events` at warn when its cap is below `declared`, the
+/// table's level, and at info otherwise; under `FindingLog::Debug` at
+/// debug.
+fn log_finding(table: &str, finding: &Finding, log: FindingLog, declared: Level) {
     let message = finding.message();
     let code = finding.code();
-    let tier = finding.tier();
+    let caps = finding.caps().map(Level::name);
     let file = finding.file();
-    match (log, tier) {
-        (FindingLog::Events, Tier::Inefficient) => {
-            tracing::warn!(table, code = %code, tier = %tier, file, "{message}");
+    let below = finding.caps().is_some_and(|cap| !cap.meets(declared));
+    match (log, below) {
+        (FindingLog::Events, true) => {
+            tracing::warn!(table, code = %code, caps, file, "{message}");
         }
-        (FindingLog::Events, Tier::Advice) => {
-            tracing::info!(table, code = %code, tier = %tier, file, "{message}");
+        (FindingLog::Events, false) => {
+            tracing::info!(table, code = %code, caps, file, "{message}");
         }
-        (FindingLog::Debug, Tier::Inefficient | Tier::Advice) => {
-            tracing::debug!(table, code = %code, tier = %tier, file, "{message}");
+        (FindingLog::Debug, true | false) => {
+            tracing::debug!(table, code = %code, caps, file, "{message}");
         }
     }
 }
@@ -1271,10 +1283,11 @@ mod tests {
     use crate::error::{ErrorKind, RefusalReason};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
-        FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
-        SECOND_VERSION, TABLE, THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO,
-        Table as Fixture, WriterLayout, bucketing, cache, keys_from, keys_in_bucket, local_dir,
-        long_keys, parquet, two_bucket_table, value_for, values_of,
+        FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, RESOLVE_GETS, SECOND_SEQUENCE,
+        SECOND_SNAPSHOT, SECOND_VERSION, TABLE, THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION,
+        TINY_BUDGET, TWO, Table as Fixture, WriterLayout, bucketing, cache, keys_from,
+        keys_in_bucket, local_dir, long_keys, parquet, refusal_of, two_bucket_table, value_for,
+        values_of,
     };
     use crate::index::testing::{with_dictionary_one_entry_short, with_first_page_claiming};
     use crate::index::{DecodedPart, FileFault};
@@ -1559,10 +1572,6 @@ mod tests {
             table.current().unwrap().layout.key_type
         );
     }
-
-    /// The GETs resolving a table root costs: its version hint and the
-    /// metadata file the hint names.
-    const RESOLVE_GETS: u64 = 2;
 
     #[tokio::test]
     async fn test_resolve_key_type_reads_the_metadata_alone_and_loads_nothing() {
@@ -1936,23 +1945,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_strict_refuses_an_inefficient_finding_and_only_that() {
-        let inefficient = WriterLayout {
+    async fn test_load_strict_refuses_a_snapshot_below_its_level_and_only_that() {
+        let balanced = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        let fixture = one_file_fixture(inefficient).await;
+        let fixture = one_file_fixture(balanced).await;
         let strict = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         assert!(strict.config.strict);
-        let error = strict.load().await.unwrap_err();
-        let Error::Inefficient { findings, .. } = error else {
-            panic!("expected Inefficient, got {error:?}");
-        };
-        assert_eq!(findings, [FindingCode::DictionaryEncodedValue]);
+        let reason = refusal_of(strict.load().await);
+        assert_eq!(reason, dictionary_below_optimal());
         assert!(strict.current().is_none());
         let (serving, kept) = degraded(&strict);
         assert_eq!(serving, None);
-        assert_eq!(kept, ErrorKind::Inefficient);
+        assert_eq!(kept, ErrorKind::Refused(reason));
+
+        let accepting = table_over(
+            &fixture,
+            TableConfig {
+                lookups: Some(Level::Balanced),
+                ..fixture.config(Residency::Full, None)
+            },
+        )
+        .await;
+        accepting.load().await.unwrap();
+        assert_eq!(serving_id(&accepting), SnapshotId(FIRST_SNAPSHOT));
 
         let lenient = table_over(
             &fixture,
@@ -2179,7 +2196,7 @@ mod tests {
             local: Some(Arc::clone(&local)),
             ..handles_over(&fixture).await
         };
-        // Overlapping files are an inefficient finding, which strict refuses.
+        // Overlapping files cap the level at permissive, which strict refuses.
         let config = TableConfig {
             strict: false,
             ..fixture.config(Residency::Disk, None)
@@ -2341,21 +2358,28 @@ mod tests {
         );
     }
 
+    /// The refusal a strict table declared `optimal` meets on a snapshot
+    /// whose value column is dictionary-encoded.
+    fn dictionary_below_optimal() -> RefusalReason {
+        RefusalReason::BelowLevel {
+            declared: Level::Optimal,
+            achieved: Level::Balanced,
+            findings: vec![FindingCode::DictionaryEncodedValue],
+        }
+    }
+
     #[tokio::test]
-    async fn test_refresh_strict_refuses_an_inefficient_finding_and_keeps_serving() {
+    async fn test_refresh_strict_refuses_a_snapshot_below_its_level_and_keeps_serving() {
         let (mut fixture, all) = two_bucket_table().await;
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         table.load().await.unwrap();
-        let inefficient = WriterLayout {
+        let balanced = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
-        append_second(&mut fixture, &all, "dict", inefficient).await;
-        let error = table.refresh().await.unwrap_err();
-        let Error::Inefficient { findings, .. } = error else {
-            panic!("expected Inefficient, got {error:?}");
-        };
-        assert_eq!(findings, [FindingCode::DictionaryEncodedValue]);
+        append_second(&mut fixture, &all, "dict", balanced).await;
+        let reason = refusal_of(table.refresh().await);
+        assert_eq!(reason, dictionary_below_optimal());
         assert_eq!(
             table.current().unwrap().snapshot_id,
             SnapshotId(FIRST_SNAPSHOT)
@@ -2366,7 +2390,7 @@ mod tests {
         );
         let (serving, kept) = degraded(&table);
         assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
-        assert_eq!(kept, ErrorKind::Inefficient);
+        assert_eq!(kept, ErrorKind::Refused(reason));
     }
 
     /// A refresh onto a file whose keys hash to bucket 0 but whose manifest
@@ -2794,6 +2818,50 @@ mod tests {
         );
     }
 
+    /// A snapshot a strict table refuses as below its level is remembered
+    /// against its metadata location like any refusal: while the version
+    /// hint names that location each poll reads the hint alone, counts no
+    /// error, and leaves the table degraded for the refusal.
+    #[test]
+    fn test_refresh_does_not_judge_a_snapshot_below_its_level_again_until_its_location_moves() {
+        let refused = ErrorKind::Refused(dictionary_below_optimal());
+        let serving = Some(SnapshotId(FIRST_SNAPSHOT));
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            assert!(table.config.strict);
+            table.load().await.unwrap();
+            let balanced = WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            };
+            append_second(&mut fixture, &all, "dict", balanced).await;
+
+            let before = fixture.gets();
+            let error = table.refresh().await.unwrap_err();
+            assert_eq!(error.kind(), refused, "{error:?}");
+            assert!(
+                fixture.gets() > before + POLL_GETS,
+                "the first poll reads the snapshot's metadata and footers"
+            );
+            let polls_while_unchanged = 3;
+            for _ in 0..polls_while_unchanged {
+                let before = fixture.gets();
+                assert!(!table.refresh().await.unwrap());
+                assert_eq!(fixture.gets(), before + POLL_GETS, "the version hint alone");
+                assert_eq!(degraded(&table), (serving, refused.clone()));
+            }
+        });
+        assert_eq!(
+            series.counter(
+                metric::REFRESH_ERRORS_TOTAL,
+                &[table_label(), (metric::LABEL_REASON, refused.to_string())],
+            ),
+            1,
+            "counted once, when made"
+        );
+    }
+
     /// A ref the metadata does not have is a table fault fixed for that
     /// metadata file, and is remembered against its location like a
     /// refusal: while the version hint names it each poll reads the hint
@@ -2865,12 +2933,12 @@ mod tests {
 
     #[test]
     fn test_metrics_findings_and_index_bytes_describe_the_serving_generation() {
-        let inefficient = WriterLayout {
+        let balanced = WriterLayout {
             dictionary: Dictionary::Value,
             ..WriterLayout::contract()
         };
         let ((lenient_bytes, strict_bytes), series) = recorded(async {
-            let fixture = one_file_fixture(inefficient).await;
+            let fixture = one_file_fixture(balanced).await;
             let lenient = table_over(
                 &fixture,
                 TableConfig {
@@ -2893,10 +2961,13 @@ mod tests {
             .await;
             strict.load().await.unwrap();
             let strict_bytes = strict.current().unwrap().index_bytes;
-            append_second(&mut fixture, &all, "dict", inefficient).await;
+            append_second(&mut fixture, &all, "dict", balanced).await;
             assert!(matches!(
                 strict.refresh().await.unwrap_err(),
-                Error::Inefficient { .. }
+                Error::Refused {
+                    reason: RefusalReason::BelowLevel { .. },
+                    ..
+                }
             ));
             (lenient_bytes, strict_bytes)
         });

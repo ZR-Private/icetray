@@ -90,8 +90,8 @@ pub enum GoldenTable {
     /// `long_v3_50k`: the contract layout, long keys, in table format
     /// version 3 (the recipe's `FORMAT_V3`).
     LongV3_50k,
-    /// `default_layout_1m`: the writer's defaults, which the doctor finds
-    /// inefficient.
+    /// `default_layout_1m`: the writer's defaults, whose large key pages
+    /// the doctor finds cap the level at balanced.
     DefaultLayout1m,
     /// `unpartitioned_500k`: no bucket partition.
     Unpartitioned500k,
@@ -180,6 +180,7 @@ pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableC
         key_column: KEY_COLUMN.to_string(),
         value_column: VALUE_COLUMN.to_string(),
         strict,
+        lookups: None,
         residency: Residency::Full,
         resident_budget_bytes: None,
     }

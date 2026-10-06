@@ -121,10 +121,8 @@ impl<'a> FileLine<'a> {
 /// its load. Display and serde give the `snake_case` code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefusalCode {
-    /// A refusal reason of RFD 007, under its own name.
+    /// A refusal reason of RFD 007 or RFD 020, under its own name.
     Rule(RefusalReason),
-    /// `inefficient`: the table is inefficient and `strict` is on.
-    Inefficient,
     /// `load_failed`: the load failed with an error that names no rule.
     LoadFailed,
 }
@@ -136,7 +134,6 @@ impl RefusalCode {
     pub fn of(kind: ErrorKind) -> (Self, Option<ErrorKind>) {
         match kind {
             ErrorKind::Refused(reason) => (Self::Rule(reason), None),
-            ErrorKind::Inefficient => (Self::Inefficient, None),
             failed @ (ErrorKind::Iceberg
             | ErrorKind::Parquet
             | ErrorKind::ObjectStore
@@ -164,7 +161,6 @@ impl fmt::Display for RefusalCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rule(reason) => reason.fmt(f),
-            Self::Inefficient => f.write_str("inefficient"),
             Self::LoadFailed => f.write_str("load_failed"),
         }
     }
@@ -302,9 +298,9 @@ impl<'de> serde::Deserialize<'de> for KeyOrder {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use icetray_core::{
-        FindingCode, KeyType, Residency, ResidentBytes, Serviceability, TableFault,
-    };
+    use std::collections::BTreeMap;
+
+    use icetray_core::{FindingCode, KeyType, Level, Residency, ResidentBytes, TableFault};
     use serde_json::Value as Json;
 
     use super::*;
@@ -344,7 +340,8 @@ mod tests {
         TableSummary {
             table: TABLE.to_string(),
             snapshot_id: SnapshotId(SNAPSHOT),
-            serviceability: Serviceability::Efficient,
+            level: Level::Optimal,
+            lookups: Level::Optimal,
             residency: Residency::Full,
             file_count: 1,
             buckets: Some(1),
@@ -361,7 +358,12 @@ mod tests {
                 key_chunk_bytes: 1,
                 filter_bytes: None,
             },
-            inefficient: 0,
+            level_by_residency: BTreeMap::from([
+                (Residency::Full, Level::Optimal),
+                (Residency::Disk, Level::Optimal),
+                (Residency::Bloom, Level::Balanced),
+            ]),
+            capping: 0,
             advice: 0,
         }
     }
@@ -444,11 +446,13 @@ mod tests {
         assert_eq!(line["kind"], Json::String("table".to_string()));
         assert_eq!(line["table"], Json::String(TABLE.to_string()));
         assert_eq!(line["snapshot_id"], Json::String(SNAPSHOT.to_string()));
+        assert_eq!(line["level"], Json::String("optimal".to_string()));
+        assert_eq!(line["lookups"], Json::String("optimal".to_string()));
         assert_eq!(
-            line["serviceability"],
-            Json::String("efficient".to_string())
+            line["level_by_residency"]["bloom"],
+            Json::String("balanced".to_string())
         );
-        assert_eq!(line["inefficient"], Json::from(0));
+        assert_eq!(line["capping"], Json::from(0));
     }
 
     #[test]
@@ -460,7 +464,7 @@ mod tests {
             line["code"],
             Json::String(FindingCode::LargeFile.to_string())
         );
-        assert_eq!(line["tier"], Json::String("advice".to_string()));
+        assert_eq!(line["caps"], Json::Null, "advice caps nothing");
         let file = file_report();
         let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
         assert_eq!(line["kind"], Json::String("file".to_string()));
@@ -473,11 +477,15 @@ mod tests {
             table: TABLE.to_string(),
             reason: RefusalReason::DeleteFiles,
         };
-        let inefficient = icetray_core::Error::Inefficient {
+        let below_level = icetray_core::Error::Refused {
             table: TABLE.to_string(),
-            findings: vec![FindingCode::NoBucketPartition],
+            reason: RefusalReason::BelowLevel {
+                declared: Level::Optimal,
+                achieved: Level::Permissive,
+                findings: vec![FindingCode::NoBucketPartition],
+            },
         };
-        for (error, code) in [(refused, "delete_files"), (inefficient, "inefficient")] {
+        for (error, code) in [(refused, "delete_files"), (below_level, "below_level")] {
             let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
             assert_eq!(line["kind"], Json::String("refusal".to_string()));
             assert_eq!(line["reason"], Json::String(code.to_string()));

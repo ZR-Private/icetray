@@ -954,6 +954,7 @@ async fn table_over(
         key_column: KEY_COLUMN.to_string(),
         value_column: VALUE_COLUMN.to_string(),
         strict: true,
+        lookups: None,
         residency: tier.residency(),
         resident_budget_bytes: None,
     };

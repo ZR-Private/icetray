@@ -19,7 +19,7 @@ use crate::approx;
 use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
-use crate::config::{Residency, TableConfig};
+use crate::config::{ConfigError, Residency, TableConfig};
 use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
@@ -125,9 +125,11 @@ impl Generation {
     /// stale), opens a `FileHandle` for every other file with the
     /// manifest's size and `hedge`, and inspects their footers
     /// `load_concurrency()` at a time. No key chunk is read and nothing is
-    /// written; `Planned::build` does both. A snapshot timestamp jiff cannot
-    /// represent is `TableFault::SnapshotTimestampOutOfRange`, raised before
-    /// any read.
+    /// written; `Planned::build` does both. Raised before any read: a
+    /// `lookups` level the residency cannot reach, as
+    /// `ConfigViolation::LookupsUnreachable` (a configuration built by hand
+    /// meets it here rather than at validation), and a snapshot timestamp
+    /// jiff cannot represent, as `TableFault::SnapshotTimestampOutOfRange`.
     pub(crate) async fn plan_load(
         config: &TableConfig,
         resolved: &Resolved,
@@ -137,6 +139,9 @@ impl Generation {
         previous: Option<&Generation>,
     ) -> Result<Planned> {
         let table = config.name.as_str();
+        config
+            .check_lookups(None)
+            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
         let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
         let layout = TableLayout::derive(
             table,
@@ -1140,6 +1145,9 @@ pub(crate) mod testing {
     /// names the metadata location the table knows: the hint alone (RFD
     /// 005).
     pub(crate) const POLL_GETS: u64 = 1;
+    /// The GETs resolving a table root costs: its version hint and the
+    /// metadata file the hint names.
+    pub(crate) const RESOLVE_GETS: u64 = 2;
     /// The metadata versions of the end-to-end snapshots.
     pub(crate) const FIRST_VERSION: u64 = 1;
     pub(crate) const SECOND_VERSION: u64 = 2;
@@ -1577,6 +1585,7 @@ pub(crate) mod testing {
                 key_column: KEY_COLUMN.to_string(),
                 value_column: VALUE_COLUMN.to_string(),
                 strict: true,
+                lookups: None,
                 residency,
                 resident_budget_bytes: budget,
             }
@@ -1829,15 +1838,16 @@ mod tests {
 
     use super::testing::{
         self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
-        KEY_STEP, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, THIRD_SEQUENCE,
-        THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout, bucketing, cache,
-        keys_from, keys_in_bucket, local_dir, long_keys, refusal_of, two_bucket_table, value_for,
-        values_of,
+        KEY_STEP, RESOLVE_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
+        THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout,
+        bucketing, cache, keys_from, keys_in_bucket, local_dir, long_keys, refusal_of,
+        two_bucket_table, value_for, values_of,
     };
     use super::*;
     use crate::catalog::TableSource;
-    use crate::config::HedgeConfig;
+    use crate::config::{ConfigViolation, HedgeConfig};
     use crate::key::KeyType;
+    use crate::level::Level;
     use crate::manifest::testing::{
         DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID,
     };
@@ -3000,6 +3010,37 @@ mod tests {
             "each file's chunk is fetched at build"
         );
         assert_present(&generation, &all).await;
+    }
+
+    /// A configuration built by hand, which no validation saw, meets the
+    /// violation at the loader before any data file is read.
+    #[tokio::test]
+    async fn test_plan_load_refuses_lookups_its_residency_cannot_reach() {
+        let (table, _) = two_bucket_table().await;
+        let config = TableConfig {
+            lookups: Some(Level::Optimal),
+            ..table.config(Residency::Bloom, None)
+        };
+        let Err(error) = table.plan_load(&config, None).await else {
+            panic!("bloom residency cannot reach optimal");
+        };
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::LookupsUnreachable {
+                    index: None,
+                    lookups: Level::Optimal,
+                    residency: Residency::Bloom,
+                    ..
+                }))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            table.gets(),
+            RESOLVE_GETS,
+            "no manifest and no footer was read"
+        );
     }
 
     #[tokio::test]

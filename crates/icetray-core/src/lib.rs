@@ -17,6 +17,7 @@ mod error;
 pub mod generation;
 mod index;
 pub mod key;
+mod level;
 mod local;
 mod manifest;
 pub mod metric;
@@ -33,8 +34,8 @@ pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
-    FileReport, Finding, FindingCode, Penalty, Serviceability, TableReport, TableSummary, Tier,
-    WriterProperty, admit, diagnose,
+    FileReport, Finding, FindingCode, Penalty, TableReport, TableSummary, WriterProperty, diagnose,
+    judge,
 };
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
@@ -48,6 +49,7 @@ pub use index::{
     ResidentBytes, WireType,
 };
 pub use key::{Key, KeyBytes, KeyType};
+pub use level::Level;
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Applied, Opened, Refused, Tables, open};

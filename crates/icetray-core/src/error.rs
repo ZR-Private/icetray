@@ -14,6 +14,7 @@ use crate::check::FindingCode;
 use crate::config::ConfigError;
 use crate::index::FileFault;
 use crate::key::{Key, KeyType};
+use crate::level::Level;
 use crate::local::LocalFault;
 use crate::storage::LocationError;
 
@@ -55,21 +56,14 @@ pub enum Error {
     /// The page cache could not produce a page.
     #[error("page cache: {0}")]
     Cache(#[from] CacheError),
-    /// The table cannot be served correctly.
+    /// The table cannot be served correctly, or under `strict` not at the
+    /// level it declares.
     #[error("table {table} refused: {}", refusal_detail(.reason))]
     Refused {
         /// The table's configured name.
         table: String,
-        /// Why it cannot be served (RFD 007).
+        /// Why it is not served (RFD 007, RFD 020).
         reason: RefusalReason,
-    },
-    /// The table is inefficient and `strict` is on.
-    #[error("table {table} is inefficient and strict is on: {}", finding_list(.findings))]
-    Inefficient {
-        /// The table's configured name.
-        table: String,
-        /// The inefficient findings the doctor raised.
-        findings: Vec<FindingCode>,
     },
     /// A lookup key whose type is not the table's key type.
     #[error("table {table} keys are {expected}, got {got}")]
@@ -216,7 +210,6 @@ impl Error {
             | Self::Location { .. }
             | Self::Cache(_)
             | Self::Refused { .. }
-            | Self::Inefficient { .. }
             | Self::KeyType { .. }
             | Self::Table { .. }
             | Self::File { .. }
@@ -252,7 +245,6 @@ impl Error {
             Self::Location { .. } => ErrorKind::Location,
             Self::Cache(_) => ErrorKind::Cache,
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
-            Self::Inefficient { .. } => ErrorKind::Inefficient,
             Self::KeyType { .. } => ErrorKind::KeyType,
             Self::Table { .. } => ErrorKind::Table,
             Self::File { .. } => ErrorKind::File,
@@ -271,8 +263,8 @@ impl Error {
 /// Which variant an `Error` is, for the `reason` label of
 /// `refresh_errors_total`; a refusal carries its `RefusalReason`, so the
 /// label names the refusal. Display gives the label value: the refusal's own
-/// name for `Refused`, `inefficient` for the strict gate, and the variant's
-/// `snake_case` name for the rest; serde gives the same string.
+/// name for `Refused`, and the variant's `snake_case` name for the rest;
+/// serde gives the same string.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     /// `Error::Iceberg`.
@@ -293,8 +285,6 @@ pub enum ErrorKind {
     Cache,
     /// `Error::Refused`, with its reason.
     Refused(RefusalReason),
-    /// `Error::Inefficient`.
-    Inefficient,
     /// `Error::KeyType`.
     KeyType,
     /// `Error::Table`.
@@ -357,9 +347,6 @@ impl Recurs for Error {
             Self::File { fault, .. } => fault.recurrence(),
             Self::Local { fault, .. } => fault.recurrence(),
             Self::Cache(error) => error.recurrence(),
-            // The doctor's verdict on a built generation is a function of
-            // the generation, and `strict` is the table's own setting.
-            Self::Inefficient { .. } => Recurrence::Deterministic,
             // A library's error does not say whether it met malformed
             // bytes or a read that failed under it.
             Self::Iceberg(_)
@@ -399,7 +386,6 @@ impl fmt::Display for ErrorKind {
             Self::Config => "config",
             Self::Location => "location",
             Self::Cache => "cache",
-            Self::Inefficient => "inefficient",
             Self::KeyType => "key_type",
             Self::Table => "table",
             Self::File => "file",
@@ -436,7 +422,8 @@ fn location_detail(table: Option<&str>, source: &LocationError) -> String {
 
 /// A refusal for a log line: the name, then the fields a reader needs to
 /// act on: the file and row group, the types found and expected, the length
-/// over the cap, the bytes needed and the budget (RFD 007, RFD 017).
+/// over the cap, the bytes needed and the budget, the levels declared and
+/// achieved and the findings that cap it (RFD 007, RFD 017, RFD 020).
 fn refusal_detail(reason: &RefusalReason) -> String {
     match reason {
         RefusalReason::Unsorted { path, row_group }
@@ -467,11 +454,19 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         RefusalReason::OverBudget { of, needed, budget } => {
             format!("{reason} (needed {needed} bytes, {of} {budget} bytes)")
         }
+        RefusalReason::BelowLevel {
+            declared,
+            achieved,
+            findings,
+        } => format!(
+            "{reason} (lookups {declared}, the layout achieves {achieved}: {})",
+            finding_list(findings)
+        ),
         RefusalReason::KeyTypeUnsupported | RefusalReason::DeleteFiles => reason.to_string(),
     }
 }
 
-/// The finding codes of an `Inefficient` error as one comma-separated list.
+/// The finding codes of a `BelowLevel` refusal as one comma-separated list.
 fn finding_list(codes: &[FindingCode]) -> String {
     codes
         .iter()
@@ -483,10 +478,11 @@ fn finding_list(codes: &[FindingCode]) -> String {
 /// The result type of every fallible operation in this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Why a table cannot be served correctly (RFD 007). Display gives the
-/// `snake_case` name that appears in logs, the doctor's output, and the
-/// `reason` metric label; the variants that carry fields render their name
-/// alone, and `Error::Refused`'s message adds the fields.
+/// Why a table cannot be served correctly (RFD 007), or under `strict` not
+/// at the level it declares (RFD 020). Display gives the `snake_case` name
+/// that appears in logs, the doctor's output, and the `reason` metric
+/// label; the variants that carry fields render their name alone, and
+/// `Error::Refused`'s message adds the fields.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RefusalReason {
     /// A data file's key column is not sorted: a key of a row group is below
@@ -582,11 +578,24 @@ pub enum RefusalReason {
         /// The row group without a filter.
         row_group: usize,
     },
+    /// The snapshot's layout puts a `strict` table below the level it
+    /// declares (RFD 020). Unlike the other reasons the snapshot could be
+    /// served correctly; its lookups would cost more than the table
+    /// accepts.
+    BelowLevel {
+        /// The table's `lookups`.
+        declared: Level,
+        /// The level the layout achieves in the table's residency.
+        achieved: Level,
+        /// The distinct codes of the capping findings whose cap does not
+        /// meet `declared`, in the doctor's order.
+        findings: Vec<FindingCode>,
+    },
 }
 
 /// Every rule but one reads only the snapshot's metadata and files and the
-/// table's configuration (its columns, residency, and resident budget)
-/// against fixed contract limits.
+/// table's configuration (its columns, residency, resident budget, and
+/// declared level) against fixed contract limits.
 impl Recurs for RefusalReason {
     fn recurrence(&self) -> Recurrence {
         match self {
@@ -600,6 +609,7 @@ impl Recurs for RefusalReason {
             | Self::DeleteFiles
             | Self::KeyTooLong { .. }
             | Self::NoBloomFilter { .. }
+            | Self::BelowLevel { .. }
             | Self::OverBudget {
                 of: Budget::Resident,
                 ..
@@ -649,6 +659,7 @@ impl fmt::Display for RefusalReason {
             Self::KeyTooLong { .. } => "key_too_long",
             Self::OverBudget { .. } => "over_budget",
             Self::NoBloomFilter { .. } => "no_bloom_filter",
+            Self::BelowLevel { .. } => "below_level",
         };
         f.write_str(name)
     }
@@ -745,6 +756,14 @@ mod tests {
                 },
                 "no_bloom_filter",
             ),
+            (
+                RefusalReason::BelowLevel {
+                    declared: Level::Optimal,
+                    achieved: Level::Balanced,
+                    findings: vec![FindingCode::DictionaryEncodedValue],
+                },
+                "below_level",
+            ),
         ]
     }
 
@@ -782,30 +801,21 @@ mod tests {
     }
 
     /// A refusal of every reason under the table's own budget and one under
-    /// the shared one, and the strict gate, beside their classification.
+    /// the shared one, beside their classification.
     fn refusal_recurrence_cases() -> Vec<(Error, Recurrence)> {
         use Recurrence::{Deterministic, Transient};
         let mut cases: Vec<(Error, Recurrence)> = reason_cases()
             .into_iter()
             .map(|(reason, _)| (refused(reason), Deterministic))
             .collect();
-        cases.extend([
-            (
-                refused(RefusalReason::OverBudget {
-                    of: Budget::Index,
-                    needed: 1,
-                    budget: 0,
-                }),
-                Transient,
-            ),
-            (
-                Error::Inefficient {
-                    table: TABLE.to_string(),
-                    findings: vec![FindingCode::DictionaryEncodedValue],
-                },
-                Deterministic,
-            ),
-        ]);
+        cases.push((
+            refused(RefusalReason::OverBudget {
+                of: Budget::Index,
+                needed: 1,
+                budget: 0,
+            }),
+            Transient,
+        ));
         cases
     }
 
@@ -1034,8 +1044,8 @@ mod tests {
 
     /// One failure of every variant of every type that answers `Recurs`,
     /// each beside its classification: a refusal of every reason and of
-    /// both budgets, the strict gate, every table, file, local, and cache
-    /// failure, and every other variant of `Error`, all transient.
+    /// both budgets, every table, file, local, and cache failure, and every
+    /// other variant of `Error`, all transient.
     fn recurrence_cases() -> Vec<(Error, Recurrence)> {
         let mut cases = refusal_recurrence_cases();
         cases.extend(table_fault_recurrence_cases());
@@ -1044,7 +1054,6 @@ mod tests {
         cases.extend(cache_recurrence_cases());
         let classified_above = |error: &Error| match error {
             Error::Refused { .. }
-            | Error::Inefficient { .. }
             | Error::Table { .. }
             | Error::File { .. }
             | Error::Local { .. }
@@ -1159,11 +1168,15 @@ mod tests {
                 "delete_files",
             ),
             (
-                Error::Inefficient {
+                Error::Refused {
                     table: TABLE.to_string(),
-                    findings: vec![FindingCode::DictionaryEncodedValue],
+                    reason: RefusalReason::BelowLevel {
+                        declared: Level::Optimal,
+                        achieved: Level::Permissive,
+                        findings: vec![FindingCode::OverlappingFiles],
+                    },
                 },
-                "inefficient",
+                "below_level",
             ),
             (
                 Error::KeyType {

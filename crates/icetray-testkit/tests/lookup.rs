@@ -1,13 +1,14 @@
 //! Serving fixture tables from a memory catalog on local disk in the Full
 //! tier (the P tier of RFD 014): routing over every key type, one GET per
 //! cold hit and none per warm hit or miss, `Generation::plan` as the oracle
-//! for `multi_get`, and the GET costs of the layouts the doctor finds
-//! inefficient or advises on; `findings.rs` holds the doctor's verdicts on them.
+//! for `multi_get`, and the GET costs of the layouts whose findings the
+//! doctor caps a level by or advises on; `findings.rs` holds the doctor's
+//! verdicts on them.
 
 use icetray_core::approx::{count, length};
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
-use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Value, diagnose};
+use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Level, Value, diagnose};
 use icetray_testkit::error::{Precondition, SpecFault};
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, SAMPLE, SAMPLE_4K,
@@ -437,7 +438,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         assert!(gets >= 1);
         let bytes_per_get = (stats.bytes() - bytes_before) / gets;
         let generation = served.current();
-        let report = diagnose(&generation);
+        let report = diagnose(&generation, Level::Optimal);
         let flagged = report
             .findings
             .iter()

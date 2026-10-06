@@ -16,7 +16,7 @@ use icetray::error::{ERROR_PREFIX, HINT_PREFIX};
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::reload::ReloadResult;
 use icetray::serve::OVERALL_SERVICE;
-use icetray::{EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE};
+use icetray::{EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
 use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::metric::{
@@ -331,7 +331,7 @@ async fn test_info_serializes_the_summary() -> TestResult {
         info[0]["records"],
         Json::from(SMALL_IDS.end - SMALL_IDS.start)
     );
-    assert_eq!(info[0]["serviceability"], "efficient");
+    assert_eq!(info[0]["level"], "optimal");
     assert_eq!(info[0]["residency"], "full");
     Ok(())
 }
@@ -385,7 +385,7 @@ async fn test_info_reads_a_glue_table_through_its_catalog() -> TestResult {
 }
 
 #[tokio::test]
-async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
+async fn test_doctor_reports_the_contract_fixture_at_optimal() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_doctor", KeyType::Long)).await?;
     let output = run(
@@ -396,8 +396,9 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     let report = lines(&output.stdout);
     assert_eq!(report[0]["kind"], "table");
     assert_eq!(report[0]["table"], fixture.ident().name());
-    assert_eq!(report[0]["serviceability"], "efficient");
-    assert_eq!(report[0]["inefficient"], Json::from(0));
+    assert_eq!(report[0]["level"], "optimal");
+    assert_eq!(report[0]["lookups"], "optimal");
+    assert_eq!(report[0]["capping"], Json::from(0));
     assert_eq!(report[0]["advice"], Json::from(0));
     assert!(report.iter().all(|line| line["kind"] != "finding"));
     assert_eq!(
@@ -407,8 +408,8 @@ async fn test_doctor_reports_the_contract_fixture_as_efficient() -> TestResult {
     Ok(())
 }
 
-/// A small fixture with no bucket partition, which the doctor finds
-/// inefficient.
+/// A small fixture with no bucket partition, whose layout the doctor finds
+/// permissive.
 async fn unpartitioned_fixture(dir: &Path, name: &str) -> Result<Fixture, BoxError> {
     let spec = FixtureSpec {
         buckets: 0,
@@ -421,37 +422,39 @@ async fn unpartitioned_fixture(dir: &Path, name: &str) -> Result<Fixture, BoxErr
     local_fixture(dir, spec).await
 }
 
-/// Asserts `report` opens with an inefficient `table` line and carries
-/// the `no_bucket_partition` finding at the inefficient tier.
-fn assert_unpartitioned_findings(report: &[Json]) {
+/// Asserts `report` opens with a permissive `table` line declared
+/// `lookups` and carries the `no_bucket_partition` finding capping it at
+/// permissive.
+fn assert_unpartitioned_findings(report: &[Json], lookups: &str) {
     assert_eq!(report[0]["kind"], "table");
-    assert_eq!(report[0]["serviceability"], "inefficient");
+    assert_eq!(report[0]["level"], "permissive");
+    assert_eq!(report[0]["lookups"], lookups);
     assert!(
         report.iter().any(|line| line["kind"] == "finding"
             && line["code"] == "no_bucket_partition"
-            && line["tier"] == "inefficient"),
+            && line["caps"] == "permissive"),
         "{report:?}"
     );
 }
 
 #[tokio::test]
-async fn test_doctor_reports_an_unpartitioned_table_inefficient_and_exits_2() -> TestResult {
+async fn test_doctor_reports_an_unpartitioned_table_below_its_level_and_exits_2() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = unpartitioned_fixture(dir.path(), "kv_flat").await?;
     let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
-    assert_exit(&output, EXIT_INEFFICIENT);
+    assert_exit(&output, EXIT_BELOW_LEVEL);
     let report = lines(&output.stdout);
-    assert_unpartitioned_findings(&report);
+    assert_unpartitioned_findings(&report, "optimal");
     assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
 }
 
 /// A configured table keeps its `strict`: under the default, on, the
-/// doctor reports the inefficient table's findings and then refuses it, as
-/// `info` and `serve` do, with exit 1; with `strict` off it is inefficient,
-/// exit 2.
+/// doctor reports the findings of a table below its level and then refuses
+/// it as `below_level`, as `info` and `serve` do, with exit 1; with
+/// `strict` off it is below its level and served, exit 2.
 #[tokio::test]
-async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict() -> TestResult {
+async fn test_doctor_refuses_a_strict_table_below_its_level() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = unpartitioned_fixture(dir.path(), "kv_flat_strict").await?;
     let strict = write_file(
@@ -462,14 +465,14 @@ async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict
     let output = run(&["doctor", "--config", &strict], &[]);
     assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
-    assert_unpartitioned_findings(&report);
+    assert_unpartitioned_findings(&report, "optimal");
     let refused: Vec<&Json> = report
         .iter()
         .filter(|line| line["kind"] == "refusal")
         .collect();
     assert_eq!(refused.len(), 1, "{report:?}");
     assert_eq!(refused[0]["table"], TABLE_A);
-    assert_eq!(refused[0]["reason"], "inefficient");
+    assert_eq!(refused[0]["reason"], "below_level");
     assert_eq!(
         report.last(),
         Some(refused[0]),
@@ -479,22 +482,50 @@ async fn test_doctor_refuses_an_inefficient_table_its_configuration_makes_strict
 
     let lenient = write_file(dir.path(), "lenient.toml", &toml_table(TABLE_A, &fixture))?;
     let output = run(&["doctor", "--config", &lenient], &[]);
-    assert_exit(&output, EXIT_INEFFICIENT);
+    assert_exit(&output, EXIT_BELOW_LEVEL);
     let report = lines(&output.stdout);
-    assert_unpartitioned_findings(&report);
+    assert_unpartitioned_findings(&report, "optimal");
     assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
+}
+
+/// A table that declares `permissive` meets it with a permissive layout:
+/// the findings are reported and the doctor exits 0, under the default
+/// `strict` as well, since nothing is below the level it declares.
+#[tokio::test]
+async fn test_doctor_exits_0_for_a_table_at_a_permissive_declared_level() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = unpartitioned_fixture(dir.path(), "kv_flat_permissive").await?;
+    let permissive = write_file(
+        dir.path(),
+        "permissive.toml",
+        &format!(
+            "{}lookups = \"permissive\"\n",
+            toml_table_default_strict(TABLE_A, &fixture)
+        ),
+    )?;
+    let output = run(&["doctor", "--config", &permissive], &[]);
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    assert_unpartitioned_findings(&report, "permissive");
+    assert!(report.iter().all(|line| line["kind"] != "refusal"));
+    Ok(())
+}
+
+/// A small fixture written in descending key order, which every load
+/// refuses as `unsorted`.
+fn unsorted_spec(name: &str) -> FixtureSpec {
+    FixtureSpec {
+        ids: IDS_4K,
+        order: Order::Descending,
+        ..FixtureSpec::small(name, KeyType::Long)
+    }
 }
 
 #[tokio::test]
 async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let spec = FixtureSpec {
-        ids: IDS_4K,
-        order: Order::Descending,
-        ..FixtureSpec::small("kv_unsorted", KeyType::Long)
-    };
-    let fixture = local_fixture(dir.path(), spec).await?;
+    let fixture = local_fixture(dir.path(), unsorted_spec("kv_unsorted")).await?;
     let output = run(&[&["doctor"][..], &location(&fixture)].concat(), &[]);
     assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
@@ -504,6 +535,66 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     assert_eq!(report[0]["reason"], "unsorted");
     assert!(report[0].get("error_kind").is_none(), "{report:?}");
     assert!(report[0]["message"].is_string());
+    Ok(())
+}
+
+/// A refusal outranks a table below its level: over one table refused and
+/// another only below its level, the doctor reports both and exits 1.
+#[tokio::test]
+async fn test_doctor_exits_1_when_one_table_is_refused_and_another_below_level() -> TestResult {
+    let refused_dir = tempfile::tempdir()?;
+    let below_dir = tempfile::tempdir()?;
+    let unsorted = local_fixture(refused_dir.path(), unsorted_spec("kv_unsorted_two")).await?;
+    let flat = unpartitioned_fixture(below_dir.path(), "kv_flat_two").await?;
+    let toml = format!(
+        "{}\n{}",
+        toml_table(TABLE_A, &unsorted),
+        toml_table(TABLE_B, &flat)
+    );
+    let config = write_file(refused_dir.path(), "two.toml", &toml)?;
+    let output = run(&["doctor", "--config", &config], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    let report = lines(&output.stdout);
+    let refused: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "refusal")
+        .collect();
+    assert_eq!(refused.len(), 1, "{report:?}");
+    assert_eq!(refused[0]["table"], TABLE_A);
+    assert_eq!(refused[0]["reason"], "unsorted");
+    let below: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "table" && line["table"] == TABLE_B)
+        .collect();
+    assert_eq!(below.len(), 1, "{report:?}");
+    assert_eq!(below[0]["level"], "permissive");
+    assert_eq!(below[0]["lookups"], "optimal");
+    Ok(())
+}
+
+/// A `--location` table takes its declared level from `--residency`: in
+/// the bloom tier the contract fixture is balanced, as the tier is at best,
+/// and meets it.
+#[tokio::test]
+async fn test_doctor_location_in_the_bloom_tier_declares_balanced_and_exits_0() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_bloom", KeyType::Long)).await?;
+    let output = run(
+        &[
+            &["doctor"][..],
+            &location(&fixture),
+            &["--residency", "bloom"],
+        ]
+        .concat(),
+        &[],
+    );
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    assert_eq!(report[0]["kind"], "table");
+    assert_eq!(report[0]["residency"], "bloom");
+    assert_eq!(report[0]["level"], "balanced");
+    assert_eq!(report[0]["lookups"], "balanced");
+    assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
 }
 

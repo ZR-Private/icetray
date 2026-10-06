@@ -196,6 +196,7 @@ mod tests {
             key_column: "key".to_string(),
             value_column: "value".to_string(),
             strict: true,
+            lookups: None,
             residency: Residency::Full,
             resident_budget_bytes: None,
         };

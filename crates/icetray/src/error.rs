@@ -27,8 +27,8 @@ use crate::cli::{ConfigPath, ENV_CONFIG};
 use crate::serve::PeriodicTask;
 use crate::service::WireVariant;
 
-/// The run did what was asked: the doctor found nothing inefficient, every
-/// lookup was answered, the daemon drained.
+/// The run did what was asked: the doctor found every table at or above its
+/// declared level, every lookup was answered, the daemon drained.
 pub const EXIT_OK: u8 = 0;
 
 /// The run failed: a configuration that cannot be read, parsed, or
@@ -39,9 +39,10 @@ pub const EXIT_OK: u8 = 0;
 /// deadline.
 pub const EXIT_FAILURE: u8 = 1;
 
-/// The doctor found an inefficient finding (RFD 016): the table serves,
-/// inefficiently, which a build pipeline gates on.
-pub const EXIT_INEFFICIENT: u8 = 2;
+/// The doctor found a table below its declared level that `serve` would not
+/// refuse (RFD 016, RFD 020): the table serves at a higher lookup cost than
+/// it declares, which a build pipeline gates on.
+pub const EXIT_BELOW_LEVEL: u8 = 2;
 
 /// The command line or the target could not be used: clap's own errors, no
 /// configuration and no target, a `--location` no store serves, `--table`
@@ -663,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_exit_codes_are_distinct() {
-        let codes = [EXIT_OK, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_USAGE];
+        let codes = [EXIT_OK, EXIT_FAILURE, EXIT_BELOW_LEVEL, EXIT_USAGE];
         for (i, a) in codes.iter().enumerate() {
             for b in &codes[i + 1..] {
                 assert_ne!(a, b);

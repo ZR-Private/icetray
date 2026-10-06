@@ -17,7 +17,7 @@ use icetray_core::config::{
 };
 
 use crate::error::{
-    CliError, EXIT_FAILURE, EXIT_INEFFICIENT, EXIT_OK, EXIT_USAGE, RewriteTextFault,
+    CliError, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, RewriteTextFault,
 };
 use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 
@@ -93,7 +93,7 @@ fn footer() -> String {
 {heading}Exit status:{heading:#}
   {EXIT_OK:<3} Success; an absent key is an answer
   {EXIT_FAILURE:<3} Failure, or a table refused
-  {EXIT_INEFFICIENT:<3} The doctor found an inefficient table it did not refuse
+  {EXIT_BELOW_LEVEL:<3} The doctor found a table below its lookups level it did not refuse
   {EXIT_USAGE:<3} Usage error
 
 {heading}Examples:{heading:#}
@@ -138,13 +138,17 @@ pub enum Command {
     },
     /// Check tables against the table contract.
     ///
-    /// Loads each table and prints a JSON table line with its summary, a
-    /// finding line for each inefficient finding or advice, and a refusal
-    /// line for a table that cannot be served. A table from a configuration
-    /// file is judged under its strict setting, as serve judges it.
+    /// Loads each table and prints a JSON table line with its summary and
+    /// the lookup level its layout achieves, a finding line for each
+    /// finding with the level it caps the table at, or none for advice, and
+    /// a refusal line for a table that cannot be served. A table from a
+    /// configuration file is judged against its lookups level under its
+    /// strict setting, as serve judges it; a --location table declares the
+    /// best level its residency reaches and is never strict.
     ///
-    /// Exits 0 when no table is inefficient, 2 when one is inefficient and
-    /// not refused, and 1 when one cannot be loaded or is refused.
+    /// Exits 0 when every table meets its lookups level, 2 when one is
+    /// below it and not refused, and 1 when one cannot be loaded or is
+    /// refused.
     Doctor {
         /// Where the tables come from.
         #[command(flatten)]
@@ -182,7 +186,7 @@ pub enum Command {
     /// Describe each table's current snapshot.
     ///
     /// Loads each table and prints one JSON table line per table with its
-    /// snapshot, size, serviceability, and each residency's resident bytes.
+    /// snapshot, size, lookup level, and each residency's resident bytes.
     Info {
         /// Where the tables come from.
         #[command(flatten)]
@@ -508,6 +512,7 @@ impl Target {
                 key_column: self.key_column.clone(),
                 value_column: self.value_column.clone(),
                 strict: false,
+                lookups: None,
                 residency: self.residency,
                 resident_budget_bytes: None,
             }],
@@ -574,6 +579,7 @@ mod tests {
                 key_column: DEFAULT_KEY_COLUMN.to_string(),
                 value_column: DEFAULT_VALUE_COLUMN.to_string(),
                 strict: false,
+                lookups: None,
                 residency: Residency::Full,
                 resident_budget_bytes: None,
             }]

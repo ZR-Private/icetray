@@ -11,7 +11,7 @@ use std::sync::Arc;
 use iceberg::Catalog;
 use icetray_core::approx::{self, count};
 use icetray_core::config::Residency;
-use icetray_core::{Error, Generation, Key, KeyType, LoadedFile, RefusalReason, diagnose};
+use icetray_core::{Error, Generation, Key, KeyType, Level, LoadedFile, RefusalReason, diagnose};
 use icetray_testkit::error::Precondition;
 use icetray_testkit::fixture::{
     IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, LONG_KEY_PAD, NAMESPACE, NEWEST_SAMPLE,
@@ -209,7 +209,7 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         bloom.index_bytes,
         full.index_bytes
     );
-    let predicted = diagnose(&full).summary.predicted;
+    let predicted = diagnose(&full, Level::Optimal).summary.predicted;
     assert_eq!(
         predicted.in_tier(Residency::Full),
         Some(count(full.index_bytes)),
@@ -220,7 +220,13 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         Some(count(bloom.index_bytes)),
         "and the Bloom tier's: footers, indexes, filters, and fences, no chunk"
     );
-    assert_eq!(diagnose(&bloom).summary.residency, Residency::Bloom);
+    let bloom_summary = diagnose(&bloom, Level::Balanced).summary;
+    assert_eq!(bloom_summary.residency, Residency::Bloom);
+    assert_eq!(
+        bloom_summary.level,
+        Level::Balanced,
+        "bloom residency caps the level"
+    );
     verify_bloom_hit_cost(&tiers, &fixture, &SAMPLE).await
 }
 
