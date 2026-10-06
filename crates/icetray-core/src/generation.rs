@@ -137,14 +137,17 @@ type RankedRoutes = BTreeMap<Option<Bucketing>, BTreeMap<u32, Vec<ProbeRank>>>;
 
 impl Generation {
     /// The footer stage of a load of `snapshot` of `table`: derives the
-    /// layout from the snapshot's schema, lists its live files, reuses from
-    /// `previous` every file the snapshot still names by the same path at
-    /// the same size and data sequence number (the same `Arc`, RFD 005;
-    /// `reuse_or_open`), opens a `FileHandle` for every other file with the
-    /// manifest's size and `hedge`, and inspects their footers
-    /// `load_concurrency()` at a time. No key chunk is read and nothing is
-    /// written; `Planned::build` does both. Raised before any read: a
-    /// `lookups` level the residency cannot reach, as
+    /// layout from the snapshot's schema, lists its live files
+    /// (`manifest::list_files`, which refuses the deletes it documents),
+    /// refuses a snapshot with any readable delete file left as
+    /// `RefusalReason::DeleteFiles`, since a generation applies no delete to
+    /// its lookups, reuses from `previous` every file the snapshot still
+    /// names by the same path at the same size and data sequence number
+    /// (the same `Arc`, RFD 005; `reuse_or_open`), opens a `FileHandle` for
+    /// every other file with the manifest's size and `hedge`, and inspects
+    /// their footers `load_concurrency()` at a time. No key chunk is read
+    /// and nothing is written; `Planned::build` does both. Raised before
+    /// any read: a `lookups` level the residency cannot reach, as
     /// `ConfigViolation::LookupsUnreachable` (a configuration built by hand
     /// meets it here rather than at validation), and a snapshot timestamp
     /// jiff cannot represent, as `TableFault::SnapshotTimestampOutOfRange`.
@@ -166,10 +169,12 @@ impl Generation {
             &config.key_column,
             &config.value_column,
         )?;
-        let entries =
-            manifest::list_data_files(table, &resolved.metadata, snapshot, &layout, storage)
-                .await?;
-        let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge).await?;
+        let files =
+            manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
+        if !files.deletes.is_empty() {
+            return Err(Error::refused(table, RefusalReason::DeleteFiles));
+        }
+        let (reused, pending) = reuse_or_open(files.data, previous, storage, &hedge).await?;
         let inspected = inspect_all(table, &layout, pending).await?;
         Ok(Planned {
             config: config.clone(),

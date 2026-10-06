@@ -447,6 +447,8 @@ pub struct Fixture {
     metadata_location: String,
     /// Every data file the current snapshot lists.
     files: Vec<DataFile>,
+    /// Every delete file the current snapshot lists.
+    deletes: Vec<DataFile>,
     /// The commit that added each file the current snapshot lists, data or
     /// delete, by path: what a by-hand commit carries the file at as an
     /// existing entry, as a writer does.
@@ -471,6 +473,7 @@ impl Fixture {
             metadata,
             metadata_location,
             files: Vec::new(),
+            deletes: Vec::new(),
             added: HashMap::new(),
             by_hand: false,
             hand_commits: 0,
@@ -797,6 +800,7 @@ impl Fixture {
             })
             .collect();
         self.files = snapshot.data;
+        self.deletes = snapshot.deletes;
         self.by_hand = true;
         self.write_hint().await
     }
@@ -839,15 +843,17 @@ impl Fixture {
 
     /// Rewrites every id written so far into new data files, ascending,
     /// grouped by bucket as a first build writes them, named after
-    /// `prefix`, and commits them by hand as a snapshot that lists them
-    /// alone: what a compaction leaves, the same rows in as few files per
-    /// bucket as the file size target allows (`commit_by_hand`).
+    /// `prefix`, and commits them by hand as a snapshot that lists them in
+    /// place of every data file before (`commit_by_hand`): what a compaction
+    /// leaves, the same rows in as few files per bucket as the file size
+    /// target allows. The current snapshot's delete files stay listed, as
+    /// a rewrite of data files leaves them, now older than every data file.
     pub async fn compact(&mut self, prefix: &str) -> Result<()> {
         let data =
             write_data_files(&self.table, &self.spec, self.ids.iter().copied(), prefix).await?;
         self.commit_by_hand(HandSnapshot {
             data,
-            deletes: Vec::new(),
+            deletes: self.deletes.clone(),
         })
         .await
     }
@@ -1248,23 +1254,74 @@ fn data_file(
     })
 }
 
-/// A position-delete file entry at `path` under `spec_id` with `partition`
-/// as its tuple, for `HandSnapshot::deletes`: the file need not exist, since
-/// the content type alone decides the refusal.
+/// A position-delete file entry at `path` in `format` under `spec_id` with
+/// `partition` as its tuple, for `HandSnapshot::deletes`: the file need not
+/// exist, since the manifest alone decides every refusal it meets.
 pub fn position_delete_file(
     path: &str,
     spec_id: i32,
     partition: Struct,
     records: u64,
     size: u64,
+    format: DataFileFormat,
 ) -> Result<DataFile> {
-    data_file(
+    delete_file(
         path,
         spec_id,
         partition,
-        records,
-        size,
-        None,
+        (records, size),
         DataContentType::PositionDeletes,
+        format,
     )
+}
+
+/// An equality-delete file entry on the key column at `path` under
+/// `spec_id` with `partition` as its tuple, for `HandSnapshot::deletes`;
+/// the file need not exist, as for `position_delete_file`.
+pub fn equality_delete_file(
+    path: &str,
+    spec_id: i32,
+    partition: Struct,
+    records: u64,
+    size: u64,
+) -> Result<DataFile> {
+    delete_file(
+        path,
+        spec_id,
+        partition,
+        (records, size),
+        DataContentType::EqualityDeletes,
+        DataFileFormat::Parquet,
+    )
+}
+
+/// A delete file entry of `content` in `format` with `(records, size)`;
+/// an equality delete is on the key column.
+fn delete_file(
+    path: &str,
+    spec_id: i32,
+    partition: Struct,
+    (records, size): (u64, u64),
+    content: DataContentType,
+    format: DataFileFormat,
+) -> Result<DataFile> {
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(content)
+        .file_path(path.to_string())
+        .file_format(format)
+        .partition(partition)
+        .partition_spec_id(spec_id)
+        .record_count(records)
+        .file_size_in_bytes(size);
+    if content == DataContentType::EqualityDeletes {
+        builder.equality_ids(Some(vec![KEY_FIELD_ID]));
+    }
+    builder.build().map_err(|error| {
+        iceberg::Error::new(
+            ErrorKind::DataInvalid,
+            format!("delete file entry incomplete: {error}"),
+        )
+        .into()
+    })
 }

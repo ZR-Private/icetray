@@ -148,12 +148,20 @@ pub enum TableFault {
     /// at the initial sequence number. An existing entry without one has
     /// lost the commit its rows came from, which orders it against deletes
     /// (RFD 021).
-    #[error("data file {path} in manifest {manifest} records no data sequence number")]
+    #[error("file {path} in manifest {manifest} records no data sequence number")]
     SequenceNumberMissing {
         /// The file's location.
         path: String,
         /// The manifest listing it.
         manifest: String,
+    },
+    /// A deletion vector's manifest entry does not place its blob: it lacks
+    /// the data file it applies to, or its blob's offset or length, or
+    /// gives a negative one. The Puffin spec requires all three.
+    #[error("deletion vector {path} has no referenced data file, offset, or length")]
+    VectorUnplaced {
+        /// The Puffin file's location.
+        path: String,
     },
     /// The snapshot's timestamp is outside the range a `jiff::Timestamp`
     /// represents, so its age cannot be measured.
@@ -180,6 +188,7 @@ impl Recurs for TableFault {
             | Self::BucketValueMissing { .. }
             | Self::BucketValueOutOfRange { .. }
             | Self::SequenceNumberMissing { .. }
+            | Self::VectorUnplaced { .. }
             | Self::SnapshotTimestampOutOfRange { .. } => Recurrence::Deterministic,
             // The version hint is rewritten in place by every commit, and the
             // catalog's record is the catalog's to change: neither is part of

@@ -11,18 +11,18 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
-use iceberg::spec::{PrimitiveType, Struct};
+use iceberg::spec::{DataFile, DataFileFormat, PrimitiveType, Struct};
 use icetray_core::approx::count;
 use icetray_core::config::{ConfigError, ConfigViolation, LocalConfig, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
     Budget, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason, Storage,
-    TableSource, TableState, bucket,
+    TableSource, TableState, UnsupportedDelete, bucket,
 };
 use icetray_testkit::fixture::{
-    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SECOND_CLASS, STRAY_IDS,
-    TINY_BUDGET, TWO_BUCKETS, local_catalog, position_delete_file, residue_class,
-    write_table_of_types,
+    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
+    STRAY_IDS, TINY_BUDGET, TWO_BUCKETS, equality_delete_file, local_catalog, position_delete_file,
+    residue_class, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
@@ -307,38 +307,160 @@ async fn test_unsupported_value_type_is_refused() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_delete_file_is_refused() -> Result<()> {
-    let (_dir, catalog) = local_catalog().await?;
+/// An unpartitioned `IDS_2K` fixture, as the delete fixtures start from.
+async fn unpartitioned_fixture(catalog: &Arc<dyn Catalog>, name: &str) -> Result<Fixture> {
     let spec = FixtureSpec {
         ids: IDS_2K,
         buckets: 0,
-        ..FixtureSpec::small("kv_deletes", KeyType::Long)
+        ..FixtureSpec::small(name, KeyType::Long)
     };
-    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-    let delete = position_delete_file(
-        &format!("{}/{DATA_DIR}/{DELETE_FILE}", fixture.root()),
-        fixture.metadata().default_partition_spec_id(),
-        Struct::empty(),
-        DELETE_RECORDS,
-        DELETE_BYTES,
-    )?;
+    write_fixture(catalog.as_ref(), NAMESPACE, spec).await
+}
+
+/// Commits the fixture's data files by hand beside `deletes`; each data
+/// file is carried at the sequence number it was added at, and every
+/// delete is added by the new commit, so it is newer than every data file.
+async fn commit_deletes(
+    fixture: &mut Fixture,
+    deletes: Vec<iceberg::spec::DataFile>,
+) -> Result<()> {
     fixture
         .commit_by_hand(HandSnapshot {
             data: fixture.files().to_vec(),
-            deletes: vec![delete],
+            deletes,
         })
-        .await?;
+        .await
+}
+
+/// `load_refused` of `fixture` followed through its root.
+async fn refused_through_root(fixture: &Fixture) -> Result<Refused> {
     let source = fixture.root_source();
-    let refused = load_refused(
+    load_refused(
         TableConfig {
             source: source.clone(),
             ..fixture.config(Residency::Full, false)
         },
         TableSource::from_config(&source).await?,
     )
-    .await?;
+    .await
+}
+
+/// The location of delete file `name` under `fixture`'s data directory.
+fn delete_path(fixture: &Fixture, name: &str) -> String {
+    format!("{}/{DATA_DIR}/{name}", fixture.root())
+}
+
+#[tokio::test]
+async fn test_delete_file_is_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = unpartitioned_fixture(&catalog, "kv_deletes").await?;
+    let delete = position_delete_file(
+        &delete_path(&fixture, DELETE_FILE),
+        fixture.metadata().default_partition_spec_id(),
+        Struct::empty(),
+        DELETE_RECORDS,
+        DELETE_BYTES,
+        DataFileFormat::Parquet,
+    )?;
+    commit_deletes(&mut fixture, vec![delete]).await?;
+    let refused = refused_through_root(&fixture).await?;
     assert_eq!(refused.reason, RefusalReason::DeleteFiles);
+    Ok(())
+}
+
+/// A position delete file in Avro is refused from its manifest entry, before
+/// any data file's footer is read.
+#[tokio::test]
+async fn test_avro_position_delete_is_refused_as_an_unsupported_kind() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = unpartitioned_fixture(&catalog, "kv_avro_deletes").await?;
+    let path = delete_path(&fixture, "deletes.avro");
+    let delete = position_delete_file(
+        &path,
+        fixture.metadata().default_partition_spec_id(),
+        Struct::empty(),
+        DELETE_RECORDS,
+        DELETE_BYTES,
+        DataFileFormat::Avro,
+    )?;
+    commit_deletes(&mut fixture, vec![delete]).await?;
+    let refused = refused_through_root(&fixture).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::DeleteKindUnsupported {
+            path,
+            kind: UnsupportedDelete::AvroPositions,
+        }
+    );
+    assert_eq!(
+        refused.storage.stats().gets(),
+        verify::HINT_POLL_GETS + verify::METADATA_FILE_GETS + DELETE_SNAPSHOT_MANIFEST_GETS,
+        "refused from the manifests alone"
+    );
+    Ok(())
+}
+
+/// The GETs the manifests of a by-hand snapshot with deletes cost: the
+/// manifest list, the data manifest, and the delete manifest.
+const DELETE_SNAPSHOT_MANIFEST_GETS: u64 = 3;
+
+/// An equality delete newer than the data files it may delete from is
+/// refused from its manifest entry; after a compaction rewrites the data
+/// at a later sequence number and leaves the delete behind, it applies to
+/// nothing and the snapshot serves every key.
+#[tokio::test]
+async fn test_equality_delete_is_refused_while_live_and_served_once_dangling() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = unpartitioned_fixture(&catalog, "kv_equality").await?;
+    let path = delete_path(&fixture, "equality.parquet");
+    let delete = equality_delete_file(
+        &path,
+        fixture.metadata().default_partition_spec_id(),
+        Struct::empty(),
+        DELETE_RECORDS,
+        DELETE_BYTES,
+    )?;
+    commit_deletes(&mut fixture, vec![delete]).await?;
+    let refused = refused_through_root(&fixture).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::EqualityDeletes { path: path.clone() }
+    );
+    assert_eq!(
+        refused.storage.stats().gets(),
+        verify::HINT_POLL_GETS + verify::METADATA_FILE_GETS + DELETE_SNAPSHOT_MANIFEST_GETS,
+        "refused from the manifests alone"
+    );
+
+    fixture.compact("compacted").await?;
+    let source = fixture.root_source();
+    let served = verify::serve(
+        TableConfig {
+            source: source.clone(),
+            ..fixture.config(Residency::Full, false)
+        },
+        TableSource::from_config(&source).await?,
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    let generation = served.current();
+    assert_eq!(
+        generation.snapshot_id.0,
+        fixture.metadata().current_snapshot().unwrap().snapshot_id()
+    );
+    let mut served_paths: Vec<&str> = generation
+        .files
+        .iter()
+        .map(|file| file.entry.path.as_str())
+        .collect();
+    let mut compacted: Vec<&str> = fixture.files().iter().map(DataFile::file_path).collect();
+    served_paths.sort_unstable();
+    compacted.sort_unstable();
+    assert_eq!(served_paths, compacted, "the compacted files alone serve");
+    for id in SAMPLE_4K.into_iter().filter(|id| IDS_2K.contains(id)) {
+        let key = fixture.key(id);
+        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+    }
     Ok(())
 }
 

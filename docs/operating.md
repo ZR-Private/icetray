@@ -193,16 +193,17 @@ The label values:
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
   `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,
-  `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`,
-  `below_level`), or an error kind (`iceberg`, `parquet`, `object_store`,
-  `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`,
-  `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`,
-  `load_deadline`, `refresh_deadline`, `verify_canceled`,
-  `lookup_canceled`). There are too many to expose for every table at
-  start, so a series appears with its first error; alert on
-  `icetray_table_state` instead ([What to alert on](#what-to-alert-on)). A
-  table stuck behind a refused snapshot counts the failure once, so its
-  rate falls to zero while the table stays degraded or held.
+  `delete_files`, `equality_deletes`, `delete_kind_unsupported`,
+  `key_too_long`, `over_budget`, `no_bloom_filter`, `below_level`), or an
+  error kind (`iceberg`, `parquet`, `object_store`, `object_store_path`,
+  `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`,
+  `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`,
+  `refresh_deadline`, `verify_canceled`, `lookup_canceled`). There are
+  too many to expose for every table at start, so a series appears with
+  its first error; alert on `icetray_table_state` instead ([What to alert
+  on](#what-to-alert-on)). A table stuck behind a refused snapshot counts
+  the failure once, so its rate falls to zero while the table stays
+  degraded or held.
 
 A table a reload adds gets its series when it is added. A table a reload
 removes loses its gauges at the next scrape; its counters and histograms
@@ -358,17 +359,20 @@ reads depends on the table's source
   reason, `below_level` included, except `over_budget` against
   `storage.local.index_budget_bytes`. It is a `table` fault of the
   snapshot's metadata: a ref, schema, partition spec, or column it lacks,
-  zero buckets, or a data file with no usable bucket value or one out of
-  range. It is a `file` fault that a data file's footer or bloom filters
-  show. These depend only on the snapshot and the table's entry, so trying
-  again cannot help. The failure is counted and logged once, when it is
-  met, and the table does not build that snapshot again while its source
-  names the same metadata location: each poll costs only the one read or
-  catalog call above, counts nothing, logs nothing, and the table stays
-  degraded, or held. When the source names another metadata location,
-  its snapshot is built. Once the table serves it, or refuses it in turn,
-  `source moved past a refused snapshot` is logged at `info` with the
-  `reason` and, when the ref named one, the refused `snapshot_id`. A
+  zero buckets, a data file with no usable bucket value or one out of
+  range, a manifest entry with no data sequence number of its own and none
+  to inherit, a deletion vector entry that does not place its blob in its
+  Puffin file, or a snapshot timestamp outside the range icetray can
+  represent. It is a `file` fault that a data file's footer or bloom
+  filters show. These depend only on the snapshot and the table's entry,
+  so trying again cannot help. The failure is counted and logged once,
+  when it is met, and the table does not build that snapshot again while
+  its source names the same metadata location: each poll costs only the
+  one read or catalog call above, counts nothing, logs nothing, and the
+  table stays degraded, or held. When the source names another metadata
+  location, its snapshot is built. Once the table serves it, or refuses it
+  in turn, `source moved past a refused snapshot` is logged at `info` with
+  the `reason` and, when the ref named one, the refused `snapshot_id`. A
   reload that changes a setting of the table's entry other than `lookups`
   and `strict` loads the table anew under the new entry, the refused
   snapshot included, so fixing `ref` or a column name or raising

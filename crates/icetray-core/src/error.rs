@@ -440,6 +440,10 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         RefusalReason::KeyTooLong { path, bytes } => {
             format!("{reason} (file {path}, {bytes} bytes)")
         }
+        RefusalReason::EqualityDeletes { path } => format!("{reason} (file {path})"),
+        RefusalReason::DeleteKindUnsupported { path, kind } => {
+            format!("{reason} (file {path}, {kind})")
+        }
         RefusalReason::DuplicateKeys { path, key } => {
             format!("{reason} (file {path}, key {key})")
         }
@@ -549,8 +553,26 @@ pub enum RefusalReason {
         /// `iceberg::spec::Type` does not implement `Hash`.
         got: String,
     },
-    /// The snapshot carries delete files.
+    /// The snapshot carries a live position delete file in Parquet or a
+    /// deletion vector. A generation applies no delete to its lookups, so
+    /// serving the snapshot would answer with rows it deletes.
     DeleteFiles,
+    /// An equality delete applies to a data file the snapshot holds: its
+    /// data sequence number is above that of the snapshot's oldest data
+    /// file, so it may delete rows of it (RFD 021). Equality deletes are
+    /// not served; one at or below every data file's applies to nothing
+    /// and is ignored.
+    EqualityDeletes {
+        /// The delete file's location.
+        path: String,
+    },
+    /// A delete file icetray cannot read (RFD 021).
+    DeleteKindUnsupported {
+        /// The delete file's location.
+        path: String,
+        /// What it is.
+        kind: UnsupportedDelete,
+    },
     /// A key is longer than `contract::MAX_KEY_BYTES`.
     KeyTooLong {
         /// The data file's location.
@@ -607,6 +629,8 @@ impl Recurs for RefusalReason {
             | Self::KeyTypeUnsupported
             | Self::ValueTypeUnsupported { .. }
             | Self::DeleteFiles
+            | Self::EqualityDeletes { .. }
+            | Self::DeleteKindUnsupported { .. }
             | Self::KeyTooLong { .. }
             | Self::NoBloomFilter { .. }
             | Self::BelowLevel { .. }
@@ -621,6 +645,26 @@ impl Recurs for RefusalReason {
                 of: Budget::Index, ..
             } => Recurrence::Transient,
         }
+    }
+}
+
+/// A delete file icetray cannot read, as `RefusalReason::DeleteKindUnsupported`
+/// names it (RFD 021). Display gives what it is, for a log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnsupportedDelete {
+    /// A position delete file written as Avro.
+    AvroPositions,
+    /// A position delete file written as ORC.
+    OrcPositions,
+}
+
+impl fmt::Display for UnsupportedDelete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::AvroPositions => "position deletes in avro",
+            Self::OrcPositions => "position deletes in orc",
+        };
+        f.write_str(name)
     }
 }
 
@@ -656,6 +700,8 @@ impl fmt::Display for RefusalReason {
             Self::KeyTypeUnsupported => "key_type_unsupported",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
             Self::DeleteFiles => "delete_files",
+            Self::EqualityDeletes { .. } => "equality_deletes",
+            Self::DeleteKindUnsupported { .. } => "delete_kind_unsupported",
             Self::KeyTooLong { .. } => "key_too_long",
             Self::OverBudget { .. } => "over_budget",
             Self::NoBloomFilter { .. } => "no_bloom_filter",
@@ -734,6 +780,26 @@ mod tests {
                 "value_type_unsupported",
             ),
             (RefusalReason::DeleteFiles, "delete_files"),
+            (
+                RefusalReason::EqualityDeletes {
+                    path: FILE_PATH.to_string(),
+                },
+                "equality_deletes",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::AvroPositions,
+                },
+                "delete_kind_unsupported",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::OrcPositions,
+                },
+                "delete_kind_unsupported",
+            ),
             (
                 RefusalReason::KeyTooLong {
                     path: FILE_PATH.to_string(),
@@ -861,6 +927,12 @@ mod tests {
                 table(TableFault::SequenceNumberMissing {
                     path: FILE_PATH.to_string(),
                     manifest: FILE_PATH.to_string(),
+                }),
+                Deterministic,
+            ),
+            (
+                table(TableFault::VectorUnplaced {
+                    path: FILE_PATH.to_string(),
                 }),
                 Deterministic,
             ),

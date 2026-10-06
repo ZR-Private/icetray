@@ -1,24 +1,24 @@
-//! From a snapshot to its live data files (RFD 005, RFD 009). The table's
-//! layout (key and value columns, bucket transform) is derived from the
-//! snapshot's own schema, and every manifest is read under its own
+//! From a snapshot to its live data and delete files (RFD 005, RFD 021).
+//! The table's layout (key and value columns, bucket transform) is derived
+//! from the snapshot's own schema, and every manifest is read under its own
 //! partition spec, so a schema or spec change between snapshots cannot
 //! misroute a key; the table's current schema plays no part. Delete
-//! manifests are read like data manifests, so a delete file is refused
-//! rather than skipped.
+//! manifests are read like data manifests, and wherever a delete file is
+//! listed it is classified by its content and format rather than skipped.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{
-    DataContentType, DataFile, Datum, Literal, Manifest, ManifestEntry, ManifestFile, ManifestList,
-    ManifestStatus, PartitionSpec, PrimitiveLiteral, PrimitiveType, Snapshot, TableMetadata,
-    Transform, Type,
+    DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestEntry,
+    ManifestFile, ManifestList, ManifestStatus, PartitionSpec, PrimitiveLiteral, PrimitiveType,
+    Snapshot, TableMetadata, Transform, Type,
 };
 
 use crate::bucket;
 use crate::catalog::TableFault;
-use crate::error::{Error, RefusalReason, Result};
+use crate::error::{Error, RefusalReason, Result, UnsupportedDelete};
 use crate::key::{Key, KeyType};
 use crate::snapshot::SequenceNumber;
 use crate::storage::Storage;
@@ -253,32 +253,66 @@ pub struct DataFileEntry {
     pub key_max: Option<Key>,
 }
 
-/// The live data files of `snapshot`: the manifest list and every manifest
-/// it names, data and delete manifests alike, read through `storage` with
+/// One live delete file of a snapshot that icetray can read, as its
+/// manifest records it: a position delete file in Parquet or a deletion
+/// vector (RFD 021).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteFileEntry {
+    /// The file's location: the position delete file, or the Puffin file
+    /// holding the vector.
+    pub(crate) path: String,
+}
+
+/// A snapshot's live files (`list_files`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotFiles {
+    /// Every live data file, ordered by (bucketing, bucket, `key_min` with
+    /// `None` first, path).
+    pub(crate) data: Vec<DataFileEntry>,
+    /// Every live delete file that may apply, in the order the manifests
+    /// list them.
+    pub(crate) deletes: Vec<DeleteFileEntry>,
+}
+
+/// The live files of `snapshot`: the manifest list and every manifest it
+/// names, data and delete manifests alike, read through `storage` with
 /// `MANIFEST_READ_CONCURRENCY` manifests in flight. An entry with status
-/// `Deleted` is skipped; a live entry whose content is not data (a
-/// positional or equality delete file, wherever it is listed) is
-/// `RefusalReason::DeleteFiles` (RFD 009). Each file's bucket comes from
-/// its own manifest's partition spec, looked up in `md` by the id the
-/// manifest list records (missing is `TableFault::SpecMissing`): the spec's
-/// bucket field on the key names the position in the partition tuple whose
-/// integer is the bucket (a non-integer there is
-/// `TableFault::BucketValueMissing`, one at or past the spec's count
-/// `TableFault::BucketValueOutOfRange`), and a spec with no such field files
-/// the entry under `UNBUCKETED` with no bucketing. Each file's data sequence
-/// number is its entry's own or the one it inherits from the manifest list's
-/// record of its manifest (`inherited_sequence`); an entry that has neither
-/// is `TableFault::SequenceNumberMissing`. Key bounds come from the
-/// manifest's lower and upper bounds for the key field through
-/// `Key::from_datum`. The result is ordered by (bucketing, bucket, `key_min`
-/// with `None` first, path), the same for the same manifests in any order.
-pub(crate) async fn list_data_files(
+/// `Deleted` is skipped. Each file's data sequence number is its entry's
+/// own or the one it inherits from the manifest list's record of its
+/// manifest (`inherited_sequence`); an entry that has neither is
+/// `TableFault::SequenceNumberMissing`.
+///
+/// A data file's bucket comes from its own manifest's partition spec,
+/// looked up in `md` by the id the manifest list records (missing is
+/// `TableFault::SpecMissing`): the spec's bucket field on the key names the
+/// position in the partition tuple whose integer is the bucket (a
+/// non-integer there is `TableFault::BucketValueMissing`, one at or past
+/// the spec's count `TableFault::BucketValueOutOfRange`), and a spec with
+/// no such field files the entry under `UNBUCKETED` with no bucketing. Key
+/// bounds come from the manifest's lower and upper bounds for the key field
+/// through `Key::from_datum`.
+///
+/// A delete file is classified wherever it is listed (`classify_delete`).
+/// Refused, after every manifest is read so that the verdict is the same
+/// for the same manifests in any order: first the position delete file in
+/// Avro or ORC with the least path, as
+/// `RefusalReason::DeleteKindUnsupported`; then the equality delete with
+/// the least path among those above the least data sequence number of the
+/// snapshot's data files, which may delete rows of that file, as
+/// `RefusalReason::EqualityDeletes`. An equality delete at or below every
+/// data file's sequence number applies to nothing and is dropped, as one
+/// is when the snapshot has no data file.
+///
+/// A fault is raised at the first entry that shows it, so of a snapshot
+/// with several, which one is reported can depend on the order of its
+/// manifests; a refusal cannot.
+pub(crate) async fn list_files(
     table: &str,
     md: &TableMetadata,
     snapshot: &Snapshot,
     layout: &TableLayout,
     storage: &Storage,
-) -> Result<Vec<DataFileEntry>> {
+) -> Result<SnapshotFiles> {
     let list_bytes = storage.read_all(snapshot.manifest_list()).await?;
     let list = ManifestList::parse_with_version(&list_bytes, md.format_version())?;
     // Collected before streaming: the library returns an opaque
@@ -294,7 +328,7 @@ pub(crate) async fn list_data_files(
         .buffered(MANIFEST_READ_CONCURRENCY)
         .try_collect()
         .await?;
-    let mut entries = Vec::new();
+    let mut listed = Listed::default();
     for (file, manifest) in &manifests {
         let spec = md
             .partition_spec_by_id(file.partition_spec_id)
@@ -313,33 +347,123 @@ pub(crate) async fn list_data_files(
                 ManifestStatus::Added | ManifestStatus::Existing => {}
             }
             let data_file = entry.data_file();
+            let sequence = data_sequence(table, entry, file)?;
             match data_file.content_type() {
-                DataContentType::Data => {}
+                DataContentType::Data => {
+                    let (bucketing, bucket) = match bucket_field {
+                        None => (None, UNBUCKETED),
+                        Some(field) => (
+                            Some(field.bucketing),
+                            bucket_value(table, data_file, spec.spec_id(), field)?,
+                        ),
+                    };
+                    listed.data.push(DataFileEntry {
+                        path: data_file.file_path().to_string(),
+                        bucket,
+                        bucketing,
+                        records: data_file.record_count(),
+                        sequence,
+                        size: data_file.file_size_in_bytes(),
+                        key_min: key_bound(data_file.lower_bounds(), layout.key_field_id),
+                        key_max: key_bound(data_file.upper_bounds(), layout.key_field_id),
+                    });
+                }
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    return Err(Error::refused(table, RefusalReason::DeleteFiles));
+                    classify_delete(table, data_file, sequence, &mut listed)?;
                 }
             }
-            let (bucketing, bucket) = match bucket_field {
-                None => (None, UNBUCKETED),
-                Some(field) => (
-                    Some(field.bucketing),
-                    bucket_value(table, data_file, spec.spec_id(), field)?,
-                ),
-            };
-            entries.push(DataFileEntry {
-                path: data_file.file_path().to_string(),
-                bucket,
-                bucketing,
-                records: data_file.record_count(),
-                sequence: data_sequence(table, entry, file)?,
-                size: data_file.file_size_in_bytes(),
-                key_min: key_bound(data_file.lower_bounds(), layout.key_field_id),
-                key_max: key_bound(data_file.upper_bounds(), layout.key_field_id),
-            });
         }
     }
-    entries.sort_by(entry_order);
-    Ok(entries)
+    listed.judge(table)
+}
+
+/// A snapshot's live files as `list_files` reads them, before the delete
+/// files it cannot serve are judged.
+#[derive(Default)]
+struct Listed {
+    data: Vec<DataFileEntry>,
+    deletes: Vec<DeleteFileEntry>,
+    /// The position delete files icetray cannot read.
+    unsupported: Vec<(String, UnsupportedDelete)>,
+    /// Every equality delete, by path, with its data sequence number.
+    equality: Vec<(String, SequenceNumber)>,
+}
+
+impl Listed {
+    /// The refusals `list_files` documents, else the files, the data files
+    /// in order.
+    fn judge(mut self, table: &str) -> Result<SnapshotFiles> {
+        if let Some((path, kind)) = self
+            .unsupported
+            .iter()
+            .min_by_key(|&(path, _)| path)
+            .cloned()
+        {
+            return Err(Error::refused(
+                table,
+                RefusalReason::DeleteKindUnsupported { path, kind },
+            ));
+        }
+        if let Some(oldest) = self.data.iter().map(|entry| entry.sequence).min()
+            && let Some((path, _)) = self
+                .equality
+                .into_iter()
+                .filter(|&(_, sequence)| sequence > oldest)
+                .min()
+        {
+            return Err(Error::refused(
+                table,
+                RefusalReason::EqualityDeletes { path },
+            ));
+        }
+        self.data.sort_by(entry_order);
+        Ok(SnapshotFiles {
+            data: self.data,
+            deletes: self.deletes,
+        })
+    }
+}
+
+/// Files the live delete file `data_file` at `sequence` into `listed`: an
+/// equality delete for judging; a position delete file by its format, a
+/// Parquet one as readable, an Avro or ORC one as unsupported, and a Puffin
+/// one as a readable deletion vector, whose entry must name its data file
+/// and its blob's offset and length, each non-negative, or it is
+/// `TableFault::VectorUnplaced`.
+fn classify_delete(
+    table: &str,
+    data_file: &DataFile,
+    sequence: SequenceNumber,
+    listed: &mut Listed,
+) -> Result<()> {
+    let path = data_file.file_path().to_string();
+    let unsupported = match (data_file.content_type(), data_file.file_format()) {
+        (DataContentType::EqualityDeletes, _) => {
+            listed.equality.push((path, sequence));
+            return Ok(());
+        }
+        (_, DataFileFormat::Avro) => Some(UnsupportedDelete::AvroPositions),
+        (_, DataFileFormat::Orc) => Some(UnsupportedDelete::OrcPositions),
+        (_, DataFileFormat::Parquet) => None,
+        (_, DataFileFormat::Puffin) => {
+            let placed = |value: Option<i64>| value.is_some_and(|value| value >= 0);
+            if data_file.referenced_data_file().is_none()
+                || !placed(data_file.content_offset())
+                || !placed(data_file.content_size_in_bytes())
+            {
+                return Err(Error::table_fault(
+                    table,
+                    TableFault::VectorUnplaced { path },
+                ));
+            }
+            None
+        }
+    };
+    match unsupported {
+        Some(kind) => listed.unsupported.push((path, kind)),
+        None => listed.deletes.push(DeleteFileEntry { path }),
+    }
+    Ok(())
 }
 
 /// The data sequence number of `entry` of `manifest`, or
@@ -452,7 +576,7 @@ fn key_bound(bounds: &HashMap<i32, Datum>, key_field_id: i32) -> Option<Key> {
     bounds.get(&key_field_id).and_then(Key::from_datum)
 }
 
-/// The order of `list_data_files`'s result.
+/// The order of `list_files`'s data files.
 fn entry_order(a: &DataFileEntry, b: &DataFileEntry) -> Ordering {
     a.bucketing
         .cmp(&b.bucketing)
@@ -671,6 +795,72 @@ pub(crate) mod testing {
         Deleted(i64),
     }
 
+    /// What a fixture delete file is.
+    #[derive(Clone, Debug)]
+    pub(crate) enum DeleteSpec {
+        /// A position delete file in the given format.
+        Positions(DataFileFormat),
+        /// A deletion vector in a Puffin file, with the fields its manifest
+        /// entry records as given.
+        Vector {
+            referenced: Option<String>,
+            offset: Option<i64>,
+            length: Option<i64>,
+        },
+        /// An equality delete on the key column.
+        Equality,
+    }
+
+    /// The rows a fixture delete file entry records it deletes. No test
+    /// reads the count, and nothing is written at the entry's path.
+    const DELETE_RECORDS: u64 = 1;
+    /// The bytes a fixture delete file entry records, under the same terms.
+    const DELETE_BYTES: u64 = 1;
+
+    /// A delete file entry at `path` under `spec_id` as `spec` describes
+    /// it, of `DELETE_RECORDS` rows and `DELETE_BYTES` bytes; nothing is
+    /// written there.
+    pub(crate) fn delete_file(
+        path: &str,
+        spec_id: i32,
+        partition: Struct,
+        spec: DeleteSpec,
+    ) -> DataFile {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .file_path(path.to_string())
+            .partition(partition)
+            .partition_spec_id(spec_id)
+            .record_count(DELETE_RECORDS)
+            .file_size_in_bytes(DELETE_BYTES);
+        match spec {
+            DeleteSpec::Positions(format) => {
+                builder
+                    .content(DataContentType::PositionDeletes)
+                    .file_format(format);
+            }
+            DeleteSpec::Vector {
+                referenced,
+                offset,
+                length,
+            } => {
+                builder
+                    .content(DataContentType::PositionDeletes)
+                    .file_format(DataFileFormat::Puffin)
+                    .referenced_data_file(referenced)
+                    .content_offset(offset)
+                    .content_size_in_bytes(length);
+            }
+            DeleteSpec::Equality => {
+                builder
+                    .content(DataContentType::EqualityDeletes)
+                    .file_format(DataFileFormat::Parquet)
+                    .equality_ids(Some(vec![KEY_FIELD_ID]));
+            }
+        }
+        builder.build().unwrap()
+    }
+
     /// One manifest to write: the spec its files are under, its content,
     /// and its entries as it records them.
     pub(crate) struct ManifestSpec {
@@ -797,7 +987,7 @@ mod tests {
     };
 
     use super::testing::{
-        self, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID, Written,
+        self, DATA_DIR, DeleteSpec, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID, Written,
     };
     use super::*;
     use crate::bucket;
@@ -805,6 +995,8 @@ mod tests {
     use crate::generation::testing::{TABLE, refusal_of, table_fault_of};
     use crate::key::UUID_BYTES;
 
+    /// The spec id of an unpartitioned fixture table's one spec.
+    const UNPARTITIONED_SPEC: i32 = 0;
     /// A column name no fixture schema has.
     const ABSENT_COLUMN: &str = "absent";
     /// The second value column name of the evolved schema.
@@ -902,6 +1094,19 @@ mod tests {
             ),
             Written::Added,
         )
+    }
+
+    /// `list_files`'s data files.
+    async fn data_files(
+        table: &str,
+        md: &TableMetadata,
+        snapshot: &Snapshot,
+        layout: &TableLayout,
+        storage: &Storage,
+    ) -> Result<Vec<DataFileEntry>> {
+        list_files(table, md, snapshot, layout, storage)
+            .await
+            .map(|files| files.data)
     }
 
     fn bucketing(count: u32) -> Bucketing {
@@ -1144,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_derive_and_list_data_files_take_the_first_bucket_field_on_the_key() {
+    async fn test_derive_and_list_files_take_the_first_bucket_field_on_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), twice_bucketed());
@@ -1182,7 +1387,7 @@ mod tests {
         )
         .await;
         let md = testing::with_snapshot(md, snapshot.clone());
-        let entries = list_data_files(TABLE, &md, &snapshot, &layout, &storage())
+        let entries = data_files(TABLE, &md, &snapshot, &layout, &storage())
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -1207,7 +1412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_skips_deleted_entries_and_orders_by_bucket_and_bounds() {
+    async fn test_list_files_skips_deleted_entries_and_orders_by_bucket_and_bounds() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
@@ -1235,7 +1440,7 @@ mod tests {
         let md = testing::with_snapshot(md, snapshot.clone());
         let layout = derive(&md, &snapshot).unwrap();
         let storage = storage();
-        let entries = list_data_files(TABLE, &md, &snapshot, &layout, &storage)
+        let entries = data_files(TABLE, &md, &snapshot, &layout, &storage)
             .await
             .unwrap();
         assert_eq!(storage.stats().gets(), 2, "the list and one manifest");
@@ -1260,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_unpartitioned_files_carry_no_bucketing() {
+    async fn test_list_files_unpartitioned_files_carry_no_bucketing() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
@@ -1283,7 +1488,7 @@ mod tests {
         .await;
         let md = testing::with_snapshot(md, snapshot.clone());
         let layout = derive(&md, &snapshot).unwrap();
-        let entries = list_data_files(TABLE, &md, &snapshot, &layout, &storage())
+        let entries = data_files(TABLE, &md, &snapshot, &layout, &storage())
             .await
             .unwrap();
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
@@ -1294,60 +1499,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_refuses_a_live_delete_file_and_reads_delete_manifests() {
+    async fn test_list_files_lists_position_deletes_and_vectors_from_delete_manifests() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
         let spec_id = md.default_partition_spec_id();
-        let position_delete = |name: &str, status: Written| {
+        let delete = |name: &str, spec: DeleteSpec, written: Written| {
             (
-                testing::data_file(
+                testing::delete_file(
                     &data_path(&root, name),
                     spec_id,
                     testing::partition(testing::Partition::Bucket(1)),
-                    RECORDS,
-                    SIZE,
-                    None,
-                    DataContentType::PositionDeletes,
+                    spec,
                 ),
-                status,
+                written,
             )
+        };
+        let (offset, length) = (4, 40);
+        let f0 = data_path(&root, "f0");
+        let vector = || DeleteSpec::Vector {
+            referenced: Some(f0.clone()),
+            offset: Some(offset),
+            length: Some(length),
         };
         let with_deletes = testing::write_snapshot(
             &md,
-            SNAPSHOT_A,
-            None,
-            SEQUENCE_A,
-            md.current_schema_id(),
-            vec![
-                testing::ManifestSpec {
-                    spec_id,
-                    content: ManifestContentType::Data,
-                    entries: vec![live(&root, "f0", spec_id, Some(1), None)],
-                },
-                testing::ManifestSpec {
-                    spec_id,
-                    content: ManifestContentType::Deletes,
-                    entries: vec![position_delete("d0", Written::Added)],
-                },
-            ],
-        )
-        .await;
-        let md = testing::with_snapshot(md, with_deletes.clone());
-        let layout = derive(&md, &with_deletes).unwrap();
-        let storage = storage();
-        assert_eq!(
-            refusal_of(list_data_files(TABLE, &md, &with_deletes, &layout, &storage).await),
-            RefusalReason::DeleteFiles
-        );
-        assert_eq!(storage.stats().gets(), 3, "the list and both manifests");
-
-        // A delete manifest whose only entry is itself deleted carries no
-        // live delete file; the snapshot serves.
-        let removed = testing::write_snapshot(
-            &md,
             SNAPSHOT_B,
-            Some(SNAPSHOT_A),
+            None,
             SEQUENCE_B,
             md.current_schema_id(),
             vec![
@@ -1359,17 +1537,304 @@ mod tests {
                 testing::ManifestSpec {
                     spec_id,
                     content: ManifestContentType::Deletes,
-                    entries: vec![position_delete("d0", Written::Deleted(SEQUENCE_A))],
+                    entries: vec![
+                        delete("v0", vector(), Written::Added),
+                        delete(
+                            "d0",
+                            DeleteSpec::Positions(DataFileFormat::Parquet),
+                            Written::Existing(SEQUENCE_A),
+                        ),
+                    ],
                 },
             ],
         )
         .await;
-        let md = testing::with_snapshot(md, removed.clone());
-        let entries = list_data_files(TABLE, &md, &removed, &layout, &storage)
+        let md = testing::with_snapshot(md, with_deletes.clone());
+        let layout = derive(&md, &with_deletes).unwrap();
+        let storage = storage();
+        let files = list_files(TABLE, &md, &with_deletes, &layout, &storage)
             .await
             .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, data_path(&root, "f0"));
+        assert_eq!(storage.stats().gets(), 3, "the list and both manifests");
+        assert_eq!(files.data.len(), 1);
+        assert_eq!(
+            delete_paths(&files),
+            [data_path(&root, "d0"), data_path(&root, "v0")]
+        );
+    }
+
+    /// The paths of the delete files `files` lists, sorted: nothing reads
+    /// their order.
+    fn delete_paths(files: &SnapshotFiles) -> Vec<&str> {
+        let mut paths: Vec<&str> = files
+            .deletes
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// An unpartitioned snapshot `SNAPSHOT_B` at `SEQUENCE_B` listing
+    /// `data` in a data manifest and then each of `delete_manifests` in a
+    /// delete manifest of its own, with its metadata.
+    async fn with_deletes(
+        root: &str,
+        data: Vec<(iceberg::spec::DataFile, Written)>,
+        delete_manifests: Vec<Vec<(iceberg::spec::DataFile, Written)>>,
+    ) -> (TableMetadata, Snapshot) {
+        let md = testing::metadata(root, testing::long_schema(), testing::unpartitioned());
+        let spec_id = md.default_partition_spec_id();
+        let data_manifest = testing::ManifestSpec {
+            spec_id,
+            content: ManifestContentType::Data,
+            entries: data,
+        };
+        let manifests = std::iter::once(data_manifest)
+            .chain(
+                delete_manifests
+                    .into_iter()
+                    .map(|entries| testing::ManifestSpec {
+                        spec_id,
+                        content: ManifestContentType::Deletes,
+                        entries,
+                    }),
+            )
+            .collect();
+        let snapshot = testing::write_snapshot(
+            &md,
+            SNAPSHOT_B,
+            None,
+            SEQUENCE_B,
+            md.current_schema_id(),
+            manifests,
+        )
+        .await;
+        (testing::with_snapshot(md, snapshot.clone()), snapshot)
+    }
+
+    /// `list_files` of `with_deletes`'s snapshot with `deletes` in one
+    /// delete manifest.
+    async fn listed(
+        root: &str,
+        data: Vec<(iceberg::spec::DataFile, Written)>,
+        deletes: Vec<(iceberg::spec::DataFile, Written)>,
+    ) -> Result<SnapshotFiles> {
+        listed_across(root, data, vec![deletes]).await
+    }
+
+    /// `list_files` of `with_deletes`'s snapshot.
+    async fn listed_across(
+        root: &str,
+        data: Vec<(iceberg::spec::DataFile, Written)>,
+        delete_manifests: Vec<Vec<(iceberg::spec::DataFile, Written)>>,
+    ) -> Result<SnapshotFiles> {
+        let (md, snapshot) = with_deletes(root, data, delete_manifests).await;
+        let layout = derive(&md, &snapshot).unwrap();
+        list_files(TABLE, &md, &snapshot, &layout, &storage()).await
+    }
+
+    /// An unpartitioned delete file entry named `name`.
+    fn unpartitioned_delete(root: &str, name: &str, spec: DeleteSpec) -> iceberg::spec::DataFile {
+        testing::delete_file(
+            &data_path(root, name),
+            UNPARTITIONED_SPEC,
+            testing::partition(testing::Partition::None),
+            spec,
+        )
+    }
+
+    /// An unpartitioned data file entry named `name`.
+    fn unpartitioned_data(root: &str, name: &str) -> iceberg::spec::DataFile {
+        live(root, name, UNPARTITIONED_SPEC, None, Some((LOW, HIGH))).0
+    }
+
+    #[tokio::test]
+    async fn test_list_files_skips_delete_entries_that_are_themselves_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let data = vec![(unpartitioned_data(&root, "f0"), Written::Added)];
+        let vector = DeleteSpec::Vector {
+            referenced: Some(data_path(&root, "f0")),
+            offset: Some(0),
+            length: Some(1),
+        };
+        let deletes = vec![
+            (
+                unpartitioned_delete(&root, "v0", vector),
+                Written::Deleted(SEQUENCE_A),
+            ),
+            (
+                unpartitioned_delete(&root, "d0", DeleteSpec::Positions(DataFileFormat::Parquet)),
+                Written::Deleted(SEQUENCE_A),
+            ),
+            (
+                unpartitioned_delete(&root, "eq", DeleteSpec::Equality),
+                Written::Deleted(SEQUENCE_A),
+            ),
+        ];
+        let files = listed(&root, data, deletes).await.unwrap();
+        assert_eq!(files.data.len(), 1);
+        assert_eq!(files.deletes, []);
+    }
+
+    #[tokio::test]
+    async fn test_list_files_refuses_an_equality_delete_above_the_oldest_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        // The older data file at A, a newer one and the delete at B: the
+        // delete may remove rows of the older file.
+        let data = vec![
+            (
+                unpartitioned_data(&root, "old"),
+                Written::Existing(SEQUENCE_A),
+            ),
+            (unpartitioned_data(&root, "new"), Written::Added),
+        ];
+        let deletes = vec![
+            (
+                unpartitioned_delete(&root, "eq1", DeleteSpec::Equality),
+                Written::Added,
+            ),
+            (
+                unpartitioned_delete(&root, "eq0", DeleteSpec::Equality),
+                Written::Added,
+            ),
+        ];
+        assert_eq!(
+            refusal_of(listed(&root, data, deletes).await),
+            RefusalReason::EqualityDeletes {
+                path: data_path(&root, "eq0"),
+            },
+            "the least path of the live ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_files_drops_an_equality_delete_no_data_file_is_older_than() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        // A compaction rewrote the data at B and left the delete at A, and
+        // one more delete at B: neither is above any data file.
+        let data = vec![(unpartitioned_data(&root, "compacted"), Written::Added)];
+        let deletes = vec![
+            (
+                unpartitioned_delete(&root, "eq_old", DeleteSpec::Equality),
+                Written::Existing(SEQUENCE_A),
+            ),
+            (
+                unpartitioned_delete(&root, "eq_same", DeleteSpec::Equality),
+                Written::Added,
+            ),
+        ];
+        let files = listed(&root, data, deletes.clone()).await.unwrap();
+        assert_eq!(files.data.len(), 1);
+        assert_eq!(files.deletes, [], "a dangling equality delete is dropped");
+        // With no data file at all, an equality delete applies to nothing.
+        let files = listed(&root, Vec::new(), deletes).await.unwrap();
+        assert_eq!(
+            files,
+            SnapshotFiles {
+                data: Vec::new(),
+                deletes: Vec::new()
+            }
+        );
+        // Beside a readable delete, the dangling one leaves the readable one
+        // to decide.
+        let data = vec![(unpartitioned_data(&root, "compacted"), Written::Added)];
+        let deletes = vec![
+            (
+                unpartitioned_delete(&root, "eq_old", DeleteSpec::Equality),
+                Written::Existing(SEQUENCE_A),
+            ),
+            (
+                unpartitioned_delete(&root, "pos", DeleteSpec::Positions(DataFileFormat::Parquet)),
+                Written::Added,
+            ),
+        ];
+        let files = listed(&root, data, deletes).await.unwrap();
+        assert_eq!(delete_paths(&files), [data_path(&root, "pos")]);
+    }
+
+    #[tokio::test]
+    async fn test_list_files_refuses_avro_and_orc_position_deletes_before_equality_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let data = || {
+            vec![(
+                unpartitioned_data(&root, "old"),
+                Written::Existing(SEQUENCE_A),
+            )]
+        };
+        let cases = [
+            (DataFileFormat::Avro, UnsupportedDelete::AvroPositions),
+            (DataFileFormat::Orc, UnsupportedDelete::OrcPositions),
+        ];
+        for (format, kind) in cases {
+            let equality = vec![(
+                unpartitioned_delete(&root, "a_live_equality", DeleteSpec::Equality),
+                Written::Added,
+            )];
+            let positions = vec![
+                (
+                    unpartitioned_delete(&root, "z_positions", DeleteSpec::Positions(format)),
+                    Written::Added,
+                ),
+                (
+                    unpartitioned_delete(&root, "y_positions", DeleteSpec::Positions(format)),
+                    Written::Added,
+                ),
+            ];
+            let orders = [
+                vec![equality.clone(), positions.clone()],
+                vec![positions, equality],
+            ];
+            for delete_manifests in orders {
+                assert_eq!(
+                    refusal_of(listed_across(&root, data(), delete_manifests).await),
+                    RefusalReason::DeleteKindUnsupported {
+                        path: data_path(&root, "y_positions"),
+                        kind,
+                    },
+                    "{format:?} in either manifest order"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_files_vector_without_its_placement_is_a_table_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let referenced = Some(data_path(&root, "old"));
+        let negative = -1;
+        let unplaced = [
+            (None, Some(0), Some(1)),
+            (referenced.clone(), None, Some(1)),
+            (referenced.clone(), Some(0), None),
+            (referenced, Some(negative), Some(1)),
+        ];
+        for (referenced, offset, length) in unplaced {
+            let deletes = vec![(
+                unpartitioned_delete(
+                    &root,
+                    "vectors",
+                    DeleteSpec::Vector {
+                        referenced,
+                        offset,
+                        length,
+                    },
+                ),
+                Written::Added,
+            )];
+            let data = vec![(unpartitioned_data(&root, "old"), Written::Added)];
+            assert_eq!(
+                fault_of(listed(&root, data, deletes).await),
+                TableFault::VectorUnplaced {
+                    path: data_path(&root, "vectors"),
+                }
+            );
+        }
     }
 
     /// Metadata whose default spec buckets by `MORE_BUCKETS` after a first
@@ -1392,7 +1857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_evolved_spec_gives_each_manifests_bucketing() {
+    async fn test_list_files_evolved_spec_gives_each_manifests_bucketing() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let (md, first_spec, second_spec) = evolved(&root);
@@ -1423,7 +1888,7 @@ mod tests {
             Some(bucketing(MORE_BUCKETS)),
             "the default spec's"
         );
-        let entries = list_data_files(TABLE, &md, &snapshot, &layout, &storage())
+        let entries = data_files(TABLE, &md, &snapshot, &layout, &storage())
             .await
             .unwrap();
         let routed: Vec<(&str, Option<Bucketing>, u32)> = entries
@@ -1448,7 +1913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_missing_spec_is_a_table_fault() {
+    async fn test_list_files_missing_spec_is_a_table_fault() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let (two_specs, _, second_spec) = evolved(&root);
@@ -1473,7 +1938,7 @@ mod tests {
         assert!(one_spec.partition_spec_by_id(second_spec).is_none());
         let layout = derive(&one_spec, &snapshot).unwrap();
         assert_eq!(
-            fault_of(list_data_files(TABLE, &one_spec, &snapshot, &layout, &storage()).await),
+            fault_of(data_files(TABLE, &one_spec, &snapshot, &layout, &storage()).await),
             TableFault::SpecMissing {
                 spec_id: second_spec,
             }
@@ -1481,7 +1946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_null_bucket_value_is_a_table_fault() {
+    async fn test_list_files_null_bucket_value_is_a_table_fault() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
@@ -1514,7 +1979,7 @@ mod tests {
         let md = testing::with_snapshot(md, snapshot.clone());
         let layout = derive(&md, &snapshot).unwrap();
         assert_eq!(
-            fault_of(list_data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
+            fault_of(data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
             TableFault::BucketValueMissing { path, spec_id }
         );
     }
@@ -1523,7 +1988,7 @@ mod tests {
     /// admitted, the file would never be consulted and its keys answered
     /// absent.
     #[tokio::test]
-    async fn test_list_data_files_bucket_value_at_or_past_the_count_is_a_table_fault() {
+    async fn test_list_files_bucket_value_at_or_past_the_count_is_a_table_fault() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
@@ -1547,7 +2012,7 @@ mod tests {
         let md = testing::with_snapshot(md, snapshot.clone());
         let layout = derive(&md, &snapshot).unwrap();
         assert_eq!(
-            fault_of(list_data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
+            fault_of(data_files(TABLE, &md, &snapshot, &layout, &storage()).await),
             TableFault::BucketValueOutOfRange {
                 path: data_path(&root, "f1"),
                 spec_id,
@@ -1558,7 +2023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_order_is_the_same_for_shuffled_manifests() {
+    async fn test_list_files_order_is_the_same_for_shuffled_manifests() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
@@ -1617,10 +2082,10 @@ mod tests {
         let md = testing::with_snapshot(md, shuffled.clone());
         let layout = derive(&md, &in_order).unwrap();
         let storage = storage();
-        let a = list_data_files(TABLE, &md, &in_order, &layout, &storage)
+        let a = data_files(TABLE, &md, &in_order, &layout, &storage)
             .await
             .unwrap();
-        let b = list_data_files(TABLE, &md, &shuffled, &layout, &storage)
+        let b = data_files(TABLE, &md, &shuffled, &layout, &storage)
             .await
             .unwrap();
         assert_eq!(a, b);
@@ -1644,7 +2109,7 @@ mod tests {
     /// listing order.
     async fn sequences(md: &TableMetadata, snapshot: &Snapshot) -> Vec<(String, SequenceNumber)> {
         let layout = derive(md, snapshot).unwrap();
-        list_data_files(TABLE, md, snapshot, &layout, &storage())
+        data_files(TABLE, md, snapshot, &layout, &storage())
             .await
             .unwrap()
             .into_iter()
@@ -1653,8 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_data_files_takes_an_explicit_sequence_number_and_inherits_a_null_added_one()
-    {
+    async fn test_list_files_takes_an_explicit_sequence_number_and_inherits_a_null_added_one() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
@@ -1696,7 +2160,7 @@ mod tests {
     /// without one; `test_data_sequence_existing_entry_without_one_is_a_table_fault`
     /// exercises that branch.
     #[tokio::test]
-    async fn test_list_data_files_keeps_v1_entries_at_the_initial_sequence_number() {
+    async fn test_list_files_keeps_v1_entries_at_the_initial_sequence_number() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
         let md = testing::metadata_of_version(
