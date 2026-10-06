@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{
-    DataContentType, DataFile, Datum, Literal, Manifest, ManifestFile, ManifestList,
+    DataContentType, DataFile, Datum, Literal, Manifest, ManifestEntry, ManifestFile, ManifestList,
     ManifestStatus, PartitionSpec, PrimitiveLiteral, PrimitiveType, Snapshot, TableMetadata,
     Transform, Type,
 };
@@ -20,6 +20,7 @@ use crate::bucket;
 use crate::catalog::TableFault;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType};
+use crate::snapshot::SequenceNumber;
 use crate::storage::Storage;
 
 /// Manifests read at once while a snapshot's files are listed. A manifest
@@ -28,6 +29,11 @@ use crate::storage::Storage;
 /// few round trips of latency while holding a few dozen megabytes of Avro
 /// at most.
 const MANIFEST_READ_CONCURRENCY: usize = 16;
+
+/// The sequence number of every manifest of a format v1 table, which
+/// predates sequence numbers; an entry of such a manifest inherits it
+/// whatever its status (`inherited_sequence`).
+const INITIAL_SEQUENCE_NUMBER: i64 = 0;
 
 /// The bucket a file of a table without a bucket transform on the key is
 /// filed under: every such file is in the one bucket.
@@ -231,6 +237,11 @@ pub struct DataFileEntry {
     pub bucketing: Option<Bucketing>,
     /// The file's row count, from the manifest.
     pub records: u64,
+    /// The file's data sequence number: the entry's own, or the one it
+    /// inherits from its manifest (`inherited_sequence`). A delete applies
+    /// to the file only when its own is no lower (RFD 021), and a path
+    /// listed again at another sequence number is another file.
+    pub sequence: SequenceNumber,
     /// The file's size in bytes, from the manifest; what `FileHandle::open`
     /// takes in place of a request.
     pub size: u64,
@@ -254,7 +265,10 @@ pub struct DataFileEntry {
 /// integer is the bucket (a non-integer there is
 /// `TableFault::BucketValueMissing`, one at or past the spec's count
 /// `TableFault::BucketValueOutOfRange`), and a spec with no such field files
-/// the entry under `UNBUCKETED` with no bucketing. Key bounds come from the
+/// the entry under `UNBUCKETED` with no bucketing. Each file's data sequence
+/// number is its entry's own or the one it inherits from the manifest list's
+/// record of its manifest (`inherited_sequence`); an entry that has neither
+/// is `TableFault::SequenceNumberMissing`. Key bounds come from the
 /// manifest's lower and upper bounds for the key field through
 /// `Key::from_datum`. The result is ordered by (bucketing, bucket, `key_min`
 /// with `None` first, path), the same for the same manifests in any order.
@@ -317,6 +331,7 @@ pub(crate) async fn list_data_files(
                 bucket,
                 bucketing,
                 records: data_file.record_count(),
+                sequence: data_sequence(table, entry, file)?,
                 size: data_file.file_size_in_bytes(),
                 key_min: key_bound(data_file.lower_bounds(), layout.key_field_id),
                 key_max: key_bound(data_file.upper_bounds(), layout.key_field_id),
@@ -325,6 +340,50 @@ pub(crate) async fn list_data_files(
     }
     entries.sort_by(entry_order);
     Ok(entries)
+}
+
+/// The data sequence number of `entry` of `manifest`, or
+/// `TableFault::SequenceNumberMissing` when `inherited_sequence` finds none.
+/// `Manifest::parse_avro` reads entries as written, without the inheritance
+/// iceberg-rust applies only on its own `FileIO` path, so it is applied here.
+fn data_sequence(
+    table: &str,
+    entry: &ManifestEntry,
+    manifest: &ManifestFile,
+) -> Result<SequenceNumber> {
+    inherited_sequence(
+        entry.sequence_number(),
+        entry.status(),
+        manifest.sequence_number,
+    )
+    .ok_or_else(|| {
+        Error::table_fault(
+            table,
+            TableFault::SequenceNumberMissing {
+                path: entry.file_path().to_string(),
+                manifest: manifest.manifest_path.clone(),
+            },
+        )
+    })
+}
+
+/// Iceberg's inheritance of a data sequence number: an entry's `own`, when
+/// it records one; else its manifest's, `manifest`, when the entry was
+/// added by the manifest's own commit (a writer leaves an added entry's
+/// null, to be assigned at commit) or the manifest is a v1 one at
+/// `INITIAL_SEQUENCE_NUMBER`; else none, since an existing or deleted entry
+/// was added by an earlier commit whose sequence number it no longer
+/// carries.
+fn inherited_sequence(
+    own: Option<i64>,
+    status: ManifestStatus,
+    manifest: i64,
+) -> Option<SequenceNumber> {
+    let inherits = match status {
+        ManifestStatus::Added => true,
+        ManifestStatus::Existing | ManifestStatus::Deleted => manifest == INITIAL_SEQUENCE_NUMBER,
+    };
+    own.or(inherits.then_some(manifest)).map(SequenceNumber)
 }
 
 /// The bucket in `data_file`'s partition tuple at `field`'s position: a
@@ -417,10 +476,9 @@ pub(crate) mod testing {
     use iceberg::io::FileIO;
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-        MAIN_BRANCH, ManifestContentType, ManifestListWriter, ManifestStatus,
-        ManifestWriterBuilder, NestedField, Operation, PartitionSpec, PrimitiveType, Schema,
-        Snapshot, SortOrder, Struct, Summary, TableMetadata, TableMetadataBuilder, Transform, Type,
-        UnboundPartitionSpec,
+        MAIN_BRANCH, ManifestContentType, ManifestListWriter, ManifestWriterBuilder, NestedField,
+        Operation, PartitionSpec, PrimitiveType, Schema, Snapshot, SortOrder, Struct, Summary,
+        TableMetadata, TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
     };
 
     use crate::catalog::{METADATA_DIR, hint_location, version_file};
@@ -437,6 +495,9 @@ pub(crate) mod testing {
     pub(crate) const VALUE_FIELD_ID: i32 = 2;
     /// The directory under a table root holding its data files.
     pub(crate) const DATA_DIR: &str = "data";
+    /// The sequence number `ManifestWriter::add_file` writes as null, for the
+    /// manifest list to assign: any negative one.
+    const UNASSIGNED_SEQUENCE: i64 = -1;
     /// The time between the stamps of consecutive fixture snapshots: one
     /// millisecond, the least step Iceberg's timestamps can hold.
     const SNAPSHOT_STEP: Duration = Duration::from_millis(1);
@@ -500,12 +561,22 @@ pub(crate) mod testing {
         schema: Schema,
         spec: UnboundPartitionSpec,
     ) -> TableMetadata {
+        metadata_of_version(root, schema, spec, FormatVersion::V2)
+    }
+
+    /// `metadata` at format `version`; `write_snapshot` writes v1 and v2.
+    pub(crate) fn metadata_of_version(
+        root: &str,
+        schema: Schema,
+        spec: UnboundPartitionSpec,
+        version: FormatVersion,
+    ) -> TableMetadata {
         TableMetadataBuilder::new(
             schema,
             spec,
             SortOrder::unsorted_order(),
             root.to_string(),
-            FormatVersion::V2,
+            version,
             HashMap::new(),
         )
         .unwrap()
@@ -584,21 +655,37 @@ pub(crate) mod testing {
         builder.build().unwrap()
     }
 
+    /// How a manifest records one entry: its status and its data sequence
+    /// number.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Written {
+        /// Added by the snapshot, the sequence number left null for the
+        /// manifest list to assign, as a writer leaves it.
+        Added,
+        /// Added by the snapshot, the sequence number written as given.
+        AddedAt(i64),
+        /// Carried from the commit at the given sequence number.
+        Existing(i64),
+        /// Removed by the snapshot; it was added at the given sequence
+        /// number.
+        Deleted(i64),
+    }
+
     /// One manifest to write: the spec its files are under, its content,
-    /// and its entries with their status.
+    /// and its entries as it records them.
     pub(crate) struct ManifestSpec {
         /// The partition spec the manifest's files are under.
         pub(crate) spec_id: i32,
         /// Whether it lists data files or delete files.
         pub(crate) content: ManifestContentType,
-        /// Its entries, each with the status the manifest records for it.
-        pub(crate) entries: Vec<(DataFile, ManifestStatus)>,
+        /// Its entries, each with how the manifest records it.
+        pub(crate) entries: Vec<(DataFile, Written)>,
     }
 
     /// Writes one manifest per `manifests` and the manifest list naming
     /// them under `md`'s root, and returns the snapshot that points at the
-    /// list, ready for `with_snapshot`. `sequence` is the snapshot's and
-    /// every entry's sequence number.
+    /// list, ready for `with_snapshot`. `sequence` is the snapshot's, the
+    /// one the manifest list records for each manifest.
     pub(crate) async fn write_snapshot(
         md: &TableMetadata,
         snapshot_id: i64,
@@ -620,35 +707,44 @@ pub(crate) mod testing {
                 Arc::clone(&schema),
                 spec,
             );
-            let mut writer = match manifest.content {
-                ManifestContentType::Data => builder.build_v2_data(),
-                ManifestContentType::Deletes => builder.build_v2_deletes(),
+            let mut writer = match (md.format_version(), manifest.content) {
+                (FormatVersion::V1, ManifestContentType::Data) => builder.build_v1(),
+                (FormatVersion::V2, ManifestContentType::Data) => builder.build_v2_data(),
+                (FormatVersion::V2, ManifestContentType::Deletes) => builder.build_v2_deletes(),
+                (FormatVersion::V1, ManifestContentType::Deletes) | (FormatVersion::V3, _) => {
+                    unreachable!(
+                        "no fixture writes {:?} manifests of a {:?} table",
+                        manifest.content,
+                        md.format_version()
+                    )
+                }
             };
-            for (data_file, status) in manifest.entries {
-                match status {
-                    ManifestStatus::Added => writer.add_file(data_file, sequence).unwrap(),
-                    ManifestStatus::Existing => writer
-                        .add_existing_file(data_file, snapshot_id, sequence, Some(sequence))
+            for (data_file, written) in manifest.entries {
+                match written {
+                    Written::Added => writer.add_file(data_file, UNASSIGNED_SEQUENCE).unwrap(),
+                    Written::AddedAt(at) => writer.add_file(data_file, at).unwrap(),
+                    Written::Existing(at) => writer
+                        .add_existing_file(data_file, snapshot_id, at, Some(at))
                         .unwrap(),
-                    ManifestStatus::Deleted => writer
-                        .add_delete_file(data_file, sequence, Some(sequence))
-                        .unwrap(),
+                    Written::Deleted(at) => {
+                        writer.add_delete_file(data_file, at, Some(at)).unwrap();
+                    }
                 }
             }
             files.push(writer.write_manifest_file().await.unwrap());
         }
         let list_path = format!("{root}/{METADATA_DIR}/snap-{snapshot_id}.avro");
-        let mut list = ManifestListWriter::v2(
-            file_io
-                .new_output(&list_path)
-                .unwrap()
-                .writer()
-                .await
-                .unwrap(),
-            snapshot_id,
-            parent,
-            sequence,
-        );
+        let output = file_io
+            .new_output(&list_path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut list = match md.format_version() {
+            FormatVersion::V1 => ManifestListWriter::v1(output, snapshot_id, parent),
+            FormatVersion::V2 => ManifestListWriter::v2(output, snapshot_id, parent, sequence),
+            FormatVersion::V3 => unreachable!("no fixture writes a v3 manifest list"),
+        };
         list.add_manifests(files.into_iter()).unwrap();
         list.close().await.unwrap();
         Snapshot::builder()
@@ -696,11 +792,13 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use iceberg::spec::{
-        DataContentType, ManifestContentType, ManifestStatus, NestedField, PrimitiveType, Schema,
-        Snapshot, TableMetadataBuilder, Type,
+        DataContentType, ManifestContentType, NestedField, PrimitiveType, Schema, Snapshot,
+        TableMetadataBuilder, Type,
     };
 
-    use super::testing::{self, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID};
+    use super::testing::{
+        self, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, VALUE_COLUMN, VALUE_FIELD_ID, Written,
+    };
     use super::*;
     use crate::bucket;
     use crate::config::StorageConfig;
@@ -788,7 +886,7 @@ mod tests {
         spec_id: i32,
         bucket: Option<u32>,
         bounds: Option<(i64, i64)>,
-    ) -> (iceberg::spec::DataFile, ManifestStatus) {
+    ) -> (iceberg::spec::DataFile, Written) {
         let bounds = bounds.map(|(min, max)| (Key::Long(min), Key::Long(max)));
         (
             testing::data_file(
@@ -802,7 +900,7 @@ mod tests {
                 bounds.as_ref().map(|(min, max)| (min, max)),
                 DataContentType::Data,
             ),
-            ManifestStatus::Added,
+            Written::Added,
         )
     }
 
@@ -1078,7 +1176,7 @@ mod tests {
                         None,
                         DataContentType::Data,
                     ),
-                    ManifestStatus::Added,
+                    Written::Added,
                 )],
             }],
         )
@@ -1115,7 +1213,7 @@ mod tests {
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
         let spec_id = md.default_partition_spec_id();
         let mut deleted = live(&root, "f3", spec_id, Some(0), Some((LOW, HIGH)));
-        deleted.1 = ManifestStatus::Deleted;
+        deleted.1 = Written::Deleted(SEQUENCE_A);
         let snapshot = testing::write_snapshot(
             &md,
             SNAPSHOT_A,
@@ -1146,6 +1244,7 @@ mod tests {
             bucket,
             bucketing: Some(bucketing(BUCKETS)),
             records: RECORDS,
+            sequence: SequenceNumber(SEQUENCE_A),
             size: SIZE,
             key_min: bounds.map(|(min, _)| Key::Long(min)),
             key_max: bounds.map(|(_, max)| Key::Long(max)),
@@ -1200,7 +1299,7 @@ mod tests {
         let root = testing::file_root(dir.path());
         let md = testing::metadata(&root, testing::long_schema(), testing::bucket_spec(BUCKETS));
         let spec_id = md.default_partition_spec_id();
-        let position_delete = |name: &str, status: ManifestStatus| {
+        let position_delete = |name: &str, status: Written| {
             (
                 testing::data_file(
                     &data_path(&root, name),
@@ -1229,7 +1328,7 @@ mod tests {
                 testing::ManifestSpec {
                     spec_id,
                     content: ManifestContentType::Deletes,
-                    entries: vec![position_delete("d0", ManifestStatus::Added)],
+                    entries: vec![position_delete("d0", Written::Added)],
                 },
             ],
         )
@@ -1260,7 +1359,7 @@ mod tests {
                 testing::ManifestSpec {
                     spec_id,
                     content: ManifestContentType::Deletes,
-                    entries: vec![position_delete("d0", ManifestStatus::Deleted)],
+                    entries: vec![position_delete("d0", Written::Deleted(SEQUENCE_A))],
                 },
             ],
         )
@@ -1407,7 +1506,7 @@ mod tests {
                         None,
                         DataContentType::Data,
                     ),
-                    ManifestStatus::Added,
+                    Written::Added,
                 )],
             }],
         )
@@ -1473,7 +1572,12 @@ mod tests {
             ]
         };
         let forward = files();
-        let mut backward = files();
+        // Written at the first snapshot's sequence number, so that the
+        // listings differ in manifest order alone.
+        let mut backward: Vec<_> = files()
+            .into_iter()
+            .map(|(file, _)| (file, Written::AddedAt(SEQUENCE_A)))
+            .collect();
         backward.reverse();
         let (first_half, second_half) = backward.split_at(2);
         let in_order = testing::write_snapshot(
@@ -1533,6 +1637,180 @@ mod tests {
                 (1, Some(Key::Long(LOW))),
                 (3, Some(Key::Long(LOWER))),
             ]
+        );
+    }
+
+    /// Every data file of `snapshot` with its data sequence number, in
+    /// listing order.
+    async fn sequences(md: &TableMetadata, snapshot: &Snapshot) -> Vec<(String, SequenceNumber)> {
+        let layout = derive(md, snapshot).unwrap();
+        list_data_files(TABLE, md, snapshot, &layout, &storage())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path, entry.sequence))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_list_data_files_takes_an_explicit_sequence_number_and_inherits_a_null_added_one()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
+        let spec_id = md.default_partition_spec_id();
+        let file =
+            |name: &str, written: Written| (live(&root, name, spec_id, None, None).0, written);
+        let snapshot = testing::write_snapshot(
+            &md,
+            SNAPSHOT_B,
+            None,
+            SEQUENCE_B,
+            md.current_schema_id(),
+            vec![testing::ManifestSpec {
+                spec_id,
+                content: ManifestContentType::Data,
+                entries: vec![
+                    file("existing", Written::Existing(SEQUENCE_A)),
+                    file("explicit", Written::AddedAt(SEQUENCE_A)),
+                    file("inherited", Written::Added),
+                ],
+            }],
+        )
+        .await;
+        let md = testing::with_snapshot(md, snapshot.clone());
+        assert_eq!(
+            sequences(&md, &snapshot).await,
+            [
+                (data_path(&root, "existing"), SequenceNumber(SEQUENCE_A)),
+                (data_path(&root, "explicit"), SequenceNumber(SEQUENCE_A)),
+                (data_path(&root, "inherited"), SequenceNumber(SEQUENCE_B)),
+            ]
+        );
+    }
+
+    /// iceberg-rust parses every v1 manifest entry with the initial
+    /// sequence number as its own, so this pins that icetray keeps such
+    /// entries there. It does not reach `inherited_sequence`'s branch for a
+    /// manifest at the initial sequence number, since no entry arrives
+    /// without one; `test_data_sequence_existing_entry_without_one_is_a_table_fault`
+    /// exercises that branch.
+    #[tokio::test]
+    async fn test_list_data_files_keeps_v1_entries_at_the_initial_sequence_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata_of_version(
+            &root,
+            testing::long_schema(),
+            testing::unpartitioned(),
+            iceberg::spec::FormatVersion::V1,
+        );
+        let spec_id = md.default_partition_spec_id();
+        let snapshot = testing::write_snapshot(
+            &md,
+            SNAPSHOT_A,
+            None,
+            INITIAL_SEQUENCE_NUMBER,
+            md.current_schema_id(),
+            vec![testing::ManifestSpec {
+                spec_id,
+                content: ManifestContentType::Data,
+                entries: vec![
+                    live(&root, "added", spec_id, None, None),
+                    (
+                        live(&root, "existing", spec_id, None, None).0,
+                        Written::Existing(INITIAL_SEQUENCE_NUMBER),
+                    ),
+                ],
+            }],
+        )
+        .await;
+        let md = testing::with_snapshot(md, snapshot.clone());
+        let initial = SequenceNumber(INITIAL_SEQUENCE_NUMBER);
+        assert_eq!(
+            sequences(&md, &snapshot).await,
+            [
+                (data_path(&root, "added"), initial),
+                (data_path(&root, "existing"), initial),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inherited_sequence_follows_icebergs_rule() {
+        let (own, manifest) = (SEQUENCE_A, SEQUENCE_B);
+        let cases = [
+            (Some(own), ManifestStatus::Added, manifest, Some(own)),
+            (Some(own), ManifestStatus::Existing, manifest, Some(own)),
+            (None, ManifestStatus::Added, manifest, Some(manifest)),
+            (None, ManifestStatus::Existing, manifest, None),
+            (None, ManifestStatus::Deleted, manifest, None),
+            (
+                None,
+                ManifestStatus::Existing,
+                INITIAL_SEQUENCE_NUMBER,
+                Some(INITIAL_SEQUENCE_NUMBER),
+            ),
+        ];
+        for (own, status, manifest, expected) in cases {
+            assert_eq!(
+                inherited_sequence(own, status, manifest),
+                expected.map(SequenceNumber),
+                "{own:?} {status:?} under {manifest}"
+            );
+        }
+    }
+
+    /// An existing entry with a null sequence number, which iceberg-rust's
+    /// writer refuses to write, taken from a written manifest with the
+    /// number cleared: a fault under a manifest past the initial sequence
+    /// number, and the manifest's own, inherited, under one at it.
+    #[tokio::test]
+    async fn test_data_sequence_existing_entry_without_one_is_a_table_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
+        let spec_id = md.default_partition_spec_id();
+        let snapshot = testing::write_snapshot(
+            &md,
+            SNAPSHOT_B,
+            None,
+            SEQUENCE_B,
+            md.current_schema_id(),
+            vec![testing::ManifestSpec {
+                spec_id,
+                content: ManifestContentType::Data,
+                entries: vec![(
+                    live(&root, "existing", spec_id, None, None).0,
+                    Written::Existing(SEQUENCE_A),
+                )],
+            }],
+        )
+        .await;
+        let storage = storage();
+        let list = ManifestList::parse_with_version(
+            &storage.read_all(snapshot.manifest_list()).await.unwrap(),
+            md.format_version(),
+        )
+        .unwrap();
+        let mut manifest = list.entries()[0].clone();
+        let parsed =
+            Manifest::parse_avro(&storage.read_all(&manifest.manifest_path).await.unwrap())
+                .unwrap();
+        let mut entry = ManifestEntry::clone(&parsed.entries()[0]);
+        assert_eq!(entry.status(), ManifestStatus::Existing);
+        entry.sequence_number = None;
+        assert_eq!(
+            fault_of(data_sequence(TABLE, &entry, &manifest)),
+            TableFault::SequenceNumberMissing {
+                path: data_path(&root, "existing"),
+                manifest: manifest.manifest_path.clone(),
+            }
+        );
+        manifest.sequence_number = INITIAL_SEQUENCE_NUMBER;
+        assert_eq!(
+            data_sequence(TABLE, &entry, &manifest).unwrap(),
+            SequenceNumber(INITIAL_SEQUENCE_NUMBER)
         );
     }
 }

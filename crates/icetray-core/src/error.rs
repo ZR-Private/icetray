@@ -858,6 +858,13 @@ mod tests {
                 Deterministic,
             ),
             (
+                table(TableFault::SequenceNumberMissing {
+                    path: FILE_PATH.to_string(),
+                    manifest: FILE_PATH.to_string(),
+                }),
+                Deterministic,
+            ),
+            (
                 table(TableFault::SnapshotTimestampOutOfRange {
                     snapshot_id: SnapshotId(1),
                 }),

@@ -22,9 +22,9 @@ use iceberg::io::{LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, MAIN_BRANCH,
-    ManifestListWriter, ManifestWriterBuilder, NestedField, NullOrder, Operation, PartitionKey,
-    PartitionSpec, PrimitiveType, Schema, Snapshot, SortDirection, SortField, SortOrder, Struct,
-    Summary, TableMetadata, Transform, Type, UnboundPartitionSpec,
+    ManifestFile, ManifestListWriter, ManifestWriterBuilder, NestedField, NullOrder, Operation,
+    PartitionKey, PartitionSpec, PrimitiveType, Schema, Snapshot, SortDirection, SortField,
+    SortOrder, Struct, Summary, TableMetadata, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
@@ -414,14 +414,21 @@ impl RawFile {
     }
 }
 
-/// A snapshot to commit by hand: the data files it lists, added, and the
-/// delete files it lists, added as position deletes.
+/// A snapshot to commit by hand: the data files it lists and the delete
+/// files it lists (`Fixture::commit_by_hand`).
 #[derive(Clone, Debug, Default)]
 pub struct HandSnapshot {
     /// Every data file of the snapshot.
     pub data: Vec<DataFile>,
     /// The delete files of the snapshot; any bytes, since content decides.
     pub deletes: Vec<DataFile>,
+}
+
+/// The commit that added a file: what an existing entry carries it at.
+#[derive(Clone, Copy, Debug)]
+struct AddedBy {
+    snapshot_id: i64,
+    sequence: i64,
 }
 
 /// A written fixture: the table as this fixture last committed it, and the
@@ -440,6 +447,10 @@ pub struct Fixture {
     metadata_location: String,
     /// Every data file the current snapshot lists.
     files: Vec<DataFile>,
+    /// The commit that added each file the current snapshot lists, data or
+    /// delete, by path: what a by-hand commit carries the file at as an
+    /// existing entry, as a writer does.
+    added: HashMap<String, AddedBy>,
     /// Whether a snapshot was committed by hand, after which the catalog's
     /// record is behind and only `commit_by_hand` may advance the table.
     by_hand: bool,
@@ -460,6 +471,7 @@ impl Fixture {
             metadata,
             metadata_location,
             files: Vec::new(),
+            added: HashMap::new(),
             by_hand: false,
             hand_commits: 0,
         })
@@ -680,21 +692,34 @@ impl Fixture {
         self.table = tx.commit(catalog).await?;
         self.metadata = self.table.metadata().clone();
         self.metadata_location = self.table.metadata_location_result()?.to_string();
+        let current = self
+            .metadata
+            .current_snapshot()
+            .expect("a committed append leaves a current snapshot");
+        let by = AddedBy {
+            snapshot_id: current.snapshot_id(),
+            sequence: current.sequence_number(),
+        };
+        for file in &files {
+            self.added.insert(file.file_path().to_string(), by);
+        }
         self.files.extend(files);
         Ok(())
     }
 
     /// Commits `snapshot` by hand, past the catalog: one data manifest
-    /// listing `snapshot.data` as added entries, one delete manifest listing
-    /// `snapshot.deletes` as added position deletes when there are any, the
-    /// manifest list, a snapshot one id and one sequence number above the
-    /// current with the current as parent, and the metadata with the main
-    /// branch moved to it, written as `version_file(root, n)` for the `n`-th
-    /// by-hand commit and named by the version hint. This is how a snapshot
-    /// carrying a delete file or dropping a data file is produced, neither
-    /// of which a fast append can commit. From here on the table is followed
-    /// through its root: its catalog record is behind, and `append` and
-    /// `append_raw` refuse with `SpecFault::CatalogBehind`.
+    /// listing `snapshot.data`, one delete manifest listing
+    /// `snapshot.deletes` when there are any, the manifest list, a snapshot
+    /// one id and one sequence number above the current with the current as
+    /// parent, and the metadata with the main branch moved to it, written
+    /// as `version_file(root, n)` for the `n`-th by-hand commit and named by
+    /// the version hint. A file the current snapshot lists is an existing
+    /// entry carrying the snapshot id and data sequence number it was added
+    /// at; every other file is added at the new sequence number. This is
+    /// how a snapshot carrying a delete file or dropping a data file is
+    /// produced, neither of which a fast append can commit. From here on the
+    /// table is followed through its root: its catalog record is behind, and
+    /// `append` and `append_raw` refuse with `SpecFault::CatalogBehind`.
     pub async fn commit_by_hand(&mut self, snapshot: HandSnapshot) -> Result<()> {
         let root = self.root().to_string();
         let file_io = self.table.file_io();
@@ -703,8 +728,10 @@ impl Fixture {
             None => (None, FIRST_SNAPSHOT_ID),
         };
         let sequence = self.metadata.last_sequence_number() + 1;
-        let schema = self.metadata.current_schema().clone();
-        let spec = PartitionSpec::clone(self.metadata.default_partition_spec());
+        let now = AddedBy {
+            snapshot_id,
+            sequence,
+        };
         let mut manifests = Vec::new();
         let listings = [
             (Some(snapshot.data.as_slice()), false),
@@ -718,21 +745,7 @@ impl Fixture {
                 continue;
             };
             let path = format!("{root}/{MANIFEST_DIR}/{snapshot_id}-m{index}{MANIFEST_SUFFIX}");
-            let builder = ManifestWriterBuilder::new(
-                file_io.new_output(&path)?,
-                Some(snapshot_id),
-                Arc::clone(&schema),
-                spec.clone(),
-            );
-            let mut writer = if deletes {
-                builder.build_v2_deletes()
-            } else {
-                builder.build_v2_data()
-            };
-            for file in files {
-                writer.add_file(file.clone(), sequence)?;
-            }
-            manifests.push(writer.write_manifest_file().await?);
+            manifests.push(self.write_hand_manifest(&path, files, deletes, now).await?);
         }
         let list_path = format!("{root}/{MANIFEST_DIR}/snap-{snapshot_id}{MANIFEST_SUFFIX}");
         let mut list = ManifestListWriter::v2(
@@ -773,9 +786,55 @@ impl Fixture {
             .await?;
         self.metadata = metadata;
         self.metadata_location = location;
+        self.added = snapshot
+            .data
+            .iter()
+            .chain(&snapshot.deletes)
+            .map(|file| {
+                let path = file.file_path().to_string();
+                let by = self.added.get(&path).copied().unwrap_or(now);
+                (path, by)
+            })
+            .collect();
         self.files = snapshot.data;
         self.by_hand = true;
         self.write_hint().await
+    }
+
+    /// Writes one manifest of a by-hand commit at `path`, of delete files
+    /// when `deletes`: each of `files` the current snapshot lists as an
+    /// existing entry at the commit that added it, every other one added by
+    /// `now`.
+    async fn write_hand_manifest(
+        &self,
+        path: &str,
+        files: &[DataFile],
+        deletes: bool,
+        now: AddedBy,
+    ) -> Result<ManifestFile> {
+        let builder = ManifestWriterBuilder::new(
+            self.table.file_io().new_output(path)?,
+            Some(now.snapshot_id),
+            Arc::clone(self.metadata.current_schema()),
+            PartitionSpec::clone(self.metadata.default_partition_spec()),
+        );
+        let mut writer = if deletes {
+            builder.build_v2_deletes()
+        } else {
+            builder.build_v2_data()
+        };
+        for file in files {
+            match self.added.get(file.file_path()) {
+                Some(by) => writer.add_existing_file(
+                    file.clone(),
+                    by.snapshot_id,
+                    by.sequence,
+                    Some(by.sequence),
+                )?,
+                None => writer.add_file(file.clone(), now.sequence)?,
+            }
+        }
+        Ok(writer.write_manifest_file().await?)
     }
 
     /// Rewrites every id written so far into new data files, ascending,

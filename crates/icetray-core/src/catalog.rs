@@ -142,6 +142,19 @@ pub enum TableFault {
         /// The parameter as the catalog holds it; `None` when absent.
         table_type: Option<String>,
     },
+    /// A live manifest entry records no data sequence number and may not
+    /// inherit its manifest's: Iceberg lets an entry inherit only when it
+    /// was added by the manifest's own commit or the manifest is a v1 one,
+    /// at the initial sequence number. An existing entry without one has
+    /// lost the commit its rows came from, which orders it against deletes
+    /// (RFD 021).
+    #[error("data file {path} in manifest {manifest} records no data sequence number")]
+    SequenceNumberMissing {
+        /// The file's location.
+        path: String,
+        /// The manifest listing it.
+        manifest: String,
+    },
     /// The snapshot's timestamp is outside the range a `jiff::Timestamp`
     /// represents, so its age cannot be measured.
     #[error("snapshot {snapshot_id} has a timestamp outside the representable range")]
@@ -166,6 +179,7 @@ impl Recurs for TableFault {
             | Self::ZeroBuckets { .. }
             | Self::BucketValueMissing { .. }
             | Self::BucketValueOutOfRange { .. }
+            | Self::SequenceNumberMissing { .. }
             | Self::SnapshotTimestampOutOfRange { .. } => Recurrence::Deterministic,
             // The version hint is rewritten in place by every commit, and the
             // catalog's record is the catalog's to change: neither is part of

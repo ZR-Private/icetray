@@ -1832,6 +1832,7 @@ mod tests {
             bucket: 0,
             bucketing: None,
             records: 0,
+            sequence: crate::snapshot::SequenceNumber(0),
             size: 0,
             key_min,
             key_max,

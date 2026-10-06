@@ -3,8 +3,8 @@
 //! overlap groups among them checked for a key two files share, and the
 //! lookup level and the resident-bytes budget checked at the footer stage
 //! before any key chunk is fetched. Immutable once built; a `Table` builds
-//! the next one beside it, reusing every file whose path is unchanged, and
-//! swaps atomically.
+//! the next one beside it, reusing every file whose path, size, and data
+//! sequence number are unchanged, and swaps atomically.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -134,9 +134,8 @@ impl Generation {
     /// The footer stage of a load of `snapshot` of `table`: derives the
     /// layout from the snapshot's schema, lists its live files, reuses from
     /// `previous` every file the snapshot still names by the same path at
-    /// the same size (the same `Arc`, RFD 005; a data file is immutable, so
-    /// a path whose size changed is another file and its index would be
-    /// stale), opens a `FileHandle` for every other file with the
+    /// the same size and data sequence number (the same `Arc`, RFD 005;
+    /// `reuse_or_open`), opens a `FileHandle` for every other file with the
     /// manifest's size and `hedge`, and inspects their footers
     /// `load_concurrency()` at a time. No key chunk is read and nothing is
     /// written; `Planned::build` does both. Raised before any read: a
@@ -736,12 +735,14 @@ fn snapshot_timestamp(table: &str, snapshot: &Snapshot) -> Result<jiff::Timestam
 type Pending = (DataFileEntry, Arc<FileHandle>);
 
 /// Splits the snapshot's files into those `previous` holds by the same path
-/// at the same size, reused as the same `Arc` (RFD 005; a data file is
-/// immutable, so a path whose size changed is another file and its index
-/// would be stale), and the rest, each opened as a `FileHandle` with the
-/// manifest's size and `hedge`. Opening sends nothing to the store; the
-/// first S3 location a storage opens loads the SDK's defaults
-/// (`Storage::locate`).
+/// at the same size and data sequence number, reused as the same `Arc`
+/// (RFD 005), and the rest, each opened as a `FileHandle` with the
+/// manifest's size and `hedge`. A data file is immutable, so a path whose
+/// size changed is another file and its index would be stale; a path
+/// committed again at another sequence number is another file to the
+/// deletes, which apply by sequence number (RFD 021), so its entry would
+/// be stale. Opening sends nothing to the store; the first S3 location a
+/// storage opens loads the SDK's defaults (`Storage::locate`).
 async fn reuse_or_open(
     entries: Vec<DataFileEntry>,
     previous: Option<&Generation>,
@@ -762,7 +763,7 @@ async fn reuse_or_open(
     for entry in entries {
         let unchanged = reusable
             .get(entry.path.as_str())
-            .filter(|file| file.entry.size == entry.size);
+            .filter(|file| file.entry.size == entry.size && file.entry.sequence == entry.sequence);
         if let Some(file) = unchanged {
             reused.push(Arc::clone(file));
         } else {
@@ -1348,7 +1349,7 @@ pub struct MultiLookup {
 /// this module and of `check`. Nothing here is compiled outside tests.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use arrow::array::{
@@ -1358,8 +1359,8 @@ pub(crate) mod testing {
     use bytes::Bytes;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        DataContentType, DataFile, ManifestContentType, ManifestStatus, PrimitiveType, Schema,
-        TableMetadata, TableMetadataBuilder, Type, UnboundPartitionSpec,
+        DataContentType, DataFile, ManifestContentType, PrimitiveType, Schema, TableMetadata,
+        TableMetadataBuilder, Type, UnboundPartitionSpec,
     };
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
@@ -1380,6 +1381,7 @@ pub(crate) mod testing {
     use crate::manifest::Bucketing;
     use crate::manifest::testing::{
         self as manifest_testing, DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN,
+        Written,
     };
     use crate::storage::{HedgeWindow, IoStats, Storage};
 
@@ -1821,6 +1823,9 @@ pub(crate) mod testing {
         /// Every data file written and delete file recorded so far with the
         /// spec it was written under: its entry for the next manifest.
         pub(crate) files: Vec<(DataFile, i32)>,
+        /// The sequence number of the commit that first listed each path of
+        /// `files`, which later commits carry it at as an existing entry.
+        committed: HashMap<String, i64>,
     }
 
     impl Table {
@@ -1837,6 +1842,7 @@ pub(crate) mod testing {
                 spec_id: md.default_partition_spec_id(),
                 md,
                 files: Vec::new(),
+                committed: HashMap::new(),
             }
         }
 
@@ -1937,6 +1943,7 @@ pub(crate) mod testing {
         pub(crate) fn remove_file(&mut self, name: &str) {
             let path = self.path_of(name);
             self.files.retain(|(file, _)| file.file_path() != path);
+            self.committed.remove(&path);
         }
 
         /// Deletes the version hint, so the next resolve of the root fails
@@ -1991,7 +1998,9 @@ pub(crate) mod testing {
         /// Commits every file added so far as snapshot `id`, one data
         /// manifest per spec the data files were written under and one
         /// delete manifest per spec the delete files were, and writes the
-        /// metadata as `version`, pointing the hint at it.
+        /// metadata as `version`, pointing the hint at it. A file an earlier
+        /// commit listed is an existing entry at that commit's sequence
+        /// number, as a writer carries it; the rest are added at `sequence`.
         pub(crate) async fn commit(
             &mut self,
             id: i64,
@@ -1999,14 +2008,22 @@ pub(crate) mod testing {
             sequence: i64,
             version: u64,
         ) {
-            let mut by_spec: BTreeMap<(i32, bool), Vec<(DataFile, ManifestStatus)>> =
-                BTreeMap::new();
+            let mut by_spec: BTreeMap<(i32, bool), Vec<(DataFile, Written)>> = BTreeMap::new();
             for (file, spec_id) in &self.files {
                 let deletes = file.content_type() != DataContentType::Data;
+                let written = match self.committed.get(file.file_path()) {
+                    Some(&at) => Written::Existing(at),
+                    None => Written::Added,
+                };
                 by_spec
                     .entry((*spec_id, deletes))
                     .or_default()
-                    .push((file.clone(), ManifestStatus::Added));
+                    .push((file.clone(), written));
+            }
+            for (file, _) in &self.files {
+                self.committed
+                    .entry(file.file_path().to_string())
+                    .or_insert(sequence);
             }
             let manifests = by_spec
                 .into_iter()
@@ -2252,6 +2269,7 @@ mod tests {
                     bucket,
                     bucketing,
                     records: approx::count(keys.len()),
+                    sequence: SequenceNumber(FIRST_SEQUENCE),
                     size,
                     key_min: bounds.map(|(min, _)| Key::Long(*min)),
                     key_max: bounds.map(|(_, max)| Key::Long(*max)),
@@ -3255,6 +3273,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_reloads_a_path_added_again_at_another_sequence_number() {
+        let (mut table, all) = two_bucket_table().await;
+        let config = table.config(Residency::Full, None);
+        let first = table.load(&config, None, None).await.unwrap();
+        // The same bytes under f0's path, added again by the next commit:
+        // the same size, a later data sequence number.
+        let in_bucket_zero = keys_in_bucket(&all, bucketing(TWO), 0);
+        table.remove_file("f0");
+        table.add_long_file("f0", &in_bucket_zero, 0).await;
+        table
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+        let before = table.gets();
+        let second = table.load(&config, None, Some(&first)).await.unwrap();
+        assert_eq!(
+            table.gets(),
+            before + METADATA_GETS + FILE_GETS,
+            "the re-added file is loaded anew, the other reused"
+        );
+        let by_name = |generation: &Generation, name: &str| {
+            let path = table.path_of(name);
+            generation
+                .files
+                .iter()
+                .find(|file| file.entry.path == path)
+                .cloned()
+                .unwrap()
+        };
+        let (old, new) = (by_name(&first, "f0"), by_name(&second, "f0"));
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert_eq!(old.entry.size, new.entry.size);
+        assert_eq!(old.entry.sequence, SequenceNumber(FIRST_SEQUENCE));
+        assert_eq!(new.entry.sequence, SequenceNumber(SECOND_SEQUENCE));
+        let kept = by_name(&second, "f1");
+        assert!(Arc::ptr_eq(&by_name(&first, "f1"), &kept));
+        assert_eq!(
+            kept.entry.sequence,
+            SequenceNumber(FIRST_SEQUENCE),
+            "an existing entry keeps the sequence number it was added at"
+        );
+        assert_present(&second, &all).await;
+    }
+
+    #[tokio::test]
     async fn test_load_routes_files_under_an_evolved_bucket_count() {
         let (mut table, all) = two_bucket_table().await;
         let config = table.config(Residency::Full, None);
@@ -3832,6 +3899,7 @@ mod tests {
             bucket,
             bucketing,
             records: 1,
+            sequence: SequenceNumber(FIRST_SEQUENCE),
             size: 1,
             key_min: None,
             key_max: None,

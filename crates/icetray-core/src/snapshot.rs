@@ -28,12 +28,15 @@ impl serde::Serialize for SnapshotId {
     }
 }
 
-/// A snapshot's sequence number: Iceberg's count of the table's commits,
-/// which rises with each one. A newtype, so that it cannot be passed where
-/// the snapshot id beside it is expected. Unlike the id it is a gauge value
-/// (`metric::GENERATION_SEQUENCE_NUMBER`): a count of commits stays exact
-/// in an `f64` up to two to the fifty-third of them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A sequence number: Iceberg's count of the table's commits, which rises
+/// with each one. A snapshot carries the one it was committed at, and each
+/// file a snapshot lists carries a data sequence number, that of the commit
+/// that added the file's rows, which orders the file against deletes (RFD
+/// 021). A newtype, so that it cannot be passed where the snapshot id
+/// beside it is expected. Unlike the id it is ordered, and it is a gauge
+/// value (`metric::GENERATION_SEQUENCE_NUMBER`): a count of commits stays
+/// exact in an `f64` up to two to the fifty-third of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SequenceNumber(pub i64);
 
 #[cfg(test)]
