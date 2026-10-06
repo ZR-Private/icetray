@@ -105,10 +105,14 @@ pub struct PuffinWritten {
 /// the magic and the vector, the magic, the vector in roaring's portable
 /// 64-bit format, and a four-byte big-endian CRC-32 of the magic and the
 /// vector. The checksum is CRC-32 (ISO-HDLC), which the Iceberg spec fixes
-/// for deletion vectors.
+/// for deletion vectors. The vector is optimized before it is serialized,
+/// as Java Iceberg's `BitmapPositionDeleteIndex` run-length encodes, so a
+/// fixture holds run containers wherever Java's writer would.
 pub fn encode_vector(positions: &RoaringTreemap) -> Result<Vec<u8>> {
+    let mut optimized = positions.clone();
+    optimized.optimize();
     let mut body = VECTOR_MAGIC.to_vec();
-    positions.serialize_into(&mut body)?;
+    optimized.serialize_into(&mut body)?;
     let length =
         u32::try_from(body.len()).map_err(|_| SpecFault::VectorTooLong { bytes: body.len() })?;
     let mut blob = length.to_be_bytes().to_vec();
@@ -372,25 +376,14 @@ mod tests {
     use crate::merge_oracle::{decode_vector, read_positions};
 
     /// Java's `BitmapPositionDeleteIndex` run-length encodes before it
-    /// serializes, so a vector optimized the same way encodes to Java's
-    /// bytes. One collected from positions holds only array and bitset
-    /// containers, so where Java chose runs its bytes differ while it
-    /// decodes to the same positions.
+    /// serializes, as `encode_vector` does, so positions collected without
+    /// optimizing encode to Java's bytes, run containers included.
     #[test]
-    fn test_encode_vector_writes_the_bytes_java_iceberg_wrote_once_optimized() {
+    fn test_encode_vector_writes_the_bytes_java_iceberg_wrote() {
         for java in java::vectors() {
-            let mut optimized = java.positions.clone();
-            optimized.optimize();
             assert_eq!(
-                encode_vector(&optimized).unwrap(),
+                encode_vector(&java.positions).unwrap(),
                 java.blob,
-                "{}",
-                java.name
-            );
-            let collected = encode_vector(&java.positions).unwrap();
-            assert_eq!(
-                decode_vector(&collected).as_ref(),
-                Some(&java.positions),
                 "{}",
                 java.name
             );
@@ -406,8 +399,10 @@ mod tests {
     fn test_encode_vector_frames_the_portable_vector_as_the_spec_fixes() {
         let positions = positions();
         let blob = encode_vector(&positions).unwrap();
+        let mut optimized = positions.clone();
+        optimized.optimize();
         let mut vector = Vec::new();
-        positions.serialize_into(&mut vector).unwrap();
+        optimized.serialize_into(&mut vector).unwrap();
         let body_len = VECTOR_MAGIC.len() + vector.len();
         assert_eq!(blob.len(), body_len + 2 * VECTOR_FRAME_BYTES);
         assert_eq!(

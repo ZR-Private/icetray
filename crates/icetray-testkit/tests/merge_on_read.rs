@@ -739,6 +739,39 @@ async fn test_a_ref_moved_back_past_a_vector_refuses_two_live_copies() -> Result
     Ok(())
 }
 
+/// A deletion vector of consecutive rows is written as a run container, as
+/// Java Iceberg writes one, and every tier serves the rows it deletes.
+#[tokio::test]
+async fn test_a_vector_of_consecutive_rows_serves_through_a_run_container() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = fixture(catalog.as_ref(), "kv_run").await?;
+    let run_rows: u64 = 200;
+    let run: Vec<u64> = (FIRST_FILE_IDS[0]..FIRST_FILE_IDS[0] + run_rows).collect();
+    let before = MergeOracle::read(&fixture).await?;
+    let positions: Vec<u64> = run
+        .iter()
+        .map(|&id| before.copies(&fixture.key(id))[0].position)
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "the run's rows are consecutive in one file"
+    );
+    fixture.delete(&run, DeleteForm::Vectors, "run").await?;
+    // An array container takes two bytes a row; the run takes a few in all.
+    let array_bytes = 2 * run_rows;
+    let [vector] = fixture.deletes() else {
+        panic!("one deletion vector, got {:?}", fixture.deletes());
+    };
+    let blob_bytes = u64::try_from(vector.content_size_in_bytes().unwrap()).unwrap();
+    assert!(blob_bytes < array_bytes, "{blob_bytes} bytes");
+    let mut tiers = Tiers::serve(&fixture).await?;
+    let oracle = check(&mut tiers, &fixture).await?;
+    for id in run {
+        assert_eq!(oracle.expected(&fixture.key(id)), Value::Absent);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_a_ref_moved_back_past_a_vector_serves_a_revived_only_copy() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
