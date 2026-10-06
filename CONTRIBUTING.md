@@ -243,7 +243,8 @@ Check each of these against your own diff before asking for review.
 ## Commits
 
 Conventional Commits: `<type>(<scope>): <description>`. Types are `feat`,
-`fix`, `refactor`, `test`, `docs`, `chore`, `ci`, `perf`. Scopes are crate
-names or the top-level area (`ci`, `docs`). The message says what changed and
-why, in enough detail that the reader does not need the diff for the why.
+`fix`, `refactor`, `test`, `docs`, `chore`, `ci`, `perf`, `build`. Scopes are
+crate names or the top-level area (`ci`, `docs`, `deps`). The message says
+what changed and why, in enough detail that the reader does not need the diff
+for the why.
 No attribution trailers for tools or agents.

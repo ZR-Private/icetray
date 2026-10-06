@@ -13,6 +13,7 @@ arrow = { workspace = true }
 async-trait = { workspace = true }
 base64.workspace = true
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -22,6 +23,7 @@ icetray-core = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 pin-project-lite = { workspace = true }
+roaring = { workspace = true }
 s3s = { workspace = true }
 s3s-fs = { workspace = true }
 serde.workspace = true
