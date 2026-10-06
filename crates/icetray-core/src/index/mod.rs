@@ -398,6 +398,16 @@ impl Keys {
         self.len() == 0
     }
 
+    /// The run's first key; `None` for an empty run.
+    pub(crate) fn first(&self) -> Option<Key> {
+        (!self.is_empty()).then(|| self.get(0))
+    }
+
+    /// The run's last key; `None` for an empty run.
+    pub(crate) fn last(&self) -> Option<Key> {
+        self.len().checked_sub(1).map(|at| self.get(at))
+    }
+
     /// The key at `at`, which is below `len`.
     pub(crate) fn get(&self, at: usize) -> Key {
         match self {
@@ -685,6 +695,7 @@ impl FileIndex {
             metadata,
             layout,
             predicted,
+            reuse: None,
         })
     }
 

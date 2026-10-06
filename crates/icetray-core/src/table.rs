@@ -969,14 +969,15 @@ impl Table {
         resolved.snapshot_for_ref(&self.config.name, &self.config.r#ref)
     }
 
-    /// Builds `snapshot` over `previous`, gates it, and swaps it in.
+    /// Plans `snapshot` over `previous` at the footer stage, judges its
+    /// level there, builds it, gates it, and swaps it in.
     async fn build_and_admit(
         &self,
         resolved: &Resolved,
         snapshot: &Snapshot,
         previous: Option<&Arc<Generation>>,
     ) -> Result<()> {
-        let generation = Generation::plan_load(
+        let mut planned = Generation::plan_load(
             &self.config,
             resolved,
             snapshot,
@@ -984,9 +985,9 @@ impl Table {
             Arc::clone(&self.hedge),
             previous.map(Arc::as_ref),
         )
-        .await?
-        .build(self.local.as_ref())
         .await?;
+        planned.judge_level(self.local.as_ref()).await?;
+        let generation = planned.build(self.local.as_ref()).await?;
         let findings = self.gate(&generation)?;
         self.swap(generation, previous, &findings);
         self.remember(&resolved.location, None);
@@ -1011,14 +1012,16 @@ impl Table {
         });
     }
 
-    /// The level gate (RFD 016, RFD 020): the doctor's verdict on a built
-    /// generation before it is swapped in. Every finding is logged as the
-    /// table's `FindingLog` says. Under `strict`, a generation below the
-    /// table's `lookups` is dropped, never swapped, with the
-    /// `RefusalReason::BelowLevel` that `check::judge` gives. `Ok` carries
-    /// the admitted generation's findings per code, for the `findings`
-    /// gauge; a refused generation's reach the logs and the error and never
-    /// the gauge, which describes the serving generation.
+    /// The doctor's verdict on a built generation before it is swapped in
+    /// (RFD 016). Every finding is logged as the table's `FindingLog` says.
+    /// The level was judged at the footer stage (`Planned::judge_level`);
+    /// the generation's measured level is judged again under `strict` as a
+    /// backstop, by the same `check::judge`, so a generation below the
+    /// table's `lookups` is never swapped in whatever the footer stage
+    /// missed. `Ok` carries the admitted generation's findings per code,
+    /// for the `findings` gauge; a refused generation's reach the logs and
+    /// the error and never the gauge, which describes the serving
+    /// generation.
     fn gate(&self, generation: &Generation) -> Result<BTreeMap<FindingCode, u64>> {
         let declared = self.config.lookups();
         let report = check::diagnose(generation, declared);
@@ -1027,13 +1030,7 @@ impl Table {
             *counts.entry(finding.code()).or_default() += 1;
             log_finding(self.name(), finding, self.findings, declared);
         }
-        check::judge(
-            self.name(),
-            report.summary.level,
-            &report.capping_codes(),
-            declared,
-            self.config.strict,
-        )?;
+        generation.judge(declared, self.config.strict)?;
         Ok(counts)
     }
 
@@ -1280,7 +1277,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::config::{Residency, ServerConfig};
-    use crate::error::{ErrorKind, RefusalReason};
+    use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, RESOLVE_GETS, SECOND_SEQUENCE,
@@ -1695,8 +1692,12 @@ mod tests {
         (table, fixture, all, gauged)
     }
 
-    /// `fixture`'s table with `strict` off, as the one-row-per-page tables
-    /// are served.
+    /// `fixture`'s table in the Full tier with `strict` off: as the
+    /// one-row-per-page tables are served, and wherever a test checks a
+    /// refusal or a decode that the level gate would otherwise meet first.
+    /// A duplicate key, for one, is only possible across overlapping files,
+    /// which strict refuses as `below_level` before the merge that finds
+    /// it.
     fn lenient(fixture: &Fixture) -> TableConfig {
         TableConfig {
             strict: false,
@@ -1971,14 +1972,7 @@ mod tests {
         accepting.load().await.unwrap();
         assert_eq!(serving_id(&accepting), SnapshotId(FIRST_SNAPSHOT));
 
-        let lenient = table_over(
-            &fixture,
-            TableConfig {
-                strict: false,
-                ..fixture.config(Residency::Full, None)
-            },
-        )
-        .await;
+        let lenient = table_over(&fixture, lenient(&fixture)).await;
         lenient.load().await.unwrap();
         assert_eq!(serving_id(&lenient), SnapshotId(FIRST_SNAPSHOT));
 
@@ -2092,7 +2086,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_refused_keeps_the_previous_generation_then_recovers() {
         let (mut fixture, all) = two_bucket_table().await;
-        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        let table = table_over(&fixture, lenient(&fixture)).await;
         table.load().await.unwrap();
         let reason = commit_duplicate(
             &mut fixture,
@@ -2198,8 +2192,8 @@ mod tests {
         };
         // Overlapping files cap the level at permissive, which strict refuses.
         let config = TableConfig {
-            strict: false,
-            ..fixture.config(Residency::Disk, None)
+            residency: Residency::Disk,
+            ..lenient(&fixture)
         };
         let defaults = ServerConfig::default();
         let table = table_sharing(
@@ -2306,7 +2300,9 @@ mod tests {
         fixture
             .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
             .await;
-        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        // Two unbucketed files cap the table at permissive, which strict
+        // refuses as below_level before any key page is decoded.
+        let table = table_over(&fixture, lenient(&fixture)).await;
         table.load().await.unwrap();
 
         let repeats = 2;
@@ -2366,6 +2362,115 @@ mod tests {
             achieved: Level::Balanced,
             findings: vec![FindingCode::DictionaryEncodedValue],
         }
+    }
+
+    /// Appends to `fixture` a file `dict` in bucket 0 whose value column is
+    /// dictionary-encoded and whose keys interleave with bucket 0's file's,
+    /// committed as `SECOND_SNAPSHOT`.
+    async fn append_dictionary_overlap(fixture: &mut Fixture) {
+        let interleaved = keys_in_bucket(&keys_from(1, E2E_KEYS), bucketing(TWO), 0);
+        let keys = long_keys(&interleaved);
+        fixture
+            .add_file(FileSpec {
+                name: "dict",
+                keys: &keys,
+                values: values_of(&interleaved),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout {
+                    dictionary: Dictionary::Value,
+                    ..WriterLayout::contract()
+                },
+            })
+            .await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+    }
+
+    /// A footer cap that already puts a strict table below its level does
+    /// not leave overlap unread: the refusal is at the level the snapshot
+    /// achieves and names every code below the declared level.
+    #[tokio::test]
+    async fn test_refresh_below_level_names_overlap_beside_a_footer_cap() {
+        let (mut fixture, _) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        append_dictionary_overlap(&mut fixture).await;
+        assert_eq!(
+            refusal_of(table.refresh().await),
+            RefusalReason::BelowLevel {
+                declared: Level::Optimal,
+                achieved: Level::Permissive,
+                findings: vec![
+                    FindingCode::DictionaryEncodedValue,
+                    FindingCode::OverlappingFiles
+                ],
+            }
+        );
+    }
+
+    /// A strict Disk table below its level under a local directory too
+    /// small for its chunk files is refused for its level, not its budget:
+    /// the level is judged at the footer stage, before the budget is
+    /// reserved, and the refusal writes nothing.
+    #[tokio::test]
+    async fn test_level_gate_runs_before_the_index_budget_is_reserved() {
+        let fixture = one_file_fixture(WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        })
+        .await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), fixture.storage.stats(), Some(TINY_BUDGET));
+        let handles = TableHandles {
+            local: Some(Arc::clone(&local)),
+            ..handles_over(&fixture).await
+        };
+        let defaults = ServerConfig::default();
+        let strict = table_sharing(
+            &fixture,
+            fixture.config(Residency::Disk, None),
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        assert!(strict.config.strict);
+        assert_eq!(refusal_of(strict.load().await), dictionary_below_optimal());
+        assert_eq!(
+            local.index_bytes_in_use().unwrap(),
+            0,
+            "nothing was written"
+        );
+
+        let lenient = table_sharing(
+            &fixture,
+            TableConfig {
+                residency: Residency::Disk,
+                ..lenient(&fixture)
+            },
+            TableHandles {
+                local: Some(Arc::clone(&local)),
+                ..handles_over(&fixture).await
+            },
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        assert!(
+            matches!(
+                refusal_of(lenient.load().await),
+                RefusalReason::OverBudget {
+                    of: Budget::Index,
+                    ..
+                }
+            ),
+            "the budget refuses it once the level does not"
+        );
     }
 
     #[tokio::test]
@@ -2534,7 +2639,7 @@ mod tests {
         let started = time::unix_seconds(time::now());
         let (reason, series) = recorded(async {
             let (mut fixture, all) = two_bucket_table().await;
-            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
             table.get(&Key::Long(all[0])).await.unwrap();
             table.get(&Key::Long(all[0])).await.unwrap();
@@ -2939,14 +3044,7 @@ mod tests {
         };
         let ((lenient_bytes, strict_bytes), series) = recorded(async {
             let fixture = one_file_fixture(balanced).await;
-            let lenient = table_over(
-                &fixture,
-                TableConfig {
-                    strict: false,
-                    ..fixture.config(Residency::Full, None)
-                },
-            )
-            .await;
+            let lenient = table_over(&fixture, lenient(&fixture)).await;
             lenient.load().await.unwrap();
             let lenient_bytes = lenient.current().unwrap().index_bytes;
 

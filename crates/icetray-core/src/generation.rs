@@ -1,9 +1,10 @@
-//! A generation (RFD 005, RFD 017): one snapshot of one table, every live
-//! data file indexed, the files in a deterministic order, the overlap
-//! groups among them checked for a key two files share, and the
-//! resident-bytes budget checked at the footer stage before any key chunk
-//! is fetched. Immutable once built; a `Table` builds the next one beside
-//! it, reusing every file whose path is unchanged, and swaps atomically.
+//! A generation (RFD 005, RFD 017, RFD 020): one snapshot of one table,
+//! every live data file indexed, the files in a deterministic order, the
+//! overlap groups among them checked for a key two files share, and the
+//! lookup level and the resident-bytes budget checked at the footer stage
+//! before any key chunk is fetched. Immutable once built; a `Table` builds
+//! the next one beside it, reusing every file whose path is unchanged, and
+//! swaps atomically.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -19,10 +20,12 @@ use crate::approx;
 use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
+use crate::check::{self, Caps, FileView, FindingCode, LayoutView};
 use crate::config::{ConfigError, Residency, TableConfig};
 use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
+use crate::level::Level;
 use crate::local::{DataFileIdentity, LocalDir, Reservation};
 use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
 use crate::metric::LookupResult;
@@ -99,6 +102,13 @@ pub struct Generation {
     /// The snapshot's own timestamp, when the writer committed it; what
     /// `generation_age_seconds` measures against now.
     pub snapshot_timestamp: jiff::Timestamp,
+    /// The level the snapshot's layout achieves in `residency` (RFD 020),
+    /// measured once as the generation is assembled (`check::layout_caps`);
+    /// what the level gauges and a reload judge the generation by.
+    pub level: Level,
+    /// The distinct codes of the findings that cap `level`, in the finding
+    /// table's order.
+    capping: Vec<FindingCode>,
     /// Positions in `files`, in file order, per bucketing the files carry
     /// and per bucket under it; how a key finds its candidates.
     routes: Routes,
@@ -196,6 +206,12 @@ impl Generation {
         let routes = routes(&spans);
         let groups = overlap_groups(&spans, &routes);
         let overlapping = widest_per_bucket(&spans, &groups);
+        let caps = check::layout_caps(&LayoutView {
+            layout: &layout,
+            residency,
+            files: files.iter().map(|file| FileView::loaded(file)).collect(),
+            overlapping: &overlapping,
+        });
         let to_verify: Vec<Vec<usize>> = groups
             .into_iter()
             .filter(|group| !group.iter().all(|&at| members[at].reused))
@@ -230,10 +246,18 @@ impl Generation {
             index_bytes,
             loaded_at: Instant::now(),
             snapshot_timestamp,
+            level: caps.level,
+            capping: caps.codes(),
             routes,
             overlapping,
             verified_groups: to_verify.len(),
         })
+    }
+
+    /// The level gate (`check::judge`) over the generation's measured level
+    /// for a table that declares `declared`.
+    pub(crate) fn judge(&self, declared: Level, strict: bool) -> Result<()> {
+        check::judge(&self.table, self.level, &self.capping, declared, strict)
     }
 
     /// The files that may hold `key`, in file order: under every bucketing
@@ -399,6 +423,121 @@ pub(crate) struct Planned {
 }
 
 impl Planned {
+    /// The level gate at the footer stage (RFD 020): under `strict`,
+    /// `RefusalReason::BelowLevel` (`check::judge`) when the snapshot's
+    /// layout puts the table below its `lookups`, judged before any key
+    /// chunk is fetched and before the index budget is reserved, so a
+    /// refused snapshot writes nothing to the local directory. The caps the
+    /// footers, the manifest entries, and the residency set are judged
+    /// together with overlap, from the reused files' exact key ranges and
+    /// each new file's edge keys (`edge_ranges`), so a refused snapshot's
+    /// level and codes are the ones its build would measure. Overlap is
+    /// left unread only where it cannot change the verdict or the level: a
+    /// table declared `permissive`, which every layout meets, and footer
+    /// caps that already reach `permissive`, the dearest level. A new file
+    /// whose edge pages do not decode is left out of the overlap groups,
+    /// which can only narrow them: if the rest already put the table below
+    /// its level the snapshot is refused for it, and otherwise the build's
+    /// verification refuses that file. Not strict, it reads nothing and
+    /// passes.
+    pub(crate) async fn judge_level(&mut self, local: Option<&Arc<LocalDir>>) -> Result<()> {
+        let (declared, strict) = (self.config.lookups(), self.config.strict);
+        if !strict {
+            return Ok(());
+        }
+        let mut caps = self.caps(&BTreeMap::new());
+        if declared < Level::Permissive && caps.level < Level::Permissive {
+            let overlapping = self.overlapping(local).await?;
+            caps = self.caps(&overlapping);
+        }
+        check::judge(
+            &self.config.name,
+            caps.level,
+            &caps.codes(),
+            declared,
+            strict,
+        )
+    }
+
+    /// The level the snapshot's layout achieves in the configured residency
+    /// with `overlapping` as its widest overlap group per bucket
+    /// (`check::layout_caps`), from the footers and manifest entries.
+    fn caps(&self, overlapping: &BTreeMap<u32, usize>) -> Caps {
+        let files = self
+            .reused
+            .iter()
+            .map(|file| FileView::loaded(file))
+            .chain(
+                self.inspected
+                    .iter()
+                    .map(|(entry, inspected)| FileView::inspected(entry, inspected)),
+            )
+            .collect();
+        check::layout_caps(&LayoutView {
+            layout: &self.layout,
+            residency: self.config.residency,
+            files,
+            overlapping,
+        })
+    }
+
+    /// Per bucket, the widest overlap group touching it
+    /// (`widest_per_bucket`), from the reused files' exact key ranges and
+    /// the new files' edge keys. A new file with `Edge::Unknown` has no
+    /// span, so the groups are those of the other files alone.
+    async fn overlapping(&mut self, local: Option<&Arc<LocalDir>>) -> Result<BTreeMap<u32, usize>> {
+        let edges = self.edge_ranges(local).await?;
+        let mut spans: Vec<Span<'_>> = self.reused.iter().map(|file| Span::of(file)).collect();
+        for ((entry, _), edge) in self.inspected.iter().zip(&edges) {
+            match edge {
+                Edge::Span(first, last) => spans.push(Span {
+                    bucketing: entry.bucketing,
+                    bucket: entry.bucket,
+                    first,
+                    last,
+                }),
+                Edge::Alone | Edge::Unknown => {}
+            }
+        }
+        spans.sort_by(|a, b| {
+            (a.bucketing, a.bucket, a.first).cmp(&(b.bucketing, b.bucket, b.first))
+        });
+        let groups = overlap_groups(&spans, &routes(&spans));
+        Ok(widest_per_bucket(&spans, &groups))
+    }
+
+    /// Per new file, in plan order, where it stands in the overlap sweep
+    /// (RFD 020, Settings): `Edge::Alone`, reading nothing, when no other
+    /// file of the snapshot is in a bucket one of its keys can fall in
+    /// (`sharing`), so a table with one file per bucket reads nothing;
+    /// otherwise its first and last key. A Disk table's file whose chunk
+    /// file in `local` is trusted takes them from the verification record
+    /// it stores, with no GET, and keeps the chunk file for `build`
+    /// (`Inspected::trusted_key_range`); any other reads its edge pages
+    /// (`Inspected::edge_keys`). `load_concurrency()` files at a time.
+    async fn edge_ranges(&mut self, local: Option<&Arc<LocalDir>>) -> Result<Vec<Edge>> {
+        let shares = sharing(
+            self.reused
+                .iter()
+                .map(|file| &file.entry)
+                .chain(self.inspected.iter().map(|(entry, _)| entry)),
+        );
+        let local = match self.config.residency {
+            Residency::Disk => local.map(Arc::as_ref),
+            Residency::Full | Residency::Bloom => None,
+        };
+        let reads: Vec<_> = self
+            .inspected
+            .iter_mut()
+            .zip(&shares[self.reused.len()..])
+            .map(|((_, inspected), &shares)| edge_of(inspected, local, shares))
+            .collect();
+        stream::iter(reads)
+            .buffered(load_concurrency())
+            .try_collect()
+            .await
+    }
+
     /// The chunk stage: checks the budget the configuration and `local`
     /// set before any chunk is fetched (Full: `resident_budget_bytes`
     /// against the reused files' resident bytes plus every new file's
@@ -447,6 +586,73 @@ impl Planned {
         )
         .await
     }
+}
+
+/// Where a new file stands in the level gate's overlap sweep
+/// (`Planned::edge_ranges`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Edge {
+    /// No other file is in a bucket one of its keys can fall in, so it
+    /// overlaps none; nothing was read.
+    Alone,
+    /// Its first and last key.
+    Span(Key, Key),
+    /// An edge page did not decode to a key; the file has no span in the
+    /// sweep, and the build's verification refuses it.
+    Unknown,
+}
+
+/// The `Edge` of a file: `Edge::Alone` unless it `shares` a bucket, and
+/// then from the chunk file `local` holds for it when that is trusted,
+/// else from its edge pages.
+async fn edge_of(
+    inspected: &mut Inspected,
+    local: Option<&LocalDir>,
+    shares: bool,
+) -> Result<Edge> {
+    if !shares {
+        return Ok(Edge::Alone);
+    }
+    if let Some(local) = local
+        && let Some((first, last)) = inspected.trusted_key_range(local).await?
+    {
+        return Ok(Edge::Span(first, last));
+    }
+    Ok(match inspected.edge_keys().await? {
+        Some((first, last)) => Edge::Span(first, last),
+        None => Edge::Unknown,
+    })
+}
+
+/// Per entry, in order, whether another entry is in a bucket that one key
+/// can fall in together with the entry's own (`buckets_may_share_a_key`):
+/// another entry of the same bucketing and bucket, or one of another
+/// bucketing whose bucket is congruent, or any entry when either has no
+/// bucketing. Buckets of one bucketing are compared only with the
+/// bucketing's other entries, so the pairwise pass runs across bucketings
+/// alone, which a table carries only after a spec evolution.
+fn sharing<'a>(entries: impl Iterator<Item = &'a DataFileEntry>) -> Vec<bool> {
+    let places: Vec<(Option<Bucketing>, u32)> = entries
+        .map(|entry| (entry.bucketing, entry.bucket))
+        .collect();
+    let mut held: BTreeMap<Option<Bucketing>, BTreeMap<u32, usize>> = BTreeMap::new();
+    for &(bucketing, bucket) in &places {
+        *held
+            .entry(bucketing)
+            .or_default()
+            .entry(bucket)
+            .or_default() += 1;
+    }
+    let shared = |(bucketing, bucket): (Option<Bucketing>, u32)| {
+        held[&bucketing][&bucket] > 1
+            || held.iter().any(|(&theirs, buckets)| {
+                theirs != bucketing
+                    && buckets
+                        .keys()
+                        .any(|&other| buckets_may_share_a_key((bucketing, bucket), (theirs, other)))
+            })
+    };
+    places.into_iter().map(shared).collect()
 }
 
 /// A file of a generation being assembled, and whether it came from the
@@ -1832,24 +2038,28 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use iceberg::spec::{Operation, Summary};
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
     use super::testing::{
-        self, Bloom, Bounds, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, FileSpec,
-        KEY_STEP, RESOLVE_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
+        self, Bloom, Bounds, Dictionary, E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION,
+        FileSpec, KEY_STEP, RESOLVE_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE,
         THIRD_SEQUENCE, THIRD_SNAPSHOT, THIRD_VERSION, TINY_BUDGET, TWO, Table, WriterLayout,
         bucketing, cache, keys_from, keys_in_bucket, local_dir, long_keys, refusal_of,
         two_bucket_table, value_for, values_of,
     };
     use super::*;
     use crate::catalog::TableSource;
+    use crate::check::thresholds::KEY_PAGE_ROWS_LARGE;
     use crate::config::{ConfigViolation, HedgeConfig};
+    use crate::index::{FileFault, testing as index_testing};
     use crate::key::KeyType;
-    use crate::level::Level;
+    use crate::local::testing as local_testing;
+    use crate::manifest::UNBUCKETED;
     use crate::manifest::testing::{
-        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID,
+        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID, unpartitioned,
     };
     use crate::storage::testing::{MEM_PREFIX, MemStore};
 
@@ -3010,6 +3220,403 @@ mod tests {
             "each file's chunk is fetched at build"
         );
         assert_present(&generation, &all).await;
+    }
+
+    /// Rows per key page of the edge-key fixture: several pages to a row
+    /// group, so a file's first and last key are on different pages.
+    const EDGE_PAGE_ROWS: usize = 4;
+
+    /// Rows per row group of the edge-key fixture: several row groups to a
+    /// file, so a file's first and last key are in different row groups.
+    const EDGE_ROW_GROUP_ROWS: usize = 8;
+
+    /// Keys drawn from for each bucket file of the edge-key fixture.
+    const EDGE_KEYS: i64 = 48;
+
+    /// A two-bucket table whose bucket 0 holds two files with interleaved
+    /// key ranges, `a` and `b`, and whose bucket 1 holds `c` alone, laid
+    /// out with `dictionary` over `EDGE_PAGE_ROWS`-row pages and
+    /// `EDGE_ROW_GROUP_ROWS`-row row groups, committed as `FIRST_SNAPSHOT`.
+    async fn edge_fixture(dictionary: Dictionary) -> Table {
+        let mut table = Table::bucketed(TWO);
+        let layout = WriterLayout {
+            page_rows: EDGE_PAGE_ROWS,
+            dictionary,
+            row_group_rows: Some(EDGE_ROW_GROUP_ROWS),
+            ..WriterLayout::contract()
+        };
+        let in_bucket = |from: i64, bucket: u32| {
+            keys_in_bucket(&keys_from(from, EDGE_KEYS), bucketing(TWO), bucket)
+        };
+        for (name, keys, bucket) in [
+            ("a", in_bucket(0, 0), 0),
+            ("b", in_bucket(1, 0), 0),
+            ("c", in_bucket(0, 1), 1),
+        ] {
+            let typed = long_keys(&keys);
+            table
+                .add_file(FileSpec {
+                    name,
+                    keys: &typed,
+                    values: values_of(&keys),
+                    partition: Partition::Bucket(bucket),
+                    bounds: Bounds::Exact,
+                    layout,
+                })
+                .await;
+        }
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        table
+    }
+
+    /// Asserts `edges`, a plan's edges of the new files named `paths`, are
+    /// each file's exact key range in `generation`, and `alone` is
+    /// `Edge::Alone`.
+    fn assert_edges_exact(generation: &Generation, paths: &[String], edges: &[Edge], alone: &str) {
+        assert_eq!(paths.len(), edges.len());
+        for (path, edge) in paths.iter().zip(edges) {
+            if path == alone {
+                assert_eq!(*edge, Edge::Alone, "{path}");
+                continue;
+            }
+            let file = generation
+                .files
+                .iter()
+                .find(|file| file.entry.path == *path)
+                .unwrap();
+            let (first, last) = file.index.key_range();
+            assert_eq!(*edge, Edge::Span(first.clone(), last.clone()), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_edge_ranges_equal_the_exact_key_range() {
+        for dictionary in [Dictionary::Off, Dictionary::Key] {
+            let table = edge_fixture(dictionary).await;
+            let alone = table.path_of("c");
+            // The first and last page of each of `a` and `b`, in different
+            // row groups, with each one's dictionary page when it has one.
+            let dictionaries = if dictionary == Dictionary::Key { 2 } else { 0 };
+            let edge_gets = 2 * (2 + dictionaries);
+            for residency in Residency::ALL {
+                let scratch = tempfile::tempdir().unwrap();
+                let local = local_dir(scratch.path(), table.storage.stats(), None);
+                let local = (residency == Residency::Disk).then_some(&local);
+                let config = table.config(residency, None);
+                let mut planned = table.plan_load(&config, None).await.unwrap();
+                let paths: Vec<String> = planned
+                    .inspected
+                    .iter()
+                    .map(|(entry, _)| entry.path.clone())
+                    .collect();
+                let before = table.gets();
+                let edges = planned.edge_ranges(local).await.unwrap();
+                assert_eq!(
+                    table.gets() - before,
+                    edge_gets,
+                    "{residency} {dictionary:?}: two edge pages of each overlapping file"
+                );
+                let generation = planned.build(local).await.unwrap();
+                assert_edges_exact(&generation, &paths, &edges, &alone);
+                let Some(local) = local else {
+                    continue;
+                };
+                // A restart over the chunk files the first load wrote takes
+                // the edges from their records, and the build reuses them.
+                let mut restarted = table.plan_load(&config, None).await.unwrap();
+                let before = table.gets();
+                let edges = restarted.edge_ranges(Some(local)).await.unwrap();
+                assert_eq!(table.gets(), before, "a trusted chunk file costs no GET");
+                let generation = restarted.build(Some(local)).await.unwrap();
+                assert_eq!(table.gets(), before, "and the build fetches no chunk");
+                assert_edges_exact(&generation, &paths, &edges, &alone);
+            }
+        }
+    }
+
+    /// An unpartitioned table of two contract files, committed as
+    /// `FIRST_SNAPSHOT`.
+    async fn two_unbucketed_files() -> Table {
+        let mut table = Table::new(KeyType::Long, unpartitioned());
+        for (name, from) in [("a", 0), ("b", E2E_KEYS * KEY_STEP)] {
+            let keys = keys_from(from, E2E_KEYS);
+            let typed = long_keys(&keys);
+            table
+                .add_file(FileSpec {
+                    name,
+                    keys: &typed,
+                    values: values_of(&keys),
+                    partition: Partition::None,
+                    bounds: Bounds::Exact,
+                    layout: WriterLayout::contract(),
+                })
+                .await;
+        }
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        table
+    }
+
+    /// `two_bucket_table` evolved to `FOUR` buckets with a file in each
+    /// whose keys interleave with the first bucketing's, so overlap links
+    /// files across the two; committed as `SECOND_SNAPSHOT`.
+    async fn interleaved_under_two_bucketings() -> Table {
+        let (mut table, _) = two_bucket_table().await;
+        table.evolve(FOUR);
+        let interleaved = keys_from(1, E2E_KEYS);
+        for bucket in 0..FOUR {
+            let keys = keys_in_bucket(&interleaved, bucketing(FOUR), bucket);
+            table
+                .add_long_file(&format!("g{bucket}"), &keys, bucket)
+                .await;
+        }
+        table
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+        table
+    }
+
+    /// The level the plan stage judges for `config` with every new file's
+    /// edges read, beside the generation the plan then builds.
+    async fn plan_stage_caps(
+        table: &Table,
+        config: &TableConfig,
+        local: Option<&Arc<LocalDir>>,
+    ) -> (Caps, Generation) {
+        let mut planned = table.plan_load(config, None).await.unwrap();
+        let overlapping = planned.overlapping(local).await.unwrap();
+        let caps = planned.caps(&overlapping);
+        (caps, planned.build(local).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_layout_caps_at_the_plan_stage_equal_the_diagnosed_level() {
+        let one_file = |layout: WriterLayout, keys: i64| async move {
+            let mut table = Table::bucketed(1);
+            let all = keys_from(0, keys);
+            let typed = long_keys(&all);
+            table
+                .add_file(FileSpec {
+                    name: "f",
+                    keys: &typed,
+                    values: values_of(&all),
+                    partition: Partition::Bucket(0),
+                    bounds: Bounds::Exact,
+                    layout,
+                })
+                .await;
+            table
+                .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+                .await;
+            table
+        };
+        let large_pages = KEY_PAGE_ROWS_LARGE + 1;
+        let cases = [
+            ("contract", two_bucket_table().await.0, Residency::Full),
+            ("bloom", two_bucket_table().await.0, Residency::Bloom),
+            (
+                "dictionary value",
+                one_file(
+                    WriterLayout {
+                        dictionary: Dictionary::Value,
+                        ..WriterLayout::contract()
+                    },
+                    E2E_KEYS,
+                )
+                .await,
+                Residency::Full,
+            ),
+            (
+                "large key pages",
+                one_file(
+                    WriterLayout {
+                        page_rows: usize::try_from(large_pages).unwrap(),
+                        ..WriterLayout::contract()
+                    },
+                    large_pages,
+                )
+                .await,
+                Residency::Full,
+            ),
+            (
+                "unpartitioned",
+                two_unbucketed_files().await,
+                Residency::Full,
+            ),
+            (
+                "overlapping",
+                edge_fixture(Dictionary::Off).await,
+                Residency::Disk,
+            ),
+            (
+                "two bucketings",
+                interleaved_under_two_bucketings().await,
+                Residency::Full,
+            ),
+        ];
+        let mut levels = BTreeSet::new();
+        for (name, table, residency) in cases {
+            let scratch = tempfile::tempdir().unwrap();
+            let local = local_dir(scratch.path(), table.storage.stats(), None);
+            let config = table.config(residency, None);
+            let (caps, generation) = plan_stage_caps(&table, &config, Some(&local)).await;
+            let report = check::diagnose(&generation, config.lookups());
+            assert_eq!(caps.level, report.summary.level, "{name}");
+            assert_eq!(caps.level, generation.level, "{name}");
+            assert_eq!(caps.codes(), report.capping_codes(), "{name}");
+            assert_eq!(caps.codes(), generation.capping, "{name}");
+            if name == "two bucketings" {
+                assert_eq!(
+                    caps.codes(),
+                    [FindingCode::OverlappingFiles],
+                    "the plan stage links files across bucketings"
+                );
+            }
+            levels.insert(caps.level);
+        }
+        assert_eq!(levels.len(), 3, "the cases reach every level");
+    }
+
+    /// The manifest entry of a file filed under `bucket` of `bucketing`.
+    fn placed(bucketing: Option<Bucketing>, bucket: u32) -> DataFileEntry {
+        DataFileEntry {
+            path: format!("{DATA_DIR}/{bucket}.parquet"),
+            bucket,
+            bucketing,
+            records: 1,
+            size: 1,
+            key_min: None,
+            key_max: None,
+        }
+    }
+
+    #[test]
+    fn test_sharing_marks_entries_one_key_can_reach_together() {
+        let (two, four) = (Some(bucketing(TWO)), Some(bucketing(FOUR)));
+        let cases = [
+            (
+                "the same bucket",
+                vec![(two, 0), (two, 0), (two, 1)],
+                vec![true, true, false],
+            ),
+            (
+                "congruent buckets under two bucketings",
+                vec![(two, 0), (four, 2)],
+                vec![true, true],
+            ),
+            (
+                "buckets under two bucketings no key reaches both of",
+                vec![(two, 0), (four, 1), (four, 3)],
+                vec![false, false, false],
+            ),
+            (
+                "an unbucketed entry beside a bucketed one",
+                vec![(None, UNBUCKETED), (two, 1)],
+                vec![true, true],
+            ),
+            (
+                "an unbucketed entry alone",
+                vec![(None, UNBUCKETED)],
+                vec![false],
+            ),
+        ];
+        for (name, places, expected) in cases {
+            let entries: Vec<DataFileEntry> = places
+                .into_iter()
+                .map(|(bucketing, bucket)| placed(bucketing, bucket))
+                .collect();
+            assert_eq!(sharing(entries.iter()), expected, "{name}");
+        }
+    }
+
+    /// Bucket 0 of a one-bucket table: `a`, whose keys interleave with
+    /// `b`'s when `with_b` adds it, and `x`, whose keys lie above both and
+    /// whose first key page claims more values than it holds, so its edge
+    /// pages do not decode; committed as `FIRST_SNAPSHOT`.
+    async fn with_an_undecodable_edge(with_b: bool) -> Table {
+        let mut table = Table::bucketed(1);
+        table.add_long_file("a", &keys_from(0, E2E_KEYS), 0).await;
+        if with_b {
+            table.add_long_file("b", &keys_from(1, E2E_KEYS), 0).await;
+        }
+        let above = E2E_KEYS * KEY_STEP;
+        table
+            .add_long_file("x", &keys_from(above, E2E_KEYS), 0)
+            .await;
+        let path = table.path_of("x");
+        let on_disk = std::path::Path::new(path.strip_prefix("file://").unwrap());
+        let bytes = Bytes::from(std::fs::read(on_disk).unwrap());
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&bytes)
+            .unwrap();
+        let first_page = metadata.offset_index().unwrap()[0][0].page_locations()[0].offset;
+        let at = usize::try_from(first_page).unwrap();
+        let more_than_it_holds = i32::try_from(E2E_KEYS + 1).unwrap();
+        local_testing::overwrite(
+            on_disk,
+            u64::try_from(first_page).unwrap(),
+            &index_testing::with_first_page_claiming(&bytes[at..], more_than_it_holds),
+        );
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        table
+    }
+
+    /// A file whose edge pages do not decode leaves the level gate's
+    /// overlap to the build when the other files alone meet the level, and
+    /// the build refuses the file for what its verification finds there.
+    #[tokio::test]
+    async fn test_judge_level_defers_an_undecodable_edge_to_the_build() {
+        let table = with_an_undecodable_edge(false).await;
+        let mut planned = table
+            .plan_load(&table.config(Residency::Full, None), None)
+            .await
+            .unwrap();
+        let edges = planned.edge_ranges(None).await.unwrap();
+        assert!(edges.contains(&Edge::Unknown), "{edges:?}");
+        planned.judge_level(None).await.unwrap();
+        let error = planned.build(None).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::File { path, fault: FileFault::PageRowsMismatch { .. } }
+                    if *path == table.path_of("x")
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A file whose edge pages do not decode beside two files that overlap
+    /// is refused for its level at the footer stage: the overlap the other
+    /// files show is enough, so no chunk file is written.
+    #[tokio::test]
+    async fn test_judge_level_refuses_overlap_beside_an_undecodable_edge() {
+        let table = with_an_undecodable_edge(true).await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        let mut planned = table
+            .plan_load(&table.config(Residency::Disk, None), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            refusal_of(planned.judge_level(Some(&local)).await),
+            RefusalReason::BelowLevel {
+                declared: Level::Optimal,
+                achieved: Level::Permissive,
+                findings: vec![FindingCode::OverlappingFiles],
+            }
+        );
+        assert_eq!(local.index_bytes_in_use().unwrap(), 0, "no chunk file");
     }
 
     /// A configuration built by hand, which no validation saw, meets the

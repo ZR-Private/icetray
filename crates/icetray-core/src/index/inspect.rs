@@ -11,7 +11,7 @@ use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
-use super::build::{OnDisk, reusable_disk_chunks, verified_under};
+use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
 use super::{
     FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of, record,
     saturating_sum, saturating_sum_all,
@@ -25,7 +25,7 @@ use crate::parquet_io::FileHandle;
 /// A data file past the footer stage of `FileIndex::build`: its footer
 /// checked and trimmed, its resident bytes predicted, and no key chunk
 /// fetched yet. `build` is the chunk stage; between the two a caller holds
-/// the budget check of RFD 017.
+/// the level gate of RFD 020 and the budget check of RFD 017.
 #[derive(Debug)]
 pub(crate) struct Inspected {
     pub(super) table: String,
@@ -33,9 +33,29 @@ pub(crate) struct Inspected {
     pub(super) metadata: Arc<ParquetMetaData>,
     pub(super) layout: Layout,
     pub(super) predicted: ResidentBytes,
+    /// What `trusted_key_range` found in the local directory for the
+    /// file, once it looked: `build` takes a trusted chunk file as it is
+    /// and rewrites a rejected one, checking neither a second time.
+    pub(super) reuse: Option<Reuse>,
 }
 
 impl Inspected {
+    /// The footer as kept, which every page index the file has is read
+    /// from.
+    pub(crate) fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    /// The key column's leaf in the footer's schema.
+    pub(crate) fn key_leaf(&self) -> usize {
+        self.layout.key_leaf
+    }
+
+    /// The value column's leaf in the footer's schema.
+    pub(crate) fn value_leaf(&self) -> usize {
+        self.layout.value_leaf
+    }
+
     /// Every tier's resident bytes for the file, from its footer alone.
     pub(crate) fn predicted(&self) -> &ResidentBytes {
         &self.predicted

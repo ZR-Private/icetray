@@ -18,7 +18,9 @@ use crate::config::Residency;
 use crate::contract;
 use crate::error::{Error, RefusalReason, Result};
 use crate::generation::{Generation, LoadedFile};
-use crate::index::{FileIndex, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all};
+use crate::index::{
+    FileIndex, Inspected, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all,
+};
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::manifest::{DataFileEntry, TableLayout};
@@ -528,9 +530,11 @@ pub struct TableSummary {
     /// Every tier's resident bytes, from the footers alone (RFD 017), so an
     /// owner chooses a tier from one run.
     pub predicted: ResidentBytes,
-    /// The level the layout achieves in every tier: its findings' dearest
-    /// cap and the tier's best level together, so an owner sees which tiers
-    /// reach a level beside what each costs in `predicted`.
+    /// The level the layout achieves in every tier that can load the
+    /// table: its findings' dearest cap and the tier's best level together,
+    /// so an owner sees which tiers reach a level beside what each costs in
+    /// `predicted`. A tier that cannot load it is left out, as Bloom is
+    /// when `predicted.bloom` is `None`.
     pub level_by_residency: BTreeMap<Residency, Level>,
     /// Capping findings, the count of those whose `caps` is set.
     pub capping: usize,
@@ -681,10 +685,33 @@ pub(crate) struct LayoutView<'a> {
 /// One file as a level is judged from it: its manifest entry and footer,
 /// with the key and value columns' leaf positions in the footer's schema.
 pub(crate) struct FileView<'a> {
-    pub(crate) entry: &'a DataFileEntry,
-    pub(crate) metadata: &'a ParquetMetaData,
-    pub(crate) key_leaf: usize,
-    pub(crate) value_leaf: usize,
+    entry: &'a DataFileEntry,
+    metadata: &'a ParquetMetaData,
+    key_leaf: usize,
+    value_leaf: usize,
+}
+
+impl<'a> FileView<'a> {
+    /// The view of an indexed file.
+    pub(crate) fn loaded(file: &'a LoadedFile) -> Self {
+        Self {
+            entry: &file.entry,
+            metadata: file.index.metadata(),
+            key_leaf: file.index.key_leaf(),
+            value_leaf: file.index.value_leaf(),
+        }
+    }
+
+    /// The view of a file past its footer stage, whose manifest entry is
+    /// `entry`.
+    pub(crate) fn inspected(entry: &'a DataFileEntry, inspected: &'a Inspected) -> Self {
+        Self {
+            entry,
+            metadata: inspected.metadata(),
+            key_leaf: inspected.key_leaf(),
+            value_leaf: inspected.value_leaf(),
+        }
+    }
 }
 
 impl<'a> LayoutView<'a> {
@@ -693,16 +720,7 @@ impl<'a> LayoutView<'a> {
         Self {
             layout: &g.layout,
             residency: g.residency,
-            files: g
-                .files
-                .iter()
-                .map(|file| FileView {
-                    entry: &file.entry,
-                    metadata: file.index.metadata(),
-                    key_leaf: file.index.key_leaf(),
-                    value_leaf: file.index.value_leaf(),
-                })
-                .collect(),
+            files: g.files.iter().map(|file| FileView::loaded(file)).collect(),
             overlapping: g.overlapping_buckets(),
         }
     }
@@ -717,8 +735,17 @@ pub(crate) struct Caps {
     /// The dearest cap the findings set, whatever the residency; `optimal`
     /// for none.
     pub(crate) layout: Level,
-    /// The capping findings, files in view order then the table's.
+    /// The capping findings in the finding table's order, then by file in
+    /// view order.
     pub(crate) findings: Vec<Finding>,
+}
+
+impl Caps {
+    /// The distinct codes of the capping findings, in the finding table's
+    /// order: what `judge` chooses a `below_level` refusal's codes from.
+    pub(crate) fn codes(&self) -> Vec<FindingCode> {
+        capping_codes(&self.findings)
+    }
 }
 
 /// The capping findings `view` raises and the level they and its residency
@@ -733,6 +760,7 @@ pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
         file_capping_findings(file, view.layout, &mut findings);
     }
     table_capping_findings(view, &mut findings);
+    sort_findings(&mut findings);
     let layout = findings
         .iter()
         .filter_map(Finding::caps)

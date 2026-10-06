@@ -20,7 +20,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
 
 use super::inspect::{bloom_ranges, key_chunk_ranges};
-use super::page_header::check_page_headers;
+use super::page_header::{check_key_page_headers, check_page_headers};
 use super::pages::{ChunkPages, PageTally};
 use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
@@ -58,6 +58,7 @@ impl Inspected {
             handle,
             metadata,
             layout,
+            reuse,
             ..
         } = self;
         let ranges = key_chunk_ranges(&metadata, layout.key_leaf, handle.size());
@@ -75,7 +76,8 @@ impl Inspected {
                         },
                     ))
                 })?;
-                let (disk, verified) = disk_chunks(&to_verify, local, reservation, &ranges).await?;
+                let (disk, verified) =
+                    disk_chunks(&to_verify, local, reservation, &ranges, reuse).await?;
                 (KeyResidency::Disk(disk), verified)
             }
             Residency::Bloom => {
@@ -103,6 +105,108 @@ impl Inspected {
             rows,
         })
     }
+}
+
+impl Inspected {
+    /// The file's first and last key read from its edge pages alone (RFD
+    /// 020): the first key page of the first row group that has rows and
+    /// the last key page of the last, with the key column chunk's
+    /// dictionary page of each when it has one, in one `read_ranges` call,
+    /// one load GET per range. Of a sorted file these are its exact first
+    /// and last key, and `build` verifies afterwards that the file is
+    /// sorted, so overlap may be judged from them before any key chunk is
+    /// fetched. The pages are decoded on the blocking pool, as `verify`
+    /// is; a canceled task is `Error::VerifyCanceled` for the file. `None`
+    /// when an edge page does not decode to a key: its header is over its
+    /// bounds, it decodes to a fault, or it holds no key, all of which
+    /// `build`'s verification refuses with its own reason.
+    pub(crate) async fn edge_keys(&self) -> Result<Option<(Key, Key)>> {
+        let with_rows = "inspect checked that the row groups sum to the file's rows, which are above zero, so a row group holds rows";
+        let groups = self.metadata.row_groups();
+        let head = groups
+            .iter()
+            .position(|group| group.num_rows() > 0)
+            .expect(with_rows);
+        let tail = groups
+            .iter()
+            .rposition(|group| group.num_rows() > 0)
+            .expect(with_rows);
+        let column = Column {
+            metadata: &self.metadata,
+            leaf: self.layout.key_leaf,
+            path: &self.handle.location,
+        };
+        let (head_chunk, tail_chunk) = (column.group(head), column.group(tail));
+        let last_page = tail_chunk.page_locations().len() - 1;
+        let mut ranges = vec![head_chunk.page_range(0)];
+        if (tail, last_page) != (head, 0) {
+            ranges.push(tail_chunk.page_range(last_page));
+        }
+        ranges.extend(head_chunk.dictionary_range());
+        if tail != head {
+            ranges.extend(tail_chunk.dictionary_range());
+        }
+        let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
+        let segments = Arc::new(Segments::new(parts, self.handle.size()));
+        let handle = Arc::clone(&self.handle);
+        let metadata = Arc::clone(&self.metadata);
+        let (leaf, shape) = (self.layout.key_leaf, self.layout.key_shape);
+        let edges = on_blocking_pool(move || {
+            let column = Column {
+                metadata: &metadata,
+                leaf,
+                path: &handle.location,
+            };
+            let first = edge_key(column.group(head), shape, 0, &segments, Keys::first)?;
+            let last = edge_key(column.group(tail), shape, last_page, &segments, Keys::last)?;
+            Ok(first.zip(last))
+        })
+        .await
+        .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?;
+        Ok(edges.unwrap_or_else(|fault: Error| {
+            // intentional: verification decodes these pages again at build
+            // and refuses the file with the reason it finds there.
+            tracing::debug!(path = %self.handle.location, %fault, "edge key pages do not decode");
+            None
+        }))
+    }
+
+    /// The file's exact first and last key from the Disk-tier chunk file in
+    /// `local` that `build` would trust for it (`reused`), with no GET:
+    /// the header and the payload checksum are local reads. What was found
+    /// is kept for `build`, which uses a trusted chunk file as it is and
+    /// rewrites a stale one without checking it a second time. `None` when
+    /// no chunk file there is trusted.
+    pub(crate) async fn trusted_key_range(
+        &mut self,
+        local: &LocalDir,
+    ) -> Result<Option<(Key, Key)>> {
+        let to_verify = KeysToVerify::of(self);
+        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
+        let found = reused(&to_verify, local, &ranges).await?;
+        let range = found
+            .as_ref()
+            .ok()
+            .map(|(_, verified)| verified.key_range.clone());
+        self.reuse = Some(found);
+        Ok(range)
+    }
+}
+
+/// The key `pick` takes from key page `page` of `chunk`, decoded from
+/// `segments` after its header and the chunk's dictionary page header are
+/// checked as `verify` checks them; `None` for a page that holds no key.
+fn edge_key(
+    chunk: ColumnChunk<'_>,
+    shape: KeyShape,
+    page: usize,
+    segments: &Arc<Segments>,
+    pick: fn(&Keys) -> Option<Key>,
+) -> Result<Option<Key>> {
+    check_key_page_headers(chunk, shape, page, segments)?;
+    let keys = decode_run(chunk, shape, chunk.page_rows(page), Arc::clone(segments))?;
+    check_utf8(chunk, &keys)?;
+    Ok(pick(&keys))
 }
 
 /// The key column of one file being built, owned, so that its
@@ -207,21 +311,28 @@ pub(super) async fn chunks_from_disk(
 /// key decoded (`trusted`). Any other file, or none, is fetched, verified,
 /// and written, replacing whatever is at that name; a file that was there
 /// is logged at info with why it was not reused. Nothing about a stale file
-/// fails the load. The write runs on the blocking pool (`on_blocking_pool`)
-/// and holds `reservation` until it ends, so bytes it lands after its
-/// caller stopped waiting stay reserved until they are on disk. A canceled
-/// write or checksum pass is `Error::Local` on the chunk file's path with
-/// `LocalFault::Join`.
+/// fails the load. `found` is what `reused` already found for the file, at
+/// the level gate's edge stage, so neither a trusted nor a rejected chunk
+/// file is checked twice; `None` looks now. The write runs on the blocking
+/// pool (`on_blocking_pool`) and holds `reservation` until it ends, so
+/// bytes it lands after its caller stopped waiting stay reserved until
+/// they are on disk. A canceled write or checksum pass is `Error::Local` on
+/// the chunk file's path with `LocalFault::Join`.
 async fn disk_chunks(
     to_verify: &KeysToVerify,
     local: &Arc<LocalDir>,
     reservation: Option<&Arc<Reservation>>,
     ranges: &[Range<u64>],
+    found: Option<Reuse>,
 ) -> Result<(DiskChunks, Verified)> {
     let handle = &to_verify.handle;
     let identity = identity_of(handle);
     let path = local.chunk_path(&identity);
-    match reused(to_verify, local, ranges).await? {
+    let found = match found {
+        Some(found) => found,
+        None => reused(to_verify, local, ranges).await?,
+    };
+    match found {
         Ok(reused) => return Ok(reused),
         Err(None) => {}
         Err(Some(stale)) => tracing::info!(
@@ -255,6 +366,11 @@ async fn disk_chunks(
     Ok((disk, verified))
 }
 
+/// What `reused` finds in `local` for a data file: the chunk file and the
+/// verification record it stores when a build may trust them, otherwise
+/// why not, `None` for no file.
+pub(super) type Reuse = std::result::Result<(DiskChunks, Verified), Option<Stale>>;
+
 /// The chunk file in `local` for `to_verify`'s data file, whose key chunks
 /// are `ranges`, with what it stores of their verification, when a build
 /// may trust it: it is reusable by its header (`reusable_disk_chunks`) and
@@ -263,7 +379,7 @@ async fn reused(
     to_verify: &KeysToVerify,
     local: &LocalDir,
     ranges: &[Range<u64>],
-) -> Result<std::result::Result<(DiskChunks, Verified), Option<Stale>>> {
+) -> Result<Reuse> {
     let handle = &to_verify.handle;
     let under = verified_under(to_verify.shape.key_type());
     Ok(match reusable_disk_chunks(handle, local, ranges, under)? {

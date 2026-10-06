@@ -13,20 +13,22 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
 use iceberg::spec::{PrimitiveType, Struct};
 use icetray_core::approx::count;
-use icetray_core::config::{ConfigError, ConfigViolation, Residency, TableConfig};
+use icetray_core::config::{ConfigError, ConfigViolation, LocalConfig, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
-    Budget, Error, ErrorKind, Key, KeyType, RefusalReason, Storage, TableSource, TableState, bucket,
+    Budget, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason, Storage,
+    TableSource, TableState, bucket,
 };
 use icetray_testkit::fixture::{
-    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, STRAY_IDS, TINY_BUDGET,
-    TWO_BUCKETS, local_catalog, position_delete_file, write_table_of_types,
+    DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SECOND_CLASS, STRAY_IDS,
+    TINY_BUDGET, TWO_BUCKETS, local_catalog, position_delete_file, residue_class,
+    write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
 use icetray_testkit::{
-    Bloom, Fixture, FixtureSpec, HandSnapshot, Layout, Order, RawFile, Result, value_for,
-    write_fixture,
+    Bloom, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, Order, RawFile, Result,
+    TestkitError, value_for, write_fixture,
 };
 
 /// The long keys of a raw file, ascending, and the same values as their
@@ -487,6 +489,150 @@ async fn test_disk_tier_without_a_local_directory_is_a_config_violation() -> Res
             ))
         ),
         "{error:?}"
+    );
+    assert!(served.table.current().is_none());
+    assert!(
+        matches!(
+            served.table.state(),
+            TableState::Degraded {
+                serving: None,
+                reason: ErrorKind::Config,
+                ..
+            }
+        ),
+        "{:?}",
+        served.table.state()
+    );
+    Ok(())
+}
+
+/// A strict table whose snapshot's layout is below its level is refused at
+/// the footer stage (RFD 020): a dictionary-encoded value column caps the
+/// level at balanced, the Full tier's default declares optimal, and the
+/// load reads every footer and no key chunk.
+#[tokio::test]
+async fn test_strict_table_below_its_level_is_refused_before_any_chunk() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        layout: Layout {
+            dictionary: Dictionary::Value,
+            ..Layout::contract()
+        },
+        ..FixtureSpec::small("kv_below_level", KeyType::Long)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let refused =
+        refused_through_catalog(&fixture, &catalog, fixture.config(Residency::Full, true)).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::BelowLevel {
+            declared: Level::Optimal,
+            achieved: Level::Balanced,
+            findings: vec![FindingCode::DictionaryEncodedValue],
+        }
+    );
+    assert_eq!(
+        refused.storage.stats().gets(),
+        LOAD_METADATA_GETS + count(fixture.file_count()),
+        "every footer and no chunk"
+    );
+    Ok(())
+}
+
+/// A strict Disk table whose files overlap is refused from the files' edge
+/// keys before any chunk file is written: `index/` stays empty, so the
+/// refusal evicts nothing from the page cache.
+#[tokio::test]
+async fn test_strict_disk_table_with_overlapping_files_writes_no_chunk_file() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let mut fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::interleaved("kv_overlap_disk"),
+    )
+    .await?;
+    fixture
+        .append(catalog.as_ref(), residue_class(SECOND_CLASS), "half")
+        .await?;
+    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+    let local = Arc::new(LocalDir::open(
+        &LocalConfig {
+            dir: scratch.path().to_path_buf(),
+            index_budget_bytes: None,
+            page_cache_disk_bytes: 0,
+        },
+        storage.stats(),
+    )?);
+    let served = verify::serve_over(
+        storage,
+        fixture.config(Residency::Disk, true),
+        fixture.catalog_source(Arc::clone(&catalog)),
+        Some(Arc::clone(&local)),
+    )
+    .await;
+    let Err(TestkitError::Core(Error::Refused {
+        reason:
+            RefusalReason::BelowLevel {
+                declared,
+                achieved,
+                findings,
+            },
+        ..
+    })) = served
+    else {
+        panic!("expected a below_level refusal");
+    };
+    assert_eq!((declared, achieved), (Level::Optimal, Level::Permissive));
+    assert_eq!(findings, [FindingCode::OverlappingFiles]);
+    assert_eq!(local.index_bytes_in_use()?, 0, "no chunk file was written");
+    Ok(())
+}
+
+/// A `lookups` level the residency cannot reach is the configuration
+/// violation `Config::parse` refuses; a configuration built by hand meets
+/// it at the loader, before the snapshot's manifests are read.
+#[tokio::test]
+async fn test_lookups_its_residency_cannot_reach_is_a_config_violation() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_unreachable", KeyType::Long),
+    )
+    .await?;
+    let served = verify::build(
+        Arc::new(Storage::new(verify::storage_config_for_tests())),
+        TableConfig {
+            lookups: Some(Level::Optimal),
+            ..fixture.config(Residency::Bloom, false)
+        },
+        fixture.catalog_source(Arc::clone(&catalog)),
+        None,
+        verify::TEST_PAGE_CACHE_BYTES,
+    )
+    .await?;
+    let error = served
+        .table
+        .load()
+        .await
+        .expect_err("the configuration is designed to be refused");
+    assert!(
+        matches!(
+            error,
+            Error::Config(ConfigError::Invalid(ConfigViolation::LookupsUnreachable {
+                index: None,
+                lookups: Level::Optimal,
+                residency: Residency::Bloom,
+                ..
+            }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        served.storage.stats().gets(),
+        0,
+        "no manifest and no footer"
     );
     assert!(served.table.current().is_none());
     assert!(

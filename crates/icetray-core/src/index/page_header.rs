@@ -959,12 +959,7 @@ pub(super) fn check_page_headers(
     shape: KeyShape,
     segments: &Segments,
 ) -> Result<()> {
-    let entry = Entry::of_key(shape, chunk.column.descriptor().type_length());
-    let bounds = Bounds {
-        page_bytes: MOST_KEY_PAGE_BYTES,
-        value_bytes: Some(MOST_BYTES_PER_VALUE),
-        entries: entry.most_in(MOST_KEY_PAGE_BYTES),
-    };
+    let bounds = key_bounds(chunk, shape);
     if let Some(range) = chunk.dictionary_range() {
         check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
     }
@@ -978,6 +973,40 @@ pub(super) fn check_page_headers(
         )?;
     }
     Ok(())
+}
+
+/// `check_page_headers` for key page `page` of `chunk` alone and the
+/// chunk's dictionary page when it has one, both in `segments`: the pages
+/// a reader of the file's edge keys decodes before the chunk is verified.
+pub(super) fn check_key_page_headers(
+    chunk: ColumnChunk<'_>,
+    shape: KeyShape,
+    page: usize,
+    segments: &Segments,
+) -> Result<()> {
+    let bounds = key_bounds(chunk, shape);
+    if let Some(range) = chunk.dictionary_range() {
+        check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
+    }
+    check_page(
+        chunk,
+        ChunkPage::Data(page),
+        chunk.page_range(page),
+        bounds,
+        segments,
+    )
+}
+
+/// What a key page of `chunk` may declare: `MOST_KEY_PAGE_BYTES` as the
+/// ceiling, `MOST_BYTES_PER_VALUE` per value, and the dictionary entries
+/// the ceiling holds.
+fn key_bounds(chunk: ColumnChunk<'_>, shape: KeyShape) -> Bounds {
+    let entry = Entry::of_key(shape, chunk.column.descriptor().type_length());
+    Bounds {
+        page_bytes: MOST_KEY_PAGE_BYTES,
+        value_bytes: Some(MOST_BYTES_PER_VALUE),
+        entries: entry.most_in(MOST_KEY_PAGE_BYTES),
+    }
 }
 
 /// Refuses, before parquet's page reader sees them, the headers of data
