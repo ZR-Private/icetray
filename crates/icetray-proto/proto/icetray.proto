@@ -5,7 +5,8 @@
 // never a transport.
 //
 // Every comment states what a caller may rely on, never how the server
-// produces it. Field numbers are never reused.
+// produces it. From 1.0.0, field numbers are never reused (Stability in
+// CONTRIBUTING.md).
 syntax = "proto3";
 
 package icetray.v1;

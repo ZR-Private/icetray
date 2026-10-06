@@ -95,6 +95,24 @@ instead of falling into a `_` arm nobody reads. The test is always the same:
 if something can or cannot happen, the compiler says so, not the presence or
 absence of a substring.
 
+## Stability
+
+icetray follows semantic versioning and has not reached 1.0.0. Until it
+does, any release may change what icetray itself defines: configuration
+keys, metric and log field names, the doctor's output contract, protobuf
+fields and their numbers, and the formats it writes to disk. Such a
+change is made in place, with no alias for an old name, no reader for an
+older layout, and no field number held open, since no deployment depends
+on the old shape yet. Releases before 1.0.0 are cut to publish binaries
+and images, and they promise nothing to one another.
+
+From 1.0.0 these are contracts, and the rules here and in the RFDs that
+protect them hold within a major version: a renamed key or metric, a
+reused field number, or a changed output line waits for the next major
+release. Formats icetray reads but does not define, such as Iceberg's
+table metadata, manifests, and delete files, are outside this section:
+icetray reads what writers produce, in every format version it supports.
+
 ## Protobuf
 
 The `.proto` files are the client contract and follow the same rule. Every
@@ -103,7 +121,8 @@ closed set is an `enum` with a zero `_UNSPECIFIED` value; alternatives are a
 integer type that fits. No `map<string, string>`, no JSON or other
 serialized text inside a string field, no `google.protobuf.Struct`, `Value`,
 or `Any`. A field comment states what a caller may rely on, never how the
-server produces it. Field numbers are never reused.
+server produces it. From 1.0.0, field numbers are never reused
+([Stability](#stability)).
 
 ## Constants
 

@@ -553,9 +553,11 @@ exits 0.
 
 The line kinds and keys below are version 1 of the output contract.
 Within a version, new keys and new line kinds may be added, so a reader
-should ignore what it does not recognize. Removing or renaming a key,
-changing a value's type or meaning, or removing a line kind makes a new
-version, which this page will name.
+should ignore what it does not recognize. From icetray 1.0.0, removing or
+renaming a key, changing a value's type or meaning, or removing a line
+kind makes a new version, which this page will name. Before 1.0.0,
+version 1 changes in place with any release
+([Stability](../CONTRIBUTING.md#stability)).
 
 Two conventions hold for every line:
 

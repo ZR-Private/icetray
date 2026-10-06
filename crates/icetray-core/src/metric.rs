@@ -1,9 +1,9 @@
 //! The metric and label names of the deployment contract (RFD 012). They
-//! are a public surface: a deployer's dashboards and alerts
-//! name them, so a rename here is a breaking change. A metric name at a call
-//! site is one of these constants and a label value is an enum's `Display`,
-//! never a literal, so the set of series a process can emit is closed and
-//! readable in one place.
+//! are a public surface: a deployer's dashboards and alerts name them, so
+//! from 1.0.0 a rename here is a breaking change (Stability in
+//! CONTRIBUTING.md). A metric name at a call site is one of these constants
+//! and a label value is an enum's `Display`, never a literal, so the set of
+//! series a process can emit is closed and readable in one place.
 
 use std::fmt;
 
