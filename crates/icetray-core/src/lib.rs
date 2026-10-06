@@ -51,7 +51,7 @@ pub use index::{
     ResidentBytes, WireType,
 };
 pub use key::{Key, KeyBytes, KeyType};
-pub use level::Level;
+pub use level::{FALL_PER_MILLE, Level, PER_MILLE, RECOVER_PER_MILLE};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{Bucketing, DataFileEntry, TableLayout};
 pub use open::{Applied, Opened, Refused, Tables, open};

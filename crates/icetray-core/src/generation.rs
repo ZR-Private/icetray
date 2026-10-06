@@ -11,6 +11,7 @@
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -600,11 +601,26 @@ impl Generation {
     /// page. One transient mapping and one `mincore` call per file, no byte
     /// read: synchronous, for the blocking pool.
     pub fn chunk_residency(&self) -> std::result::Result<ResidentPages, Unobserved> {
+        self.chunk_residency_in(&mut HashMap::new())
+    }
+
+    /// `chunk_residency`, taking each chunk file's sample from `sampled`
+    /// when a generation sampled before it read the same file, and adding
+    /// to it the files it samples itself, so a sweep over several tables
+    /// samples each file once.
+    pub(crate) fn chunk_residency_in(
+        &self,
+        sampled: &mut HashMap<PathBuf, std::result::Result<ResidentPages, Unobserved>>,
+    ) -> std::result::Result<ResidentPages, Unobserved> {
         self.files
             .iter()
             .filter_map(|file| file.index.disk_chunks())
             .try_fold(ResidentPages::default(), |sum, disk| {
-                Ok(sum.plus(disk.resident()?))
+                let sample = sampled
+                    .entry(disk.path().to_path_buf())
+                    .or_insert_with(|| disk.resident())
+                    .clone()?;
+                Ok(sum.plus(sample))
             })
     }
 }
@@ -5002,6 +5018,38 @@ mod tests {
                 resident: pages
             }
         );
+    }
+
+    /// Two generations over the same chunk files, as two entries over one
+    /// table hold, sample each file once: the second takes the first's
+    /// samples, which here are made up, so a fresh sample would differ.
+    #[tokio::test]
+    async fn test_chunk_residency_in_takes_a_file_sampled_before_from_the_sweep() {
+        let (table, _) = two_bucket_table().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        let config = table.config(Residency::Disk, None);
+        let first = table.load(&config, Some(&local), None).await.unwrap();
+        let second = table.load(&config, Some(&local), None).await.unwrap();
+        let mut sampled = HashMap::new();
+        first.chunk_residency_in(&mut sampled).unwrap();
+        assert_eq!(sampled.len(), first.files.len());
+        let made_up = ResidentPages {
+            pages: 1,
+            resident: 0,
+        };
+        for sample in sampled.values_mut() {
+            *sample = Ok(made_up);
+        }
+        let files = approx::count(second.files.len());
+        assert_eq!(
+            second.chunk_residency_in(&mut sampled).unwrap(),
+            ResidentPages {
+                pages: files,
+                resident: 0
+            }
+        );
+        assert_eq!(sampled.len(), first.files.len());
     }
 
     /// A Full generation has no chunk file and counts no page.

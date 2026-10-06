@@ -5,9 +5,12 @@
 //! refreshes of one table are serialized; a failed one leaves the last
 //! generation serving and the table `Degraded`, or `Held` when the snapshot
 //! was refused for its level. A lookup takes one generation and answers
-//! from it alone, so a swap during a batch cannot mix snapshots.
+//! from it alone, so a swap during a batch cannot mix snapshots. A `disk`
+//! table's level also follows how much of its chunk files the kernel's
+//! page cache holds, a condition of the server that `strict` never acts
+//! on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,16 +25,17 @@ use tokio::sync::{MutexGuard, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::approx;
+use crate::blocking::on_blocking_pool;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode, LookupCost};
-use crate::config::TableConfig;
+use crate::config::{Residency, TableConfig};
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
-use crate::level::Level;
-use crate::local::LocalDir;
+use crate::level::{Level, PageCacheCondition};
+use crate::local::{LocalDir, ResidentPages, Unobserved};
 use crate::manifest::TableLayout;
 use crate::metric::{self, LookupResult};
 use crate::shard::{self, Sharded};
@@ -355,25 +359,39 @@ struct Gauges {
     shown: bool,
     generation: Option<GenerationGauges>,
     level: Option<LevelGauges>,
+    /// Whether the last page-cache sample failed to observe a chunk file,
+    /// so the failure, and the recovery from it, are each logged once.
+    page_cache_unobserved: bool,
 }
 
 /// What the level gauges show (RFD 020): the level the newest snapshot the
-/// table measured achieves, the one serving or the one held, against the
-/// level the table declares. Set at a swap and at a `below_level` refusal;
-/// a refusal for any other reason measured nothing new and leaves them.
+/// table measured achieves, the one serving or the one held, with the
+/// page cache's condition of the serving generation, against the level the
+/// table declares. The layout's level is set at a swap and at a
+/// `below_level` refusal; a refusal for any other reason measured nothing
+/// new and leaves it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LevelGauges {
     /// The newest measured snapshot's level for its layout.
     measured: Level,
     /// The table's `lookups`.
     declared: Level,
+    /// The page cache's condition of the serving generation's chunk files,
+    /// `None` until a `disk` table's first sample. A swap carries it to
+    /// the new generation, which keeps most of the old one's chunk files,
+    /// until a sample of the new one replaces it.
+    page_cache: Option<PageCacheCondition>,
 }
 
 impl LevelGauges {
-    /// The level the table achieves: its layout's. The one place a server
-    /// condition, such as the page cache's, joins it.
+    /// The level the table achieves: its layout's, capped by the page
+    /// cache's condition. The one place a server condition joins the
+    /// layout's level; `strict` reads the layout's alone.
     fn achieved(self) -> Level {
-        self.measured
+        self.measured.max(
+            self.page_cache
+                .map_or(Level::Optimal, PageCacheCondition::cap),
+        )
     }
 
     /// Whether the table is below its declared level.
@@ -666,6 +684,7 @@ impl Table {
                 shown: false,
                 generation: None,
                 level: None,
+                page_cache_unobserved: false,
             }),
         }
     }
@@ -692,7 +711,8 @@ impl Table {
 
     /// Writes the table's state gauges, its serving generation's gauges,
     /// and the level gauges (`icetray_table_below_level`,
-    /// `icetray_table_level`, `icetray_table_declared_level`) again as they
+    /// `icetray_table_level`, `icetray_table_declared_level`, and
+    /// `icetray_table_chunk_resident_fraction` while judged) again as they
     /// stand, while the table shows them, as `show` does; a scrape calls
     /// this for every table served, since the binary's recorder drops a
     /// gauge no scrape wrote.
@@ -712,6 +732,60 @@ impl Table {
         }
         if let Some(level) = gauges.level {
             self.write_level(level);
+        }
+    }
+
+    /// Takes `sample` of `sampled`'s chunk files as the page cache's
+    /// condition, unless another generation has been swapped in since the
+    /// sample began: it describes the generation it read, and the next
+    /// sample judges the one serving. A sample that observed nothing
+    /// (`Err`, or no page counted) makes the condition unjudged, which caps
+    /// nothing and withdraws the resident fraction. The level gauges are
+    /// written while the table shows them. A failure to observe a chunk
+    /// file is logged at warn when the sample before observed, and the
+    /// first sample that observes again after one is too; a sample that
+    /// counted no page is unjudged without a log.
+    fn observe_page_cache(
+        &self,
+        sampled: &Arc<Generation>,
+        sample: &std::result::Result<ResidentPages, Unobserved>,
+    ) {
+        let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        let serving = self.current.load();
+        if !serving
+            .as_ref()
+            .is_some_and(|serving| Arc::ptr_eq(serving, sampled))
+        {
+            return;
+        }
+        let Some(level) = gauges.level.as_mut() else {
+            return;
+        };
+        // intentional: an error is logged below when the sample before
+        // observed, and not on every sample after.
+        let now = level
+            .page_cache
+            .unwrap_or(PageCacheCondition::Unjudged)
+            .next(sample.as_ref().ok().copied());
+        level.page_cache = Some(now);
+        let level = *level;
+        if gauges.shown {
+            self.write_level(level);
+        }
+        let was_unobserved = gauges.page_cache_unobserved;
+        gauges.page_cache_unobserved = sample.is_err();
+        drop(gauges);
+        match (was_unobserved, sample) {
+            (false, Err(error)) => tracing::warn!(
+                table = self.name(),
+                %error,
+                "chunk-file residency cannot be observed, so the page cache caps no level"
+            ),
+            (true, Ok(_)) => tracing::warn!(
+                table = self.name(),
+                "chunk-file residency is observed again"
+            ),
+            (false, Ok(_)) | (true, Err(_)) => {}
         }
     }
 
@@ -1240,7 +1314,7 @@ impl Table {
     /// delete gauges from its `delete_summary`, are kept and written while
     /// the table shows them
     /// (`write_generation`), and the level gauges take the generation's
-    /// level against `declared`.
+    /// level against `declared`, keeping the page cache's condition.
     fn swap(
         &self,
         generation: Generation,
@@ -1273,21 +1347,26 @@ impl Table {
             lookup_cost: generation.lookup_cost,
             deletes: generation.delete_summary(),
         };
-        let level = LevelGauges {
-            measured: generation.level,
-            declared,
-        };
-        {
+        let snapshot_id = generation.snapshot_id;
+        let replaced = {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+            let level = LevelGauges {
+                measured: generation.level,
+                declared,
+                page_cache: gauges.level.and_then(|level| level.page_cache),
+            };
             if gauges.shown {
                 self.write_generation(&published);
                 self.write_level(level);
             }
             gauges.generation = Some(published);
             gauges.level = Some(level);
-        }
-        let snapshot_id = generation.snapshot_id;
-        self.current.store(Some(Arc::new(generation)));
+            // Stored under the lock, so a page-cache sample of the
+            // generation this replaces is seen to be stale
+            // (`observe_page_cache`).
+            self.current.swap(Some(Arc::new(generation)))
+        };
+        drop(replaced);
         self.serve_state(snapshot_id);
     }
 
@@ -1529,8 +1608,10 @@ impl Table {
         .set(approx::gauge_len(deletes.state_bytes));
     }
 
-    /// Writes the level gauges from `level`; called with the gauges' lock
-    /// held.
+    /// Writes the level gauges from `level`, and the resident fraction of
+    /// the chunk files while the page cache's condition is judged, which
+    /// the binary's recorder then drops at the next scrape; called with the
+    /// gauges' lock held.
     fn write_level(&self, level: LevelGauges) {
         metrics::gauge!(
             metric::TABLE_BELOW_LEVEL,
@@ -1547,6 +1628,13 @@ impl Table {
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(level.declared.gauge());
+        if let Some(fraction) = level.page_cache.and_then(PageCacheCondition::fraction) {
+            metrics::gauge!(
+                metric::TABLE_CHUNK_RESIDENT_FRACTION,
+                metric::LABEL_TABLE => self.name.clone()
+            )
+            .set(fraction);
+        }
     }
 
     /// `Error::NotReady` for this table.
@@ -1569,6 +1657,51 @@ impl Table {
                 got,
             })
         }
+    }
+}
+
+/// Samples which pages of the serving generation's chunk files the
+/// kernel's page cache holds, for every one of `tables` (RFD 020), on one
+/// blocking task, sampling each chunk file once however many of `tables`
+/// read it, as two entries over one Iceberg table do. Each table takes its
+/// sample as the page cache's condition (`Table::observe_page_cache`):
+/// the table falls below optimal while the resident fraction is short and
+/// recovers once it is not, with hysteresis (`PageCacheCondition::next`).
+/// A table with no generation serving, or not in the Disk tier, samples
+/// nothing. The condition caps the level the gauges show and nothing else:
+/// whether a snapshot is refused or held, and how a retune is judged, read
+/// the layout's level alone, since the page cache depends on the server
+/// and its other tables, not on the snapshot.
+pub(crate) async fn sample_page_cache(tables: &[&Table]) {
+    let serving: Vec<(&Table, Arc<Generation>)> = tables
+        .iter()
+        .filter_map(|table| {
+            let generation = table.current()?;
+            (generation.residency == Residency::Disk).then_some((*table, generation))
+        })
+        .collect();
+    if serving.is_empty() {
+        return;
+    }
+    let generations: Vec<Arc<Generation>> = serving
+        .iter()
+        .map(|(_, generation)| Arc::clone(generation))
+        .collect();
+    let Ok(samples) = on_blocking_pool(move || {
+        let mut sampled = HashMap::new();
+        generations
+            .iter()
+            .map(|generation| generation.chunk_residency_in(&mut sampled))
+            .collect::<Vec<_>>()
+    })
+    .await
+    else {
+        // intentional: the runtime is shutting down, and every condition
+        // stays as the last sample left it.
+        return;
+    };
+    for ((table, generation), sample) in serving.iter().zip(&samples) {
+        table.observe_page_cache(generation, sample);
     }
 }
 
@@ -1636,6 +1769,9 @@ mod tests {
     use crate::index::testing::{with_dictionary_one_entry_short, with_first_page_claiming};
     use crate::index::{DecodedPart, FileFault};
     use crate::key::KeyType;
+    use crate::level::{FALL_PER_MILLE, PER_MILLE};
+    #[cfg(target_os = "linux")]
+    use crate::local::testing::evict;
     use crate::local::testing::{chunks_offset, overwrite};
     use crate::manifest::testing::{self as manifest_testing, Partition};
     use crate::metric::LookupResult;
@@ -3611,6 +3747,269 @@ mod tests {
             generation.oldest_delete_committed,
             Some(fixture.committed(THIRD_SNAPSHOT))
         );
+    }
+
+    /// A sample of `PER_MILLE` pages, `resident` of them in the page
+    /// cache, so a resident count reads as thousandths.
+    fn sample_at(resident: u64) -> ResidentPages {
+        ResidentPages {
+            pages: PER_MILLE,
+            resident,
+        }
+    }
+
+    /// A sample just short of the page cache: one page below the fall.
+    fn short_sample() -> ResidentPages {
+        sample_at(FALL_PER_MILLE - 1)
+    }
+
+    /// `short_sample`'s fraction as the gauge reads it.
+    fn short_fraction() -> u64 {
+        approx::ratio(FALL_PER_MILLE - 1, PER_MILLE).to_bits()
+    }
+
+    /// `config` in the Disk tier over `fixture`, its chunk files in a fresh
+    /// local directory that the returned guard keeps, in `Loading`.
+    async fn disk_table(fixture: &Fixture, config: TableConfig) -> (Table, tempfile::TempDir) {
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), fixture.storage.stats(), None);
+        let handles = TableHandles {
+            local: Some(local),
+            ..handles_over(fixture).await
+        };
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            fixture,
+            TableConfig {
+                residency: Residency::Disk,
+                ..config
+            },
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        (table, scratch)
+    }
+
+    /// Takes `sample` as the page cache's condition of `table`'s serving
+    /// generation.
+    fn observe(table: &Table, sample: &std::result::Result<ResidentPages, Unobserved>) {
+        table.observe_page_cache(&table.current().unwrap(), sample);
+    }
+
+    /// The resident fraction gauge of `TABLE`, as bits.
+    fn fraction_gauge(series: &Series) -> u64 {
+        series
+            .gauge(metric::TABLE_CHUNK_RESIDENT_FRACTION, &[table_label()])
+            .to_bits()
+    }
+
+    /// A disk table whose chunk files fall short of the page cache is below
+    /// optimal for it, its layout's level notwithstanding, and recovers once
+    /// they are back; the resident fraction is the sample's.
+    #[test]
+    fn test_metrics_a_disk_table_short_of_the_page_cache_is_below_optimal() {
+        let (short, recovered) = recorded_with(|snapshotter| async move {
+            let (fixture, _) = two_bucket_table().await;
+            let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            observe(&table, &Ok(short_sample()));
+            let short = Series(snapshotter.snapshot().into_vec());
+            observe(&table, &Ok(sample_at(PER_MILLE)));
+            assert_eq!(table.current().unwrap().level, Level::Optimal);
+            short
+        });
+        assert_eq!(
+            level_gauges(&short),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&short), short_fraction());
+        assert_eq!(
+            level_gauges(&recovered),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&recovered), 1.0_f64.to_bits());
+    }
+
+    /// A table that declares balanced is at its level with its chunk files
+    /// short of the page cache: device reads of key chunks are a balanced
+    /// cost.
+    #[test]
+    fn test_metrics_a_balanced_disk_table_short_of_the_page_cache_stays_at_its_level() {
+        let ((), series) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let config = TableConfig {
+                lookups: Some(Level::Balanced),
+                ..lenient(&fixture)
+            };
+            let (table, _scratch) = disk_table(&fixture, config).await;
+            table.load().await.unwrap();
+            observe(&table, &Ok(short_sample()));
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(0, Level::Balanced, Level::Balanced)
+        );
+    }
+
+    /// `strict` never acts on the page cache: a strict table short of it
+    /// stays serving, a refresh swaps in the next snapshot, and the swap
+    /// and a retune both keep the condition until the next sample.
+    #[test]
+    fn test_refresh_of_a_strict_disk_table_short_of_the_page_cache_swaps_and_keeps_it() {
+        let (swapped, retuned) = recorded_with(|snapshotter| async move {
+            let (mut fixture, all) = two_bucket_table().await;
+            let strict = fixture.config(Residency::Disk, None);
+            assert!(strict.strict);
+            let (table, _scratch) = disk_table(&fixture, strict.clone()).await;
+            table.load().await.unwrap();
+            observe(&table, &Ok(short_sample()));
+            assert_eq!(serving_id(&table), SnapshotId(FIRST_SNAPSHOT));
+            append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
+            assert!(table.refresh().await.unwrap());
+            assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
+            let swapped = Series(snapshotter.snapshot().into_vec());
+            let serialized = table.serialized().await;
+            table.retune(
+                TableConfig {
+                    lookups: Some(Level::Balanced),
+                    ..strict
+                },
+                &serialized,
+            );
+            swapped
+        });
+        assert_eq!(
+            level_gauges(&swapped),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&swapped), short_fraction());
+        assert_eq!(
+            level_gauges(&retuned),
+            level_bits(0, Level::Balanced, Level::Balanced)
+        );
+        assert_eq!(fraction_gauge(&retuned), short_fraction());
+    }
+
+    /// A sample of a generation swapped out since it began describes chunk
+    /// files the table no longer serves from, and is dropped.
+    #[test]
+    fn test_observe_page_cache_drops_a_sample_of_a_generation_swapped_out() {
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            let stale = table.current().unwrap();
+            append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
+            assert!(table.refresh().await.unwrap());
+            table.observe_page_cache(&stale, &Ok(short_sample()));
+            table.publish_gauges();
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(series.named(metric::TABLE_CHUNK_RESIDENT_FRACTION), 0);
+    }
+
+    /// A sample that cannot observe a chunk file makes the condition
+    /// unjudged: the cap is lifted, and the resident fraction is no longer
+    /// written. A debugging snapshot sets every gauge it reads to zero, so
+    /// the fraction reads zero after one only when nothing wrote it since.
+    #[test]
+    fn test_metrics_an_unobserved_sample_lifts_the_cap_and_stops_the_fraction() {
+        let (short, unjudged) = recorded_with(|snapshotter| async move {
+            let (fixture, _) = two_bucket_table().await;
+            let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            observe(&table, &Ok(short_sample()));
+            let short = Series(snapshotter.snapshot().into_vec());
+            let unobserved = Err(Unobserved {
+                path: std::path::PathBuf::from("chunk"),
+                why: std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+            });
+            observe(&table, &unobserved);
+            table.publish_gauges();
+            short
+        });
+        assert_eq!(
+            level_gauges(&short),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(
+            level_gauges(&unjudged),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&unjudged), 0.0_f64.to_bits());
+    }
+
+    /// A disk table just loaded has just written its chunk files, so the
+    /// page cache holds them whole and the table is at its layout's level;
+    /// a full table has no chunk file and is never judged.
+    #[test]
+    fn test_sample_page_cache_reads_a_just_loaded_disk_table_whole_and_skips_a_full_one() {
+        let ((), series) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            sample_page_cache(&[&table]).await;
+            let full = table_over(
+                &fixture,
+                TableConfig {
+                    name: STRICT_TABLE.to_string(),
+                    ..lenient(&fixture)
+                },
+            )
+            .await;
+            full.load().await.unwrap();
+            sample_page_cache(&[&full]).await;
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&series), 1.0_f64.to_bits());
+        assert_eq!(series.named(metric::TABLE_CHUNK_RESIDENT_FRACTION), 1);
+    }
+
+    /// Evicting every chunk file of a disk table puts it below optimal at
+    /// the next sample, and reading them back recovers it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sample_page_cache_follows_chunk_files_evicted_and_read_back() {
+        let (evicted, read_back) = recorded_with(|snapshotter| async move {
+            let (fixture, _) = two_bucket_table().await;
+            let (table, scratch) = disk_table(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            let local = local_dir(scratch.path(), fixture.storage.stats(), None);
+            let paths: Vec<_> = table
+                .current()
+                .unwrap()
+                .identities()
+                .iter()
+                .map(|identity| local.chunk_path(identity))
+                .collect();
+            for path in &paths {
+                evict(path);
+            }
+            sample_page_cache(&[&table]).await;
+            let evicted = Series(snapshotter.snapshot().into_vec());
+            for path in &paths {
+                std::fs::read(path).unwrap();
+            }
+            sample_page_cache(&[&table]).await;
+            evicted
+        });
+        assert_eq!(
+            level_gauges(&evicted),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&evicted), 0.0_f64.to_bits());
+        assert_eq!(
+            level_gauges(&read_back),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(fraction_gauge(&read_back), 1.0_f64.to_bits());
     }
 
     /// A retune of a lenient table's `lookups` declares the new level at

@@ -12,6 +12,7 @@ use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::approx;
 
@@ -41,8 +42,9 @@ impl ResidentPages {
     }
 }
 
-/// Why a file's residency could not be observed; the set is closed.
-#[derive(Debug, thiserror::Error)]
+/// Why a file's residency could not be observed; the set is closed. Clone,
+/// so one sample of a file can stand for every table that reads it.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Unobservable {
     /// The process neither owns the file, nor is root, nor may write it.
     /// Linux's `mincore` then reports every page of the file resident
@@ -58,11 +60,17 @@ pub enum Unobservable {
     /// Checking the file's owner or permissions, reading the page size,
     /// mapping the file, or the `mincore` call failed.
     #[error("{0}")]
-    Io(io::Error),
+    Io(Arc<io::Error>),
+}
+
+impl From<io::Error> for Unobservable {
+    fn from(error: io::Error) -> Self {
+        Self::Io(Arc::new(error))
+    }
 }
 
 /// A chunk file whose residency could not be observed, and why.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("residency of chunk file {} cannot be observed: {why}", path.display())]
 pub struct Unobserved {
     /// The chunk file.
@@ -93,7 +101,7 @@ pub(crate) fn resident(
     // macOS's `mincore` answers for any mapping, so only Linux checks.
     #[cfg(not(target_os = "linux"))]
     let _ = path;
-    let page = page_bytes().map_err(Unobservable::Io)?;
+    let page = page_bytes()?;
     match Span::covering(range, page) {
         Some(span) => sample(file, &span, page),
         None => Ok(ResidentPages::default()),
@@ -106,8 +114,8 @@ pub(crate) fn resident(
 #[cfg(target_os = "linux")]
 fn observable_as(file: &File, path: &Path, euid: u32) -> Result<(), Unobservable> {
     use std::os::unix::fs::MetadataExt as _;
-    let owner = file.metadata().map_err(Unobservable::Io)?.uid();
-    if owner == euid || euid == 0 || writable(path).map_err(Unobservable::Io)? {
+    let owner = file.metadata()?.uid();
+    if owner == euid || euid == 0 || writable(path)? {
         Ok(())
     } else {
         Err(Unobservable::Foreign { owner, euid })
@@ -203,7 +211,7 @@ impl Drop for Mapping {
 /// of `page` bytes the page cache holds.
 fn sample(file: &File, span: &Span, page: u64) -> Result<ResidentPages, Unobservable> {
     let offset = libc::off_t::try_from(span.offset)
-        .map_err(|_| Unobservable::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let len = approx::length(span.len);
     // SAFETY: a fresh mapping at an address the kernel chooses, of a
     // descriptor `file` keeps open for the call; `offset` is a multiple of
@@ -220,7 +228,7 @@ fn sample(file: &File, span: &Span, page: u64) -> Result<ResidentPages, Unobserv
         )
     };
     if addr == libc::MAP_FAILED {
-        return Err(Unobservable::Io(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error().into());
     }
     let mapping = Mapping { addr, len };
     let mut pages = vec![0u8; approx::length(span.len.div_ceil(page))];
@@ -229,7 +237,7 @@ fn sample(file: &File, span: &Span, page: u64) -> Result<ResidentPages, Unobserv
     // `mincore` writes, and nothing else borrows it until the call returns.
     let status = unsafe { libc::mincore(mapping.addr, mapping.len, pages.as_mut_ptr().cast()) };
     if status != 0 {
-        return Err(Unobservable::Io(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error().into());
     }
     drop(mapping);
     let resident = pages

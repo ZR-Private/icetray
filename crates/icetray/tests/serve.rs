@@ -17,7 +17,9 @@ use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
 use icetray::telemetry::{self, Call, CodeLabel};
 use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
-use icetray_core::config::{Config, Residency, ServerConfig, SourceConfig, TableConfig};
+use icetray_core::config::{
+    Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig,
+};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::metric::{self, Kind, LookupResult};
 use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState};
@@ -174,6 +176,9 @@ struct Stack {
     client: IcetrayClient<Channel>,
     health: HealthClient<Channel>,
     stats: Arc<IoStats>,
+    /// The local directory `Setup::with_local_dir` made, kept for as long
+    /// as the daemon serves from it.
+    _local: Option<tempfile::TempDir>,
 }
 
 /// What `Stack::start_with` hands a test before the daemon starts: the
@@ -188,6 +193,27 @@ struct Setup {
     /// Holds the in-process store before the daemon starts, so the first
     /// loads wait on it until it is released.
     hold_store: bool,
+    /// The local directory the configuration names, when a test gave it
+    /// one.
+    local: Option<tempfile::TempDir>,
+}
+
+impl Setup {
+    /// Gives the configuration a fresh local directory with no page cache
+    /// disk level and serves every table from it in the Disk tier.
+    fn with_local_dir(&mut self) -> Result<(), BoxError> {
+        let dir = tempfile::tempdir()?;
+        self.config.storage.local = Some(LocalConfig {
+            dir: dir.path().to_path_buf(),
+            index_budget_bytes: None,
+            page_cache_disk_bytes: 0,
+        });
+        for table in &mut self.config.tables {
+            table.residency = Residency::Disk;
+        }
+        self.local = Some(dir);
+        Ok(())
+    }
 }
 
 /// A configuration over `s3` serving `tables` with both listeners on
@@ -234,6 +260,7 @@ impl Stack {
             config: config_over(&s3, tables),
             options: ServeOptions::default(),
             hold_store: false,
+            local: None,
         };
         configure(&mut setup).await?;
         let Setup {
@@ -241,6 +268,7 @@ impl Stack {
             config,
             options,
             hold_store,
+            local,
         } = setup;
         if hold_store {
             s3.hold();
@@ -260,6 +288,7 @@ impl Stack {
             client: IcetrayClient::new(channel.clone()),
             health: HealthClient::new(channel),
             stats,
+            _local: local,
         })
     }
 
@@ -1010,20 +1039,23 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
 /// series of a described gauge the first exposed, the second exposes too.
 /// The recorder drops a gauge no scrape wrote since the scrape before, so a
 /// gauge set once on an event instead of on the scrape path fails here. The
-/// server serves a table and follows its configuration, so the first
-/// scrape holds every described gauge, and the test checks that it does: a
-/// gauge this server does not expose would pass the comparison unheld.
+/// server serves a disk table whose page cache it has sampled and follows
+/// its configuration, so the first scrape holds every described gauge, and
+/// the test checks that it does: a gauge this server does not expose would
+/// pass the comparison unheld.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult {
     let mut stack = Stack::start_with(
         vec![FixtureSpec::small(SCRAPED_TABLE, KeyType::Long)],
         async |setup| {
+            setup.with_local_dir()?;
             setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
             Ok(())
         },
     )
     .await?;
     stack.serving.ready().await;
+    stack.serving.opened().sample_page_cache().await;
     let first = stack.scrape().await?;
     let second = stack.scrape().await?;
 

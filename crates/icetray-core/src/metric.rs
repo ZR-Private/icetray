@@ -78,14 +78,21 @@ pub const GENERATION_SEQUENCE_NUMBER: &str = "icetray_generation_sequence_number
 pub const GENERATION_SWAPPED_AT_SECONDS: &str = "icetray_generation_swapped_at_seconds";
 /// 1 for the table's current state and 0 for the others, by `table` and `state`.
 pub const TABLE_STATE: &str = "icetray_table_state";
-/// 1 while the newest snapshot the table measured, served or held, is
-/// below the table's declared level, else 0, by `table` (RFD 020).
+/// 1 while the table is below its declared level, else 0, by `table` (RFD
+/// 020): for its layout, the newest snapshot it measured, served or held;
+/// for the page cache, the serving generation's chunk files.
 pub const TABLE_BELOW_LEVEL: &str = "icetray_table_below_level";
-/// The level the newest measured snapshot achieves, by `table`: 0 for
-/// optimal, 1 for balanced, 2 for permissive (`Level::ordinal`).
+/// The level the table achieves, by `table`: the newest measured
+/// snapshot's for its layout, capped at balanced while the serving
+/// generation's chunk files are short of the page cache; 0 for optimal, 1
+/// for balanced, 2 for permissive (`Level::ordinal`).
 pub const TABLE_LEVEL: &str = "icetray_table_level";
 /// The level the table declares, by `table`, in `TABLE_LEVEL`'s numbers.
 pub const TABLE_DECLARED_LEVEL: &str = "icetray_table_declared_level";
+/// The fraction of the serving generation's chunk-file pages the kernel's
+/// page cache held at the last sample, by `table`, present only while that
+/// residency is observed (RFD 020, `Generation::chunk_residency`).
+pub const TABLE_CHUNK_RESIDENT_FRACTION: &str = "icetray_table_chunk_resident_fraction";
 /// GETs one cold hit makes at worst on the serving generation's layout and
 /// residency, by `table` (RFD 020, `LookupCost::gets_per_hit`).
 pub const TABLE_GETS_PER_HIT: &str = "icetray_table_gets_per_hit";
@@ -134,7 +141,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 41] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -273,17 +280,22 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 41] = [
     (
         TABLE_BELOW_LEVEL,
         Kind::Gauge,
-        "1 while the newest measured snapshot is below the table's declared level, else 0, by table.",
+        "1 while the table is below its declared level for its newest measured snapshot's layout or for the page cache, else 0, by table.",
     ),
     (
         TABLE_LEVEL,
         Kind::Gauge,
-        "The lookup level the newest measured snapshot achieves, 0 optimal, 1 balanced, 2 permissive, by table.",
+        "The lookup level the table achieves, 0 optimal, 1 balanced, 2 permissive, by table.",
     ),
     (
         TABLE_DECLARED_LEVEL,
         Kind::Gauge,
         "The lookup level the table declares, 0 optimal, 1 balanced, 2 permissive, by table.",
+    ),
+    (
+        TABLE_CHUNK_RESIDENT_FRACTION,
+        Kind::Gauge,
+        "The fraction of the serving generation's chunk-file pages in the page cache at the last sample, by table.",
     ),
     (
         TABLE_GETS_PER_HIT,

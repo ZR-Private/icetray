@@ -122,6 +122,11 @@ impl DiskChunks {
         })
     }
 
+    /// The chunk file's path under `index/`.
+    pub(crate) fn path(&self) -> &Path {
+        &self.shared.path
+    }
+
     /// What the file's verification record was computed under, as its
     /// header says.
     pub(crate) fn verified_under(&self) -> VerifiedUnder {

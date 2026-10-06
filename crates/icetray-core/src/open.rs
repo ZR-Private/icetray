@@ -19,7 +19,7 @@ use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{DataFileIdentity, LocalDir};
 use crate::storage::Storage;
-use crate::table::{CallsInFlight, FindingLog, Table, TableHandles};
+use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
 
 /// Everything a process opened: the storage every read goes through, the
 /// one page cache every table shares, the local directory when configured,
@@ -159,6 +159,16 @@ impl Opened {
     /// back to a counted reference when its thread's slots are all held.
     pub fn serving_tables(&self) -> Guard<Arc<Tables>> {
         self.tables.load()
+    }
+
+    /// Samples the page cache's condition of every table served
+    /// (`table::sample_page_cache`) on one blocking task, each chunk file
+    /// once however many tables read it. The daemon runs it on a fixed
+    /// interval.
+    pub async fn sample_page_cache(&self) {
+        let tables = self.tables();
+        let tables: Vec<&Table> = tables.iter().map(Arc::as_ref).collect();
+        table::sample_page_cache(&tables).await;
     }
 
     /// Replaces the tables served with `configs`, all or nothing (RFD
