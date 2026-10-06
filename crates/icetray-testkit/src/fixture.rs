@@ -778,6 +778,21 @@ impl Fixture {
         self.write_hint().await
     }
 
+    /// Rewrites every id written so far into new data files, ascending,
+    /// grouped by bucket as a first build writes them, named after
+    /// `prefix`, and commits them by hand as a snapshot that lists them
+    /// alone: what a compaction leaves, the same rows in as few files per
+    /// bucket as the file size target allows (`commit_by_hand`).
+    pub async fn compact(&mut self, prefix: &str) -> Result<()> {
+        let data =
+            write_data_files(&self.table, &self.spec, self.ids.iter().copied(), prefix).await?;
+        self.commit_by_hand(HandSnapshot {
+            data,
+            deletes: Vec::new(),
+        })
+        .await
+    }
+
     /// Writes the current metadata location as the whole content of the
     /// root's version hint through the table's `FileIO`, so a
     /// `SourceConfig::Static` on the root follows this fixture. Called by

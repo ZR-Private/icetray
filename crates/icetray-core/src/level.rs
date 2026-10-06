@@ -6,6 +6,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::approx;
+
 /// A lookup cost. The derived order runs from cheapest to dearest, so the
 /// level several caps set together is the greatest of them. Display and
 /// serde give the lowercase name that appears in the file, the doctor's
@@ -40,6 +42,21 @@ impl Level {
     /// Whether a table at this level meets `declared`: it costs no more.
     pub fn meets(self, declared: Self) -> bool {
         self <= declared
+    }
+
+    /// The level as the level gauges read it: 0 for optimal, 1 for
+    /// balanced, 2 for permissive (RFD 020).
+    pub(crate) const fn ordinal(self) -> u8 {
+        match self {
+            Self::Optimal => 0,
+            Self::Balanced => 1,
+            Self::Permissive => 2,
+        }
+    }
+
+    /// `ordinal` as the value a level gauge is set to.
+    pub(crate) fn gauge(self) -> f64 {
+        approx::gauge(u64::from(self.ordinal()))
     }
 }
 
@@ -76,6 +93,12 @@ mod tests {
             let back: Level = serde_json::from_str(&json).unwrap();
             assert_eq!(back, level);
         }
+    }
+
+    #[test]
+    fn test_ordinal_counts_from_optimal() {
+        let ordinals: Vec<u8> = ALL.into_iter().map(Level::ordinal).collect();
+        assert_eq!(ordinals, [0, 1, 2]);
     }
 
     #[test]

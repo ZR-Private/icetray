@@ -78,6 +78,14 @@ pub const GENERATION_SEQUENCE_NUMBER: &str = "icetray_generation_sequence_number
 pub const GENERATION_SWAPPED_AT_SECONDS: &str = "icetray_generation_swapped_at_seconds";
 /// 1 for the table's current state and 0 for the others, by `table` and `state`.
 pub const TABLE_STATE: &str = "icetray_table_state";
+/// 1 while the newest snapshot the table measured, served or held, is
+/// below the table's declared level, else 0, by `table` (RFD 020).
+pub const TABLE_BELOW_LEVEL: &str = "icetray_table_below_level";
+/// The level the newest measured snapshot achieves, by `table`: 0 for
+/// optimal, 1 for balanced, 2 for permissive (`Level::ordinal`).
+pub const TABLE_LEVEL: &str = "icetray_table_level";
+/// The level the table declares, by `table`, in `TABLE_LEVEL`'s numbers.
+pub const TABLE_DECLARED_LEVEL: &str = "icetray_table_declared_level";
 /// 1 while the configuration file differs from the configuration the
 /// server applied, 0 once they match (RFD 018).
 pub const CONFIG_PENDING: &str = "icetray_config_pending";
@@ -101,7 +109,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 30] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 33] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -236,6 +244,21 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 30] = [
         TABLE_STATE,
         Kind::Gauge,
         "1 for the table's lifecycle state and 0 for the others, by table and state.",
+    ),
+    (
+        TABLE_BELOW_LEVEL,
+        Kind::Gauge,
+        "1 while the newest measured snapshot is below the table's declared level, else 0, by table.",
+    ),
+    (
+        TABLE_LEVEL,
+        Kind::Gauge,
+        "The lookup level the newest measured snapshot achieves, 0 optimal, 1 balanced, 2 permissive, by table.",
+    ),
+    (
+        TABLE_DECLARED_LEVEL,
+        Kind::Gauge,
+        "The lookup level the table declares, 0 optimal, 1 balanced, 2 permissive, by table.",
     ),
     (
         CONFIG_PENDING,

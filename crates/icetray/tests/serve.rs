@@ -870,8 +870,10 @@ async fn test_requests_total_counts_a_request_answered_before_its_handler() -> T
 /// Every series an alert keys on is exposed once the server serves, before
 /// any call, swap, or reload: a new table's counters at zero, each call's
 /// `OK` count, each reload result, the page cache's counters and bytes,
-/// nothing in flight of the default slots, and nothing pending. The
-/// process-wide counters other tests also count are checked for presence.
+/// nothing in flight of the default slots, nothing pending, and the table
+/// neither degraded, held, nor below its level, at the optimal level it
+/// declares (RFD 020). The process-wide counters other tests also count
+/// are checked for presence.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -900,6 +902,26 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         series_value(&scrape, metric::GENERATION_SWAPS_TOTAL, &[table]),
         Some(0.0)
     );
+    // The state label's values are spelled out: `StateName` is private to
+    // icetray-core.
+    for state in ["degraded", "held"] {
+        assert_eq!(
+            series_value(
+                &scrape,
+                metric::TABLE_STATE,
+                &[table, (metric::LABEL_STATE, state)]
+            ),
+            Some(0.0),
+            "{state}"
+        );
+    }
+    for name in [
+        metric::TABLE_BELOW_LEVEL,
+        metric::TABLE_LEVEL,
+        metric::TABLE_DECLARED_LEVEL,
+    ] {
+        assert_eq!(series_value(&scrape, name, &[table]), Some(0.0), "{name}");
+    }
     for call in Call::ALL {
         assert!(calls_exposed(&scrape, call, Code::Ok), "{call} in {scrape}");
     }
@@ -1826,13 +1848,16 @@ async fn test_reload_adds_and_removes_tables_on_request() -> TestResult {
 }
 
 /// Every gauge a serving table exports under its name.
-const TABLE_GAUGES: [&str; 6] = [
+const TABLE_GAUGES: [&str; 9] = [
     metric::TABLE_STATE,
     metric::INDEX_BYTES,
     metric::FINDINGS,
     metric::GENERATION_SEQUENCE_NUMBER,
     metric::GENERATION_SWAPPED_AT_SECONDS,
     metric::GENERATION_AGE_SECONDS,
+    metric::TABLE_BELOW_LEVEL,
+    metric::TABLE_LEVEL,
+    metric::TABLE_DECLARED_LEVEL,
 ];
 
 /// A changed file is found on the poll, with no request.

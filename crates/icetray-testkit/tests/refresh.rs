@@ -1,7 +1,8 @@
 //! The ref moves and the table follows (RFD 005): an unchanged poll reads
 //! the catalog record or the hint and no object, a second snapshot appends
 //! files, the table advances on refresh reusing every unchanged file, a
-//! duplicate key is refused while the last generation keeps serving, and
+//! duplicate key is refused while the last generation keeps serving, a
+//! strict table below its level is held until a compaction, and
 //! overlapping files are verified once per group that gained a file.
 
 use std::collections::HashSet;
@@ -10,7 +11,10 @@ use std::sync::Arc;
 
 use icetray_core::approx;
 use icetray_core::config::Residency;
-use icetray_core::{Error, ErrorKind, KeyType, RefusalReason, TableSource, TableState, Value};
+use icetray_core::metric;
+use icetray_core::{
+    Error, ErrorKind, FindingCode, KeyType, Level, RefusalReason, TableSource, TableState, Value,
+};
 use icetray_testkit::fixture::{
     APPENDED_4K_6K, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
@@ -36,13 +40,14 @@ const INTERLEAVED_FILES: usize = 8;
 /// Ids written by the first two classes.
 const INTERLEAVED_WRITTEN: usize = 4_000;
 
-/// `fixture` served in the Full tier from its root, through the hint.
-async fn serve_root(fixture: &Fixture) -> Result<Served> {
+/// `fixture` served in the Full tier from its root, through the hint,
+/// under `strict`.
+async fn serve_root(fixture: &Fixture, strict: bool) -> Result<Served> {
     let source = fixture.root_source();
     verify::serve(
         icetray_core::config::TableConfig {
             source: source.clone(),
-            ..fixture.config(Residency::Full, false)
+            ..fixture.config(Residency::Full, strict)
         },
         TableSource::from_config(&source).await?,
         verify::storage_config_for_tests(),
@@ -112,7 +117,7 @@ async fn test_refresh_follows_a_static_root_through_its_hint() -> Result<()> {
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture).await?;
+    let served = serve_root(&fixture, false).await?;
     let v1 = served.current();
     assert_eq!(v1.metadata_location, fixture.metadata_location());
 
@@ -190,7 +195,7 @@ async fn test_refresh_recovers_when_the_offending_file_is_dropped() -> Result<()
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture).await?;
+    let served = serve_root(&fixture, false).await?;
     let v1 = served.current();
     let v1_paths: HashSet<String> = v1
         .files
@@ -322,5 +327,98 @@ async fn test_overlapping_files_serve_and_reverify_only_grown_groups() -> Result
     let fresh = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     verify::verify_hit_cost(fresh, &fixture, &NEWEST_SAMPLE).await?;
     assert_eq!(generation.records, approx::count(fixture.ids().count()));
+    Ok(())
+}
+
+/// The level gauges of `table` in `scrape`: below its level, the level
+/// achieved, and the level declared.
+fn level_gauges(scrape: &str, table: &str) -> [Option<f64>; 3] {
+    let labels = [(metric::LABEL_TABLE, table)];
+    [
+        metric::TABLE_BELOW_LEVEL,
+        metric::TABLE_LEVEL,
+        metric::TABLE_DECLARED_LEVEL,
+    ]
+    .map(|name| verify::series_value(scrape, name, &labels))
+}
+
+/// A strict table whose newest snapshot falls below its level is held
+/// (RFD 020): an append that interleaves with every bucket's file overlaps,
+/// so the last snapshot that met the level keeps serving, the table is
+/// `Held`, and the level gauges judge the held snapshot; once a compaction
+/// rewrites the rows into one file per bucket, the next refresh swaps the
+/// compacted snapshot in and the gauges judge it.
+#[tokio::test]
+async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()> {
+    let recorder = icetray::telemetry::install().expect("the recorder installs");
+    // The gauges' values for the levels, as `metric::TABLE_LEVEL` says.
+    let (optimal, permissive) = (0.0, 2.0);
+    let (below, at_level) = (1.0, 0.0);
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::interleaved("kv_held"),
+    )
+    .await?;
+    fixture.write_hint().await?;
+    let served = serve_root(&fixture, true).await?;
+    let v1 = served.current();
+    assert_eq!(v1.level, Level::Optimal);
+
+    let appended = residue_class(SECOND_CLASS);
+    fixture
+        .append(catalog.as_ref(), appended.iter().copied(), "half")
+        .await?;
+    fixture.write_hint().await?;
+    let error = served.table.refresh().await.unwrap_err();
+    let Error::Refused {
+        reason:
+            RefusalReason::BelowLevel {
+                declared,
+                achieved,
+                findings,
+            },
+        ..
+    } = error
+    else {
+        panic!("expected a below_level refusal, got {error:?}");
+    };
+    assert_eq!((declared, achieved), (Level::Optimal, Level::Permissive));
+    assert_eq!(findings, [FindingCode::OverlappingFiles]);
+    let TableState::Held { serving, level, .. } = served.table.state() else {
+        panic!("expected Held, got {:?}", served.table.state());
+    };
+    assert_eq!((serving, level), (v1.snapshot_id, Level::Permissive));
+    let scrape = || {
+        served.table.publish_gauges();
+        recorder.render()
+    };
+    assert_eq!(
+        level_gauges(&scrape(), served.table.name()),
+        [Some(below), Some(permissive), Some(optimal)]
+    );
+    let held_key = fixture.key(appended[0]);
+    assert_eq!(served.table.get(&held_key).await?.value, Value::Absent);
+    assert!(
+        !served.table.refresh().await?,
+        "the refused snapshot is not built again"
+    );
+
+    fixture.compact("compacted").await?;
+    assert!(served.table.refresh().await?);
+    assert!(matches!(served.table.state(), TableState::Serving { .. }));
+    let compacted = served.current();
+    assert_eq!(compacted.level, Level::Optimal);
+    assert_eq!(compacted.files.len(), v1.files.len(), "one file per bucket");
+    assert!(compacted.overlapping_buckets().is_empty());
+    assert_eq!(
+        level_gauges(&scrape(), served.table.name()),
+        [Some(at_level), Some(optimal), Some(optimal)]
+    );
+    assert_eq!(
+        served.table.get(&held_key).await?.value,
+        fixture.expected(&held_key)
+    );
     Ok(())
 }

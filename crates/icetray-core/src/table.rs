@@ -3,9 +3,9 @@
 //! serves, runs the doctor on the new generation and refuses one below the
 //! table's level under `strict`, then swaps it in atomically. Loads and
 //! refreshes of one table are serialized; a failed one leaves the last
-//! generation serving and the table `Degraded`. A lookup takes one
-//! generation and answers from it alone, so a swap during a batch cannot
-//! mix snapshots.
+//! generation serving and the table `Degraded`, or `Held` when the snapshot
+//! was refused for its level. A lookup takes one generation and answers
+//! from it alone, so a swap during a batch cannot mix snapshots.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,7 +26,7 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Finding, FindingCode};
 use crate::config::TableConfig;
-use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, Result};
+use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
 use crate::key::{Key, KeyType};
 use crate::level::Level;
@@ -56,7 +56,8 @@ const MULTI_GET_FAN_OUT: usize = 32;
 const MULTI_GET_TASK_KEYS_MIN: usize = 8;
 
 /// Where a table is in its lifecycle. Display gives the `state` metric
-/// label: the variant's name alone, `loading`, `serving`, or `degraded`.
+/// label: the variant's name alone, `loading`, `serving`, `degraded`, or
+/// `held`.
 #[derive(Clone, Debug)]
 pub enum TableState {
     /// Constructed and not yet loaded; nothing has been read.
@@ -66,7 +67,8 @@ pub enum TableState {
         /// The snapshot it serves.
         snapshot_id: SnapshotId,
         /// When the state began: the swap, or the poll that ended a
-        /// `Degraded` state by finding the table in step with its ref.
+        /// `Degraded` or `Held` state by finding the table in step with its
+        /// ref.
         since: Instant,
     },
     /// The last load or refresh failed. The generation loaded before it, if
@@ -84,6 +86,24 @@ pub enum TableState {
         /// When the failure happened.
         since: Instant,
     },
+    /// The newest snapshot was refused under `strict` for its level
+    /// (`RefusalReason::BelowLevel`, RFD 020), and the last snapshot that
+    /// met the level keeps serving. Not a fault: a writer's layout put the
+    /// table there, and a poll that finds the source moved builds again. A
+    /// transient failure of a later poll makes the table `Degraded` until a
+    /// poll finds the source unchanged, which makes it `Held` again; the
+    /// state ends at the next swap, or at a poll that finds the ref back on
+    /// the serving snapshot.
+    Held {
+        /// The snapshot still serving.
+        serving: SnapshotId,
+        /// The snapshot refused.
+        refused: SnapshotId,
+        /// The level the refused snapshot's layout achieves.
+        level: Level,
+        /// When the refusal was made.
+        since: Instant,
+    },
 }
 
 impl TableState {
@@ -93,6 +113,7 @@ impl TableState {
             Self::Loading => StateName::Loading,
             Self::Serving { .. } => StateName::Serving,
             Self::Degraded { .. } => StateName::Degraded,
+            Self::Held { .. } => StateName::Held,
         }
     }
 }
@@ -104,8 +125,8 @@ impl fmt::Display for TableState {
 }
 
 /// A `TableState`'s name without its fields: the `state` label's values,
-/// so the `table_state` gauge is set to zero for the two states a table is
-/// not in. Display gives the label value.
+/// so the `table_state` gauge is set to zero for the states a table is not
+/// in. Display gives the label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StateName {
     /// `TableState::Loading`.
@@ -114,11 +135,13 @@ enum StateName {
     Serving,
     /// `TableState::Degraded`.
     Degraded,
+    /// `TableState::Held`.
+    Held,
 }
 
 impl StateName {
-    /// Every state, for the gauge's three series.
-    const ALL: [Self; 3] = [Self::Loading, Self::Serving, Self::Degraded];
+    /// Every state, for the gauge's series.
+    const ALL: [Self; 4] = [Self::Loading, Self::Serving, Self::Degraded, Self::Held];
 }
 
 impl fmt::Display for StateName {
@@ -127,6 +150,7 @@ impl fmt::Display for StateName {
             Self::Loading => "loading",
             Self::Serving => "serving",
             Self::Degraded => "degraded",
+            Self::Held => "held",
         };
         f.write_str(name)
     }
@@ -293,11 +317,59 @@ struct Refusal {
     since: Instant,
 }
 
-/// A table's gauges: whether they are shown, and what its serving
-/// generation set them to.
+/// A failed load or poll as `fail` records it: the error, boxed so a step's
+/// result stays small, and the snapshot the failure was met building,
+/// which a `below_level` refusal holds.
+struct Failed {
+    error: Box<Error>,
+    /// The snapshot `build_and_admit` was building; `None` for a failure
+    /// before the ref named one.
+    snapshot_id: Option<SnapshotId>,
+}
+
+impl From<Error> for Failed {
+    fn from(error: Error) -> Self {
+        Self {
+            error: Box::new(error),
+            snapshot_id: None,
+        }
+    }
+}
+
+/// What a step of a load or poll returns: its value, or the failure.
+type Attempt<T> = std::result::Result<T, Failed>;
+
+/// A table's gauges: whether they are shown, what its serving generation
+/// set them to, and the level series, `None` until the first swap.
 struct Gauges {
     shown: bool,
     generation: Option<GenerationGauges>,
+    level: Option<LevelGauges>,
+}
+
+/// What the level gauges show (RFD 020): the level the newest snapshot the
+/// table measured achieves, the one serving or the one held, against the
+/// level the table declares. Set at a swap and at a `below_level` refusal;
+/// a refusal for any other reason measured nothing new and leaves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LevelGauges {
+    /// The newest measured snapshot's level for its layout.
+    measured: Level,
+    /// The table's `lookups`.
+    declared: Level,
+}
+
+impl LevelGauges {
+    /// The level the table achieves: its layout's. The one place a server
+    /// condition, such as the page cache's, joins it.
+    fn achieved(self) -> Level {
+        self.measured
+    }
+
+    /// Whether the table is below its declared level.
+    fn below_level(self) -> bool {
+        !self.achieved().meets(self.declared)
+    }
 }
 
 /// What a swap sets the generation gauges to, kept so a table shown after
@@ -580,6 +652,7 @@ impl Table {
             gauges: Mutex::new(Gauges {
                 shown: false,
                 generation: None,
+                level: None,
             }),
         }
     }
@@ -604,10 +677,12 @@ impl Table {
         gauges.shown = false;
     }
 
-    /// Writes the table's state and serving generation's gauges again as
-    /// they stand, while the table shows them, as `show` does; a scrape
-    /// calls this for every table served, since the binary's recorder
-    /// drops a gauge no scrape wrote.
+    /// Writes the table's state gauges, its serving generation's gauges,
+    /// and the level gauges (`icetray_table_below_level`,
+    /// `icetray_table_level`, `icetray_table_declared_level`) again as they
+    /// stand, while the table shows them, as `show` does; a scrape calls
+    /// this for every table served, since the binary's recorder drops a
+    /// gauge no scrape wrote.
     pub fn publish_gauges(&self) {
         let gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
         if gauges.shown {
@@ -616,11 +691,14 @@ impl Table {
     }
 
     /// Writes the state gauges and, when there is a serving generation,
-    /// its gauges; `gauges` is the held lock.
+    /// its gauges and the level gauges; `gauges` is the held lock.
     fn write_gauges(&self, gauges: &Gauges) {
         self.write_state(gauges);
         if let Some(generation) = &gauges.generation {
             self.write_generation(generation);
+        }
+        if let Some(level) = gauges.level {
+            self.write_level(level);
         }
     }
 
@@ -637,12 +715,13 @@ impl Table {
     /// is not counted under `refresh_errors_total`. On a table that already
     /// serves, a full re-resolve and reload, reusing every file the new
     /// snapshot still names by the same path and size, within the refresh
-    /// deadline.
+    /// deadline; a failure leaves the table as a poll's would (`fail`),
+    /// `Held` for a `below_level` refusal.
     pub async fn load(&self) -> Result<()> {
         let _serialized = self.serial.lock().await;
         self.within_deadline(self.reload())
             .await
-            .map_err(|error| self.degrade(error))
+            .map_err(|failed| self.fail(failed))
     }
 
     /// One poll, serialized per table. `Ok(true)` when a new generation was
@@ -650,15 +729,16 @@ impl Table {
     /// `Degraded` with no generation recovers on the next poll); otherwise
     /// one small read when nothing moved (RFD 005), and a build with reuse
     /// when the ref advanced. `Err` leaves the current generation serving,
-    /// the table `Degraded`, and counts one `refresh_errors_total` with the
-    /// error's kind as its reason; `Ok(false)` after such a failure ends
-    /// the `Degraded` state, since the table is in step with its ref again.
-    /// A failure over a serving generation that is fixed for the snapshot
-    /// is the exception (`Recurrence::Deterministic`): the table remembers
-    /// it, and while the source names the same metadata location each poll
-    /// costs only the small read, returns `Ok(false)`, counts nothing, and
-    /// leaves the table `Degraded` for that failure. A transient failure is
-    /// tried again on the next poll.
+    /// the table `Degraded`, or `Held` for a `below_level` refusal, and
+    /// counts one `refresh_errors_total` with the error's kind as its
+    /// reason; `Ok(false)` after such a failure ends the state, since the
+    /// table is in step with its ref again. A failure over a serving
+    /// generation that is fixed for the snapshot is the exception
+    /// (`Recurrence::Deterministic`): the table remembers it, and while the
+    /// source names the same metadata location each poll costs only the
+    /// small read, returns `Ok(false)`, counts nothing, and leaves the table
+    /// in the state that failure set (`fail`). A transient failure is tried
+    /// again on the next poll.
     /// The poll runs within the refresh deadline, or with no generation
     /// serving within the load deadline; past it the poll is dropped as
     /// `Error::RefreshDeadline` or `Error::LoadDeadline`, a failure like any
@@ -680,14 +760,14 @@ impl Table {
                 }
                 Ok(swapped)
             }
-            Err(error) => {
+            Err(failed) => {
                 metrics::counter!(
                     metric::REFRESH_ERRORS_TOTAL,
                     metric::LABEL_TABLE => self.config.name.clone(),
-                    metric::LABEL_REASON => error.kind().to_string()
+                    metric::LABEL_REASON => failed.error.kind().to_string()
                 )
                 .increment(1);
-                Err(self.degrade(error))
+                Err(self.fail(failed))
             }
         }
     }
@@ -754,6 +834,7 @@ impl Table {
             Ok(layout.key_type)
         })
         .await
+        .map_err(|failed| *failed.error)
     }
 
     /// One lookup against the serving generation. `Error::NotReady` with no
@@ -878,7 +959,7 @@ impl Table {
     /// `serial`, once the deadline passes, and the next poll or
     /// `Opened::retain` can take it. A location error from the work is
     /// given the table's name (`Error::for_table`).
-    async fn within_deadline<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
+    async fn within_deadline<T>(&self, work: impl Future<Output = Attempt<T>>) -> Attempt<T> {
         let table = &self.config.name;
         let outcome = if self.current().is_none() {
             let after = self.load_deadline;
@@ -897,12 +978,15 @@ impl Table {
                     after,
                 })?
         };
-        outcome.map_err(|error| error.for_table(table))
+        outcome.map_err(|Failed { error, snapshot_id }| Failed {
+            error: Box::new(error.for_table(table)),
+            snapshot_id,
+        })
     }
 
     /// Resolves the source and builds the snapshot the ref names over the
     /// current generation, whether or not one serves.
-    async fn reload(&self) -> Result<()> {
+    async fn reload(&self) -> Attempt<()> {
         let resolved = self.source.resolve(&self.storage).await?;
         let snapshot = self.ref_snapshot(&resolved)?;
         let previous = self.current();
@@ -913,9 +997,9 @@ impl Table {
     /// One poll over `current`: the source is asked whether its metadata
     /// moved from the known location, and the table advances to what the
     /// ref names there (`advance`). A failure of that step fixed for the
-    /// snapshot is remembered against the location, so an unchanged source
-    /// then builds nothing.
-    async fn poll(&self, current: &Arc<Generation>) -> Result<bool> {
+    /// snapshot is remembered against the location, with the snapshot it
+    /// was met building, so an unchanged source then builds nothing.
+    async fn poll(&self, current: &Arc<Generation>) -> Attempt<bool> {
         let known = self
             .known
             .lock()
@@ -933,25 +1017,25 @@ impl Table {
             }
             return Ok(false);
         };
-        self.advance(&resolved, current).await.inspect_err(|error| {
-            if error.recurrence() == Recurrence::Deterministic {
-                let refusal = Refusal {
-                    snapshot_id: resolved
-                        .metadata
-                        .snapshot_for_ref(&self.config.r#ref)
-                        .map(|snapshot| SnapshotId(snapshot.snapshot_id())),
-                    reason: error.kind(),
-                    since: Instant::now(),
-                };
-                self.remember(&resolved.location, Some(refusal));
-            }
-        })
+        self.advance(&resolved, current)
+            .await
+            .inspect_err(|failed| {
+                if failed.error.recurrence() == Recurrence::Deterministic {
+                    let reason = failed.error.kind();
+                    let refusal = Refusal {
+                        snapshot_id: failed.snapshot_id,
+                        since: self.refused_since(failed.snapshot_id, &reason),
+                        reason,
+                    };
+                    self.remember(&resolved.location, Some(refusal));
+                }
+            })
     }
 
     /// Moves the table onto the snapshot the ref names in `resolved`: only
     /// a snapshot with another id than `current`'s is built. `Ok(true)`
     /// when one was swapped in.
-    async fn advance(&self, resolved: &Resolved, current: &Arc<Generation>) -> Result<bool> {
+    async fn advance(&self, resolved: &Resolved, current: &Arc<Generation>) -> Attempt<bool> {
         let snapshot = self.ref_snapshot(resolved)?;
         if SnapshotId(snapshot.snapshot_id()) == current.snapshot_id {
             self.remember(&resolved.location, None);
@@ -970,35 +1054,49 @@ impl Table {
     }
 
     /// Plans `snapshot` over `previous` at the footer stage, judges its
-    /// level there, builds it, gates it, and swaps it in.
+    /// level there, builds it, gates it, and swaps it in. A failure carries
+    /// `snapshot`'s id.
     async fn build_and_admit(
         &self,
         resolved: &Resolved,
         snapshot: &Snapshot,
         previous: Option<&Arc<Generation>>,
-    ) -> Result<()> {
-        let mut planned = Generation::plan_load(
-            &self.config,
-            resolved,
-            snapshot,
-            &self.storage,
-            Arc::clone(&self.hedge),
-            previous.map(Arc::as_ref),
-        )
-        .await?;
-        planned.judge_level(self.local.as_ref()).await?;
-        let generation = planned.build(self.local.as_ref()).await?;
-        let findings = self.gate(&generation)?;
-        self.swap(generation, previous, &findings);
-        self.remember(&resolved.location, None);
-        Ok(())
+    ) -> Attempt<()> {
+        let admitted: Result<()> = async {
+            let mut planned = Generation::plan_load(
+                &self.config,
+                resolved,
+                snapshot,
+                &self.storage,
+                Arc::clone(&self.hedge),
+                previous.map(Arc::as_ref),
+            )
+            .await?;
+            planned.judge_level(self.local.as_ref()).await?;
+            let generation = planned.build(self.local.as_ref()).await?;
+            let findings = self.gate(&generation)?;
+            self.swap(generation, previous, &findings);
+            self.remember(&resolved.location, None);
+            Ok(())
+        }
+        .await;
+        admitted.map_err(|error| Failed {
+            error: Box::new(error),
+            snapshot_id: Some(SnapshotId(snapshot.snapshot_id())),
+        })
     }
 
-    /// The poll found the table in step with its ref, so a `Degraded` state
-    /// an earlier failed poll left ends: the last refresh succeeded and
-    /// `current` is the snapshot the ref names.
+    /// The poll found the table in step with its ref, so a `Degraded` or
+    /// `Held` state an earlier poll left ends: the last refresh succeeded
+    /// and `current` is the snapshot the ref names, so the level gauges
+    /// measure it again in place of a snapshot a `below_level` refusal
+    /// held.
     fn in_step(&self, current: &Generation) {
-        if matches!(self.state(), TableState::Degraded { .. }) {
+        if matches!(
+            self.state(),
+            TableState::Degraded { .. } | TableState::Held { .. }
+        ) {
+            self.measured(current.level);
             self.serve_state(current.snapshot_id);
         }
     }
@@ -1068,45 +1166,127 @@ impl Table {
             sequence_number: generation.sequence_number,
             swapped_at: time::unix_seconds(time::now()),
         };
+        let level = LevelGauges {
+            measured: generation.level,
+            declared: self.config.lookups(),
+        };
         {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
             if gauges.shown {
                 self.write_generation(&published);
+                self.write_level(level);
             }
             gauges.generation = Some(published);
+            gauges.level = Some(level);
         }
         let snapshot_id = generation.snapshot_id;
         self.current.store(Some(Arc::new(generation)));
         self.serve_state(snapshot_id);
     }
 
-    /// Records the failure's kind as the table's state and hands the
-    /// failure back to the caller, which logs it. The current generation is
-    /// untouched.
-    fn degrade(&self, error: Error) -> Error {
-        self.set_state(TableState::Degraded {
-            serving: self.current().map(|generation| generation.snapshot_id),
-            reason: error.kind(),
-            since: Instant::now(),
-        });
-        error
+    /// Records the failure as the table's state and hands its error back
+    /// to the caller, which logs it. The current generation is untouched. A
+    /// `below_level` refusal measured a snapshot, so the level gauges take
+    /// its level once the table has swapped one in, and it makes the table
+    /// `Held` on the snapshot it was met building whenever a generation
+    /// serves, from a poll or a `load` alike (`failed_state`); every other
+    /// failure, and a first load below its level, makes it `Degraded`.
+    fn fail(&self, Failed { error, snapshot_id }: Failed) -> Error {
+        let reason = error.kind();
+        if let ErrorKind::Refused(RefusalReason::BelowLevel { achieved, .. }) = &reason {
+            self.measured(*achieved);
+        }
+        self.set_state(self.failed_state(&Refusal {
+            snapshot_id,
+            since: self.refused_since(snapshot_id, &reason),
+            reason,
+        }));
+        *error
+    }
+
+    /// When the refusal of `snapshot_id` for `reason` counts from: a `Held`
+    /// table refused below its level again for the snapshot it holds keeps
+    /// the `since` of the first refusal, so the state's age is how long that
+    /// snapshot has been held; any other refusal counts from now.
+    fn refused_since(&self, snapshot_id: Option<SnapshotId>, reason: &ErrorKind) -> Instant {
+        if let TableState::Held { refused, since, .. } = self.state()
+            && let ErrorKind::Refused(RefusalReason::BelowLevel { .. }) = reason
+            && snapshot_id == Some(refused)
+        {
+            since
+        } else {
+            Instant::now()
+        }
     }
 
     /// The poll found the source still naming the location where `refusal`
-    /// was met, so the table stays `Degraded` for that refusal.
-    /// The state is set again when it names another reason: a transient
-    /// failure of a poll since the refusal replaced it.
+    /// was met, so the table stays in the state that refusal set
+    /// (`failed_state`). The state is set again when it is another: a
+    /// transient failure of a poll since the refusal replaced it.
     fn held_back(&self, refusal: &Refusal) {
-        let degraded_for_it = matches!(
-            self.state(),
-            TableState::Degraded { ref reason, .. } if *reason == refusal.reason
-        );
-        if !degraded_for_it {
-            self.set_state(TableState::Degraded {
-                serving: self.current().map(|generation| generation.snapshot_id),
+        let state = self.failed_state(refusal);
+        let already = match (&state, self.state()) {
+            (
+                TableState::Held { refused, .. },
+                TableState::Held {
+                    refused: current, ..
+                },
+            ) => *refused == current,
+            (
+                TableState::Degraded { reason, .. },
+                TableState::Degraded {
+                    reason: current, ..
+                },
+            ) => *reason == current,
+            (
+                TableState::Loading
+                | TableState::Serving { .. }
+                | TableState::Degraded { .. }
+                | TableState::Held { .. },
+                _,
+            ) => false,
+        };
+        if !already {
+            self.set_state(state);
+        }
+    }
+
+    /// The state `refusal` leaves the table in: `Held` for a `below_level`
+    /// refusal of a named snapshot while a generation serves (RFD 020),
+    /// `Degraded` for anything else.
+    fn failed_state(&self, refusal: &Refusal) -> TableState {
+        let serving = self.current().map(|generation| generation.snapshot_id);
+        match (&refusal.reason, serving, refusal.snapshot_id) {
+            (
+                ErrorKind::Refused(RefusalReason::BelowLevel { achieved, .. }),
+                Some(serving),
+                Some(refused),
+            ) => TableState::Held {
+                serving,
+                refused,
+                level: *achieved,
+                since: refusal.since,
+            },
+            _ => TableState::Degraded {
+                serving,
                 reason: refusal.reason.clone(),
                 since: refusal.since,
-            });
+            },
+        }
+    }
+
+    /// Takes `measured` as the newest measured snapshot's level for the
+    /// level gauges, once a swap made them appear, and writes them while
+    /// the table shows its gauges.
+    fn measured(&self, measured: Level) {
+        let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(level) = gauges.level.as_mut() else {
+            return;
+        };
+        level.measured = measured;
+        let level = *level;
+        if gauges.shown {
+            self.write_level(level);
         }
     }
 
@@ -1147,7 +1327,7 @@ impl Table {
     }
 
     /// Sets the `table_state` gauge to 1 for the current state and 0 for
-    /// each of the other two, while the table shows its gauges; every
+    /// the others, while the table shows its gauges; every
     /// state the table is ever in, the initial `Loading` included, passes
     /// through here or through `show`.
     fn publish_state(&self) {
@@ -1200,6 +1380,26 @@ impl Table {
             metric::LABEL_TABLE => self.config.name.clone()
         )
         .set(generation.swapped_at);
+    }
+
+    /// Writes the level gauges from `level`; called with the gauges' lock
+    /// held.
+    fn write_level(&self, level: LevelGauges) {
+        metrics::gauge!(
+            metric::TABLE_BELOW_LEVEL,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(approx::gauge(u64::from(level.below_level())));
+        metrics::gauge!(
+            metric::TABLE_LEVEL,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(level.achieved().gauge());
+        metrics::gauge!(
+            metric::TABLE_DECLARED_LEVEL,
+            metric::LABEL_TABLE => self.config.name.clone()
+        )
+        .set(level.declared.gauge());
     }
 
     /// `Error::NotReady` for this table.
@@ -1277,7 +1477,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::config::{Residency, ServerConfig};
-    use crate::error::{Budget, ErrorKind, RefusalReason};
+    use crate::error::{Budget, ErrorKind};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, RESOLVE_GETS, SECOND_SEQUENCE,
@@ -1499,6 +1699,29 @@ mod tests {
         };
         snapshot_id
     }
+
+    /// The snapshots a `Held` state names, serving then refused, and the
+    /// refused snapshot's level; any other state fails.
+    fn held(table: &Table) -> (SnapshotId, SnapshotId, Level) {
+        let TableState::Held {
+            serving,
+            refused,
+            level,
+            ..
+        } = table.state()
+        else {
+            panic!("expected Held, got {:?}", table.state());
+        };
+        (serving, refused, level)
+    }
+
+    /// The `Held` state of a table serving `FIRST_SNAPSHOT` whose refresh
+    /// to `SECOND_SNAPSHOT` was refused at balanced.
+    const HELD_AT_BALANCED: (SnapshotId, SnapshotId, Level) = (
+        SnapshotId(FIRST_SNAPSHOT),
+        SnapshotId(SECOND_SNAPSHOT),
+        Level::Balanced,
+    );
 
     /// The fields of a `Degraded` state; any other state fails.
     fn degraded(table: &Table) -> (Option<SnapshotId>, ErrorKind) {
@@ -2413,6 +2636,14 @@ mod tests {
                 ],
             }
         );
+        assert_eq!(
+            held(&table),
+            (
+                SnapshotId(FIRST_SNAPSHOT),
+                SnapshotId(SECOND_SNAPSHOT),
+                Level::Permissive
+            )
+        );
     }
 
     /// A strict Disk table below its level under a local directory too
@@ -2474,7 +2705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_strict_refuses_a_snapshot_below_its_level_and_keeps_serving() {
+    async fn test_refresh_below_level_under_strict_holds_the_last_snapshot_at_level() {
         let (mut fixture, all) = two_bucket_table().await;
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         table.load().await.unwrap();
@@ -2493,9 +2724,95 @@ mod tests {
             table.get(&Key::Long(all[0])).await.unwrap().value,
             present(all[0])
         );
-        let (serving, kept) = degraded(&table);
+        assert_eq!(held(&table), HELD_AT_BALANCED);
+    }
+
+    /// A transient failure of a poll while held makes the table `Degraded`,
+    /// and the next poll that finds the source unchanged makes it `Held`
+    /// for the remembered refusal again, building nothing.
+    #[tokio::test]
+    async fn test_refresh_transient_fault_while_held_reads_degraded_until_an_unchanged_poll() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let balanced = WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        };
+        append_second(&mut fixture, &all, "dict", balanced).await;
+        table.refresh().await.unwrap_err();
+        assert_eq!(held(&table), HELD_AT_BALANCED);
+
+        fixture.remove_hint();
+        let error = table.refresh().await.unwrap_err();
+        assert!(matches!(error, Error::ObjectStore(_)), "{error:?}");
+        let (serving, reason) = degraded(&table);
         assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
-        assert_eq!(kept, ErrorKind::Refused(reason));
+        assert_eq!(reason, ErrorKind::ObjectStore);
+
+        fixture.restore_hint(SECOND_VERSION).await;
+        let before = fixture.gets();
+        assert!(!table.refresh().await.unwrap());
+        assert_eq!(fixture.gets(), before + POLL_GETS, "the version hint alone");
+        assert_eq!(held(&table), HELD_AT_BALANCED);
+    }
+
+    /// A first load below its level has no snapshot to hold: the table is
+    /// `Degraded` with nothing serving, which `serve` exits on.
+    #[tokio::test]
+    async fn test_load_below_level_with_nothing_serving_is_degraded() {
+        let fixture = one_file_fixture(WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        })
+        .await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        let reason = refusal_of(table.load().await);
+        assert_eq!(degraded(&table), (None, ErrorKind::Refused(reason)));
+    }
+
+    /// A `load` over a serving generation that meets a snapshot below its
+    /// level holds it as a poll does, naming the snapshot the load refused.
+    #[tokio::test]
+    async fn test_load_below_level_over_a_serving_generation_is_held() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let balanced = WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        };
+        append_second(&mut fixture, &all, "dict", balanced).await;
+        assert_eq!(refusal_of(table.load().await), dictionary_below_optimal());
+        assert_eq!(held(&table), HELD_AT_BALANCED);
+    }
+
+    /// When a `Held` state began; any other state fails.
+    fn held_since(table: &Table) -> Instant {
+        let TableState::Held { since, .. } = table.state() else {
+            panic!("expected Held, got {:?}", table.state());
+        };
+        since
+    }
+
+    /// A held table refused below its level again for the snapshot it
+    /// holds, by a `load` here, stays held from the first refusal.
+    #[tokio::test]
+    async fn test_load_below_level_again_for_the_held_snapshot_keeps_its_since() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        let balanced = WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        };
+        append_second(&mut fixture, &all, "dict", balanced).await;
+        table.refresh().await.unwrap_err();
+        let first = held_since(&table);
+
+        assert_eq!(refusal_of(table.load().await), dictionary_below_optimal());
+        assert_eq!(held(&table), HELD_AT_BALANCED);
+        assert_eq!(held_since(&table), first);
     }
 
     /// A refresh onto a file whose keys hash to bucket 0 but whose manifest
@@ -2794,6 +3111,146 @@ mod tests {
         )
     }
 
+    /// The level gauges of `table`, as bits: below the declared level, the
+    /// level achieved, and the level declared.
+    fn level_gauges(series: &Series) -> [u64; 3] {
+        let labels = [table_label()];
+        [
+            metric::TABLE_BELOW_LEVEL,
+            metric::TABLE_LEVEL,
+            metric::TABLE_DECLARED_LEVEL,
+        ]
+        .map(|name| series.gauge(name, &labels).to_bits())
+    }
+
+    /// What `level_gauges` reads for `below`, 1 or 0, at `achieved` against
+    /// `declared`.
+    fn level_bits(below: u64, achieved: Level, declared: Level) -> [u64; 3] {
+        [
+            approx::gauge(below).to_bits(),
+            achieved.gauge().to_bits(),
+            declared.gauge().to_bits(),
+        ]
+    }
+
+    #[test]
+    fn test_metrics_level_series_appear_at_first_swap() {
+        let ((), before) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            fixture.remove_hint();
+            table.load().await.unwrap_err();
+        });
+        for name in [
+            metric::TABLE_BELOW_LEVEL,
+            metric::TABLE_LEVEL,
+            metric::TABLE_DECLARED_LEVEL,
+        ] {
+            assert_eq!(before.named(name), 0, "{name} before any swap");
+        }
+        let ((), after) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let config = TableConfig {
+                lookups: Some(Level::Balanced),
+                ..fixture.config(Residency::Full, None)
+            };
+            table_over(&fixture, config).await.load().await.unwrap();
+        });
+        assert_eq!(
+            level_gauges(&after),
+            level_bits(0, Level::Optimal, Level::Balanced)
+        );
+    }
+
+    #[test]
+    fn test_metrics_below_level_judges_the_held_snapshot() {
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let balanced = WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            };
+            append_second(&mut fixture, &all, "dict", balanced).await;
+            table.refresh().await.unwrap_err();
+            assert_eq!(held(&table), HELD_AT_BALANCED);
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(1, Level::Balanced, Level::Optimal),
+            "the held snapshot is below the level, though the serving one meets it"
+        );
+        assert_eq!(
+            state_gauge(&series, TABLE, StateName::Held).to_bits(),
+            approx::gauge(1).to_bits()
+        );
+        assert_eq!(
+            state_gauge(&series, TABLE, StateName::Degraded).to_bits(),
+            approx::gauge(0).to_bits()
+        );
+    }
+
+    #[test]
+    fn test_metrics_refusal_outside_the_levels_leaves_the_level_series() {
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            commit_duplicate(
+                &mut fixture,
+                &all,
+                SECOND_SNAPSHOT,
+                FIRST_SNAPSHOT,
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+            let reason = refusal_of(table.refresh().await);
+            assert!(matches!(reason, RefusalReason::DuplicateKeys { .. }));
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(0, Level::Optimal, Level::Optimal),
+            "the refused snapshot overlaps, but only the serving one was measured"
+        );
+    }
+
+    /// A held table whose ref goes back to the serving snapshot is in step
+    /// with it without a swap: it serves, and the level gauges measure the
+    /// serving snapshot again.
+    #[test]
+    fn test_refresh_ref_back_on_the_serving_snapshot_ends_held_at_its_level() {
+        let ((), series) = recorded(async {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let balanced = WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            };
+            append_second(&mut fixture, &all, "dict", balanced).await;
+            table.refresh().await.unwrap_err();
+            assert_eq!(held(&table), HELD_AT_BALANCED);
+
+            fixture.restore_hint(FIRST_VERSION).await;
+            assert!(!table.refresh().await.unwrap());
+            assert_eq!(serving_id(&table), SnapshotId(FIRST_SNAPSHOT));
+        });
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(0, Level::Optimal, Level::Optimal)
+        );
+        assert_eq!(
+            state_gauge(&series, TABLE, StateName::Serving).to_bits(),
+            approx::gauge(1).to_bits()
+        );
+        assert_eq!(
+            state_gauge(&series, TABLE, StateName::Held).to_bits(),
+            approx::gauge(0).to_bits()
+        );
+    }
+
     #[test]
     fn test_refresh_unchanged_after_a_failed_poll_returns_to_serving() {
         let ((), series) = recorded(async {
@@ -2926,11 +3383,10 @@ mod tests {
     /// A snapshot a strict table refuses as below its level is remembered
     /// against its metadata location like any refusal: while the version
     /// hint names that location each poll reads the hint alone, counts no
-    /// error, and leaves the table degraded for the refusal.
+    /// error, and leaves the table held for the refusal.
     #[test]
     fn test_refresh_does_not_judge_a_snapshot_below_its_level_again_until_its_location_moves() {
         let refused = ErrorKind::Refused(dictionary_below_optimal());
-        let serving = Some(SnapshotId(FIRST_SNAPSHOT));
         let ((), series) = recorded(async {
             let (mut fixture, all) = two_bucket_table().await;
             let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
@@ -2954,7 +3410,7 @@ mod tests {
                 let before = fixture.gets();
                 assert!(!table.refresh().await.unwrap());
                 assert_eq!(fixture.gets(), before + POLL_GETS, "the version hint alone");
-                assert_eq!(degraded(&table), (serving, refused.clone()));
+                assert_eq!(held(&table), HELD_AT_BALANCED);
             }
         });
         assert_eq!(
@@ -3175,8 +3631,8 @@ mod tests {
 
     /// A hidden table writes no gauge while it loads, nor when a scrape
     /// publishes, so the table serving under its name keeps its series;
-    /// `show` then publishes its state and its generation's gauges as the
-    /// swap set them.
+    /// `show` then publishes its state, its generation's gauges, and the
+    /// level gauges as the swap set them.
     #[test]
     fn test_a_hidden_table_writes_its_gauges_once_shown() {
         let (index_bytes, loading) = recorded(async {
@@ -3192,6 +3648,9 @@ mod tests {
             metric::FINDINGS,
             metric::GENERATION_SEQUENCE_NUMBER,
             metric::GENERATION_SWAPPED_AT_SECONDS,
+            metric::TABLE_BELOW_LEVEL,
+            metric::TABLE_LEVEL,
+            metric::TABLE_DECLARED_LEVEL,
         ];
         for name in gauges {
             assert_eq!(loading.named(name), 0, "{name}");
@@ -3210,6 +3669,10 @@ mod tests {
         assert_eq!(
             shown.gauge(metric::INDEX_BYTES, &[table_label()]).to_bits(),
             approx::gauge_len(index_bytes).to_bits()
+        );
+        assert_eq!(
+            level_gauges(&shown),
+            level_bits(0, Level::Optimal, Level::Optimal)
         );
     }
 
@@ -3256,6 +3719,15 @@ mod tests {
                     since: Instant::now(),
                 },
                 "degraded",
+            ),
+            (
+                TableState::Held {
+                    serving: SnapshotId(FIRST_SNAPSHOT),
+                    refused: SnapshotId(SECOND_SNAPSHOT),
+                    level: Level::Balanced,
+                    since: Instant::now(),
+                },
+                "held",
             ),
         ];
         for (state, name) in cases {
