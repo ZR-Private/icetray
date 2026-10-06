@@ -399,6 +399,32 @@ pub fn value_of_kind(key: &Key, len: usize, kind: ValueKind) -> Vec<u8> {
     }
 }
 
+/// The version a key's first write carries: `value_of_version` at it is
+/// `value_of_kind`.
+pub const FIRST_VERSION: u64 = 0;
+
+/// The bit every byte of a later version's mask carries, so no mask byte is
+/// zero and every byte of that version's value differs from the first's.
+const MASK_BYTE_SET_BIT: u8 = 1;
+
+/// The `len`-byte value of `kind` that version `version` of `key` stores
+/// (RFD 014): `value_of_kind` at `FIRST_VERSION`, and at a later version
+/// that value with every byte masked by a stream seeded from the key and
+/// the version, so an update's value differs from every other version's
+/// and a lookup that answered from a deleted copy is told apart from one
+/// that answered from the live row.
+pub fn value_of_version(key: &Key, len: usize, kind: ValueKind, version: u64) -> Vec<u8> {
+    let mut value = value_of_kind(key, len, kind);
+    if version != FIRST_VERSION {
+        let mut mask = Stream::from_key(key);
+        mask.state ^= version.wrapping_mul(SEED_MULTIPLIER);
+        for byte in &mut value {
+            *byte ^= mask.next().to_le_bytes()[0] | MASK_BYTE_SET_BIT;
+        }
+    }
+    value
+}
+
 /// The word-valued fields of a text value, in the order they are written,
 /// repeated from the first when a value is long enough to need more.
 const TEXT_FIELDS: [&str; 6] = ["status", "region", "plan", "device", "locale", "segment"];

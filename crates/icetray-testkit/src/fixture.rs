@@ -1,7 +1,9 @@
 //! Fixture tables written with the Iceberg library's own writer (RFD 014):
 //! a `bucket(N, key)`-partitioned, key-sorted table in the serving layout of
 //! RFD 002, or in any layout a test names through `Layout`. Values are a
-//! function of the key, so any answer is checkable without a stored oracle.
+//! function of the key and of the version that wrote it, so any answer is
+//! checkable without a stored oracle, and a live row is told apart from a
+//! deleted copy of its key.
 //! What the library's writer cannot produce (a delete file, a dropped data
 //! file, a null key, a key column whose Parquet type contradicts the schema)
 //! is committed as a raw file or as a snapshot written by hand.
@@ -18,13 +20,14 @@ use arrow::array::{
 use arrow::buffer::Buffer;
 use arrow::datatypes::Schema as ArrowSchema;
 use bytes::Bytes;
-use iceberg::io::{LocalFsStorageFactory, StorageFactory};
+use iceberg::io::{FileIO, LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, MAIN_BRANCH,
-    ManifestFile, ManifestListWriter, ManifestWriterBuilder, NestedField, NullOrder, Operation,
-    PartitionKey, PartitionSpec, PrimitiveType, Schema, Snapshot, SortDirection, SortField,
-    SortOrder, Struct, Summary, TableMetadata, Transform, Type, UnboundPartitionSpec,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
+    MAIN_BRANCH, ManifestFile, ManifestListWriter, ManifestWriterBuilder, NestedField, NullOrder,
+    Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema, Snapshot, SnapshotReference,
+    SnapshotRetention, SortDirection, SortField, SortOrder, Struct, Summary, TableMetadata,
+    Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
@@ -47,14 +50,17 @@ use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
 use icetray_core::{Key, KeyType, Value};
 use parquet::arrow::ArrowWriter;
+use roaring::RoaringTreemap;
 use tempfile::TempDir;
 
+use crate::delete_files::{PositionDeletes, Vector, write_position_deletes, write_vectors};
 use crate::error::{Result, SpecFault};
 use crate::keys::{
-    KeyShape, SCATTERED_ID_SPACE, STRING_KEY_FIXED_BYTES, VALUE_BYTES, ValueKind, absent_key_from,
-    id_of, key_at_shaped, value_of_kind,
+    FIRST_VERSION, KeyShape, SCATTERED_ID_SPACE, STRING_KEY_FIXED_BYTES, VALUE_BYTES, ValueKind,
+    absent_key_from, id_of, key_at_shaped, value_of_version,
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
+use crate::merge_oracle::MergeOracle;
 use crate::s3::S3Fixture;
 
 /// Ids of the small fixture: twenty thousand rows, about 1,250 per bucket
@@ -269,6 +275,10 @@ pub struct FixtureSpec {
     pub nulls: Nulls,
     /// The Parquet layout every data file is written in.
     pub layout: Layout,
+    /// The table's Iceberg format version: the catalog creates it at this
+    /// version, and a by-hand commit writes its manifests and manifest
+    /// list at it.
+    pub format_version: FormatVersion,
 }
 
 /// The order ids are handed to the writer within each bucket. `Descending`
@@ -309,6 +319,7 @@ impl FixtureSpec {
             value_kind: ValueKind::Random,
             nulls: Nulls::None,
             layout: Layout::contract(),
+            format_version: FormatVersion::V2,
         }
     }
 
@@ -424,6 +435,24 @@ pub struct HandSnapshot {
     pub deletes: Vec<DataFile>,
 }
 
+/// How `Fixture::delete` and `Fixture::update` record the rows they
+/// remove (RFD 021).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteForm {
+    /// A deletion vector per data file touched, all in one new Puffin file.
+    /// A data file that already has a vector gets a new one holding its old
+    /// rows and the new ones, and the old entry leaves the snapshot, as a
+    /// v3 writer replaces it; its Puffin file may still hold other live
+    /// vectors.
+    Vectors,
+    /// A Parquet position delete file per data file touched, naming it as
+    /// its referenced data file.
+    ScopedPositions,
+    /// A Parquet position delete file per partition touched, naming no
+    /// referenced data file.
+    Positions,
+}
+
 /// The commit that added a file: what an existing entry carries it at.
 #[derive(Clone, Copy, Debug)]
 struct AddedBy {
@@ -453,11 +482,27 @@ pub struct Fixture {
     /// delete, by path: what a by-hand commit carries the file at as an
     /// existing entry, as a writer does.
     added: HashMap<String, AddedBy>,
+    /// The version each id's live row was written at, for ids an `update`
+    /// rewrote; every other id is at `FIRST_VERSION`.
+    versions: HashMap<u64, u64>,
+    /// What each snapshot this fixture committed by hand listed, by
+    /// snapshot id, so `move_ref` can return the table to one.
+    history: HashMap<i64, Listing>,
     /// Whether a snapshot was committed by hand, after which the catalog's
     /// record is behind and only `commit_by_hand` may advance the table.
     by_hand: bool,
     /// By-hand commits so far; the next writes metadata version one above.
     hand_commits: u64,
+}
+
+/// What one snapshot lists, as a `Fixture` follows it.
+#[derive(Clone, Debug)]
+struct Listing {
+    ids: BTreeSet<u64>,
+    versions: HashMap<u64, u64>,
+    files: Vec<DataFile>,
+    deletes: Vec<DataFile>,
+    added: HashMap<String, AddedBy>,
 }
 
 impl Fixture {
@@ -475,6 +520,8 @@ impl Fixture {
             files: Vec::new(),
             deletes: Vec::new(),
             added: HashMap::new(),
+            versions: HashMap::new(),
+            history: HashMap::new(),
             by_hand: false,
             hand_commits: 0,
         })
@@ -516,11 +563,19 @@ impl Fixture {
     }
 
     /// The value stored for `key`: `None` for an id `Nulls` names, else the
-    /// `value_bytes` bytes of `value_kind` derived from the key.
+    /// `value_bytes` bytes of `value_kind` derived from the key and the
+    /// version its live row was written at (`value_of_version`).
     pub fn value(&self, key: &Key) -> Option<Vec<u8>> {
-        let null = id_of(key, self.spec.key_pad, self.spec.key_shape)
-            .is_some_and(|id| self.spec.is_null(id));
-        (!null).then(|| value_of_kind(key, self.spec.value_bytes, self.spec.value_kind))
+        let id = id_of(key, self.spec.key_pad, self.spec.key_shape);
+        let null = id.is_some_and(|id| self.spec.is_null(id));
+        let version = id.map_or(FIRST_VERSION, |id| self.version_of(id));
+        (!null).then(|| value_of_version(key, self.spec.value_bytes, self.spec.value_kind, version))
+    }
+
+    /// The version `id`'s live row was written at: `FIRST_VERSION` until
+    /// an `update` rewrites it.
+    pub(crate) fn version_of(&self, id: u64) -> u64 {
+        self.versions.get(&id).copied().unwrap_or(FIRST_VERSION)
     }
 
     /// The lookup outcome for a key this fixture holds: `Present` with its
@@ -630,9 +685,17 @@ impl Fixture {
         }
         let ids: Vec<u64> = ids.into_iter().collect();
         self.spec.check_ids(&ids)?;
-        let files = write_data_files(&self.table, &self.spec, ids.iter().copied(), prefix).await?;
+        let files = write_data_files(
+            &self.table,
+            &self.spec,
+            ids.iter().copied(),
+            prefix,
+            &|id| self.version_of(id),
+        )
+        .await?;
         self.commit_files(catalog, files).await?;
         self.ids.extend(ids);
+        self.remember_current();
         Ok(())
     }
 
@@ -648,7 +711,9 @@ impl Fixture {
         let schema = self.metadata.current_schema();
         let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
         let keys: Vec<Key> = ids.iter().map(|&id| self.key(id)).collect();
-        let rows = batch(&arrow_schema, &self.spec, ids, &keys)?;
+        let rows = batch(&arrow_schema, &self.spec, ids, &keys, &|id| {
+            self.version_of(id)
+        })?;
         let bounds = keys.first().cloned().zip(keys.last().cloned());
         RawFile::from_batch(
             name,
@@ -681,7 +746,9 @@ impl Fixture {
             file.bounds.as_ref(),
             DataContentType::Data,
         )?;
-        self.commit_files(catalog, vec![data_file]).await
+        self.commit_files(catalog, vec![data_file]).await?;
+        self.remember_current();
+        Ok(())
     }
 
     /// Commits `files` as one fast append and takes the table as the
@@ -713,23 +780,31 @@ impl Fixture {
     /// Commits `snapshot` by hand, past the catalog: one data manifest
     /// listing `snapshot.data`, one delete manifest listing
     /// `snapshot.deletes` when there are any, the manifest list, a snapshot
-    /// one id and one sequence number above the current with the current as
-    /// parent, and the metadata with the main branch moved to it, written
-    /// as `version_file(root, n)` for the `n`-th by-hand commit and named by
-    /// the version hint. A file the current snapshot lists is an existing
-    /// entry carrying the snapshot id and data sequence number it was added
-    /// at; every other file is added at the new sequence number. This is
-    /// how a snapshot carrying a delete file or dropping a data file is
-    /// produced, neither of which a fast append can commit. From here on the
-    /// table is followed through its root: its catalog record is behind, and
-    /// `append` and `append_raw` refuse with `SpecFault::CatalogBehind`.
+    /// with the current as parent, one sequence number above the table's
+    /// last and an id above every snapshot's, and the metadata with the main
+    /// branch moved to it, written as `version_file(root, n)` for the `n`-th
+    /// by-hand commit and named by the version hint. Manifests and the list
+    /// are written at the table's format version; a v3 snapshot carries the
+    /// row range its list assigns. A file the current snapshot lists is an
+    /// existing entry carrying the snapshot id and data sequence number it
+    /// was added at; every other file is added at the new sequence number.
+    /// This is how a snapshot carrying a delete file or dropping a data file
+    /// is produced, neither of which a fast append can commit. From here on
+    /// the table is followed through its root: its catalog record is behind,
+    /// and `append` and `append_raw` refuse with `SpecFault::CatalogBehind`.
     pub async fn commit_by_hand(&mut self, snapshot: HandSnapshot) -> Result<()> {
         let root = self.root().to_string();
-        let file_io = self.table.file_io();
-        let (parent, snapshot_id) = match self.metadata.current_snapshot() {
-            Some(current) => (Some(current.snapshot_id()), current.snapshot_id() + 1),
-            None => (None, FIRST_SNAPSHOT_ID),
-        };
+        let file_io = self.table.file_io().clone();
+        let parent = self
+            .metadata
+            .current_snapshot()
+            .map(|current| current.snapshot_id());
+        let snapshot_id = self
+            .metadata
+            .snapshots()
+            .map(|listed| listed.snapshot_id())
+            .max()
+            .map_or(FIRST_SNAPSHOT_ID, |last| last + 1);
         let sequence = self.metadata.last_sequence_number() + 1;
         let now = AddedBy {
             snapshot_id,
@@ -751,15 +826,20 @@ impl Fixture {
             manifests.push(self.write_hand_manifest(&path, files, deletes, now).await?);
         }
         let list_path = format!("{root}/{MANIFEST_DIR}/snap-{snapshot_id}{MANIFEST_SUFFIX}");
-        let mut list = ManifestListWriter::v2(
-            file_io.new_output(&list_path)?.writer().await?,
-            snapshot_id,
-            parent,
-            sequence,
-        );
+        let output = file_io.new_output(&list_path)?.writer().await?;
+        let first_row_id = self.metadata.next_row_id();
+        let mut list = match self.spec.format_version {
+            FormatVersion::V3 => {
+                ManifestListWriter::v3(output, snapshot_id, parent, sequence, Some(first_row_id))
+            }
+            FormatVersion::V1 | FormatVersion::V2 => {
+                ManifestListWriter::v2(output, snapshot_id, parent, sequence)
+            }
+        };
         list.add_manifests(manifests.into_iter())?;
+        let next_row_id = list.next_row_id();
         list.close().await?;
-        let committed = Snapshot::builder()
+        let builder = Snapshot::builder()
             .with_snapshot_id(snapshot_id)
             .with_parent_snapshot_id(parent)
             .with_sequence_number(sequence)
@@ -772,8 +852,13 @@ impl Fixture {
                 operation: Operation::Overwrite,
                 additional_properties: HashMap::new(),
             })
-            .with_schema_id(self.metadata.current_schema_id())
-            .build();
+            .with_schema_id(self.metadata.current_schema_id());
+        let committed = match next_row_id {
+            Some(next) => builder
+                .with_row_range(first_row_id, next - first_row_id)
+                .build(),
+            None => builder.build(),
+        };
         let metadata = self
             .metadata
             .clone()
@@ -781,14 +866,7 @@ impl Fixture {
             .set_branch_snapshot(committed, MAIN_BRANCH)?
             .build()?
             .metadata;
-        self.hand_commits += 1;
-        let location = version_file(&root, self.hand_commits);
-        file_io
-            .new_output(&location)?
-            .write(Bytes::from(serde_json::to_vec(&metadata)?))
-            .await?;
-        self.metadata = metadata;
-        self.metadata_location = location;
+        self.write_metadata(metadata).await?;
         self.added = snapshot
             .data
             .iter()
@@ -801,14 +879,89 @@ impl Fixture {
             .collect();
         self.files = snapshot.data;
         self.deletes = snapshot.deletes;
-        self.by_hand = true;
+        self.remember_current();
         self.write_hint().await
     }
 
+    /// Moves the main branch back, or forward, to `snapshot_id`, a snapshot
+    /// this fixture committed, as a rollback does, writing the metadata as
+    /// the next by-hand version and naming it in the version hint; the
+    /// fixture then holds what that snapshot listed. A snapshot it did not
+    /// commit is `SpecFault::UnknownSnapshot`.
+    pub async fn move_ref(&mut self, snapshot_id: i64) -> Result<()> {
+        let listing = self
+            .history
+            .get(&snapshot_id)
+            .cloned()
+            .ok_or(SpecFault::UnknownSnapshot { snapshot_id })?;
+        let branch = SnapshotReference::new(
+            snapshot_id,
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            },
+        );
+        let metadata = self
+            .metadata
+            .clone()
+            .into_builder(Some(self.metadata_location.clone()))
+            .set_ref(MAIN_BRANCH, branch)?
+            .build()?
+            .metadata;
+        self.write_metadata(metadata).await?;
+        self.ids = listing.ids;
+        self.versions = listing.versions;
+        self.files = listing.files;
+        self.deletes = listing.deletes;
+        self.added = listing.added;
+        self.write_hint().await
+    }
+
+    /// The current snapshot's id; `None` before the first commit.
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.metadata
+            .current_snapshot()
+            .map(|current| current.snapshot_id())
+    }
+
+    /// Writes `metadata` as the next by-hand version and takes it as the
+    /// table's; the version hint is the caller's to write.
+    async fn write_metadata(&mut self, metadata: TableMetadata) -> Result<()> {
+        self.hand_commits += 1;
+        let location = version_file(self.root(), self.hand_commits);
+        self.table
+            .file_io()
+            .new_output(&location)?
+            .write(Bytes::from(serde_json::to_vec(&metadata)?))
+            .await?;
+        self.metadata = metadata;
+        self.metadata_location = location;
+        self.by_hand = true;
+        Ok(())
+    }
+
+    /// Records what the current snapshot lists, for `move_ref`.
+    fn remember_current(&mut self) {
+        let Some(snapshot_id) = self.snapshot_id() else {
+            return;
+        };
+        self.history.insert(
+            snapshot_id,
+            Listing {
+                ids: self.ids.clone(),
+                versions: self.versions.clone(),
+                files: self.files.clone(),
+                deletes: self.deletes.clone(),
+                added: self.added.clone(),
+            },
+        );
+    }
+
     /// Writes one manifest of a by-hand commit at `path`, of delete files
-    /// when `deletes`: each of `files` the current snapshot lists as an
-    /// existing entry at the commit that added it, every other one added by
-    /// `now`.
+    /// when `deletes`, at the table's format version: each of `files` the
+    /// current snapshot lists as an existing entry at the commit that added
+    /// it, every other one added by `now`.
     async fn write_hand_manifest(
         &self,
         path: &str,
@@ -822,10 +975,11 @@ impl Fixture {
             Arc::clone(self.metadata.current_schema()),
             PartitionSpec::clone(self.metadata.default_partition_spec()),
         );
-        let mut writer = if deletes {
-            builder.build_v2_deletes()
-        } else {
-            builder.build_v2_data()
+        let mut writer = match (self.spec.format_version, deletes) {
+            (FormatVersion::V3, true) => builder.build_v3_deletes(),
+            (FormatVersion::V3, false) => builder.build_v3_data(),
+            (FormatVersion::V1 | FormatVersion::V2, true) => builder.build_v2_deletes(),
+            (FormatVersion::V1 | FormatVersion::V2, false) => builder.build_v2_data(),
         };
         for file in files {
             match self.added.get(file.file_path()) {
@@ -841,6 +995,181 @@ impl Fixture {
         Ok(writer.write_manifest_file().await?)
     }
 
+    /// Deletes the live row of every one of `ids` and commits the deletes
+    /// by hand in `form`, files named after `name`, beside every data file
+    /// and every delete file the current snapshot lists except a deletion
+    /// vector `form` replaces. The ids leave the fixture's (`ids`); an id
+    /// with no live row is `SpecFault::IdNotLive`.
+    pub async fn delete(&mut self, ids: &[u64], form: DeleteForm, name: &str) -> Result<()> {
+        let deletes = self.deletes_for(ids, form, name).await?;
+        for id in ids {
+            self.ids.remove(id);
+            self.versions.remove(id);
+        }
+        self.commit_by_hand(HandSnapshot {
+            data: self.files.clone(),
+            deletes,
+        })
+        .await
+    }
+
+    /// Rewrites every one of `ids` at its next version into new data files
+    /// named after `name`, deletes its live row in `form`, and commits both
+    /// by hand in one snapshot, as a merge-on-read `UPDATE` does: the new
+    /// rows and the deletes share its sequence number. An id with no live
+    /// row is `SpecFault::IdNotLive`.
+    pub async fn update(&mut self, ids: &[u64], form: DeleteForm, name: &str) -> Result<()> {
+        let deletes = self.deletes_for(ids, form, name).await?;
+        let next: HashMap<u64, u64> = ids
+            .iter()
+            .map(|&id| (id, self.version_of(id) + 1))
+            .collect();
+        let written = write_data_files(&self.table, &self.spec, ids.iter().copied(), name, &|id| {
+            next.get(&id).copied().unwrap_or(FIRST_VERSION)
+        })
+        .await?;
+        self.versions.extend(next);
+        let mut data = self.files.clone();
+        data.extend(written);
+        self.commit_by_hand(HandSnapshot { data, deletes }).await
+    }
+
+    /// The rows of `ids` at `version` as new data files named after
+    /// `prefix`, grouped by bucket as `append` writes them, not committed:
+    /// for a test that lists them in a `HandSnapshot` of its own. The
+    /// fixture's ids and versions do not change.
+    pub async fn write_rows(
+        &self,
+        ids: &[u64],
+        version: u64,
+        prefix: &str,
+    ) -> Result<Vec<DataFile>> {
+        write_data_files(
+            &self.table,
+            &self.spec,
+            ids.iter().copied(),
+            prefix,
+            &|_| version,
+        )
+        .await
+    }
+
+    /// The delete files of the current snapshot with the live rows of `ids`
+    /// deleted in `form`, the new ones written under `name`.
+    async fn deletes_for(
+        &self,
+        ids: &[u64],
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<Vec<DataFile>> {
+        let oracle = MergeOracle::read(self).await?;
+        let mut by_file: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for &id in ids {
+            let copy = oracle
+                .live_copy(&self.key(id))
+                .ok_or(SpecFault::IdNotLive { id })?;
+            by_file
+                .entry(copy.path.clone())
+                .or_default()
+                .push(copy.position);
+        }
+        let mut deletes = self.deletes.clone();
+        let file_io = self.table.file_io();
+        match form {
+            DeleteForm::Vectors => {
+                let mut vectors = Vec::new();
+                for (path, positions) in by_file {
+                    let mut rows: RoaringTreemap =
+                        oracle.deleted_positions(&path).into_iter().collect();
+                    rows.extend(positions);
+                    deletes.retain(|delete| {
+                        delete.file_format() != DataFileFormat::Puffin
+                            || delete.referenced_data_file().as_deref() != Some(path.as_str())
+                    });
+                    vectors.push(Vector {
+                        partition: self.partition_of(&path)?,
+                        spec_id: self.metadata.default_partition_spec_id(),
+                        data_file: path,
+                        positions: rows,
+                    });
+                }
+                let path = self.delete_path(&format!("{name}.puffin"));
+                deletes.extend(write_vectors(file_io, &path, &vectors).await?);
+            }
+            DeleteForm::ScopedPositions | DeleteForm::Positions => {
+                let scoped = form == DeleteForm::ScopedPositions;
+                for (at, group) in self.position_groups(by_file, scoped)?.iter().enumerate() {
+                    let delete_path = self.delete_path(&format!("{name}-{at}.parquet"));
+                    deletes.push(write_position_deletes(file_io, &delete_path, group).await?);
+                }
+            }
+        }
+        Ok(deletes)
+    }
+
+    /// The position delete files that delete `by_file`'s positions: one per
+    /// data file naming it as its referenced data file when `scoped`, else
+    /// one per partition naming none.
+    fn position_groups(
+        &self,
+        by_file: BTreeMap<String, Vec<u64>>,
+        scoped: bool,
+    ) -> Result<Vec<PositionDeletes>> {
+        let mut groups: Vec<PositionDeletes> = Vec::new();
+        for (path, positions) in by_file {
+            let partition = self.partition_of(&path)?;
+            let referenced = scoped.then(|| path.clone());
+            let rows = positions
+                .into_iter()
+                .map(|position| (path.clone(), position));
+            match groups
+                .iter_mut()
+                .find(|group| group.referenced == referenced && group.partition == partition)
+            {
+                Some(group) => group.rows.extend(rows),
+                None => groups.push(PositionDeletes {
+                    rows: rows.collect(),
+                    referenced,
+                    spec_id: self.metadata.default_partition_spec_id(),
+                    partition,
+                }),
+            }
+        }
+        Ok(groups)
+    }
+
+    /// The partition tuple the current snapshot records for the data file
+    /// at `path`; a file it does not list is `SpecFault::FileNotListed`.
+    pub(crate) fn partition_of(&self, path: &str) -> Result<Struct> {
+        self.files
+            .iter()
+            .find(|file| file.file_path() == path)
+            .map(|file| file.partition().clone())
+            .ok_or_else(|| {
+                SpecFault::FileNotListed {
+                    path: path.to_string(),
+                }
+                .into()
+            })
+    }
+
+    /// The location of a delete file `name`, extension included, under the
+    /// table's data directory.
+    pub fn delete_path(&self, name: &str) -> String {
+        format!("{}/{DATA_DIR}/{name}", self.root())
+    }
+
+    /// Every delete file the current snapshot lists, as its manifest
+    /// records it.
+    pub fn deletes(&self) -> &[DataFile] {
+        &self.deletes
+    }
+
+    /// The table's `FileIO`, which every fixture file is written through.
+    pub fn file_io(&self) -> &FileIO {
+        self.table.file_io()
+    }
+
     /// Rewrites every id written so far into new data files, ascending,
     /// grouped by bucket as a first build writes them, named after
     /// `prefix`, and commits them by hand as a snapshot that lists them in
@@ -849,8 +1178,14 @@ impl Fixture {
     /// target allows. The current snapshot's delete files stay listed, as
     /// a rewrite of data files leaves them, now older than every data file.
     pub async fn compact(&mut self, prefix: &str) -> Result<()> {
-        let data =
-            write_data_files(&self.table, &self.spec, self.ids.iter().copied(), prefix).await?;
+        let data = write_data_files(
+            &self.table,
+            &self.spec,
+            self.ids.iter().copied(),
+            prefix,
+            &|id| self.version_of(id),
+        )
+        .await?;
         self.commit_by_hand(HandSnapshot {
             data,
             deletes: self.deletes.clone(),
@@ -951,6 +1286,7 @@ pub async fn write_fixture(
         primitive_of(spec.key_type),
         PrimitiveType::Binary,
         spec.buckets,
+        spec.format_version,
     )
     .await?;
     let ids = spec.written_ids();
@@ -974,7 +1310,16 @@ pub async fn write_table_of_types(
     file: RawFile,
 ) -> Result<Fixture> {
     let key_type = KeyType::from_iceberg(&Type::Primitive(key.clone())).unwrap_or(KeyType::Binary);
-    let (table, ident) = create_table(catalog, namespace, name, key, value, buckets).await?;
+    let (table, ident) = create_table(
+        catalog,
+        namespace,
+        name,
+        key,
+        value,
+        buckets,
+        FormatVersion::V2,
+    )
+    .await?;
     let spec = FixtureSpec {
         ids: 0..0,
         buckets,
@@ -999,7 +1344,7 @@ fn primitive_of(key_type: KeyType) -> PrimitiveType {
 /// `KEY_FIELD_ID`), an optional `value` of `value` type (field
 /// `VALUE_FIELD_ID`, so a null value is a legal row per RFD 002),
 /// `bucket(buckets, key)` when `buckets` is above zero, and a sort order on
-/// the key. Creates the namespace when absent.
+/// the key, at format `format_version`. Creates the namespace when absent.
 async fn create_table(
     catalog: &dyn Catalog,
     namespace: &str,
@@ -1007,6 +1352,7 @@ async fn create_table(
     key: PrimitiveType,
     value: PrimitiveType,
     buckets: u32,
+    format_version: FormatVersion,
 ) -> Result<(Table, TableIdent)> {
     let namespace = NamespaceIdent::new(namespace.to_string());
     if !catalog.namespace_exists(&namespace).await? {
@@ -1043,6 +1389,7 @@ async fn create_table(
         .schema(schema)
         .partition_spec(partition_spec.build())
         .sort_order(sort_order)
+        .format_version(format_version)
         .build();
     let table = catalog.create_table(&namespace, creation).await?;
     Ok((table, TableIdent::new(namespace, name.to_string())))
@@ -1060,12 +1407,13 @@ struct BucketRows {
 /// bucket transform, in the given order within a bucket, through a
 /// `ClusteredWriter` over the rolling data file writer under
 /// `spec.layout`'s properties and file size target, in batches of
-/// `spec.layout.page_rows` rows.
+/// `spec.layout.page_rows` rows, each id's value at `version_of(id)`.
 pub(crate) async fn write_data_files(
     table: &Table,
     spec: &FixtureSpec,
     ids: impl IntoIterator<Item = u64>,
     prefix: &str,
+    version_of: &dyn Fn(u64) -> u64,
 ) -> Result<Vec<DataFile>> {
     let schema = table.metadata().current_schema().clone();
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema)?);
@@ -1095,7 +1443,10 @@ pub(crate) async fn write_data_files(
             .zip(rows.keys.chunks(batch_rows))
         {
             writer
-                .write(key.clone(), batch(&arrow_schema, spec, ids, keys)?)
+                .write(
+                    key.clone(),
+                    batch(&arrow_schema, spec, ids, keys, version_of)?,
+                )
                 .await?;
         }
     }
@@ -1132,21 +1483,23 @@ fn group_by_bucket(
     Ok(by_bucket)
 }
 
-/// One batch of `keys` with their values, a null for every id `spec.nulls`
-/// names, cast to the arrow types the library's schema conversion gives the
-/// two columns.
+/// One batch of `keys` with their values at `version_of` each id, a null
+/// for every id `spec.nulls` names, cast to the arrow types the library's
+/// schema conversion gives the two columns.
 fn batch(
     arrow_schema: &Arc<ArrowSchema>,
     spec: &FixtureSpec,
     ids: &[u64],
     keys: &[Key],
+    version_of: &dyn Fn(u64) -> u64,
 ) -> Result<RecordBatch> {
     let key = key_array(spec.key_type, keys);
     let values: BinaryArray = ids
         .iter()
         .zip(keys)
         .map(|(&id, key)| {
-            (!spec.is_null(id)).then(|| value_of_kind(key, spec.value_bytes, spec.value_kind))
+            (!spec.is_null(id))
+                .then(|| value_of_version(key, spec.value_bytes, spec.value_kind, version_of(id)))
         })
         .collect();
     let value: ArrayRef = Arc::new(values);

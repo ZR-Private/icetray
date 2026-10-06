@@ -1,14 +1,15 @@
 //! The one error type of the testkit: every library failure a fixture or
-//! an assertion can meet, one variant per source, plus the three faults
+//! an assertion can meet, one variant per source, plus the four faults
 //! this crate raises itself: a fixture specification the writer refuses, a
-//! helper called in a state it cannot measure, and a truth-file line that
-//! cannot be read. A test matches the variant; the message is for a person
+//! helper called in a state it cannot measure, a truth-file line that
+//! cannot be read, and a snapshot the merge-on-read oracle cannot answer
+//! for. A test matches the variant; the message is for a person
 //! reading the failure.
 
 use std::env::VarError;
 
-use icetray_core::KeyType;
 use icetray_core::config::Residency;
+use icetray_core::{Key, KeyType};
 
 use crate::golden::WAREHOUSE_VAR;
 use crate::truth::TruthFault;
@@ -57,6 +58,9 @@ pub enum TestkitError {
     /// A truth-file line that cannot be read.
     #[error("truth file: {0}")]
     Truth(#[from] TruthFault),
+    /// The merge-on-read oracle found a snapshot it cannot answer for.
+    #[error("merge oracle: {0}")]
+    Oracle(#[from] OracleFault),
 }
 
 impl From<s3s_fs::Error> for TestkitError {
@@ -94,6 +98,67 @@ pub enum SpecFault {
     /// table; only `commit_by_hand` may advance it from then on.
     #[error("the table has committed by hand and its catalog record is behind")]
     CatalogBehind,
+    /// A delete or update named an id whose key has no live row.
+    #[error("id {id} has no live row to delete")]
+    IdNotLive {
+        /// The id.
+        id: u64,
+    },
+    /// A data file the current snapshot does not list.
+    #[error("data file {path} is not listed")]
+    FileNotListed {
+        /// The file's location.
+        path: String,
+    },
+    /// `move_ref` named a snapshot this fixture did not commit.
+    #[error("snapshot {snapshot_id} was not committed by this fixture")]
+    UnknownSnapshot {
+        /// The snapshot id.
+        snapshot_id: i64,
+    },
+    /// A deletion vector longer than its four-byte length prefix can say.
+    #[error("a deletion vector of {bytes} bytes is past its length prefix's 4 GiB")]
+    VectorTooLong {
+        /// The bytes of the magic and the vector.
+        bytes: usize,
+    },
+    /// A value a delete file's manifest entry or row records as a long is
+    /// past the largest long.
+    #[error("{field} {value} is past the largest long")]
+    PastLong {
+        /// What the value is.
+        field: LongField,
+        /// The value.
+        value: u64,
+    },
+    /// A delete file entry the iceberg builder refuses for a missing
+    /// required field.
+    #[error("the manifest entry of delete file {path} is incomplete")]
+    DeleteEntryIncomplete {
+        /// The delete file's location.
+        path: String,
+    },
+}
+
+/// What a value `SpecFault::PastLong` names is; closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LongField {
+    /// A deletion vector's offset in its Puffin file.
+    Offset,
+    /// A deletion vector's length.
+    Length,
+    /// A position a position delete file deletes.
+    Position,
+}
+
+impl std::fmt::Display for LongField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Offset => "offset",
+            Self::Length => "length",
+            Self::Position => "position",
+        })
+    }
 }
 
 /// A helper asked to measure what it cannot, from the state it was given;
@@ -122,6 +187,71 @@ pub enum Precondition {
     /// The REST catalog is not named in the environment.
     #[error("{REST_URI_VAR} is not set")]
     RestUriUnset,
+}
+
+/// What the merge-on-read oracle (`merge_oracle`) finds in a snapshot that
+/// leaves a key without one answer; closed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OracleFault {
+    /// Two live rows hold one key.
+    #[error("key {key} is live in {first} and {second}")]
+    LiveDuplicate {
+        /// The key.
+        key: Key,
+        /// The data file of one live copy.
+        first: String,
+        /// The data file of another.
+        second: String,
+    },
+    /// Two deletion vectors apply to one data file.
+    #[error("two deletion vectors apply to {data_file}")]
+    TwoVectors {
+        /// The data file's location.
+        data_file: String,
+    },
+    /// A deletion vector whose blob does not decode or contradicts its
+    /// manifest entry.
+    #[error("deletion vector in {path} is malformed")]
+    MalformedVector {
+        /// The Puffin file's location.
+        path: String,
+    },
+    /// A position delete file names a negative position.
+    #[error("position delete file {path} names a negative position")]
+    NegativePosition {
+        /// The delete file's location.
+        path: String,
+    },
+    /// A live equality delete, which the oracle does not apply.
+    #[error("equality delete {path} is live")]
+    EqualityDelete {
+        /// The delete file's location.
+        path: String,
+    },
+    /// A live entry whose data sequence number iceberg could not inherit.
+    #[error("file {path} has no data sequence number")]
+    NoSequence {
+        /// The file's location.
+        path: String,
+    },
+    /// A column a file lacks.
+    #[error("{path} has no column {column}")]
+    MissingColumn {
+        /// The file's location.
+        path: String,
+        /// The column.
+        column: String,
+    },
+    /// A column of a type the oracle does not read.
+    #[error("column {column} of {path} is {found}")]
+    UnexpectedColumn {
+        /// The file's location.
+        path: String,
+        /// The column.
+        column: String,
+        /// What the file holds instead.
+        found: String,
+    },
 }
 
 /// The result type of every fallible operation in this crate.
