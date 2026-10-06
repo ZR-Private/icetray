@@ -220,9 +220,10 @@ impl Generation {
             .iter()
             .map(|member| Arc::clone(&member.file))
             .collect();
-        let routes = routes(&files);
-        let groups = overlap_groups(&files, &routes);
-        let overlapping = widest_per_bucket(&files, &groups);
+        let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
+        let routes = routes(&spans);
+        let groups = overlap_groups(&spans, &routes);
+        let overlapping = widest_per_bucket(&spans, &groups);
         let to_verify: Vec<Vec<usize>> = groups
             .into_iter()
             .filter(|group| !group.iter().all(|&at| members[at].reused))
@@ -431,14 +432,39 @@ fn file_order(a: &LoadedFile, b: &LoadedFile) -> Ordering {
         .then_with(|| a.entry.path.cmp(&b.entry.path))
 }
 
-/// The routes of `files`, which are in `file_order`.
-fn routes(files: &[Arc<LoadedFile>]) -> Routes {
+/// One file as the overlap sweep sees it: the bucket its manifest entry
+/// files it under and its exact first and last key. A span's position in
+/// its slice stands for the file's.
+#[derive(Clone, Copy, Debug)]
+struct Span<'a> {
+    bucketing: Option<Bucketing>,
+    bucket: u32,
+    first: &'a Key,
+    last: &'a Key,
+}
+
+impl<'a> Span<'a> {
+    /// The span of an indexed file, its key range decoded at build.
+    fn of(file: &'a LoadedFile) -> Self {
+        let (first, last) = file.index.key_range();
+        Self {
+            bucketing: file.entry.bucketing,
+            bucket: file.entry.bucket,
+            first,
+            last,
+        }
+    }
+}
+
+/// The routes of `spans`, which are in file order: by bucketing, then
+/// bucket, then first key.
+fn routes(spans: &[Span<'_>]) -> Routes {
     let mut routes = Routes::new();
-    for (at, file) in files.iter().enumerate() {
+    for (at, span) in spans.iter().enumerate() {
         routes
-            .entry(file.entry.bucketing)
+            .entry(span.bucketing)
             .or_default()
-            .entry(file.entry.bucket)
+            .entry(span.bucket)
             .or_default()
             .push(at);
     }
@@ -674,14 +700,12 @@ fn refuse_any_key_outside_bucket(table: &str, file: &LoadedFile, chunks: &Segmen
     Ok(())
 }
 
-/// Whether the exact key ranges of two files intersect.
-fn intersects(a: &LoadedFile, b: &LoadedFile) -> bool {
-    let (a_first, a_last) = a.index.key_range();
-    let (b_first, b_last) = b.index.key_range();
-    a_first <= b_last && b_first <= a_last
+/// Whether the key ranges of two spans intersect.
+fn intersects(a: &Span<'_>, b: &Span<'_>) -> bool {
+    a.first <= b.last && b.first <= a.last
 }
 
-/// A disjoint-set forest over positions in a generation's files.
+/// A disjoint-set forest over positions in a slice of spans.
 struct Components {
     parent: Vec<usize>,
 }
@@ -727,22 +751,22 @@ impl Components {
     }
 }
 
-/// The overlap groups of `files` (RFD 005): the connected components of
-/// "may hold a key in common", where two files may when their exact key
-/// ranges intersect and one key can fall in both their buckets
+/// The overlap groups of `spans` (RFD 005), whose `routes` are given: the
+/// connected components of "may hold a key in common", where two files may
+/// when their key ranges intersect and one key can fall in both their buckets
 /// (`buckets_may_share_a_key`). Within one bucket the files are in
 /// first-key order, so a file joins the running group exactly when it
 /// starts at or before the group's greatest last key; across two
 /// bucketings, which a table carries only after a spec evolution, every
 /// intersecting pair of files in buckets a key can share is linked, a
 /// pairwise pass whose cost is accepted for that rare case.
-fn overlap_groups(files: &[Arc<LoadedFile>], routes: &Routes) -> Vec<Vec<usize>> {
-    let mut components = Components::new(files.len());
+fn overlap_groups(spans: &[Span<'_>], routes: &Routes) -> Vec<Vec<usize>> {
+    let mut components = Components::new(spans.len());
     for buckets in routes.values() {
         for members in buckets.values() {
             let mut open: Option<(usize, &Key)> = None;
             for &at in members {
-                let (first, last) = files[at].index.key_range();
+                let Span { first, last, .. } = spans[at];
                 match open {
                     Some((member, group_last)) if first <= group_last => {
                         components.link(member, at);
@@ -761,17 +785,17 @@ fn overlap_groups(files: &[Arc<LoadedFile>], routes: &Routes) -> Vec<Vec<usize>>
         .collect();
     for (at, ours) in per_bucketing.iter().enumerate() {
         for theirs in &per_bucketing[at + 1..] {
-            link_across_bucketings(&mut components, files, *ours, *theirs);
+            link_across_bucketings(&mut components, spans, *ours, *theirs);
         }
     }
     components.groups()
 }
 
-/// Links every pair of files, one under each bucketing, whose exact key
-/// ranges intersect and whose buckets one key can fall in at once.
+/// Links every pair of spans, one under each bucketing, whose key ranges
+/// intersect and whose buckets one key can fall in at once.
 fn link_across_bucketings(
     components: &mut Components,
-    files: &[Arc<LoadedFile>],
+    spans: &[Span<'_>],
     (ours, our_buckets): (Option<Bucketing>, &Buckets),
     (theirs, their_buckets): (Option<Bucketing>, &Buckets),
 ) {
@@ -782,7 +806,7 @@ fn link_across_bucketings(
             }
             for &a in our_members {
                 for &b in their_members {
-                    if intersects(&files[a], &files[b]) {
+                    if intersects(&spans[a], &spans[b]) {
                         components.link(a, b);
                     }
                 }
@@ -818,11 +842,11 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 }
 
 /// Per bucket a group member is in, the widest group touching it.
-fn widest_per_bucket(files: &[Arc<LoadedFile>], groups: &[Vec<usize>]) -> BTreeMap<u32, usize> {
+fn widest_per_bucket(spans: &[Span<'_>], groups: &[Vec<usize>]) -> BTreeMap<u32, usize> {
     let mut widest = BTreeMap::new();
     for group in groups {
         for &at in group {
-            let entry = widest.entry(files[at].entry.bucket).or_insert(0);
+            let entry = widest.entry(spans[at].bucket).or_insert(0);
             *entry = (*entry).max(group.len());
         }
     }
@@ -2430,7 +2454,8 @@ mod tests {
         let mut files = files.to_vec();
         files.sort_by(|a, b| file_order(a, b));
         let files = &files;
-        overlap_groups(files, &routes(files))
+        let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
+        overlap_groups(&spans, &routes(&spans))
             .into_iter()
             .map(|group| {
                 group
