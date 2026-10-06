@@ -1153,17 +1153,20 @@ impl Table {
     ) -> Attempt<()> {
         let config = self.config();
         let admitted: Result<()> = async {
-            let mut planned = Generation::plan_load(
+            // The footer stage and the chunk stage are boxed: inline, the
+            // larger of them puts a refresh's future over the size
+            // clippy::large_futures allows a future that is moved.
+            let mut planned = Box::pin(Generation::plan_load(
                 &config,
                 resolved,
                 snapshot,
                 &self.storage,
                 Arc::clone(&self.hedge),
                 previous.map(Arc::as_ref),
-            )
+            ))
             .await?;
             planned.judge_level(self.local.as_ref()).await?;
-            let generation = planned.build(self.local.as_ref()).await?;
+            let generation = Box::pin(planned.build(self.local.as_ref())).await?;
             let findings = self.gate(&generation, &config)?;
             self.swap(generation, previous, &findings, config.lookups());
             self.remember(&resolved.location, None);
@@ -1596,7 +1599,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::config::{Residency, ServerConfig};
-    use crate::error::{Budget, ErrorKind};
+    use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, RESOLVE_GETS, SECOND_SEQUENCE,
@@ -3598,22 +3601,25 @@ mod tests {
         );
     }
 
-    /// A snapshot refused for a delete file (RFD 009) is remembered against
-    /// its metadata location: while the version hint names that location
-    /// each poll reads the hint alone, counts no error, and leaves the
-    /// table degraded for the refusal, a transient failure in between
-    /// included; once the hint names another location, its snapshot is
-    /// built.
+    /// A snapshot refused for a delete file icetray cannot read (RFD 021)
+    /// is remembered against its metadata location: while the version hint
+    /// names that location each poll reads the hint alone, counts no error,
+    /// and leaves the table degraded for the refusal, a transient failure
+    /// in between included; once the hint names another location, its
+    /// snapshot is built.
     #[test]
     fn test_refresh_does_not_build_a_refused_snapshot_again_until_its_location_moves() {
-        let refused = ErrorKind::Refused(RefusalReason::DeleteFiles);
+        let deletes = "deletes";
         let serving = Some(SnapshotId(FIRST_SNAPSHOT));
-        let ((), series) = recorded(async {
+        let (refused, series) = recorded(async {
             let (mut fixture, all) = two_bucket_table().await;
+            let refused = ErrorKind::Refused(RefusalReason::DeleteKindUnsupported {
+                path: fixture.path_of(deletes),
+                kind: UnsupportedDelete::AvroPositions,
+            });
             let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
             table.load().await.unwrap();
-            let deletes = "deletes";
-            fixture.add_position_delete(deletes, 0);
+            fixture.add_avro_position_delete(deletes, 0);
             fixture
                 .commit(
                     SECOND_SNAPSHOT,
@@ -3669,6 +3675,7 @@ mod tests {
             let before = fixture.gets();
             assert!(!table.refresh().await.unwrap());
             assert_eq!(fixture.gets(), before + POLL_GETS);
+            refused
         });
         let errors = |reason: &ErrorKind| {
             series.counter(

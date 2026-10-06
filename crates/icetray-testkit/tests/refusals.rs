@@ -40,10 +40,8 @@ const RAW_INT_KEYS: [i32; 3] = [0, 3, 6];
 /// The position of the null in the null-key raw file.
 const NULL_KEY_AT: usize = 1;
 
-/// The name of every raw file under its table's data directory, and of the
-/// delete file a by-hand snapshot lists.
+/// The name of every raw file under its table's data directory.
 const RAW_FILE: &str = "raw.parquet";
-const DELETE_FILE: &str = "deletes.parquet";
 
 /// Records and bytes the manifest records for the delete file that need
 /// not exist.
@@ -348,24 +346,6 @@ async fn refused_through_root(fixture: &Fixture) -> Result<Refused> {
 /// The location of delete file `name` under `fixture`'s data directory.
 fn delete_path(fixture: &Fixture, name: &str) -> String {
     format!("{}/{DATA_DIR}/{name}", fixture.root())
-}
-
-#[tokio::test]
-async fn test_delete_file_is_refused() -> Result<()> {
-    let (_dir, catalog) = local_catalog().await?;
-    let mut fixture = unpartitioned_fixture(&catalog, "kv_deletes").await?;
-    let delete = position_delete_file(
-        &delete_path(&fixture, DELETE_FILE),
-        fixture.metadata().default_partition_spec_id(),
-        Struct::empty(),
-        DELETE_RECORDS,
-        DELETE_BYTES,
-        DataFileFormat::Parquet,
-    )?;
-    commit_deletes(&mut fixture, vec![delete]).await?;
-    let refused = refused_through_root(&fixture).await?;
-    assert_eq!(refused.reason, RefusalReason::DeleteFiles);
-    Ok(())
 }
 
 /// A position delete file in Avro is refused from its manifest entry, before

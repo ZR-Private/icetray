@@ -1836,6 +1836,7 @@ mod tests {
             size: 0,
             key_min,
             key_max,
+            partition: crate::manifest::Partition::unpartitioned(),
         };
         assert!(bounds_intact(
             &entry(Some(first.clone()), Some(last.clone())),

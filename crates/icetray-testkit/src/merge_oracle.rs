@@ -20,15 +20,15 @@ use bytes::Bytes;
 use iceberg::io::FileIO;
 use iceberg::puffin::PuffinReader;
 use iceberg::spec::{DataContentType, DataFile, DataFileFormat, ManifestList};
+use icetray_core::deletes::{
+    CARDINALITY_PROPERTY, FILE_PATH_COLUMN, POS_COLUMN, REFERENCED_DATA_FILE_PROPERTY,
+};
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{Key, Value};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
-use crate::delete_files::{
-    CARDINALITY_PROPERTY, FILE_PATH_COLUMN, POS_COLUMN, REFERENCED_DATA_FILE_PROPERTY,
-    VECTOR_FRAME_BYTES, VECTOR_MAGIC,
-};
+use crate::delete_files::{VECTOR_FRAME_BYTES, VECTOR_MAGIC};
 use crate::error::{OracleFault, Result};
 use crate::fixture::Fixture;
 use crate::layout::{KEY_COLUMN, VALUE_COLUMN};

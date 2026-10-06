@@ -8,12 +8,13 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestEntry,
     ManifestFile, ManifestList, ManifestStatus, PartitionSpec, PrimitiveLiteral, PrimitiveType,
-    Snapshot, TableMetadata, Transform, Type,
+    Snapshot, Struct, TableMetadata, Transform, Type,
 };
 
 use crate::bucket;
@@ -251,6 +252,35 @@ pub struct DataFileEntry {
     pub key_min: Option<Key>,
     /// The manifest's upper bound on the key, under the same terms.
     pub key_max: Option<Key>,
+    /// The file's partition, which an unscoped position delete must share
+    /// to apply to it (RFD 021).
+    pub(crate) partition: Partition,
+}
+
+/// A content file's partition as Iceberg's scan planning compares two for
+/// a delete to apply: the spec its manifest is written under and its
+/// partition tuple, equal only when both are. The tuple is shared by every
+/// entry of one listing that carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Partition {
+    spec_id: i32,
+    values: Arc<Struct>,
+}
+
+#[cfg(test)]
+impl Partition {
+    /// The partition of a file under spec `spec_id` with tuple `values`.
+    pub(crate) fn new(spec_id: i32, values: Struct) -> Self {
+        Self {
+            spec_id,
+            values: Arc::new(values),
+        }
+    }
+
+    /// The one partition of an unpartitioned spec 0.
+    pub(crate) fn unpartitioned() -> Self {
+        Self::new(0, Struct::empty())
+    }
 }
 
 /// One live delete file of a snapshot that icetray can read, as its
@@ -261,6 +291,37 @@ pub(crate) struct DeleteFileEntry {
     /// The file's location: the position delete file, or the Puffin file
     /// holding the vector.
     pub(crate) path: String,
+    /// The rows it deletes, from the manifest: a vector's cardinality, a
+    /// position delete file's row count.
+    pub(crate) records: u64,
+    /// The file's size in bytes, from the manifest; a Puffin footer is
+    /// read from the end of it.
+    pub(crate) size: u64,
+    /// Its data sequence number, as `DataFileEntry::sequence` is found.
+    pub(crate) sequence: SequenceNumber,
+    /// The one data file it applies to, when the entry names one; a
+    /// vector always does.
+    pub(crate) referenced: Option<String>,
+    /// Its partition; a position delete file that names no data file
+    /// applies only to the files of this one.
+    pub(crate) partition: Partition,
+    /// What it is.
+    pub(crate) kind: DeleteKind,
+}
+
+/// What a readable delete file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteKind {
+    /// A Parquet position delete file.
+    Positions,
+    /// A deletion vector: the blob at `offset` of `length` bytes in a
+    /// Puffin file.
+    Vector {
+        /// The blob's offset in the Puffin file.
+        offset: u64,
+        /// The blob's length.
+        length: u64,
+    },
 }
 
 /// A snapshot's live files (`list_files`).
@@ -295,7 +356,9 @@ pub(crate) struct SnapshotFiles {
 /// A delete file is classified wherever it is listed (`classify_delete`).
 /// Refused, after every manifest is read so that the verdict is the same
 /// for the same manifests in any order: first the position delete file in
-/// Avro or ORC with the least path, as
+/// Avro or ORC with the least path among those that may apply to a data
+/// file of the snapshot (`Listed::applying_unsupported`; one that provably
+/// applies to none is dropped), as
 /// `RefusalReason::DeleteKindUnsupported`; then the equality delete with
 /// the least path among those above the least data sequence number of the
 /// snapshot's data files, which may delete rows of that file, as
@@ -329,6 +392,7 @@ pub(crate) async fn list_files(
         .try_collect()
         .await?;
     let mut listed = Listed::default();
+    let mut partitions: HashMap<(i32, &Struct), Partition> = HashMap::new();
     for (file, manifest) in &manifests {
         let spec = md
             .partition_spec_by_id(file.partition_spec_id)
@@ -348,6 +412,13 @@ pub(crate) async fn list_files(
             }
             let data_file = entry.data_file();
             let sequence = data_sequence(table, entry, file)?;
+            let partition = partitions
+                .entry((file.partition_spec_id, data_file.partition()))
+                .or_insert_with(|| Partition {
+                    spec_id: file.partition_spec_id,
+                    values: Arc::new(data_file.partition().clone()),
+                })
+                .clone();
             match data_file.content_type() {
                 DataContentType::Data => {
                     let (bucketing, bucket) = match bucket_field {
@@ -366,10 +437,11 @@ pub(crate) async fn list_files(
                         size: data_file.file_size_in_bytes(),
                         key_min: key_bound(data_file.lower_bounds(), layout.key_field_id),
                         key_max: key_bound(data_file.upper_bounds(), layout.key_field_id),
+                        partition,
                     });
                 }
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    classify_delete(table, data_file, sequence, &mut listed)?;
+                    classify_delete(table, data_file, sequence, partition, &mut listed)?;
                 }
             }
         }
@@ -384,21 +456,26 @@ struct Listed {
     data: Vec<DataFileEntry>,
     deletes: Vec<DeleteFileEntry>,
     /// The position delete files icetray cannot read.
-    unsupported: Vec<(String, UnsupportedDelete)>,
+    unsupported: Vec<Unsupported>,
     /// Every equality delete, by path, with its data sequence number.
     equality: Vec<(String, SequenceNumber)>,
+}
+
+/// A position delete file icetray cannot read, with what decides whether
+/// it may apply to a data file.
+struct Unsupported {
+    path: String,
+    kind: UnsupportedDelete,
+    sequence: SequenceNumber,
+    referenced: Option<String>,
+    partition: Partition,
 }
 
 impl Listed {
     /// The refusals `list_files` documents, else the files, the data files
     /// in order.
     fn judge(mut self, table: &str) -> Result<SnapshotFiles> {
-        if let Some((path, kind)) = self
-            .unsupported
-            .iter()
-            .min_by_key(|&(path, _)| path)
-            .cloned()
-        {
+        if let Some(Unsupported { path, kind, .. }) = self.applying_unsupported() {
             return Err(Error::refused(
                 table,
                 RefusalReason::DeleteKindUnsupported { path, kind },
@@ -422,46 +499,101 @@ impl Listed {
             deletes: self.deletes,
         })
     }
+
+    /// Of the unreadable position deletes that may apply to a data file of
+    /// the snapshot, the one with the least path. One that names a data
+    /// file applies only to that file, when the snapshot lists it at a
+    /// sequence number no greater than its own; one that names none, only
+    /// to a file of its partition at such a number. Any other provably
+    /// applies to nothing and is dropped, as a dangling readable delete
+    /// is never read.
+    fn applying_unsupported(&mut self) -> Option<Unsupported> {
+        let by_path: HashMap<&str, SequenceNumber> = self
+            .data
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.sequence))
+            .collect();
+        let mut oldest: HashMap<&Partition, SequenceNumber> = HashMap::new();
+        for entry in &self.data {
+            oldest
+                .entry(&entry.partition)
+                .and_modify(|held| *held = (*held).min(entry.sequence))
+                .or_insert(entry.sequence);
+        }
+        let least = self
+            .unsupported
+            .iter()
+            .enumerate()
+            .filter(|(_, delete)| {
+                let target = match &delete.referenced {
+                    Some(referenced) => by_path.get(referenced.as_str()),
+                    None => oldest.get(&delete.partition),
+                };
+                target.is_some_and(|&sequence| sequence <= delete.sequence)
+            })
+            .min_by_key(|(_, delete)| &delete.path)
+            .map(|(at, _)| at)?;
+        Some(self.unsupported.swap_remove(least))
+    }
 }
 
-/// Files the live delete file `data_file` at `sequence` into `listed`: an
-/// equality delete for judging; a position delete file by its format, a
-/// Parquet one as readable, an Avro or ORC one as unsupported, and a Puffin
-/// one as a readable deletion vector, whose entry must name its data file
-/// and its blob's offset and length, each non-negative, or it is
-/// `TableFault::VectorUnplaced`.
+/// Files the live delete file `data_file` at `sequence` in `partition`
+/// into `listed`: an equality delete for judging; a position delete file
+/// by its format, a Parquet one as readable, an Avro or ORC one as
+/// unsupported, and a Puffin one as a readable deletion vector, whose entry
+/// must name its data file and its blob's offset and length, each
+/// non-negative, or it is `TableFault::VectorUnplaced`.
 fn classify_delete(
     table: &str,
     data_file: &DataFile,
     sequence: SequenceNumber,
+    partition: Partition,
     listed: &mut Listed,
 ) -> Result<()> {
     let path = data_file.file_path().to_string();
-    let unsupported = match (data_file.content_type(), data_file.file_format()) {
+    let kind = match (data_file.content_type(), data_file.file_format()) {
         (DataContentType::EqualityDeletes, _) => {
             listed.equality.push((path, sequence));
             return Ok(());
         }
-        (_, DataFileFormat::Avro) => Some(UnsupportedDelete::AvroPositions),
-        (_, DataFileFormat::Orc) => Some(UnsupportedDelete::OrcPositions),
-        (_, DataFileFormat::Parquet) => None,
+        (_, DataFileFormat::Avro) => Err(UnsupportedDelete::AvroPositions),
+        (_, DataFileFormat::Orc) => Err(UnsupportedDelete::OrcPositions),
+        (_, DataFileFormat::Parquet) => Ok(DeleteKind::Positions),
         (_, DataFileFormat::Puffin) => {
-            let placed = |value: Option<i64>| value.is_some_and(|value| value >= 0);
-            if data_file.referenced_data_file().is_none()
-                || !placed(data_file.content_offset())
-                || !placed(data_file.content_size_in_bytes())
-            {
-                return Err(Error::table_fault(
-                    table,
-                    TableFault::VectorUnplaced { path },
-                ));
+            let placed = |value: Option<i64>| value.and_then(|value| u64::try_from(value).ok());
+            match (
+                data_file.referenced_data_file(),
+                placed(data_file.content_offset()),
+                placed(data_file.content_size_in_bytes()),
+            ) {
+                (Some(_), Some(offset), Some(length)) => Ok(DeleteKind::Vector { offset, length }),
+                _unplaced => {
+                    return Err(Error::table_fault(
+                        table,
+                        TableFault::VectorUnplaced { path },
+                    ));
+                }
             }
-            None
         }
     };
-    match unsupported {
-        Some(kind) => listed.unsupported.push((path, kind)),
-        None => listed.deletes.push(DeleteFileEntry { path }),
+    let referenced = data_file.referenced_data_file();
+    match kind {
+        Err(kind) => listed.unsupported.push(Unsupported {
+            path,
+            kind,
+            sequence,
+            referenced,
+            partition,
+        }),
+        Ok(kind) => listed.deletes.push(DeleteFileEntry {
+            path,
+            records: data_file.record_count(),
+            size: data_file.file_size_in_bytes(),
+            sequence,
+            referenced,
+            partition,
+            kind,
+        }),
     }
     Ok(())
 }
@@ -800,6 +932,9 @@ pub(crate) mod testing {
     pub(crate) enum DeleteSpec {
         /// A position delete file in the given format.
         Positions(DataFileFormat),
+        /// A position delete file in the given format whose entry names
+        /// the given referenced data file.
+        ScopedPositions(DataFileFormat, String),
         /// A deletion vector in a Puffin file, with the fields its manifest
         /// entry records as given.
         Vector {
@@ -811,11 +946,11 @@ pub(crate) mod testing {
         Equality,
     }
 
-    /// The rows a fixture delete file entry records it deletes. No test
-    /// reads the count, and nothing is written at the entry's path.
-    const DELETE_RECORDS: u64 = 1;
+    /// The rows a fixture delete file entry records it deletes; nothing is
+    /// written at the entry's path.
+    pub(crate) const DELETE_RECORDS: u64 = 1;
     /// The bytes a fixture delete file entry records, under the same terms.
-    const DELETE_BYTES: u64 = 1;
+    pub(crate) const DELETE_BYTES: u64 = 1;
 
     /// A delete file entry at `path` under `spec_id` as `spec` describes
     /// it, of `DELETE_RECORDS` rows and `DELETE_BYTES` bytes; nothing is
@@ -838,6 +973,12 @@ pub(crate) mod testing {
                 builder
                     .content(DataContentType::PositionDeletes)
                     .file_format(format);
+            }
+            DeleteSpec::ScopedPositions(format, referenced) => {
+                builder
+                    .content(DataContentType::PositionDeletes)
+                    .file_format(format)
+                    .referenced_data_file(Some(referenced));
             }
             DeleteSpec::Vector {
                 referenced,
@@ -1453,6 +1594,10 @@ mod tests {
             size: SIZE,
             key_min: bounds.map(|(min, _)| Key::Long(min)),
             key_max: bounds.map(|(_, max)| Key::Long(max)),
+            partition: Partition::new(
+                spec_id,
+                testing::partition(testing::Partition::Bucket(bucket)),
+            ),
         };
         assert_eq!(
             entries,
@@ -1557,9 +1702,37 @@ mod tests {
             .unwrap();
         assert_eq!(storage.stats().gets(), 3, "the list and both manifests");
         assert_eq!(files.data.len(), 1);
+        let mut deletes = files.deletes.clone();
+        deletes.sort_by(|a, b| a.path.cmp(&b.path));
+        let entry = |name: &str, sequence: i64, referenced: Option<String>, kind: DeleteKind| {
+            DeleteFileEntry {
+                path: data_path(&root, name),
+                records: testing::DELETE_RECORDS,
+                size: testing::DELETE_BYTES,
+                sequence: SequenceNumber(sequence),
+                referenced,
+                partition: Partition::new(
+                    spec_id,
+                    testing::partition(testing::Partition::Bucket(1)),
+                ),
+                kind,
+            }
+        };
         assert_eq!(
-            delete_paths(&files),
-            [data_path(&root, "d0"), data_path(&root, "v0")]
+            deletes,
+            [
+                entry("d0", SEQUENCE_A, None, DeleteKind::Positions),
+                entry(
+                    "v0",
+                    SEQUENCE_B,
+                    Some(f0.clone()),
+                    DeleteKind::Vector {
+                        offset: u64::try_from(offset).unwrap(),
+                        length: u64::try_from(length).unwrap(),
+                    }
+                ),
+            ],
+            "an existing entry keeps its sequence number and an added one inherits the manifest's"
         );
     }
 
@@ -1794,12 +1967,53 @@ mod tests {
                     refusal_of(listed_across(&root, data(), delete_manifests).await),
                     RefusalReason::DeleteKindUnsupported {
                         path: data_path(&root, "y_positions"),
-                        kind,
+                        kind: kind.clone(),
                     },
                     "{format:?} in either manifest order"
                 );
             }
         }
+    }
+
+    /// An Avro or ORC position delete that provably applies to nothing is
+    /// dropped, as a dangling readable delete is: one older than every
+    /// data file, one naming a data file the snapshot does not list, and
+    /// one naming a listed file newer than itself. One that may apply is
+    /// refused.
+    #[tokio::test]
+    async fn test_list_files_drops_unreadable_position_deletes_that_apply_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let data = || {
+            vec![(
+                unpartitioned_data(&root, "new"),
+                Written::AddedAt(SEQUENCE_B),
+            )]
+        };
+        let avro = DataFileFormat::Avro;
+        let scoped = |name: &str, referenced: &str, written| {
+            let spec = DeleteSpec::ScopedPositions(avro, data_path(&root, referenced));
+            (unpartitioned_delete(&root, name, spec), written)
+        };
+        let dangling = vec![
+            (
+                unpartitioned_delete(&root, "older", DeleteSpec::Positions(avro)),
+                Written::Existing(SEQUENCE_A),
+            ),
+            scoped("gone", "gone", Written::Added),
+            scoped("before", "new", Written::Existing(SEQUENCE_A)),
+        ];
+        let files = listed(&root, data(), dangling.clone()).await.unwrap();
+        assert!(files.deletes.is_empty());
+        let mut applying = dangling;
+        applying.push(scoped("same", "new", Written::Added));
+        assert_eq!(
+            refusal_of(listed(&root, data(), applying).await),
+            RefusalReason::DeleteKindUnsupported {
+                path: data_path(&root, "same"),
+                kind: UnsupportedDelete::AvroPositions,
+            }
+        );
     }
 
     #[tokio::test]

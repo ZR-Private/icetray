@@ -653,6 +653,23 @@ pub(crate) fn with_dictionary_one_entry_short(file: &Bytes, leaf: usize) -> (Byt
     (patched, num_values)
 }
 
+/// `file` with the header of row group 0's first data page in its `leaf`
+/// chunk claiming `claimed` values, in place (`with_claim_in_place`).
+pub(crate) fn with_first_data_page_claiming(file: &Bytes, leaf: usize, claimed: i32) -> Bytes {
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .parse_and_finish(file)
+        .unwrap();
+    with_claim_in_place(
+        file,
+        &metadata,
+        leaf,
+        ChunkPage::Data(0),
+        HeaderField::NumValues,
+        claimed,
+    )
+}
+
 /// `chunk`, the bytes of a column chunk that starts with a data page, with
 /// that page's header claiming `claimed` values, in a varint as wide as the
 /// one it replaces, so no byte after it moves.

@@ -431,7 +431,7 @@ impl RawFile {
 pub struct HandSnapshot {
     /// Every data file of the snapshot.
     pub data: Vec<DataFile>,
-    /// The delete files of the snapshot; any bytes, since content decides.
+    /// The delete files of the snapshot.
     pub deletes: Vec<DataFile>,
 }
 
@@ -1608,8 +1608,9 @@ fn data_file(
 }
 
 /// A position-delete file entry at `path` in `format` under `spec_id` with
-/// `partition` as its tuple, for `HandSnapshot::deletes`: the file need not
-/// exist, since the manifest alone decides every refusal it meets.
+/// `partition` as its tuple, for `HandSnapshot::deletes`, with nothing
+/// written there: for a format icetray refuses from the manifest alone,
+/// Avro or ORC. A Parquet one is read, and `delete_files` writes it.
 pub fn position_delete_file(
     path: &str,
     spec_id: i32,

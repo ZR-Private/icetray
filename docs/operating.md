@@ -193,8 +193,8 @@ The label values:
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
   `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,
-  `delete_files`, `equality_deletes`, `delete_kind_unsupported`,
-  `key_too_long`, `over_budget`, `no_bloom_filter`, `below_level`), or an
+  `equality_deletes`, `delete_kind_unsupported`, `key_too_long`,
+  `over_budget`, `no_bloom_filter`, `below_level`), or an
   error kind (`iceberg`, `parquet`, `object_store`, `object_store_path`,
   `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`,
   `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`,

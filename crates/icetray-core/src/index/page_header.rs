@@ -31,10 +31,11 @@ use std::mem::size_of;
 use std::ops::Range;
 
 use bytes::Bytes;
-use parquet::basic::{Encoding, PageType};
+use parquet::basic::{Encoding, PageType, Type as PhysicalType};
 use parquet::column::page::Page;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::ParquetError;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::ChunkReader;
 
 use super::{ColumnChunk, FileFault, KeyShape, ValueShape, file_fault, row_index};
@@ -1059,7 +1060,8 @@ struct Bounds {
 }
 
 /// One page of `check_page_headers` or `check_value_page_headers`, at
-/// `range` of the file, held to `bounds`.
+/// `range` of the file, held to `bounds` (`check_header`); a data page's
+/// values are its rows in the offset index.
 fn check_page(
     chunk: ColumnChunk<'_>,
     page: ChunkPage,
@@ -1067,11 +1069,52 @@ fn check_page(
     bounds: Bounds,
     segments: &Segments,
 ) -> Result<()> {
-    let row_group = chunk.row_group();
     let bytes = segments.get_bytes(range.start, approx::length(range.end - range.start))?;
+    let place = Place {
+        path: chunk.column.path,
+        row_group: chunk.row_group(),
+        rows: chunk.rows(),
+        page,
+    };
+    let span_values = |at| {
+        let span = chunk.page_rows(at);
+        approx::count(row_index(span.end - span.start))
+    };
+    check_header(&bytes, place, bounds, span_values).map(|_taken| ())
+}
+
+/// Where a page whose header `check_header` reads lies: the file, the row
+/// group and its rows, and the page.
+#[derive(Clone, Copy)]
+struct Place<'a> {
+    path: &'a str,
+    row_group: usize,
+    rows: i64,
+    page: ChunkPage,
+}
+
+/// The header at the start of `bytes`, the page's bytes from its header to
+/// the end of its place, held to `bounds`: it decodes as parquet reads it,
+/// it is the page type its place holds, a dictionary counts no more values
+/// than the row group has rows or the bounds' entries, its uncompressed
+/// size is within the bound its values (`data_values` of a data page) give,
+/// its v2 level lengths within that size, and its compressed size within
+/// `bytes`. The bytes the page takes, header and compressed body.
+fn check_header(
+    bytes: &[u8],
+    place: Place<'_>,
+    bounds: Bounds,
+    data_values: impl FnOnce(usize) -> u64,
+) -> Result<u64> {
+    let Place {
+        path,
+        row_group,
+        rows,
+        page,
+    } = place;
     let malformed = |fault| {
         file_fault(
-            chunk.column.path,
+            path,
             FileFault::MalformedPageHeader {
                 row_group,
                 page,
@@ -1081,7 +1124,7 @@ fn check_page(
     };
     let over = |field, declared, allowed| {
         file_fault(
-            chunk.column.path,
+            path,
             FileFault::PageHeaderOverBound {
                 row_group,
                 page,
@@ -1091,21 +1134,17 @@ fn check_page(
             },
         )
     };
-    let header = PageHeader::read(&bytes).map_err(malformed)?;
+    let header = PageHeader::read(bytes).map_err(malformed)?;
     let values = match (page, header.body) {
         (ChunkPage::Dictionary, PageBody::Dictionary { num_values }) => {
             let declared = u64::from(num_values);
-            let rows = approx::count(row_index(chunk.rows()));
-            let allowed = rows.min(bounds.entries);
+            let allowed = approx::count(row_index(rows)).min(bounds.entries);
             if declared > allowed {
                 return Err(over(HeaderField::NumValues, declared, allowed));
             }
             declared
         }
-        (ChunkPage::Data(at), PageBody::Data { .. } | PageBody::DataV2 { .. }) => {
-            let span = chunk.page_rows(at);
-            approx::count(row_index(span.end - span.start))
-        }
+        (ChunkPage::Data(at), PageBody::Data { .. } | PageBody::DataV2 { .. }) => data_values(at),
         (
             ChunkPage::Dictionary,
             PageBody::Data { .. } | PageBody::DataV2 { .. } | PageBody::Index,
@@ -1139,6 +1178,79 @@ fn check_page(
     let declared = u64::from(header.compressed_page_size);
     if declared > room {
         return Err(over(HeaderField::CompressedPageSize, declared, room));
+    }
+    Ok(approx::count(header.header_len) + declared)
+}
+
+/// Refuses, before parquet's column reader sees them, every page header of
+/// the column chunk of leaf `leaf` in row group `row_group` of the file at
+/// `path`, held whole in `bytes` and described by `metadata`, as
+/// `check_value_page_headers` refuses a value page's: a position delete
+/// file's (RFD 021), whose values the spec caps no more than the contract
+/// caps a value. Such a file need carry no offset index, so the pages are
+/// walked as parquet's page reader walks them, from the chunk's start, each
+/// header's compressed size leading to the next, the first page the
+/// dictionary when the footer records one. A chunk that runs past the file
+/// is `PageHeaderFault::Truncated` at its first page. A data page's own
+/// count of values bounds nothing, as a value page's rows do not. A
+/// dictionary entry is held to the fewest bytes its physical type takes; a
+/// type `Entry` has no case for is held as a byte array, the tighter bound.
+pub(crate) fn check_chunk_page_headers(
+    path: &str,
+    bytes: &Bytes,
+    metadata: &ParquetMetaData,
+    row_group: usize,
+    leaf: usize,
+) -> Result<()> {
+    let chunk = metadata.row_group(row_group).column(leaf);
+    let descriptor = chunk.column_descr();
+    let entry = match descriptor.physical_type() {
+        PhysicalType::INT64 => Entry::Int64,
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => Entry::FixedLen(descriptor.type_length()),
+        PhysicalType::BYTE_ARRAY
+        | PhysicalType::BOOLEAN
+        | PhysicalType::INT32
+        | PhysicalType::INT96
+        | PhysicalType::FLOAT
+        | PhysicalType::DOUBLE => Entry::ByteArray,
+    };
+    let bounds = Bounds {
+        page_bytes: MOST_VALUE_PAGE_BYTES,
+        value_bytes: None,
+        entries: entry.most_in(MOST_VALUE_PAGE_BYTES),
+    };
+    let rows = metadata.row_group(row_group).num_rows();
+    let (start, len) = chunk.byte_range();
+    let Some(end) = start
+        .checked_add(len)
+        .filter(|&end| end <= approx::count(bytes.len()))
+    else {
+        return Err(file_fault(
+            path,
+            FileFault::MalformedPageHeader {
+                row_group,
+                page: ChunkPage::Data(0),
+                fault: PageHeaderFault::Truncated,
+            },
+        ));
+    };
+    let mut at = start;
+    let mut data_pages = 0;
+    while at < end {
+        let page_bytes = &bytes[approx::length(at)..approx::length(end)];
+        let page = if at == start && chunk.dictionary_page_offset().is_some() {
+            ChunkPage::Dictionary
+        } else {
+            data_pages += 1;
+            ChunkPage::Data(data_pages - 1)
+        };
+        let place = Place {
+            path,
+            row_group,
+            rows,
+            page,
+        };
+        at += check_header(page_bytes, place, bounds, |_| 0)?;
     }
     Ok(())
 }

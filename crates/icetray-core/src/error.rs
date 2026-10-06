@@ -86,10 +86,13 @@ pub enum Error {
         /// What is wrong with its metadata.
         fault: TableFault,
     },
-    /// A data file is malformed for serving; the fault set is closed.
+    /// A file a load reads is malformed for serving: a data file, or a
+    /// delete file (a position delete file or a Puffin file) the snapshot
+    /// lists; the fault set is closed.
     #[error("file {path}: {fault}")]
     File {
-        /// The data file's location.
+        /// The file's location: the data file, the position delete file, or
+        /// the Puffin file.
         path: String,
         /// What is wrong with it.
         fault: FileFault,
@@ -148,15 +151,21 @@ pub enum Error {
         /// The deadline that passed.
         after: Duration,
     },
-    /// The blocking task that verified keys was canceled: the runtime shut
-    /// down under it. The task checked one data file's keys at load, an
-    /// overlap group's keys for a key two files share, or one file's keys
-    /// against its bucket in the doctor. A panic in that task is resumed on
+    /// A blocking task of a load or of the doctor was canceled: the runtime
+    /// shut down under it. The task verified keys (one data file's at load,
+    /// an overlap group's for a key two files share, or one file's against
+    /// its bucket in the doctor) or worked a load's deletes (decoded a
+    /// position delete file or a Puffin file's vectors, or applied the
+    /// decoded rows to the data files). A panic in that task is resumed on
     /// the caller instead, never turned into an error.
-    #[error("key verification of file {path} was canceled: {source}")]
+    #[error(
+        "the blocking task verifying keys or working deletes of file {path} was canceled: {source}"
+    )]
     VerifyCanceled {
-        /// The data file's location; for an overlap group, its first file
-        /// in file order.
+        /// The file the task worked on: the data file; for an overlap
+        /// group, its first file in file order; the position delete file or
+        /// the Puffin file it decoded; for the applying of deletes, the
+        /// load's first data file.
         path: String,
         /// The canceled task's outcome.
         source: tokio::task::JoinError,
@@ -466,7 +475,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             "{reason} (lookups {declared}, the layout achieves {achieved}: {})",
             finding_list(findings)
         ),
-        RefusalReason::KeyTypeUnsupported | RefusalReason::DeleteFiles => reason.to_string(),
+        RefusalReason::KeyTypeUnsupported => reason.to_string(),
     }
 }
 
@@ -553,10 +562,6 @@ pub enum RefusalReason {
         /// `iceberg::spec::Type` does not implement `Hash`.
         got: String,
     },
-    /// The snapshot carries a live position delete file in Parquet or a
-    /// deletion vector. A generation applies no delete to its lookups, so
-    /// serving the snapshot would answer with rows it deletes.
-    DeleteFiles,
     /// An equality delete applies to a data file the snapshot holds: its
     /// data sequence number is above that of the snapshot's oldest data
     /// file, so it may delete rows of it (RFD 021). Equality deletes are
@@ -628,7 +633,6 @@ impl Recurs for RefusalReason {
             | Self::KeyTypeMismatch { .. }
             | Self::KeyTypeUnsupported
             | Self::ValueTypeUnsupported { .. }
-            | Self::DeleteFiles
             | Self::EqualityDeletes { .. }
             | Self::DeleteKindUnsupported { .. }
             | Self::KeyTooLong { .. }
@@ -650,21 +654,40 @@ impl Recurs for RefusalReason {
 
 /// A delete file icetray cannot read, as `RefusalReason::DeleteKindUnsupported`
 /// names it (RFD 021). Display gives what it is, for a log line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UnsupportedDelete {
     /// A position delete file written as Avro.
     AvroPositions,
     /// A position delete file written as ORC.
     OrcPositions,
+    /// A Puffin blob a manifest entry names as a delete that is not a
+    /// deletion vector.
+    PuffinBlob {
+        /// The blob type the footer records.
+        blob_type: String,
+    },
+    /// A Puffin file whose footer payload is compressed, which icetray
+    /// does not decompress.
+    CompressedFooter,
+    /// A Puffin file whose footer sets flags the spec reserves, which no
+    /// writer icetray knows of sets, so icetray cannot tell how to read it.
+    ReservedFooterFlags {
+        /// The reserved flags set, the four flag bytes read little-endian.
+        flags: u32,
+    },
 }
 
 impl fmt::Display for UnsupportedDelete {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::AvroPositions => "position deletes in avro",
-            Self::OrcPositions => "position deletes in orc",
-        };
-        f.write_str(name)
+        match self {
+            Self::AvroPositions => f.write_str("position deletes in avro"),
+            Self::OrcPositions => f.write_str("position deletes in orc"),
+            Self::PuffinBlob { blob_type } => write!(f, "a puffin blob of type {blob_type}"),
+            Self::CompressedFooter => f.write_str("a compressed puffin footer"),
+            Self::ReservedFooterFlags { flags } => {
+                write!(f, "a puffin footer with reserved flags {flags:#010x} set")
+            }
+        }
     }
 }
 
@@ -699,7 +722,6 @@ impl fmt::Display for RefusalReason {
             Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
-            Self::DeleteFiles => "delete_files",
             Self::EqualityDeletes { .. } => "equality_deletes",
             Self::DeleteKindUnsupported { .. } => "delete_kind_unsupported",
             Self::KeyTooLong { .. } => "key_too_long",
@@ -717,6 +739,7 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigViolation;
+    use crate::deletes::{BlobFraming, DeleteFault};
     use crate::generation::testing::TABLE;
     use crate::index::{ChunkPage, DecodedPart, HeaderField, PageHeaderFault};
     use crate::snapshot::SnapshotId;
@@ -779,27 +802,6 @@ mod tests {
                 },
                 "value_type_unsupported",
             ),
-            (RefusalReason::DeleteFiles, "delete_files"),
-            (
-                RefusalReason::EqualityDeletes {
-                    path: FILE_PATH.to_string(),
-                },
-                "equality_deletes",
-            ),
-            (
-                RefusalReason::DeleteKindUnsupported {
-                    path: FILE_PATH.to_string(),
-                    kind: UnsupportedDelete::AvroPositions,
-                },
-                "delete_kind_unsupported",
-            ),
-            (
-                RefusalReason::DeleteKindUnsupported {
-                    path: FILE_PATH.to_string(),
-                    kind: UnsupportedDelete::OrcPositions,
-                },
-                "delete_kind_unsupported",
-            ),
             (
                 RefusalReason::KeyTooLong {
                     path: FILE_PATH.to_string(),
@@ -829,6 +831,58 @@ mod tests {
                     findings: vec![FindingCode::DictionaryEncodedValue],
                 },
                 "below_level",
+            ),
+        ]
+        .into_iter()
+        .chain(delete_reason_cases())
+        .collect()
+    }
+
+    /// One delete refusal of every reason and kind, beside its label.
+    fn delete_reason_cases() -> Vec<(RefusalReason, &'static str)> {
+        vec![
+            (
+                RefusalReason::EqualityDeletes {
+                    path: FILE_PATH.to_string(),
+                },
+                "equality_deletes",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::AvroPositions,
+                },
+                "delete_kind_unsupported",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::OrcPositions,
+                },
+                "delete_kind_unsupported",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::PuffinBlob {
+                        blob_type: "apache-datasketches-theta-v1".to_string(),
+                    },
+                },
+                "delete_kind_unsupported",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::CompressedFooter,
+                },
+                "delete_kind_unsupported",
+            ),
+            (
+                RefusalReason::DeleteKindUnsupported {
+                    path: FILE_PATH.to_string(),
+                    kind: UnsupportedDelete::ReservedFooterFlags { flags: 2 },
+                },
+                "delete_kind_unsupported",
             ),
         ]
     }
@@ -1046,6 +1100,119 @@ mod tests {
                 }),
                 Transient,
             ),
+            (
+                file(FileFault::DecoderPanicked {
+                    part: DecodedPart::PositionDeletes,
+                    message: "sample".to_string(),
+                }),
+                Deterministic,
+            ),
+        ]
+        .into_iter()
+        .chain(delete_fault_recurrence_cases())
+        .collect()
+    }
+
+    /// One delete fault of every variant beside its classification.
+    fn delete_fault_recurrence_cases() -> Vec<(Error, Recurrence)> {
+        use Recurrence::{Deterministic, Transient};
+        let delete = |fault| file(FileFault::Delete(fault));
+        let data_file = || FILE_PATH.to_string();
+        vec![
+            (delete(DeleteFault::FooterFraming), Transient),
+            (
+                delete(DeleteFault::BlobFraming(BlobFraming::Length)),
+                Transient,
+            ),
+            (
+                delete(DeleteFault::BlobFraming(BlobFraming::Magic)),
+                Transient,
+            ),
+            (
+                delete(DeleteFault::BlobFraming(BlobFraming::Checksum)),
+                Transient,
+            ),
+            (
+                delete(DeleteFault::VectorUnlisted {
+                    offset: 4,
+                    length: 1,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::BlobOutOfRange {
+                    offset: 0,
+                    length: 1,
+                    blobs_end: 1,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::PuffinSizeMismatch {
+                    recorded: 1,
+                    other: 2,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::BlobCompressed {
+                    codec: iceberg::puffin::CompressionCodec::zstd_default(),
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::ReferencedFileMismatch {
+                    referenced: data_file(),
+                    found: None,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::CardinalityProperty {
+                    recorded: 1,
+                    found: None,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::RecordsDecoded {
+                    recorded: 1,
+                    decoded: 2,
+                }),
+                Deterministic,
+            ),
+            (delete(DeleteFault::VectorMalformed), Deterministic),
+            (
+                delete(DeleteFault::PositionPastEnd {
+                    data_file: data_file(),
+                    position: 1,
+                    records: 1,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::NegativePosition {
+                    data_file: data_file(),
+                    position: -1,
+                }),
+                Deterministic,
+            ),
+            (
+                delete(DeleteFault::TwoVectors {
+                    data_file: data_file(),
+                    other: data_file(),
+                }),
+                Deterministic,
+            ),
+            (delete(DeleteFault::PositionSchema), Deterministic),
+            (delete(DeleteFault::PositionNull), Deterministic),
+            (
+                delete(DeleteFault::RecordCountMismatch {
+                    manifest: 1,
+                    footer: 2,
+                }),
+                Deterministic,
+            ),
         ]
     }
 
@@ -1092,7 +1259,7 @@ mod tests {
             ),
             (
                 Error::Cache(CacheError::Fetch(Arc::new(refused(
-                    RefusalReason::DeleteFiles,
+                    RefusalReason::KeyTypeUnsupported,
                 )))),
                 Deterministic,
             ),
@@ -1242,9 +1409,9 @@ mod tests {
             (
                 Error::Refused {
                     table: TABLE.to_string(),
-                    reason: RefusalReason::DeleteFiles,
+                    reason: RefusalReason::KeyTypeUnsupported,
                 },
-                "delete_files",
+                "key_type_unsupported",
             ),
             (
                 Error::Refused {

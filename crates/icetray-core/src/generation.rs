@@ -1,10 +1,12 @@
-//! A generation (RFD 005, RFD 017, RFD 020): one snapshot of one table,
-//! every live data file indexed, the files in a deterministic order, the
-//! overlap groups among them checked for a key two files share, and the
-//! lookup level and the resident-bytes budget checked at the footer stage
-//! before any key chunk is fetched. Immutable once built; a `Table` builds
-//! the next one beside it, reusing every file whose path, size, and data
-//! sequence number are unchanged, and swaps atomically.
+//! A generation (RFD 005, RFD 017, RFD 020, RFD 021): one snapshot of one
+//! table, every live data file indexed with the rows its deletes remove,
+//! the files in a deterministic order, the overlap groups among them
+//! checked for a live key two files share, and the lookup level and the
+//! resident-bytes budget checked at the footer stage before any key chunk
+//! or delete is fetched. Immutable once built; a `Table` builds the next
+//! one beside it, reusing every file whose path, size, and data sequence
+//! number are unchanged and every applied delete whose sources are, and
+//! swaps atomically.
 
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
@@ -22,12 +24,13 @@ use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::check::{self, Caps, FileView, FindingCode, LayoutView, LookupCost};
 use crate::config::{Residency, TableConfig};
+use crate::deletes::{self, DataTarget, DeleteFault, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
-use crate::index::{self, FileIndex, Inspected, Keys, PageRef, RowPosition};
+use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition};
 use crate::key::Key;
 use crate::level::Level;
 use crate::local::{DataFileIdentity, LocalDir, Reservation};
-use crate::manifest::{self, Bucketing, DataFileEntry, TableLayout};
+use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayout};
 use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
 use crate::shard;
@@ -95,7 +98,8 @@ pub struct Generation {
     pub files: Vec<Arc<LoadedFile>>,
     /// Rows across every file, from the manifests.
     pub records: u64,
-    /// Bytes resident across every file index.
+    /// Bytes resident across every file index, the rows its deletes
+    /// remove, and what the deletes keep for the next load.
     pub index_bytes: usize,
     /// When the load finished.
     pub loaded_at: Instant,
@@ -122,6 +126,12 @@ pub struct Generation {
     overlapping: BTreeMap<u32, usize>,
     /// Overlap groups this load merged to prove key uniqueness.
     verified_groups: usize,
+    /// Per file of `files`, the rows its deletes remove (RFD 021); `None`
+    /// where no delete applies.
+    deletes: Arc<[Option<Arc<FileDeletes>>]>,
+    /// What the next load's deletes need not read again, by index into
+    /// `files`.
+    delete_reads: deletes::Known,
 }
 
 /// Positions in a generation's files by bucketing and bucket. `None`
@@ -139,15 +149,15 @@ impl Generation {
     /// The footer stage of a load of `snapshot` of `table`: derives the
     /// layout from the snapshot's schema, lists its live files
     /// (`manifest::list_files`, which refuses the deletes it documents),
-    /// refuses a snapshot with any readable delete file left as
-    /// `RefusalReason::DeleteFiles`, since a generation applies no delete to
-    /// its lookups, reuses from `previous` every file the snapshot still
-    /// names by the same path at the same size and data sequence number
-    /// (the same `Arc`, RFD 005; `reuse_or_open`), opens a `FileHandle` for
-    /// every other file with the manifest's size and `hedge`, and inspects
-    /// their footers `load_concurrency()` at a time. No key chunk is read
-    /// and nothing is written; `Planned::build` does both. Raised before
-    /// any read: a `lookups` level the residency cannot reach, as
+    /// bounds the memory its deletes take from the manifests alone
+    /// (`deletes::bound`), reuses from `previous` every file the snapshot
+    /// still names by the same path at the same size and data sequence
+    /// number (the same `Arc`, RFD 005; `reuse_or_open`) with the rows its
+    /// deletes removed there, opens a `FileHandle` for every other file
+    /// with the manifest's size and `hedge`, and inspects their footers
+    /// `load_concurrency()` at a time. No key chunk or delete is read and
+    /// nothing is written; `Planned::build` does both. Raised before any
+    /// read: a `lookups` level the residency cannot reach, as
     /// `ConfigViolation::LookupsUnreachable` (a configuration built by hand
     /// meets it here rather than at validation), and a snapshot timestamp
     /// jiff cannot represent, as `TableFault::SnapshotTimestampOutOfRange`.
@@ -171,10 +181,17 @@ impl Generation {
         )?;
         let files =
             manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
-        if !files.deletes.is_empty() {
-            return Err(Error::refused(table, RefusalReason::DeleteFiles));
-        }
         let (reused, pending) = reuse_or_open(files.data, previous, storage, &hedge).await?;
+        let targets: Vec<DataTarget> = reused
+            .iter()
+            .map(|file| &file.entry)
+            .chain(pending.iter().map(|(entry, _)| entry))
+            .map(DataTarget::of)
+            .collect();
+        let delete_bound = deletes::bound(&deletes::Sorted::of(&files.deletes), &targets);
+        let previous_deletes = previous
+            .map(|previous| previous.deletes_of(&reused))
+            .unwrap_or_default();
         let inspected = inspect_all(table, &layout, pending).await?;
         Ok(Planned {
             config: config.clone(),
@@ -182,18 +199,56 @@ impl Generation {
             snapshot_timestamp,
             metadata_location: resolved.location.clone(),
             layout,
+            storage: Arc::clone(storage),
             reused,
             inspected,
+            targets,
+            deletes: files.deletes,
+            previous_deletes,
+            delete_bound,
         })
+    }
+
+    /// What a load reusing `reused`, files of this generation, starts its
+    /// deletes from (`deletes::load`): this generation's applied rows of
+    /// each, in `reused`'s order, and what its deletes read, moved from
+    /// indices into `files` to indices into `reused`.
+    fn deletes_of(&self, reused: &[Arc<LoadedFile>]) -> deletes::Previous {
+        let at: HashMap<*const LoadedFile, usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(at, file)| (Arc::as_ptr(file), at))
+            .collect();
+        let mut moved_to = vec![None; self.files.len()];
+        let applied = (0_u32..)
+            .zip(reused)
+            .map(|(to, file)| {
+                let from = *at
+                    .get(&Arc::as_ptr(file))
+                    .expect("a reused file is one of the previous generation's");
+                moved_to[from] = Some(to);
+                self.deletes[from].clone()
+            })
+            .collect();
+        deletes::Previous {
+            applied,
+            known: self.delete_reads.reindexed(&moved_to),
+        }
     }
 
     /// Everything after the files are indexed: sorts them, builds the
     /// routes, finds the overlap groups, and merges every group that a
-    /// non-reused file belongs to, refusing a key two files share. The
-    /// groups are merged one at a time, each one's key chunks gathered
-    /// before its merge and dropped after, so the load holds one group's
-    /// chunks at once and not the table's (RFD 017: the Disk tier reads
-    /// them back from the chunk files, the Bloom tier fetches them again).
+    /// non-reused file belongs to, or a member whose deletes shrank,
+    /// refusing a live key two files share; a row a file's deletes remove
+    /// is not live (RFD 021). A data file with deletes whose manifest
+    /// records another row count than its footer is
+    /// `DeleteFault::RecordCountMismatch`, since its deletes' positions
+    /// were checked against the manifest's. The groups are merged one at a
+    /// time, each one's key chunks gathered before its merge and dropped
+    /// after, so the load holds one group's chunks at once and not the
+    /// table's (RFD 017: the Disk tier reads them back from the chunk
+    /// files, the Bloom tier fetches them again).
     /// Each merge runs on the blocking pool (`blocking::on_blocking_pool`),
     /// one at a time for this load; while it runs, the async worker goes on
     /// polling other tasks, and the task goes on polling the other loads it
@@ -213,6 +268,11 @@ impl Generation {
             .iter()
             .map(|member| Arc::clone(&member.file))
             .collect();
+        let deletes: Arc<[Option<Arc<FileDeletes>>]> = members
+            .iter()
+            .map(|member| member.deletes.clone())
+            .collect();
+        refuse_record_count_mismatch(&files, &deletes)?;
         let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
         let routes = routes(&spans);
         let probe_routes = ranked_routes(&files, &routes);
@@ -226,18 +286,39 @@ impl Generation {
         });
         let to_verify: Vec<Vec<usize>> = groups
             .into_iter()
-            .filter(|group| !group.iter().all(|&at| members[at].reused))
+            .filter(|group| {
+                group
+                    .iter()
+                    .any(|&at| !members[at].reused || members[at].shrank)
+            })
             .collect();
         for group in &to_verify {
             let members = gather_members(&files, group).await?;
             let first = files[group[0]].index.handle().location.clone();
             let owned_table = table.to_string();
-            blocking::on_blocking_pool(move || refuse_duplicates(&owned_table, &members, None))
-                .await
-                .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
+            let removed = Arc::clone(&deletes);
+            blocking::on_blocking_pool(move || {
+                let gone = move |at: usize, position: RowPosition| {
+                    removed[at]
+                        .as_ref()
+                        .is_some_and(|rows| rows.contains(position))
+                };
+                refuse_duplicates(&owned_table, &members, Some(&gone))
+            })
+            .await
+            .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
         }
         let records = files.iter().map(|file| file.entry.records).sum();
-        let index_bytes = files.iter().map(|file| file.index.resident_bytes()).sum();
+        let delete_bytes = deletes
+            .iter()
+            .flatten()
+            .map(|rows| approx::length(rows.resident_bytes()))
+            .sum::<usize>();
+        let index_bytes = files
+            .iter()
+            .map(|file| file.index.resident_bytes())
+            .sum::<usize>()
+            + delete_bytes;
         tracing::debug!(
             table,
             snapshot_id = %snapshot.snapshot_id(),
@@ -264,6 +345,8 @@ impl Generation {
             probe_routes,
             overlapping,
             verified_groups: to_verify.len(),
+            deletes,
+            delete_reads: deletes::Known::default(),
         })
     }
 
@@ -287,9 +370,35 @@ impl Generation {
         &'a self,
         key: &'a Key,
     ) -> impl Iterator<Item = &'a Arc<LoadedFile>> + 'a {
+        self.ranked_candidates(key).map(|(_, file)| file)
+    }
+
+    /// `candidates` with each file's position in `files`.
+    fn ranked_candidates<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Iterator<Item = (usize, &'a Arc<LoadedFile>)> + 'a {
         ProbeOrder::new(&self.probe_routes, key)
-            .map(|at| &self.files[at])
-            .filter(move |file| file.index.may_contain(key))
+            .map(|at| (at, &self.files[at]))
+            .filter(move |(_, file)| file.index.may_contain(key))
+    }
+
+    /// Whether the deletes of the file at `at` in `files` remove the row at
+    /// `position`.
+    fn is_deleted(&self, at: usize, position: RowPosition) -> bool {
+        self.deletes[at]
+            .as_ref()
+            .is_some_and(|rows| rows.contains(position))
+    }
+
+    /// Whether the deletes of the file at `at` in `files` remove the row
+    /// `page` names. A page names its row (`PageRef::position`) only where
+    /// the key page it searched is resident, as the Full tier's are; in the
+    /// Disk and Bloom tiers naming the row takes a read, the page names
+    /// none, and this is false.
+    fn page_deleted(&self, at: usize, page: &PageRef) -> bool {
+        page.position
+            .is_some_and(|position| self.is_deleted(at, position))
     }
 
     /// Per bucket that an overlap group touches, how many files a lookup in
@@ -351,24 +460,29 @@ impl Generation {
         self.verified_groups
     }
 
-    /// One lookup and the `result` label it earns: the candidates are probed
-    /// in probe order and the first whose `find` answers gives the row, whose
-    /// value page is read through `cache`. `Present` carries the bytes,
-    /// `Null` is a present key with a null value, `Absent` a key no
-    /// candidate holds. The GET cost is the index's: in the Full tier one
-    /// GET for a cold hit, none for a warm hit or a miss. The label is
-    /// `Miss` for an absent key; for a present one, `ColdHit` when its value
-    /// page came from outside the cache (a fetch this lookup ran or joined)
-    /// and `WarmHit` when the cache served it from memory or its disk level.
-    /// Only the value page decides it; a key-page GET in the Bloom tier does
-    /// not.
+    /// One lookup and the `result` label it earns: the candidates are
+    /// probed in probe order and the first whose `find` answers with a row
+    /// its file's deletes do not remove gives the row, whose value page is
+    /// read through `cache`; a deleted row is passed over with no value
+    /// page read (RFD 021). `Present` carries the bytes, `Null` is a
+    /// present key with a null value, `Absent` a key no candidate holds.
+    /// The GET cost is the index's: in the Full tier one GET for a cold
+    /// hit, none for a warm hit or a miss. The label is `Miss` for an
+    /// absent key; for a present one, `ColdHit` when its value page came
+    /// from outside the cache (a fetch this lookup ran or joined) and
+    /// `WarmHit` when the cache served it from memory or its disk level.
+    /// Only the value page decides it; a key-page GET in the Bloom tier
+    /// does not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
         cache: &PageCache,
     ) -> Result<(Value, LookupResult)> {
-        for file in self.candidates(key) {
+        for (at, file) in self.ranked_candidates(key) {
             if let Some(row) = file.index.find(key, Some(cache)).await? {
+                if self.is_deleted(at, file.index.position(row)) {
+                    continue;
+                }
                 let (value, origin) = file.index.read_value(row, Some(cache)).await?;
                 let value = match value {
                     Some(bytes) => Value::Present(bytes),
@@ -386,11 +500,12 @@ impl Generation {
 
     /// Which file and page each key would reach; the oracle for cost tests.
     /// Of the pages the key's candidates name, in the order a lookup probes
-    /// them (`probed`), the first that names a value page, with that page:
-    /// in the Full tier that is the file holding the key, wherever in an
-    /// overlap group it sits, and the page's `value_page_offset` is the one
-    /// GET a cold hit makes. When no candidate names a value page (the key
-    /// is absent from every file whose fences cover it, or the tier is Disk
+    /// them (`probed`), the first that names a value page for a row its
+    /// file's deletes do not remove, with that page: in the Full tier that
+    /// is the file holding the live key, wherever in an overlap group it
+    /// sits, and the page's `value_page_offset` is the one GET a cold hit
+    /// makes. When no candidate names such a page (the key is absent or
+    /// deleted from every file whose fences cover it, or the tier is Disk
     /// or Bloom, where naming one would take a read), the first candidate
     /// that would decode a key page for it, the first probe. `None` for a
     /// key no candidate would decode a page for, which `lookup` answers
@@ -401,8 +516,8 @@ impl Generation {
 
     fn plan_one(&self, key: &Key) -> Option<(Arc<LoadedFile>, PageRef)> {
         let mut first_probe = None;
-        for (file, page) in self.probed(key) {
-            if page.value_page_offset.is_some() {
+        for (at, file, page) in self.probed(key) {
+            if page.value_page_offset.is_some() && !self.page_deleted(at, &page) {
                 return Some((Arc::clone(file), page));
             }
             first_probe.get_or_insert_with(|| (Arc::clone(file), page));
@@ -411,22 +526,31 @@ impl Generation {
     }
 
     /// Every page a lookup of `key` would decode were each probe to miss,
-    /// with its file, in probe order (`probed`). `plan` reaches the first
-    /// of them that holds the key; a cost test counts the GETs of the
-    /// probes before it.
+    /// with its file and whether the file's deletes remove the key's row
+    /// there (`page_deleted`: meaningful in the Full tier alone, false
+    /// elsewhere, where no page names its row), in probe order (`probed`).
+    /// `plan` reaches the first of them that holds the key live; a cost
+    /// test counts the GETs of the probes before it, deleted copies among
+    /// them.
     #[cfg(test)]
-    pub(crate) fn probes(&self, key: &Key) -> Vec<(Arc<LoadedFile>, PageRef)> {
+    pub(crate) fn probes(&self, key: &Key) -> Vec<(Arc<LoadedFile>, PageRef, bool)> {
         self.probed(key)
-            .map(|(file, page)| (Arc::clone(file), page))
+            .map(|(at, file, page)| {
+                let deleted = self.page_deleted(at, &page);
+                (Arc::clone(file), page, deleted)
+            })
             .collect()
     }
 
     /// The pages a lookup of `key` would decode were each probe to miss,
-    /// with their files, in probe order (`candidates`): each candidate
-    /// whose `page_of` names a key page.
-    fn probed<'a>(&'a self, key: &'a Key) -> impl Iterator<Item = (&'a Arc<LoadedFile>, PageRef)> {
-        self.candidates(key)
-            .filter_map(|file| file.index.page_of(key).map(|page| (file, page)))
+    /// with their files and the files' positions, in probe order
+    /// (`candidates`): each candidate whose `page_of` names a key page.
+    fn probed<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Iterator<Item = (usize, &'a Arc<LoadedFile>, PageRef)> {
+        self.ranked_candidates(key)
+            .filter_map(|(at, file)| file.index.page_of(key).map(|page| (at, file, page)))
     }
 
     /// The identity of every file's chunk file, for `LocalDir::retain`:
@@ -444,15 +568,27 @@ impl Generation {
 
 /// A snapshot through the footer stage of its load
 /// (`Generation::plan_load`): its layout, the files reused from the
-/// previous generation, and every other file's inspected footer.
+/// previous generation, every other file's inspected footer, and its
+/// readable deletes with the bound on the memory they take.
 pub(crate) struct Planned {
     config: TableConfig,
     snapshot: Snapshot,
     snapshot_timestamp: jiff::Timestamp,
     metadata_location: String,
     layout: TableLayout,
+    /// What the deletes are read through.
+    storage: Arc<Storage>,
     reused: Vec<Arc<LoadedFile>>,
     inspected: Vec<(DataFileEntry, Inspected)>,
+    /// Every data file as the deletes see it: the reused files, then the
+    /// inspected ones, in their orders.
+    targets: Vec<DataTarget>,
+    /// Every live delete file icetray can read.
+    deletes: Vec<DeleteFileEntry>,
+    /// The previous generation's applied deletes of the reused files.
+    previous_deletes: deletes::Previous,
+    /// The bytes the applied deletes take at most (`deletes::bound`).
+    delete_bound: u64,
 }
 
 impl Planned {
@@ -571,44 +707,70 @@ impl Planned {
             .await
     }
 
-    /// The chunk stage: checks the budget the configuration and `local`
-    /// set before any chunk is fetched (Full: `resident_budget_bytes`
+    /// The chunk stage: checks the budget the configuration and `local` set
+    /// before any chunk or delete is fetched (Full: `resident_budget_bytes`
     /// against the reused files' resident bytes plus every new file's
-    /// predicted full bytes; Disk: `local.index_budget()` against the bytes
-    /// `index/` holds, what other tables' loads have reserved, and what
-    /// every new file would write there, reserved until the new indexes are
-    /// built; over either is `RefusalReason::OverBudget`), then builds the
-    /// new indexes `load_concurrency()` at a time, refusing a bucketed file
-    /// whose fences or first or last key hash to another bucket than its
-    /// manifest entry records (`RefusalReason::KeyOutsideBucket`; a reused
-    /// file was checked when it was built, and every key is
-    /// `verify_buckets`'s to check), and assembles the generation: files
-    /// sorted, overlap groups found, and every group that gained a file
-    /// merged to refuse a duplicate key. `Err` leaves nothing behind; the
-    /// caller keeps serving the previous generation.
+    /// predicted full bytes plus the deletes' bound; Disk:
+    /// `local.index_budget()` against the bytes `index/` holds, what other
+    /// tables' loads have reserved, and what every new file would write
+    /// there, reserved until the new indexes are built; over either is
+    /// `RefusalReason::OverBudget`), then builds the new indexes
+    /// `load_concurrency()` at a time, refusing a bucketed file whose
+    /// fences or first or last key hash to another bucket than its manifest
+    /// entry records (`RefusalReason::KeyOutsideBucket`; a reused file was
+    /// checked when it was built, and every key is `verify_buckets`'s to
+    /// check), and beside the builds applies the snapshot's deletes
+    /// (`deletes::load`), the first failure of either stopping the other,
+    /// then assembles the generation: files sorted, overlap groups found,
+    /// and every group that gained a file or whose deletes shrank merged to
+    /// refuse a duplicate live key. `Err` leaves nothing behind; the caller
+    /// keeps serving the previous generation.
     pub(crate) async fn build(self, local: Option<&Arc<LocalDir>>) -> Result<Generation> {
         let table = self.config.name.as_str();
-        let reservation = check_budget(table, &self.config, local, &self.reused, &self.inspected)?;
-        let built = build_all(
+        let reservation = check_budget(
             table,
-            self.config.residency,
+            &self.config,
             local,
-            reservation.as_ref(),
-            self.inspected,
-        )
-        .await;
+            &self.reused,
+            &self.inspected,
+            self.delete_bound,
+        )?;
+        let (built, applied) = futures::try_join!(
+            build_all(
+                table,
+                self.config.residency,
+                local,
+                reservation.as_ref(),
+                self.inspected,
+            ),
+            deletes::load(
+                table,
+                &self.storage,
+                self.targets,
+                &self.deletes,
+                self.previous_deletes,
+            ),
+        )?;
         drop(reservation);
-        let built = built?;
-        let members = self
+        let mut rows = applied.rows.into_iter();
+        let mut shrank = applied.shrank.into_iter();
+        let members: Vec<Member> = self
             .reused
             .into_iter()
-            .map(|file| Member { file, reused: true })
-            .chain(built.into_iter().map(|file| Member {
+            .map(|file| (file, true))
+            .chain(built.into_iter().map(|file| (file, false)))
+            .map(|(file, reused)| Member {
                 file,
-                reused: false,
-            }))
+                reused,
+                deletes: rows.next().flatten(),
+                shrank: shrank.next().unwrap_or(false),
+            })
             .collect();
-        Generation::assemble(
+        let targets: Vec<Arc<LoadedFile>> = members
+            .iter()
+            .map(|member| Arc::clone(&member.file))
+            .collect();
+        let mut generation = Generation::assemble(
             table,
             &self.snapshot,
             self.snapshot_timestamp,
@@ -617,7 +779,18 @@ impl Planned {
             self.config.residency,
             members,
         )
-        .await
+        .await?;
+        let at: HashMap<*const LoadedFile, u32> = (0_u32..)
+            .zip(&generation.files)
+            .map(|(at, file)| (Arc::as_ptr(file), at))
+            .collect();
+        let moved_to: Vec<Option<u32>> = targets
+            .iter()
+            .map(|file| at.get(&Arc::as_ptr(file)).copied())
+            .collect();
+        generation.delete_reads = applied.known.reindexed(&moved_to);
+        generation.index_bytes += approx::length(generation.delete_reads.resident_bytes());
+        Ok(generation)
     }
 }
 
@@ -688,11 +861,42 @@ fn sharing<'a>(entries: impl Iterator<Item = &'a DataFileEntry>) -> Vec<bool> {
     places.into_iter().map(shared).collect()
 }
 
-/// A file of a generation being assembled, and whether it came from the
-/// previous generation, which verified every overlap group it was in.
+/// A file of a generation being assembled, whether it came from the
+/// previous generation, which verified every overlap group it was in, and
+/// the rows its deletes remove, with whether they no longer hold every row
+/// the previous generation's removed.
 struct Member {
     file: Arc<LoadedFile>,
     reused: bool,
+    deletes: Option<Arc<FileDeletes>>,
+    shrank: bool,
+}
+
+/// `DeleteFault::RecordCountMismatch` for the first of `files` with
+/// `deletes` whose manifest records another row count than its footer
+/// gives: a delete's positions are checked against the manifest's count,
+/// so the two must agree where a delete applies.
+fn refuse_record_count_mismatch(
+    files: &[Arc<LoadedFile>],
+    deletes: &[Option<Arc<FileDeletes>>],
+) -> Result<()> {
+    for (file, _) in files
+        .iter()
+        .zip(deletes)
+        .filter(|(_, deletes)| deletes.is_some())
+    {
+        let footer = file.index.rows();
+        if u64::try_from(footer).ok() != Some(file.entry.records) {
+            return Err(Error::File {
+                path: file.entry.path.clone(),
+                fault: FileFault::Delete(DeleteFault::RecordCountMismatch {
+                    manifest: file.entry.records,
+                    footer,
+                }),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The order of a generation's files: bucketing, bucket, the exact first
@@ -951,26 +1155,29 @@ async fn build_all(
         .await
 }
 
-/// The budget the residency sets, checked before any key chunk is fetched
-/// (RFD 017). Full: `config.resident_budget_bytes`, against the resident
-/// bytes of the reused files plus the predicted full bytes of every new
-/// one; the budget is the table's alone, and the check holds nothing. Disk:
-/// `local.index_budget()`, shared by every table, reserved through
+/// The budget the residency sets, checked before any key chunk or delete
+/// is fetched (RFD 017, RFD 021). Full: `config.resident_budget_bytes`,
+/// against the resident bytes of the reused files plus the predicted full
+/// bytes of every new one plus `deletes`, the bound on the applied deletes,
+/// which counts reused deletes too, so the check is a function of the
+/// snapshot; the budget is the table's alone, and the check holds nothing.
+/// Disk: `local.index_budget()`, shared by every table, reserved through
 /// `LocalDir::reserve` for the bytes every new file would write, which is
 /// nothing for a file whose chunk file is already there, against the bytes
 /// `index/` holds (the reused files' chunk files among them) and every
 /// other load's outstanding reservation. The reservation returned must be
 /// held until the load has finished writing; every chunk file write shares
-/// it and holds it until the write ends. Bloom takes no budget. Over
-/// is `RefusalReason::OverBudget` carrying both numbers. The sums saturate,
-/// as the predictions they add do: a need that would wrap stays at
-/// `u64::MAX` instead of wrapping to a small number that fits the budget.
+/// it and holds it until the write ends. Bloom takes no budget. Over is
+/// `RefusalReason::OverBudget` carrying both numbers. The sums saturate, as
+/// the predictions they add do: a need that would wrap stays at `u64::MAX`
+/// instead of wrapping to a small number that fits the budget.
 fn check_budget(
     table: &str,
     config: &TableConfig,
     local: Option<&Arc<LocalDir>>,
     reused: &[Arc<LoadedFile>],
     inspected: &[(DataFileEntry, Inspected)],
+    deletes: u64,
 ) -> Result<Option<Arc<Reservation>>> {
     match config.residency {
         Residency::Full => {
@@ -983,7 +1190,8 @@ fn check_budget(
                             inspected
                                 .iter()
                                 .map(|(_, inspected)| inspected.predicted().full),
-                        ),
+                        )
+                        .chain([deletes]),
                 );
                 if needed > budget {
                     return Err(Error::refused(
@@ -1528,8 +1736,8 @@ pub(crate) mod testing {
     use bytes::Bytes;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        DataContentType, DataFile, ManifestContentType, PrimitiveType, Schema, TableMetadata,
-        TableMetadataBuilder, Type, UnboundPartitionSpec,
+        DataContentType, DataFile, DataFileFormat, ManifestContentType, PrimitiveType, Schema,
+        TableMetadata, TableMetadataBuilder, Type, UnboundPartitionSpec,
     };
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
@@ -2086,22 +2294,17 @@ pub(crate) mod testing {
             .await;
         }
 
-        /// Records a position-delete file `name` in `bucket` for the next
-        /// snapshot, listed in a delete manifest, as a merge-on-read writer
-        /// leaves one (RFD 009). Nothing is written at its path: a live
-        /// delete entry is refused from the manifest alone.
-        pub(crate) fn add_position_delete(&mut self, name: &str, bucket: u32) {
-            let records = 1;
-            let bytes = 1;
+        /// Records a position-delete file `name` in Avro in `bucket` for the
+        /// next snapshot, listed in a delete manifest. Nothing is written at
+        /// its path: icetray does not read Avro position deletes, and
+        /// refuses the entry from the manifest alone (RFD 021).
+        pub(crate) fn add_avro_position_delete(&mut self, name: &str, bucket: u32) {
             self.files.push((
-                manifest_testing::data_file(
+                manifest_testing::delete_file(
                     &self.path_of(name),
                     self.spec_id,
                     manifest_testing::partition(Partition::Bucket(bucket)),
-                    records,
-                    bytes,
-                    None,
-                    DataContentType::PositionDeletes,
+                    manifest_testing::DeleteSpec::Positions(DataFileFormat::Avro),
                 ),
                 self.spec_id,
             ));
@@ -2438,6 +2641,7 @@ mod tests {
                     size,
                     key_min: bounds.map(|(min, _)| Key::Long(*min)),
                     key_max: bounds.map(|(_, max)| Key::Long(*max)),
+                    partition: manifest::Partition::unpartitioned(),
                 },
                 index,
             })
@@ -2484,7 +2688,38 @@ mod tests {
             Residency::Full,
             members
                 .into_iter()
-                .map(|(file, reused)| Member { file, reused })
+                .map(|(file, reused)| Member {
+                    file,
+                    reused,
+                    deletes: None,
+                    shrank: false,
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    /// Assembles a generation from `files`, none reused, each with the
+    /// rows its deletes remove.
+    async fn assemble_deleted(
+        files: Vec<(Arc<LoadedFile>, Option<Arc<FileDeletes>>)>,
+        layout: TableLayout,
+    ) -> Result<Generation> {
+        Generation::assemble(
+            TABLE,
+            &placeholder_snapshot(),
+            jiff::Timestamp::UNIX_EPOCH,
+            &mem_metadata(),
+            layout,
+            Residency::Full,
+            files
+                .into_iter()
+                .map(|(file, deletes)| Member {
+                    file,
+                    reused: false,
+                    deletes,
+                    shrank: false,
+                })
                 .collect(),
         )
         .await
@@ -2677,11 +2912,11 @@ mod tests {
         let probe_order = ["b", "d", "c", "a"].map(Mem::location);
         assert_eq!(paths(generation.candidates(&key)), probe_order);
         let probes = generation.probes(&key);
-        assert_eq!(paths(probes.iter().map(|(file, _)| file)), probe_order);
+        assert_eq!(paths(probes.iter().map(|(file, _, _)| file)), probe_order);
         let holding: Vec<&str> = probes
             .iter()
-            .filter(|(_, page)| page.position.is_some())
-            .map(|(file, _)| file.entry.path.as_str())
+            .filter(|(_, page, _)| page.position.is_some())
+            .map(|(file, _, _)| file.entry.path.as_str())
             .collect();
         assert_eq!(holding, [Mem::location("a")], "only the holder has a row");
         let (planned, _) = generation.plan(std::slice::from_ref(&key))[0]
@@ -4355,6 +4590,7 @@ mod tests {
             size: 1,
             key_min: None,
             key_max: None,
+            partition: manifest::Partition::unpartitioned(),
         }
     }
 
@@ -4751,5 +4987,147 @@ mod tests {
     async fn test_load_concurrency_stops_at_its_ceiling() {
         assert!(shard::workers() * LOAD_FILES_PER_WORKER > LOAD_FILES_MAX);
         assert_eq!(load_concurrency(), LOAD_FILES_MAX);
+    }
+
+    /// The value a newer copy of `key` holds, unlike its first.
+    fn updated_value(key: i64) -> Vec<u8> {
+        testing::value_of_len(key + KEY_STEP * E2E_KEYS, testing::VALUE_BYTES)
+    }
+
+    #[tokio::test]
+    async fn test_lookup_and_plan_pass_over_a_deleted_copy_in_probe_order() {
+        let mem = Mem::new();
+        let keys = keys_from(0, E2E_KEYS);
+        let updated = keys[keys.len() / 2];
+        let (older, newer) = ("older", "newer");
+        let old_file = at_sequence(mem.keyed(older, &keys, None, manifest::UNBUCKETED).await, 1);
+        let new_file = at_sequence(
+            mem.file(
+                newer,
+                &[updated],
+                &[Some(updated_value(updated))],
+                (None, manifest::UNBUCKETED),
+                &WriterLayout::contract(),
+            )
+            .await,
+            2,
+        );
+        let key = Key::Long(updated);
+        let old_row = RowPosition(approx::count(keys.len() / 2));
+        let at_row = |rows: &[u64]| Some(Arc::new(FileDeletes::of_rows(rows.iter().copied())));
+        let both_live = assemble_deleted(
+            vec![(Arc::clone(&old_file), None), (Arc::clone(&new_file), None)],
+            layout(None),
+        )
+        .await;
+        assert!(matches!(
+            refusal_of(both_live),
+            RefusalReason::DuplicateKeys { .. }
+        ));
+
+        // The older copy deleted: the newer answers, probed first.
+        let generation = assemble_deleted(
+            vec![
+                (Arc::clone(&old_file), at_row(&[old_row.0])),
+                (Arc::clone(&new_file), None),
+            ],
+            layout(None),
+        )
+        .await
+        .unwrap();
+        let probes = generation.probes(&key);
+        let seen: Vec<(String, bool)> = probes
+            .iter()
+            .map(|(file, _, deleted)| (file.entry.path.clone(), *deleted))
+            .collect();
+        assert_eq!(
+            seen,
+            [(Mem::location(newer), false), (Mem::location(older), true)]
+        );
+        let (planned, _) = generation.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap();
+        assert_eq!(planned.entry.path, Mem::location(newer));
+        let cache = cache().await;
+        assert_eq!(
+            generation.lookup(&key, &cache).await.unwrap().0,
+            Value::Present(Bytes::from(updated_value(updated)))
+        );
+
+        // The newer copy deleted: the older answers, past the first probe,
+        // with no value page of the deleted copy read.
+        let generation = assemble_deleted(
+            vec![
+                (Arc::clone(&old_file), None),
+                (Arc::clone(&new_file), at_row(&[0])),
+            ],
+            layout(None),
+        )
+        .await
+        .unwrap();
+        let (planned, page) = generation.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap();
+        assert_eq!(planned.entry.path, Mem::location(older));
+        let cache = testing::cache().await;
+        let before = mem.store.storage.stats().gets();
+        assert_eq!(
+            generation.lookup(&key, &cache).await.unwrap().0,
+            Value::Present(Bytes::from(value_for(updated)))
+        );
+        assert_eq!(
+            mem.store.storage.stats().gets(),
+            before + 1,
+            "the live copy's value page alone"
+        );
+        assert!(page.value_page_offset.is_some());
+
+        // Both deleted: absent, with no GET in the Full tier.
+        let generation = assemble_deleted(
+            vec![
+                (Arc::clone(&old_file), at_row(&[old_row.0])),
+                (new_file, at_row(&[0])),
+            ],
+            layout(None),
+        )
+        .await
+        .unwrap();
+        let before = mem.store.storage.stats().gets();
+        assert_eq!(
+            generation.lookup(&key, &cache).await.unwrap().0,
+            Value::Absent
+        );
+        assert_eq!(mem.store.storage.stats().gets(), before);
+        let (first, page) = generation.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap();
+        assert_eq!(first.entry.path, Mem::location(newer), "the first probe");
+        assert!(page.position.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_assemble_refuses_a_file_with_deletes_whose_row_counts_disagree() {
+        let mem = Mem::new();
+        let keys = keys_from(0, E2E_KEYS);
+        let file = mem.keyed("f", &keys, None, manifest::UNBUCKETED).await;
+        let mut changed = Arc::into_inner(file).unwrap();
+        changed.entry.records += 1;
+        let file = Arc::new(changed);
+        assemble_deleted(vec![(Arc::clone(&file), None)], layout(None))
+            .await
+            .unwrap();
+        let deletes = Some(Arc::new(FileDeletes::of_rows([0])));
+        let result = assemble_deleted(vec![(file, deletes)], layout(None)).await;
+        let Err(Error::File { path, fault }) = result else {
+            panic!("expected a file fault, got {result:?}");
+        };
+        assert_eq!(path, Mem::location("f"));
+        assert_eq!(
+            fault,
+            FileFault::Delete(DeleteFault::RecordCountMismatch {
+                manifest: approx::count(keys.len()) + 1,
+                footer: i64::try_from(keys.len()).unwrap(),
+            })
+        );
     }
 }

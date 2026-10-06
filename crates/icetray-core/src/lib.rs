@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod check;
 pub mod config;
 pub mod contract;
+pub mod deletes;
 pub mod descriptors;
 mod error;
 pub mod generation;
@@ -42,6 +43,7 @@ pub use config::{
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
     StandardField, StorageConfig, TableConfig,
 };
+pub use deletes::{BlobFraming, DeleteFault};
 pub use error::{Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
 pub use index::{

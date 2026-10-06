@@ -486,7 +486,9 @@ mod tests {
     fn test_serialize_refusal_line_rule_is_its_reason_with_no_error_kind() {
         let refused = icetray_core::Error::Refused {
             table: TABLE.to_string(),
-            reason: RefusalReason::DeleteFiles,
+            reason: RefusalReason::EqualityDeletes {
+                path: TABLE.to_string(),
+            },
         };
         let below_level = icetray_core::Error::Refused {
             table: TABLE.to_string(),
@@ -496,7 +498,7 @@ mod tests {
                 findings: vec![FindingCode::NoBucketPartition],
             },
         };
-        for (error, code) in [(refused, "delete_files"), (below_level, "below_level")] {
+        for (error, code) in [(refused, "equality_deletes"), (below_level, "below_level")] {
             let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
             assert_eq!(line["kind"], Json::String("refusal".to_string()));
             assert_eq!(line["reason"], Json::String(code.to_string()));

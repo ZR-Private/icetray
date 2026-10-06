@@ -653,7 +653,7 @@ mod tests {
             (
                 Error::Refused {
                     table: TABLE.to_string(),
-                    reason: RefusalReason::DeleteFiles,
+                    reason: RefusalReason::KeyTypeUnsupported,
                 },
                 Code::Internal,
             ),

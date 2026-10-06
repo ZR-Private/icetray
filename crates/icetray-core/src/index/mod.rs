@@ -34,6 +34,7 @@ use parquet::schema::types::ColumnDescPtr;
 use crate::approx;
 use crate::cache::{PageCache, PageOrigin};
 use crate::config::Residency;
+use crate::deletes::DeleteFault;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{DataFileIdentity, DiskChunks};
@@ -41,6 +42,7 @@ use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
+pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
 
@@ -206,6 +208,9 @@ pub enum FileFault {
         /// decides on it.
         message: String,
     },
+    /// A delete file, or a data file's deletes, is unservable (RFD 021).
+    #[error("{0}")]
+    Delete(DeleteFault),
 }
 
 /// A fault the footer shows, or a bloom filter read from the data file,
@@ -228,12 +233,17 @@ impl Recurs for FileFault {
             // Bloom filters are read from the data file at every load and
             // never kept on local disk.
             | Self::CorruptBloomFilter { .. }
-            // Parquet panics on the same bytes the same way, and the footer
-            // and bloom filters are always the data file's own bytes.
+            // Parquet panics on the same bytes the same way, and the footer,
+            // the bloom filters, and a position delete file are always the
+            // file's own bytes.
             | Self::DecoderPanicked {
-                part: DecodedPart::Footer | DecodedPart::BloomFilter { .. },
+                part:
+                    DecodedPart::Footer
+                    | DecodedPart::BloomFilter { .. }
+                    | DecodedPart::PositionDeletes,
                 ..
             } => Recurrence::Deterministic,
+            Self::Delete(fault) => fault.recurrence(),
             Self::PageRowsMismatch { .. }
             | Self::MalformedPageHeader { .. }
             | Self::PageHeaderOverBound { .. }
@@ -266,6 +276,8 @@ pub enum DecodedPart {
         /// before the panic; `None` when it had taken up none.
         page: Option<ChunkPage>,
     },
+    /// A Parquet position delete file, read whole.
+    PositionDeletes,
 }
 
 impl std::fmt::Display for DecodedPart {
@@ -283,6 +295,7 @@ impl std::fmt::Display for DecodedPart {
                 row_group,
                 page: None,
             } => write!(f, "row group {row_group} before its first page"),
+            Self::PositionDeletes => f.write_str("the position delete file"),
         }
     }
 }

@@ -3,7 +3,10 @@
 //! vectors in Puffin files, each blob framed as the Iceberg spec fixes it.
 //! The blob bytes are encoded here with roaring and crc32fast, and the
 //! Puffin footer is written by iceberg's own `PuffinWriter`, so neither the
-//! fixtures nor the oracle (`merge_oracle`) share icetray's reader.
+//! fixtures nor the oracle (`merge_oracle`) share icetray's reader. The
+//! names the spec fixes (columns, field ids, blob properties) are taken
+//! from icetray-core, where they have their one home; the blob framing is
+//! not, so the oracle decodes a vector without the reader's code.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -16,41 +19,27 @@ use iceberg::io::FileIO;
 use iceberg::puffin::{Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinWriter};
 use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Struct};
 use icetray_core::approx::count;
+use icetray_core::deletes::{
+    CARDINALITY_PROPERTY, FILE_PATH_COLUMN, FILE_PATH_FIELD_ID, POS_COLUMN, POS_FIELD_ID,
+    REFERENCED_DATA_FILE_PROPERTY,
+};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use roaring::RoaringTreemap;
 
 use crate::error::{LongField, Result, SpecFault};
 
-/// The column of a position delete file naming the data file of a row.
-pub(crate) const FILE_PATH_COLUMN: &str = "file_path";
-
-/// The column of a position delete file naming a row's position in its
-/// data file, counted from the file's first row.
-pub(crate) const POS_COLUMN: &str = "pos";
-
-/// The field id the Iceberg spec reserves for `FILE_PATH_COLUMN`.
-pub(crate) const FILE_PATH_FIELD_ID: i32 = 2_147_483_546;
-
-/// The field id the Iceberg spec reserves for `POS_COLUMN`.
-pub(crate) const POS_FIELD_ID: i32 = 2_147_483_545;
-
 /// The magic a deletion vector's bytes start with, after its length: the
 /// Puffin spec's `deletion-vector-v1` blob fixes these four bytes, so a
-/// reader can tell a vector from other bytes at the blob's offset. The
-/// writers and the oracle declare it here rather than take icetray's
-/// reader's, so neither shares the reader's code.
+/// reader can tell a vector from other bytes at the blob's offset. It is
+/// declared again here, beside icetray-core's reader's, on purpose: the
+/// writers and the oracle frame and decode vectors without the reader's
+/// code, so a mistake in one does not hide in both.
 pub(crate) const VECTOR_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 
 /// The bytes of a deletion vector blob's big-endian length prefix, and of
 /// its big-endian CRC-32 suffix, which the Puffin spec fixes; declared here
 /// for the same independence as `VECTOR_MAGIC`.
 pub const VECTOR_FRAME_BYTES: usize = 4;
-
-/// The blob property naming the data file a deletion vector applies to.
-pub(crate) const REFERENCED_DATA_FILE_PROPERTY: &str = "referenced-data-file";
-
-/// The blob property holding a deletion vector's count of deleted rows.
-pub(crate) const CARDINALITY_PROPERTY: &str = "cardinality";
 
 /// The snapshot id and sequence number a deletion vector's blob metadata
 /// carries: the spec fixes both at -1, since the blob is written before
