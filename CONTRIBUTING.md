@@ -55,7 +55,12 @@ CI runs clippy with `-D warnings` on all targets, so a warning is a failure.
   (`ratio`, `gauge`), so a call site says what the float is for, and the loss
   above 2^53 is accepted there by design. Identifiers never become floats;
   they go in metric labels and log fields.
-- `#[allow(dead_code)]` never. Unused code is deleted, not kept for later.
+- `#[allow(dead_code)]` never. Unused code is deleted, not kept for later,
+  with one exception: code whose first reader lands later in the same
+  series may carry `#[expect(dead_code, reason = "read by <what>")]`.
+  When the reader arrives the expectation goes unmet and clippy fails, so
+  that commit removes the marker. `dev/ci-checks.sh` refuses any tree that
+  still carries one, so a marker never reaches a push or a merge.
 - `unwrap()` in production code never. `expect("reason")` marks a case that
   cannot happen and says why. `?` handles everything else. Tests may
   `unwrap()`; `clippy.toml` exempts them.

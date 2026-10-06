@@ -8,7 +8,11 @@ adds what an agent gets wrong more often than a person does.
   and keep what it writes. Do not edit a version string by hand.
 - **Never add `#[allow(...)]`** to get past clippy. Fix the code. If you
   believe the lint is wrong, say so and stop; changing the workspace lint
-  table is a decision for a person.
+  table is a decision for a person. The one exception is staging code for
+  a reader later in the same batch, under `#[expect(dead_code, reason =
+  "...")]` as `CONTRIBUTING.md` describes. Remove the marker in the commit
+  that reads the code, and never report a batch that still has one:
+  `dev/ci-checks.sh` fails on it.
 - **Gate at the batch, not the change.** `cargo test -p <crate>` while you
   work. `dev/ci-checks.sh` and `cargo test --workspace` once, when the
   batch is done, before reporting. Run them to completion and read the
