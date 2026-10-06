@@ -3,6 +3,11 @@
 > Updated 2026-10-04: a configuration lists at least one table; one that
 > lists none is invalid.
 
+> Updated 2026-10-05: a table entry also has `lookups`, the lookup level
+> it accepts, which defaults to the best its residency reaches, and
+> `strict` takes the meaning RFD 020 (Lookup levels) gives it, off by
+> default. A `lookups` the residency cannot reach is invalid.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -42,10 +47,10 @@ hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
 static keys RFD 003 (One storage stack) lets configuration supply, and the
 optional local directory of RFD 012 (Deployment contract). Tables are a
 list of at least one, and each entry has a name, a source, a ref, a key
-column, a value column, `strict` (whose meaning is RFD 007 (Serving
-tiers)), and the `residency` and resident-bytes budget of RFD 017
-(Residency tiers). The source is one of four kinds: a static table root
-or metadata file, an Iceberg REST catalog, or a table in Glue or in S3
+column, a value column, `lookups` and `strict` (whose meanings are RFD
+020 (Lookup levels)), and the `residency` and resident-bytes budget of RFD
+017 (Residency tiers). The source is one of four kinds: a static table
+root or metadata file, an Iceberg REST catalog, or a table in Glue or in S3
 Tables (RFD 019 (AWS catalog sources)). The prototype's TOML configuration had this shape
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).
 

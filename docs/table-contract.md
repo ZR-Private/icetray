@@ -46,11 +46,13 @@ A table that misses a requirement gets one of three outcomes:
 - **Refused**: icetray will not serve the table, because an answer could
   be wrong or the table cannot be held as configured. The load fails with
   the reason in the second column.
-- **Inefficient**: every answer is right, and some lookups do more work.
+- **Caps a level**: every answer is right, and some lookups do more work.
   The doctor reports the finding with its measured penalty in extra GETs
-  per hit, keys decoded per lookup, or files probed per lookup. With
-  `strict` on, the default, an inefficient table is refused; with it off,
-  the table serves with the penalty.
+  per hit, keys decoded per lookup, or files probed per lookup, and the
+  [level](configuration.md#choosing-a-level) it caps the table at:
+  `balanced` for a cost within one file, `permissive` for more files
+  probed. A table capped below its `lookups` level serves and is flagged;
+  under `strict` the snapshot is refused as `below_level`.
 - **Advice**: the doctor names the writer property to change. Advice never
   affects whether the table serves.
 
@@ -67,10 +69,10 @@ doctor's output and the metrics spell it.
 | No delete files or deletion vectors | Refused: `delete_files` | `write.delete.mode`, `write.update.mode`, and `write.merge.mode` left at `copy-on-write`. A table written merge-on-read can be served from a tag or branch that a compaction moves after rewriting the deletes into data files. |
 | Each data file sorted by key | Refused: `unsorted` | `ALTER TABLE ... WRITE LOCALLY ORDERED BY key`. A global sort is not needed. |
 | Every key in the bucket its file's manifest entry records | Refused: `key_outside_bucket` | Let Iceberg's bucket transform assign files; never register files under a partition by hand |
-| `bucket(N, key)` partitioning, and no other partition field | Inefficient: `no_bucket_partition`, files probed per lookup | `PARTITIONED BY (bucket(N, key))`, then rewrite the files written without it. See [Choosing the bucket count](#choosing-the-bucket-count). |
-| Within a bucket, files whose key ranges do not intersect | Inefficient: `overlapping_files`, files probed per lookup | `'write.distribution-mode' = 'hash'`; `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=false` on the write session; or a compaction |
-| Dictionary encoding off on the value column | Inefficient: `dictionary_encoded_value`, one extra GET per hit | `'parquet.enable.dictionary' = 'false'` |
-| Key pages of 1,000 rows | Inefficient above 2,000 rows: `large_key_pages`, keys decoded per lookup | `'write.parquet.page-row-limit' = '1000'` |
+| `bucket(N, key)` partitioning, and no other partition field | Caps at `permissive`: `no_bucket_partition`, files probed per lookup | `PARTITIONED BY (bucket(N, key))`, then rewrite the files written without it. See [Choosing the bucket count](#choosing-the-bucket-count). |
+| Within a bucket, files whose key ranges do not intersect | Caps at `permissive`: `overlapping_files`, files probed per lookup | `'write.distribution-mode' = 'hash'`; `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=false` on the write session; or a compaction |
+| Dictionary encoding off on the value column | Caps at `balanced`: `dictionary_encoded_value`, one extra GET per hit | `'parquet.enable.dictionary' = 'false'` |
+| Key pages of 1,000 rows | Caps at `balanced` above 2,000 rows: `large_key_pages`, keys decoded per lookup | `'write.parquet.page-row-limit' = '1000'` |
 | Value pages bounded by bytes for large values | Advice when a file's mean value page is over 1 MiB: `large_value_pages`. Over 64 MiB: `value_pages_over_ceiling`, and a lookup into a page that large is refused with an error | `'write.parquet.page-size-bytes' = '65536'` with a short page-size check interval, as the recipe above describes |
 | Full-length manifest metrics on the key | Advice: `bounds_missing` | `'write.metadata.metrics.column.key' = 'full'` |
 | A full-length column index on the key | Advice: `column_index_truncated` | `'parquet.columnindex.truncate.length'` at least the key length, such as `'256'` |
@@ -122,7 +124,8 @@ means rewriting every file.
 and output are in [Configuration and the command line](configuration.md).
 The decisions behind the contract:
 [RFD 002](rfd/002-serving-layout-contract.md) (the contract),
-[RFD 007](rfd/007-serving-tiers.md) (refused, inefficient, and advice, with
+[RFD 007](rfd/007-serving-tiers.md) (refusals, costs, and advice, with
 their penalties), [RFD 009](rfd/009-writes-between-builds.md) (delete
-files), and [RFD 016](rfd/016-doctor.md) (the doctor). Terms such as
-residency and strict are in the [glossary](glossary.md).
+files), [RFD 016](rfd/016-doctor.md) (the doctor), and
+[RFD 020](rfd/020-lookup-levels.md) (lookup levels). Terms such as
+residency, level, and strict are in the [glossary](glossary.md).

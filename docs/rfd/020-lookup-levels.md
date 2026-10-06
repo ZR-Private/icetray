@@ -101,11 +101,13 @@ and refresh) describes, until the source moves or a reload changes the
 table's entry. For a strict table the level is judged before any key
 chunk is built, from the snapshot's manifests and footers and, for each
 new file that shares a bucket with another, the first and last key of
-the file, which decide overlap and cost at most two key-page reads. A
-refused snapshot writes nothing to the local directory. Because the level
-is judged first, `serve` names `below_level` for a snapshot that would
-also fail a later check, such as sorting; the doctor, which loads the
-whole snapshot, names the other reason. Both refuse it.
+the file, which decide overlap and cost at most two key-page reads, with
+the key column's dictionary page beside each when it has one. A refused
+snapshot writes nothing to the local directory. Because the level is
+judged first, `serve` can name `below_level` for a snapshot that would
+also fail a later check, such as sorting. Whether it does depends on the
+edge keys, which in an unsorted file may hide its overlap; the doctor,
+which loads the whole snapshot, names the other reason. Both refuse it.
 
 ### What `strict` acts on
 
@@ -114,7 +116,7 @@ belongs to the snapshot, and `strict` refuses it. A shortfall that depends
 on the server (its memory, its other tables, the kernel's cache) belongs
 to the server and is flagged at every setting, because holding an older
 snapshot would not reliably cure it, and refusing on it would make the
-outcome depend on load order and on neighbours. The page cache is the one
+outcome depend on load order and on neighbors. The page cache is the one
 server condition a level depends on today:
 
 - While a `disk` table serves, icetray samples which of its chunk-file
@@ -169,16 +171,17 @@ read below the predicted cost.
 
 The doctor reports, per table, the declared level (`lookups`), the level
 its layout achieves (`level`, replacing `serviceability`), and for each
-finding the level it caps. For a chosen level it names the residencies
-that can reach it and what each costs in memory and disk. Its exit codes
-follow the level: 0 for a table at or above its declared level, 2 for one
-below it that would be served, 1 for one that would be refused, whether
-for a refusal or for its level under `strict`. A refusal for the level
-carries the reason `below_level`, which replaces `inefficient` in the
-output contract and in `icetray_refresh_errors_total`. The doctor judges
-the layout only. The page cache is a condition of the serving process,
-which the doctor runs apart from, and it never decides a refusal, so the
-doctor still never passes a table that `serve` refuses.
+finding the level it caps. For each residency that can load the table it
+reports the level the layout reaches there (`level_by_residency`), beside
+what each costs in memory and disk. Its exit codes follow the level: 0
+for a table at or above its declared level, 2 for one below it that would
+be served, 1 for one that would be refused, whether for a refusal or for
+its level under `strict`. A refusal for the level carries the reason
+`below_level`, which replaces `inefficient` in the output contract and in
+`icetray_refresh_errors_total`. The doctor judges the layout only. The
+page cache is a condition of the serving process, which the doctor runs
+apart from, and it never decides a refusal, so the doctor still never
+passes a table that `serve` refuses.
 
 ### Reload
 
@@ -208,7 +211,7 @@ schedule.
 **Refusing under `strict` when the chunk files will not fit the page
 cache.** Rejected because whether a snapshot fits depends on the other
 tables and on load order: a lenient table that grows would hold a strict
-neighbour at every later commit, and two replicas with one configuration
+neighbor at every later commit, and two replicas with one configuration
 could refuse different tables. The index budget is treated the same way
 for the same reason.
 
@@ -239,8 +242,8 @@ code should know. RFD 011 (Configuration) gains `lookups` and the new
 tier, and the `inefficient` refusal reason give way to the level and
 `below_level`. RFD 005's table states gain `held`.
 
-The level check moves ahead of building key chunks. Today the strict gate
-runs on a built generation, so a refused snapshot has already written its
+The level check moves ahead of building key chunks. RFD 007's strict gate
+ran on a built generation, so a refused snapshot had already written its
 chunk files and evicted other tables' pages from the page cache.
 
 Measuring the level at load costs little, since the findings exist. The

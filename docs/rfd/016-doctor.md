@@ -12,6 +12,10 @@
 > table whose load fails with an error rather than a rule is refused as
 > `load_failed`, with the error's kind beside it.
 
+> Updated 2026-10-05: the doctor reports lookup levels in place of
+> serviceability, and its exit codes follow the declared level. See RFD
+> 020 (Lookup levels).
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -33,8 +37,8 @@ has to answer both, or the two answers drift apart.
 ## Decision
 
 A `doctor` command, and the same check at every generation load, will
-report a table's serviceability, its inefficient findings with their
-penalties, and its advice with the writer property to change, against
+report the lookup level a table's layout achieves, the inefficient
+findings that cap it with their penalties, and its advice with the writer property to change, against
 thresholds that are measured defaults kept in one documented table.
 
 The refusal reasons and inefficient findings are RFD 007's lists, grouped
@@ -72,21 +76,21 @@ bytes, computed from footers alone, so an owner chooses a tier (RFD 017
 (Residency tiers)) from one run
 ([bloom residency tier, results](../analysis/2026-09-10-bloom-residency-tier.md#results)).
 
-The command exits 0 for a table with no inefficient finding (advice does
-not change the code), 2 when an inefficient finding is present, and 1
-with the refusal reason when the table cannot be served. The reason is
-always a refusal code: one of RFD 007's refusal reasons, `inefficient`
-under `strict`, or `load_failed` when an error rather than a rule stopped
+The command exits 0 for a table that meets its declared lookup level
+(advice does not change the code), 2 for one below it that would be
+served, and 1 with the refusal reason when the table cannot be served.
+The reason is always a refusal code: one of RFD 007's refusal reasons,
+`below_level` under `strict`, or `load_failed` when an error rather than a rule stopped
 the load (an object store failure, a table that cannot be opened), with
 the error's kind reported beside it. A pipeline that gates on the reason
 then matches a closed set of rules, and a new error kind lands under
 `load_failed` instead of reading as a new rule. A table from a
 configuration file is judged under its configured `strict`, as `serve`
-judges it: an inefficient table whose `strict` is on is reported with
-every finding and then refused under RFD 007's `inefficient` reason, with
-exit 1, so the doctor never passes with 2 a table that `serve` refuses. A
-table located directly, with no configuration, is never strict, since
-nothing configures it to be.
+judges it: a strict table below its level is reported with every
+finding and then refused as `below_level`, with exit 1, so the doctor
+never passes with 2 a table that `serve` refuses. A table located
+directly, with no configuration, declares the best level its residency
+reaches and is never strict, since nothing configures it to be.
 
 Only the doctor checks every key's bucket. After the load it decodes every
 key of every bucketed file, hashes it under the file's own bucketing, and
@@ -97,7 +101,7 @@ makes it a refusal rather than an inefficiency or advice. The load hashes only e
 file's fences and its first and last key (RFD 007), since hashing every
 row would add tens of nanoseconds per key to every load, while the doctor
 runs before a table ships and can afford the time. At load the same
-findings decide the tier, honor `strict`, and are reported under the names
+findings decide the level, honor `strict`, and are reported under the names
 RFD 007 fixes. The command is a subcommand of the serving binary (RFD 012
 (Deployment contract)).
 

@@ -10,6 +10,14 @@
 > logged and counted the same failure each time. Transient failures are
 > still retried on every poll.
 
+> Updated 2026-10-05: a strict table that refuses a snapshot for its
+> level is `held`, not degraded, while the last snapshot that met the
+> level serves, so a writer's layout and a fault read as different
+> states. A reload that changes only a table's `lookups` or `strict`
+> retunes it in place and forgets every remembered refusal, so the next
+> poll builds the ref's snapshot again and a snapshot refused for another
+> reason is refused once more. See RFD 020 (Lookup levels).
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -57,8 +65,9 @@ file; how that depth grows with more files is open
 Data files in one bucket whose exact key ranges intersect form an overlap
 group. The group's sorted key runs are merged from the resident key column
 chunks to find any key present in more than one file. A duplicate key is a
-refusal. Overlap without duplicates is an inefficient finding, measured under
-RFD 007 (Serving tiers).
+refusal. Overlap without duplicates is a finding measured under RFD 007
+(Serving tiers) that caps the table's lookup level under RFD 020 (Lookup
+levels).
 
 When a refresh fails, the last good generation keeps serving and the
 failure is reported. A failure that is a function of the snapshot's

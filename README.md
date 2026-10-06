@@ -123,11 +123,14 @@ icetray doctor --location target/golden-warehouse/db/long_2m
 ```
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","serviceability":"efficient","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"inefficient":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"capping":0,"advice":0}
 ```
 
-It exits 0, with no finding. `predicted` is the memory and disk each
-[residency](docs/configuration.md#choosing-a-residency) would need.
+It exits 0, with no finding: the table reaches the `optimal`
+[level](docs/configuration.md#choosing-a-level) it declares. `predicted` is
+the memory and disk each
+[residency](docs/configuration.md#choosing-a-residency) would need, and
+`level_by_residency` the level each would reach.
 
 Serve it. A configuration file's locations are absolute, so write the
 file with the full path:
@@ -198,10 +201,11 @@ Check it:
 icetray doctor --location s3://warehouse/db/kv
 ```
 
-The doctor exits 0 for a table that serves efficiently, 2 for one that
-serves [inefficiently](docs/glossary.md), and 1 for one it refuses. A
-table in a configuration file has `strict` on unless the file turns it
-off, and `serve` refuses a strict table that is inefficient. `icetray
+The doctor exits 0 for a table that meets its
+[lookups level](docs/configuration.md#choosing-a-level), 2 for one below
+it that would still be served, and 1 for one it refuses. A table in a
+configuration file is served below its level and flagged unless the file
+sets `strict = true`, and then `serve` refuses the snapshot. `icetray
 doctor --config` judges each table the same way, so it exits 1 for such a
 table.
 

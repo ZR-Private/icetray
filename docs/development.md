@@ -52,7 +52,7 @@ Two suites need fixtures and show as ignored under a plain `cargo test`.
 - `dev/test-golden.sh` runs the layout tests against the golden tables
   `dev/golden-tables.py` writes: one contract-shaped table per key type,
   one in table format version 3 (the rest are version 2, the writer's
-  default), and the off-contract layouts whose inefficient and advice findings
+  default), and the off-contract layouts whose capping and advice findings
   the doctor reports.
 
 ```sh

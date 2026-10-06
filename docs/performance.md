@@ -189,7 +189,7 @@ cheapest:
 
 - **Key pages of 1,000 rows.** A lookup decodes one key page, so the
   page's row count is the keys a lookup decodes. Pages above 2,000 rows
-  are an inefficient finding.
+  draw `large_key_pages`, which caps the table's level at `balanced`.
 - **Value pages bounded by bytes.** A hit fetches and decompresses one
   whole value page and caches it. For values of kilobytes the contract
   bounds pages at 64 KiB; a page bounded by rows alone grows to megabytes,

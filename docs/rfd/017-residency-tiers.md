@@ -15,6 +15,11 @@
 > every table loads at once at start; icetray raises its soft open-file
 > limit to the hard limit at start.
 
+> Updated 2026-10-05: a snapshot that a strict table refuses for its
+> level writes no chunk files, since the level is judged from manifests,
+> footers, and each new file's edge keys before any key chunk is built.
+> See RFD 020 (Lookup levels).
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -262,12 +267,14 @@ that replaces every data file needs room for the old set and the new one
 at once, and a table rewritten wholesale is sized at about twice its
 steady footprint. Measuring against the directory as it would be after the
 swap would admit a write that overfills the volume during the load, which
-is the failure the budget exists to prevent. A generation the strict gate
-refuses has already written its new files' chunks. They stay until a
-later swap deletes what no generation references, because the next poll
-rebuilds the same snapshot and reuses them, and deleting them at once
-would make every poll fetch and write them again for as long as the
-refusal lasts.
+is the failure the budget exists to prevent. A generation refused once
+built, such as one with unsorted keys, has already written its new files'
+chunks. They stay until a later swap deletes what no generation
+references, because they are usually built again. The snapshot committed
+after a refusal usually keeps most of the refused one's files, and a
+reload, or a failure that is retried, builds the same snapshot again;
+deleting the chunk files at once would make that build fetch and write
+them again.
 
 Chunk files that no serving generation references are deleted with every
 table's load lock held, taken in configuration order. A load in flight has

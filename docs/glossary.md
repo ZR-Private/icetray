@@ -11,7 +11,8 @@ good generation keeps serving, `icetray_table_state{state="degraded"}`
 reads 1, and the next poll tries again, except after a failure of the
 snapshot itself, a refusal or a fault of its metadata or data files, which
 is tried again once the table's metadata location moves. Readiness does
-not change. See [Refresh and reload](operating.md#refresh-and-reload).
+not change. A strict table refused for its level is held instead. See
+[Refresh and reload](operating.md#refresh-and-reload).
 
 **Fence array.** The first key of every key page of a data file, held in
 memory for every residency. A lookup binary-searches it to pick the one key
@@ -22,29 +23,43 @@ snapshot's data files with their resident index. A new snapshot is built
 as a new generation beside the serving one and swapped in whole, so every
 answer comes from exactly one snapshot, whose id it carries.
 
-**Inefficient.** A table that icetray serves correctly but with more work
-per lookup than the contract layout: an extra GET per hit, more keys
-decoded, or more files probed. The doctor reports each such finding with
-its measured penalty. With `strict` on, the default, an inefficient table
-is refused. See [the table contract](table-contract.md).
+**Held.** The state of a strict table that refused its newest snapshot
+for its level while the last snapshot that met the level keeps serving.
+`icetray_table_state{state="held"}` reads 1, and the table is not
+degraded, since a writer's layout put it there and no fault did. It
+ends when a snapshot that meets the level swaps in, when the ref returns
+to the serving snapshot, or when a reload relaxes `lookups` to a level the
+refused snapshot meets or turns `strict` off. See
+[Refresh and reload](operating.md#refresh-and-reload).
 
 **Key chunk.** The compressed bytes of a data file's key column in one row
 group. A load reads every key chunk once to verify the keys, and the
 `full` residency keeps them in memory.
 
+**Level.** The lookup cost a table declares it accepts, its `lookups`,
+and the cost its snapshot's layout achieves, each one of `optimal`,
+`balanced`, or `permissive`. `optimal` is one GET per hit and none per
+miss, probing one file; `balanced` probes one file at a fixed extra cost;
+`permissive` is any snapshot icetray serves correctly, including one where
+a lookup probes several files. Residency and the doctor's capping findings
+set the level achieved, and a table below its declared level is flagged.
+See [Choosing a level](configuration.md#choosing-a-level).
+
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
 `doctor`, `get`, and `info`. Each loads its tables the way `serve` does.
 See [the command line](configuration.md#the-command-line).
 
-**Refused.** A table icetray will not serve, for a named reason: an answer
-could be wrong (unsorted files, duplicate keys, delete files, and the
-like), the table cannot be held the way its residency requires, or it is
-inefficient while `strict` is on.
+**Refused.** A snapshot icetray will not serve, for a named reason: an
+answer could be wrong (unsorted files, duplicate keys, delete files, and
+the like), the table cannot be held the way its residency requires, or,
+under `strict`, its layout is below the table's level (`below_level`).
 
 **Residency.** Where a table keeps its key chunks: `full` (in memory),
 `disk` (in a file in the local directory, with footers, page indexes,
 and the fence array in memory), or `bloom` (bloom filters in memory instead). See
 [Choosing a residency](configuration.md#choosing-a-residency).
 
-**Strict.** A per-table setting, on by default, that refuses an
-inefficient table instead of serving it with its penalty.
+**Strict.** A per-table setting, off by default, that refuses a snapshot
+whose layout puts the table below its level instead of serving it
+flagged. A strict table holds its last snapshot that met the level, and
+fails to start when its first snapshot is below it.

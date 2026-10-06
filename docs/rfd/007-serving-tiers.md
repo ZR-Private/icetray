@@ -7,6 +7,13 @@
 > Updated 2026-10-04: the doctor honors each configured table's `strict`,
 > as the load does. See RFD 016.
 
+> Updated 2026-10-05: RFD 020 (Lookup levels) replaces the strict gate
+> and the inefficient tier. An inefficient finding now caps the table's
+> lookup level, `strict` refuses a snapshot whose layout puts the table
+> below the level it declares, and `strict` defaults to off, which closes
+> the open question below. The refusals, the penalty units, and advice
+> are unchanged.
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -32,8 +39,8 @@ residency refusals of RFD 017 (Residency tiers)) will be refused at load
 with a named reason; a table it can serve only inefficiently (a
 dictionary-encoded value column, key pages over 2,000 rows, no bucket
 partition, overlapping files in a bucket) will be served with its penalty
-measured and reported, and refused only when the table's `strict` setting
-is on; tuning advice will never affect whether a table serves.
+measured and reported, and each such finding caps the table's lookup
+level (RFD 020); tuning advice will never affect whether a table serves.
 
 The tiers are refusal, inefficient, and advice, and the line between them
 is what a client could observe. A refusal means icetray cannot serve the
@@ -97,9 +104,10 @@ Placements settled elsewhere:
   is not one of the penalty units
   ([prototype findings, finding 13](../analysis/2026-09-10-prototype-findings.md#13-key-length)).
 
-`strict` is per table and defaults to on. The doctor applies the same
-classification as the load path and the same `strict` to a configured
-table; what it reports, and how, is RFD 016 (Doctor).
+`strict` is per table; its meaning and its default, off, are RFD 020's
+(Lookup levels). The doctor applies the same classification as the load
+path and the same `strict` to a configured table; what it reports, and
+how, is RFD 016 (Doctor).
 
 ## Alternatives Considered
 
@@ -123,11 +131,13 @@ logs, in the doctor's output, and in the metrics. The penalty vocabulary is
 fixed to the three units above, so an inefficient finding that fits none of
 them is advice or a refusal.
 
-Open question: whether `strict` should stay on by default. On means a
-regressed layout fails loudly at load, before it reaches clients, and a
-table owner who wants an inefficient table served turns it off knowingly, with one
-line per table. The price is a refusal at first contact for an existing
-table that would have served correctly. Off means an inefficient table serves and
-the doctor tells you, the way a database runs a full table scan rather
-than refusing the query, and a build pipeline can still get a loud failure
-from the doctor's exit code (RFD 016). The default is one line to change.
+The open question of whether `strict` should stay on by default was
+closed by RFD 020 (Lookup levels), which chose off. On means a regressed
+layout fails loudly at load, before it reaches clients, and a table
+owner who wants an inefficient table served turns it off knowingly, with
+one line per table. The price is a refusal at first contact for an
+existing table that would have served correctly. Off means an
+inefficient table serves and the doctor tells you, the way a database
+runs a full table scan rather than refusing the query, and a build
+pipeline can still get a loud failure from the doctor's exit code (RFD
+016). The default is one line to change.

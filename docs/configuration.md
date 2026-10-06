@@ -223,7 +223,8 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `key_column` | string | required | The key column. |
 | `value_column` | string | required | The value column. |
 | `source` | table | required | Where the table's metadata comes from, below. |
-| `strict` | boolean | `true` | Refuse the table when it is [inefficient](glossary.md). Off, it serves with its penalty reported. |
+| `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
+| `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
 | `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` needs `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
 | `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it is refused as `over_budget` once the footers are read, before any key chunk is fetched. Set on a `disk` or `bloom` table, it makes the file invalid. |
 
@@ -350,6 +351,57 @@ footers alone, so the choice can be made with the numbers in hand.
 
 The decision is recorded in [RFD 017](rfd/017-residency-tiers.md).
 
+## Choosing a level
+
+A table's `lookups` is the lookup cost its owner accepts. A level is
+stated in what a lookup costs, so it means the same on every table:
+
+- `optimal`: a hit costs one GET and a miss none, and a lookup probes one
+  file and decodes one key page of ordinary size.
+- `balanced`: a lookup still probes one file, with a fixed extra cost: an
+  extra GET per hit, a GET for a miss the bloom filter passes, or larger
+  key pages.
+- `permissive`: any snapshot icetray serves correctly, including one where
+  a lookup probes more than one file.
+
+The level a snapshot achieves is the costliest level that its residency
+or any of its findings caps it at. `bloom` residency caps it at
+`balanced`; the findings that cap it, and at which level, are in
+[the table contract](table-contract.md#requirements). Advice caps
+nothing. The doctor prints the level as `level`, and under `level_by_residency` the
+level each residency would reach with the same files, beside what each
+costs under `predicted`.
+
+The line between `balanced` and `permissive` is the one that matters for
+operations. A cost within one file follows from how the files are written
+and stays put. Extra files probed come from how the table is committed
+to, and they grow with every append until a compaction removes them.
+
+Choose the level by what the table's readers and its writer can live
+with:
+
+- Keep the default, the best level the residency reaches, when the
+  table's lookups sit on a latency-sensitive path and a table that gets
+  slower should alert its owner.
+- Declare `balanced` for a table whose writer cannot drop the value
+  dictionary or shrink its key pages. Left at the default, such a table
+  reads below its level from its first load
+  ([What to alert on](operating.md#what-to-alert-on)).
+- Declare `permissive` for a table that takes appends with no compaction
+  schedule, accepting lookups that slow down until a compaction runs.
+
+`strict` decides what falling below the level does. Off, the default, the
+snapshot serves and the table is flagged. On, a snapshot whose layout is
+below the level is refused as `below_level`: at start `serve` exits 1, and
+on a refresh the last snapshot that met the level keeps serving and the
+table is held ([Refresh and reload](operating.md#refresh-and-reload)). A
+strict table's level is judged before any key chunk is fetched, from the
+manifests, the footers, and the first and last key page of each new file
+that shares a bucket with another, with the key's dictionary page when it
+has one, so a refused snapshot writes nothing to the local directory.
+
+The decision is recorded in [RFD 020](rfd/020-lookup-levels.md).
+
 ## The command line
 
 ```
@@ -441,9 +493,11 @@ root. The table is named after the table root's last directory: `kv` for
 `s3://warehouse/db/kv/metadata/v3.metadata.json`. A location with no
 directory to name it after, such as a bare bucket, opens as `table`.
 
-A located table runs with `strict` off and with every `[server]` and
-`[storage]` default, so the doctor reports what `strict` would refuse
-without refusing it.
+A located table runs with every `[server]` and `[storage]` default. Its
+`lookups` is the best level its `--residency` reaches, `optimal` for
+`full` and `balanced` for `bloom`, and it is never strict, so the doctor
+reports a located table below that level with exit 2 rather than refusing
+it.
 
 ```sh
 icetray doctor --location s3://warehouse/db/kv
@@ -515,13 +569,14 @@ Two conventions hold for every line:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","serviceability":"efficient","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"inefficient":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"capping":0,"advice":0}
 ```
 
 | Key | Value |
 |---|---|
 | `snapshot_id` | The snapshot loaded. |
-| `serviceability` | `efficient`, or `inefficient` when any finding is inefficient. |
+| `level` | The [level](#choosing-a-level) the snapshot achieves in the loaded residency: `optimal`, `balanced`, or `permissive`, the costliest level that the residency or any finding caps it at. |
+| `lookups` | The level the table declares: its configured `lookups`, or for a located table the best level its residency reaches. |
 | `residency` | The residency the table was loaded in. |
 | `file_count` | Live data files in the snapshot. |
 | `buckets` | The bucket count of the key's bucket transform, `null` for a table without one. |
@@ -536,20 +591,21 @@ One per table, from `info` and from `doctor`:
 | `predicted.bloom_bits_per_key` | Filter bits per row; `null` when `predicted.bloom` is. |
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
 | `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
-| `inefficient` | The number of inefficient findings. |
+| `level_by_residency` | For each residency that can load the table, the level its files would reach there. A residency that cannot load the table is left out, as `bloom` is when `predicted.bloom` is `null`. |
+| `capping` | The number of findings that cap the level. |
 | `advice` | The number of advice findings. |
 
 #### `finding`
 
-One per finding, from `doctor`, inefficient findings first:
+One per finding, from `doctor`, capping findings first:
 
 | Key | Value |
 |---|---|
-| `tier` | `inefficient` or `advice`. |
+| `caps` | The level the finding caps the table at, `balanced` or `permissive`; `null` for advice. |
 | `code` | The finding's code, such as `large_key_pages`; the codes are in [the table contract](table-contract.md#requirements). |
 | `message` | What was measured, for a person. |
 | `file` | The data file's location, or `null` for a table-level finding. |
-| `penalty` | `null` for advice. For an inefficient finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
+| `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
 | `property` | The writer property that fixes it, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
 
 #### `file`
@@ -581,12 +637,12 @@ One per table the doctor refused, after any `table` and `finding` lines
 for it:
 
 ```json
-{"kind":"refusal","table":"unpart","reason":"inefficient","message":"table unpart is inefficient and strict is on: no_bucket_partition"}
+{"kind":"refusal","table":"unpart","reason":"below_level","message":"table unpart refused: below_level (lookups optimal, the layout achieves permissive: no_bucket_partition)"}
 ```
 
 | Key | Value |
 |---|---|
-| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`, `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`); `inefficient` for an inefficient table under `strict`; or `load_failed` when an error rather than a rule stopped the load. |
+| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`, `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`; or `load_failed` when an error rather than a rule stopped the load. |
 | `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
@@ -617,22 +673,24 @@ One per key, from `get`:
 The same codes apply to every command; the root help's footer lists them.
 
 - **0**: the run did what was asked. An absent key is an answer, so a
-  `get` of absent keys exits 0. The doctor exits 0 when no table is
-  inefficient; advice does not change the code. `serve` exits 0 after a
-  drain that finished within `server.drain_deadline`.
+  `get` of absent keys exits 0. The doctor exits 0 when every table meets
+  its `lookups` level; advice does not change the code, and neither does
+  a capping finding the level accepts. `serve` exits 0 after a drain that
+  finished within `server.drain_deadline`.
 - **1**: the run failed. A configuration file that cannot be read, is not
   TOML or JSON, does not fit the schema (a key missing, unknown, or of the
-  wrong type), or breaks a rule (no table listed, a rewrite rule with an
-  empty half, an empty or unservable location, a bad log field mapping,
-  and the rest); a relative path on the command line with no readable
-  working directory; a load or read error; a table refused, which for the
-  doctor is a `refusal` line and takes precedence over 2; and for `serve`,
-  a first load that failed, a listener that would not bind, or a drain
-  that passed its deadline.
-- **2**: the doctor found an inefficient table that it did not refuse: a
-  `--location` table, or a configured table with `strict = false`. A
-  configured table with `strict` on is refused instead, exit 1, as `serve`
-  would refuse it.
+  wrong type), or breaks a rule (no table listed, a `lookups` level its
+  residency cannot reach, a rewrite rule with an empty half, an empty or
+  unservable location, a bad log field mapping, and the rest); a relative
+  path on the command line with no readable working directory; a load or
+  read error; a table refused, which for the doctor is a `refusal` line,
+  `below_level` under `strict` among them, and takes precedence over 2;
+  and for `serve`, a first load that failed, a listener that would not
+  bind, or a drain that passed its deadline.
+- **2**: the doctor found a table below its `lookups` level that it did
+  not refuse: a configured table with `strict` off, the default, or a
+  `--location` table, which is never strict. A strict table below its
+  level is refused instead, exit 1, as `serve` would refuse it.
 - **64**: the command line could not be used: no configuration; both
   `--config` and `--location`; a `--location` that is empty, a `file:` URI
   with a relative path or another host, or one no store serves; a

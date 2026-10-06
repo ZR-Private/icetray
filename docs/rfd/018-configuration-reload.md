@@ -6,6 +6,12 @@
 > Updated 2026-10-04: a removed table's gauges leave the metrics at the
 > next scrape instead of keeping their last values.
 
+> Updated 2026-10-05: a change to only a table's `lookups` or `strict`
+> applies to its serving generation in place, with no load, since the
+> level is judged from the layout the generation holds; the reload is
+> refused whole when a strict table's serving snapshot is below its new
+> level. See RFD 020 (Lookup levels).
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing

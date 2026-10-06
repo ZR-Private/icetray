@@ -12,7 +12,7 @@ an RFD and implies nothing about order.
 | [004](004-resident-key-chunk-index.md) | Resident key-chunk index | Each data file's footer, page indexes, key chunks, exact key range, and fence array stay in memory, so a hit fetches at most one value page and a miss fetches nothing. |
 | [005](005-generations-and-refresh.md) | Generations and refresh | A table follows one ref, builds each new snapshot beside the current one while reusing unchanged files, and swaps it in atomically. |
 | [006](006-lookup-hot-path.md) | Lookup hot path | Lookups decode keys and values with the Parquet column reader over in-memory byte segments, with Arrow kept off the path. |
-| [007](007-serving-tiers.md) | Serving tiers | A table that cannot be served correctly is refused, one that serves only inefficiently is served with its penalty measured unless `strict` is on, and advice never affects serving. |
+| [007](007-serving-tiers.md) | Serving tiers | A table that cannot be served correctly is refused, a finding that adds work per lookup is served with its penalty measured and caps the table's lookup level (RFD 020), and advice never affects serving. |
 | [008](008-keys.md) | Keys | One key column of type long, string, binary, or uuid, moved as bytes unchanged, with keys over 4,096 bytes refused. |
 | [009](009-writes-between-builds.md) | Writes between builds | Appends and copy-on-write snapshots are served, and snapshots with delete files are refused, with a ref advanced behind compaction as the pattern for merge-on-read tables. |
 | [010](010-transport-and-client-contract.md) | Transport and client contract | Clients speak gRPC through the checked-in protobuf service (Get, MultiGet, TableInfo), and every answer carries its snapshot id. |
@@ -21,7 +21,7 @@ an RFD and implies nothing about order.
 | [013](013-tail-latency.md) | Tail latency | Lookup GETs are hedged after a delay taken from observed latency and capped by a hedge-rate ceiling, and load reads are never hedged. |
 | [014](014-test-layering.md) | Test layering | Correctness and cost are proven in layers, from unit tests to golden tables written by Spark, with the GET counter as the oracle. |
 | [015](015-lint-policy.md) | Lint policy | Clippy's pedantic group is denied everywhere with four named exceptions in one workspace table and two scoped carve-outs. |
-| [016](016-doctor.md) | Doctor | A `doctor` command and the same check at every load report serviceability, inefficient findings with penalties, and advice with the writer property to change. |
+| [016](016-doctor.md) | Doctor | A `doctor` command and the same check at every load report the lookup level a table's layout achieves, the findings that cap it with their penalties, and advice with the writer property to change. |
 | [017](017-residency-tiers.md) | Residency tiers | Where a table keeps its key chunks (`full`, `disk`, or `bloom`) is an explicit per-table setting chosen by the owner, with a local directory for the disk files and the page cache's disk level. |
 | [018](018-configuration-reload.md) | Configuration reload | A change to the file's tables is applied to a running server by loading the changed tables beside the serving ones and swapping the whole set, or refused whole. |
 | [019](019-aws-catalog-sources.md) | AWS catalog sources | Tables in Glue and S3 Tables are resolved to their metadata location through the AWS SDK with the storage credentials, and their metadata is read through the one storage layer. |

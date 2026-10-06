@@ -40,8 +40,10 @@ while tables load.
   metrics listener answers 200. Until then it answers 503.
 - A table that fails its first load is fatal: the reason is logged, health
   stays `NOT_SERVING` for ten seconds, and the process exits 1. A strict
-  table that loads as inefficient fails its first load this way, and so
-  does a load that runs past `server.load_deadline`.
+  table whose first snapshot is below its `lookups` level fails its first
+  load this way, refused as `below_level`, since there is no earlier
+  snapshot to hold, and so does a load that runs past
+  `server.load_deadline`.
 - SIGTERM or SIGINT starts a drain. Health turns `NOT_SERVING`, the gRPC
   listener stops accepting, and the metrics listener closes. The drain
   waits up to `server.drain_deadline` for open calls, then flushes the
@@ -143,6 +145,9 @@ Gauges, written at each scrape:
 | `icetray_requests_in_flight` | | `Get` and `MultiGet` calls admitted and not yet ended. |
 | `icetray_max_in_flight` | | `server.max_in_flight`. A call that finds every slot held is `RESOURCE_EXHAUSTED`. |
 | `icetray_table_state` | `table`, `state` | 1 for the table's current state, 0 for the others. |
+| `icetray_table_below_level` | `table` | 1 while the newest snapshot the table measured, the one serving or, while the table is held, the one it refused, is below the table's `lookups` level, else 0. |
+| `icetray_table_level` | `table` | The [level](configuration.md#choosing-a-level) that snapshot's layout achieves: 0 for `optimal`, 1 for `balanced`, 2 for `permissive`. |
+| `icetray_table_declared_level` | `table` | The table's `lookups`, in the same numbers. |
 | `icetray_generation_age_seconds` | `table` | Seconds since the serving snapshot was committed, by its timestamp. A table written once a day reads up to a day between writes; it is not a replication lag. |
 | `icetray_generation_sequence_number` | `table` | The serving snapshot's sequence number. |
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
@@ -152,6 +157,12 @@ Gauges, written at each scrape:
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the system; `retained` is address space only. |
+
+The three level gauges appear with the table's first swap, like the
+generation gauges. A snapshot refused as `below_level` was measured, so
+they take its level; a snapshot refused for any other reason leaves them
+as they were. A reload that changes `lookups` sets
+`icetray_table_declared_level` at once.
 
 The label values:
 
@@ -168,7 +179,8 @@ The label values:
   `cold_hit` (the value page was fetched), `warm_hit` (the page cache
   served it), `miss`.
 - `result` of `icetray_config_reloads_total`: `applied`, `refused`.
-- `state`: `loading`, `serving`, `degraded`.
+- `state`: `loading`, `serving`, `degraded`, `held` ([Refresh and
+  reload](#refresh-and-reload)).
 - `code` of `icetray_findings`: `dictionary_encoded_value`,
   `large_key_pages`, `no_bucket_partition`, `overlapping_files`,
   `bounds_missing`, `column_index_truncated`, `large_value_pages`,
@@ -178,16 +190,16 @@ The label values:
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
   `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,
-  `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`),
-  `inefficient`, or an error kind (`iceberg`, `parquet`, `object_store`,
+  `delete_files`, `key_too_long`, `over_budget`, `no_bloom_filter`,
+  `below_level`), or an error kind (`iceberg`, `parquet`, `object_store`,
   `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`,
   `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`,
   `load_deadline`, `refresh_deadline`, `verify_canceled`,
   `lookup_canceled`). There are too many to expose for every table at
   start, so a series appears with its first error; alert on
-  `icetray_table_state{state="degraded"}` instead. A table stuck behind a
-  refused snapshot counts the failure once, so its rate falls to zero
-  while the table stays degraded.
+  `icetray_table_state` instead ([What to alert on](#what-to-alert-on)). A
+  table stuck behind a refused snapshot counts the failure once, so its
+  rate falls to zero while the table stays degraded or held.
 
 A table a reload adds gets its series when it is added. A table a reload
 removes loses its gauges at the next scrape; its counters and histograms
@@ -224,10 +236,14 @@ Events worth knowing:
   `table serving` per table as its first load completes.
 - `swapped in a generation`, with the snapshot id and the files reused,
   on every load and refresh.
-- A finding on a load, with `code`, `tier`, and `file`: at `warn` for an
-  inefficient finding and at `info` for advice.
+- A finding on a load, with `code`, `caps` (absent for advice), and
+  `file`: at `warn` for a finding whose cap is below the table's
+  `lookups` level, and at `info` for the rest, advice included.
+- `configuration reloaded`, at `info`, with the file's `digest`, the
+  tables `added`, `changed`, `retuned`, and `removed` by name, and the
+  count `kept`.
 - `configuration reload refused`, at `warn`, with the `reason`, after a
-  `table refused for a reload` for each table that failed
+  `table refused for a reload` for each table refused
   ([Refresh and reload](#refresh-and-reload)).
 - `draining`, when a signal starts the drain.
 - `run failed`, at `error`, with the `error` that ended the run.
@@ -237,8 +253,8 @@ The one-shots log the same JSON to stderr at `warn`, so their stdout stays
 data, and they report their final failure as plain text, `error:
 <message>` with an optional `  hint: <fix>` line. A write to a closed
 stderr is dropped, and the run's exit code stands. The doctor's findings
-are its output and are not logged; `info` and `get` log a table's
-inefficient findings at `warn`.
+are its output and are not logged; `info` and `get` log at `warn` the
+findings that put a table below its `lookups` level.
 
 ## The local directory
 
@@ -321,10 +337,23 @@ reads depends on the table's source
   not hold, then swaps it in. `icetray_generation_swaps_total` counts it.
 - A refresh that fails leaves the last good generation serving, counts
   `icetray_refresh_errors_total`, logs `refresh failed` at `warn`, and
-  moves the table to degraded. Readiness is unchanged.
+  moves the table to degraded, or to held for a `below_level` refusal.
+  Readiness is unchanged.
+- A strict table whose new snapshot is below its `lookups` level refuses
+  it as `below_level`, and the last snapshot that met the level keeps
+  serving. The table is held, not degraded, since a writer's layout put
+  it there and no fault did: `icetray_table_state{state="held"}` reads 1,
+  and so does `icetray_table_below_level`, which measures the refused
+  snapshot. Held ends at the next swap, as when a compaction commits a
+  snapshot that meets the level, or at a poll that finds the ref back on
+  the serving snapshot. A reload that relaxes `lookups` to a level the
+  refused snapshot meets, or turns `strict` off, ends it too, and the next
+  poll swaps that snapshot in. A transient failure of a poll while held
+  makes the table degraded until a poll finds the source unchanged, which
+  makes it held again.
 - A failure of the snapshot itself is remembered. That is any refusal
-  reason, except `over_budget` against `storage.local.index_budget_bytes`,
-  and `inefficient` under `strict`. It is a `table` fault of the
+  reason, `below_level` included, except `over_budget` against
+  `storage.local.index_budget_bytes`. It is a `table` fault of the
   snapshot's metadata: a ref, schema, partition spec, or column it lacks,
   zero buckets, or a data file with no usable bucket value or one out of
   range. It is a `file` fault that a data file's footer or bloom filters
@@ -333,15 +362,21 @@ reads depends on the table's source
   met, and the table does not build that snapshot again while its source
   names the same metadata location: each poll costs only the one read or
   catalog call above, counts nothing, logs nothing, and the table stays
-  degraded. When the source names another metadata location, its snapshot
-  is built. Once the table serves it, or refuses it in turn, `source moved
-  past a refused snapshot` is logged at `info` with the `reason` and, when
-  the ref named one, the refused `snapshot_id`. A reload that changes the
-  table's entry loads the table anew under the new entry, the refused
-  snapshot included, so fixing `ref` or a column name, raising
-  `resident_budget_bytes`, or turning `strict` off takes effect without
-  waiting for a new snapshot; if the snapshot is still refused, the reload
-  is refused.
+  degraded, or held. When the source names another metadata location,
+  its snapshot is built. Once the table serves it, or refuses it in turn,
+  `source moved past a refused snapshot` is logged at `info` with the
+  `reason` and, when the ref named one, the refused `snapshot_id`. A
+  reload that changes a setting of the table's entry other than `lookups`
+  and `strict` loads the table anew under the new entry, the refused
+  snapshot included, so fixing `ref` or a column name or raising
+  `resident_budget_bytes` takes effect without waiting for a new snapshot;
+  if the snapshot is still refused, the reload is refused. A reload that
+  changes only `lookups` or `strict` retunes the table in place and loads
+  nothing. It forgets every remembered refusal, whatever its reason, and
+  logs `retune forgot a refused snapshot` at `info`, so the next poll
+  builds the snapshot the ref names under the new entry. A snapshot
+  refused for another reason than its level is then refused once more,
+  and remembered again.
 - Every other failure is tried again on every poll and is counted and
   logged each time: a store, catalog, cache, or local-directory error, a
   timeout or deadline, `over_budget` against the shared
@@ -372,24 +407,33 @@ The configuration file is read on the same interval, and at once on
 SIGHUP. A change to its tables applies without a restart
 ([RFD 018](rfd/018-configuration-reload.md)).
 
-- A table whose entry is unchanged keeps serving untouched.
+- A table whose entry is unchanged keeps serving untouched. An entry
+  that spells out the default `lookups` is unchanged from one that leaves
+  it out.
+- A table whose entry changed only in `lookups` or `strict` is retuned in
+  place: its generation keeps serving and nothing is loaded, since the
+  level is judged from the layout the generation already holds. A strict
+  table whose serving snapshot is below its new level refuses the reload,
+  as starting with that file would.
 - Added and changed tables load beside the tables serving. Once every one
-  of them serves, the whole set swaps at once. A removed table then
-  answers `NOT_FOUND`.
-- A reload is refused whole when any of those tables fails to load, when
-  the file does not parse or validate (a file that lists no table among
-  them), or when any setting outside `[[tables]]` changed; those apply on
-  restart only. The refusal is logged as `configuration reload refused`
-  and counted, and `icetray_config_pending` reads 1 until the file and
-  the server agree. Its `reason` names what to fix:
+  of them serves, the whole set swaps at once, and the retuned tables take
+  their new entries with it. A removed table then answers `NOT_FOUND`.
+  The outcome is logged as `configuration reloaded` ([Logs](#logs)).
+- A reload is refused whole when any of those tables fails to load or a
+  retuned table is refused, when the file does not parse or validate (a
+  file that lists no table among them), or when any setting outside
+  `[[tables]]` changed; those apply on restart only. The refusal is logged
+  as `configuration reload refused` and counted, and
+  `icetray_config_pending` reads 1 until the file and the server agree.
+  Its `reason` names what to fix:
   - for a file that does not parse or validate, the error, naming the file
     and the setting by its full path;
   - for a restart-only change, the setting, as in
     `server.listen changed, which only a restart applies`;
-  - for tables that failed to load, their names, as in
-    `tables refused: kv`. Each table's own error is logged just
-    before, as `table refused for a reload` with `table`, `reason`,
-    and `error`.
+  - for tables refused, their names, as in `tables refused: kv`. Each
+    table's own error is logged just before, as `table refused for a
+    reload` with `table`, `reason`, and `error`: a load's failure, or
+    `below_level` for a retuned table.
 
   The server keeps serving. The poll retries once the file changes; SIGHUP
   retries at once.
@@ -601,9 +645,27 @@ node's ([File descriptors](#file-descriptors)).
 
 ## What to alert on
 
+Each of the first three conditions is one series compared with a
+constant, so each reaches its owner without a join.
+
+- `icetray_table_below_level == 1`: the newest snapshot of a table costs
+  more per lookup than its `lookups` accepts. This is the table owner's
+  alert: a writer changed the layout, or a compaction is overdue. It reads
+  the same with `strict` on or off, since it measures the newest snapshot
+  whether it serves or was refused. `icetray_table_level` and the table's
+  findings say what put it there.
 - `icetray_table_state{state="degraded"} == 1` for longer than a few
   polls: a table's refreshes are failing, or its ref names a snapshot it
-  refused, and it serves an old snapshot.
+  refused for a reason other than its level, and it serves an old
+  snapshot. This is the alert for whoever runs the server: it fires for
+  faults in storage and catalogs and for snapshots that cannot be served
+  correctly, while a layout that only costs more reads as below its
+  level, and under `strict` as held.
+- `icetray_table_state{state="held"} == 1`: a strict table refused its
+  newest snapshot for its level and serves the last one that met it, so
+  its data falls behind its writer until a snapshot that meets the level
+  is committed. How far behind shows in `icetray_generation_age_seconds`,
+  the next alert.
 - `icetray_generation_age_seconds` above the table's publishing interval
   plus a margin: the served data is older than its writer's schedule
   allows.
