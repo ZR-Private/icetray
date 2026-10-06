@@ -775,6 +775,15 @@ impl FileIndex {
         }
     }
 
+    /// The chunk file holding the key chunks, in the Disk tier; `None` in
+    /// the others, which keep no chunk file.
+    pub(crate) fn disk_chunks(&self) -> Option<&DiskChunks> {
+        match &self.keys {
+            KeyResidency::Disk(disk) => Some(disk),
+            KeyResidency::Chunks(_) | KeyResidency::Filters(_) => None,
+        }
+    }
+
     /// The file the index describes.
     pub(crate) fn handle(&self) -> &Arc<FileHandle> {
         &self.handle

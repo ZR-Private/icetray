@@ -186,6 +186,19 @@ pub(crate) fn edit_verification(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
     rewrite(path, |_, verification| edit(verification));
 }
 
+/// Drops the pages of the file at `path` from the operating system's page
+/// cache, written back first so that none is dirty and each can be dropped.
+#[cfg(target_os = "linux")]
+pub(crate) fn evict(path: &Path) {
+    use std::os::fd::AsRawFd as _;
+    let file = fs::File::open(path).unwrap();
+    file.sync_all().unwrap();
+    // SAFETY: `posix_fadvise` takes no pointer; the descriptor is `file`'s,
+    // open for the call. Offset 0 and length 0 cover the file.
+    let advised = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    assert_eq!(advised, 0, "posix_fadvise failed");
+}
+
 /// Where the key chunks of the chunk file at `path` begin: past its
 /// envelope, header, and verification record.
 pub(crate) fn chunks_offset(path: &Path) -> u64 {

@@ -3,8 +3,10 @@
 //! and carrying that file's identity in a header inside the persisted-state
 //! envelope of RFD 011, so a restarted replica reuses them and a generation
 //! that drops a file deletes them; the page cache's disk level under
-//! `cache/`; and positioned, counted reads of the pages the chunk files
-//! hold. Everything here is rebuilt from object storage and needs no backup.
+//! `cache/`; positioned, counted reads of the pages the chunk files hold;
+//! and samples of which of their pages the kernel's page cache holds (RFD
+//! 020). Everything here is rebuilt from object storage and needs no
+//! backup.
 //!
 //! A chunk file also stores what verifying its keys established (the
 //! verification record, which the index encodes) and a crc32c of its
@@ -16,6 +18,7 @@
 
 mod disk;
 mod format;
+mod residency;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -35,6 +38,9 @@ use format::{
 };
 pub(crate) use format::{Rejection, chunk_file_bytes};
 use prost::Message as _;
+#[cfg(test)]
+pub(crate) use residency::page_bytes;
+pub(crate) use residency::{ResidentPages, Unobserved};
 use sha2::{Digest as _, Sha256};
 
 use crate::approx;

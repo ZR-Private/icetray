@@ -29,7 +29,7 @@ use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition};
 use crate::key::Key;
 use crate::level::Level;
-use crate::local::{DataFileIdentity, LocalDir, Reservation};
+use crate::local::{DataFileIdentity, LocalDir, Reservation, ResidentPages, Unobserved};
 use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayout};
 use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
@@ -591,6 +591,21 @@ impl Generation {
             .iter()
             .map(|file| index::identity_of(file.index.handle()))
             .collect()
+    }
+
+    /// What the operating system's page cache holds of every file's key
+    /// chunks in their chunk files, summed in pages, so weighted by bytes
+    /// (RFD 020); `Err` names the first chunk file whose residency cannot be
+    /// observed. A Full or Bloom generation has no chunk file and counts no
+    /// page. One transient mapping and one `mincore` call per file, no byte
+    /// read: synchronous, for the blocking pool.
+    pub fn chunk_residency(&self) -> std::result::Result<ResidentPages, Unobserved> {
+        self.files
+            .iter()
+            .filter_map(|file| file.index.disk_chunks())
+            .try_fold(ResidentPages::default(), |sum, disk| {
+                Ok(sum.plus(disk.resident()?))
+            })
     }
 }
 
@@ -4955,6 +4970,49 @@ mod tests {
         let generous = table.config(Residency::Full, Some(predicted));
         let loaded = table.load(&generous, None, None).await.unwrap();
         assert_eq!(approx::count(loaded.index_bytes), predicted);
+    }
+
+    /// A Disk generation just loaded has just written its chunk files, so
+    /// the page cache holds every page of their key chunks: from the page
+    /// each file's first chunk starts in to its end.
+    #[tokio::test]
+    async fn test_chunk_residency_of_a_disk_load_is_every_chunk_page() {
+        let (table, _) = two_bucket_table().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let local = local_dir(scratch.path(), table.storage.stats(), None);
+        let disk = table
+            .load(&table.config(Residency::Disk, None), Some(&local), None)
+            .await
+            .unwrap();
+        let page = crate::local::page_bytes().unwrap();
+        let pages: u64 = disk
+            .identities()
+            .iter()
+            .map(|identity| {
+                let path = local.chunk_path(identity);
+                let start = local_testing::chunks_offset(&path);
+                let end = std::fs::metadata(&path).unwrap().len();
+                end.div_ceil(page) - start / page
+            })
+            .sum();
+        assert_eq!(
+            disk.chunk_residency().unwrap(),
+            ResidentPages {
+                pages,
+                resident: pages
+            }
+        );
+    }
+
+    /// A Full generation has no chunk file and counts no page.
+    #[tokio::test]
+    async fn test_chunk_residency_of_a_full_load_counts_no_page() {
+        let (table, _) = two_bucket_table().await;
+        let full = table
+            .load(&table.config(Residency::Full, None), None, None)
+            .await
+            .unwrap();
+        assert_eq!(full.chunk_residency().unwrap(), ResidentPages::default());
     }
 
     #[tokio::test]

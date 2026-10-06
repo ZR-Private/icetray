@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::format::{ParsedChunkFile, Rejection, StoredSpan};
+use super::residency::{self, ResidentPages, Unobserved};
 use super::{LocalFault, VerifiedUnder, local_fault};
 use crate::approx;
 use crate::blocking::on_blocking_pool;
@@ -36,7 +37,9 @@ const CHECKSUM_READ_BYTES: u64 = 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct ChunkFile {
     /// Read only through positioned reads, so the handle has no cursor to
-    /// share and is never mapped.
+    /// share. It is mapped only `PROT_NONE`, for as long as a residency
+    /// sample takes, to ask the kernel which pages it holds
+    /// (`DiskChunks::resident`); no byte is ever read through a map.
     file: File,
     /// For errors.
     path: PathBuf,
@@ -105,6 +108,18 @@ impl DiskChunks {
         on_blocking_pool(move || shared.read_at(file_offset, len))
             .await
             .map_err(|canceled| self.shared.error(LocalFault::Join(canceled)))?
+    }
+
+    /// What the operating system's page cache holds of the file's key
+    /// chunks, every page from the first chunk's to the file's end (RFD
+    /// 020): synchronous system calls, for the blocking pool, which read
+    /// no byte of the file.
+    pub(crate) fn resident(&self) -> std::result::Result<ResidentPages, Unobserved> {
+        let shared = &self.shared;
+        residency::resident(&shared.file, &shared.path, shared.chunks()).map_err(|why| Unobserved {
+            path: shared.path.clone(),
+            why,
+        })
     }
 
     /// What the file's verification record was computed under, as its
@@ -177,6 +192,12 @@ impl DiskChunks {
 }
 
 impl ChunkFile {
+    /// Where the key chunks lie in the chunk file: past the verification
+    /// record, to the file's end.
+    fn chunks(&self) -> Range<u64> {
+        self.payload_offset + self.verification_length..self.end
+    }
+
     /// The chunk-file offset and the length of `start..end`, when one span
     /// holds the whole range; `None` for a range that straddles spans, falls
     /// outside them all, is empty, or is inverted.
@@ -202,7 +223,7 @@ impl ChunkFile {
     }
 
     /// `len` bytes at `offset` of the chunk file by positioned read: no seek
-    /// on the shared handle, and never a map.
+    /// on the shared handle, and never through a map.
     fn read_at(&self, offset: u64, len: u64) -> Result<Bytes> {
         // A span's length is bounded by the chunk file's size, which
         // `parse_chunk_file` checked against the file on disk.
@@ -301,10 +322,12 @@ mod tests {
 
     use super::*;
     use crate::local::LocalDir;
+    #[cfg(target_os = "linux")]
+    use crate::local::testing::evict;
     use crate::local::testing::{
         EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE, SECOND_BYTES,
-        SECOND_RANGE, UNDER, VERIFICATION, chunk_file, identity, inverted_range, open, overwrite,
-        payload_len, range_len, write,
+        SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks_offset, identity, inverted_range,
+        open, overwrite, payload_len, range_len, write,
     };
 
     /// A range that starts in the first chunk and ends in the second.
@@ -489,20 +512,6 @@ mod tests {
         assert_eq!(checked(&disk), Err(Rejection::ShortPayload));
     }
 
-    /// Drops the chunk file's pages from the operating system's page cache,
-    /// written back first so that none is dirty and each can be dropped.
-    #[cfg(target_os = "linux")]
-    fn evict(path: &std::path::Path) {
-        use std::os::fd::AsRawFd as _;
-        let file = File::open(path).unwrap();
-        file.sync_all().unwrap();
-        // SAFETY: `posix_fadvise` takes no pointer; the descriptor is
-        // `file`'s, open for the call. Offset 0 and length 0 cover the file.
-        let advised =
-            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-        assert_eq!(advised, 0, "posix_fadvise failed");
-    }
-
     /// A page the operating system's page cache holds (the chunk file was
     /// just written) is read on the worker, to the bytes the blocking-pool
     /// read returns, and `page` counts it as one read. The temporary
@@ -541,7 +550,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (local, stats) = open(dir.path());
         let disk = write(&local);
-        evict(&crate::local::testing::chunk_file(&local));
+        evict(&chunk_file(&local));
         let (offset, len) = disk
             .shared
             .locate(FIRST_RANGE.start, FIRST_RANGE.end)
@@ -554,6 +563,29 @@ mod tests {
         assert_eq!(&first[..], FIRST_BYTES);
         assert_eq!(stats.local_reads(), 1);
         assert_eq!(stats.local_bytes(), range_len(&FIRST_RANGE));
+    }
+
+    /// A chunk file just written is in the page cache whole: every page of
+    /// its key chunks, from the page the first chunk starts in to its end.
+    #[test]
+    fn test_resident_counts_every_page_of_the_chunks_of_a_just_written_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, stats) = open(dir.path());
+        let disk = write(&local);
+        let path = chunk_file(&local);
+        let start = chunks_offset(&path);
+        let end = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(disk.shared.chunks(), start..end);
+        let page = super::residency::page_bytes().unwrap();
+        let pages = end.div_ceil(page) - start / page;
+        assert_eq!(
+            disk.resident().unwrap(),
+            ResidentPages {
+                pages,
+                resident: pages
+            }
+        );
+        assert_eq!(stats.local_reads(), 0, "a sample reads nothing");
     }
 
     #[test]
