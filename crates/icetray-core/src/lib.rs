@@ -21,6 +21,7 @@ pub mod key;
 mod level;
 mod local;
 mod manifest;
+pub mod memory;
 pub mod metric;
 pub mod open;
 mod parquet_io;
