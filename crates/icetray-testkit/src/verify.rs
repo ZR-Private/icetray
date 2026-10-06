@@ -230,6 +230,61 @@ pub fn predicted_probe(generation: &Generation, key: &Key) -> bool {
         .is_some_and(Option::is_some)
 }
 
+/// The pages a sequence of lookups has fetched, so `expected_lookup_gets`
+/// counts each once.
+#[derive(Default)]
+pub struct SeenPages {
+    value_pages: HashSet<(String, u64)>,
+    key_pages: HashSet<(String, usize, usize)>,
+}
+
+/// The GETs a lookup of `key` costs in `generation`'s tier after the
+/// lookups `seen` records, for a key with a live copy when `live` (RFD
+/// 021): the value page the Full tier's generation `full` plans for the
+/// live copy, unless fetched before; and in the Bloom tier every key page a
+/// probe decodes, walking the candidates in probe order up to the file the
+/// plan names, or through every candidate for a key with no live copy,
+/// deleted copies among them. The Full and Disk tiers decode key pages from
+/// memory and from local disk.
+pub fn expected_lookup_gets(
+    full: &Generation,
+    generation: &Generation,
+    key: &Key,
+    live: bool,
+    seen: &mut SeenPages,
+) -> u64 {
+    let mut gets = 0;
+    let mut live_path = None;
+    if live {
+        let (file, page) = full
+            .plan(std::slice::from_ref(key))
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the plan names a live key's file");
+        let offset = page
+            .value_page_offset
+            .expect("the Full tier names the value page");
+        gets += u64::from(seen.value_pages.insert((file.entry.path.clone(), offset)));
+        live_path = Some(file.entry.path.clone());
+    }
+    if generation.residency == Residency::Bloom {
+        for candidate in generation.candidates(key) {
+            if let Some(page) = candidate.index.page_of(key) {
+                gets += u64::from(seen.key_pages.insert((
+                    candidate.entry.path.clone(),
+                    page.row_group,
+                    page.key_page,
+                )));
+            }
+            if live_path.as_ref() == Some(&candidate.entry.path) {
+                break;
+            }
+        }
+    }
+    gets
+}
+
 /// Looks up the fixture key at every id, checking each answer against the
 /// fixture's derivation (`Present` bytes compared whole, or `Null`) and its
 /// snapshot against the serving generation's; returns the GETs the batch

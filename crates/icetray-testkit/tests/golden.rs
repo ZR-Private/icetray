@@ -4,17 +4,23 @@
 //! run by `dev/test-golden.sh`; forced without the variable, each fails on
 //! `Precondition::GoldenUnset` rather than passing.
 
+use std::path::Path;
 use std::sync::Arc;
 
-use iceberg::spec::{FormatVersion, TableMetadata};
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestList, TableMetadata,
+};
+use icetray_core::approx::count;
+use icetray_core::config::{Config, LocalConfig, StorageConfig};
 use icetray_core::{
     Error, Finding, FindingCode, FindingLog, Generation, Key, Level, LookupCost, RefusalReason,
-    Storage, Table, TableReport, Value, diagnose, open,
+    Residency, Storage, Table, TableReport, Value, diagnose, open,
 };
 use icetray_testkit::golden::{
-    self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, WIDE_REPEATS,
+    self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MOR_DELETED_IDS, MOR_UPDATED_IDS,
+    WIDE_REPEATS,
 };
-use icetray_testkit::verify;
+use icetray_testkit::verify::{self, SeenPages};
 use icetray_testkit::{Result, absent_key_from};
 
 /// Ids looked up on the two-million-row tables: the ends and the middle.
@@ -61,12 +67,36 @@ impl Golden {
 
 async fn open_golden(table: GoldenTable, strict: bool) -> Result<Golden> {
     let warehouse = golden::warehouse()?;
-    let opened = open(
-        &golden::config(&warehouse, table, strict),
-        None,
-        FindingLog::Events,
-    )
-    .await?;
+    open_config(&golden::config(&warehouse, table, strict)).await
+}
+
+/// `table` opened as `open_golden` does in `residency`, over hedge-free
+/// storage (`verify::storage_config_for_tests`), so no hedge adds a GET to
+/// a count the oracle predicts; the Disk tier's local directory lives
+/// under `scratch`.
+async fn open_in(table: GoldenTable, residency: Residency, scratch: &Path) -> Result<Golden> {
+    let warehouse = golden::warehouse()?;
+    let mut config = golden::config(&warehouse, table, false);
+    config.tables[0].residency = residency;
+    let local = match residency {
+        Residency::Disk => Some(LocalConfig {
+            dir: scratch.join(table.to_string()),
+            index_budget_bytes: None,
+            page_cache_disk_bytes: 0,
+        }),
+        Residency::Full | Residency::Bloom => None,
+    };
+    config.storage = StorageConfig {
+        local,
+        ..verify::storage_config_for_tests()
+    };
+    open_config(&config).await
+}
+
+/// The one table `config` serves, opened through `icetray_core::open` and
+/// loaded, with every key checked against its file's recorded bucket.
+async fn open_config(config: &Config) -> Result<Golden> {
+    let opened = open(config, None, FindingLog::Events).await?;
     let table = Arc::clone(&opened.tables()[0]);
     table.load().await?;
     table.serving()?.verify_buckets().await?;
@@ -393,5 +423,340 @@ async fn test_golden_overlap_serves_and_reports_overlap_permissive() -> Result<(
             files_probed: deepest,
         },
     )?;
+    Ok(())
+}
+
+/// The merge-on-read tables that keep the commands' deletes and new files
+/// uncompacted.
+const MOR_CHANGED: [GoldenTable; 2] = [GoldenTable::LongMorV2_100k, GoldenTable::LongMorV3_100k];
+
+/// The merge-on-read tables compacted after the commands.
+const MOR_COMPACTED: [GoldenTable; 2] = [
+    GoldenTable::LongMorV2Compacted100k,
+    GoldenTable::LongMorV3Compacted100k,
+];
+
+/// Rows the recipe's commands delete: the DELETE's ids, and the UPDATE's,
+/// whose old copies its deletes remove.
+const MOR_CHANGED_ROWS: u64 =
+    MOR_DELETED_IDS.end - MOR_DELETED_IDS.start + MOR_UPDATED_IDS.end - MOR_UPDATED_IDS.start;
+
+/// Ids of a merge-on-read table whose next key, absent, each tier looks
+/// up: each end of the table and of the ranges the commands touch.
+fn mor_edge_ids(table: GoldenTable) -> [u64; 6] {
+    [
+        0,
+        MOR_DELETED_IDS.start,
+        MOR_DELETED_IDS.end - 1,
+        MOR_UPDATED_IDS.start,
+        MOR_UPDATED_IDS.end - 1,
+        table.rows() - 1,
+    ]
+}
+
+/// Ids of a merge-on-read table whose key the commands leave live: the
+/// updated range's ends and the first untouched id after each range.
+const MOR_LIVE_IDS: [u64; 4] = [
+    MOR_DELETED_IDS.end,
+    MOR_UPDATED_IDS.start,
+    MOR_UPDATED_IDS.end - 1,
+    MOR_UPDATED_IDS.end,
+];
+
+/// Every id `table` was filled with answers in every tier as the recipe's
+/// commands leave it (`golden::merge_on_read_value`): absent where deleted,
+/// the update's value where updated, the first value elsewhere; the key
+/// after each of `mor_edge_ids` is absent. Each lookup costs the GETs
+/// `verify::expected_lookup_gets` predicts from the Full tier's plan, past
+/// the pages the tier fetched before.
+async fn assert_merge_on_read_serves(table: GoldenTable) -> Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let mut tiers = Vec::new();
+    for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        tiers.push((residency, open_in(table, residency, scratch.path()).await?));
+    }
+    let full = tiers[0].1.current();
+    assert_plan_names_the_update_s_copy(table, &full);
+    let absent: Vec<Key> = mor_edge_ids(table)
+        .iter()
+        .map(|&id| absent_key_from(&golden::long_key(id)))
+        .collect();
+    for (residency, served) in &tiers {
+        let generation = served.current();
+        assert_eq!(generation.residency, *residency);
+        let stats = served.storage.stats();
+        let mut seen = SeenPages::default();
+        let lookups = (0..table.rows())
+            .map(|id| (golden::long_key(id), golden::merge_on_read_value(id)))
+            .chain(absent.iter().map(|key| (key.clone(), None)));
+        for (key, expected) in lookups {
+            let gets = verify::expected_lookup_gets(
+                &full,
+                &generation,
+                &key,
+                expected.is_some(),
+                &mut seen,
+            );
+            let before = stats.gets();
+            let answer = served.table.get(&key).await?.value;
+            match &expected {
+                Some(value) => {
+                    let Value::Present(bytes) = &answer else {
+                        panic!("{table} {residency} key {key} is {answer:?}");
+                    };
+                    assert_eq!(&bytes[..], &value[..], "{table} {residency} key {key}");
+                }
+                None => assert_eq!(answer, Value::Absent, "{table} {residency} key {key}"),
+            }
+            assert_eq!(
+                stats.gets() - before,
+                gets,
+                "{table} {residency} GETs for key {key}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The Full tier's plan names, for every key the UPDATE rewrote, the copy
+/// the UPDATE wrote, skipping the one its deletes remove: a file at the
+/// newest data sequence number. In a table not compacted since, that is
+/// after the INSERT's files, so the check tells the two copies apart; a
+/// compacted table holds one copy, and the check holds trivially there.
+fn assert_plan_names_the_update_s_copy(table: GoldenTable, full: &Generation) {
+    let sequences = full.files.iter().map(|file| file.entry.sequence);
+    let newest = sequences.clone().max().expect("a golden table has files");
+    let oldest = sequences.min().expect("a golden table has files");
+    let compacted = matches!(
+        table,
+        GoldenTable::LongMorV2Compacted100k | GoldenTable::LongMorV3Compacted100k
+    );
+    assert_eq!(newest > oldest, !compacted, "{table} sequences");
+    for id in MOR_UPDATED_IDS {
+        let key = golden::long_key(id);
+        let (file, _) = full.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap_or_else(|| panic!("{table} plans no file for updated key {key}"));
+        assert_eq!(
+            file.entry.sequence, newest,
+            "{table} key {key} is planned at {}, a deleted copy",
+            file.entry.path
+        );
+    }
+}
+
+/// The live delete entries of the snapshot `golden` serves, from its
+/// manifests as Iceberg's own reader parses them.
+async fn listed_deletes(golden: &Golden) -> Result<Vec<DataFile>> {
+    let generation = golden.current();
+    let metadata: TableMetadata = serde_json::from_slice(
+        &golden
+            .storage
+            .read_all(&generation.metadata_location)
+            .await?,
+    )?;
+    let snapshot = metadata
+        .current_snapshot()
+        .expect("a served table has a current snapshot");
+    assert_eq!(snapshot.snapshot_id(), generation.snapshot_id.0);
+    let list = ManifestList::parse_with_version(
+        &golden.storage.read_all(snapshot.manifest_list()).await?,
+        metadata.format_version(),
+    )?;
+    let mut deletes = Vec::new();
+    for manifest_file in list.entries() {
+        let manifest = Manifest::parse_avro(
+            &golden
+                .storage
+                .read_all(&manifest_file.manifest_path)
+                .await?,
+        )?;
+        deletes.extend(
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive() && entry.content_type() != DataContentType::Data)
+                .map(|entry| entry.data_file().clone()),
+        );
+    }
+    Ok(deletes)
+}
+
+/// The deepest any key's candidates reach in `golden`'s serving
+/// generation, reached at some file's first key.
+fn deepest_probe(golden: &Golden) -> usize {
+    let generation = golden.current();
+    generation
+        .files
+        .iter()
+        .map(|file| generation.candidates(file.index.key_range().0).count())
+        .max()
+        .expect("the table has files")
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_v2_serves_every_key_in_every_tier() -> Result<()> {
+    assert_merge_on_read_serves(GoldenTable::LongMorV2_100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_v3_serves_every_key_in_every_tier() -> Result<()> {
+    assert_merge_on_read_serves(GoldenTable::LongMorV3_100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_v2_compacted_serves_every_key_in_every_tier() -> Result<()> {
+    assert_merge_on_read_serves(GoldenTable::LongMorV2Compacted100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_v3_compacted_serves_every_key_in_every_tier() -> Result<()> {
+    assert_merge_on_read_serves(GoldenTable::LongMorV3Compacted100k).await
+}
+
+/// The UPDATE adds one file per bucket over the older file's key range, so
+/// the doctor caps the table at permissive for overlapping files and
+/// advises a compaction; a cold hit still costs one GET and a miss none,
+/// and a lookup probes both files.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_updates_overlap_permissive() -> Result<()> {
+    for table in MOR_CHANGED {
+        let golden = open_golden(table, false).await?;
+        let generation = golden.current();
+        assert_eq!(
+            generation.overlapping_buckets().len(),
+            usize::try_from(table.buckets()).unwrap(),
+            "{table}: every bucket gains an overlapping file"
+        );
+        let report = golden.report();
+        assert_eq!(report.summary.level, Level::Permissive, "{table}");
+        let capping = report.capping_codes();
+        assert!(
+            capping.contains(&FindingCode::OverlappingFiles),
+            "{table} {capping:?}"
+        );
+        let advice = advice_codes(&golden);
+        assert!(
+            advice.contains(&FindingCode::DeletesPending),
+            "{table} {advice:?}"
+        );
+        let updated_and_older = 2;
+        assert_eq!(deepest_probe(&golden), updated_and_older, "{table}");
+        let keys: Vec<Key> = MOR_LIVE_IDS
+            .iter()
+            .map(|&id| golden::long_key(id))
+            .collect();
+        assert_lookup_cost(
+            &golden,
+            &keys,
+            LookupCost {
+                gets_per_hit: 1,
+                gets_per_miss: 0,
+                files_probed: updated_and_older,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A compaction rewrites each bucket into one sorted file, so the table
+/// serves at its floor again with no deletes left to advise on.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_compaction_restores_optimal() -> Result<()> {
+    for table in MOR_COMPACTED {
+        let golden = open_golden(table, false).await?;
+        let report = golden.report();
+        assert_eq!(report.summary.level, Level::Optimal, "{table}");
+        assert!(
+            report.capping_codes().is_empty(),
+            "{table} {:?}",
+            report.findings
+        );
+        let advice = advice_codes(&golden);
+        assert!(
+            !advice.contains(&FindingCode::DeletesPending),
+            "{table} {advice:?}"
+        );
+        assert!(golden.current().overlapping_buckets().is_empty(), "{table}");
+        let keys: Vec<Key> = MOR_LIVE_IDS
+            .iter()
+            .map(|&id| golden::long_key(id))
+            .collect();
+        assert_lookup_cost(
+            &golden,
+            &keys,
+            LookupCost {
+                gets_per_hit: 1,
+                gets_per_miss: 0,
+                files_probed: 1,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// What Spark records for the commands, read from the manifests, and the
+/// doctor's deletes summary beside it. In format version 2 the deletes are
+/// Parquet position delete files whose entries name no data file, so a
+/// load reads each to learn what it names; in version 3, deletion vectors
+/// in a Puffin file, each naming its data file. Neither writes an equality
+/// delete. Uncompacted, the summary's rows are the rows the commands
+/// changed and its files the live deletes listed. Compacted, nothing
+/// applies: in version 2 the position delete files stay listed, naming
+/// only files the rewrite removed, and in version 3 the rewrite dropped
+/// the vectors.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_merge_on_read_deletes_summary_matches_the_manifests() -> Result<()> {
+    let tables = [
+        (GoldenTable::LongMorV2_100k, DataFileFormat::Parquet),
+        (GoldenTable::LongMorV3_100k, DataFileFormat::Puffin),
+        (GoldenTable::LongMorV2Compacted100k, DataFileFormat::Parquet),
+        (GoldenTable::LongMorV3Compacted100k, DataFileFormat::Puffin),
+    ];
+    for (table, format) in tables {
+        let golden = open_golden(table, false).await?;
+        let deletes = listed_deletes(&golden).await?;
+        for delete in &deletes {
+            let path = delete.file_path();
+            assert_eq!(
+                delete.content_type(),
+                DataContentType::PositionDeletes,
+                "{table} {path}"
+            );
+            assert_eq!(delete.file_format(), format, "{table} {path}");
+            assert_eq!(
+                delete.referenced_data_file().is_some(),
+                format == DataFileFormat::Puffin,
+                "{table} {path}: a deletion vector names its data file and \
+                 Spark's position delete files name none"
+            );
+        }
+        let listed_rows: u64 = deletes.iter().map(DataFile::record_count).sum();
+        let summary = golden.report().summary;
+        if MOR_CHANGED.contains(&table) {
+            assert_eq!(listed_rows, MOR_CHANGED_ROWS, "{table}");
+            assert_eq!(summary.deletes.rows, listed_rows, "{table}");
+            assert_eq!(summary.deletes.files, count(deletes.len()), "{table}");
+            let updated_rows = MOR_UPDATED_IDS.end - MOR_UPDATED_IDS.start;
+            assert_eq!(summary.records, table.rows() + updated_rows, "{table}");
+        } else {
+            let dangling = format == DataFileFormat::Parquet;
+            assert_eq!(!deletes.is_empty(), dangling, "{table}: {deletes:?}");
+            if dangling {
+                assert_eq!(listed_rows, MOR_CHANGED_ROWS, "{table}");
+            }
+            assert_eq!(summary.deletes.rows, 0, "{table}");
+            assert_eq!(summary.deletes.files, 0, "{table}");
+            let deleted_rows = MOR_DELETED_IDS.end - MOR_DELETED_IDS.start;
+            assert_eq!(summary.records, table.rows() - deleted_rows, "{table}");
+        }
+    }
     Ok(())
 }

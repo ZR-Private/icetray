@@ -25,7 +25,7 @@ use icetray_testkit::fixture::{
     IDS_2K, NAMESPACE, STRAY_IDS, TWO_BUCKETS, UNPARTITIONED_FILE_BYTES, local_catalog,
 };
 use icetray_testkit::keys::FIRST_VERSION;
-use icetray_testkit::verify::{self, HINT_POLL_GETS, METADATA_FILE_GETS, Served};
+use icetray_testkit::verify::{self, HINT_POLL_GETS, METADATA_FILE_GETS, SeenPages, Served};
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, Result, TestkitError,
     write_fixture,
@@ -92,7 +92,7 @@ async fn fixture(catalog: &dyn iceberg::Catalog, name: &str) -> Result<Fixture> 
 /// Disk tier's local directory lives in `scratch`.
 struct Tiers {
     served: Vec<(Residency, Served)>,
-    seen: Vec<Seen>,
+    seen: Vec<SeenPages>,
     scratch: tempfile::TempDir,
 }
 
@@ -108,7 +108,7 @@ impl Tiers {
             ));
         }
         Ok(Self {
-            seen: tiers.iter().map(|_| Seen::default()).collect(),
+            seen: tiers.iter().map(|_| SeenPages::default()).collect(),
             served: tiers,
             scratch,
         })
@@ -216,54 +216,24 @@ async fn check(tiers: &mut Tiers, fixture: &Fixture) -> Result<MergeOracle> {
     Ok(oracle)
 }
 
-/// The pages a sequence of lookups has fetched, so each is counted once.
-#[derive(Default)]
-struct Seen {
-    value_pages: HashSet<(String, u64)>,
-    key_pages: HashSet<(String, usize, usize)>,
-}
-
-/// The GETs a lookup of `key` costs in `generation`'s tier after the
-/// lookups `seen` records: the live copy's value page, which the Full
-/// tier's plan names, unless fetched before; and in the Bloom tier every
-/// key page a probe decodes, walking the candidates in probe order up to
-/// the file holding the live copy, or through every candidate for a key
-/// with none, deleted copies among them. The Full and Disk tiers decode key
-/// pages from memory and from local disk.
+/// The GETs a lookup of `key` costs (`verify::expected_lookup_gets`),
+/// once the Full tier's plan is shown to name the oracle's live copy of it,
+/// skipping its deleted copies.
 fn expected_gets(
     full: &Generation,
     generation: &Generation,
     oracle: &MergeOracle,
     key: &Key,
-    seen: &mut Seen,
+    seen: &mut SeenPages,
 ) -> u64 {
     let live = oracle.live_copy(key);
-    let mut gets = 0;
     if let Some(live) = live {
-        let (file, page) = full.plan(std::slice::from_ref(key))[0]
+        let (file, _) = full.plan(std::slice::from_ref(key))[0]
             .clone()
             .expect("the plan names a live key's file");
         assert_eq!(file.entry.path, live.path, "the plan skips deleted copies");
-        let offset = page
-            .value_page_offset
-            .expect("the Full tier names the value page");
-        gets += u64::from(seen.value_pages.insert((file.entry.path.clone(), offset)));
     }
-    if generation.residency == Residency::Bloom {
-        for candidate in generation.candidates(key) {
-            if let Some(page) = candidate.index.page_of(key) {
-                gets += u64::from(seen.key_pages.insert((
-                    candidate.entry.path.clone(),
-                    page.row_group,
-                    page.key_page,
-                )));
-            }
-            if live.is_some_and(|live| live.path == candidate.entry.path) {
-                break;
-            }
-        }
-    }
-    gets
+    verify::expected_lookup_gets(full, generation, key, live.is_some(), seen)
 }
 
 /// The GETs `served` issues while `work` runs.

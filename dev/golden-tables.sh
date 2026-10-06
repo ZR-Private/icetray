@@ -5,7 +5,7 @@
 # the `file://` locations the Hadoop catalog records resolve on both sides,
 # for the tests as much as for the writer.
 #
-#   dev/golden-tables.sh                 write both groups under target/golden-warehouse
+#   dev/golden-tables.sh                 write every group under target/golden-warehouse
 #   dev/golden-tables.sh --only contract write one group; every flag goes to the recipe
 #   dev/golden-tables.sh --only long_2m  write one table by name
 #

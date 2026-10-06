@@ -5,6 +5,7 @@
 //! without it fails on `Precondition::GoldenUnset` rather than passing.
 
 use std::fmt::{self, Write as _};
+use std::ops::Range;
 
 use icetray_core::config::{Config, ServerConfig, SourceConfig, StorageConfig, TableConfig};
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
@@ -39,11 +40,14 @@ const ROWS_500K: u64 = 500_000;
 /// Rows of `long_wide_250k` and `overlap_250k`.
 const ROWS_250K: u64 = 250_000;
 
+/// Rows of the merge-on-read tables before their changes.
+const ROWS_100K: u64 = 100_000;
+
 /// Rows of `long_v3_50k`.
 const ROWS_50K: u64 = 50_000;
 
-/// Buckets of the contract tables, `long_v3_50k`, and `default_layout_1m`
-/// (`create(..., 4)`).
+/// Buckets of the contract tables, `long_v3_50k`, the merge-on-read tables,
+/// and `default_layout_1m` (`create(..., 4)`).
 const FOUR_BUCKETS: u32 = 4;
 
 /// Buckets of the wide and overlap tables (`create(..., 2, extra=WIDE)`).
@@ -69,6 +73,21 @@ pub const CONTRACT_REPEATS: usize = 3;
 /// The recipe's `sequence(1, 256)`: a wide value concatenates this many
 /// distinct digests.
 pub const WIDE_REPEATS: usize = 256;
+
+/// The recipe's `MOR_DELETED_IDS`: the ids a merge-on-read table's DELETE
+/// removes, half-open.
+pub const MOR_DELETED_IDS: Range<u64> = 10_000..20_000;
+
+/// The recipe's `MOR_UPDATED_IDS`: the ids a merge-on-read table's UPDATE
+/// rewrites at `MOR_UPDATE_VERSION`, half-open.
+pub const MOR_UPDATED_IDS: Range<u64> = 50_000..60_000;
+
+/// The recipe's `MOR_FIRST_VERSION`: the version a merge-on-read table's
+/// INSERT writes every id at.
+pub const MOR_FIRST_VERSION: u64 = 1;
+
+/// The recipe's `MOR_UPDATE_VERSION`: the version its UPDATE writes.
+pub const MOR_UPDATE_VERSION: u64 = 2;
 
 /// The ASCII bytes of one hex SHA-256 digest: the digest's width in hex
 /// digits.
@@ -98,6 +117,20 @@ pub enum GoldenTable {
     /// `overlap_250k`: permuted keys written with skew splitting on, so a
     /// bucket may hold overlapping sorted files.
     Overlap250k,
+    /// `long_mor_v2_100k`: the contract layout in format version 2, then a
+    /// merge-on-read DELETE of `MOR_DELETED_IDS` and UPDATE of
+    /// `MOR_UPDATED_IDS`, recorded as Parquet position deletes.
+    LongMorV2_100k,
+    /// `long_mor_v3_100k`: the same in format version 3, recorded as
+    /// deletion vectors.
+    LongMorV3_100k,
+    /// `long_mor_v2_compacted_100k`: `long_mor_v2_100k`'s commands, then
+    /// `rewrite_data_files`, which leaves its position deletes listed and
+    /// dangling.
+    LongMorV2Compacted100k,
+    /// `long_mor_v3_compacted_100k`: `long_mor_v3_100k`'s commands, then
+    /// `rewrite_data_files` and `rewrite_position_delete_files`.
+    LongMorV3Compacted100k,
 }
 
 impl GoldenTable {
@@ -109,7 +142,11 @@ impl GoldenTable {
             | Self::LongV3_50k
             | Self::DefaultLayout1m
             | Self::Unpartitioned500k
-            | Self::Overlap250k => KeyType::Long,
+            | Self::Overlap250k
+            | Self::LongMorV2_100k
+            | Self::LongMorV3_100k
+            | Self::LongMorV2Compacted100k
+            | Self::LongMorV3Compacted100k => KeyType::Long,
             Self::Str2m => KeyType::String,
             Self::Bin16_500k => KeyType::Binary,
         }
@@ -122,13 +159,17 @@ impl GoldenTable {
             | Self::Str2m
             | Self::Bin16_500k
             | Self::LongV3_50k
-            | Self::DefaultLayout1m => FOUR_BUCKETS,
+            | Self::DefaultLayout1m
+            | Self::LongMorV2_100k
+            | Self::LongMorV3_100k
+            | Self::LongMorV2Compacted100k
+            | Self::LongMorV3Compacted100k => FOUR_BUCKETS,
             Self::LongWide250k | Self::Overlap250k => TWO_BUCKETS,
             Self::Unpartitioned500k => UNPARTITIONED,
         }
     }
 
-    /// The rows the recipe filled the table with.
+    /// The rows the recipe filled the table with, before any change.
     pub fn rows(self) -> u64 {
         match self {
             Self::Long2m | Self::Str2m => ROWS_2M,
@@ -136,6 +177,10 @@ impl GoldenTable {
             Self::Bin16_500k | Self::Unpartitioned500k => ROWS_500K,
             Self::LongWide250k | Self::Overlap250k => ROWS_250K,
             Self::LongV3_50k => ROWS_50K,
+            Self::LongMorV2_100k
+            | Self::LongMorV3_100k
+            | Self::LongMorV2Compacted100k
+            | Self::LongMorV3Compacted100k => ROWS_100K,
         }
     }
 }
@@ -151,6 +196,10 @@ impl fmt::Display for GoldenTable {
             Self::DefaultLayout1m => "default_layout_1m",
             Self::Unpartitioned500k => "unpartitioned_500k",
             Self::Overlap250k => "overlap_250k",
+            Self::LongMorV2_100k => "long_mor_v2_100k",
+            Self::LongMorV3_100k => "long_mor_v3_100k",
+            Self::LongMorV2Compacted100k => "long_mor_v2_compacted_100k",
+            Self::LongMorV3Compacted100k => "long_mor_v3_compacted_100k",
         };
         f.write_str(name)
     }
@@ -222,6 +271,37 @@ pub fn value(key_text: &str) -> Vec<u8> {
     hex_digest(key_text).repeat(CONTRACT_REPEATS).into_bytes()
 }
 
+/// A merge-on-read table's value for the key whose Spark string form is
+/// `key_text` at `version`: `value` of `v{version}:{key_text}`, the recipe's
+/// `value_expr(..., version=version)`.
+pub fn versioned_value(key_text: &str, version: u64) -> Vec<u8> {
+    value(&format!("v{version}:{key_text}"))
+}
+
+/// What a lookup of `long_key(id)` answers in a merge-on-read table once
+/// the recipe's commands ran: absent for an id in `MOR_DELETED_IDS`, the
+/// `MOR_UPDATE_VERSION` value for one in `MOR_UPDATED_IDS`, and the
+/// `MOR_FIRST_VERSION` value for every other id the table was filled with.
+pub fn merge_on_read_value(id: u64) -> Option<Vec<u8>> {
+    if MOR_DELETED_IDS.contains(&id) {
+        return None;
+    }
+    let version = if MOR_UPDATED_IDS.contains(&id) {
+        MOR_UPDATE_VERSION
+    } else {
+        MOR_FIRST_VERSION
+    };
+    Some(versioned_value(&long_key_text(id), version))
+}
+
+/// The decimal text Spark casts `long_key(id)` to.
+fn long_key_text(id: u64) -> String {
+    let Key::Long(value) = long_key(id) else {
+        panic!("long_key gives long keys");
+    };
+    value.to_string()
+}
+
 /// A wide table's value for `key_text`: the hex SHA-256 of `{key_text}:{i}`
 /// for `i` in `1..=WIDE_REPEATS`, concatenated, as ASCII bytes.
 pub fn wide_value(key_text: &str) -> Vec<u8> {
@@ -249,7 +329,7 @@ mod tests {
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
 
     /// Every table, beside the name the recipe writes it under.
-    const NAMES: [(GoldenTable, &str); 8] = [
+    const NAMES: [(GoldenTable, &str); 12] = [
         (GoldenTable::Long2m, "long_2m"),
         (GoldenTable::Str2m, "str_2m"),
         (GoldenTable::Bin16_500k, "bin16_500k"),
@@ -258,6 +338,16 @@ mod tests {
         (GoldenTable::DefaultLayout1m, "default_layout_1m"),
         (GoldenTable::Unpartitioned500k, "unpartitioned_500k"),
         (GoldenTable::Overlap250k, "overlap_250k"),
+        (GoldenTable::LongMorV2_100k, "long_mor_v2_100k"),
+        (GoldenTable::LongMorV3_100k, "long_mor_v3_100k"),
+        (
+            GoldenTable::LongMorV2Compacted100k,
+            "long_mor_v2_compacted_100k",
+        ),
+        (
+            GoldenTable::LongMorV3Compacted100k,
+            "long_mor_v3_compacted_100k",
+        ),
     ];
 
     /// Ids the permutation is checked over: small next to the modulus, so
@@ -323,6 +413,30 @@ mod tests {
         let value = value("0");
         assert_eq!(value.len(), CONTRACT_REPEATS * HEX_DIGEST_BYTES);
         assert_eq!(value, SHA256_OF_ZERO.repeat(CONTRACT_REPEATS).into_bytes());
+    }
+
+    #[test]
+    fn test_merge_on_read_value_follows_the_recipe_commands() {
+        assert_eq!(merge_on_read_value(MOR_DELETED_IDS.start), None);
+        assert_eq!(merge_on_read_value(MOR_DELETED_IDS.end - 1), None);
+        let updated = MOR_UPDATED_IDS.start;
+        let updated_text = long_key_text(updated);
+        assert_eq!(
+            merge_on_read_value(updated),
+            Some(value(&format!("v{MOR_UPDATE_VERSION}:{updated_text}")))
+        );
+        let untouched = MOR_DELETED_IDS.end;
+        assert_eq!(
+            merge_on_read_value(untouched),
+            Some(value(&format!(
+                "v{MOR_FIRST_VERSION}:{}",
+                long_key_text(untouched)
+            )))
+        );
+        assert_ne!(
+            versioned_value(&updated_text, MOR_FIRST_VERSION),
+            versioned_value(&updated_text, MOR_UPDATE_VERSION),
+        );
     }
 
     #[test]
