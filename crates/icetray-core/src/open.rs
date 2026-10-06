@@ -39,10 +39,12 @@ pub struct Opened {
     /// `retain` counts them live. Never held across an `await`.
     pending: Mutex<Vec<Arc<Table>>>,
     /// Held by `retain` from computing its live set to its deletes, and by
-    /// `apply` to add to `pending` and to swap, so no table joins the set
-    /// between the two; retains run one at a time. A refused or dropped
-    /// `apply` takes its tables out of `pending` without it: a table
-    /// leaving only makes a retain in progress keep more than it needs.
+    /// `apply` to add to `pending` and from taking the retuned tables' load
+    /// locks to the swap, so no table joins the set between the two;
+    /// retains run one at a time. Either takes load locks only while
+    /// holding it. A refused or dropped `apply` takes its tables out of
+    /// `pending` without it: a table leaving only makes a retain in
+    /// progress keep more than it needs.
     membership: tokio::sync::Mutex<()>,
     /// Held by `apply` throughout: one reload at a time, each diffed
     /// against the set the last one left.
@@ -100,19 +102,26 @@ struct Deadlines {
 }
 
 /// What `Opened::apply` changed: the tables it loaded and swapped in, the
-/// tables it swapped out, and how many it kept as they were. A table whose
-/// configuration changed is in both lists, under one name.
+/// tables it swapped out, the tables it retuned in place, and how many it
+/// kept as they were. A table whose configuration changed in a field other
+/// than `lookups` and `strict` is in both `started` and `stopped`, under one
+/// name.
 pub struct Applied {
     /// The tables swapped in, each serving its first generation.
     pub started: Vec<Arc<Table>>,
     /// The tables swapped out, whose gauges are withdrawn.
     pub stopped: Vec<Arc<Table>>,
+    /// The tables whose configuration changed in `lookups` or `strict`
+    /// alone, which serve on in place under the new entry
+    /// (`Table::retune`), their generation and refresh untouched.
+    pub retuned: Vec<Arc<Table>>,
     /// The tables kept, whose configuration is unchanged.
     pub kept: usize,
 }
 
 /// Why `Opened::apply` changed nothing: every table it could not open or
-/// load, by name, in configuration order.
+/// load, or whose new `lookups` or `strict` its serving generation does not
+/// meet, by name, in configuration order.
 #[derive(Debug)]
 pub struct Refused {
     /// Each table that failed, with its failure.
@@ -155,34 +164,58 @@ impl Opened {
     /// Replaces the tables served with `configs`, all or nothing (RFD
     /// 018). Tables are matched by name: one whose configuration is equal
     /// in every field is kept as it is, generation and refresh untouched;
-    /// every other is built and loaded beside the set serving, the
-    /// serving table of its name included, and neither is touched until
-    /// every one has loaded. Then the set is swapped at once: the tables
-    /// no longer configured are withdrawn (`Table::withdraw`) and dropped
-    /// from the set, the new ones shown, and a call that looks a table up
-    /// after the swap finds the new set; a call in flight finishes on the
-    /// generation it holds. When any table fails to open or load, the
-    /// tables built are dropped and the set serving is untouched, and
-    /// `Refused` names every failure: every load runs to its end or its
-    /// deadline, so a refusal holds what the loads reserved until the
-    /// slowest ends. The caller spawns and stops the refreshes, and runs
-    /// `retain` after either outcome, to free what the dropped tables held
-    /// or what the refused ones wrote. `configs` is taken as validated: the names are
-    /// distinct. An `Opened` that `only` narrowed stays narrowed, and its
-    /// `retain` still frees nothing.
+    /// one whose configuration differs in `lookups` or `strict` alone is
+    /// retuned in place at the swap, with no load (RFD 020); every other is
+    /// built and loaded beside the set serving, the serving table of its
+    /// name included, and neither is touched until every one has loaded.
+    /// Each retuned table's serving generation is judged against its new
+    /// entry (`Table::judge_retune`) twice. First as the tables are
+    /// matched, before any table is loaded, so a retune that would be
+    /// refused costs no load. Then at the swap, holding the membership lock
+    /// and every retuned table's load lock, which is the judgement that
+    /// decides, since a refresh may swap in another generation between the
+    /// two. Only when all of them pass is anything changed: the retuned
+    /// tables take their new entries (`Table::retune`), the set is swapped
+    /// at once, the tables no longer configured are withdrawn
+    /// (`Table::withdraw`) and dropped from the set, the new ones shown,
+    /// and a call that looks a table up after the swap finds the new set; a
+    /// call in flight finishes on the generation it holds. A retuned
+    /// table's load lock is waited for behind a load or refresh in flight,
+    /// which gives it up within its own deadline, as `retain` waits. When
+    /// any table fails to open or load, or a retuned one's serving snapshot
+    /// is below its new level under `strict`, the tables built are dropped,
+    /// the set serving and every entry are untouched, and `Refused` names
+    /// every failure of the stage that refused: a retune refused at the
+    /// first judgement is named with every table that failed to open, and
+    /// every load runs to its end or its deadline, so a refusal holds what
+    /// the loads reserved until the slowest ends. The caller spawns and
+    /// stops the refreshes, and runs `retain` after either outcome, to free
+    /// what the dropped tables held or what the refused ones wrote.
+    /// `configs` is taken as validated: the names are distinct. An `Opened`
+    /// that `only` narrowed stays narrowed, and its `retain` still frees
+    /// nothing.
     pub async fn apply(&self, configs: &[TableConfig]) -> std::result::Result<Applied, Refused> {
         let _applying = self.applying.lock().await;
         let serving = self.tables();
         let mut next = Vec::with_capacity(configs.len());
         let mut started = Vec::new();
+        let mut retuned = Vec::new();
         let mut failures = Vec::new();
         for config in configs {
-            let kept = serving
-                .iter()
-                .find(|table| table.name() == config.name && table.config() == config);
-            if let Some(kept) = kept {
-                next.push(Arc::clone(kept));
-                continue;
+            if let Some(same) = serving.get(&config.name) {
+                let entry = same.config();
+                if *entry == *config {
+                    next.push(Arc::clone(same));
+                    continue;
+                }
+                if entry.same_but_levels(config) {
+                    if let Err(error) = same.judge_retune(config) {
+                        failures.push((config.name.clone(), error));
+                    }
+                    retuned.push((Arc::clone(same), config.clone()));
+                    next.push(Arc::clone(same));
+                    continue;
+                }
             }
             match self.build(config).await {
                 Ok(table) => {
@@ -213,9 +246,29 @@ impl Opened {
             .filter(|table| !next.iter().any(|kept| Arc::ptr_eq(kept, table)))
             .cloned()
             .collect();
-        let kept = next.len() - started.len();
+        let kept = next.len() - started.len() - retuned.len();
         {
             let _members = self.membership.lock().await;
+            let mut serialized = Vec::with_capacity(retuned.len());
+            for (table, _) in &retuned {
+                serialized.push(table.serialized().await);
+            }
+            let failures: Vec<(String, Error)> = retuned
+                .iter()
+                .filter_map(|(table, config)| {
+                    table
+                        .judge_retune(config)
+                        .err()
+                        .map(|error| (table.name().to_string(), error))
+                })
+                .collect();
+            if !failures.is_empty() {
+                return Err(Refused { failures });
+            }
+            for ((table, config), held) in retuned.iter().zip(&serialized) {
+                table.retune(config.clone(), held);
+            }
+            drop(serialized);
             for table in &stopped {
                 table.withdraw();
             }
@@ -228,6 +281,7 @@ impl Opened {
         Ok(Applied {
             started,
             stopped,
+            retuned: retuned.into_iter().map(|(table, _)| table).collect(),
             kept,
         })
     }
@@ -416,16 +470,18 @@ mod tests {
 
     use super::*;
     use crate::approx;
+    use crate::check::FindingCode;
     use crate::config::{
-        ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig,
-        TableConfig,
+        ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig,
+        StorageConfig, TableConfig,
     };
     use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
         E2E_KEYS, FIRST_SNAPSHOT, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
-        SECOND_VERSION, TWO, Table as Fixture, bucketing, keys_from, keys_in_bucket,
-        two_bucket_table,
+        SECOND_VERSION, TABLE, TWO, Table as Fixture, bucketing, keys_from, keys_in_bucket,
+        refusal_of, two_bucket_table,
     };
+    use crate::level::Level;
     use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::STALL;
@@ -807,27 +863,351 @@ mod tests {
         assert!(opened.pending.lock().unwrap().is_empty());
     }
 
-    /// A table whose configuration changed is built and loaded as a new
-    /// table under its name, and the one it replaces is dropped.
+    /// A table whose configuration changed in a field other than `lookups`
+    /// and `strict` is built and loaded as a new table under its name, and
+    /// the one it replaces is dropped, even when `lookups` and `strict`
+    /// changed beside it.
     #[tokio::test]
     async fn test_apply_replaces_a_changed_table_under_its_name() {
         let fixture = two_file_fixture().await;
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let opened = loaded(&config(vec![first.clone()])).await;
         let before = table_named(&opened, FIRST_TABLE).unwrap();
+        // The changed field is a budget the snapshot fits exactly, so the
+        // new table's load succeeds and the replacement completes.
+        let index_bytes = before.current().unwrap().index_bytes;
         let changed = TableConfig {
+            resident_budget_bytes: Some(approx::count(index_bytes)),
             strict: !first.strict,
+            lookups: Some(Level::Balanced),
             ..first
         };
 
         let applied = opened.apply(std::slice::from_ref(&changed)).await.unwrap();
         assert_eq!(applied.kept, 0);
+        assert!(applied.retuned.is_empty());
         assert_eq!(names_of(&applied.started), [FIRST_TABLE]);
         assert!(Arc::ptr_eq(&applied.stopped[0], &before));
         let after = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(!Arc::ptr_eq(&after, &before));
-        assert_eq!(after.config(), &changed);
+        assert_eq!(*after.config(), changed);
         assert!(after.current().is_some());
+    }
+
+    /// The snapshot a `Serving` state carries; any other state fails.
+    fn serving_snapshot(table: &Table) -> SnapshotId {
+        let TableState::Serving { snapshot_id, .. } = table.state() else {
+            panic!("expected Serving, got {:?}", table.state());
+        };
+        snapshot_id
+    }
+
+    /// A table whose configuration changed in `lookups` alone is retuned in
+    /// place: the same table serves the same generation under the new
+    /// entry, and the reload reads nothing.
+    #[tokio::test]
+    async fn test_apply_changes_lookups_in_place_without_a_load() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let opened = loaded(&config(vec![first.clone()])).await;
+        let before = table_named(&opened, FIRST_TABLE).unwrap();
+        let serving = before.current().unwrap();
+        let retuned = TableConfig {
+            lookups: Some(Level::Balanced),
+            ..first
+        };
+        let stats = opened.storage.stats();
+        let gets = stats.gets();
+
+        let applied = opened.apply(std::slice::from_ref(&retuned)).await.unwrap();
+        assert_eq!(stats.gets(), gets, "the reload reads nothing");
+        assert_eq!(applied.kept, 0);
+        assert!(applied.started.is_empty());
+        assert!(applied.stopped.is_empty());
+        assert!(Arc::ptr_eq(&applied.retuned[0], &before));
+        let after = table_named(&opened, FIRST_TABLE).unwrap();
+        assert!(Arc::ptr_eq(&after, &before));
+        assert!(Arc::ptr_eq(&after.current().unwrap(), &serving));
+        assert_eq!(*after.config(), retuned);
+        assert_eq!(after.config().lookups(), Level::Balanced);
+        assert_eq!(serving_snapshot(&after), SnapshotId(FIRST_SNAPSHOT));
+    }
+
+    /// Appends to `fixture` a file in bucket 0 whose keys interleave with
+    /// bucket 0's file's, committed as `SECOND_SNAPSHOT`: the files overlap,
+    /// which caps the table at permissive.
+    async fn append_overlap(fixture: &mut Fixture) {
+        let interleaved = keys_in_bucket(&keys_from(1, E2E_KEYS), bucketing(TWO), 0);
+        fixture.add_long_file("f2", &interleaved, 0).await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+    }
+
+    /// `name` following `fixture` in the Full tier, not strict.
+    fn lenient(name: &str, fixture: &Fixture) -> TableConfig {
+        TableConfig {
+            strict: false,
+            ..named(name, fixture, Residency::Full)
+        }
+    }
+
+    /// A reload that would make a table strict while its serving snapshot
+    /// is below its level is refused whole, as a start under it would be,
+    /// and before any table is loaded: the table it would have added is
+    /// never loaded, so the reload reads nothing, and the retuned table
+    /// keeps its entry.
+    #[tokio::test]
+    async fn test_apply_refuses_whole_when_strict_leaves_the_serving_snapshot_below_its_level() {
+        let (mut fixture, _) = two_bucket_table().await;
+        append_overlap(&mut fixture).await;
+        let first = lenient(FIRST_TABLE, &fixture);
+        let opened = loaded(&config(vec![first.clone()])).await;
+        let before = opened.tables();
+        let strict = TableConfig {
+            strict: true,
+            ..first.clone()
+        };
+        let stats = opened.storage.stats();
+        let gets = stats.gets();
+
+        let refused = opened
+            .apply(&[strict, lenient(SECOND_TABLE, &fixture)])
+            .await
+            .err()
+            .expect("the serving snapshot is below the level strict holds it to");
+        assert_eq!(stats.gets(), gets, "the added table is never loaded");
+        let [(name, error)] = &refused.failures[..] else {
+            panic!("one failure: {:?}", refused.failures);
+        };
+        assert_eq!(name, FIRST_TABLE);
+        assert!(
+            matches!(
+                error,
+                Error::Refused {
+                    reason: RefusalReason::BelowLevel {
+                        declared: Level::Optimal,
+                        achieved: Level::Permissive,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(Arc::ptr_eq(&opened.tables(), &before));
+        assert!(table_named(&opened, SECOND_TABLE).is_none());
+        assert!(opened.pending.lock().unwrap().is_empty());
+        let table = table_named(&opened, FIRST_TABLE).unwrap();
+        assert_eq!(*table.config(), first);
+        assert_eq!(serving_snapshot(&table), SnapshotId(SECOND_SNAPSHOT));
+    }
+
+    /// A retune to a `lookups` its residency cannot reach, in entries no
+    /// validation saw, is refused as a load under it would be, and the
+    /// table keeps its entry.
+    #[tokio::test]
+    async fn test_apply_refuses_a_retune_to_lookups_its_residency_cannot_reach() {
+        let fixture = two_file_fixture().await;
+        let bloom = named(FIRST_TABLE, &fixture, Residency::Bloom);
+        let opened = loaded(&config(vec![bloom.clone()])).await;
+        let unreachable = TableConfig {
+            lookups: Some(Level::Optimal),
+            ..bloom.clone()
+        };
+
+        let refused = opened
+            .apply(std::slice::from_ref(&unreachable))
+            .await
+            .err()
+            .expect("bloom residency cannot reach optimal");
+        let [(name, error)] = &refused.failures[..] else {
+            panic!("one failure: {:?}", refused.failures);
+        };
+        assert_eq!(name, FIRST_TABLE);
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::LookupsUnreachable {
+                    index: None,
+                    lookups: Level::Optimal,
+                    residency: Residency::Bloom,
+                    ..
+                }))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(*table_named(&opened, FIRST_TABLE).unwrap().config(), bloom);
+    }
+
+    /// The `Held` state's snapshots, serving then refused, and the refused
+    /// snapshot's level; any other state fails.
+    fn held(table: &Table) -> (SnapshotId, SnapshotId, Level) {
+        let TableState::Held {
+            serving,
+            refused,
+            level,
+            ..
+        } = table.state()
+        else {
+            panic!("expected Held, got {:?}", table.state());
+        };
+        (serving, refused, level)
+    }
+
+    /// What `held` reads for a table serving `FIRST_SNAPSHOT` that refused
+    /// `SECOND_SNAPSHOT` at permissive.
+    const HELD_AT_PERMISSIVE: (SnapshotId, SnapshotId, Level) = (
+        SnapshotId(FIRST_SNAPSHOT),
+        SnapshotId(SECOND_SNAPSHOT),
+        Level::Permissive,
+    );
+
+    /// A strict table, `TABLE`, opened and loaded over `fixture`'s first
+    /// snapshot, then held at permissive on the overlapping second; with
+    /// the table.
+    async fn held_table(fixture: &mut Fixture) -> (Opened, Arc<Table>) {
+        let opened = loaded(&config(vec![fixture.config(Residency::Full, None)])).await;
+        let table = table_named(&opened, TABLE).unwrap();
+        assert!(table.config().strict);
+        append_overlap(fixture).await;
+        assert!(matches!(
+            refusal_of(table.refresh().await),
+            RefusalReason::BelowLevel { .. }
+        ));
+        assert_eq!(held(&table), HELD_AT_PERMISSIVE);
+        (opened, table)
+    }
+
+    /// A held table retuned to a level its refused snapshot still falls
+    /// below stays held, and the next poll builds that snapshot again under
+    /// the new entry and refuses it again; retuned to a level the snapshot
+    /// meets, it serves on, and the next poll builds the snapshot and swaps
+    /// it in.
+    #[tokio::test]
+    async fn test_apply_relaxing_a_held_table_builds_its_snapshot_on_the_next_poll() {
+        let (mut fixture, _) = two_bucket_table().await;
+        let (opened, table) = held_table(&mut fixture).await;
+        let entry = table.config();
+        let balanced = TableConfig {
+            lookups: Some(Level::Balanced),
+            ..(*entry).clone()
+        };
+        let applied = opened.apply(std::slice::from_ref(&balanced)).await.unwrap();
+        assert!(Arc::ptr_eq(&applied.retuned[0], &table));
+        assert_eq!(held(&table), HELD_AT_PERMISSIVE);
+        assert_eq!(
+            refusal_of(table.refresh().await),
+            RefusalReason::BelowLevel {
+                declared: Level::Balanced,
+                achieved: Level::Permissive,
+                findings: vec![FindingCode::OverlappingFiles],
+            },
+            "the refused snapshot is built again under the new entry"
+        );
+        assert_eq!(held(&table), HELD_AT_PERMISSIVE);
+
+        let permissive = TableConfig {
+            lookups: Some(Level::Permissive),
+            ..balanced
+        };
+        opened
+            .apply(std::slice::from_ref(&permissive))
+            .await
+            .unwrap();
+        assert_eq!(serving_snapshot(&table), SnapshotId(FIRST_SNAPSHOT));
+        assert_eq!(
+            table.current().unwrap().snapshot_id,
+            SnapshotId(FIRST_SNAPSHOT),
+            "nothing is built until the next poll"
+        );
+        assert!(table.refresh().await.unwrap());
+        assert_eq!(serving_snapshot(&table), SnapshotId(SECOND_SNAPSHOT));
+    }
+
+    /// Turning `strict` off ends a hold at once, whatever the held
+    /// snapshot's level: the table serves on, and the next poll swaps in
+    /// the snapshot it held back.
+    #[tokio::test]
+    async fn test_apply_turning_strict_off_serves_the_held_snapshot() {
+        let (mut fixture, _) = two_bucket_table().await;
+        let (opened, table) = held_table(&mut fixture).await;
+        let lenient = TableConfig {
+            strict: false,
+            ..(*table.config()).clone()
+        };
+        opened.apply(std::slice::from_ref(&lenient)).await.unwrap();
+        assert_eq!(serving_snapshot(&table), SnapshotId(FIRST_SNAPSHOT));
+        assert!(table.refresh().await.unwrap());
+        assert_eq!(serving_snapshot(&table), SnapshotId(SECOND_SNAPSHOT));
+    }
+
+    /// A retune forgets a remembered refusal that has nothing to do with
+    /// the level, here over budget: the table stays degraded until the next
+    /// poll, which builds the refused snapshot again rather than passing it
+    /// over.
+    #[tokio::test]
+    async fn test_apply_retune_forgets_a_remembered_over_budget_refusal() {
+        let (mut fixture, all) = two_bucket_table().await;
+        let unbounded = fixture.config(Residency::Full, None);
+        let opened = loaded(&config(vec![unbounded.clone()])).await;
+        let first_bytes = table_named(&opened, TABLE)
+            .unwrap()
+            .current()
+            .unwrap()
+            .index_bytes;
+        let bounded = TableConfig {
+            resident_budget_bytes: Some(approx::count(first_bytes)),
+            ..unbounded
+        };
+        opened.apply(std::slice::from_ref(&bounded)).await.unwrap();
+        let table = table_named(&opened, TABLE).unwrap();
+        let above = keys_from(all.last().unwrap() + KEY_STEP, E2E_KEYS);
+        fixture
+            .add_long_file("f2", &keys_in_bucket(&above, bucketing(TWO), 0), 0)
+            .await;
+        fixture
+            .commit(
+                SECOND_SNAPSHOT,
+                Some(FIRST_SNAPSHOT),
+                SECOND_SEQUENCE,
+                SECOND_VERSION,
+            )
+            .await;
+        table.refresh().await.unwrap_err();
+        poll_held_back(&opened, &table).await;
+
+        let flipped = TableConfig {
+            strict: !bounded.strict,
+            ..bounded
+        };
+        let applied = opened.apply(std::slice::from_ref(&flipped)).await.unwrap();
+        assert!(Arc::ptr_eq(&applied.retuned[0], &table));
+        assert!(matches!(
+            table.state(),
+            TableState::Degraded {
+                reason: ErrorKind::Refused(RefusalReason::OverBudget { .. }),
+                ..
+            }
+        ));
+        let stats = opened.storage.stats();
+        let before = stats.gets();
+        assert!(matches!(
+            refusal_of(table.refresh().await),
+            RefusalReason::OverBudget {
+                of: Budget::Resident,
+                ..
+            }
+        ));
+        assert!(
+            stats.gets() > before + POLL_GETS,
+            "the refused snapshot is built again"
+        );
     }
 
     /// One poll of `table` whose source still names the location of a
@@ -914,6 +1294,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names_of(&applied.started), [FIRST_TABLE]);
+        assert!(applied.retuned.is_empty());
         let replaced = table_named(&opened, FIRST_TABLE).unwrap();
         assert_eq!(
             replaced.current().unwrap().snapshot_id,

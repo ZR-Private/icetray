@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use metrics::{Counter, Histogram};
@@ -235,7 +235,12 @@ impl Default for CallsInFlight {
 /// `Generation::plan_load`, so one table's delay is set from its own reads
 /// and never another's (RFD 013). Shared across tasks behind an `Arc`.
 pub struct Table {
-    config: TableConfig,
+    /// The table's entry. A reload that changes only its `lookups` or
+    /// `strict` stores another in place (`retune`) while `serial` is held,
+    /// so a load or refresh reads one entry throughout.
+    config: ArcSwap<TableConfig>,
+    /// `config`'s name, which no retune changes.
+    name: String,
     source: TableSource,
     storage: Arc<Storage>,
     local: Option<Arc<LocalDir>>,
@@ -262,12 +267,16 @@ pub struct Table {
     /// the source names another location. A transient failure does not
     /// advance it: the next poll reads the metadata again and retries.
     /// `None` until the first successful build. A reload that changes the
-    /// table's entry builds a new `Table`, which remembers nothing, so a
-    /// refusal that depended on the old entry is tried again under the new
-    /// one (RFD 018).
+    /// table's entry forgets every refusal: one that changes only `lookups`
+    /// or `strict` resets this to the serving generation's location
+    /// (`retune`), and one that changes another field builds a new `Table`,
+    /// which remembers nothing, so a refusal that depended on the old entry
+    /// is tried again under the new one (RFD 005, RFD 018).
     known: Mutex<Option<Known>>,
-    /// Serializes `load` and `refresh`; `Opened::retain` takes every
-    /// table's in turn, and nothing else ever takes two.
+    /// Serializes `load`, `refresh`, and `retune`; `Opened::retain` takes
+    /// every table's in turn and `Opened::apply` every retuned table's, each
+    /// while holding `Opened`'s membership lock, and nothing else ever
+    /// takes two.
     serial: tokio::sync::Mutex<()>,
     /// How long a `load` or `refresh` with no generation serving, which
     /// builds from nothing, may hold `serial` doing its work, from
@@ -635,7 +644,8 @@ impl Table {
             metric::LABEL_TABLE => config.name.clone()
         );
         Self {
-            config,
+            name: config.name.clone(),
+            config: ArcSwap::from_pointee(config),
             source,
             storage,
             local,
@@ -702,9 +712,10 @@ impl Table {
         }
     }
 
-    /// The table's configuration.
-    pub fn config(&self) -> &TableConfig {
-        &self.config
+    /// The table's entry as it stands; a later retune does not change the
+    /// one returned.
+    pub fn config(&self) -> Arc<TableConfig> {
+        self.config.load_full()
     }
 
     /// First load: resolves the source, builds the snapshot the ref names,
@@ -763,7 +774,7 @@ impl Table {
             Err(failed) => {
                 metrics::counter!(
                     metric::REFRESH_ERRORS_TOTAL,
-                    metric::LABEL_TABLE => self.config.name.clone(),
+                    metric::LABEL_TABLE => self.name.clone(),
                     metric::LABEL_REASON => failed.error.kind().to_string()
                 )
                 .increment(1);
@@ -774,7 +785,7 @@ impl Table {
 
     /// The table's configured name.
     pub fn name(&self) -> &str {
-        &self.config.name
+        &self.name
     }
 
     /// The lifecycle state now.
@@ -824,12 +835,13 @@ impl Table {
         self.within_deadline(async {
             let resolved = self.source.resolve(&self.storage).await?;
             let snapshot = self.ref_snapshot(&resolved)?;
+            let config = self.config.load();
             let layout = TableLayout::derive(
                 self.name(),
                 &resolved.metadata,
                 &snapshot,
-                &self.config.key_column,
-                &self.config.value_column,
+                &config.key_column,
+                &config.value_column,
             )?;
             Ok(layout.key_type)
         })
@@ -932,7 +944,7 @@ impl Table {
             let (index, values) = joined.map_err(|error| match error.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
                 Err(canceled) => Error::LookupCanceled {
-                    table: self.config.name.clone(),
+                    table: self.name.clone(),
                     source: canceled,
                 },
             })?;
@@ -942,10 +954,86 @@ impl Table {
     }
 
     /// Holds the table's load and refresh lock, so no load is in flight
-    /// while the holder reads the current generation's identities; for
-    /// `Opened::retain`, which takes every table's in turn.
+    /// while the holder reads the current generation's identities or
+    /// retunes the table; for `Opened::retain`, which takes every table's
+    /// in turn, and `Opened::apply`, which takes every retuned table's.
     pub(crate) async fn serialized(&self) -> MutexGuard<'_, ()> {
         self.serial.lock().await
+    }
+
+    /// Whether `config`, an entry that differs from the table's in
+    /// `lookups` and `strict` alone (`TableConfig::same_but_levels`), can be
+    /// applied in place: a `lookups` the residency cannot reach is refused
+    /// as a load refuses it (`TableConfig::check_reachable`), and the
+    /// serving generation is judged against the entry (`Generation::judge`),
+    /// so a strict entry whose level the serving snapshot does not meet is
+    /// refused as `RefusalReason::BelowLevel`, as a load under it would
+    /// refuse that snapshot. With no generation serving there is nothing to
+    /// judge. Only a judgement made while holding `serial` (`serialized`)
+    /// through `retune` decides: without it a build may swap another
+    /// generation in after the judgement.
+    pub(crate) fn judge_retune(&self, config: &TableConfig) -> Result<()> {
+        config.check_reachable()?;
+        match self.current() {
+            Some(current) => current.judge(config.lookups(), config.strict),
+            None => Ok(()),
+        }
+    }
+
+    /// Applies `config`, which `judge_retune` admitted under the same held
+    /// `serial`, in place (RFD 020): the serving generation keeps serving
+    /// and nothing is read. The level gauges declare the new `lookups` at
+    /// once, against the newest measured snapshot's level, which a retune
+    /// does not change. Every remembered refusal is forgotten, and logged
+    /// as forgotten: the known location becomes the serving generation's,
+    /// so the next poll builds the snapshot the ref names under the new
+    /// entry (RFD 005). A `Held` state ends in `Serving` when the new entry
+    /// would admit the held snapshot's level, which the next poll then
+    /// swaps in, and stays `Held` until that poll refuses it again
+    /// otherwise. A `Degraded` state stays until the next poll ends it,
+    /// since the last load or refresh failed whatever the entry.
+    pub(crate) fn retune(&self, config: TableConfig, _serialized: &MutexGuard<'_, ()>) {
+        let (declared, strict) = (config.lookups(), config.strict);
+        self.config.store(Arc::new(config));
+        {
+            let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(level) = gauges.level.as_mut() {
+                level.declared = declared;
+                let level = *level;
+                if gauges.shown {
+                    self.write_level(level);
+                }
+            }
+        }
+        let Some(current) = self.current() else {
+            return;
+        };
+        let previous = self
+            .known
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(Known {
+                location: current.metadata_location.clone(),
+                refused: None,
+            });
+        if let Some(Known {
+            location,
+            refused: Some(past),
+        }) = previous
+        {
+            tracing::info!(
+                table = self.name(),
+                snapshot_id = past.snapshot_id.map(tracing::field::display),
+                reason = %past.reason,
+                location,
+                "retune forgot a refused snapshot"
+            );
+        }
+        if let TableState::Held { level, .. } = self.state()
+            && (!strict || level.meets(declared))
+        {
+            self.serve_state(current.snapshot_id);
+        }
     }
 
     /// `work` within the deadline its build takes: with no generation
@@ -960,7 +1048,7 @@ impl Table {
     /// `Opened::retain` can take it. A location error from the work is
     /// given the table's name (`Error::for_table`).
     async fn within_deadline<T>(&self, work: impl Future<Output = Attempt<T>>) -> Attempt<T> {
-        let table = &self.config.name;
+        let table = &self.name;
         let outcome = if self.current().is_none() {
             let after = self.load_deadline;
             tokio::time::timeout(after, work)
@@ -1050,21 +1138,22 @@ impl Table {
     /// The snapshot the configured ref names in `resolved`, under the
     /// table's name.
     fn ref_snapshot(&self, resolved: &Resolved) -> Result<Arc<Snapshot>> {
-        resolved.snapshot_for_ref(&self.config.name, &self.config.r#ref)
+        resolved.snapshot_for_ref(&self.name, &self.config.load().r#ref)
     }
 
     /// Plans `snapshot` over `previous` at the footer stage, judges its
-    /// level there, builds it, gates it, and swaps it in. A failure carries
-    /// `snapshot`'s id.
+    /// level there, builds it, gates it, and swaps it in, all under one
+    /// entry. A failure carries `snapshot`'s id.
     async fn build_and_admit(
         &self,
         resolved: &Resolved,
         snapshot: &Snapshot,
         previous: Option<&Arc<Generation>>,
     ) -> Attempt<()> {
+        let config = self.config();
         let admitted: Result<()> = async {
             let mut planned = Generation::plan_load(
-                &self.config,
+                &config,
                 resolved,
                 snapshot,
                 &self.storage,
@@ -1074,8 +1163,8 @@ impl Table {
             .await?;
             planned.judge_level(self.local.as_ref()).await?;
             let generation = planned.build(self.local.as_ref()).await?;
-            let findings = self.gate(&generation)?;
-            self.swap(generation, previous, &findings);
+            let findings = self.gate(&generation, &config)?;
+            self.swap(generation, previous, &findings, config.lookups());
             self.remember(&resolved.location, None);
             Ok(())
         }
@@ -1086,17 +1175,18 @@ impl Table {
         })
     }
 
-    /// The poll found the table in step with its ref, so a `Degraded` or
-    /// `Held` state an earlier poll left ends: the last refresh succeeded
-    /// and `current` is the snapshot the ref names, so the level gauges
-    /// measure it again in place of a snapshot a `below_level` refusal
-    /// held.
+    /// The poll found the table in step with its ref: `current` is the
+    /// snapshot the ref names, so it is the newest snapshot and the level
+    /// gauges measure it, in place of a snapshot a `below_level` refusal
+    /// held, whatever the state (a retune can end `Held` with the held
+    /// snapshot's level still measured). A `Degraded` or `Held` state an
+    /// earlier poll left ends, since the last refresh succeeded.
     fn in_step(&self, current: &Generation) {
+        self.measured(current.level);
         if matches!(
             self.state(),
             TableState::Degraded { .. } | TableState::Held { .. }
         ) {
-            self.measured(current.level);
             self.serve_state(current.snapshot_id);
         }
     }
@@ -1111,7 +1201,8 @@ impl Table {
     }
 
     /// The doctor's verdict on a built generation before it is swapped in
-    /// (RFD 016). Every finding is logged as the table's `FindingLog` says.
+    /// (RFD 016), under the entry `config` it was built for. Every finding
+    /// is logged as the table's `FindingLog` says.
     /// The level was judged at the footer stage (`Planned::judge_level`);
     /// the generation's measured level is judged again under `strict` as a
     /// backstop, by the same `check::judge`, so a generation below the
@@ -1120,15 +1211,19 @@ impl Table {
     /// for the `findings` gauge; a refused generation's reach the logs and
     /// the error and never the gauge, which describes the serving
     /// generation.
-    fn gate(&self, generation: &Generation) -> Result<BTreeMap<FindingCode, u64>> {
-        let declared = self.config.lookups();
+    fn gate(
+        &self,
+        generation: &Generation,
+        config: &TableConfig,
+    ) -> Result<BTreeMap<FindingCode, u64>> {
+        let declared = config.lookups();
         let report = check::diagnose(generation, declared);
         let mut counts: BTreeMap<FindingCode, u64> = BTreeMap::new();
         for finding in &report.findings {
             *counts.entry(finding.code()).or_default() += 1;
             log_finding(self.name(), finding, self.findings, declared);
         }
-        generation.judge(declared, self.config.strict)?;
+        generation.judge(declared, config.strict)?;
         Ok(counts)
     }
 
@@ -1136,12 +1231,14 @@ impl Table {
     /// `index_bytes`, `findings` from `findings`,
     /// `generation_sequence_number`, and `generation_swapped_at_seconds`
     /// from the clock, are kept and written while the table shows them
-    /// (`write_generation`).
+    /// (`write_generation`), and the level gauges take the generation's
+    /// level against `declared`.
     fn swap(
         &self,
         generation: Generation,
         previous: Option<&Arc<Generation>>,
         findings: &BTreeMap<FindingCode, u64>,
+        declared: Level,
     ) {
         let reused = previous.map_or(0, |previous| {
             generation
@@ -1168,7 +1265,7 @@ impl Table {
         };
         let level = LevelGauges {
             measured: generation.level,
-            declared: self.config.lookups(),
+            declared,
         };
         {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1277,12 +1374,15 @@ impl Table {
 
     /// Takes `measured` as the newest measured snapshot's level for the
     /// level gauges, once a swap made them appear, and writes them while
-    /// the table shows its gauges.
+    /// the table shows its gauges and the level changed.
     fn measured(&self, measured: Level) {
         let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(level) = gauges.level.as_mut() else {
             return;
         };
+        if level.measured == measured {
+            return;
+        }
         level.measured = measured;
         let level = *level;
         if gauges.shown {
@@ -1344,7 +1444,7 @@ impl Table {
         for name in StateName::ALL {
             metrics::gauge!(
                 metric::TABLE_STATE,
-                metric::LABEL_TABLE => self.config.name.clone(),
+                metric::LABEL_TABLE => self.name.clone(),
                 metric::LABEL_STATE => name.to_string()
             )
             .set(approx::gauge(u64::from(name == current)));
@@ -1357,13 +1457,13 @@ impl Table {
     fn write_generation(&self, generation: &GenerationGauges) {
         metrics::gauge!(
             metric::INDEX_BYTES,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge_len(generation.index_bytes));
         for code in FindingCode::ALL {
             metrics::gauge!(
                 metric::FINDINGS,
-                metric::LABEL_TABLE => self.config.name.clone(),
+                metric::LABEL_TABLE => self.name.clone(),
                 metric::LABEL_CODE => code.to_string()
             )
             .set(approx::gauge(
@@ -1372,12 +1472,12 @@ impl Table {
         }
         metrics::gauge!(
             metric::GENERATION_SEQUENCE_NUMBER,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::signed_gauge(generation.sequence_number.0));
         metrics::gauge!(
             metric::GENERATION_SWAPPED_AT_SECONDS,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(generation.swapped_at);
     }
@@ -1387,17 +1487,17 @@ impl Table {
     fn write_level(&self, level: LevelGauges) {
         metrics::gauge!(
             metric::TABLE_BELOW_LEVEL,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge(u64::from(level.below_level())));
         metrics::gauge!(
             metric::TABLE_LEVEL,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(level.achieved().gauge());
         metrics::gauge!(
             metric::TABLE_DECLARED_LEVEL,
-            metric::LABEL_TABLE => self.config.name.clone()
+            metric::LABEL_TABLE => self.name.clone()
         )
         .set(level.declared.gauge());
     }
@@ -1405,7 +1505,7 @@ impl Table {
     /// `Error::NotReady` for this table.
     fn not_ready(&self) -> Error {
         Error::NotReady {
-            table: self.config.name.clone(),
+            table: self.name.clone(),
         }
     }
 
@@ -1417,7 +1517,7 @@ impl Table {
             Ok(())
         } else {
             Err(Error::KeyType {
-                table: self.config.name.clone(),
+                table: self.name.clone(),
                 expected,
                 got,
             })
@@ -1428,7 +1528,7 @@ impl Table {
 impl fmt::Debug for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Table")
-            .field("name", &self.config.name)
+            .field("name", &self.name)
             .field("state", &self.state())
             .finish_non_exhaustive()
     }
@@ -1469,7 +1569,7 @@ mod tests {
     use iceberg::io::FileIO;
     use metrics::{Key as MetricKey, SharedString, Unit};
     use metrics_util::CompositeKey;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
     use object_store::local::LocalFileSystem;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -2176,7 +2276,7 @@ mod tests {
         };
         let fixture = one_file_fixture(balanced).await;
         let strict = table_over(&fixture, fixture.config(Residency::Full, None)).await;
-        assert!(strict.config.strict);
+        assert!(strict.config().strict);
         let reason = refusal_of(strict.load().await);
         assert_eq!(reason, dictionary_below_optimal());
         assert!(strict.current().is_none());
@@ -2671,7 +2771,7 @@ mod tests {
             defaults.load_deadline,
             defaults.refresh_deadline,
         );
-        assert!(strict.config.strict);
+        assert!(strict.config().strict);
         assert_eq!(refusal_of(strict.load().await), dictionary_below_optimal());
         assert_eq!(
             local.index_bytes_in_use().unwrap(),
@@ -3090,13 +3190,22 @@ mod tests {
     /// A debugging recorder's snapshot of what `body` emitted, run on a
     /// current-thread runtime, since the local recorder is thread-local.
     fn recorded<T>(body: impl Future<Output = T>) -> (T, Series) {
+        recorded_with(|_| body)
+    }
+
+    /// `recorded`, with `body` given a snapshotter of the same recorder, to
+    /// read the series while it runs. A snapshot zeroes every series it
+    /// reads, so a later one holds only what was written after it.
+    fn recorded_with<T, F: Future<Output = T>>(body: impl FnOnce(Snapshotter) -> F) -> (T, Series) {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let out = metrics::with_local_recorder(&recorder, || runtime.block_on(body));
+        let out = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(body(recorder.snapshotter()))
+        });
         (out, Series(snapshotter.snapshot().into_vec()))
     }
 
@@ -3159,6 +3268,81 @@ mod tests {
         assert_eq!(
             level_gauges(&after),
             level_bits(0, Level::Optimal, Level::Balanced)
+        );
+    }
+
+    /// A retune of a lenient table's `lookups` declares the new level at
+    /// once, before any poll: a table serving a balanced snapshot reads
+    /// below its declared `optimal`, and retuned to `balanced` reads at its
+    /// level.
+    #[test]
+    fn test_metrics_retune_declares_the_new_level_at_once() {
+        let (before, after) = recorded_with(|snapshotter| async move {
+            let fixture = one_file_fixture(WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            })
+            .await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            let before = Series(snapshotter.snapshot().into_vec());
+            let serialized = table.serialized().await;
+            table.retune(
+                TableConfig {
+                    lookups: Some(Level::Balanced),
+                    ..lenient(&fixture)
+                },
+                &serialized,
+            );
+            before
+        });
+        assert_eq!(
+            level_gauges(&before),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(
+            level_gauges(&after),
+            level_bits(0, Level::Balanced, Level::Balanced)
+        );
+    }
+
+    /// A held table retuned to `strict` off serves on with the held
+    /// snapshot's level measured, below its level; once its ref goes back
+    /// to the serving snapshot, the poll finds it in step and the level
+    /// gauges measure the serving snapshot again, though no state ended.
+    #[test]
+    fn test_refresh_in_step_after_a_retune_out_of_held_measures_the_serving_snapshot() {
+        let (during, after) = recorded_with(|snapshotter| async move {
+            let (mut fixture, all) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let balanced = WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            };
+            append_second(&mut fixture, &all, "dict", balanced).await;
+            table.refresh().await.unwrap_err();
+            assert_eq!(held(&table), HELD_AT_BALANCED);
+            {
+                let serialized = table.serialized().await;
+                table.retune(lenient(&fixture), &serialized);
+            }
+            assert_eq!(serving_id(&table), SnapshotId(FIRST_SNAPSHOT));
+            let during = Series(snapshotter.snapshot().into_vec());
+
+            fixture.restore_hint(FIRST_VERSION).await;
+            assert!(!table.refresh().await.unwrap());
+            assert_eq!(serving_id(&table), SnapshotId(FIRST_SNAPSHOT));
+            table.publish_gauges();
+            during
+        });
+        assert_eq!(
+            level_gauges(&during),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(
+            level_gauges(&after),
+            level_bits(0, Level::Optimal, Level::Optimal)
         );
     }
 
@@ -3390,7 +3574,7 @@ mod tests {
         let ((), series) = recorded(async {
             let (mut fixture, all) = two_bucket_table().await;
             let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
-            assert!(table.config.strict);
+            assert!(table.config().strict);
             table.load().await.unwrap();
             let balanced = WriterLayout {
                 dictionary: Dictionary::Value,

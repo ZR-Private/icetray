@@ -30,7 +30,8 @@ use icetray_proto::v1::{
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
-    Fixture, FixtureSpec, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3, write_fixture,
+    Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture, memory_catalog_s3,
+    write_fixture,
 };
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -1733,20 +1734,24 @@ impl ConfigSource for Versions {
 /// A stack over two small fixtures, `TABLE` and `UUID_TABLE`, serving
 /// `TABLE` alone and following `Versions` from there, loaded.
 async fn following() -> Result<(Stack, Arc<Versions>), BoxError> {
+    following_over(vec![
+        FixtureSpec::small(TABLE, KeyType::Long),
+        FixtureSpec::small(UUID_TABLE, KeyType::Uuid),
+    ])
+    .await
+}
+
+/// A stack over `specs`, serving the first alone and following `Versions`
+/// from there, loaded.
+async fn following_over(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
     let mut followed = None;
-    let mut stack = Stack::start_with(
-        vec![
-            FixtureSpec::small(TABLE, KeyType::Long),
-            FixtureSpec::small(UUID_TABLE, KeyType::Uuid),
-        ],
-        async |setup| {
-            setup.config.tables.truncate(1);
-            let versions = Versions::new(setup.config.clone());
-            setup.options.reload = Some(versions.reload());
-            followed = Some(versions);
-            Ok(())
-        },
-    )
+    let mut stack = Stack::start_with(specs, async |setup| {
+        setup.config.tables.truncate(1);
+        let versions = Versions::new(setup.config.clone());
+        setup.options.reload = Some(versions.reload());
+        followed = Some(versions);
+        Ok(())
+    })
     .await?;
     stack.serving.ready().await;
     let versions = followed.ok_or("the setup ran")?;
@@ -1963,5 +1968,64 @@ async fn test_reload_refreshes_a_changed_table_under_its_new_configuration() -> 
     .await?;
     let (status, _) = stack.http_get(READY_PATH).await?;
     assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+/// A reload that changes only a table's `strict` applies to the table
+/// serving in place, with no load: the same table serves the same
+/// generation under the new entry, and the reload is counted applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_applies_a_strict_change_in_place() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following().await?;
+    let table = Arc::clone(&stack.serving.opened().tables()[0]);
+    let generation = stack.generation();
+    let before = stack.reloads(ReloadResult::Applied).await?;
+    let mut next = versions.config();
+    assert!(!next.tables[0].strict);
+    next.tables[0].strict = true;
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Applied, before).await?;
+
+    let after = Arc::clone(&stack.serving.opened().tables()[0]);
+    assert!(
+        Arc::ptr_eq(&after, &table),
+        "the table serving is retuned, not replaced"
+    );
+    assert!(Arc::ptr_eq(&stack.generation(), &generation));
+    assert!(after.config().strict);
+    stack.table_info(TABLE).await?;
+    Ok(())
+}
+
+/// A reload that would make a table strict while its serving snapshot is
+/// below its level is refused and counted refused, as a start under it
+/// would fail: the table serves on under its entry, and `config_pending`
+/// reads 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_refuses_a_strict_change_the_serving_snapshot_is_below() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let balanced = FixtureSpec {
+        layout: Layout {
+            dictionary: Dictionary::Value,
+            ..Layout::contract()
+        },
+        ..FixtureSpec::small(TABLE, KeyType::Long)
+    };
+    let (mut stack, versions) = following_over(vec![balanced]).await?;
+    let table = Arc::clone(&stack.serving.opened().tables()[0]);
+    let before = stack.reloads(ReloadResult::Refused).await?;
+    let mut next = versions.config();
+    assert!(!next.tables[0].strict);
+    next.tables[0].strict = true;
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, before).await?;
+
+    assert!(Arc::ptr_eq(&stack.serving.opened().tables()[0], &table));
+    assert!(!table.config().strict, "the refused entry is not taken");
+    assert_eq!(stack.pending().await?, Some(1.0));
+    stack.table_info(TABLE).await?;
     Ok(())
 }

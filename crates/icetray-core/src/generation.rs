@@ -21,7 +21,7 @@ use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
 use crate::check::{self, Caps, FileView, FindingCode, LayoutView};
-use crate::config::{ConfigError, Residency, TableConfig};
+use crate::config::{Residency, TableConfig};
 use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
 use crate::key::Key;
@@ -149,9 +149,7 @@ impl Generation {
         previous: Option<&Generation>,
     ) -> Result<Planned> {
         let table = config.name.as_str();
-        config
-            .check_lookups(None)
-            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
+        config.check_reachable()?;
         let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
         let layout = TableLayout::derive(
             table,
@@ -2053,7 +2051,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableSource;
     use crate::check::thresholds::KEY_PAGE_ROWS_LARGE;
-    use crate::config::{ConfigViolation, HedgeConfig};
+    use crate::config::{ConfigError, ConfigViolation, HedgeConfig};
     use crate::index::{FileFault, testing as index_testing};
     use crate::key::KeyType;
     use crate::local::testing as local_testing;

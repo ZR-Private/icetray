@@ -227,7 +227,7 @@ Events worth knowing:
 - A finding on a load, with `code`, `tier`, and `file`: at `warn` for an
   inefficient finding and at `info` for advice.
 - `configuration reload refused`, at `warn`, with the `reason`, after a
-  `table failed to load for a reload` for each table that failed
+  `table refused for a reload` for each table that failed
   ([Refresh and reload](#refresh-and-reload)).
 - `draining`, when a signal starts the drain.
 - `run failed`, at `error`, with the `error` that ended the run.
@@ -387,8 +387,8 @@ SIGHUP. A change to its tables applies without a restart
   - for a restart-only change, the setting, as in
     `server.listen changed, which only a restart applies`;
   - for tables that failed to load, their names, as in
-    `tables failed to load: kv`. Each table's own error is logged just
-    before, as `table failed to load for a reload` with `table`, `reason`,
+    `tables refused: kv`. Each table's own error is logged just
+    before, as `table refused for a reload` with `table`, `reason`,
     and `error`.
 
   The server keeps serving. The poll retries once the file changes; SIGHUP

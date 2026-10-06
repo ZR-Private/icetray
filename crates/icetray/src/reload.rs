@@ -135,7 +135,8 @@ pub enum ReloadRefusal {
     Invalid(ConfigRejected),
     /// Settings outside the tables changed, by their names in the file.
     Restart(Vec<&'static str>),
-    /// A table failed to open or load.
+    /// A table failed to open or load, or its serving generation does not
+    /// meet its retuned `lookups` or `strict`.
     Tables(Refused),
 }
 
@@ -154,7 +155,7 @@ impl fmt::Display for ReloadRefusal {
                     .iter()
                     .map(|(name, _)| name.as_str())
                     .collect();
-                write!(f, "tables failed to load: {}", names.join(", "))
+                write!(f, "tables refused: {}", names.join(", "))
             }
         }
     }
@@ -332,10 +333,12 @@ impl Reloader {
             .await
             .map_err(ReloadRefusal::Tables)?;
         let (added, changed, removed) = changes(&applied);
+        let retuned = names(&applied.retuned);
         tracing::info!(
             digest = %reading.digest,
             ?added,
             ?changed,
+            ?retuned,
             ?removed,
             kept = applied.kept,
             "configuration reloaded"
@@ -357,7 +360,7 @@ impl Reloader {
                     table = table.as_str(),
                     reason = %error.kind(),
                     %error,
-                    "table failed to load for a reload"
+                    "table refused for a reload"
                 );
             }
         }

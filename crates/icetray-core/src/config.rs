@@ -16,7 +16,7 @@ use crate::approx;
 use crate::aws_catalog;
 use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::level::Level;
 use crate::storage::{self, LocationError};
 use crate::time;
@@ -1423,9 +1423,32 @@ impl TableConfig {
         self.lookups.unwrap_or_else(|| self.residency.best_level())
     }
 
+    /// Whether `other` differs from this entry in `lookups` and `strict`
+    /// alone, `lookups` compared as resolved: a reload applies such a change
+    /// to the serving generation in place, since the level is judged from
+    /// the layout the generation already holds (RFD 020). True for equal
+    /// entries too.
+    pub(crate) fn same_but_levels(&self, other: &Self) -> bool {
+        *self
+            == Self {
+                lookups: self.lookups,
+                strict: self.strict,
+                ..other.clone()
+            }
+    }
+
+    /// `check_lookups` where the entry is used rather than validated, by a
+    /// load and by a retune: a configuration built by hand meets an
+    /// unreachable `lookups` here, as `Error::Config`.
+    pub(crate) fn check_reachable(&self) -> Result<()> {
+        self.check_lookups(None)
+            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))
+    }
+
     /// `ConfigViolation::LookupsUnreachable` when `lookups` is a level the
     /// residency cannot reach; `index` is the table's place in `tables`
-    /// when validation asks, `None` when a load does.
+    /// when validation asks, `None` when a load or retune does
+    /// (`check_reachable`).
     pub(crate) fn check_lookups(
         &self,
         index: Option<usize>,
@@ -2501,6 +2524,29 @@ locaton = "typo"
             ..absent.clone()
         };
         assert_ne!(absent, flipped);
+    }
+
+    #[test]
+    fn test_same_but_levels_is_true_for_lookups_and_strict_alone() {
+        let config = Config::parse(TOML_MINIMAL).unwrap();
+        let entry = config.tables[0].clone();
+        let retuned = TableConfig {
+            lookups: Some(Level::Permissive),
+            strict: !entry.strict,
+            ..entry.clone()
+        };
+        assert!(entry.same_but_levels(&retuned));
+        assert!(entry.same_but_levels(&entry));
+        let moved = TableConfig {
+            r#ref: format!("{}-next", entry.r#ref),
+            ..retuned.clone()
+        };
+        assert!(!entry.same_but_levels(&moved));
+        let budgeted = TableConfig {
+            resident_budget_bytes: Some(1),
+            ..retuned
+        };
+        assert!(!entry.same_but_levels(&budgeted));
     }
 
     #[test]
