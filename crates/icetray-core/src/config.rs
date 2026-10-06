@@ -68,10 +68,10 @@ const DEFAULT_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// (`cache::check_capacity`).
 const PARSE_CACHE_SHARDS: usize = 1;
 
-/// `strict` when a table says nothing: on. A snapshot whose layout puts the
-/// table below its `lookups` level is refused until its owner turns strict
-/// off with one line (RFD 020).
-const DEFAULT_STRICT: bool = true;
+/// `strict` when a table says nothing: off. No table is refused for its
+/// cost by default; a table whose snapshot's layout falls below its
+/// `lookups` level serves it and is flagged below its level (RFD 020).
+const DEFAULT_STRICT: bool = false;
 
 /// Residency when a table says nothing: `full`, RFD 017's fastest tier, one
 /// GET per hit and none per miss. The other tiers are chosen by the owner
@@ -1397,8 +1397,12 @@ pub struct TableConfig {
     pub key_column: String,
     /// The value column; Iceberg binary, fixed, or string.
     pub value_column: String,
-    /// Refuse a snapshot whose layout puts the table below its `lookups`
-    /// level (RFD 020).
+    /// Whether falling below `lookups` for a reason in the snapshot's
+    /// layout is an error rather than a warning (RFD 020): a strict table
+    /// refuses such a snapshot, failing the start when it is the first and
+    /// otherwise holding the last snapshot that met the level. Off by
+    /// default, when the table serves the snapshot and is flagged below its
+    /// level.
     #[serde(default = "default_strict")]
     pub strict: bool,
     /// The lookup level the table declares it accepts (RFD 020); `None`
@@ -1790,7 +1794,7 @@ name = "orders"
 ref = "main"
 key_column = "id"
 value_column = "payload"
-strict = false
+strict = true
 lookups = "balanced"
 residency = "full"
 resident_budget_bytes = {FIXTURE_RESIDENT_BUDGET_BYTES}
@@ -1906,7 +1910,7 @@ endpoint = "https://s3tables.example"
                 "ref": "main",
                 "key_column": "id",
                 "value_column": "payload",
-                "strict": false,
+                "strict": true,
                 "lookups": "balanced",
                 "residency": "full",
                 "resident_budget_bytes": FIXTURE_RESIDENT_BUDGET_BYTES
@@ -2035,7 +2039,7 @@ value_column = "value"
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
                 value_column: "payload".to_string(),
-                strict: false,
+                strict: true,
                 lookups: Some(Level::Balanced),
                 residency: Residency::Full,
                 resident_budget_bytes: Some(FIXTURE_RESIDENT_BUDGET_BYTES),
@@ -2138,7 +2142,7 @@ value_column = "value"
         assert_eq!(config.storage.hedge.window, DEFAULT_HEDGE_WINDOW);
         assert_eq!(config.storage.local, None);
         assert_eq!(config.tables.len(), 1);
-        assert!(config.tables[0].strict);
+        assert!(!config.tables[0].strict);
         assert_eq!(config.tables[0].lookups, None);
         assert_eq!(config.tables[0].lookups(), Level::Optimal);
         assert_eq!(config.tables[0].residency, Residency::Full);
@@ -2492,11 +2496,11 @@ locaton = "typo"
             ..absent.clone()
         };
         assert_ne!(absent, other);
-        let lenient = TableConfig {
+        let flipped = TableConfig {
             strict: !absent.strict,
             ..absent.clone()
         };
-        assert_ne!(absent, lenient);
+        assert_ne!(absent, flipped);
     }
 
     #[test]

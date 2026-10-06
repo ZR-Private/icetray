@@ -142,31 +142,28 @@ fn location(fixture: &Fixture) -> [&str; 2] {
 }
 
 /// A table of the two-table configuration, in TOML, pinned to `fixture`,
-/// with `strict` off.
+/// with `strict` left out, so the table takes the default, off.
 fn toml_table(name: &str, fixture: &Fixture) -> String {
-    format!(
-        "{}strict = false\n",
-        toml_table_default_strict(name, fixture)
-    )
-}
-
-/// `toml_table` with `strict` left out, so the table takes the default.
-fn toml_table_default_strict(name: &str, fixture: &Fixture) -> String {
     format!(
         "[[tables]]\nname = \"{name}\"\nsource = {{ type = \"static\", location = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n",
         fixture.metadata_location()
     )
 }
 
-/// A table of a JSON configuration, pinned to `fixture`.
+/// `toml_table` with `strict` on.
+fn toml_table_strict(name: &str, fixture: &Fixture) -> String {
+    format!("{}strict = true\n", toml_table(name, fixture))
+}
+
+/// A table of a JSON configuration, pinned to `fixture`, with `strict`
+/// left out, as `toml_table` leaves it.
 fn json_table(name: &str, fixture: &Fixture) -> Json {
     serde_json::json!({
         "name": name,
         "source": {"type": "static", "location": fixture.metadata_location()},
         "ref": "main",
         "key_column": "key",
-        "value_column": "value",
-        "strict": false
+        "value_column": "value"
     })
 }
 
@@ -449,10 +446,10 @@ async fn test_doctor_reports_an_unpartitioned_table_below_its_level_and_exits_2(
     Ok(())
 }
 
-/// A configured table keeps its `strict`: under the default, on, the
-/// doctor reports the findings of a table below its level and then refuses
-/// it as `below_level`, as `info` and `serve` do, with exit 1; with
-/// `strict` off it is below its level and served, exit 2.
+/// A configured table keeps its `strict`: with `strict` on, the doctor
+/// reports the findings of a table below its level and then refuses it as
+/// `below_level`, as `info` and `serve` do, with exit 1; under the default,
+/// off, it is below its level and served, exit 2.
 #[tokio::test]
 async fn test_doctor_refuses_a_strict_table_below_its_level() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -460,7 +457,7 @@ async fn test_doctor_refuses_a_strict_table_below_its_level() -> TestResult {
     let strict = write_file(
         dir.path(),
         "strict.toml",
-        &toml_table_default_strict(TABLE_A, &fixture),
+        &toml_table_strict(TABLE_A, &fixture),
     )?;
     let output = run(&["doctor", "--config", &strict], &[]);
     assert_exit(&output, EXIT_FAILURE);
@@ -490,8 +487,8 @@ async fn test_doctor_refuses_a_strict_table_below_its_level() -> TestResult {
 }
 
 /// A table that declares `permissive` meets it with a permissive layout:
-/// the findings are reported and the doctor exits 0, under the default
-/// `strict` as well, since nothing is below the level it declares.
+/// the findings are reported and the doctor exits 0, under `strict` as
+/// well, since nothing is below the level it declares.
 #[tokio::test]
 async fn test_doctor_exits_0_for_a_table_at_a_permissive_declared_level() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -501,7 +498,7 @@ async fn test_doctor_exits_0_for_a_table_at_a_permissive_declared_level() -> Tes
         "permissive.toml",
         &format!(
             "{}lookups = \"permissive\"\n",
-            toml_table_default_strict(TABLE_A, &fixture)
+            toml_table_strict(TABLE_A, &fixture)
         ),
     )?;
     let output = run(&["doctor", "--config", &permissive], &[]);
