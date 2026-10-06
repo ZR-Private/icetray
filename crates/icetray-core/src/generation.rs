@@ -7,7 +7,7 @@
 //! sequence number are unchanged, and swaps atomically.
 
 use std::borrow::Borrow;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -113,9 +113,10 @@ pub struct Generation {
     /// The distinct codes of the findings that cap `level`, in the finding
     /// table's order.
     capping: Vec<FindingCode>,
-    /// Positions in `files`, in file order, per bucketing the files carry
-    /// and per bucket under it; how a key finds its candidates.
-    routes: Routes,
+    /// The probe ranks of `files` per bucketing the files carry and per
+    /// bucket under it, ascending, which is the order a lookup probes them
+    /// (`ranked_routes`); how a key finds its candidates.
+    probe_routes: RankedRoutes,
     /// Per bucket a member of an overlap group is in, how many files a
     /// lookup there may probe (`widest_per_bucket`).
     overlapping: BTreeMap<u32, usize>,
@@ -129,6 +130,10 @@ type Routes = BTreeMap<Option<Bucketing>, Buckets>;
 
 /// Positions in a generation's files by bucket, in file order.
 type Buckets = BTreeMap<u32, Vec<usize>>;
+
+/// `Routes` with each position as its probe rank, every bucket's ranks
+/// ascending.
+type RankedRoutes = BTreeMap<Option<Bucketing>, BTreeMap<u32, Vec<ProbeRank>>>;
 
 impl Generation {
     /// The footer stage of a load of `snapshot` of `table`: derives the
@@ -205,6 +210,7 @@ impl Generation {
             .collect();
         let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
         let routes = routes(&spans);
+        let probe_routes = ranked_routes(&files, &routes);
         let groups = overlap_groups(&spans, &routes);
         let overlapping = widest_per_bucket(&spans, &groups);
         let caps = check::layout_caps(&LayoutView {
@@ -250,7 +256,7 @@ impl Generation {
             level: caps.level,
             lookup_cost: caps.cost,
             capping: caps.codes(),
-            routes,
+            probe_routes,
             overlapping,
             verified_groups: to_verify.len(),
         })
@@ -262,22 +268,22 @@ impl Generation {
         check::judge(&self.table, self.level, &self.capping, declared, strict)
     }
 
-    /// The files that may hold `key`, in file order: under every bucketing
+    /// The files that may hold `key`, in probe order: under every bucketing
     /// the files carry, the files of the bucket `key` falls in under it
     /// (each bucketing routes the key to its own bucket), and every file
     /// without a bucketing, narrowed to those whose exact key range covers
     /// the key. A table whose files all carry one bucketing yields one
     /// bucket's files; after a spec evolution, one bucket's files per
-    /// bucketing.
-    pub fn candidates(&self, key: &Key) -> impl Iterator<Item = &Arc<LoadedFile>> {
-        self.routes
-            .iter()
-            .flat_map(move |(bucketing, buckets)| {
-                let bucket =
-                    bucketing.map_or(manifest::UNBUCKETED, |bucketing| bucketing.bucket_of(key));
-                buckets.get(&bucket).into_iter().flatten()
-            })
-            .map(|&at| &self.files[at])
+    /// bucketing. They come in descending data sequence number across every
+    /// bucketing, ties in file order (RFD 021): the newest copy of an
+    /// updated key first. A key held by two files is refused at load, so
+    /// the order changes no answer.
+    pub fn candidates<'a>(
+        &'a self,
+        key: &'a Key,
+    ) -> impl Iterator<Item = &'a Arc<LoadedFile>> + 'a {
+        ProbeOrder::new(&self.probe_routes, key)
+            .map(|at| &self.files[at])
             .filter(move |file| file.index.may_contain(key))
     }
 
@@ -341,7 +347,7 @@ impl Generation {
     }
 
     /// One lookup and the `result` label it earns: the candidates are probed
-    /// in order and the first whose `find` answers gives the row, whose
+    /// in probe order and the first whose `find` answers gives the row, whose
     /// value page is read through `cache`. `Present` carries the bytes,
     /// `Null` is a present key with a null value, `Absent` a key no
     /// candidate holds. The GET cost is the index's: in the Full tier one
@@ -374,31 +380,48 @@ impl Generation {
     }
 
     /// Which file and page each key would reach; the oracle for cost tests.
-    /// The first candidate whose `page_of` names a value page, with that
-    /// page: in the Full tier that is the file holding the key, wherever in
-    /// an overlap group it sits, and the page's `value_page_offset` is the
-    /// one GET a cold hit makes. When no candidate names a value page (the
-    /// key is absent from every file whose fences cover it, or the tier is
-    /// Disk or Bloom, where naming one would take a read), the first
-    /// candidate that would decode a key page for it, the first probe.
-    /// `None` for a key no candidate would decode a page for, which `lookup`
-    /// answers `Absent` with no I/O.
+    /// Of the pages the key's candidates name, in the order a lookup probes
+    /// them (`probed`), the first that names a value page, with that page:
+    /// in the Full tier that is the file holding the key, wherever in an
+    /// overlap group it sits, and the page's `value_page_offset` is the one
+    /// GET a cold hit makes. When no candidate names a value page (the key
+    /// is absent from every file whose fences cover it, or the tier is Disk
+    /// or Bloom, where naming one would take a read), the first candidate
+    /// that would decode a key page for it, the first probe. `None` for a
+    /// key no candidate would decode a page for, which `lookup` answers
+    /// `Absent` with no I/O.
     pub fn plan(&self, keys: &[Key]) -> Vec<Option<(Arc<LoadedFile>, PageRef)>> {
         keys.iter().map(|key| self.plan_one(key)).collect()
     }
 
     fn plan_one(&self, key: &Key) -> Option<(Arc<LoadedFile>, PageRef)> {
         let mut first_probe = None;
-        for file in self.candidates(key) {
-            let Some(page) = file.index.page_of(key) else {
-                continue;
-            };
+        for (file, page) in self.probed(key) {
             if page.value_page_offset.is_some() {
                 return Some((Arc::clone(file), page));
             }
             first_probe.get_or_insert_with(|| (Arc::clone(file), page));
         }
         first_probe
+    }
+
+    /// Every page a lookup of `key` would decode were each probe to miss,
+    /// with its file, in probe order (`probed`). `plan` reaches the first
+    /// of them that holds the key; a cost test counts the GETs of the
+    /// probes before it.
+    #[cfg(test)]
+    pub(crate) fn probes(&self, key: &Key) -> Vec<(Arc<LoadedFile>, PageRef)> {
+        self.probed(key)
+            .map(|(file, page)| (Arc::clone(file), page))
+            .collect()
+    }
+
+    /// The pages a lookup of `key` would decode were each probe to miss,
+    /// with their files, in probe order (`candidates`): each candidate
+    /// whose `page_of` names a key page.
+    fn probed<'a>(&'a self, key: &'a Key) -> impl Iterator<Item = (&'a Arc<LoadedFile>, PageRef)> {
+        self.candidates(key)
+            .filter_map(|file| file.index.page_of(key).map(|page| (file, page)))
     }
 
     /// The identity of every file's chunk file, for `LocalDir::retain`:
@@ -716,6 +739,101 @@ fn routes(spans: &[Span<'_>]) -> Routes {
             .push(at);
     }
     routes
+}
+
+/// Where a file stands in probe order (RFD 021): its data sequence number,
+/// highest first, then its position in file order. Positions are distinct,
+/// so ranks are.
+type ProbeRank = (Reverse<SequenceNumber>, usize);
+
+/// `routes` with every position as its probe rank and every bucket's
+/// ranks sorted, computed once per generation so that a lookup sorts
+/// nothing and its merge compares ranks without reaching into `files`.
+fn ranked_routes(files: &[Arc<LoadedFile>], routes: &Routes) -> RankedRoutes {
+    routes
+        .iter()
+        .map(|(&bucketing, buckets)| {
+            let ranked = buckets
+                .iter()
+                .map(|(&bucket, positions)| {
+                    let mut ranks: Vec<ProbeRank> = positions
+                        .iter()
+                        .map(|&at| (Reverse(files[at].entry.sequence), at))
+                        .collect();
+                    ranks.sort_unstable();
+                    (bucket, ranks)
+                })
+                .collect();
+            (bucketing, ranked)
+        })
+        .collect()
+}
+
+/// The ranks, ascending, of the bucket `key` falls in under `bucketing`;
+/// empty when no file is in it.
+fn bucket_ranks<'a>(
+    bucketing: Option<Bucketing>,
+    buckets: &'a BTreeMap<u32, Vec<ProbeRank>>,
+    key: &Key,
+) -> &'a [ProbeRank] {
+    let bucket = bucketing.map_or(manifest::UNBUCKETED, |bucketing| bucketing.bucket_of(key));
+    buckets.get(&bucket).map_or(&[], Vec::as_slice)
+}
+
+/// The positions of a key's candidate files in probe order, before the key
+/// range filter: per bucketing the files carry, the ranks of the key's
+/// bucket (`bucket_ranks`), merged. Under one bucketing that list is walked
+/// as it is. Under several, each step takes the least rank past the last
+/// one taken, found by binary search in each list, so a lookup allocates
+/// nothing. A position is under one bucketing alone, so no rank repeats.
+struct ProbeOrder<'a> {
+    routes: &'a RankedRoutes,
+    key: &'a Key,
+    /// The one list, when the files carry one bucketing or none.
+    walk: Option<std::slice::Iter<'a, ProbeRank>>,
+    /// The last rank the merge took.
+    after: Option<ProbeRank>,
+}
+
+impl<'a> ProbeOrder<'a> {
+    fn new(routes: &'a RankedRoutes, key: &'a Key) -> Self {
+        let mut lists = routes.iter();
+        let walk = match (lists.next(), lists.next()) {
+            (None, _) => Some([].iter()),
+            (Some((bucketing, buckets)), None) => {
+                Some(bucket_ranks(*bucketing, buckets, key).iter())
+            }
+            (Some(_), Some(_)) => None,
+        };
+        Self {
+            routes,
+            key,
+            walk,
+            after: None,
+        }
+    }
+}
+
+impl Iterator for ProbeOrder<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if let Some(walk) = &mut self.walk {
+            return walk.next().map(|&(_, at)| at);
+        }
+        let after = self.after;
+        let next = self
+            .routes
+            .iter()
+            .filter_map(|(bucketing, buckets)| {
+                let list = bucket_ranks(*bucketing, buckets, self.key);
+                let start = after.map_or(0, |after| list.partition_point(|&rank| rank <= after));
+                list.get(start).copied()
+            })
+            .min()?;
+        self.after = Some(next);
+        Some(next.1)
+    }
 }
 
 /// The snapshot's timestamp as jiff holds it; one outside jiff's range is
@@ -2468,6 +2586,169 @@ mod tests {
         }
         check_present(&generation, &mem.store.storage, &all).await;
         check_present(&generation, &mem.store.storage, &unbucketed_keys).await;
+    }
+
+    /// `file` with its manifest entry at data sequence number `sequence`.
+    fn at_sequence(file: Arc<LoadedFile>, sequence: i64) -> Arc<LoadedFile> {
+        let mut file = Arc::into_inner(file).expect("the file is not shared yet");
+        file.entry.sequence = SequenceNumber(sequence);
+        Arc::new(file)
+    }
+
+    /// Every `files`-th of `keys` starting at `first`: disjoint key sets
+    /// whose ranges interleave.
+    fn every_nth(keys: &[i64], first: usize, files: usize) -> Vec<i64> {
+        keys.iter().copied().skip(first).step_by(files).collect()
+    }
+
+    #[tokio::test]
+    async fn test_candidates_probe_in_descending_sequence_number_ties_in_file_order() {
+        let mem = Mem::new();
+        let names = ["a", "b", "c", "d"];
+        let sequences = [1, 3, 2, 3];
+        let count = names.len();
+        let all = keys_from(0, KEYS_PER_FILE * i64::try_from(count).unwrap());
+        let mut files = Vec::new();
+        for (first, (name, sequence)) in names.into_iter().zip(sequences).enumerate() {
+            let keys = every_nth(&all, first, count);
+            files.push(at_sequence(
+                mem.keyed(name, &keys, None, manifest::UNBUCKETED).await,
+                sequence,
+            ));
+        }
+        let generation = assemble(files, layout(None)).await.unwrap();
+        assert_eq!(paths(generation.files.iter()), names.map(Mem::location));
+        // A key of the oldest file, which every file's range covers.
+        let oldest = every_nth(&all, 0, count);
+        let key = Key::Long(oldest[oldest.len() / 2]);
+        let probe_order = ["b", "d", "c", "a"].map(Mem::location);
+        assert_eq!(paths(generation.candidates(&key)), probe_order);
+        let probes = generation.probes(&key);
+        assert_eq!(paths(probes.iter().map(|(file, _)| file)), probe_order);
+        let holding: Vec<&str> = probes
+            .iter()
+            .filter(|(_, page)| page.position.is_some())
+            .map(|(file, _)| file.entry.path.as_str())
+            .collect();
+        assert_eq!(holding, [Mem::location("a")], "only the holder has a row");
+        let (planned, _) = generation.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap();
+        assert_eq!(planned.entry.path, Mem::location("a"));
+        check_present(&generation, &mem.store.storage, &all).await;
+    }
+
+    #[tokio::test]
+    async fn test_candidates_merge_bucketings_by_sequence_number() {
+        let mem = Mem::new();
+        let all = keys_from(0, KEYS_PER_FILE * i64::from(EIGHT) * i64::from(FOUR));
+        // Absent from every file, inside every file's range.
+        let key = Key::Long(all[all.len() / 2] + 1);
+        let (four, eight) = (bucketing(FOUR), bucketing(EIGHT));
+        let (in_four, in_eight) = (four.bucket_of(&key), eight.bucket_of(&key));
+        let specs = [
+            ("four_new", Some(four), in_four, 4),
+            ("four_old", Some(four), in_four, 1),
+            ("eight", Some(eight), in_eight, 3),
+            ("flat", None, manifest::UNBUCKETED, 2),
+        ];
+        let (files, held) = sequenced_files(&mem, &all, &specs).await;
+        let generation = assemble(files, layout(Some(eight))).await.unwrap();
+        assert_eq!(
+            paths(generation.files.iter()),
+            ["flat", "four_old", "four_new", "eight"].map(Mem::location),
+            "file order: bucketing, bucket, first key"
+        );
+        assert_eq!(
+            paths(generation.candidates(&key)),
+            ["four_new", "eight", "flat", "four_old"].map(Mem::location)
+        );
+        assert_eq!(
+            generation.lookup(&key, &cache().await).await.unwrap().0,
+            Value::Absent
+        );
+        check_present(&generation, &mem.store.storage, &held).await;
+    }
+
+    /// One file per spec of (name, bucketing, bucket, data sequence number),
+    /// the `n`-th of `specs.len()` holding every such `n`-th of `all` that is
+    /// in its bucket, with every key they hold.
+    async fn sequenced_files(
+        mem: &Mem,
+        all: &[i64],
+        specs: &[(&str, Option<Bucketing>, u32, i64)],
+    ) -> (Vec<Arc<LoadedFile>>, Vec<i64>) {
+        let mut files = Vec::new();
+        let mut held = Vec::new();
+        for (first, &(name, routed, bucket, sequence)) in specs.iter().enumerate() {
+            let class = every_nth(all, first, specs.len());
+            let keys = match routed {
+                Some(routed) => keys_in_bucket(&class, routed, bucket),
+                None => class,
+            };
+            held.extend(&keys);
+            files.push(at_sequence(
+                mem.keyed(name, &keys, routed, bucket).await,
+                sequence,
+            ));
+        }
+        (files, held)
+    }
+
+    #[tokio::test]
+    async fn test_candidates_merge_bucketings_ties_in_file_order() {
+        let mem = Mem::new();
+        let all = keys_from(0, KEYS_PER_FILE * i64::from(EIGHT) * i64::from(FOUR));
+        // Absent from every file, inside every file's range.
+        let key = Key::Long(all[all.len() / 2] + 1);
+        let (four, eight) = (bucketing(FOUR), bucketing(EIGHT));
+        let (newest, older) = (3, 2);
+        let specs = [
+            ("x", Some(four), four.bucket_of(&key), newest),
+            ("y", Some(eight), eight.bucket_of(&key), newest),
+            ("z", None, manifest::UNBUCKETED, older),
+        ];
+        let (files, held) = sequenced_files(&mem, &all, &specs).await;
+        let generation = assemble(files, layout(Some(eight))).await.unwrap();
+        assert_eq!(
+            paths(generation.files.iter()),
+            ["z", "x", "y"].map(Mem::location),
+            "file order: bucketing, bucket, first key"
+        );
+        assert_eq!(
+            paths(generation.candidates(&key)),
+            ["x", "y", "z"].map(Mem::location),
+            "x and y tie on sequence number and come in file order"
+        );
+        check_present(&generation, &mem.store.storage, &held).await;
+    }
+
+    #[tokio::test]
+    async fn test_candidates_merge_past_a_bucketing_whose_bucket_is_empty() {
+        let mem = Mem::new();
+        let all = keys_from(0, KEYS_PER_FILE * i64::from(EIGHT) * i64::from(FOUR));
+        let key = Key::Long(all[all.len() / 2] + 1);
+        let (four, eight) = (bucketing(FOUR), bucketing(EIGHT));
+        // The eight-bucket file sits in another bucket than the key's, so
+        // the key's bucket under that bucketing holds no file.
+        let elsewhere = (eight.bucket_of(&key) + 1) % EIGHT;
+        let in_four = four.bucket_of(&key);
+        let specs = [
+            ("four_old", Some(four), in_four, 1),
+            ("eight", Some(eight), elsewhere, 3),
+            ("four_new", Some(four), in_four, 2),
+        ];
+        let (files, held) = sequenced_files(&mem, &all, &specs).await;
+        let generation = assemble(files, layout(Some(eight))).await.unwrap();
+        assert_eq!(
+            paths(generation.candidates(&key)),
+            ["four_new", "four_old"].map(Mem::location)
+        );
+        assert_eq!(
+            generation.lookup(&key, &cache().await).await.unwrap().0,
+            Value::Absent
+        );
+        check_present(&generation, &mem.store.storage, &held).await;
     }
 
     #[tokio::test]

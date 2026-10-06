@@ -27,7 +27,7 @@ use bytes::Bytes;
 use parquet::basic::Type as PhysicalType;
 use parquet::bloom_filter::Sbbf;
 use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType};
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::ColumnDescPtr;
 
@@ -52,6 +52,13 @@ pub(crate) struct RowRef {
     /// The row's index within the row group.
     pub row: i64,
 }
+
+/// A row's position in a data file counted from the file's first row
+/// across every row group: how Iceberg's position deletes and deletion
+/// vectors name a row (RFD 021). A newtype, so that it is never taken for a
+/// row within one row group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RowPosition(pub(crate) u64);
 
 /// What makes a data file unservable beyond the contract's refusals. The set
 /// is closed; a fault outside it is a library error, not a file fault.
@@ -361,6 +368,10 @@ pub struct PageRef {
     /// the Disk and Bloom tiers, where naming the value page would take a
     /// read.
     pub value_page_offset: Option<u64>,
+    /// The position of `key`'s row in the file, under the same terms as
+    /// `value_page_offset`: `Some` only where the key page is resident and
+    /// holds the key.
+    pub(crate) position: Option<RowPosition>,
 }
 
 /// A decoded run of keys in file order, one arm per key type, holding the
@@ -921,19 +932,30 @@ impl FileIndex {
         {
             return None;
         }
-        let value_page_offset = match &self.keys {
+        let row = match &self.keys {
             KeyResidency::Chunks(chunks) => self
                 .search(key, row_group, key_page, Arc::clone(chunks))
-                .expect("build decoded this key page from these resident bytes and checked it against its offset index; decoding it again cannot fail")
-                .and_then(|row| self.value_page_index(row))
-                .map(|page| self.value_column().group(row_group).page_range(page).start),
+                .expect("build decoded this key page from these resident bytes and checked it against its offset index; decoding it again cannot fail"),
             KeyResidency::Disk(_) | KeyResidency::Filters(_) => None,
         };
         Some(PageRef {
             row_group,
             key_page,
-            value_page_offset,
+            value_page_offset: row
+                .and_then(|row| self.value_page_index(row))
+                .map(|page| self.value_column().group(row_group).page_range(page).start),
+            position: row.map(|row| self.position(row)),
         })
+    }
+
+    /// The position of `row` in the file: the rows of every earlier row
+    /// group, then the row within its own.
+    pub(crate) fn position(&self, row: RowRef) -> RowPosition {
+        let before: i64 = self.metadata.row_groups()[..row.row_group]
+            .iter()
+            .map(RowGroupMetaData::num_rows)
+            .sum();
+        RowPosition(approx::count(row_index(before + row.row)))
     }
 
     /// The key column of `row_group` decoded from `chunks`, or one page of
@@ -2264,6 +2286,13 @@ mod tests {
             let page = index.page_of(&key).unwrap();
             let row = index.find(&key, None).await.unwrap().unwrap();
             assert_eq!(page.row_group, row.row_group);
+            let position = RowPosition(approx::count(i));
+            assert_eq!(
+                index.position(row),
+                position,
+                "row {i} counts from the file's first row"
+            );
+            assert_eq!(page.position, Some(position));
             assert!(
                 index
                     .key_column()
@@ -2292,8 +2321,13 @@ mod tests {
         let absent = absent_after(&key_for(page_rows(), KeyType::String));
         let page = index.page_of(&absent).unwrap();
         assert_eq!(
-            (page.row_group, page.key_page, page.value_page_offset),
-            (0, 1, None)
+            (
+                page.row_group,
+                page.key_page,
+                page.value_page_offset,
+                page.position
+            ),
+            (0, 1, None, None)
         );
     }
 
@@ -2313,6 +2347,7 @@ mod tests {
                     row_group: 1,
                     key_page: 1,
                     value_page_offset: None,
+                    position: None,
                 })
             );
             assert_eq!(index.page_of(&above_range(KeyType::Long)), None);
