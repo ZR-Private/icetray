@@ -204,9 +204,9 @@ impl Default for CallsInFlight {
 
 /// One served table: its configuration and source, the generation it
 /// serves, and its lifecycle state. Owns the table's `HedgeWindow`, built
-/// from the storage's hedge settings and handed to every `Generation::load`,
-/// so one table's delay is set from its own reads and never another's (RFD
-/// 013). Shared across tasks behind an `Arc`.
+/// from the storage's hedge settings and handed to every
+/// `Generation::plan_load`, so one table's delay is set from its own reads
+/// and never another's (RFD 013). Shared across tasks behind an `Arc`.
 pub struct Table {
     config: TableConfig,
     source: TableSource,
@@ -974,15 +974,16 @@ impl Table {
         snapshot: &Snapshot,
         previous: Option<&Arc<Generation>>,
     ) -> Result<()> {
-        let generation = Generation::load(
+        let generation = Generation::plan_load(
             &self.config,
             resolved,
             snapshot,
             &self.storage,
             Arc::clone(&self.hedge),
-            self.local.as_ref(),
             previous.map(Arc::as_ref),
         )
+        .await?
+        .build(self.local.as_ref())
         .await?;
         let findings = self.gate(&generation)?;
         self.swap(generation, previous, &findings);

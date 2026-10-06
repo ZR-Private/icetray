@@ -117,38 +117,25 @@ type Routes = BTreeMap<Option<Bucketing>, Buckets>;
 type Buckets = BTreeMap<u32, Vec<usize>>;
 
 impl Generation {
-    /// Loads `snapshot` of `table`. Derives the layout from the snapshot's
-    /// schema, lists its live files, reuses from `previous` every file the
-    /// snapshot still names by the same path at the same size (the same
-    /// `Arc`, RFD 005; a data file is immutable, so a path whose size
-    /// changed is another file and its index would be stale), opens a
-    /// `FileHandle` for every other file with the manifest's size and
-    /// `hedge`, inspects their footers `load_concurrency()` at a time,
-    /// checks the budget `config` and `local` set before any chunk is
-    /// fetched (Full: `config.resident_budget_bytes` against the reused
-    /// files' resident bytes plus every new file's predicted full bytes;
-    /// Disk: `local.index_budget()` against the bytes `index/` holds, what
-    /// other tables' loads have reserved, and what every new file would
-    /// write there, reserved until the new indexes are built; over either
-    /// is `RefusalReason::OverBudget`), then builds the new indexes at the
-    /// same concurrency, refusing a bucketed file whose fences or first or
-    /// last key hash to another bucket than its manifest entry records
-    /// (`RefusalReason::KeyOutsideBucket`; a reused file was checked when
-    /// it was built, and every key is `verify_buckets`'s to check), and
-    /// assembles the generation: files sorted, overlap
-    /// groups found, and every group that gained a file merged to refuse a
-    /// duplicate key. `Err` leaves nothing behind; the caller keeps serving
-    /// `previous`. A snapshot timestamp jiff cannot represent is
-    /// `TableFault::SnapshotTimestampOutOfRange`, raised before any read.
-    pub(crate) async fn load(
+    /// The footer stage of a load of `snapshot` of `table`: derives the
+    /// layout from the snapshot's schema, lists its live files, reuses from
+    /// `previous` every file the snapshot still names by the same path at
+    /// the same size (the same `Arc`, RFD 005; a data file is immutable, so
+    /// a path whose size changed is another file and its index would be
+    /// stale), opens a `FileHandle` for every other file with the
+    /// manifest's size and `hedge`, and inspects their footers
+    /// `load_concurrency()` at a time. No key chunk is read and nothing is
+    /// written; `Planned::build` does both. A snapshot timestamp jiff cannot
+    /// represent is `TableFault::SnapshotTimestampOutOfRange`, raised before
+    /// any read.
+    pub(crate) async fn plan_load(
         config: &TableConfig,
         resolved: &Resolved,
         snapshot: &Snapshot,
         storage: &Arc<Storage>,
         hedge: Arc<HedgeWindow>,
-        local: Option<&Arc<LocalDir>>,
         previous: Option<&Generation>,
-    ) -> Result<Self> {
+    ) -> Result<Planned> {
         let table = config.name.as_str();
         let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
         let layout = TableLayout::derive(
@@ -163,35 +150,15 @@ impl Generation {
                 .await?;
         let (reused, pending) = reuse_or_open(entries, previous, storage, &hedge).await?;
         let inspected = inspect_all(table, &layout, pending).await?;
-        let reservation = check_budget(table, config, local, &reused, &inspected)?;
-        let built = build_all(
-            table,
-            config.residency,
-            local,
-            reservation.as_ref(),
-            inspected,
-        )
-        .await;
-        drop(reservation);
-        let built = built?;
-        let members = reused
-            .into_iter()
-            .map(|file| Member { file, reused: true })
-            .chain(built.into_iter().map(|file| Member {
-                file,
-                reused: false,
-            }))
-            .collect();
-        Self::assemble(
-            table,
-            snapshot,
+        Ok(Planned {
+            config: config.clone(),
+            snapshot: snapshot.clone(),
             snapshot_timestamp,
-            &resolved.location,
+            metadata_location: resolved.location.clone(),
             layout,
-            config.residency,
-            members,
-        )
-        .await
+            reused,
+            inspected,
+        })
     }
 
     /// Everything after the files are indexed: sorts them, builds the
@@ -410,6 +377,70 @@ impl Generation {
             .iter()
             .map(|file| index::identity_of(file.index.handle()))
             .collect()
+    }
+}
+
+/// A snapshot through the footer stage of its load
+/// (`Generation::plan_load`): its layout, the files reused from the
+/// previous generation, and every other file's inspected footer.
+pub(crate) struct Planned {
+    config: TableConfig,
+    snapshot: Snapshot,
+    snapshot_timestamp: jiff::Timestamp,
+    metadata_location: String,
+    layout: TableLayout,
+    reused: Vec<Arc<LoadedFile>>,
+    inspected: Vec<(DataFileEntry, Inspected)>,
+}
+
+impl Planned {
+    /// The chunk stage: checks the budget the configuration and `local`
+    /// set before any chunk is fetched (Full: `resident_budget_bytes`
+    /// against the reused files' resident bytes plus every new file's
+    /// predicted full bytes; Disk: `local.index_budget()` against the bytes
+    /// `index/` holds, what other tables' loads have reserved, and what
+    /// every new file would write there, reserved until the new indexes are
+    /// built; over either is `RefusalReason::OverBudget`), then builds the
+    /// new indexes `load_concurrency()` at a time, refusing a bucketed file
+    /// whose fences or first or last key hash to another bucket than its
+    /// manifest entry records (`RefusalReason::KeyOutsideBucket`; a reused
+    /// file was checked when it was built, and every key is
+    /// `verify_buckets`'s to check), and assembles the generation: files
+    /// sorted, overlap groups found, and every group that gained a file
+    /// merged to refuse a duplicate key. `Err` leaves nothing behind; the
+    /// caller keeps serving the previous generation.
+    pub(crate) async fn build(self, local: Option<&Arc<LocalDir>>) -> Result<Generation> {
+        let table = self.config.name.as_str();
+        let reservation = check_budget(table, &self.config, local, &self.reused, &self.inspected)?;
+        let built = build_all(
+            table,
+            self.config.residency,
+            local,
+            reservation.as_ref(),
+            self.inspected,
+        )
+        .await;
+        drop(reservation);
+        let built = built?;
+        let members = self
+            .reused
+            .into_iter()
+            .map(|file| Member { file, reused: true })
+            .chain(built.into_iter().map(|file| Member {
+                file,
+                reused: false,
+            }))
+            .collect();
+        Generation::assemble(
+            table,
+            &self.snapshot,
+            self.snapshot_timestamp,
+            &self.metadata_location,
+            self.layout,
+            self.config.residency,
+            members,
+        )
+        .await
     }
 }
 
@@ -1025,9 +1056,9 @@ pub struct MultiLookup {
 
 /// Iceberg tables in a temporary directory whose data files arrow writes
 /// under typed layout knobs, followed through `Storage`'s `file://` store
-/// and loaded through `Generation::load`, with the key and value
-/// derivations every fixture shares; for the tests of this module and of
-/// `check`. Nothing here is compiled outside tests.
+/// and loaded through `Generation::plan_load` and `Planned::build`, with
+/// the key and value derivations every fixture shares; for the tests of
+/// this module and of `check`. Nothing here is compiled outside tests.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::collections::BTreeMap;
@@ -1048,7 +1079,7 @@ pub(crate) mod testing {
     use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
     use parquet::schema::types::ColumnPath;
 
-    use super::Generation;
+    use super::{Generation, Planned};
     use crate::approx::count;
     use crate::cache::PageCache;
     use crate::catalog::{TableFault, TableSource, VERSION_HINT, hint_location};
@@ -1713,6 +1744,29 @@ pub(crate) mod testing {
             manifest_testing::write_metadata(&self.md, version).await;
         }
 
+        /// Resolves the root and plans a load of the main branch's
+        /// snapshot through the footer stage.
+        pub(crate) async fn plan_load(
+            &self,
+            config: &TableConfig,
+            previous: Option<&Generation>,
+        ) -> Result<Planned> {
+            let source = TableSource::Static {
+                location: self.root(),
+            };
+            let resolved = source.resolve(&self.storage).await?;
+            let snapshot = resolved.snapshot_for_ref(TABLE, MAIN)?;
+            Generation::plan_load(
+                config,
+                &resolved,
+                &snapshot,
+                &self.storage,
+                Arc::clone(&self.hedge),
+                previous,
+            )
+            .await
+        }
+
         /// Resolves the root and loads the main branch's snapshot.
         pub(crate) async fn load(
             &self,
@@ -1720,21 +1774,7 @@ pub(crate) mod testing {
             local: Option<&Arc<LocalDir>>,
             previous: Option<&Generation>,
         ) -> Result<Generation> {
-            let source = TableSource::Static {
-                location: self.root(),
-            };
-            let resolved = source.resolve(&self.storage).await?;
-            let snapshot = resolved.snapshot_for_ref(TABLE, MAIN)?;
-            Generation::load(
-                config,
-                &resolved,
-                &snapshot,
-                &self.storage,
-                Arc::clone(&self.hedge),
-                local,
-                previous,
-            )
-            .await
+            self.plan_load(config, previous).await?.build(local).await
         }
 
         /// GETs the table's storage has issued so far.
@@ -2945,6 +2985,21 @@ mod tests {
         // The previous generation is untouched and keeps answering.
         assert_present(&first, &all).await;
         assert_successors_absent(&first, &all).await;
+    }
+
+    #[tokio::test]
+    async fn test_plan_load_reads_no_key_chunk() {
+        let (table, all) = two_bucket_table().await;
+        let config = table.config(Residency::Full, None);
+        let planned = table.plan_load(&config, None).await.unwrap();
+        assert_eq!(table.gets(), METADATA_GETS + 2, "two footers and no chunk");
+        let generation = planned.build(None).await.unwrap();
+        assert_eq!(
+            table.gets(),
+            METADATA_GETS + 2 * FILE_GETS,
+            "each file's chunk is fetched at build"
+        );
+        assert_present(&generation, &all).await;
     }
 
     #[tokio::test]

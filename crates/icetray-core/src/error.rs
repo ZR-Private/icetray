@@ -517,7 +517,7 @@ pub enum RefusalReason {
     /// its manifest entry records (RFD 007). Routing sends a key to no
     /// bucketed file outside the bucket it hashes to, so such a key would
     /// answer `Absent` though present. The load hashes each file's fences
-    /// and its first and last key (`Generation::load`); the doctor hashes
+    /// and its first and last key (`Planned::build`); the doctor hashes
     /// every key (`Generation::verify_buckets`).
     KeyOutsideBucket {
         /// The data file's location.
