@@ -1487,6 +1487,25 @@ async fn reload_counted(metrics: SocketAddr, result: ReloadResult) -> Result<Str
     .await
 }
 
+/// Waits for `config_pending` to read `pending`. A scrape publishes the
+/// flag before it renders the counters, so the scrape that first counts a
+/// reload can still read the flag from just before it.
+async fn pending_reads(metrics: SocketAddr, pending: bool) -> TestResult {
+    let want = f64::from(u8::from(pending)).to_bits();
+    poll_until(
+        READY_WAIT,
+        "config_pending to follow the reload",
+        async || {
+            let (_, exposition) = http_get(metrics, METRICS_PATH).await?;
+            Ok(
+                (series_value(&exposition, CONFIG_PENDING, &[]).map(f64::to_bits) == Some(want))
+                    .then_some(()),
+            )
+        },
+    )
+    .await
+}
+
 /// Ends `daemon` with SIGTERM and asserts its drain exits 0.
 async fn drain(mut daemon: Daemon) -> TestResult {
     send(&daemon, "-TERM")?;
@@ -1535,10 +1554,7 @@ async fn test_serve_reloads_its_file_on_sighup() -> TestResult {
         Some(1.0_f64.to_bits()),
         "the added table serves"
     );
-    assert_eq!(
-        series_value(&exposition, CONFIG_PENDING, &[]).map(f64::to_bits),
-        Some(0.0_f64.to_bits())
-    );
+    pending_reads(metrics, false).await?;
     assert!(
         daemon.0.try_wait()?.is_none(),
         "the daemon lives through SIGHUP"
@@ -1562,10 +1578,7 @@ async fn test_serve_refuses_a_reload_to_a_file_with_no_table() -> TestResult {
     std::fs::write(&config, empty.to_string())?;
     send(&daemon, "-HUP")?;
     let exposition = reload_counted(metrics, ReloadResult::Refused).await?;
-    assert_eq!(
-        series_value(&exposition, CONFIG_PENDING, &[]).map(f64::to_bits),
-        Some(1.0_f64.to_bits())
-    );
+    pending_reads(metrics, true).await?;
     assert_eq!(
         series_value(
             &exposition,

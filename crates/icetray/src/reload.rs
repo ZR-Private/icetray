@@ -343,11 +343,13 @@ impl Reloader {
             kept = applied.kept,
             "configuration reloaded"
         );
-        count(ReloadResult::Applied);
+        // The state is set before the count, so a scrape that reads the
+        // count also reads the file as applied.
         self.pending.set(false);
         self.running = config;
         self.applied = reading.digest;
         self.refused = None;
+        count(ReloadResult::Applied);
         Ok(applied)
     }
 
@@ -366,8 +368,8 @@ impl Reloader {
         }
         tracing::warn!(%digest, reason = %refusal, "configuration reload refused");
         self.refused = Some(digest);
-        count(ReloadResult::Refused);
         self.pending.set(true);
+        count(ReloadResult::Refused);
     }
 }
 
