@@ -38,8 +38,9 @@ table:
   key chunks from memory or the kernel's page cache, never from the
   device.
 - `balanced`: a lookup still probes one file, with a fixed extra cost:
-  extra GETs per hit, GETs on a miss at a filter's false-positive rate,
-  larger key pages, or device reads of key chunks.
+  extra GETs per hit, GETs on a miss at a filter's false-positive rate
+  or for a deleted key (RFD 021), larger key pages, or device reads of key
+  chunks.
 - `permissive`: any snapshot icetray can serve correctly, including one
   where a lookup probes more than one file.
 
@@ -149,7 +150,7 @@ For dashboards, `icetray_table_level{table}` is the level achieved and
 `icetray_table_declared_level{table}` the level declared, each 0 for
 optimal, 1 for balanced, 2 for permissive. The level series appear with
 the table's first swap, like the other per-generation gauges (RFD 018). A
-snapshot refused for a reason outside the levels, such as delete files,
+snapshot refused for a reason outside the levels, such as unsorted keys,
 leaves them as they were.
 
 The measurements behind a level are per-table gauges, so a dashboard shows
