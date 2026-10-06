@@ -24,7 +24,7 @@ use tokio::task::JoinSet;
 use crate::approx;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
-use crate::check::{self, Finding, FindingCode};
+use crate::check::{self, Finding, FindingCode, LookupCost};
 use crate::config::TableConfig;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Value};
@@ -388,6 +388,7 @@ struct GenerationGauges {
     findings: BTreeMap<FindingCode, u64>,
     sequence_number: SequenceNumber,
     swapped_at: f64,
+    lookup_cost: LookupCost,
 }
 
 /// What a lookup needs beside its generation: the table's page cache
@@ -1229,8 +1230,9 @@ impl Table {
 
     /// Makes `generation` the serving one. The generation gauges it sets,
     /// `index_bytes`, `findings` from `findings`,
-    /// `generation_sequence_number`, and `generation_swapped_at_seconds`
-    /// from the clock, are kept and written while the table shows them
+    /// `generation_sequence_number`, `generation_swapped_at_seconds` from
+    /// the clock, and the lookup-cost gauges from its `lookup_cost`, are
+    /// kept and written while the table shows them
     /// (`write_generation`), and the level gauges take the generation's
     /// level against `declared`.
     fn swap(
@@ -1262,6 +1264,7 @@ impl Table {
             findings: findings.clone(),
             sequence_number: generation.sequence_number,
             swapped_at: time::unix_seconds(time::now()),
+            lookup_cost: generation.lookup_cost,
         };
         let level = LevelGauges {
             measured: generation.level,
@@ -1480,6 +1483,22 @@ impl Table {
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(generation.swapped_at);
+        let cost = generation.lookup_cost;
+        metrics::gauge!(
+            metric::TABLE_GETS_PER_HIT,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(cost.gets_per_hit));
+        metrics::gauge!(
+            metric::TABLE_GETS_PER_MISS,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(cost.gets_per_miss));
+        metrics::gauge!(
+            metric::TABLE_FILES_PROBED_PER_LOOKUP,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge_len(cost.files_probed));
     }
 
     /// Writes the level gauges from `level`; called with the gauges' lock
@@ -3271,6 +3290,107 @@ mod tests {
         );
     }
 
+    /// The lookup-cost gauges of `table`, as bits: GETs per hit, GETs per
+    /// miss, and files probed per lookup.
+    fn cost_gauges(series: &Series) -> [u64; 3] {
+        let labels = [table_label()];
+        [
+            metric::TABLE_GETS_PER_HIT,
+            metric::TABLE_GETS_PER_MISS,
+            metric::TABLE_FILES_PROBED_PER_LOOKUP,
+        ]
+        .map(|name| series.gauge(name, &labels).to_bits())
+    }
+
+    /// What `cost_gauges` reads for `cost`.
+    fn cost_bits(cost: LookupCost) -> [u64; 3] {
+        [
+            approx::gauge(cost.gets_per_hit).to_bits(),
+            approx::gauge(cost.gets_per_miss).to_bits(),
+            approx::gauge_len(cost.files_probed).to_bits(),
+        ]
+    }
+
+    /// The cost of a cold lookup on `two_bucket_table` in `full`.
+    const CONTRACT_COST: LookupCost = LookupCost {
+        gets_per_hit: 1,
+        gets_per_miss: 0,
+        files_probed: 1,
+    };
+
+    /// The cost on `two_bucket_table` after `append_dictionary_overlap`, in
+    /// `full`: the value dictionary page beside the value page, and the
+    /// two files of bucket 0 probed.
+    const DICTIONARY_OVERLAP_COST: LookupCost = LookupCost {
+        gets_per_hit: 2,
+        gets_per_miss: 0,
+        files_probed: 2,
+    };
+
+    /// The lookup-cost gauges appear with the first swap and follow the
+    /// serving generation: a swap to a layout with overlapping files and a
+    /// dictionary-encoded value column raises them.
+    #[test]
+    fn test_metrics_lookup_cost_appears_at_first_swap_and_follows_the_swaps() {
+        let ((), before) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            fixture.remove_hint();
+            table.load().await.unwrap_err();
+        });
+        for name in [
+            metric::TABLE_GETS_PER_HIT,
+            metric::TABLE_GETS_PER_MISS,
+            metric::TABLE_FILES_PROBED_PER_LOOKUP,
+        ] {
+            assert_eq!(before.named(name), 0, "{name} before any swap");
+        }
+        let (first, after) = recorded_with(|snapshotter| async move {
+            let (mut fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            assert_eq!(table.current().unwrap().lookup_cost, CONTRACT_COST);
+            let first = Series(snapshotter.snapshot().into_vec());
+            append_dictionary_overlap(&mut fixture).await;
+            assert!(table.refresh().await.unwrap());
+            assert_eq!(
+                table.current().unwrap().lookup_cost,
+                DICTIONARY_OVERLAP_COST
+            );
+            first
+        });
+        assert_eq!(cost_gauges(&first), cost_bits(CONTRACT_COST));
+        assert_eq!(cost_gauges(&after), cost_bits(DICTIONARY_OVERLAP_COST));
+    }
+
+    /// A strict table held on a snapshot that costs more keeps the serving
+    /// generation's cost: the gauges say what lookups pay now.
+    #[test]
+    fn test_metrics_lookup_cost_is_the_serving_generations_while_held() {
+        let ((), series) = recorded(async {
+            let (mut fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            append_dictionary_overlap(&mut fixture).await;
+            table.refresh().await.unwrap_err();
+            assert_eq!(
+                held(&table),
+                (
+                    SnapshotId(FIRST_SNAPSHOT),
+                    SnapshotId(SECOND_SNAPSHOT),
+                    Level::Permissive
+                )
+            );
+            table.publish_gauges();
+        });
+        assert_eq!(cost_gauges(&series), cost_bits(CONTRACT_COST));
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(1, Level::Permissive, Level::Optimal),
+            "the level gauges judge the held snapshot"
+        );
+    }
+
     /// A retune of a lenient table's `lookups` declares the new level at
     /// once, before any poll: a table serving a balanced snapshot reads
     /// below its declared `optimal`, and retuned to `balanced` reads at its
@@ -3835,6 +3955,9 @@ mod tests {
             metric::TABLE_BELOW_LEVEL,
             metric::TABLE_LEVEL,
             metric::TABLE_DECLARED_LEVEL,
+            metric::TABLE_GETS_PER_HIT,
+            metric::TABLE_GETS_PER_MISS,
+            metric::TABLE_FILES_PROBED_PER_LOOKUP,
         ];
         for name in gauges {
             assert_eq!(loading.named(name), 0, "{name}");
@@ -3858,6 +3981,7 @@ mod tests {
             level_gauges(&shown),
             level_bits(0, Level::Optimal, Level::Optimal)
         );
+        assert_eq!(cost_gauges(&shown), cost_bits(CONTRACT_COST));
     }
 
     /// A withdrawn table writes no gauge: a refresh that fails after the

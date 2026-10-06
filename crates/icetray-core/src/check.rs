@@ -108,10 +108,23 @@ pub mod thresholds {
     pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5;
 }
 
-/// The GETs a hit spends on a dictionary-encoded value column's dictionary
-/// page besides the value page (RFD 007): the penalty of
-/// `dictionary_encoded_value`.
-const DICTIONARY_PAGE_GETS: u32 = 1;
+/// The GETs a cold lookup spends on a column chunk's dictionary page beside
+/// the page it decodes: for the value column on a hit, the penalty of
+/// `dictionary_encoded_value` (RFD 007); for the key column under `bloom`,
+/// on each file whose filter answers yes (RFD 017).
+const DICTIONARY_PAGE_GETS: u64 = 1;
+
+/// The GETs a cold hit spends on its value page (RFD 006).
+const VALUE_PAGE_GETS: u64 = 1;
+
+/// The GETs a cold lookup under `bloom` spends on the key page of each file
+/// it probes whose filter answers yes (RFD 017); `full` holds the page and
+/// `disk` reads it from a chunk file, neither with a GET.
+const KEY_PAGE_GETS: u64 = 1;
+
+/// The files a lookup probes where no files overlap: the one its key routes
+/// to.
+const FILES_PROBED_ALONE: usize = 1;
 
 /// The files a bucket's bytes explain at the least: one, however few bytes
 /// it holds, so a bucket of one small file is never many files.
@@ -128,7 +141,7 @@ const DISTINCT_MINS_UNOBSERVABLE: f64 = 1.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Penalty {
     /// GETs a hit makes beyond the one value page.
-    pub extra_gets_per_hit: Option<u32>,
+    pub extra_gets_per_hit: Option<u64>,
     /// Keys a lookup decodes, where the contract decodes `contract::PAGE_ROWS`.
     pub keys_decoded_per_lookup: Option<i64>,
     /// Files a lookup may probe, where the contract probes one.
@@ -144,6 +157,27 @@ impl Penalty {
             ..Self::default()
         }
     }
+}
+
+/// What one cold lookup pays at worst on a layout in a residency (RFD 020):
+/// the numbers behind its level, which rise before the level changes.
+/// Observed traffic is `icetray_lookups_total`'s, where a warm hit pays
+/// less than `gets_per_hit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LookupCost {
+    /// GETs a cold hit makes: its value page, the value column's dictionary
+    /// page when any file's is dictionary-encoded, and under `bloom` the key
+    /// page of every file probed, each filter answering yes, with the key
+    /// column's dictionary page when any file's is dictionary-encoded.
+    pub gets_per_hit: u64,
+    /// GETs a miss makes: none under `full` and `disk`; under `bloom` the
+    /// key pages a hit spends, every filter answering yes.
+    pub gets_per_miss: u64,
+    /// Files a lookup probes at most: the most in any bucket
+    /// (`Generation::overlapping_buckets`, which takes unbucketed files as
+    /// one bucket), one where no files overlap; an upper bound where files
+    /// were written under two or more bucketings.
+    pub files_probed: usize,
 }
 
 /// A finding's code (RFD 016). Display and serde give the `snake_case` code
@@ -167,7 +201,7 @@ pub enum FindingCode {
     /// probes every file.
     NoBucketPartition,
     /// Files within one bucket have intersecting exact key ranges; a lookup
-    /// probes each of them.
+    /// probes each of them whose range covers its key.
     OverlappingFiles,
     /// A manifest lacks key bounds, or its bounds are shorter than the
     /// file's exact first or last key.
@@ -536,6 +570,9 @@ pub struct TableSummary {
     /// `predicted`. A tier that cannot load it is left out, as Bloom is
     /// when `predicted.bloom` is `None`.
     pub level_by_residency: BTreeMap<Residency, Level>,
+    /// What one cold lookup pays at worst in the loaded tier, from the same
+    /// measurement as `level`.
+    pub lookup_cost: LookupCost,
     /// Capping findings, the count of those whose `caps` is set.
     pub capping: usize,
     /// Advice findings, the count of those whose `caps` is `None`.
@@ -603,6 +640,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         index_bytes: g.index_bytes,
         predicted,
         level_by_residency: level_by_residency(caps.layout, &predicted),
+        lookup_cost: caps.cost,
         capping,
         advice: findings.len() - capping,
     };
@@ -671,14 +709,14 @@ fn capping_codes(findings: &[Finding]) -> Vec<FindingCode> {
 
 /// What a snapshot's level for its layout is judged from (RFD 020): the
 /// table's layout and residency, each file's manifest entry and footer, and
-/// per bucket the widest overlap group touching it. A built generation
+/// per bucket the most files a lookup there probes. A built generation
 /// gives every part exactly (`LayoutView::of`); none needs a key chunk.
 pub(crate) struct LayoutView<'a> {
     pub(crate) layout: &'a TableLayout,
     pub(crate) residency: Residency,
     pub(crate) files: Vec<FileView<'a>>,
-    /// Per bucket, the widest overlap group touching it, as
-    /// `Generation::overlapping_buckets` gives it.
+    /// Per bucket an overlap group touches, the most files a lookup there
+    /// probes, as `Generation::overlapping_buckets` gives it.
     pub(crate) overlapping: &'a BTreeMap<u32, usize>,
 }
 
@@ -738,6 +776,8 @@ pub(crate) struct Caps {
     /// The capping findings in the finding table's order, then by file in
     /// view order.
     pub(crate) findings: Vec<Finding>,
+    /// What one cold lookup pays at worst in the view's residency.
+    pub(crate) cost: LookupCost,
 }
 
 impl Caps {
@@ -748,12 +788,12 @@ impl Caps {
     }
 }
 
-/// The capping findings `view` raises and the level they and its residency
-/// allow (RFD 020): the one function the doctor's report and the load's
-/// level gate both judge a level by, so the two cannot disagree. Per file,
-/// a dictionary-encoded value column and large key pages; per table, files
-/// written with no bucket partition and overlapping files. No `f64`
-/// enters.
+/// The capping findings `view` raises, the level they and its residency
+/// allow, and the cost of a cold lookup there (RFD 020): the one function
+/// the doctor's report, the load's level gate, and the cost gauges all
+/// measure a layout by, so none can disagree. Per file, a dictionary-encoded
+/// value column and large key pages; per table, files written with no
+/// bucket partition and overlapping files. No `f64` enters.
 pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     let mut findings = Vec::new();
     for file in &view.files {
@@ -768,7 +808,48 @@ pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     Caps {
         level: layout.max(view.residency.best_level()),
         layout,
+        cost: lookup_cost(view, &findings),
         findings,
+    }
+}
+
+/// The cost of one cold lookup on `view`, whose capping findings are
+/// `findings`. A hit reads one file's value, so the dearest
+/// `extra_gets_per_hit` of any finding is what it adds. The files probed
+/// are the most any bucket's lookup probes, the figure `overlapping_files`
+/// carries; `no_bucket_partition`'s figure counts every unbucketed file,
+/// while a lookup probes only those whose exact key range covers its key,
+/// which the overlap figure already narrows to.
+fn lookup_cost(view: &LayoutView<'_>, findings: &[Finding]) -> LookupCost {
+    let extra_per_hit = findings
+        .iter()
+        .filter_map(|finding| finding.penalty()?.extra_gets_per_hit)
+        .max()
+        .unwrap_or(0);
+    let files_probed = view
+        .overlapping
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(FILES_PROBED_ALONE);
+    let key_pages = match view.residency {
+        Residency::Full | Residency::Disk => 0,
+        Residency::Bloom => {
+            let key_dictionary = view.files.iter().any(|file| {
+                chunk_facts(file.metadata, file.key_leaf, file.value_leaf).key_dictionary
+            });
+            let dictionary = if key_dictionary {
+                DICTIONARY_PAGE_GETS
+            } else {
+                0
+            };
+            (KEY_PAGE_GETS + dictionary) * approx::count(files_probed)
+        }
+    };
+    LookupCost {
+        gets_per_hit: VALUE_PAGE_GETS + extra_per_hit + key_pages,
+        gets_per_miss: key_pages,
+        files_probed,
     }
 }
 
@@ -1251,7 +1332,7 @@ fn table_capping_findings(view: &LayoutView<'_>, findings: &mut Vec<Finding>) {
             FindingCode::OverlappingFiles,
             None,
             format!(
-                "bucket {bucket} holds {probed} files with intersecting key ranges, checked free of shared keys at load; a lookup there probes up to {probed} files ({property}=false on the write, or a compaction)",
+                "bucket {bucket} holds files with intersecting key ranges, checked free of shared keys at load; a lookup there probes up to {probed} files ({property}=false on the write, or a compaction)",
                 property = WriterProperty::SkewSplitting,
             ),
             Penalty::files_probed(probed),
@@ -2047,7 +2128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diagnose_overlapping_files_penalty_is_the_widest_group_of_the_bucket() {
+    async fn test_diagnose_overlapping_files_penalty_is_the_files_a_lookup_probes() {
         let mut table = Table::bucketed(ONE);
         let first = testing::keys_from(0, FILE_KEYS);
         let interleaved: Vec<i64> = first.iter().map(|key| key + 1).collect();
@@ -2760,9 +2841,19 @@ mod tests {
                 "index_bytes",
                 "predicted",
                 "level_by_residency",
+                "lookup_cost",
                 "capping",
                 "advice",
             ])
+        );
+        assert_eq!(
+            summary["lookup_cost"],
+            serde_json::json!({
+                "gets_per_hit": VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
+                "gets_per_miss": 0,
+                "files_probed": FILES_PROBED_ALONE,
+            }),
+            "a full hit fetches the value dictionary page beside the value page"
         );
         assert_eq!(summary["table"], Json::String(TABLE.to_string()));
         assert_eq!(

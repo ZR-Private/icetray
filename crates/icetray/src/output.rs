@@ -300,7 +300,9 @@ mod tests {
     use bytes::Bytes;
     use std::collections::BTreeMap;
 
-    use icetray_core::{FindingCode, KeyType, Level, Residency, ResidentBytes, TableFault};
+    use icetray_core::{
+        FindingCode, KeyType, Level, LookupCost, Residency, ResidentBytes, TableFault,
+    };
     use serde_json::Value as Json;
 
     use super::*;
@@ -363,6 +365,11 @@ mod tests {
                 (Residency::Disk, Level::Optimal),
                 (Residency::Bloom, Level::Balanced),
             ]),
+            lookup_cost: LookupCost {
+                gets_per_hit: 1,
+                gets_per_miss: 0,
+                files_probed: 1,
+            },
             capping: 0,
             advice: 0,
         }
@@ -453,6 +460,10 @@ mod tests {
             Json::String("balanced".to_string())
         );
         assert_eq!(line["capping"], Json::from(0));
+        assert_eq!(
+            line["lookup_cost"],
+            serde_json::json!({"gets_per_hit": 1, "gets_per_miss": 0, "files_probed": 1})
+        );
     }
 
     #[test]

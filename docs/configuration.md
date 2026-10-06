@@ -569,7 +569,7 @@ Two conventions hold for every line:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"capping":0,"advice":0}
 ```
 
 | Key | Value |
@@ -592,6 +592,9 @@ One per table, from `info` and from `doctor`:
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
 | `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
 | `level_by_residency` | For each residency that can load the table, the level its files would reach there. A residency that cannot load the table is left out, as `bloom` is when `predicted.bloom` is `null`. |
+| `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, as `icetray_table_gets_per_hit` reports it while the snapshot serves. |
+| `lookup_cost.gets_per_miss` | GETs one miss makes at worst, as `icetray_table_gets_per_miss` reports it. |
+| `lookup_cost.files_probed` | Files one lookup probes at worst, as `icetray_table_files_probed_per_lookup` reports it. |
 | `capping` | The number of findings that cap the level. |
 | `advice` | The number of advice findings. |
 

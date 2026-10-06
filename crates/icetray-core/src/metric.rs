@@ -86,6 +86,15 @@ pub const TABLE_BELOW_LEVEL: &str = "icetray_table_below_level";
 pub const TABLE_LEVEL: &str = "icetray_table_level";
 /// The level the table declares, by `table`, in `TABLE_LEVEL`'s numbers.
 pub const TABLE_DECLARED_LEVEL: &str = "icetray_table_declared_level";
+/// GETs one cold hit makes at worst on the serving generation's layout and
+/// residency, by `table` (RFD 020, `LookupCost::gets_per_hit`).
+pub const TABLE_GETS_PER_HIT: &str = "icetray_table_gets_per_hit";
+/// GETs one miss makes at worst on the serving generation, by `table`
+/// (`LookupCost::gets_per_miss`).
+pub const TABLE_GETS_PER_MISS: &str = "icetray_table_gets_per_miss";
+/// Files one lookup probes at most on the serving generation, by `table`
+/// (`LookupCost::files_probed`).
+pub const TABLE_FILES_PROBED_PER_LOOKUP: &str = "icetray_table_files_probed_per_lookup";
 /// 1 while the configuration file differs from the configuration the
 /// server applied, 0 once they match (RFD 018).
 pub const CONFIG_PENDING: &str = "icetray_config_pending";
@@ -109,7 +118,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 33] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 36] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -259,6 +268,21 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 33] = [
         TABLE_DECLARED_LEVEL,
         Kind::Gauge,
         "The lookup level the table declares, 0 optimal, 1 balanced, 2 permissive, by table.",
+    ),
+    (
+        TABLE_GETS_PER_HIT,
+        Kind::Gauge,
+        "GETs one cold hit makes at worst on the serving generation's layout and residency, by table.",
+    ),
+    (
+        TABLE_GETS_PER_MISS,
+        Kind::Gauge,
+        "GETs one miss makes at worst on the serving generation's layout and residency, by table.",
+    ),
+    (
+        TABLE_FILES_PROBED_PER_LOOKUP,
+        Kind::Gauge,
+        "Files one lookup probes at most on the serving generation's layout, by table.",
     ),
     (
         CONFIG_PENDING,

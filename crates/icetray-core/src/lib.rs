@@ -34,8 +34,8 @@ pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
-    FileReport, Finding, FindingCode, Penalty, TableReport, TableSummary, WriterProperty, diagnose,
-    judge,
+    FileReport, Finding, FindingCode, LookupCost, Penalty, TableReport, TableSummary,
+    WriterProperty, diagnose, judge,
 };
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,

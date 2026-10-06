@@ -20,7 +20,7 @@ use crate::approx;
 use crate::blocking;
 use crate::cache::{PageCache, PageOrigin};
 use crate::catalog::{Resolved, TableFault};
-use crate::check::{self, Caps, FileView, FindingCode, LayoutView};
+use crate::check::{self, Caps, FileView, FindingCode, LayoutView, LookupCost};
 use crate::config::{Residency, TableConfig};
 use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileIndex, Inspected, Keys, PageRef};
@@ -106,14 +106,18 @@ pub struct Generation {
     /// measured once as the generation is assembled (`check::layout_caps`);
     /// what the level gauges and a reload judge the generation by.
     pub level: Level,
+    /// What one cold lookup pays at worst on the snapshot's layout in
+    /// `residency`, from the same measurement as `level`; what the cost
+    /// gauges show while the generation serves.
+    pub lookup_cost: LookupCost,
     /// The distinct codes of the findings that cap `level`, in the finding
     /// table's order.
     capping: Vec<FindingCode>,
     /// Positions in `files`, in file order, per bucketing the files carry
     /// and per bucket under it; how a key finds its candidates.
     routes: Routes,
-    /// Per bucket a member of an overlap group is in, the widest group
-    /// touching it: how many files a lookup there may probe.
+    /// Per bucket a member of an overlap group is in, how many files a
+    /// lookup there may probe (`widest_per_bucket`).
     overlapping: BTreeMap<u32, usize>,
     /// Overlap groups this load merged to prove key uniqueness.
     verified_groups: usize,
@@ -245,6 +249,7 @@ impl Generation {
             loaded_at: Instant::now(),
             snapshot_timestamp,
             level: caps.level,
+            lookup_cost: caps.cost,
             capping: caps.codes(),
             routes,
             overlapping,
@@ -277,9 +282,12 @@ impl Generation {
             .filter(move |file| file.index.may_contain(key))
     }
 
-    /// Per bucket that an overlap group touches, the widest such group:
-    /// how many files a lookup in that bucket may probe (RFD 007). A group
-    /// spanning two bucketings is recorded under every member's bucket.
+    /// Per bucket that an overlap group touches, how many files a lookup in
+    /// that bucket may probe (RFD 007): the most of the group's files whose
+    /// exact key ranges cover one key and whose buckets can hold it, which
+    /// is fewer than the group holds where its files chain end to end
+    /// (`widest_per_bucket`). Files counted together across two bucketings
+    /// are recorded under every one's bucket.
     /// Keyed by the bucket number alone, as the doctor reports it: after a
     /// spec evolution, buckets of two bucketings that share a number share
     /// one entry, and an unbucketed file's `manifest::UNBUCKETED` is bucket
@@ -458,7 +466,7 @@ impl Planned {
     }
 
     /// The level the snapshot's layout achieves in the configured residency
-    /// with `overlapping` as its widest overlap group per bucket
+    /// with `overlapping` as the most files a lookup probes per bucket
     /// (`check::layout_caps`), from the footers and manifest entries.
     fn caps(&self, overlapping: &BTreeMap<u32, usize>) -> Caps {
         let files = self
@@ -479,10 +487,10 @@ impl Planned {
         })
     }
 
-    /// Per bucket, the widest overlap group touching it
-    /// (`widest_per_bucket`), from the reused files' exact key ranges and
-    /// the new files' edge keys. A new file with `Edge::Unknown` has no
-    /// span, so the groups are those of the other files alone.
+    /// Per bucket an overlap group touches, the most files a lookup there
+    /// may probe (`widest_per_bucket`), from the reused files' exact key
+    /// ranges and the new files' edge keys. A new file with `Edge::Unknown`
+    /// has no span, so the groups are those of the other files alone.
     async fn overlapping(&mut self, local: Option<&Arc<LocalDir>>) -> Result<BTreeMap<u32, usize>> {
         let edges = self.edge_ranges(local).await?;
         let mut spans: Vec<Span<'_>> = self.reused.iter().map(|file| Span::of(file)).collect();
@@ -1081,16 +1089,86 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
-/// Per bucket a group member is in, the widest group touching it.
+/// Per bucket a group member is in, the most files one lookup there may
+/// probe: a lookup probes the candidates whose exact key range covers its
+/// key, so a group whose files chain end to end probes fewer files than it
+/// holds. Each group is swept in first-key order, and at each member's
+/// first key the members whose range still covers it are counted as
+/// `probed_together` counts them. Every key's candidates are open at the
+/// last-swept of them, so no lookup probes more than the sweep records.
+/// The work is the group's files times the files open at once.
 fn widest_per_bucket(spans: &[Span<'_>], groups: &[Vec<usize>]) -> BTreeMap<u32, usize> {
     let mut widest = BTreeMap::new();
     for group in groups {
-        for &at in group {
-            let entry = widest.entry(spans[at].bucket).or_insert(0);
-            *entry = (*entry).max(group.len());
+        let mut members = group.clone();
+        members.sort_by(|&a, &b| spans[a].first.cmp(spans[b].first));
+        let mut open: Vec<usize> = Vec::new();
+        for at in members {
+            let first = spans[at].first;
+            open.retain(|&member| spans[member].last >= first);
+            open.push(at);
+            probed_together(spans, &open, at, &mut widest);
         }
     }
     widest
+}
+
+/// Records in `widest`, per bucket, the files one key can reach among
+/// `open`, the members whose ranges cover `at`'s first key: every
+/// unbucketed member, the members of `at`'s own bucket under its
+/// bucketing, and under each other bucketing one bucket that can share a
+/// key with `at`'s. The count with each other bucketing's largest such
+/// bucket goes under the buckets of the unbucketed members and of `at`'s
+/// own, and each other bucket's count with it in place of its
+/// bucketing's largest goes under that bucket. Under at most one bucketing
+/// beside unbucketed files that is every candidate set a key reaching
+/// `at` can have; under two or more, the buckets taken from different
+/// bucketings are not checked against one another, so the count is an
+/// upper bound.
+fn probed_together(
+    spans: &[Span<'_>],
+    open: &[usize],
+    at: usize,
+    widest: &mut BTreeMap<u32, usize>,
+) {
+    let step = spans[at];
+    let mut together: Vec<u32> = Vec::new();
+    let mut others: BTreeMap<(Bucketing, u32), usize> = BTreeMap::new();
+    for &member in open {
+        let span = spans[member];
+        match span.bucketing {
+            None => together.push(span.bucket),
+            Some(_) if span.bucketing == step.bucketing => {
+                if span.bucket == step.bucket {
+                    together.push(span.bucket);
+                }
+            }
+            Some(bucketing) => {
+                if buckets_may_share_a_key(
+                    (step.bucketing, step.bucket),
+                    (span.bucketing, span.bucket),
+                ) {
+                    *others.entry((bucketing, span.bucket)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut largest: BTreeMap<Bucketing, usize> = BTreeMap::new();
+    for (&(bucketing, _), &files) in &others {
+        let entry = largest.entry(bucketing).or_insert(0);
+        *entry = (*entry).max(files);
+    }
+    let total = together.len() + largest.values().sum::<usize>();
+    let mut record = |bucket: u32, probed: usize| {
+        let entry = widest.entry(bucket).or_insert(0);
+        *entry = (*entry).max(probed);
+    };
+    for bucket in together {
+        record(bucket, total);
+    }
+    for (&(bucketing, bucket), &files) in &others {
+        record(bucket, total - largest[&bucketing] + files);
+    }
 }
 
 /// One file of an overlap group with the key chunks its merge decodes
@@ -2070,6 +2148,11 @@ mod tests {
     const EIGHT: u32 = 8;
     /// Keys per bucket file in the routing tests.
     const KEYS_PER_FILE: i64 = 16;
+    /// Keys spread over the bucketed files of the mixed-bucketing fixture.
+    const MIXED_BUCKETED_KEYS: i64 = 64;
+    /// The key index the mixed fixture's unbucketed file starts after: late
+    /// enough that every bucket's first key comes before it.
+    const MIXED_UNBUCKETED_FROM: i64 = 16;
     /// A false-positive rate far above the contract's: the writer folds the
     /// filter to its one-block minimum, so with `BLOOM_KEYS` keys the
     /// filter passes about a third of the absent keys in range and rules
@@ -2837,6 +2920,88 @@ mod tests {
         );
     }
 
+    /// An unbucketed file and one file per bucket of a bucketing, all
+    /// starting at one key and covering one range: a key reaches the
+    /// unbucketed file and its own bucket's, two files, whichever of them
+    /// the sweep reaches first.
+    #[test]
+    fn test_widest_per_bucket_mixed_unbucketed_and_bucketed_counts_one_bucket() {
+        let (first, last) = (Key::Long(0), Key::Long(KEYS_PER_FILE));
+        let unbucketed = Span {
+            bucketing: None,
+            bucket: UNBUCKETED,
+            first: &first,
+            last: &last,
+        };
+        let bucketed: Vec<Span<'_>> = (0..FOUR)
+            .map(|bucket| Span {
+                bucketing: Some(bucketing(FOUR)),
+                bucket,
+                first: &first,
+                last: &last,
+            })
+            .collect();
+        let unbucketed_first: Vec<Span<'_>> = std::iter::once(unbucketed)
+            .chain(bucketed.clone())
+            .collect();
+        let unbucketed_last: Vec<Span<'_>> = bucketed
+            .into_iter()
+            .chain(std::iter::once(unbucketed))
+            .collect();
+        let one_key_reaches = 2;
+        let expected: BTreeMap<u32, usize> =
+            (0..FOUR).map(|bucket| (bucket, one_key_reaches)).collect();
+        for spans in [unbucketed_first, unbucketed_last] {
+            let group: Vec<usize> = (0..spans.len()).collect();
+            assert_eq!(widest_per_bucket(&spans, &[group]), expected);
+        }
+    }
+
+    /// On a generation of an unbucketed file over the whole key space and
+    /// one bucketed file per bucket, every bucket starting at or before the
+    /// unbucketed file, the recorded files probed are the most candidates
+    /// any key has, not the group's size.
+    #[tokio::test]
+    async fn test_overlapping_buckets_mixed_unbucketed_and_bucketed_is_the_candidates() {
+        let mem = Mem::new();
+        let bucketed_keys = keys_from(0, MIXED_BUCKETED_KEYS);
+        let mut files = Vec::new();
+        for bucket in 0..FOUR {
+            let keys = keys_in_bucket(&bucketed_keys, bucketing(FOUR), bucket);
+            files.push(
+                mem.keyed(&format!("b{bucket}"), &keys, Some(bucketing(FOUR)), bucket)
+                    .await,
+            );
+        }
+        let unbucketed_keys = keys_from(1 + MIXED_UNBUCKETED_FROM * KEY_STEP, KEYS_PER_FILE);
+        assert!(
+            files
+                .iter()
+                .all(|file| *file.index.key_range().0 <= Key::Long(unbucketed_keys[0])),
+            "every bucket starts at or before the unbucketed file"
+        );
+        files.push(mem.keyed("u", &unbucketed_keys, None, UNBUCKETED).await);
+        let generation = assemble(files, layout(Some(bucketing(FOUR))))
+            .await
+            .unwrap();
+        let most = (0..=*bucketed_keys.last().unwrap())
+            .map(|key| generation.candidates(&Key::Long(key)).count())
+            .max()
+            .unwrap();
+        let one_key_reaches = 2;
+        assert_eq!(
+            most, one_key_reaches,
+            "a key reaches u and its own bucket's file"
+        );
+        assert_eq!(
+            generation.overlapping_buckets(),
+            &(0..FOUR)
+                .map(|bucket| (bucket, most))
+                .collect::<BTreeMap<_, _>>()
+        );
+        assert_eq!(generation.lookup_cost.files_probed, most);
+    }
+
     #[tokio::test]
     async fn test_assemble_verifies_only_groups_that_gained_a_file() {
         let mem = Mem::new();
@@ -2887,7 +3052,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(joined.overlap_groups_verified(), 1, "d bridges both groups");
-        assert_eq!(joined.overlapping_buckets(), &BTreeMap::from([(0, 4)]));
+        assert_eq!(
+            joined.overlapping_buckets(),
+            &BTreeMap::from([(0, 3)]),
+            "no key is in all four ranges: a lookup probes a, b, and d, or c and d"
+        );
+        assert_eq!(
+            joined.candidates(&Key::Long(first[0] + 2)).count(),
+            3,
+            "d's first key probes three files"
+        );
     }
 
     /// The GETs a load makes before any data file: the hint, the metadata,
@@ -3481,6 +3655,174 @@ mod tests {
             levels.insert(caps.level);
         }
         assert_eq!(levels.len(), 3, "the cases reach every level");
+    }
+
+    /// The spacing of one file's keys in `cost_fixture`: files interleave at
+    /// offsets below it, and a key at offset `COST_STRIDE - 1` is in no file.
+    const COST_STRIDE: i64 = 4;
+
+    /// A table whose files start at `offsets`, each holding `BLOOM_KEYS`
+    /// keys `COST_STRIDE` apart, in `layout`: bucketed one way, so files at
+    /// offsets below `COST_STRIDE` overlap, or unpartitioned; committed as
+    /// `FIRST_SNAPSHOT`.
+    async fn cost_fixture(offsets: &[i64], bucketed: bool, layout: WriterLayout) -> Table {
+        let (mut table, partition) = if bucketed {
+            (Table::bucketed(1), Partition::Bucket(0))
+        } else {
+            (Table::new(KeyType::Long, unpartitioned()), Partition::None)
+        };
+        for (at, offset) in offsets.iter().enumerate() {
+            let keys: Vec<i64> = (0..BLOOM_KEYS)
+                .map(|row| offset + row * COST_STRIDE)
+                .collect();
+            let typed = long_keys(&keys);
+            table
+                .add_file(FileSpec {
+                    name: &format!("f{at}"),
+                    keys: &typed,
+                    values: values_of(&keys),
+                    partition,
+                    bounds: Bounds::Exact,
+                    layout,
+                })
+                .await;
+        }
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        table
+    }
+
+    /// The GETs one lookup of `key` costs through a fresh cache, so cold.
+    async fn cold_gets(table: &Table, generation: &Generation, key: i64) -> (Value, u64) {
+        let cache = cache().await;
+        let before = table.gets();
+        let (value, _) = generation.lookup(&Key::Long(key), &cache).await.unwrap();
+        (value, table.gets() - before)
+    }
+
+    /// The keys of `keys` a lookup pays the worst case for: as many
+    /// candidates as `files_probed`, each of which would decode a key page,
+    /// its filter, under `bloom`, answering yes.
+    fn worst_case(generation: &Generation, keys: impl Iterator<Item = i64>) -> Vec<i64> {
+        keys.filter(|&key| {
+            let key = Key::Long(key);
+            let candidates: Vec<_> = generation.candidates(&key).collect();
+            candidates.len() == generation.lookup_cost.files_probed
+                && candidates
+                    .iter()
+                    .all(|file| file.index.page_of(&key).is_some())
+        })
+        .collect()
+    }
+
+    /// The cost prediction is what lookups pay. Per layout and residency:
+    /// no key has more candidates than `files_probed` and some key has
+    /// that many; a cold hit on a key the last of them holds, every filter
+    /// answering yes, costs `gets_per_hit` GETs; and a miss on a key every
+    /// candidate's filter passes costs `gets_per_miss`. The doctor's
+    /// summary reports the same cost.
+    #[tokio::test]
+    async fn test_lookup_cost_per_residency_is_what_a_cold_lookup_pays() {
+        let cost = |gets_per_hit, gets_per_miss, files_probed| LookupCost {
+            gets_per_hit,
+            gets_per_miss,
+            files_probed,
+        };
+        let after_the_first = BLOOM_KEYS * COST_STRIDE;
+        // Per case, the files' offsets, whether the table is bucketed, the
+        // dictionary columns, and the cost under full, disk, and bloom.
+        let cases = [
+            (
+                "contract",
+                vec![0],
+                true,
+                Dictionary::Off,
+                [cost(1, 0, 1), cost(1, 0, 1), cost(2, 1, 1)],
+            ),
+            (
+                "dictionary value",
+                vec![0],
+                true,
+                Dictionary::Value,
+                [cost(2, 0, 1), cost(2, 0, 1), cost(3, 1, 1)],
+            ),
+            (
+                "dictionary key",
+                vec![0],
+                true,
+                Dictionary::Key,
+                [cost(1, 0, 1), cost(1, 0, 1), cost(3, 2, 1)],
+            ),
+            (
+                "two overlapping",
+                vec![0, 1],
+                true,
+                Dictionary::Off,
+                [cost(1, 0, 2), cost(1, 0, 2), cost(3, 2, 2)],
+            ),
+            (
+                "three overlapping",
+                vec![0, 1, 2],
+                true,
+                Dictionary::Off,
+                [cost(1, 0, 3), cost(1, 0, 3), cost(4, 3, 3)],
+            ),
+            (
+                "unbucketed",
+                vec![0, after_the_first],
+                false,
+                Dictionary::Off,
+                [cost(1, 0, 1), cost(1, 0, 1), cost(2, 1, 1)],
+            ),
+        ];
+        for (name, offsets, bucketed, dictionary, expected) in cases {
+            let layout = WriterLayout {
+                dictionary,
+                bloom: Bloom::Fpp(LOOSE_FPP),
+                ..WriterLayout::contract()
+            };
+            let table = cost_fixture(&offsets, bucketed, layout).await;
+            let last = *offsets.last().unwrap();
+            let end = last + BLOOM_KEYS * COST_STRIDE;
+            let held_by_last: Vec<i64> = (0..BLOOM_KEYS)
+                .map(|row| last + row * COST_STRIDE)
+                .collect();
+            let absent = (0..end).filter(|key| key % COST_STRIDE == COST_STRIDE - 1);
+            for (residency, expected) in Residency::ALL.into_iter().zip(expected) {
+                let scratch = tempfile::tempdir().unwrap();
+                let local = local_dir(scratch.path(), table.storage.stats(), None);
+                let config = TableConfig {
+                    strict: false,
+                    ..table.config(residency, None)
+                };
+                let generation = table.load(&config, Some(&local), None).await.unwrap();
+                assert_eq!(generation.lookup_cost, expected, "{name} {residency}");
+                assert_eq!(
+                    check::diagnose(&generation, config.lookups())
+                        .summary
+                        .lookup_cost,
+                    expected,
+                    "{name} {residency}: the doctor reports the gauges' cost"
+                );
+                let most = (0..end)
+                    .map(|key| generation.candidates(&Key::Long(key)).count())
+                    .max();
+                assert_eq!(most, Some(expected.files_probed), "{name} {residency}");
+                let hits = worst_case(&generation, held_by_last.iter().copied());
+                let misses = worst_case(&generation, absent.clone());
+                assert!(
+                    !hits.is_empty() && !misses.is_empty(),
+                    "{name} {residency}: the fixture reaches the worst case"
+                );
+                let (value, gets) = cold_gets(&table, &generation, hits[0]).await;
+                assert_eq!(value, Value::Present(Bytes::from(value_for(hits[0]))));
+                assert_eq!(gets, expected.gets_per_hit, "{name} {residency}: a hit");
+                let (value, gets) = cold_gets(&table, &generation, misses[0]).await;
+                assert_eq!(value, Value::Absent);
+                assert_eq!(gets, expected.gets_per_miss, "{name} {residency}: a miss");
+            }
+        }
     }
 
     /// The manifest entry of a file filed under `bucket` of `bucketing`.

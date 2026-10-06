@@ -1853,7 +1853,7 @@ async fn test_reload_adds_and_removes_tables_on_request() -> TestResult {
 }
 
 /// Every gauge a serving table exports under its name.
-const TABLE_GAUGES: [&str; 9] = [
+const TABLE_GAUGES: [&str; 12] = [
     metric::TABLE_STATE,
     metric::INDEX_BYTES,
     metric::FINDINGS,
@@ -1863,6 +1863,9 @@ const TABLE_GAUGES: [&str; 9] = [
     metric::TABLE_BELOW_LEVEL,
     metric::TABLE_LEVEL,
     metric::TABLE_DECLARED_LEVEL,
+    metric::TABLE_GETS_PER_HIT,
+    metric::TABLE_GETS_PER_MISS,
+    metric::TABLE_FILES_PROBED_PER_LOOKUP,
 ];
 
 /// A changed file is found on the poll, with no request.

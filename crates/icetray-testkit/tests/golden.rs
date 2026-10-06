@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use iceberg::spec::{FormatVersion, TableMetadata};
 use icetray_core::{
-    Error, Finding, FindingCode, FindingLog, Generation, Key, Level, RefusalReason, Storage, Table,
-    TableReport, Value, diagnose, open,
+    Error, Finding, FindingCode, FindingLog, Generation, Key, Level, LookupCost, RefusalReason,
+    Storage, Table, TableReport, Value, diagnose, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, WIDE_REPEATS,
@@ -157,6 +157,24 @@ fn level(golden: &Golden) -> Level {
     golden.report().summary.level
 }
 
+/// The doctor's and the serving generation's lookup cost are `expected`,
+/// and the oracle prices a cold hit on each of `keys`, alone, at
+/// `expected.gets_per_hit`: every golden table is served in the Full
+/// tier, where a hit's GETs are the value pages the plan names.
+fn assert_lookup_cost(golden: &Golden, keys: &[Key], expected: LookupCost) -> Result<()> {
+    let generation = golden.current();
+    assert_eq!(golden.report().summary.lookup_cost, expected);
+    assert_eq!(generation.lookup_cost, expected);
+    for key in keys {
+        assert_eq!(
+            verify::expected_cold_gets(&generation, std::slice::from_ref(key))?,
+            expected.gets_per_hit,
+            "key {key}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_long_contract_serves_one_get_per_hit() -> Result<()> {
@@ -169,6 +187,12 @@ async fn test_golden_long_contract_serves_one_get_per_hit() -> Result<()> {
     );
     assert_eq!(report.summary.level, Level::Optimal);
     let keys: Vec<Key> = IDS_2M.iter().map(|&id| golden::long_key(id)).collect();
+    let contract = LookupCost {
+        gets_per_hit: 1,
+        gets_per_miss: 0,
+        files_probed: 1,
+    };
+    assert_lookup_cost(&golden, &keys, contract)?;
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
 
@@ -349,5 +373,25 @@ async fn test_golden_overlap_serves_and_reports_overlap_permissive() -> Result<(
         "{capping:?}"
     );
     assert_eq!(level(&golden), Level::Permissive);
+    // A lookup probes the files whose exact range covers its key, and the
+    // most of them any key reaches is reached at some file's first key; the
+    // skew-split tasks chain their ranges, so fewer than a bucket holds.
+    let deepest = generation
+        .files
+        .iter()
+        .map(|file| generation.candidates(file.index.key_range().0).count())
+        .max()
+        .expect("the table has files");
+    assert!(deepest > 1, "overlapping files share a key range");
+    assert!(deepest <= golden.report().summary.max_files_per_bucket);
+    assert_lookup_cost(
+        &golden,
+        &keys,
+        LookupCost {
+            gets_per_hit: 1,
+            gets_per_miss: 0,
+            files_probed: deepest,
+        },
+    )?;
     Ok(())
 }
