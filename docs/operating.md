@@ -145,8 +145,8 @@ Gauges, written at each scrape:
 | `icetray_requests_in_flight` | | `Get` and `MultiGet` calls admitted and not yet ended. |
 | `icetray_max_in_flight` | | `server.max_in_flight`. A call that finds every slot held is `RESOURCE_EXHAUSTED`. |
 | `icetray_table_state` | `table`, `state` | 1 for the table's current state, 0 for the others. |
-| `icetray_table_below_level` | `table` | 1 while the newest snapshot the table measured, the one serving or, while the table is held, the one it refused, is below the table's `lookups` level, else 0. |
-| `icetray_table_level` | `table` | The [level](configuration.md#choosing-a-level) that snapshot's layout achieves: 0 for `optimal`, 1 for `balanced`, 2 for `permissive`. |
+| `icetray_table_below_level` | `table` | 1 while the table is below its `lookups` level, else 0: for its layout, judged on the newest snapshot it measured, the one serving or, while the table is held, the one it refused; or for the page cache, judged on the serving generation's chunk files. |
+| `icetray_table_level` | `table` | The [level](configuration.md#choosing-a-level) the table achieves: that snapshot's layout's level, raised to `balanced` while a `disk` table's chunk files are short of the page cache; 0 for `optimal`, 1 for `balanced`, 2 for `permissive`. |
 | `icetray_table_declared_level` | `table` | The table's `lookups`, in the same numbers. |
 | `icetray_table_chunk_resident_fraction` | `table` | The fraction of a `disk` table's chunk-file pages, in its serving generation, that the kernel's page cache held at the last sample. The table falls short below 0.95 and recovers above 0.99. Absent while the residency cannot be observed. |
 | `icetray_table_gets_per_hit` | `table` | GETs one cold hit makes at worst on the serving generation's layout and residency: the value page, a dictionary-encoded value column's dictionary page, and under `bloom` the key page of every file probed, with a dictionary-encoded key column's dictionary page. Counted before hedges, unlike `icetray_object_gets_total`. Observed traffic is in `icetray_lookups_total`, where warm hits read below the prediction. |
@@ -172,6 +172,18 @@ generation gauges. A snapshot refused as `below_level` was measured, so
 they take its level; a snapshot refused for any other reason leaves them
 as they were. A reload that changes `lookups` sets
 `icetray_table_declared_level` at once.
+
+The server samples which pages of every `disk` table's chunk files the
+kernel's page cache holds as soon as the tables serve, then every 15
+seconds. A sample maps each chunk file without reading it, for as long
+as one `mincore` call takes. The page cache is a condition of the server,
+not of the snapshot, so `strict` never refuses or holds a snapshot for it.
+When a chunk file's residency cannot be observed, the page cache caps no
+level, `icetray_table_chunk_resident_fraction` is absent, and the server
+logs a warning, and another when it can be observed again. On Linux, a
+chunk file the server's user neither owns nor may write is not sampled
+unless the server runs as root: Linux would report every page of it
+resident, which would hide a shortfall.
 
 The label values:
 
@@ -678,12 +690,18 @@ node's ([File descriptors](#file-descriptors)).
 Each of the first three conditions is one series compared with a
 constant, so each reaches its owner without a join.
 
-- `icetray_table_below_level == 1`: the newest snapshot of a table costs
-  more per lookup than its `lookups` accepts. This is the table owner's
-  alert: a writer changed the layout, or a compaction is overdue. It reads
-  the same with `strict` on or off, since it measures the newest snapshot
-  whether it serves or was refused. `icetray_table_level` and the table's
-  findings say what put it there.
+- `icetray_table_below_level == 1`: a table costs more per lookup than
+  its `lookups` accepts. Usually its newest snapshot's layout put it
+  there: a writer changed the layout, or a compaction is overdue, and
+  this is the table owner's alert. It reads the same with `strict` on or
+  off, since it measures the newest snapshot whether it serves or was
+  refused. `icetray_table_level` and the table's findings say what put it
+  there. When the findings cap nothing, the cause is the server instead:
+  a `disk` table's chunk files do not fit the page cache beside
+  everything else under the memory limit ([Memory](#memory)). Such a
+  table fell below when `icetray_table_chunk_resident_fraction` dropped
+  under 0.95, and stays below until the fraction rises above 0.99, so a
+  fraction between the two can read either way.
 - `icetray_table_state{state="degraded"} == 1` for longer than a few
   polls: a table's refreshes are failing, or its ref names a snapshot it
   refused for a reason other than its level, and it serves an old

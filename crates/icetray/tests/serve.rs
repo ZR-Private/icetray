@@ -70,6 +70,14 @@ const FRESH_TABLE: &str = "kv_fresh";
 /// A table no other test serves, so its gauges are this test's alone.
 const SCRAPED_TABLE: &str = "kv_scraped";
 
+/// A disk table no other test serves, so its page-cache gauges are this
+/// test's alone.
+const SAMPLED_TABLE: &str = "kv_sampled";
+
+/// How long the page-cache test waits for the first sample: the start's
+/// sample runs as the tables serve, so this is room for a loaded machine.
+const FIRST_SAMPLE_WAIT: Duration = Duration::from_secs(10);
+
 /// A table served with deletes beside `TABLE`.
 const DELETED_TABLE: &str = "kv_deleted";
 
@@ -1077,6 +1085,42 @@ async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult
     Ok(())
 }
 
+/// The daemon samples a disk table's chunk files as soon as the tables
+/// serve, with no call or scrape asking: the resident fraction is exposed
+/// without waiting out `PAGE_CACHE_SAMPLE_INTERVAL`, and a table that has
+/// just written its chunk files has them whole in the page cache, at its
+/// layout's level.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_page_cache_is_sampled_as_the_tables_serve() -> TestResult {
+    let mut stack = Stack::start_with(
+        vec![FixtureSpec::small(SAMPLED_TABLE, KeyType::Long)],
+        async |setup| setup.with_local_dir(),
+    )
+    .await?;
+    stack.serving.ready().await;
+    let labels = [(metric::LABEL_TABLE, SAMPLED_TABLE)];
+    let fraction = poll_until(
+        FIRST_SAMPLE_WAIT,
+        "the first page cache sample",
+        async || {
+            let exposition = stack.scrape().await?;
+            Ok(series_value(
+                &exposition,
+                metric::TABLE_CHUNK_RESIDENT_FRACTION,
+                &labels,
+            ))
+        },
+    )
+    .await?;
+    assert_eq!(fraction.to_bits(), 1.0_f64.to_bits());
+    let exposition = stack.scrape().await?;
+    assert_eq!(
+        series_value(&exposition, metric::TABLE_BELOW_LEVEL, &labels).map(f64::to_bits),
+        Some(0.0_f64.to_bits())
+    );
+    Ok(())
+}
+
 /// One sample line's series: its metric name and its label text.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Series<'a> {
@@ -1376,6 +1420,9 @@ async fn test_periodic_task_panic_ends_the_run_naming_the_task() -> TestResult {
     match task {
         PeriodicTask::Refresh { table } => assert_eq!(table, TABLE),
         PeriodicTask::Upkeep => {}
+        PeriodicTask::PageCacheSample => {
+            panic!("the page cache sample runs on its own interval, not the poll interval")
+        }
     }
     Ok(())
 }

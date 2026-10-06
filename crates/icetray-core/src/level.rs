@@ -3,6 +3,7 @@
 //! a level means the same on every table.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,11 @@ pub const FALL_PER_MILLE: u64 = 950;
 /// page cache recovers its layout's level: 990, above `FALL_PER_MILLE` so
 /// that a residency hovering at the fall does not flap the level.
 pub const RECOVER_PER_MILLE: u64 = 990;
+
+/// How often the daemon samples every `disk` table's chunk files: 15
+/// seconds, about one Prometheus scrape interval, so a scrape reads a
+/// sample at most one interval old.
+pub const PAGE_CACHE_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Thousandths in the whole: what `FALL_PER_MILLE` and `RECOVER_PER_MILLE`
 /// count resident pages against.

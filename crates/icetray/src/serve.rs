@@ -1,7 +1,8 @@
 //! The daemon (RFD 012, RFD 005): both listeners bound and the health
 //! service registered before any table loads, every table loaded
 //! concurrently, readiness and `SERVING` once every table serves, one
-//! refresh task per table and the recorder's upkeep on the poll interval, the
+//! refresh task per table and the recorder's upkeep on the poll interval, a
+//! sample of the page cache's hold on the chunk files on its own interval, the
 //! configuration followed when the run was given one to follow (RFD 018),
 //! and a drain on shutdown that ends health watches, waits up to the drain
 //! deadline for in-flight calls, and flushes the page cache's disk level.
@@ -19,7 +20,9 @@ use std::time::Duration;
 use futures::future::join_all;
 use icetray_core::config::{Config, ServerConfig};
 use icetray_core::open::open_with;
-use icetray_core::{ErrorKind, FindingLog, Opened, Storage, Table, open};
+use icetray_core::{
+    ErrorKind, FindingLog, Opened, PAGE_CACHE_SAMPLE_INTERVAL, Storage, Table, open,
+};
 use icetray_proto::v1::icetray_server::{IcetrayServer, SERVICE_NAME};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
@@ -312,8 +315,8 @@ async fn stop(mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
-/// A task the run keeps on the poll interval, named so the failure that
-/// ends one says which. Display gives the name the log and `ServeError`
+/// A task the run keeps on an interval, named so the failure that ends one
+/// says which. Display gives the name the log and `ServeError`
 /// carry.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PeriodicTask {
@@ -324,6 +327,9 @@ pub enum PeriodicTask {
     },
     /// The recorder's upkeep, which drains its histogram samples.
     Upkeep,
+    /// The sample of which chunk-file pages the page cache holds, for
+    /// every `disk` table's level (RFD 020).
+    PageCacheSample,
 }
 
 impl fmt::Display for PeriodicTask {
@@ -331,6 +337,7 @@ impl fmt::Display for PeriodicTask {
         match self {
             Self::Refresh { table } => write!(f, "refresh of table {table}"),
             Self::Upkeep => f.write_str("recorder upkeep"),
+            Self::PageCacheSample => f.write_str("page cache sample"),
         }
     }
 }
@@ -520,6 +527,10 @@ impl Run {
         periodic.spawn(
             PeriodicTask::Upkeep,
             upkeep_loop(self.handle.clone(), self.poll_interval),
+        );
+        periodic.spawn(
+            PeriodicTask::PageCacheSample,
+            page_cache_loop(Arc::clone(&self.opened)),
         );
 
         // Biased, the ended task first: when a task has ended and a
@@ -760,6 +771,19 @@ async fn upkeep_loop(handle: PrometheusHandle, poll_interval: Duration) -> Infal
     loop {
         ticker.tick().await;
         handle.run_upkeep();
+    }
+}
+
+/// Samples the page cache's hold on every served table's chunk files at
+/// once, then every `PAGE_CACHE_SAMPLE_INTERVAL` (RFD 020), so a `disk`
+/// table's level reflects its chunk files from the first scrape after the
+/// tables serve. A sample of the tables a reload swapped in follows from
+/// the next tick, since each reads the set served then.
+async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
+    let mut ticker = ticker(PAGE_CACHE_SAMPLE_INTERVAL);
+    loop {
+        opened.sample_page_cache().await;
+        ticker.tick().await;
     }
 }
 

@@ -20,6 +20,11 @@
 > footers, and each new file's edge keys before any key chunk is built.
 > See RFD 020 (Lookup levels).
 
+> Updated 2026-10-06: chunk files are still read only by positioned reads;
+> they are mapped only `PROT_NONE`, for one `mincore` call, to ask the
+> kernel which of their pages it holds (RFD 020), and no byte is read
+> through a mapping.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything

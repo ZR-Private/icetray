@@ -1,5 +1,10 @@
 # Lookup levels
 
+> Updated 2026-10-06: the page-cache condition is not judged when a chunk
+> file's residency cannot be observed, which happens at run time on every
+> platform icetray builds for, rather than on a platform that cannot
+> sample.
+
 ## Problem
 
 RFD 007 (Serving tiers) sorts what the doctor finds into refusals,
@@ -122,8 +127,8 @@ server condition a level depends on today:
 - While a `disk` table serves, icetray samples which of its chunk-file
   pages are resident. The table falls below `optimal` when the resident
   fraction drops below a fixed threshold and recovers when it rises above
-  a higher one, so the flag does not flap. The sample decides; on a
-  platform that cannot sample, this condition is not judged and the table
+  a higher one, so the flag does not flap. The sample decides; when
+  residency cannot be observed, this condition is not judged and the table
   reads the level of its layout.
 - At load, icetray compares what every `disk` table's chunk files and the
   page cache's disk level need with the room under the memory limit (the
