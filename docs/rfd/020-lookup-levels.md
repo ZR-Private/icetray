@@ -98,9 +98,14 @@ start. A refresh to such a snapshot is refused, the last snapshot that met
 the level keeps serving, and the table is `held`. The refusal is
 deterministic for its snapshot and is remembered as RFD 005 (Generations
 and refresh) describes, until the source moves or a reload changes the
-table's entry. The level is judged from the snapshot's manifests and
-footers before any key chunk is built, so a refused snapshot writes
-nothing to the local directory.
+table's entry. For a strict table the level is judged before any key
+chunk is built, from the snapshot's manifests and footers and, for each
+new file that shares a bucket with another, the first and last key of
+the file, which decide overlap and cost at most two key-page reads. A
+refused snapshot writes nothing to the local directory. Because the level
+is judged first, `serve` names `below_level` for a snapshot that would
+also fail a later check, such as sorting; the doctor, which loads the
+whole snapshot, names the other reason. Both refuse it.
 
 ### What `strict` acts on
 
