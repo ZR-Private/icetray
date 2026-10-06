@@ -400,7 +400,7 @@ mod tests {
     use icetray_core::KeyType;
 
     use super::*;
-    use crate::delete_files::{PositionDeletes, write_position_deletes};
+    use crate::delete_files::{PositionDeletes, java, write_position_deletes};
     use crate::fixture::{
         DeleteForm, Fixture, FixtureSpec, HandSnapshot, IDS_2K, NAMESPACE, TWO_BUCKETS,
         UNPARTITIONED_FILE_BYTES,
@@ -710,6 +710,18 @@ mod tests {
             "a row of another partition's file stays live"
         );
         assert_eq!(oracle.deleted_rows(), 1);
+    }
+
+    #[test]
+    fn test_decode_vector_reads_the_positions_java_iceberg_wrote() {
+        for java in java::vectors() {
+            assert_eq!(
+                decode_vector(java.blob).as_ref(),
+                Some(&java.positions),
+                "{}",
+                java.name
+            );
+        }
     }
 
     /// `crc32fast` computes the CRC-32 the Iceberg spec fixes for a

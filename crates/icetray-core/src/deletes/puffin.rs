@@ -448,6 +448,7 @@ mod tests {
     use super::*;
     use crate::config::StorageConfig;
     use crate::deletes::delete_fault_of;
+    use crate::error::{Recurrence, Recurs};
     use crate::generation::testing::{TABLE, refusal_of};
 
     /// Rows across two blocks and two segments.
@@ -500,6 +501,129 @@ mod tests {
     fn test_decode_checksum_is_crc32_iso_hdlc() {
         let iso_hdlc_check_value = 0xCBF4_3926;
         assert_eq!(crc32fast::hash(b"123456789"), iso_hdlc_check_value);
+    }
+
+    /// The position Java Iceberg's `TestBitmapPositionDeleteIndex` names by
+    /// `position(bitmap, container, value)`: `value` in the container of
+    /// that index within the 32-bit bitmap of that index.
+    fn java_position(bitmap: u32, container: u16, value: u16) -> u64 {
+        (u64::from(bitmap) << u32::BITS) | (u64::from(container) << u16::BITS) | u64::from(value)
+    }
+
+    /// Each deletion vector blob Java Iceberg's `BitmapPositionDeleteIndex`
+    /// serialized (`testdata/iceberg/README.md`), and the positions its test
+    /// deleted before serializing it, ascending. A two-position
+    /// `delete(start, end)` in Java deletes `start..end`.
+    fn java_vectors() -> [(&'static str, &'static [u8], Vec<u64>); 4] {
+        let integer_max = u64::try_from(i32::MAX).unwrap();
+        let ranges = [
+            java_position(0, 0, 5)..java_position(0, 0, 5) + 1,
+            java_position(0, 0, 7)..java_position(0, 0, 7) + 1,
+            java_position(0, 1, 1)..java_position(0, 1, 1000),
+            java_position(0, 2, 1)..java_position(0, 2, u16::MAX),
+            java_position(1, 0, 10)..java_position(1, 0, 10) + 1,
+            java_position(1, 0, 20)..java_position(1, 0, 20) + 1,
+            java_position(1, 1, 10)..java_position(1, 1, 500),
+            java_position(1, 2, 1)..java_position(1, 2, u16::MAX),
+        ];
+        [
+            (
+                "empty",
+                include_bytes!("../../testdata/iceberg/empty-position-index.bin"),
+                Vec::new(),
+            ),
+            (
+                "small alternating values",
+                include_bytes!(
+                    "../../testdata/iceberg/small-alternating-values-position-index.bin"
+                ),
+                vec![1, 3, 5, 7, 9],
+            ),
+            (
+                "small and large values",
+                include_bytes!("../../testdata/iceberg/small-and-large-values-position-index.bin"),
+                vec![100, 101, integer_max + 100, integer_max + 101],
+            ),
+            (
+                "all container types",
+                include_bytes!("../../testdata/iceberg/all-container-types-position-index.bin"),
+                ranges.into_iter().flatten().collect(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_decode_reads_the_positions_java_iceberg_wrote() {
+        for (name, blob, positions) in java_vectors() {
+            let decoded: Vec<u64> = decode(blob).unwrap().iter().collect();
+            assert_eq!(decoded, positions, "{name}");
+        }
+    }
+
+    /// The CRC-32 Java Iceberg stored after each vector is `crc32fast`'s over
+    /// the magic and the vector, the bytes between the length and the CRC.
+    #[test]
+    fn test_decode_checksum_matches_the_crc_java_iceberg_stored() {
+        for (name, blob, _) in java_vectors() {
+            let (_, rest) = blob.split_first_chunk::<VECTOR_FRAME_BYTES>().unwrap();
+            let (body, stored) = rest.split_last_chunk::<VECTOR_FRAME_BYTES>().unwrap();
+            assert!(body.starts_with(&VECTOR_MAGIC), "{name}");
+            assert_eq!(u32::from_be_bytes(*stored), crc32fast::hash(body), "{name}");
+        }
+    }
+
+    /// `bitmap`, a bare portable 64-bit roaring bitmap, framed as a
+    /// deletion vector blob.
+    fn framed_bitmap(bitmap: &[u8]) -> Vec<u8> {
+        frame(&[VECTOR_MAGIC.as_slice(), bitmap].concat())
+    }
+
+    /// The roaring format spec's examples that Iceberg's
+    /// `TestRoaringPositionBitmap` accepts. The spec's testdata README does
+    /// not describe these files, so the expected positions are read from
+    /// each file's layout: no bitmaps; one bitmap of key 0 holding 0
+    /// through 9; ten bitmaps of keys 0 through 9, each holding 0 through 9.
+    #[test]
+    fn test_decode_reads_the_64_bit_examples_iceberg_accepts() {
+        let values_per_bitmap = 10;
+        let spread_bitmaps = 10;
+        let low: Vec<u64> = (0..values_per_bitmap).collect();
+        let spread: Vec<u64> = (0..spread_bitmaps)
+            .flat_map(|key| (0..values_per_bitmap).map(move |low| (key << u32::BITS) | low))
+            .collect();
+        let examples: [(&str, &[u8], Vec<u64>); 3] = [
+            (
+                "64mapempty",
+                include_bytes!("../../testdata/iceberg/64mapempty.bin"),
+                Vec::new(),
+            ),
+            (
+                "64map32bitvals",
+                include_bytes!("../../testdata/iceberg/64map32bitvals.bin"),
+                low,
+            ),
+            (
+                "64mapspreadvals",
+                include_bytes!("../../testdata/iceberg/64mapspreadvals.bin"),
+                spread,
+            ),
+        ];
+        for (name, bitmap, positions) in examples {
+            let decoded: Vec<u64> = decode(&framed_bitmap(bitmap)).unwrap().iter().collect();
+            assert_eq!(decoded, positions, "{name}");
+        }
+    }
+
+    /// The example Iceberg rejects for a key above `Integer.MAX_VALUE` holds,
+    /// as Iceberg's copy has it, U+FFFD's UTF-8 bytes wherever a byte at or
+    /// above 0x80 belongs, so its first key is 0xEFBDBFEF and the bytes after
+    /// it are no 32-bit bitmap: it is malformed, deterministically.
+    #[test]
+    fn test_decode_refuses_the_high_keys_example_iceberg_rejects_as_malformed() {
+        let bitmap = include_bytes!("../../testdata/iceberg/64maphighvals.bin");
+        let fault = decode(&framed_bitmap(bitmap)).unwrap_err();
+        assert_eq!(fault, DeleteFault::VectorMalformed);
+        assert_eq!(fault.recurrence(), Recurrence::Deterministic);
     }
 
     #[test]

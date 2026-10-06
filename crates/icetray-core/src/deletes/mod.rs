@@ -1704,6 +1704,30 @@ mod tests {
         );
     }
 
+    /// A well-formed vector whose key exceeds `Integer.MAX_VALUE`, which Java
+    /// Iceberg refuses to deserialize, names a position above `i64::MAX`, past
+    /// any data file's record count, which is an `i64`: the load refuses it
+    /// as past the end, deterministically.
+    #[tokio::test]
+    async fn test_load_refuses_a_vector_position_above_icebergs_maximum_as_past_the_end() {
+        let files = Files::new();
+        let data = [files.data("a", 1)];
+        let above_iceberg = u64::try_from(i64::MAX).unwrap() + 1;
+        for position in [above_iceberg, u64::MAX] {
+            let vector = files.vectors("high.puffin", &[("a", &[position])], 2).await;
+            let fault = delete_fault_of(files.load(&data, &vector, Previous::default()).await).1;
+            assert_eq!(
+                fault,
+                DeleteFault::PositionPastEnd {
+                    data_file: files.location("a"),
+                    position,
+                    records: RECORDS,
+                }
+            );
+            assert_eq!(fault.recurrence(), Recurrence::Deterministic);
+        }
+    }
+
     #[tokio::test]
     async fn test_load_refuses_a_puffin_file_whose_entries_disagree_on_its_size() {
         let files = Files::new();

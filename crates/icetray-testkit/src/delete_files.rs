@@ -288,12 +288,114 @@ fn built(path: &str, builder: &DataFileBuilder) -> Result<DataFile> {
     })
 }
 
+/// The deletion vector blobs Java Iceberg's `BitmapPositionDeleteIndex`
+/// serialized, as `icetray-core/testdata/iceberg/README.md` describes them,
+/// for the tests of this crate's encoder and of the oracle's decoder. They
+/// are read from icetray-core's copy, so each file has one checked-in copy
+/// and one recorded SHA-256.
+#[cfg(test)]
+pub(crate) mod java {
+    use roaring::RoaringTreemap;
+
+    /// One blob Java wrote, and the positions its test deleted before
+    /// serializing it.
+    pub(crate) struct JavaVector {
+        /// The blob's name in Java's test.
+        pub(crate) name: &'static str,
+        /// The blob's bytes.
+        pub(crate) blob: &'static [u8],
+        /// The positions, ascending.
+        pub(crate) positions: RoaringTreemap,
+    }
+
+    /// The position Java's `TestBitmapPositionDeleteIndex` names by
+    /// `position(bitmap, container, value)`: `value` in the container of
+    /// that index within the 32-bit bitmap of that index.
+    fn java_position(bitmap: u32, container: u16, value: u16) -> u64 {
+        (u64::from(bitmap) << u32::BITS) | (u64::from(container) << u16::BITS) | u64::from(value)
+    }
+
+    /// Every blob Java wrote. A two-position `delete(start, end)` in Java
+    /// deletes `start..end`.
+    pub(crate) fn vectors() -> [JavaVector; 4] {
+        let integer_max = u64::try_from(i32::MAX).unwrap();
+        let ranges = [
+            java_position(0, 0, 5)..java_position(0, 0, 5) + 1,
+            java_position(0, 0, 7)..java_position(0, 0, 7) + 1,
+            java_position(0, 1, 1)..java_position(0, 1, 1000),
+            java_position(0, 2, 1)..java_position(0, 2, u16::MAX),
+            java_position(1, 0, 10)..java_position(1, 0, 10) + 1,
+            java_position(1, 0, 20)..java_position(1, 0, 20) + 1,
+            java_position(1, 1, 10)..java_position(1, 1, 500),
+            java_position(1, 2, 1)..java_position(1, 2, u16::MAX),
+        ];
+        [
+            JavaVector {
+                name: "empty",
+                blob: include_bytes!(
+                    "../../icetray-core/testdata/iceberg/empty-position-index.bin"
+                ),
+                positions: RoaringTreemap::new(),
+            },
+            JavaVector {
+                name: "small alternating values",
+                blob: include_bytes!(
+                    "../../icetray-core/testdata/iceberg/small-alternating-values-position-index.bin"
+                ),
+                positions: [1, 3, 5, 7, 9].into_iter().collect(),
+            },
+            JavaVector {
+                name: "small and large values",
+                blob: include_bytes!(
+                    "../../icetray-core/testdata/iceberg/small-and-large-values-position-index.bin"
+                ),
+                positions: [100, 101, integer_max + 100, integer_max + 101]
+                    .into_iter()
+                    .collect(),
+            },
+            JavaVector {
+                name: "all container types",
+                blob: include_bytes!(
+                    "../../icetray-core/testdata/iceberg/all-container-types-position-index.bin"
+                ),
+                positions: ranges.into_iter().flatten().collect(),
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use iceberg::puffin::PuffinReader;
 
     use super::*;
     use crate::merge_oracle::{decode_vector, read_positions};
+
+    /// Java's `BitmapPositionDeleteIndex` run-length encodes before it
+    /// serializes, so a vector optimized the same way encodes to Java's
+    /// bytes. One collected from positions holds only array and bitset
+    /// containers, so where Java chose runs its bytes differ while it
+    /// decodes to the same positions.
+    #[test]
+    fn test_encode_vector_writes_the_bytes_java_iceberg_wrote_once_optimized() {
+        for java in java::vectors() {
+            let mut optimized = java.positions.clone();
+            optimized.optimize();
+            assert_eq!(
+                encode_vector(&optimized).unwrap(),
+                java.blob,
+                "{}",
+                java.name
+            );
+            let collected = encode_vector(&java.positions).unwrap();
+            assert_eq!(
+                decode_vector(&collected).as_ref(),
+                Some(&java.positions),
+                "{}",
+                java.name
+            );
+        }
+    }
 
     /// Positions spanning two 65,536-row blocks and a second 2^32 segment.
     fn positions() -> RoaringTreemap {
