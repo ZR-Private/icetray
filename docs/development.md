@@ -110,6 +110,38 @@ dev/residency-sweep.sh
 Arguments after the script's name go to the sweep, as
 `--resident-per-mille 1000,950,900` narrows it.
 
+## Merge-on-read measurements
+
+An example program that makes the measurements
+[RFD 021](rfd/021-merge-on-read.md) calls for before release, in process
+and over local tables it writes and removes:
+
+```sh
+dev/merge-on-read-bench.sh
+```
+
+- `probe` times hits and misses at 1, 2, 4, 8, and 16 files per bucket in
+  every tier, over three tables: `control`, whose newer files hold other
+  keys of the same range and nothing is deleted; `updated`, whose every
+  commit rewrites the keys and deletes the older copies; and `shadowed`,
+  whose newer files hold deleted copies of the keys, so a hit passes a
+  deleted row in every newer file before the live one. It then times a
+  key-page decode and a deleted-row check apart and prints their ratio
+  beside the RFD's threshold of a tenth.
+- `memory` compares the delete state's bytes with the bound the budget
+  counts, at deleted fractions from 0.1% to 50%, for each delete form,
+  with the deleted rows in one run or scattered.
+- `load` times a first load with up to 1,000 live delete files and a
+  refresh onto one more, with their GETs.
+
+It runs anywhere and finishes in minutes on four cores at its defaults;
+numbers for `docs/performance.md` come from the Linux host. The tables go
+under `ICETRAY_MOR_WORK` (default `target/merge-on-read/work`) and the
+results under `target/merge-on-read`. Arguments after the script's name go
+to the program, as `--measure probe --depths 1,16` narrows it;
+`cargo run -p icetray-testkit --example deletes --release -- --help` lists
+them.
+
 ## Releases
 
 A release is a tag. Set `version` under `[workspace.package]` in

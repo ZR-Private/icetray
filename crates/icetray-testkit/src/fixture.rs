@@ -1063,7 +1063,7 @@ impl Fixture {
         name: &str,
     ) -> Result<Vec<DataFile>> {
         let oracle = MergeOracle::read(self).await?;
-        let mut by_file: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut by_file: BTreeMap<String, RoaringTreemap> = BTreeMap::new();
         for &id in ids {
             let copy = oracle
                 .live_copy(&self.key(id))
@@ -1071,80 +1071,72 @@ impl Fixture {
             by_file
                 .entry(copy.path.clone())
                 .or_default()
-                .push(copy.position);
+                .insert(copy.position);
         }
         let mut deletes = self.deletes.clone();
-        let file_io = self.table.file_io();
-        match form {
-            DeleteForm::Vectors => {
-                let mut vectors = Vec::new();
-                for (path, positions) in by_file {
-                    let mut rows: RoaringTreemap =
-                        oracle.deleted_positions(&path).into_iter().collect();
-                    rows.extend(positions);
-                    deletes.retain(|delete| {
-                        delete.file_format() != DataFileFormat::Puffin
-                            || delete.referenced_data_file().as_deref() != Some(path.as_str())
-                    });
-                    vectors.push(Vector {
-                        partition: self.partition_of(&path)?,
-                        spec_id: self.metadata.default_partition_spec_id(),
-                        data_file: path,
-                        positions: rows,
-                    });
-                }
-                let path = self.delete_path(&format!("{name}.puffin"));
-                deletes.extend(write_vectors(file_io, &path, &vectors).await?);
-            }
-            DeleteForm::ScopedPositions | DeleteForm::Positions => {
-                let scoped = form == DeleteForm::ScopedPositions;
-                for (at, group) in self.position_groups(by_file, scoped)?.iter().enumerate() {
-                    let delete_path = self.delete_path(&format!("{name}-{at}.parquet"));
-                    deletes.push(write_position_deletes(file_io, &delete_path, group).await?);
-                }
+        if form == DeleteForm::Vectors {
+            for (path, rows) in &mut by_file {
+                rows.extend(oracle.deleted_positions(path));
+                deletes.retain(|delete| {
+                    delete.file_format() != DataFileFormat::Puffin
+                        || delete.referenced_data_file().as_deref() != Some(path.as_str())
+                });
             }
         }
+        let targets = by_file
+            .into_iter()
+            .map(|(path, rows)| Ok((self.listed(&path)?.clone(), rows)))
+            .collect::<Result<Vec<_>>>()?;
+        deletes.extend(self.write_deletes(targets, form, name).await?);
         Ok(deletes)
     }
 
-    /// The position delete files that delete `by_file`'s positions: one per
-    /// data file naming it as its referenced data file when `scoped`, else
-    /// one per partition naming none.
-    fn position_groups(
+    /// Writes delete files in `form`, named after `name`, deleting the
+    /// positions paired with each data file of `targets`, and returns their
+    /// manifest entries uncommitted, for a `HandSnapshot` that may list the
+    /// data files too. `Vectors` writes one Puffin file of one vector per
+    /// data file, which must hold every row that file's deletes remove, as
+    /// it replaces any earlier vector of the file; the position forms write
+    /// the files `DeleteForm` names.
+    pub async fn write_deletes(
         &self,
-        by_file: BTreeMap<String, Vec<u64>>,
-        scoped: bool,
-    ) -> Result<Vec<PositionDeletes>> {
-        let mut groups: Vec<PositionDeletes> = Vec::new();
-        for (path, positions) in by_file {
-            let partition = self.partition_of(&path)?;
-            let referenced = scoped.then(|| path.clone());
-            let rows = positions
-                .into_iter()
-                .map(|position| (path.clone(), position));
-            match groups
-                .iter_mut()
-                .find(|group| group.referenced == referenced && group.partition == partition)
-            {
-                Some(group) => group.rows.extend(rows),
-                None => groups.push(PositionDeletes {
-                    rows: rows.collect(),
-                    referenced,
-                    spec_id: self.metadata.default_partition_spec_id(),
-                    partition,
-                }),
+        targets: Vec<(DataFile, RoaringTreemap)>,
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<Vec<DataFile>> {
+        let spec_id = self.metadata.default_partition_spec_id();
+        let file_io = self.table.file_io();
+        let scoped = match form {
+            DeleteForm::Vectors => {
+                let vectors: Vec<Vector> = targets
+                    .into_iter()
+                    .map(|(file, positions)| Vector {
+                        data_file: file.file_path().to_string(),
+                        positions,
+                        spec_id,
+                        partition: file.partition().clone(),
+                    })
+                    .collect();
+                let path = self.delete_path(&format!("{name}.puffin"));
+                return write_vectors(file_io, &path, &vectors).await;
             }
+            DeleteForm::ScopedPositions => true,
+            DeleteForm::Positions => false,
+        };
+        let mut entries = Vec::new();
+        for (at, group) in position_groups(targets, scoped, spec_id).iter().enumerate() {
+            let delete_path = self.delete_path(&format!("{name}-{at}.parquet"));
+            entries.push(write_position_deletes(file_io, &delete_path, group).await?);
         }
-        Ok(groups)
+        Ok(entries)
     }
 
-    /// The partition tuple the current snapshot records for the data file
-    /// at `path`; a file it does not list is `SpecFault::FileNotListed`.
-    pub(crate) fn partition_of(&self, path: &str) -> Result<Struct> {
+    /// The data file at `path` as the current snapshot lists it; a file it
+    /// does not list is `SpecFault::FileNotListed`.
+    fn listed(&self, path: &str) -> Result<&DataFile> {
         self.files
             .iter()
             .find(|file| file.file_path() == path)
-            .map(|file| file.partition().clone())
             .ok_or_else(|| {
                 SpecFault::FileNotListed {
                     path: path.to_string(),
@@ -1206,6 +1198,35 @@ impl Fixture {
             .await?;
         Ok(())
     }
+}
+
+/// The position delete files that delete `targets`' positions under spec
+/// `spec_id`: one per data file naming it as its referenced data file when
+/// `scoped`, else one per partition naming none.
+fn position_groups(
+    targets: Vec<(DataFile, RoaringTreemap)>,
+    scoped: bool,
+    spec_id: i32,
+) -> Vec<PositionDeletes> {
+    let mut groups: Vec<PositionDeletes> = Vec::new();
+    for (file, positions) in targets {
+        let path = file.file_path().to_string();
+        let referenced = scoped.then(|| path.clone());
+        let rows = positions.iter().map(|position| (path.clone(), position));
+        match groups
+            .iter_mut()
+            .find(|group| group.referenced == referenced && group.partition == *file.partition())
+        {
+            Some(group) => group.rows.extend(rows),
+            None => groups.push(PositionDeletes {
+                rows: rows.collect(),
+                referenced,
+                spec_id,
+                partition: file.partition().clone(),
+            }),
+        }
+    }
+    groups
 }
 
 /// The ids of `class` modulo `INTERLEAVE_STRIDE` inside `INTERLEAVED_IDS`:
