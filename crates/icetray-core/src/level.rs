@@ -11,9 +11,9 @@ use crate::approx;
 use crate::local::ResidentPages;
 
 /// Below this many resident pages in a thousand of a `disk` table's chunk
-/// files, the table falls to balanced: 950, where about one lookup in
-/// twenty over uniform keys reads its key page from the device, which puts
-/// the 95th-percentile lookup there (RFD 020).
+/// files, the table falls to balanced: 950, one page in twenty missing,
+/// where under uniform keys the 90th-percentile lookup reads its key page
+/// from the device (RFD 020; docs/analysis/2026-10-07-page-cache-residency.md).
 pub const FALL_PER_MILLE: u64 = 950;
 
 /// Above this many resident pages in a thousand, a table that fell for the
