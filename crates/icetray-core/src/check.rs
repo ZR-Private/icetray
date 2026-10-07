@@ -1386,6 +1386,10 @@ fn many_files_findings(buckets: &Buckets<'_>) -> Vec<Finding> {
 /// removes a row: the rows and delete files a compaction would remove and,
 /// where updates overlap, the level a compaction restores
 /// (`compacted_level`).
+/// Where the costs `deletes_pending` states were measured, named in its
+/// message so an operator can read the method and the host behind them.
+const MERGE_ON_READ_COSTS: &str = "measured in docs/analysis/2026-10-07-merge-on-read-costs.md";
+
 fn deletes_pending(g: &Generation, caps: &Caps, deletes: DeleteSummary) -> Option<Finding> {
     if deletes.rows == 0 {
         return None;
@@ -1396,11 +1400,16 @@ fn deletes_pending(g: &Generation, caps: &Caps, deletes: DeleteSummary) -> Optio
     let restored = compacted_level(g, caps).map_or_else(String::new, |level| {
         format!("; files overlap, and with none overlapping the table reaches {level}")
     });
+    let fetched = if g.residency == Residency::Bloom {
+        " and fetches it, one GET each"
+    } else {
+        ""
+    };
     Some(Finding::advice(
         FindingCode::DeletesPending,
         None,
         format!(
-            "deletes remove {rows} rows through {files} position delete files and deletion vectors, holding {bytes} bytes of delete state{restored} (a compaction rewrites the data files without the deleted rows and drops the position delete files and deletion vectors)",
+            "deletes remove {rows} rows through {files} position delete files and deletion vectors, holding {bytes} bytes of delete state{restored}; checking a row against them costs a few thousandths of a key-page decode, so a hit pays nothing for them, but a miss on a deleted key decodes the key page of every file holding a deleted copy{fetched} ({MERGE_ON_READ_COSTS}; a compaction rewrites the data files without the deleted rows and drops the position delete files and deletion vectors)",
         ),
         None,
     ))
