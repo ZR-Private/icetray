@@ -1,0 +1,174 @@
+# Field projection
+
+## Problem
+
+RFD 002 (Serving layout contract) recommends packing a row into one
+binary column as a serialized protobuf, and RFD 022 (Value columns) lets
+a table split a row into columns along how it is read. A column is cut
+once, at write time, for every caller. Within one column, a caller that
+wants two fields of a message holding a thousand still receives all of
+it and decodes all of it, on every lookup. The decode is the larger
+cost: a protobuf runtime parses every field it is handed, so a caller's
+CPU per lookup follows the size of the message, not of what it reads.
+Callers who cannot afford that build a narrower copy of the table for
+themselves, or serve from another store.
+
+The protobuf wire format can be trimmed without its schema. Every
+field begins with a tag carrying its number and wire type, and the wire
+type gives the field's length, so the top-level fields of a message can
+be walked, kept, or skipped by number alone. Icetray already holds the
+value's bytes after the page cache, before it answers.
+
+## Decision
+
+Callers that read a few fields of a protobuf value will be served by
+trimming, at request time, the value of a column declared protobuf to
+the top-level field numbers the request names, after the page cache,
+with the whole value returned when the request names none.
+
+- **Declared per column.** A `binary` column's entry in `value_columns`
+  may declare `format = "protobuf"`; on a `fixed` or `string` column the
+  declaration is a configuration error, since a trimmed value has no
+  fixed width and a protobuf is not text. TableInfo reports each
+  column's format. A field list sent for a column not declared protobuf
+  is `INVALID_ARGUMENT`. A change of format touches no layout, so it is
+  applied in place, as RFD 020 (Lookup levels) applies `lookups`.
+- **Named per request.** Each column a Get or MultiGet reads carries a
+  list of field numbers, applied to every key of the call, and empty
+  for the whole value; there is no default list in the configuration.
+  So the request's list of columns becomes a list of per-column
+  messages, and an empty list of columns still means presence alone
+  while an empty list of fields means the whole value. A number outside
+  1 to 536,870,911, protobuf's range, or a number given twice, is
+  `INVALID_ARGUMENT`. `server.max_multi_get_values` counts as RFD 022
+  has it.
+- **What is kept.** The value's top-level fields whose numbers were
+  named are copied in the order the value holds them, every occurrence
+  kept: each element of a repeated field, each record of a packed field
+  (an encoder may split one), each map entry, and each occurrence of a
+  singular field, so a scalar's last write still wins and a singular
+  message's occurrences still merge when the caller parses. A named
+  field is copied whole, a sub-message or a group from its start tag to
+  its end tag. Nothing inside a length-delimited field is examined.
+- **What the caller can rely on.** A projected value parses as the
+  caller's type whenever the whole value does, and holds what the whole
+  value holds for each named field, with one exception the caller
+  avoids: a caller that names a member of a oneof names every member of
+  it, since setting one member clears the others, and a member the
+  whole value later cleared would otherwise come back set. A field not
+  named reads as unset, which for a field without presence is its zero
+  value. A message with proto2 required fields, or `LEGACY_REQUIRED`
+  under editions, may arrive without them, and the caller parses it
+  partially, as Go's `UnmarshalOptions{AllowPartial: true}` or Java's
+  `parser().parsePartialFrom` do. Icetray holds no schema, so it knows
+  neither oneofs nor required fields, and does not check that a named
+  number exists.
+- **Malformed values.** A value is malformed when its top-level walk
+  meets wire type 6 or 7, a field number of 0 or above 536,870,911, a
+  tag over 5 bytes or a varint over 10, a length past the value's end,
+  or a group whose end tag is missing or names another number. A
+  malformed value fails a projected lookup as `FAILED_PRECONDITION`,
+  naming the table, column, and key: the bytes are what the writer
+  wrote, and it is the declaration they do not meet. The failure is the
+  same on every attempt, so it is not retried, and under RFD 010
+  (Transport and client contract) it fails every MultiGet that projects
+  that key. A lookup that names no fields returns the bytes unchanged.
+  The walk is linear in the value's bytes, groups nested in it
+  included, with no recursion, so no value can make it costlier than
+  its length.
+- **The rest of a value.** A null stays null, and a value holding none
+  of the named fields is present with zero bytes, distinct from null. A
+  default RFD 023 (Column resolution) answers is projected as a value.
+- **After the cache.** The page cache keeps pages as the store returned
+  them, so every caller shares them whatever fields it names. A
+  projection changes no GET, no level, and no lookup-cost gauge.
+- **Counted.** `icetray_value_bytes_read_total` and
+  `icetray_value_bytes_returned_total` count, by table and column, the
+  bytes of the values a lookup read and the bytes it returned, a
+  whole-value lookup counting the same in both, so an owner can see
+  what projection saves. `icetray_projection_errors_total` counts
+  malformed values by table and column.
+- **Checked by the doctor.** The `doctor` command walks the values of
+  one value page of each protobuf column, one GET each, and reports a
+  malformed value as a finding, which catches a column declared
+  protobuf that holds another format. The check at every load does not,
+  since it reads no value page.
+
+## Alternatives Considered
+
+A default field list in the configuration, overridden by the request.
+Rejected because a request that names no fields would then mean
+whatever the configuration lists, a behavior the caller never stated,
+and the whole value would stop being what an empty list returns. If
+callers repeat one list, a named list a request asks for by name is
+the intentional form, and can be added without changing this one.
+
+Nested field paths, such as a field of a sub-message. Rejected for now.
+On the wire a sub-message, a string, bytes, and a packed repeated field
+are all length-delimited, so descending into one needs the schema to
+say it is a message. Registering descriptors per column would also let
+icetray keep a oneof whole, and can be decided later if top-level
+projection or the oneof rule proves too coarse.
+
+Fields named rather than numbered. Rejected because a name needs the
+schema, and the number is the stable part of the protobuf contract: a
+rename keeps it, and a caller's generated code carries it.
+
+Projection in the caller. Rejected because the bytes still cross the
+wire and icetray ships no client (RFD 010).
+
+Narrower copies of the table, or a column per caller under RFD 022.
+Kept for a row split by a few large parts, but rejected as the answer
+to fine-grained reads: a copy per caller is the cost this decision
+exists to avoid.
+
+Other formats. Protobuf only, for now. Avro carries no field tags, so
+trimming it needs the writer's schema; JSON can be trimmed only by
+parsing it; FlatBuffers is already read in place. The `format` key
+leaves room for another.
+
+Checking every value at load. Rejected because it reads value pages a
+load otherwise never fetches; the doctor's one page per column catches
+the likeliest error, a wrong declaration, for one GET.
+
+A cap on group nesting, as protobuf runtimes set one. Rejected because
+the walk does not recurse, and a cap would fail projected a value that
+serves whole.
+
+## Consequences
+
+A projected cold hit costs the same GETs as a whole one. Icetray spends
+a walk linear in the value's bytes, small beside the page decompression
+every lookup already pays for a value much smaller than its page. What
+projection saves is the bytes on the wire and the caller's decode.
+
+The oneof rule is the caller's to keep, and breaking it returns a
+cleared member as set, with no error. Callers project oneofs with care,
+and the table contract says so.
+
+A malformed value that the doctor's page did not hold is found when a
+caller first projects it, and fails every projected batch that holds it
+until it is rewritten or the caller stops projecting it. The error
+counter is how an owner learns of it.
+
+Removing a column's declaration reaches the clients first, since a field
+list for an undeclared column is `INVALID_ARGUMENT`.
+
+Earlier RFDs and documents are revised to match: RFD 002 (projection is
+decided here, not as a tier under RFD 007 (Serving tiers)); RFD 006
+(Lookup hot path) (a projected lookup walks its value); RFD 010 (the
+per-column field list, `FAILED_PRECONDITION`, and a deterministic
+failure not retried); RFD 011 (a column's `format`); RFD 016 (Doctor)
+(the walk of one page per protobuf column); RFD 018 (Configuration
+reload) (a format change applies in place); RFD 022 (a column entry
+carries its format, and its projection alternative points here); the
+table contract (the declaration, the oneof rule, and the partial-parse
+rule); and the performance guide (when to split a row into columns and
+when to project one).
+
+Property tests pin the walker under RFD 014 (Test layering): over typed
+fixture messages with repeated, packed and split-packed, map, oneof,
+group, and nested fields, the named fields of the parsed projection
+equal those of the parsed whole value, and every malformed shape above
+fails. Fixtures pin a null, a value holding none of the named fields,
+and a projected column default.
