@@ -202,6 +202,14 @@ const KEY_FIELD_ID: i32 = 1;
 /// The field id of the value column in every fixture schema.
 const VALUE_FIELD_ID: i32 = 2;
 
+/// The field id of `SECOND_VALUE_COLUMN` in a schema that holds it.
+const SECOND_VALUE_FIELD_ID: i32 = 3;
+
+/// A second binary value column, written when `FixtureSpec::second_value`
+/// is set: each row's `value` bytes reversed, null where `value` is, so a
+/// table entry naming it reads bytes no entry naming `value` returns.
+pub const SECOND_VALUE_COLUMN: &str = "detail";
+
 /// The schema id every fixture table is created with.
 const SCHEMA_ID: i32 = 0;
 
@@ -279,6 +287,8 @@ pub struct FixtureSpec {
     /// version, and a by-hand commit writes its manifests and manifest
     /// list at it.
     pub format_version: FormatVersion,
+    /// Whether the table also holds `SECOND_VALUE_COLUMN`.
+    pub second_value: bool,
 }
 
 /// The order ids are handed to the writer within each bucket. `Descending`
@@ -320,6 +330,7 @@ impl FixtureSpec {
             nulls: Nulls::None,
             layout: Layout::contract(),
             format_version: FormatVersion::V2,
+            second_value: false,
         }
     }
 
@@ -570,6 +581,11 @@ impl Fixture {
         let null = id.is_some_and(|id| self.spec.is_null(id));
         let version = id.map_or(FIRST_VERSION, |id| self.version_of(id));
         (!null).then(|| value_of_version(key, self.spec.value_bytes, self.spec.value_kind, version))
+    }
+
+    /// The bytes `SECOND_VALUE_COLUMN` holds for `key`: `value` reversed.
+    pub fn second_value(&self, key: &Key) -> Option<Vec<u8>> {
+        self.value(key).map(reversed)
     }
 
     /// The version `id`'s live row was written at: `FIRST_VERSION` until
@@ -1305,7 +1321,10 @@ pub async fn write_fixture(
         namespace,
         &spec.name,
         primitive_of(spec.key_type),
-        PrimitiveType::Binary,
+        ValueColumns {
+            value: PrimitiveType::Binary,
+            second: spec.second_value,
+        },
         spec.buckets,
         spec.format_version,
     )
@@ -1314,6 +1333,15 @@ pub async fn write_fixture(
     let mut fixture = Fixture::new(table, ident, spec)?;
     fixture.append(catalog, ids, FIRST_BUILD_PREFIX).await?;
     Ok(fixture)
+}
+
+/// The value columns `create_table` gives a table: `VALUE_COLUMN` of
+/// `value`'s type, and `SECOND_VALUE_COLUMN` when `second` is set.
+struct ValueColumns {
+    /// The Iceberg type of `VALUE_COLUMN`.
+    value: PrimitiveType,
+    /// Whether the table also holds `SECOND_VALUE_COLUMN`.
+    second: bool,
 }
 
 /// Creates a table whose key and value columns have the given Iceberg types
@@ -1336,7 +1364,10 @@ pub async fn write_table_of_types(
         namespace,
         name,
         key,
-        value,
+        ValueColumns {
+            value,
+            second: false,
+        },
         buckets,
         FormatVersion::V2,
     )
@@ -1362,8 +1393,9 @@ fn primitive_of(key_type: KeyType) -> PrimitiveType {
 }
 
 /// Creates `name` in `namespace`: a required `key` of `key` type (field
-/// `KEY_FIELD_ID`), an optional `value` of `value` type (field
-/// `VALUE_FIELD_ID`, so a null value is a legal row per RFD 002),
+/// `KEY_FIELD_ID`), an optional `value` of `values.value` type (field
+/// `VALUE_FIELD_ID`, so a null value is a legal row per RFD 002), an
+/// optional binary `SECOND_VALUE_COLUMN` when `values.second` is set,
 /// `bucket(buckets, key)` when `buckets` is above zero, and a sort order on
 /// the key, at format `format_version`. Creates the namespace when absent.
 async fn create_table(
@@ -1371,7 +1403,7 @@ async fn create_table(
     namespace: &str,
     name: &str,
     key: PrimitiveType,
-    value: PrimitiveType,
+    values: ValueColumns,
     buckets: u32,
     format_version: FormatVersion,
 ) -> Result<(Table, TableIdent)> {
@@ -1379,12 +1411,23 @@ async fn create_table(
     if !catalog.namespace_exists(&namespace).await? {
         catalog.create_namespace(&namespace, HashMap::new()).await?;
     }
+    let mut fields = vec![
+        NestedField::required(KEY_FIELD_ID, KEY_COLUMN, Type::Primitive(key)).into(),
+        NestedField::optional(VALUE_FIELD_ID, VALUE_COLUMN, Type::Primitive(values.value)).into(),
+    ];
+    if values.second {
+        fields.push(
+            NestedField::optional(
+                SECOND_VALUE_FIELD_ID,
+                SECOND_VALUE_COLUMN,
+                Type::Primitive(PrimitiveType::Binary),
+            )
+            .into(),
+        );
+    }
     let schema = Schema::builder()
         .with_schema_id(SCHEMA_ID)
-        .with_fields([
-            NestedField::required(KEY_FIELD_ID, KEY_COLUMN, Type::Primitive(key)).into(),
-            NestedField::optional(VALUE_FIELD_ID, VALUE_COLUMN, Type::Primitive(value)).into(),
-        ])
+        .with_fields(fields)
         .build()?;
     let mut partition_spec = UnboundPartitionSpec::builder().with_spec_id(SPEC_ID);
     if buckets > 0 {
@@ -1523,15 +1566,37 @@ fn batch(
                 .then(|| value_of_version(key, spec.value_bytes, spec.value_kind, version_of(id)))
         })
         .collect();
+    let second: Option<ArrayRef> = spec.second_value.then(|| {
+        Arc::new(
+            values
+                .iter()
+                .map(|value| value.map(|bytes| reversed(bytes.to_vec())))
+                .collect::<BinaryArray>(),
+        ) as ArrayRef
+    });
     let value: ArrayRef = Arc::new(values);
-    let columns = vec![
+    let mut columns = vec![
         arrow::compute::cast(&key, arrow_schema.field_with_name(KEY_COLUMN)?.data_type())?,
         arrow::compute::cast(
             &value,
             arrow_schema.field_with_name(VALUE_COLUMN)?.data_type(),
         )?,
     ];
+    if let Some(second) = second {
+        columns.push(arrow::compute::cast(
+            &second,
+            arrow_schema
+                .field_with_name(SECOND_VALUE_COLUMN)?
+                .data_type(),
+        )?);
+    }
     Ok(RecordBatch::try_new(Arc::clone(arrow_schema), columns)?)
+}
+
+/// `bytes` in reverse order: a row's `SECOND_VALUE_COLUMN` from its `value`.
+fn reversed(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.reverse();
+    bytes
 }
 
 /// The message of the impossible case: `key_at_shaped` builds every key

@@ -1,0 +1,109 @@
+//! Two table entries over one Iceberg table, each naming a different value
+//! column: each answers its own column's bytes, the value pages of both
+//! share one page cache, and in the Disk tier both entries share one chunk
+//! file per data file, which `retain` keeps while either serves it.
+
+use std::sync::Arc;
+
+use icetray_core::config::{
+    Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
+};
+use icetray_core::open::open_with;
+use icetray_core::{FindingLog, KeyType, Storage, Value};
+use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, local_catalog};
+use icetray_testkit::{FixtureSpec, Result, verify, write_fixture};
+
+/// The entry that names the fixture's `value` column.
+const VALUE_TABLE: &str = "jobs_value";
+/// The entry that names `SECOND_VALUE_COLUMN`.
+const DETAIL_TABLE: &str = "jobs_detail";
+
+/// The local directory's chunk file subdirectory.
+const INDEX_DIR: &str = "index";
+
+#[tokio::test]
+async fn test_two_entries_over_one_table_serve_their_own_value_columns() -> Result<()> {
+    for residency in [Residency::Full, Residency::Disk] {
+        let (_dir, catalog) = local_catalog().await?;
+        let scratch = tempfile::tempdir()?;
+        let spec = FixtureSpec {
+            second_value: true,
+            ..FixtureSpec::small("jobs", KeyType::Long)
+        };
+        let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        let value = fixture.config(residency, false);
+        let detail = TableConfig {
+            name: DETAIL_TABLE.to_string(),
+            value_column: SECOND_VALUE_COLUMN.to_string(),
+            ..value.clone()
+        };
+        let value = TableConfig {
+            name: VALUE_TABLE.to_string(),
+            ..value
+        };
+        let config = Config {
+            server: ServerConfig::default(),
+            storage: StorageConfig {
+                local: Some(LocalConfig {
+                    dir: scratch.path().to_path_buf(),
+                    index_budget_bytes: None,
+                    page_cache_disk_bytes: 0,
+                }),
+                ..verify::storage_config_for_tests()
+            },
+            tables: vec![value, detail],
+        };
+        let storage = Arc::new(Storage::new(config.storage.clone()));
+        let opened = open_with(&config, None, Arc::clone(&storage), FindingLog::Events).await?;
+        let tables = opened.tables();
+        let (value, detail) = (&tables[0], &tables[1]);
+        value.load().await?;
+        detail.load().await?;
+
+        let stats = storage.stats();
+        for id in SAMPLE {
+            let key = fixture.key(id);
+            assert_eq!(
+                value.get(&key).await?.value,
+                fixture.expected(&key),
+                "{residency:?} {key}"
+            );
+            let expected = Value::Present(fixture.second_value(&key).unwrap().into());
+            assert_eq!(
+                detail.get(&key).await?.value,
+                expected,
+                "{residency:?} {key}"
+            );
+            assert_ne!(
+                value.get(&key).await?.value,
+                detail.get(&key).await?.value,
+                "the entries read different columns"
+            );
+        }
+        let gets = stats.gets();
+        for id in SAMPLE {
+            let key = fixture.key(id);
+            value.get(&key).await?;
+            detail.get(&key).await?;
+        }
+        assert_eq!(
+            stats.gets(),
+            gets,
+            "{residency:?}: both columns' pages stay in the one page cache"
+        );
+        let absent = fixture.absent_near(SAMPLE[0]);
+        assert_eq!(value.get(&absent).await?.value, Value::Absent);
+        assert_eq!(detail.get(&absent).await?.value, Value::Absent);
+
+        if residency == Residency::Disk {
+            let chunk_files = std::fs::read_dir(scratch.path().join(INDEX_DIR))?.count();
+            assert_eq!(
+                chunk_files,
+                fixture.file_count(),
+                "one chunk file per data file, shared by both entries"
+            );
+            assert_eq!(opened.retain().await?, 0, "both entries' chunks are live");
+        }
+    }
+    Ok(())
+}
