@@ -5,6 +5,11 @@
 > platform icetray builds for, rather than on a platform that cannot
 > sample.
 
+> Updated 2026-10-07: the page-cache condition's fractions, 0.95 and
+> 0.99, and its 15-second sample are decided on a measurement of latency
+> against residency, which closes the open question
+> ([analysis](../analysis/2026-10-07-page-cache-residency.md)).
+
 ## Problem
 
 RFD 007 (Serving tiers) sorts what the doctor finds into refusals,
@@ -125,11 +130,19 @@ outcome depend on load order and on neighbors. The page cache is the one
 server condition a level depends on today:
 
 - While a `disk` table serves, icetray samples which of its chunk-file
-  pages are resident. The table falls below `optimal` when the resident
-  fraction drops below a fixed threshold and recovers when it rises above
-  a higher one, so the flag does not flap. The sample decides; when
-  residency cannot be observed, this condition is not judged and the table
-  reads the level of its layout.
+  pages are resident, every 15 seconds. The table falls below `optimal`
+  when the resident fraction drops below 0.95 and recovers when it rises
+  above 0.99, so the flag does not flap. The fractions are fixed by
+  icetray, not configured, and track the 90th percentile: in a sweep
+  over uniform keys with pages evicted at random, the worst case for a
+  cache, a miss's p90 moved from the page cache to the device once one
+  page in twenty was missing, and from 0.97 up only the p99 was on the
+  device. Under skewed access the kernel evicts the coldest pages first,
+  so at a given fraction fewer lookups pay and the cap is conservative.
+  The cap says whether a table's chunk files still fit in memory, and
+  `icetray_lookup_seconds` reports tail latency itself. The sample
+  decides; when residency cannot be observed, this condition is not
+  judged and the table reads the level of its layout.
 - At load, icetray compares what every `disk` table's chunk files and the
   page cache's disk level need with the room under the memory limit (the
   cgroup's, or the host's) less the process's resident set. A shortfall
@@ -220,6 +233,12 @@ neighbor at every later commit, and two replicas with one configuration
 could refuse different tables. The index budget is treated the same way
 for the same reason.
 
+**Page-cache thresholds on the 99th percentile,** falling near 0.99
+and recovering near 0.997, where the measured p99 moved. Rejected because
+the kernel reclaims cold pages of a cached file in the ordinary course of
+running, and a cap that fires at a 1% shortfall would flag tables whose
+working set fits.
+
 **A `degraded` series that includes held tables.** Rejected because one
 series would then fire for a storage outage and for a writer's layout,
 and routing the page to the right owner would need a join.
@@ -252,16 +271,10 @@ ran on a built generation, so a refused snapshot had already written its
 chunk files and evicted other tables' pages from the page cache.
 
 Measuring the level at load costs little, since the findings exist. The
-page cache adds a sum at load and a periodic residency sample.
+page cache adds a sum at load and a residency sample every 15 seconds,
+which costs tens of milliseconds of CPU per GiB of chunk files.
 Merge-on-read adds measurements that RFD 021 defines.
 
 The default flags any table worse than its residency allows. A deployment
 serving `full` or `disk` tables it knows to be balanced should say so in
 their entries, or its alerts fire on the first day.
-
-Open questions:
-
-- The two resident fractions between which a `disk` table falls out of
-  and back into `optimal`, and how often it is sampled. The values are
-  fixed by icetray rather than configured, and are chosen after measuring
-  how lookup latency tracks residency.

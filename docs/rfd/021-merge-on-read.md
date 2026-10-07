@@ -5,6 +5,11 @@
 > a deletion vector masks, and the oldest-delete dating now state what
 > icetray does.
 
+> Updated 2026-10-07: the measurements before release were made and the
+> uncapped deleted-row check stands, at a few thousandths of the decode
+> it sits beside; delete-state memory is stated as measured
+> ([analysis](../analysis/2026-10-07-merge-on-read-costs.md)).
+
 ## Problem
 
 RFD 009 (Writes between builds) refuses every snapshot that carries a
@@ -117,8 +122,11 @@ of its deletion vector, or else of the position delete files that name
 it, summed and at most r. A block costs at most two bytes per deleted row
 in it and never more than 8 KiB, plus a fixed overhead C of a few tens
 of bytes, and a segment costs a fixed overhead F of a few hundred bytes,
-so dense deletes cost about two bytes a row and scattered deletes, one to
-a block, cost tens of bytes a row. The sum runs over the deletes that
+so the bound allows about two bytes a row where a block holds many
+deletes and tens of bytes a row where they fall one to a block. Measured,
+deletes scattered at random through a block cost what the bound allows,
+and a run of consecutive deletes a small fraction of a byte a row, since
+the bitmap stores a run by its ends. The sum runs over the deletes that
 apply to the file: each adds a slot S in the file's list of sources and
 its path, counted for every data file it applies to although a load
 holds one copy of it.
@@ -243,8 +251,8 @@ Merge-on-read needs no cap of its own in RFD 020's table:
   older file's, which is `overlapping_files` and caps the table at
   `permissive`. The probes grow with each such commit until a compaction
   rewrites the bucket, which is the growing cost `permissive` names.
-- The bitmap check is uncapped. It is a probe of an in-memory bitmap
-  beside a key-page decode that costs far more.
+- The bitmap check is uncapped. It is a probe of an in-memory bitmap,
+  nanoseconds beside a key-page decode of tens of microseconds.
 
 A table that wants `optimal` under merge-on-read updates keeps RFD 009's
 serving ref behind compaction, or declares `strict` and is held at the
@@ -288,7 +296,12 @@ under each residency, with deleted rows first in the probe order;
 delete-state memory at deleted fractions from 0.1% to 50%; and load and
 refresh time with up to 1,000 live delete files. If the bitmap check
 adds more than a tenth of a key-page decode to a lookup, the uncapped
-check is revisited in this RFD. Correctness is
+check is revisited in this RFD. The measurements
+([analysis](../analysis/2026-10-07-merge-on-read-costs.md)) put the
+check at a few thousandths of a decode at most, so the check stays
+uncapped. Deleted rows first in the probe order cost only the probes
+themselves, the bound is exact for scattered deletes, and each delete
+file adds one or two reads to a load. Correctness is
 pinned by fixtures (RFD 014) for each delete kind, for a delete committed
 with its data file, for a deletion vector beside position deletes, for a
 Puffin file holding a replaced vector, for a dangling delete, for a
@@ -357,6 +370,7 @@ Open questions:
 
 - Whether a `disk` table's delete state should move to the local
   directory once it is large, as its key chunks do. At about two bytes
-  per deleted row when deletes are dense, and tens of bytes when they are
-  scattered, it can exceed the memory `disk` keeps per key, and the
-  delete-state measurements decide whether that happens on real tables.
+  per deleted row when deletes are scattered many to a block, up to tens
+  of bytes when they fall one to a block, and well under a byte when they
+  fall in runs, it can exceed the memory `disk` keeps per key, and the
+  deleted fractions and patterns of real tables decide whether it does.

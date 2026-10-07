@@ -171,6 +171,31 @@ toward `server.load_deadline` ([CPU](operating.md#cpu)).
 - The doctor decodes and hashes every key to check its bucket, which a load
   does not, so it takes longer than `info` on the same table.
 
+## Deletes
+
+A merge-on-read table's deleted rows are held in memory and checked before
+a lookup reads a value page ([RFD 021](rfd/021-merge-on-read.md)). The
+check costs nanoseconds, a few thousandths of the key-page decode beside
+it, so a lookup's cost under deletes is the files it probes, one key-page
+decode each ([analysis](analysis/2026-10-07-merge-on-read-costs.md)):
+
+- A hit on an updated key probes one file however many commits updated
+  it, because the newest copy is probed first.
+- A miss on a deleted key probes every file that holds a deleted copy,
+  under `bloom` too, since a deleted row stays in its file's filter, and
+  there each probe costs a key-page GET when the page is not cached.
+  Commits that update add such files until a compaction rewrites the
+  bucket; `icetray_table_files_probed_per_lookup` shows how many.
+- The delete state takes about two bytes a deleted row when deletes are
+  scattered through a block, and a small fraction of a byte when they fall
+  in runs, as a delete of a key range leaves them. A `full` table's budget
+  counts an upper bound, which is exact for scattered deletes and
+  generous for runs and for position delete files that name no data file.
+  `icetray_table_delete_state_bytes` shows what it holds.
+- Each delete file adds one read to a load, two for a deletion vector (its
+  Puffin footer and its blob). A refresh reads only the deletes that are
+  new.
+
 ## File descriptors
 
 A replica's descriptor needs grow with three settings: the disk level's
@@ -221,9 +246,17 @@ files and the disk level need more than the limit leaves beside the
 process. While it serves, it samples how much of each `disk` table's
 chunk files the page cache holds, `icetray_table_chunk_resident_fraction`.
 Below 0.95 the table reads as `balanced`, below an `optimal` declaration,
-since about one lookup in twenty then waits on the device; it recovers
-above 0.99. These thresholds are provisional until a measurement of
-latency against residency sets them.
+and it recovers above 0.99. The thresholds come from a sweep of `disk`
+lookups over uniform keys with chunk-file pages evicted at random, the
+worst case for a cache
+([analysis](analysis/2026-10-07-page-cache-residency.md)). A miss there
+took about 100 µs with its key page in the page cache and about 730 µs
+with it on the device. Its 90th percentile reached the device once one
+page in twenty was missing, and above 0.97 only its 99th percentile was
+there. Under skewed access the kernel drops the coldest pages first, so a
+real table at the same fraction loses less. The fraction says whether the
+chunk files still fit in memory; `icetray_lookup_seconds` shows the
+latency itself.
 
 The local directory belongs on a mounted volume with a filesystem such as
 ext4. A container's overlay filesystem cannot serve a cached read without
