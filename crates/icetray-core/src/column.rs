@@ -135,9 +135,10 @@ pub(crate) enum Found {
 /// is a rename, neither in a file that records field ids is
 /// `Found::Absent`, and a file that records none cannot tell. A file
 /// records field ids when every top-level column carries one; one where
-/// only some do records none. A column of that name is one named `name`
-/// or `avro_compatible(name)`, the name Iceberg's Java writers give it in
-/// the file.
+/// only some do records none. A column of that name is the one named
+/// `name`, else the one named `avro_compatible(name)`, the name Iceberg's
+/// Java writers give it in the file: a file may hold both, `a-b` beside a
+/// sibling named `a_x2Db`, and the escaped form is the other column.
 pub(crate) fn find(
     schema: &SchemaDescriptor,
     name: &str,
@@ -149,7 +150,8 @@ pub(crate) fn find(
     let compatible = avro_compatible(name);
     let named = fields
         .iter()
-        .position(|field| field.name() == name || field.name() == compatible);
+        .position(|field| field.name() == name)
+        .or_else(|| fields.iter().position(|field| field.name() == compatible));
     match named {
         Some(at) => match ids[at] {
             Some(found) if found != field_id => Err(ColumnMismatch::OtherFieldId {
@@ -630,6 +632,30 @@ mod tests {
                 expected: OTHER_FIELD_ID,
                 found: VALUE_FIELD_ID,
             })
+        );
+    }
+
+    #[test]
+    fn test_find_prefers_the_exact_name_over_an_avro_escaped_sibling() {
+        /// The field ids of `a-b` and of its sibling `a_x2Db`, written `= 5`
+        /// and `= 6`; the file lists the sibling first.
+        const EXACT_FIELD_ID: i32 = 5;
+        const ESCAPED_FIELD_ID: i32 = 6;
+        let with_ids = "message m { required int64 key = 1; optional binary a_x2Db = 6; optional binary a-b = 5; }";
+        assert_eq!(found(with_ids, "a-b", EXACT_FIELD_ID), Ok(Found::Leaf(2)));
+        assert_eq!(
+            found(with_ids, "a_x2Db", ESCAPED_FIELD_ID),
+            Ok(Found::Leaf(1))
+        );
+        let without_ids =
+            "message m { required int64 key; optional binary a_x2Db; optional binary a-b; }";
+        assert_eq!(
+            found(without_ids, "a-b", EXACT_FIELD_ID),
+            Ok(Found::Leaf(2))
+        );
+        assert_eq!(
+            found(without_ids, "a_x2Db", ESCAPED_FIELD_ID),
+            Ok(Found::Leaf(1))
         );
     }
 
