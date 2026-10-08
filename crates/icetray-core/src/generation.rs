@@ -4298,7 +4298,7 @@ mod tests {
         (table, config, generation, all)
     }
 
-    /// A lookup answers the columns at the positions it names in the order
+    /// A lookup returns the columns at the positions it requests in the order
     /// it names them, whatever the layout's order (RFD 022).
     #[tokio::test]
     async fn test_lookup_answers_the_positions_named_in_their_order() {

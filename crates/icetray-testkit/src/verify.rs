@@ -257,7 +257,7 @@ pub fn storage_config_for_tests() -> StorageConfig {
 /// page of each column named; a dictionary-encoded column's dictionary page
 /// is not counted. A key the plan names no row for costs nothing in the Full
 /// tier, where a resident key page shows it absent, and neither does a
-/// column a file answers by its default (RFD 023); in any other tier the
+/// column of a file written before it was added (RFD 023); in any other tier the
 /// oracle cannot name value pages without I/O, which is
 /// `Precondition::OracleNotFull`.
 ///
@@ -350,7 +350,7 @@ pub struct SeenPages {
 /// lookups `seen` records, for a key with a live copy when `live` (RFD
 /// 021), naming value column `column`: its value page the Full tier's
 /// generation `full` plans for the live copy, unless fetched before or its
-/// file answers the column's default and reads none (RFD 023); and in the
+/// file was written before the column was added and reads none (RFD 023); and in the
 /// Bloom tier every key page a probe decodes, walking the candidates in
 /// probe order up to the file the plan names, or through every candidate
 /// for a key with no live copy, deleted copies among them. The Full and

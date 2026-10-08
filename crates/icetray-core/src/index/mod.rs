@@ -1082,7 +1082,7 @@ impl FileIndex {
     /// page cache, and its dictionary page's when the chunk has one, its
     /// headers checked as `read_column` checks them. Empty for a file whose
     /// row groups hold no page, and for a page of only nulls. `None` for a
-    /// file that answers the column's default (RFD 023). What the doctor
+    /// file written before the column was added (RFD 023). What the doctor
     /// walks a protobuf column's values on (RFD 024).
     pub(crate) async fn first_page_values(&self, column: usize) -> Result<Option<Vec<Bytes>>> {
         const FIRST_PAGE: usize = 0;
@@ -1134,7 +1134,7 @@ impl FileIndex {
     /// position in the table's layout, that a hit on the key `page` names
     /// would fetch: `Some` only where `page` names the key's row (in the
     /// Full tier, for a present key) in a file that holds the column;
-    /// `None` for a file that answers the column's default and fetches no
+    /// `None` for a file written before the column was added, which fetches no
     /// value page (RFD 023).
     pub fn value_page_offset(&self, column: usize, page: &PageRef) -> Option<u64> {
         let value = self.values[column]?;

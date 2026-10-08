@@ -2385,7 +2385,7 @@ mod tests {
     /// `oracle` does, and answers every `stride`th probe of `key_type` as
     /// `oracle` does: the same row for a present key, none for an absent
     /// one.
-    async fn assert_answers_as(
+    async fn assert_lookups_match(
         index: &FileIndex,
         oracle: &FileIndex,
         key_type: KeyType,
@@ -2427,7 +2427,7 @@ mod tests {
                 reads,
                 "{key_type}: no chunk was read back to be decoded"
             );
-            assert_answers_as(&reused, &oracle, key_type, 1).await;
+            assert_lookups_match(&reused, &oracle, key_type, 1).await;
         }
     }
 
@@ -2518,12 +2518,12 @@ mod tests {
                 1 + count(ROW_GROUPS),
                 "{case}: footer, then every chunk"
             );
-            assert_answers_as(&rebuilt, &oracle, key_type, PROBE_STRIDE).await;
+            assert_lookups_match(&rebuilt, &oracle, key_type, PROBE_STRIDE).await;
             let reads = self.opened.stats().local_reads();
             let (reused, gets) = self.restart(key_type).await;
             assert_eq!(gets, 1, "{case}: the rewritten file is reused");
             assert_eq!(self.opened.stats().local_reads(), reads, "{case}");
-            assert_answers_as(&reused, &oracle, key_type, PROBE_STRIDE).await;
+            assert_lookups_match(&reused, &oracle, key_type, PROBE_STRIDE).await;
         }
     }
 

@@ -1,7 +1,7 @@
 //! How a configured column is found in each data file (RFD 023), one
 //! fixture per row of its table and per case it names: a column served by
 //! name and field id, a swap and a rename refused, a column added after a
-//! file answering its default with no value-page GET, a reused file whose
+//! file written before a column returning its default with no value-page GET, a reused file whose
 //! name was dropped and added again refused on refresh while the last
 //! generation serves, a default that does not read, a `fixed` column at
 //! another width, a file without its key column, and files that record no
@@ -294,7 +294,7 @@ async fn add_column_then_rows(fixture: &mut Fixture, default: StatedDefault) -> 
 /// Looks up every one of `ids` in `served` naming `columns`, asserting
 /// each answers `expected` of its key, and returns the GETs the lookups
 /// made.
-async fn gets_answering(
+async fn gets_of_lookups(
     served: &Served,
     fixture: &Fixture,
     ids: &[u64],
@@ -324,7 +324,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         .await?;
     let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
     assert_eq!(
-        gets_answering(
+        gets_of_lookups(
             &served,
             &fixture,
             &FIRST_BUILD_SAMPLE,
@@ -333,7 +333,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         )
         .await?,
         0,
-        "a row answered by its default reads no value page"
+        "a row that gets its column's default reads no value page"
     );
     assert_eq!(
         served
@@ -347,7 +347,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         Row::Absent,
         "a deleted row is deleted whatever its column answers"
     );
-    let gets = gets_answering(&served, &fixture, &later, &[SECOND_VALUE_COLUMN], |key| {
+    let gets = gets_of_lookups(&served, &fixture, &later, &[SECOND_VALUE_COLUMN], |key| {
         fixture.expected_of(key, &[SECOND_VALUE_COLUMN])
     })
     .await?;
@@ -368,7 +368,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         &[VALUE_COLUMN],
     )?;
     assert!(one_column_gets > 0);
-    let earlier_gets = gets_answering(&served_both, &fixture, &FIRST_BUILD_SAMPLE, &both, |key| {
+    let earlier_gets = gets_of_lookups(&served_both, &fixture, &FIRST_BUILD_SAMPLE, &both, |key| {
         Row::Present(vec![fixture.value(key).map(Into::into), None])
     })
     .await?;
@@ -376,7 +376,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         earlier_gets, one_column_gets,
         "the column a file holds costs its pages, the defaulted one none"
     );
-    gets_answering(&served_both, &fixture, &later, &both, |key| {
+    gets_of_lookups(&served_both, &fixture, &later, &both, |key| {
         fixture.expected_of(key, &both)
     })
     .await?;
@@ -409,7 +409,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     Ok(())
 }
 
-/// In the Bloom tier a row answered by its default costs the key page its
+/// In the Bloom tier a row that gets its column's default costs the key page its
 /// probe decodes and no value page; in the Disk tier it costs no GET, the
 /// key page being on local disk. One `multi_get` answers keys of files
 /// that hold the column and files that predate it.
@@ -443,7 +443,7 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
                 )
             })
             .sum();
-        let gets = gets_answering(
+        let gets = gets_of_lookups(
             &served,
             &fixture,
             &FIRST_BUILD_SAMPLE,
@@ -487,7 +487,7 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
     Ok(())
 }
 
-/// A row answered by its default reads no value page, so its lookup is
+/// A row that gets its column's default reads no value page, so its lookup is
 /// counted a warm hit, never a cold one.
 #[tokio::test]
 async fn test_a_default_answer_is_counted_a_warm_hit() -> Result<()> {
@@ -495,7 +495,7 @@ async fn test_a_default_answer_is_counted_a_warm_hit() -> Result<()> {
     let (_dir, mut fixture) = two_bucket_fixture("kv_added_warm", FormatVersion::V2, false).await?;
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
     let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
-    gets_answering(
+    gets_of_lookups(
         &served,
         &fixture,
         &FIRST_BUILD_SAMPLE,
@@ -537,7 +537,7 @@ async fn test_a_column_added_with_a_v3_initial_default_answers_its_bytes() -> Re
     .await?;
     let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
     assert_eq!(
-        gets_answering(
+        gets_of_lookups(
             &served,
             &fixture,
             &FIRST_BUILD_SAMPLE,
@@ -546,7 +546,7 @@ async fn test_a_column_added_with_a_v3_initial_default_answers_its_bytes() -> Re
         )
         .await?,
         0,
-        "a row answered by its default reads no value page"
+        "a row that gets its column's default reads no value page"
     );
     Ok(())
 }
@@ -682,7 +682,7 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
     assert_eq!(
         stats.gets(),
         before,
-        "every file answers the default, so no page is read"
+        "every file predates the column, so no page is read"
     );
     assert!(examined.unwalked.is_empty());
     let found: Vec<_> = examined
@@ -1015,7 +1015,7 @@ async fn test_a_file_without_field_ids_lacking_the_value_column_is_refused() -> 
 }
 
 /// Were the file's one field id taken for a file that records ids, the
-/// absent value column would answer its default; a file where only some
+/// absent value column would get its default; a file where only some
 /// columns carry one records none, so it is refused.
 #[tokio::test]
 async fn test_a_file_with_field_ids_on_only_some_columns_records_none() -> Result<()> {

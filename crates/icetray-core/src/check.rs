@@ -937,7 +937,7 @@ pub struct Unwalked {
 /// The `doctor` command's report on `g` (RFD 016, RFD 024): `diagnose`'s,
 /// with the walk no load makes of each column `formats` declares protobuf.
 /// The walk checks the column's stated default (RFD 023), with no GET,
-/// when a file of `g` answers the column by it (a file written after the
+/// when a file of `g` was written before the column was added (a file written after the
 /// column was added holds the column, so a default no file answers is
 /// never served), and every value on the first value page of the first file in
 /// generation order that holds the column, read with one GET (two for a

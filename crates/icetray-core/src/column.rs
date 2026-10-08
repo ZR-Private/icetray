@@ -2,7 +2,7 @@
 //! data file. A column is matched by its name among the file's top-level
 //! columns and checked against the field id the snapshot's schema gives
 //! that name when the file records field ids; a value column the file
-//! provably lacks answers the column's default from that schema, and every
+//! provably lacks returns the column's default from that schema, and every
 //! other mismatch refuses the snapshot as `RefusalReason::ColumnMismatch`.
 //! The check compares the names and field ids a footer holds and reads
 //! nothing, so a load runs it against every file of its snapshot, a file
@@ -51,7 +51,7 @@ pub enum ColumnMismatch {
     /// or renamed.
     AbsentWithoutFieldIds,
     /// The file records field ids and holds neither the key column's name
-    /// nor its field id. A value column answers its default there; a key
+    /// nor its field id. A lookup returns a value column's default there; a key
     /// column has none.
     KeyAbsent,
     /// The configured name is not a top-level field of the snapshot's
@@ -238,7 +238,7 @@ pub(crate) struct FileColumns {
     /// The key column's leaf.
     pub(crate) key_leaf: usize,
     /// Each value column's leaf, in the layout's order; `None` for a file
-    /// written before the column was added, which answers the column's
+    /// written before the column was added, for whose rows a lookup returns the column's
     /// default.
     pub(crate) value_leaves: Vec<Option<usize>>,
 }
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_a_value_column_the_file_lacks_answers_the_default() {
+    fn test_resolve_a_value_column_the_file_lacks_returns_the_default() {
         let schema = schema_of("message m { required int64 key = 1; optional binary other = 7; }");
         assert_eq!(
             resolve(TABLE, PATH, &schema, &layout(None)).unwrap(),
@@ -733,7 +733,7 @@ mod tests {
 
     /// Each value column is resolved on its own (RFD 022): in one file one
     /// column is served and another, added after the file was written,
-    /// answers its default, while a mismatch of either refuses the file
+    /// returns its default, while a mismatch of either refuses the file
     /// naming that column.
     #[test]
     fn test_resolve_resolves_each_value_column_on_its_own() {
