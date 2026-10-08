@@ -31,7 +31,8 @@ use crate::storage::{FILE_SCHEME, PATH_SEPARATOR, Storage, file_parts, split_loc
 
 /// The file under a static table root that names the current metadata
 /// version, as the Hadoop catalog lays a table out. Its content is a bare
-/// version number (`3` means `metadata/v3.metadata.json`), a file name
+/// version number (`3` means `metadata/v3.metadata.json`, or its
+/// gzip-compressed forms: `VersionHint::metadata_files`), a file name
 /// under `metadata/`, or a full location.
 pub(crate) const VERSION_HINT: &str = "metadata/version-hint.text";
 
@@ -39,9 +40,20 @@ pub(crate) const VERSION_HINT: &str = "metadata/version-hint.text";
 /// version hint's bare version or file name resolves.
 pub(crate) const METADATA_DIR: &str = "metadata";
 
-/// The suffix of a metadata file's name. A static location ending in it
-/// names the file itself and never advances; any other names a table root.
+/// The suffix of a metadata file's name. A static location ending in it,
+/// or in `LEGACY_GZIP_METADATA_SUFFIX`, names the file itself and never
+/// advances; any other names a table root.
 const METADATA_SUFFIX: &str = ".metadata.json";
+
+/// The suffix of a gzip-compressed metadata file's name as Iceberg's Java
+/// `TableMetadataParser` names one: `v3.gz.metadata.json`. It ends in
+/// `METADATA_SUFFIX`.
+const GZIP_METADATA_SUFFIX: &str = ".gz.metadata.json";
+
+/// The suffix of a gzip-compressed metadata file under the name Iceberg's
+/// Java `TableMetadataParser` gave one before `GZIP_METADATA_SUFFIX`, and
+/// which its Hadoop tables still read: `v3.metadata.json.gz`.
+const LEGACY_GZIP_METADATA_SUFFIX: &str = ".metadata.json.gz";
 
 /// The prefix of a metadata file named by a bare version: `v3.metadata.json`.
 const VERSION_FILE_PREFIX: &str = "v";
@@ -365,11 +377,11 @@ impl TableSource {
     ) -> Result<Option<Resolved>> {
         match self {
             Self::Static { location } => {
-                let file = current_metadata_file(storage, location).await?;
-                if known == Some(file.as_str()) {
+                let files = current_metadata_files(storage, location).await?;
+                if known.is_some_and(|known| files.iter().any(|file| file == known)) {
                     return Ok(None);
                 }
-                read_metadata(storage, file).await.map(Some)
+                read_first_metadata(storage, files).await.map(Some)
             }
             Self::Catalog { catalog, ident } => {
                 let (metadata, location) =
@@ -404,16 +416,41 @@ impl TableSource {
     }
 }
 
-/// The metadata file a static location names now: the location itself when
-/// it ends in `METADATA_SUFFIX`, otherwise the file the root's version hint
-/// points at, which is one read.
-async fn current_metadata_file(storage: &Storage, location: &str) -> Result<String> {
-    if location.ends_with(METADATA_SUFFIX) {
-        return Ok(location.to_string());
+/// Whether a static `location` names a metadata file rather than a table
+/// root: it ends in `METADATA_SUFFIX`, a gzip-compressed file's
+/// `.gz.metadata.json` included, or in `LEGACY_GZIP_METADATA_SUFFIX`.
+fn names_metadata_file(location: &str) -> bool {
+    location.ends_with(METADATA_SUFFIX) || location.ends_with(LEGACY_GZIP_METADATA_SUFFIX)
+}
+
+/// The metadata files a static location may name now, the one to read
+/// being the first that exists: the location itself when it names a file
+/// (`names_metadata_file`), otherwise what the root's version hint points
+/// at (`VersionHint::metadata_files`), which is one read.
+async fn current_metadata_files(storage: &Storage, location: &str) -> Result<Vec<String>> {
+    if names_metadata_file(location) {
+        return Ok(vec![location.to_string()]);
     }
     let root = location.trim_end_matches(PATH_SEPARATOR);
     let bytes = storage.read_all(&hint_location(root)).await?;
-    Ok(parse_hint(root, &bytes)?.metadata_file(root))
+    Ok(parse_hint(root, &bytes)?.metadata_files(root))
+}
+
+/// `read_metadata` of the first of `files` that exists: one read per file
+/// tried, each one before it not found. When none exists the first one's
+/// error stands, since it names the file a writer that does not compress
+/// its metadata writes.
+async fn read_first_metadata(storage: &Storage, files: Vec<String>) -> Result<Resolved> {
+    let mut first_missing = None;
+    for file in files {
+        match read_metadata(storage, file).await {
+            Err(missing @ Error::ObjectStore(object_store::Error::NotFound { .. })) => {
+                first_missing.get_or_insert(missing);
+            }
+            read => return read,
+        }
+    }
+    Err(first_missing.expect("a static location names at least one metadata file"))
 }
 
 /// Reads and parses the metadata file at `file`, gzip-compressed or not
@@ -520,7 +557,7 @@ pub fn table_root_name(location: &str) -> Option<String> {
         .rsplit(PATH_SEPARATOR)
         .filter(|component| !component.is_empty());
     let mut name = components.next()?;
-    if name.ends_with(METADATA_SUFFIX) {
+    if names_metadata_file(name) {
         name = components.next()?;
         if name == METADATA_DIR {
             name = components.next()?;
@@ -560,16 +597,24 @@ fn is_scheme(text: &str) -> bool {
 /// `metadata/v<version>.metadata.json`, the Hadoop catalog's layout. A
 /// writer publishing a snapshot by hand names its metadata file through it.
 pub fn version_file(root: &str, version: u64) -> String {
+    versioned_file(root, version, METADATA_SUFFIX)
+}
+
+/// The metadata file of `version` under `root` whose name ends in `suffix`:
+/// `metadata/v<version><suffix>`.
+fn versioned_file(root: &str, version: u64, suffix: &str) -> String {
     under(
         root,
-        &format!("{METADATA_DIR}{PATH_SEPARATOR}{VERSION_FILE_PREFIX}{version}{METADATA_SUFFIX}"),
+        &format!("{METADATA_DIR}{PATH_SEPARATOR}{VERSION_FILE_PREFIX}{version}{suffix}"),
     )
 }
 
 /// The three forms a version hint takes.
 #[derive(Debug, PartialEq, Eq)]
 enum VersionHint {
-    /// A bare version number: `3` names `metadata/v3.metadata.json`.
+    /// A bare version number: `3` names `metadata/v3.metadata.json`, or,
+    /// for a table that gzips its metadata, `metadata/v3.gz.metadata.json`
+    /// or `metadata/v3.metadata.json.gz`.
     Version(u64),
     /// A file name under `metadata/`.
     FileName(String),
@@ -578,12 +623,29 @@ enum VersionHint {
 }
 
 impl VersionHint {
-    /// The metadata file the hint names for the table at `root`.
-    fn metadata_file(self, root: &str) -> String {
+    /// The metadata files the hint may name for the table at `root`, the
+    /// one meant being the first that exists. A file name or a location is
+    /// one file. A bare version is the three names Iceberg's Java
+    /// `HadoopTableOperations` tries for it, in its order: uncompressed,
+    /// then gzip-compressed under `TableMetadataParser`'s name and its
+    /// legacy one, so a table written with
+    /// `write.metadata.compression-codec=gzip` resolves through its hint.
+    fn metadata_files(self, root: &str) -> Vec<String> {
         match self {
-            Self::Version(version) => version_file(root, version),
-            Self::FileName(name) => under(root, &format!("{METADATA_DIR}{PATH_SEPARATOR}{name}")),
-            Self::Location(location) => location,
+            Self::Version(version) => [
+                METADATA_SUFFIX,
+                GZIP_METADATA_SUFFIX,
+                LEGACY_GZIP_METADATA_SUFFIX,
+            ]
+            .map(|suffix| versioned_file(root, version, suffix))
+            .to_vec(),
+            Self::FileName(name) => {
+                vec![under(
+                    root,
+                    &format!("{METADATA_DIR}{PATH_SEPARATOR}{name}"),
+                )]
+            }
+            Self::Location(location) => vec![location],
         }
     }
 }
@@ -977,6 +1039,83 @@ mod tests {
         );
     }
 
+    /// The file of `version` under the test root whose name ends in
+    /// `suffix`.
+    fn versioned_location(version: u64, suffix: &str) -> String {
+        versioned_file(&root(), version, suffix)
+    }
+
+    /// A bare hint resolves a gzip-compressed table's metadata under either
+    /// name Iceberg's Java Hadoop tables read, after the uncompressed name
+    /// they try first: one read of the hint and one per name tried.
+    #[tokio::test]
+    async fn test_resolve_follows_a_bare_hint_to_gzip_compressed_metadata() {
+        let json = serde_json::to_vec(&second_metadata()).unwrap();
+        for (suffix, names_tried) in [(GZIP_METADATA_SUFFIX, 2), (LEGACY_GZIP_METADATA_SUFFIX, 3)] {
+            let store = Store::new();
+            let file = versioned_location(SECOND_VERSION, suffix);
+            store.put(&file, gzipped(&json)).await;
+            store.put_hint(SECOND_VERSION.to_string()).await;
+            let resolved = static_root().resolve(&store.mem.storage).await.unwrap();
+            assert_eq!(resolved.location, file);
+            assert_eq!(
+                resolved.metadata.current_snapshot_id(),
+                Some(SECOND_SNAPSHOT)
+            );
+            assert_eq!(store.gets(), 1 + names_tried, "{suffix}");
+
+            let before = store.gets();
+            let unchanged = static_root()
+                .resolve_if_changed(&store.mem.storage, Some(&resolved.location))
+                .await
+                .unwrap();
+            assert!(unchanged.is_none(), "{suffix}");
+            assert_eq!(store.gets(), before + 1, "{suffix}: the hint alone");
+
+            let pinned = TableSource::Static {
+                location: file.clone(),
+            }
+            .resolve(&store.mem.storage)
+            .await
+            .unwrap();
+            assert_eq!(pinned.location, file, "{suffix}: a file, not a root");
+        }
+
+        // The uncompressed name wins, as Java tries it first.
+        let store = Store::new();
+        store.put_metadata(SECOND_VERSION, &first_metadata()).await;
+        store
+            .put(
+                &versioned_location(SECOND_VERSION, GZIP_METADATA_SUFFIX),
+                gzipped(&json),
+            )
+            .await;
+        store.put_hint(SECOND_VERSION.to_string()).await;
+        let resolved = static_root().resolve(&store.mem.storage).await.unwrap();
+        assert_eq!(resolved.location, metadata_location(SECOND_VERSION));
+        assert_eq!(
+            resolved.metadata.current_snapshot_id(),
+            Some(FIRST_SNAPSHOT)
+        );
+    }
+
+    /// A bare hint naming a version no file holds under any name fails as
+    /// the uncompressed file not found.
+    #[tokio::test]
+    async fn test_resolve_bare_hint_with_no_file_is_not_found() {
+        let store = Store::new();
+        store.put_hint(SECOND_VERSION.to_string()).await;
+        let error = static_root().resolve(&store.mem.storage).await.unwrap_err();
+        let Error::ObjectStore(object_store::Error::NotFound { path, .. }) = error else {
+            panic!("expected not found, got {error:?}");
+        };
+        assert!(
+            metadata_location(SECOND_VERSION).ends_with(&path),
+            "{path} is the uncompressed name"
+        );
+        assert_eq!(store.gets(), 4, "the hint and every name");
+    }
+
     #[test]
     fn test_snapshot_for_ref_branch_tag_and_missing() {
         let resolved = Resolved {
@@ -1217,6 +1356,8 @@ mod tests {
             "file:data/kv",
             "/data/kv//",
             "/data/kv/metadata/v1.metadata.json",
+            "/data/kv/metadata/v1.gz.metadata.json",
+            "/data/kv/metadata/v1.metadata.json.gz",
         ] {
             assert_eq!(table_root_name(location), kv, "{location}");
         }
