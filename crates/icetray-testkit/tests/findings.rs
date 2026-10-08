@@ -23,14 +23,15 @@ use icetray_core::check::thresholds::{
 };
 use icetray_core::config::Residency;
 use icetray_core::{
-    Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, RefusalReason,
-    TableReport, Value, WriterProperty, diagnose,
+    Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, RefusalReason, Row,
+    TableReport, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
     SECOND_CLASS, SMALL_FILE_BYTES, TWO_BUCKETS, TWO_FILES, UNPARTITIONED_FILE_BYTES,
     WIDE_VALUE_BYTES, local_catalog, residue_class,
 };
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{
@@ -112,7 +113,11 @@ async fn write_and_serve(
 
 /// The distinct codes of `report` whose findings cap the level.
 fn capping_codes(report: &TableReport) -> BTreeSet<FindingCode> {
-    report.capping_codes().into_iter().collect()
+    report
+        .capping()
+        .into_iter()
+        .map(|capping| capping.code)
+        .collect()
 }
 
 /// The distinct codes of `report` whose findings cap nothing.
@@ -166,7 +171,7 @@ async fn strict_refusal(fixture: &Fixture, catalog: &Arc<dyn Catalog>) -> Result
     else {
         return Err(error);
     };
-    Ok(findings)
+    Ok(findings.into_iter().map(|capping| capping.code).collect())
 }
 
 /// The one finding of `code` in `report`.
@@ -214,7 +219,7 @@ async fn test_dictionary_encoded_value_caps_balanced_by_one_extra_get() -> Resul
     );
 
     let keys = fixture.keys_at(&SAMPLE);
-    let value_pages = verify::expected_cold_gets(&generation, &keys)?;
+    let value_pages = verify::expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
     let files_touched: HashSet<String> = generation
         .plan(&keys)
         .into_iter()
@@ -419,15 +424,15 @@ async fn test_value_pages_over_ceiling_is_advice() -> Result<()> {
         ],
     );
     assert_eq!(report.files.len(), 1);
-    assert_eq!(report.files[0].value_pages, 1);
-    assert!(report.files[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
+    assert_eq!(report.files[0].value_columns[0].value_pages, 1);
+    assert!(report.files[0].value_columns[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
     assert_eq!(
         finding(&report, FindingCode::ValuePagesOverCeiling).property(),
         Some(WriterProperty::PageSizeBytes)
     );
     let error = served
         .table
-        .get(&fixture.key(0))
+        .get(&fixture.key(0), &[VALUE_COLUMN])
         .await
         .expect_err("the value page is over the ceiling");
     assert!(
@@ -647,14 +652,17 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
     {
         let key = fixture.key(id);
         assert!(
-            matches!(served.table.get(&key).await?.value, Value::Present(_)),
+            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
             "key {key}"
         );
     }
     let stats = served.storage.stats();
     let before = stats.gets();
     let inside = fixture.absent_near(INSIDE_ID);
-    assert_eq!(served.table.get(&inside).await?.value, Value::Absent);
+    assert_eq!(
+        served.table.get(&inside, &[VALUE_COLUMN]).await?.row,
+        Row::Absent
+    );
     assert_eq!(
         stats.gets(),
         before,

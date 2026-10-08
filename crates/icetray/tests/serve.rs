@@ -18,7 +18,7 @@ use icetray::telemetry::{self, Call, CodeLabel};
 use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{
-    Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig,
+    Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueColumnConfig,
 };
 use icetray_core::key::UUID_BYTES;
 use icetray_core::metric::{self, Kind, LookupResult};
@@ -29,7 +29,7 @@ use icetray_proto::v1::{
     self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, TableInfoRequest,
     TableInfoResponse,
 };
-use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS};
+use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS};
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture,
@@ -47,6 +47,7 @@ mod common;
 use common::{
     BoxError, NULL_EVERY, NULL_ID, PRESENT_ID, SHUTDOWN_WAIT, health_status, http_get, poll_until,
 };
+use icetray_testkit::layout::VALUE_COLUMN;
 
 /// What every test returns.
 type TestResult = Result<(), BoxError>;
@@ -332,23 +333,45 @@ impl Stack {
         }))
     }
 
-    /// One `Get` of `key` on `table`.
+    /// One `Get` of `key` on `table` naming `VALUE_COLUMN`.
     async fn get(&mut self, table: &str, key: Option<v1::Key>) -> Result<GetResponse, Status> {
+        self.get_naming(table, key, &[VALUE_COLUMN]).await
+    }
+
+    /// One `Get` of `key` on `table` naming `columns`.
+    async fn get_naming(
+        &mut self,
+        table: &str,
+        key: Option<v1::Key>,
+        columns: &[&str],
+    ) -> Result<GetResponse, Status> {
         self.client
             .get(GetRequest {
                 table: table.to_string(),
                 key,
+                columns: wire_columns(columns),
             })
             .await
             .map(tonic::Response::into_inner)
     }
 
-    /// One `MultiGet` of `keys` on `table`.
+    /// One `MultiGet` of `keys` on `table` naming `VALUE_COLUMN`.
     async fn multi_get(&mut self, table: &str, keys: &[Key]) -> Result<MultiGetResponse, Status> {
+        self.multi_get_naming(table, keys, &[VALUE_COLUMN]).await
+    }
+
+    /// One `MultiGet` of `keys` on `table` naming `columns`.
+    async fn multi_get_naming(
+        &mut self,
+        table: &str,
+        keys: &[Key],
+        columns: &[&str],
+    ) -> Result<MultiGetResponse, Status> {
         self.client
             .multi_get(MultiGetRequest {
                 table: table.to_string(),
                 keys: keys.iter().map(wire_key).collect(),
+                columns: wire_columns(columns),
             })
             .await
             .map(tonic::Response::into_inner)
@@ -381,6 +404,32 @@ impl Stack {
         let (status, exposition) = self.http_get(METRICS_PATH).await?;
         assert_eq!(status, StatusCode::OK);
         Ok(exposition)
+    }
+}
+
+/// `columns` as a request carries them.
+fn wire_columns(columns: &[&str]) -> Vec<String> {
+    columns.iter().map(|&column| column.to_string()).collect()
+}
+
+/// The bytes of the one value `values` carries, `None` for a null.
+///
+/// Panics on any number of values but one, or a value with no variant.
+fn one_wire_value(values: &[v1::ColumnValue]) -> Option<Vec<u8>> {
+    let [value] = values else {
+        panic!("one value, got {values:?}");
+    };
+    wire_value(value)
+}
+
+/// The bytes `value` carries, `None` for a null.
+///
+/// Panics on a value with no variant.
+fn wire_value(value: &v1::ColumnValue) -> Option<Vec<u8>> {
+    match &value.kind {
+        Some(v1::column_value::Kind::Value(bytes)) => Some(bytes.to_vec()),
+        Some(v1::column_value::Kind::NullValue(_)) => None,
+        None => panic!("a value with no variant"),
     }
 }
 
@@ -572,7 +621,7 @@ async fn test_get_costs_one_get_cold_and_none_warm_or_absent() -> TestResult {
     let mut stack = Stack::ready_small().await?;
     let generation = stack.generation();
     let keys = stack.fixtures[0].keys_at(&SAMPLE[..COLD_IDS]);
-    let expected = expected_cold_gets(&generation, &keys)?;
+    let expected = expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
     assert_eq!(expected, approx::count(COLD_IDS), "the ids share no page");
 
     let before = stack.stats.gets();
@@ -580,7 +629,7 @@ async fn test_get_costs_one_get_cold_and_none_warm_or_absent() -> TestResult {
         let response = stack.get(TABLE, Some(wire_key(key))).await?;
         assert_eq!(response.presence, i32::from(v1::Presence::Present), "{key}");
         assert_eq!(
-            Some(response.value.to_vec()),
+            one_wire_value(&response.values),
             stack.fixtures[0].value(key),
             "{key}"
         );
@@ -603,7 +652,7 @@ async fn test_get_costs_one_get_cold_and_none_warm_or_absent() -> TestResult {
     let before = stack.stats.gets();
     let response = stack.get(TABLE, Some(wire_key(&absent))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Absent));
-    assert!(response.value.is_empty());
+    assert!(response.values.is_empty());
     assert_eq!(response.snapshot_id, generation.snapshot_id.0);
     assert_eq!(stack.stats.gets(), before, "a miss costs nothing");
     Ok(())
@@ -625,14 +674,14 @@ async fn test_get_serves_a_null_value_as_present_with_null() -> TestResult {
 
     let before = stack.stats.gets();
     let null = stack.get(TABLE, Some(wire_key(&null_key))).await?;
-    assert_eq!(null.presence, i32::from(v1::Presence::Null));
-    assert!(null.value.is_empty());
+    assert_eq!(null.presence, i32::from(v1::Presence::Present));
+    assert_eq!(one_wire_value(&null.values), None, "the value is null");
     assert_eq!(stack.stats.gets() - before, 1, "a null costs its page cold");
 
     let present = stack.get(TABLE, Some(wire_key(&present_key))).await?;
     assert_eq!(present.presence, i32::from(v1::Presence::Present));
     assert_eq!(
-        Some(present.value.to_vec()),
+        one_wire_value(&present.values),
         stack.fixtures[0].value(&present_key)
     );
 
@@ -643,7 +692,7 @@ async fn test_get_serves_a_null_value_as_present_with_null() -> TestResult {
         )
         .await?;
     assert_eq!(absent.presence, i32::from(v1::Presence::Absent));
-    assert!(absent.value.is_empty());
+    assert!(absent.values.is_empty());
     Ok(())
 }
 
@@ -656,7 +705,7 @@ async fn test_multi_get_answers_in_order_from_one_snapshot() -> TestResult {
     let absent = stack.fixtures[0].absent_near(SAMPLE[0]);
     let mut keys = present.clone();
     keys.push(absent);
-    let expected = expected_cold_gets(&generation, &present)?;
+    let expected = expected_cold_gets(&generation, &present, &[VALUE_COLUMN])?;
 
     let before = stack.stats.gets();
     let response = stack.multi_get(TABLE, &keys).await?;
@@ -666,14 +715,14 @@ async fn test_multi_get_answers_in_order_from_one_snapshot() -> TestResult {
     for (key, hit) in present.iter().zip(&response.results) {
         assert_eq!(hit.presence, i32::from(v1::Presence::Present), "{key}");
         assert_eq!(
-            Some(hit.value.to_vec()),
+            one_wire_value(&hit.values),
             stack.fixtures[0].value(key),
             "{key}"
         );
     }
     let last = &response.results[keys.len() - 1];
     assert_eq!(last.presence, i32::from(v1::Presence::Absent));
-    assert!(last.value.is_empty());
+    assert!(last.values.is_empty());
     Ok(())
 }
 
@@ -726,7 +775,7 @@ async fn test_get_maps_a_missing_or_mismatched_key_to_invalid_argument() -> Test
     let response = stack.get(UUID_TABLE, Some(wire_key(&uuid_key))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
     assert_eq!(
-        Some(response.value.to_vec()),
+        one_wire_value(&response.values),
         stack.fixtures[1].value(&uuid_key)
     );
     Ok(())
@@ -1196,7 +1245,7 @@ async fn test_refresh_follows_the_table_within_the_poll_interval() -> TestResult
     let response = stack.get(TABLE, Some(wire_key(&new_key))).await?;
     assert_eq!(response.presence, i32::from(v1::Presence::Present));
     assert_eq!(
-        Some(response.value.to_vec()),
+        one_wire_value(&response.values),
         stack.fixtures[0].value(&new_key)
     );
     assert_eq!(response.snapshot_id, advanced.snapshot_id);
@@ -1269,6 +1318,7 @@ async fn test_shutdown_drains_and_returns_ok() -> TestResult {
             .get(GetRequest {
                 table: TABLE.to_string(),
                 key: Some(wire_key(&key)),
+                columns: wire_columns(&[VALUE_COLUMN]),
             })
             .await
     });
@@ -1614,6 +1664,7 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
         let request = GetRequest {
             table: TABLE.to_string(),
             key: Some(wire_key(&keys[0])),
+            columns: wire_columns(&[VALUE_COLUMN]),
         };
         async move { client.get(request).await.map(|_| ()) }
     });
@@ -1622,6 +1673,7 @@ async fn test_a_call_beyond_max_in_flight_is_refused_at_once() -> TestResult {
         let request = MultiGetRequest {
             table: TABLE.to_string(),
             keys: vec![wire_key(&keys[1])],
+            columns: wire_columns(&[VALUE_COLUMN]),
         };
         async move { client.multi_get(request).await.map(|_| ()) }
     });
@@ -1688,6 +1740,7 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
         let mut get = tonic::Request::new(GetRequest {
             table: TABLE.to_string(),
             key: Some(wire_key(key)),
+            columns: wire_columns(&[VALUE_COLUMN]),
         });
         get.set_timeout(CLIENT_DEADLINE);
         let (outcome, elapsed) =
@@ -1718,15 +1771,16 @@ async fn test_a_client_deadline_frees_the_slot_it_held() -> TestResult {
     Ok(())
 }
 
-/// A `MultiGet` of `max_multi_get_keys` keys is answered; one more key is
-/// `INVALID_ARGUMENT` before any lookup, so it issues no GET.
+/// A `MultiGet` of `max_multi_get_values` values is answered, one column of
+/// each key or each key alone; one more value is `INVALID_ARGUMENT` before
+/// any lookup, so it issues no GET.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_multi_get_over_max_keys_is_invalid_argument_before_any_lookup() -> TestResult {
+async fn test_multi_get_over_max_values_is_invalid_argument_before_any_lookup() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::start_with(
         vec![FixtureSpec::small(TABLE, KeyType::Long)],
         async |setup| {
-            setup.config.server.max_multi_get_keys = BATCH_IDS;
+            setup.config.server.max_multi_get_values = BATCH_IDS;
             Ok(())
         },
     )
@@ -1747,6 +1801,183 @@ async fn test_multi_get_over_max_keys_is_invalid_argument_before_any_lookup() ->
     for hit in &response.results {
         assert_eq!(hit.presence, i32::from(v1::Presence::Present));
     }
+    let presence_only = stack.multi_get_naming(TABLE, at_limit, &[]).await?;
+    assert_eq!(
+        presence_only.results.len(),
+        BATCH_IDS,
+        "a presence-only key counts one value"
+    );
+    let before = stack.stats.gets();
+    assert_eq!(
+        code_of(
+            stack
+                .multi_get_naming(TABLE, &keys[..=BATCH_IDS], &[])
+                .await
+        ),
+        Code::InvalidArgument
+    );
+    assert_eq!(stack.stats.gets(), before, "a refused batch issues no GET");
+    Ok(())
+}
+
+/// A column the table does not serve, and a column named twice, are the
+/// caller's faults on `Get` and `MultiGet` alike, refused before any read;
+/// a presence-only call reads no value page.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unknown_or_repeated_column_is_invalid_argument_and_presence_only_reads_nothing()
+-> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_small().await?;
+    let key = stack.fixtures[0].key(SAMPLE[0]);
+    let before = stack.stats.gets();
+    for columns in [&["unserved"][..], &[VALUE_COLUMN, VALUE_COLUMN]] {
+        assert_eq!(
+            code_of(stack.get_naming(TABLE, Some(wire_key(&key)), columns).await),
+            Code::InvalidArgument,
+            "{columns:?}"
+        );
+        assert_eq!(
+            code_of(
+                stack
+                    .multi_get_naming(TABLE, std::slice::from_ref(&key), columns)
+                    .await
+            ),
+            Code::InvalidArgument,
+            "{columns:?}"
+        );
+    }
+    let present = stack.get_naming(TABLE, Some(wire_key(&key)), &[]).await?;
+    assert_eq!(present.presence, i32::from(v1::Presence::Present));
+    assert!(present.values.is_empty(), "presence alone carries no value");
+    let absent = stack.fixtures[0].absent_near(SAMPLE[0]);
+    let absent = stack
+        .get_naming(TABLE, Some(wire_key(&absent)), &[])
+        .await?;
+    assert_eq!(absent.presence, i32::from(v1::Presence::Absent));
+    assert_eq!(stack.stats.gets(), before, "no value page is read");
+    Ok(())
+}
+
+/// A table serving two value columns: the fixture's entry naming
+/// `SECOND_VALUE_COLUMN` beside the value column, listed out of name
+/// order, which carries no meaning.
+async fn two_column_stack() -> Result<Stack, BoxError> {
+    let spec = FixtureSpec {
+        second_value: true,
+        ..FixtureSpec::small(TABLE, KeyType::Long)
+    };
+    let mut stack = Stack::start_with(vec![spec], async |setup| {
+        setup.config.tables[0].value_columns = vec![
+            ValueColumnConfig::named(VALUE_COLUMN),
+            ValueColumnConfig::named(SECOND_VALUE_COLUMN),
+        ];
+        Ok(())
+    })
+    .await?;
+    stack.serving.ready().await;
+    Ok(stack)
+}
+
+/// `TableInfo` lists the value columns a lookup may name, in name order,
+/// each with its type and, for a `fixed` column alone, a width.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_table_info_lists_the_value_columns() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = two_column_stack().await?;
+    let info = stack.table_info(TABLE).await?;
+    let binary = |name: &str| v1::ValueColumn {
+        name: name.to_string(),
+        value_type: i32::from(v1::ValueType::Binary),
+        width: 0,
+    };
+    assert_eq!(
+        info.value_columns,
+        [binary(SECOND_VALUE_COLUMN), binary(VALUE_COLUMN)],
+        "in name order"
+    );
+    Ok(())
+}
+
+/// `Get` and `MultiGet` naming two columns carry one value per column, in
+/// the order the request names them, over the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_and_multi_get_carry_two_columns_in_request_order() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = two_column_stack().await?;
+    let fixture = &stack.fixtures[0];
+    let keys = fixture.keys_at(&SAMPLE);
+    let expected = |key: &Key, columns: &[&str]| -> Vec<Option<Vec<u8>>> {
+        columns
+            .iter()
+            .map(|&column| match column {
+                VALUE_COLUMN => fixture.value(key),
+                _ => fixture.second_value(key),
+            })
+            .collect()
+    };
+    let orders = [
+        [VALUE_COLUMN, SECOND_VALUE_COLUMN],
+        [SECOND_VALUE_COLUMN, VALUE_COLUMN],
+    ];
+    let wanted: Vec<_> = orders
+        .iter()
+        .map(|order| expected(&keys[0], order))
+        .collect();
+    assert_ne!(wanted[0], wanted[1], "the two orders differ");
+    let batches: Vec<Vec<Vec<Option<Vec<u8>>>>> = orders
+        .iter()
+        .map(|order| keys.iter().map(|key| expected(key, order)).collect())
+        .collect();
+    for (order, (single, batch)) in orders.iter().zip(wanted.iter().zip(&batches)) {
+        let got = stack
+            .get_naming(TABLE, Some(wire_key(&keys[0])), order)
+            .await?;
+        assert_eq!(got.presence, i32::from(v1::Presence::Present));
+        let values: Vec<_> = got.values.iter().map(wire_value).collect();
+        assert_eq!(&values, single, "{order:?}");
+        let answered = stack.multi_get_naming(TABLE, &keys, order).await?;
+        let values: Vec<Vec<_>> = answered
+            .results
+            .iter()
+            .map(|hit| hit.values.iter().map(wire_value).collect())
+            .collect();
+        assert_eq!(&values, batch, "{order:?}");
+    }
+    Ok(())
+}
+
+/// A null value and a present value of zero length are distinct on the
+/// wire: `null` and `bytes` holding nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_tells_a_null_from_a_zero_length_value() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let spec = FixtureSpec {
+        nulls: Nulls::EveryNth(NULL_EVERY),
+        value_bytes: 0,
+        ..FixtureSpec::small(TABLE, KeyType::Long)
+    };
+    let mut stack = Stack::start(vec![spec]).await?;
+    stack.serving.ready().await;
+    let null = stack
+        .get(TABLE, Some(wire_key(&stack.fixtures[0].key(NULL_ID))))
+        .await?;
+    let empty = stack
+        .get(TABLE, Some(wire_key(&stack.fixtures[0].key(PRESENT_ID))))
+        .await?;
+    assert_eq!(null.presence, i32::from(v1::Presence::Present));
+    assert_eq!(empty.presence, i32::from(v1::Presence::Present));
+    assert_eq!(
+        null.values,
+        [v1::ColumnValue {
+            kind: Some(v1::column_value::Kind::NullValue(v1::NullValue {})),
+        }]
+    );
+    assert_eq!(
+        empty.values,
+        [v1::ColumnValue {
+            kind: Some(v1::column_value::Kind::Value(bytes::Bytes::new())),
+        }]
+    );
     Ok(())
 }
 
@@ -1777,6 +2008,7 @@ async fn test_drain_stops_waiting_at_its_deadline() -> TestResult {
             .get(GetRequest {
                 table: TABLE.to_string(),
                 key: Some(wire_key(&key)),
+                columns: wire_columns(&[VALUE_COLUMN]),
             })
             .await
     });

@@ -24,6 +24,11 @@
 > before its value column was added answers the column's default. See
 > RFD 023.
 
+> Updated 2026-10-07: a table may serve several value columns. The
+> `value_type_unsupported` refusal names its column, and a
+> dictionary-encoded value column's extra GET falls on the hits that name
+> that column. See RFD 022.
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -44,8 +49,8 @@ deviation costs, and the two must agree on one classification.
 A table icetray cannot serve correctly (unsorted files, null or duplicate
 keys, keys outside their file's recorded bucket, a key column whose
 physical type does not match the schema, a configured column a data file
-does not hold as the schema means it, a value column that is not
-binary, fixed, or string, equality deletes and unreadable deletes that
+does not hold as the schema means it, a configured value column that is
+not binary, fixed, or string, equality deletes and unreadable deletes that
 may apply, keys over 4,096 bytes, and the residency refusals of RFD 017
 (Residency tiers)) will be refused at load with a named reason; a table it
 can serve only inefficiently (a dictionary-encoded value column, key pages
@@ -73,7 +78,8 @@ Placements settled elsewhere:
   stay off the lookup path.
 - A dictionary-encoded key column costs nothing extra, since its dictionary
   page is in the resident chunk. A dictionary-encoded value column is
-  inefficient by one extra GET per hit.
+  inefficient by one extra GET per hit that names it, and the finding
+  names the column (RFD 022 (Value columns)).
 - Overlapping files in a bucket, and a table with no bucket partition, are
   inefficient, measured in files probed per lookup. A duplicate key across overlapping
   files is a refusal, detected as RFD 005 (Generations and refresh)
@@ -99,8 +105,9 @@ Placements settled elsewhere:
   oversized page and can be pushed above the ceiling by a large value
   dictionary. It cannot name the lookups that will be refused, so it does
   not decide whether the table serves (RFD 016).
-- A value column that is not binary, fixed, or string is refused because
-  the wire carries a value as opaque bytes (RFD 010 (Transport and client
+- A configured value column that is not binary, fixed, or string is
+  refused as `value_type_unsupported`, naming the column, because the
+  wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)). A typed column has no defined encoding there, and any answer
   would be a guess. RFD 002 (Serving layout contract) states the clause.
 - A configured column a data file does not hold as the snapshot's schema
@@ -111,7 +118,7 @@ Placements settled elsewhere:
   a name that is not a top-level field, and a default that does not
   read. A swap of two names would otherwise
   serve one column's bytes under the other's name. A file that records
-  field ids and lacks the value column was written before the column was
+  field ids and lacks a value column was written before the column was
   added and answers its default, which is no deviation. RFD 023 (Column
   resolution) gives the rule.
 - Equality deletes and unreadable deletes that may apply are refused;

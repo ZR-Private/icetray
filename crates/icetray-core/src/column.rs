@@ -233,21 +233,23 @@ fn leaf_of(schema: &SchemaDescriptor, at: usize) -> Option<usize> {
 }
 
 /// The key and value columns of one data file under a layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileColumns {
     /// The key column's leaf.
     pub(crate) key_leaf: usize,
-    /// The value column's leaf; `None` for a file written before the
-    /// column was added, which answers the layout's `value_default`.
-    pub(crate) value_leaf: Option<usize>,
+    /// Each value column's leaf, in the layout's order; `None` for a file
+    /// written before the column was added, which answers the column's
+    /// default.
+    pub(crate) value_leaves: Vec<Option<usize>>,
 }
 
 /// The key and value columns of the data file at `path`, whose schema is
-/// `schema`, under `layout`, the snapshot's (`find`), or
-/// `RefusalReason::ColumnMismatch` under `table` naming the column and the
-/// file: a key column the file lacks (`ColumnMismatch::KeyAbsent`, since a
-/// key has no default), any mismatch `find` gives, and a `fixed` key or
-/// value column stored at another width (`check_width`).
+/// `schema`, under `layout`, the snapshot's (`find`), each value column by
+/// the same rules on its own (RFD 022), or `RefusalReason::ColumnMismatch`
+/// under `table` naming the first column at fault and the file: a key
+/// column the file lacks (`ColumnMismatch::KeyAbsent`, since a key has no
+/// default), any mismatch `find` gives, and a `fixed` key or value column
+/// stored at another width (`check_width`).
 pub(crate) fn resolve(
     table: &str,
     path: &str,
@@ -273,18 +275,22 @@ pub(crate) fn resolve(
         Ok(Found::Absent) => return Err(refuse(&layout.key_column, ColumnMismatch::KeyAbsent)),
         Err(mismatch) => return Err(refuse(&layout.key_column, mismatch)),
     };
-    let value_leaf = match find(schema, &layout.value_column, layout.value_field_id) {
-        Ok(Found::Leaf(leaf)) => {
-            check_width(&schema.column(leaf), layout.value_width)
-                .map_err(|mismatch| refuse(&layout.value_column, mismatch))?;
-            Some(leaf)
-        }
-        Ok(Found::Absent) => None,
-        Err(mismatch) => return Err(refuse(&layout.value_column, mismatch)),
-    };
+    let value_leaves = layout
+        .value_columns
+        .iter()
+        .map(|column| match find(schema, &column.name, column.field_id) {
+            Ok(Found::Leaf(leaf)) => {
+                check_width(&schema.column(leaf), column.width())
+                    .map_err(|mismatch| refuse(&column.name, mismatch))?;
+                Ok(Some(leaf))
+            }
+            Ok(Found::Absent) => Ok(None),
+            Err(mismatch) => Err(refuse(&column.name, mismatch)),
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(FileColumns {
         key_leaf,
-        value_leaf,
+        value_leaves,
     })
 }
 
@@ -475,6 +481,7 @@ mod tests {
     use super::*;
     use crate::key::KeyType;
     use crate::manifest::testing::{self as manifest_testing, KEY_FIELD_ID, VALUE_FIELD_ID};
+    use crate::manifest::{ValueColumnLayout, ValueType};
 
     /// The configured names and their field ids in the snapshot's schema.
     const KEY: &str = "key";
@@ -669,8 +676,12 @@ mod tests {
     /// A layout over the key and value columns, the value `fixed` of
     /// `width` when given.
     fn layout(width: Option<u64>) -> TableLayout {
+        let value_type = width.map_or(ValueType::Binary, |width| ValueType::Fixed { width });
         TableLayout {
-            value_width: width,
+            value_columns: vec![ValueColumnLayout {
+                value_type,
+                ..manifest_testing::binary_column(VALUE, VALUE_FIELD_ID)
+            }],
             ..manifest_testing::layout(KeyType::Long, None)
         }
     }
@@ -715,7 +726,53 @@ mod tests {
             resolve(TABLE, PATH, &schema, &layout(None)).unwrap(),
             FileColumns {
                 key_leaf: 0,
-                value_leaf: None,
+                value_leaves: vec![None],
+            }
+        );
+    }
+
+    /// Each value column is resolved on its own (RFD 022): in one file one
+    /// column is served and another, added after the file was written,
+    /// answers its default, while a mismatch of either refuses the file
+    /// naming that column.
+    #[test]
+    fn test_resolve_resolves_each_value_column_on_its_own() {
+        let layout = TableLayout {
+            value_columns: vec![
+                manifest_testing::binary_column("added", OTHER_FIELD_ID),
+                manifest_testing::binary_column(VALUE, VALUE_FIELD_ID),
+            ],
+            ..manifest_testing::layout(KeyType::Long, None)
+        };
+        let schema = schema_of("message m { required int64 key = 1; optional binary value = 2; }");
+        assert_eq!(
+            resolve(TABLE, PATH, &schema, &layout).unwrap(),
+            FileColumns {
+                key_leaf: 0,
+                value_leaves: vec![None, Some(1)],
+            }
+        );
+        let swapped = schema_of("message m { required int64 key = 1; optional binary value = 3; }");
+        assert_eq!(
+            mismatch_of(resolve(TABLE, PATH, &swapped, &layout)),
+            (
+                VALUE.to_string(),
+                Some(PATH.to_string()),
+                ColumnMismatch::OtherFieldId {
+                    expected: VALUE_FIELD_ID,
+                    found: THIRD_FIELD_ID,
+                }
+            )
+        );
+        let presence_only = TableLayout {
+            value_columns: Vec::new(),
+            ..layout
+        };
+        assert_eq!(
+            resolve(TABLE, PATH, &swapped, &presence_only).unwrap(),
+            FileColumns {
+                key_leaf: 0,
+                value_leaves: Vec::new(),
             }
         );
     }
@@ -728,8 +785,8 @@ mod tests {
         assert_eq!(
             resolve(TABLE, PATH, &at_width, &layout(Some(FIXED_WIDTH)))
                 .unwrap()
-                .value_leaf,
-            Some(1)
+                .value_leaves,
+            [Some(1)]
         );
         let narrower = schema_of(
             "message m { required int64 key = 1; optional fixed_len_byte_array(4) value = 2; }",
@@ -754,8 +811,8 @@ mod tests {
         assert_eq!(
             resolve(TABLE, PATH, &narrower, &layout(None))
                 .unwrap()
-                .value_leaf,
-            Some(1)
+                .value_leaves,
+            [Some(1)]
         );
     }
 

@@ -78,10 +78,11 @@ async fn run(cli: Cli, raised: io::Result<u64>) -> ExitCode {
         Command::Get {
             target,
             table,
+            columns,
             keys,
         } => {
             run_oneshot(&target, table, raised, |config, table| async move {
-                oneshot::get(&config, table.as_deref(), &keys)
+                oneshot::get(&config, table.as_deref(), &columns, &keys)
                     .await
                     .map(|()| ExitCode::from(EXIT_OK))
             })

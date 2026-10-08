@@ -967,7 +967,7 @@ mod tests {
             source: source.clone(),
             r#ref: "main".to_string(),
             key_column: "key".to_string(),
-            value_column: "value".to_string(),
+            value_columns: vec![icetray_core::ValueColumnConfig::named("value")],
             strict: false,
             lookups: None,
             residency,

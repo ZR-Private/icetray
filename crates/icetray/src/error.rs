@@ -210,13 +210,19 @@ pub enum CallFault {
         /// `server.max_in_flight`.
         limit: usize,
     },
-    /// A `MultiGet` carried more keys than one batch may, refused before
-    /// any lookup. The caller's fault, so `INVALID_ARGUMENT` on the wire.
-    #[error("a MultiGet carries at most {limit} keys, got {keys}")]
-    TooManyKeys {
+    /// A `MultiGet` asked for more values than one batch may, its keys
+    /// times the columns it names, a presence-only key counting one (RFD
+    /// 022), refused before any lookup. The caller's fault, so
+    /// `INVALID_ARGUMENT` on the wire.
+    #[error(
+        "a MultiGet asks for at most {limit} values, got {keys} keys of {columns} columns each"
+    )]
+    TooManyValues {
         /// The keys the batch carried.
         keys: usize,
-        /// `server.max_multi_get_keys`.
+        /// The columns it named.
+        columns: usize,
+        /// `server.max_multi_get_values`.
         limit: usize,
     },
 }
@@ -366,6 +372,10 @@ pub enum CliError {
     /// Command-line text that is not a key of the table's type.
     #[error(transparent)]
     Key(#[from] KeyTextFault),
+    /// A `get --column` the table is not configured to serve, or one given
+    /// twice: `icetray_core::Error::ColumnRequest`, found before the load.
+    #[error(transparent)]
+    Column(icetray_core::Error),
     /// Writing a line failed for a reason other than a closed pipe.
     #[error("cannot write output: {0}")]
     Io(#[from] std::io::Error),
@@ -443,6 +453,7 @@ impl CliError {
             | Self::WorkingDirectory { .. }
             | Self::WorkingDirectoryNotUtf8 { .. }
             | Self::Location(_)
+            | Self::Column(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::BrokenPipe
@@ -467,6 +478,7 @@ impl CliError {
             | Self::Location(_)
             | Self::NoTableMatched { .. }
             | Self::TableNameRequired { .. }
+            | Self::Column(_)
             | Self::Key(_) => EXIT_USAGE,
             Self::BrokenPipe => EXIT_OK,
         };
@@ -547,7 +559,7 @@ mod tests {
     #[test]
     fn test_read_rejects_a_file_carrying_its_path_origin_and_violation() {
         let table = format!(
-            "[[tables]]\nname = \"{TABLE}\"\nsource = {{ type = \"static\", location = \"s3://warehouse/db/kv\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n"
+            "[[tables]]\nname = \"{TABLE}\"\nsource = {{ type = \"static\", location = \"s3://warehouse/db/kv\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n"
         );
         let mut file = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, format!("{table}{table}").as_bytes()).unwrap();

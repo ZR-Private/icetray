@@ -47,11 +47,11 @@ use iceberg::{
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use icetray_core::approx::count;
 use icetray_core::catalog::{TableSource, hint_location, version_file};
-use icetray_core::config::{Residency, SourceConfig, TableConfig};
+use icetray_core::config::{Residency, SourceConfig, TableConfig, ValueColumnConfig};
 use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
-use icetray_core::{Key, KeyType, Value};
+use icetray_core::{Key, KeyType, Row};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
@@ -656,13 +656,32 @@ impl Fixture {
         self.versions.get(&id).copied().unwrap_or(FIRST_VERSION)
     }
 
-    /// The lookup outcome for a key this fixture holds: `Present` with its
-    /// value, or `Null`.
-    pub fn expected(&self, key: &Key) -> Value {
-        match self.value(key) {
-            Some(value) => Value::Present(Bytes::from(value)),
-            None => Value::Null,
-        }
+    /// What a lookup naming `VALUE_COLUMN` alone answers for a key this
+    /// fixture holds (`expected_of`).
+    pub fn expected(&self, key: &Key) -> Row {
+        self.expected_of(key, &[VALUE_COLUMN])
+    }
+
+    /// What a lookup naming `columns`, each `VALUE_COLUMN` or
+    /// `SECOND_VALUE_COLUMN`, answers for a key this fixture holds:
+    /// `Present` with each column's value in that order, `None` for a
+    /// null.
+    ///
+    /// Panics on a column the fixture writes no value for.
+    pub fn expected_of(&self, key: &Key, columns: &[&str]) -> Row {
+        Row::Present(
+            columns
+                .iter()
+                .map(|&column| {
+                    let value = match column {
+                        VALUE_COLUMN => self.value(key),
+                        SECOND_VALUE_COLUMN => self.second_value(key),
+                        other => panic!("the fixture writes no column {other}"),
+                    };
+                    value.map(Bytes::from)
+                })
+                .collect(),
+        )
     }
 
     /// Every key written, ascending by id.
@@ -741,7 +760,7 @@ impl Fixture {
             source: self.pinned_source(),
             r#ref: MAIN_BRANCH.to_string(),
             key_column: KEY_COLUMN.to_string(),
-            value_column: VALUE_COLUMN.to_string(),
+            value_columns: vec![ValueColumnConfig::named(VALUE_COLUMN)],
             strict,
             lookups: None,
             residency,

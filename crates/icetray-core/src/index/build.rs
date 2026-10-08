@@ -96,7 +96,7 @@ impl Inspected {
             metadata,
             key_leaf: layout.key_leaf,
             key_shape: layout.key_shape,
-            value: layout.value,
+            values: layout.values,
             keys,
             fences: verified.fences,
             groups: verified.groups,
@@ -1166,6 +1166,7 @@ mod tests {
 
     use super::*;
     use crate::approx::{self, count};
+    use crate::cache::Issue;
     use crate::config::{ConfigError, ConfigViolation};
     use crate::error::ErrorKind;
     use crate::generation::testing::Dictionary;
@@ -1222,7 +1223,11 @@ mod tests {
         assert_eq!(index.max_key_bytes(), MAX_KEY_BYTES);
         for i in 0..FEW_ROWS {
             let key = Key::Str(format!("{:0>MAX_KEY_BYTES$}", stepped(i)));
-            let row = index.find(&key, None).await.unwrap().unwrap();
+            let row = index
+                .find(&key, None, Issue::default())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 row,
                 RowRef {
@@ -1286,13 +1291,22 @@ mod tests {
         let index = store(&sorted).await.index(KeyType::Long).await;
         assert_eq!(index.metadata().num_row_groups(), 2);
         assert_eq!(
-            index.find(&Key::Long(25), None).await.unwrap(),
+            index
+                .find(&Key::Long(25), None, Issue::default())
+                .await
+                .unwrap(),
             Some(RowRef {
                 row_group: 1,
                 row: 0
             })
         );
-        assert_eq!(index.find(&Key::Long(22), None).await.unwrap(), None);
+        assert_eq!(
+            index
+                .find(&Key::Long(22), None, Issue::default())
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2296,7 +2310,7 @@ mod tests {
         assert_eq!(again.key_range(), index.key_range());
         assert_eq!(again.fences(), index.fences());
         let row = again
-            .find(&key_for(hit, KeyType::Long), Some(&cache))
+            .find(&key_for(hit, KeyType::Long), Some(&cache), Issue::default())
             .await
             .unwrap()
             .unwrap();
@@ -2365,8 +2379,8 @@ mod tests {
         assert_eq!(index.max_key_bytes(), oracle.max_key_bytes());
         for key in probes(key_type, stride) {
             assert_eq!(
-                index.find(&key, None).await.unwrap(),
-                oracle.find(&key, None).await.unwrap(),
+                index.find(&key, None, Issue::default()).await.unwrap(),
+                oracle.find(&key, None, Issue::default()).await.unwrap(),
                 "{key_type} {key}"
             );
         }

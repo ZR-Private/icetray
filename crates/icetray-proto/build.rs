@@ -13,7 +13,7 @@ const INCLUDE_DIR: &str = "proto";
 /// The fields generated as `bytes::Bytes` rather than `Vec<u8>`: the
 /// values a lookup answers with, so the server hands the bytes it read to
 /// the response without copying them into a new vector.
-const BYTES_FIELDS: [&str; 2] = [".icetray.v1.GetResponse.value", ".icetray.v1.Hit.value"];
+const BYTES_FIELDS: [&str; 1] = [".icetray.v1.ColumnValue.value"];
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed={CONTRACT}");

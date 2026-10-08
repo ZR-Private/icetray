@@ -49,11 +49,13 @@ group. A load reads every key chunk once to verify the keys, and the
 
 **Level.** The lookup cost a table declares it accepts, its `lookups`,
 and the cost its snapshot's layout achieves, each one of `optimal`,
-`balanced`, or `permissive`. `optimal` is one GET per hit and none per
-miss, probing one file; `balanced` probes one file at a fixed extra cost;
-`permissive` is any snapshot icetray serves correctly, including one where
-a lookup probes several files. Residency and the doctor's capping findings
-set the level achieved, and a table below its declared level is flagged.
+`balanced`, or `permissive`. `optimal` is one GET per column a hit reads
+and none per miss, probing one file; `balanced` probes one file at a
+fixed extra cost; `permissive` is any snapshot icetray serves correctly,
+including one where a lookup probes several files. Residency and the
+doctor's capping findings set the level achieved. Each value column has a
+level, the table's is its dearest column's, and a table below its
+declared level is flagged.
 See [Choosing a level](configuration.md#choosing-a-level).
 
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
@@ -75,3 +77,9 @@ and the fence array in memory), or `bloom` (bloom filters in memory instead). Se
 whose layout puts the table below its level instead of serving it
 flagged. A strict table holds its last snapshot that met the level, and
 fails to start when its first snapshot is below it.
+
+**Value column.** A column a table serves as bytes, listed in its
+`value_columns` and read only when a lookup names it; a table may list
+none, to answer only whether a key is present. Each column a cold hit
+names costs a GET of its own, so one packed column performs best. See
+[Value columns](table-contract.md#value-columns).

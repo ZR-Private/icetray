@@ -1,19 +1,20 @@
 # Performance and tuning
 
-A lookup in icetray costs three kinds of work, and they differ by orders of
-magnitude. A GET to object storage takes tens of milliseconds, and longer
-for a file nobody has read for hours. A read from the local directory is a
-memory copy when the operating system's page cache holds the file, and a
-device read when it does not. The CPU work of a lookup, which decodes one
-key page and decompresses one value page, takes microseconds to tens of
-microseconds. Most tuning decides how many lookups pay for a GET, and how
-much memory or local disk serves the others.
+A lookup in icetray costs three kinds of work, and they differ by orders
+of magnitude. A GET to object storage takes tens of milliseconds, and
+longer for a file nobody has read for hours. A read from the local
+directory is a memory copy when the operating system's page cache holds
+the file, and a device read when it does not. The CPU work of a lookup,
+which decodes one key page and decompresses one value page per column it
+reads, takes microseconds to tens of microseconds. Most tuning decides
+how many lookups pay for a GET, and how much memory or local disk serves
+the others.
 
-Three outcomes recur below. A **cold hit** finds its key and fetches the
-value page from object storage. A **warm hit** finds the value page in the
-page cache. A **miss** finds that the key is absent. Terms such as
-[residency](glossary.md), [key chunk](glossary.md), and
-[fence array](glossary.md) are in the glossary.
+Three outcomes recur below. A **cold hit** finds its key and fetches a
+value page from object storage. A **warm hit** finds every value page it
+needs in the page cache. A **miss** finds that the key is absent. Terms
+such as [residency](glossary.md), [key chunk](glossary.md), and [fence
+array](glossary.md) are in the glossary.
 
 ## What a lookup costs
 
@@ -23,6 +24,13 @@ page cache. A **miss** finds that the key is absent. Terms such as
 | `disk` | 1 local read and 1 GET | 1 local read | 1 local read |
 | `bloom` | 2 GETs: the key page, then the value page | nothing outside memory | nothing, or 1 GET when the filter passes an absent key |
 
+The table is for a lookup that names one value column. Each further
+column it names adds one value-page GET to a cold hit, two for a
+dictionary-encoded column, and none for a column the row's file answers
+by its default. A lookup that names no column asks only whether its key
+is present, and costs only finding the row: nothing outside memory under
+`full`, a local read under `disk`, and the key page's GET under `bloom`.
+
 A cold hit spends nearly all of its time waiting on its GET, so its latency
 is the object store's. A warm hit and a miss under `full` never leave
 memory and take microseconds. Under `disk` they add a local read of one
@@ -31,8 +39,37 @@ and a device read when it is not. `icetray get` prints each lookup's
 `gets`, so the GET count of a residency can be checked on a real table
 before choosing it.
 
-A `MultiGet` runs 32 of its lookups at a time, so a batch whose keys are
-all cold waits on the order of one GET's latency for every 32 keys.
+A `MultiGet` holds at most 32 GETs in flight across the batch, each GET
+a lookup issues taking one slot while it runs, so a batch whose keys
+are all cold waits on the order of one GET's latency for every 32 GETs:
+every 32 keys when it names one column, every 16 when it names two, and
+fewer when a column is dictionary-encoded, since its dictionary page is
+a GET of its own.
+
+## Packing or splitting a row
+
+A table may serve several [value columns](glossary.md), and a lookup
+reads only the columns it names ([RFD 022](rfd/022-value-columns.md)).
+The GETs of a cold hit naming several columns are issued concurrently,
+each hedged on its own, so the hit waits on the slowest of them, and its
+tail is wider than a one-column hit's even with every GET hedged.
+Columns share the page cache, which is keyed by file and offset.
+
+- One packed column performs best: a row packed into one `binary` column,
+  such as a serialized protobuf, costs one GET per cold hit. It is the
+  right layout for a table read by one kind of caller.
+- A table read by several kinds of caller splits its row along how it is
+  read. Fields read together share a column. A large part read on its
+  own, such as an embedding, gets a column of its own, so a caller that
+  wants only the small fields neither fetches nor decodes it, and the
+  page cache holds more of the small fields' hot rows.
+- A caller that needs most of a row is better served by one packed
+  column than by naming several, which costs a GET per column.
+
+`icetray_value_page_gets_total` counts each column's GETs, and
+`icetray_table_column_gets_per_hit` gives each column's cold cost, so a
+caller can add up what a request will spend
+([Metrics](operating.md#metrics)).
 
 ## Choosing a residency
 
@@ -67,8 +104,11 @@ decision behind the three tiers is
 Memory also has a part per data file: each file's footer and page indexes
 stay resident under every residency. At the contract's file sizes that
 part is small beside the keys. Many small files raise it, and so do values
-of kilobytes, where each value page holds only a few values and the value
-column's offset index carries an entry per page.
+of kilobytes, where each value page holds only a few values and each
+value column's offset index carries an entry per page. Only the offset
+indexes of the key and of the configured value columns stay resident;
+every other column's are dropped at load, so a column the table does not
+serve costs no memory.
 
 ## Sizing from the doctor's predicted bytes
 
@@ -216,9 +256,10 @@ cheapest:
   page's row count is the keys a lookup decodes. Pages above 2,000 rows
   draw `large_key_pages`, which caps the table's level at `balanced`.
 - **Value pages bounded by bytes.** A hit fetches and decompresses one
-  whole value page and caches it. For values of kilobytes the contract
-  bounds pages at 64 KiB; a page bounded by rows alone grows to megabytes,
-  which every hit transfers and the doctor advises against above 1 MiB.
+  whole value page for each column it names and caches it. For values of
+  kilobytes the contract bounds pages at 64 KiB; a page bounded by rows
+  alone grows to megabytes, which every hit transfers and the doctor
+  advises against above 1 MiB.
 - **Data files of 32 to 64 MiB.** Each file adds a footer read at load,
   resident index overhead, and under `disk` a descriptor. A range GET's
   first-byte time also varies with the size of the file it reads.
@@ -266,12 +307,15 @@ blocking, so every local read there moves to another thread
 ## The decisions behind these trade-offs
 
 - [RFD 004](rfd/004-resident-key-chunk-index.md): what stays resident per
-  data file, and why a hit costs one GET and a miss none.
+  data file, and why a hit costs one GET per column it reads and a miss
+  none.
 - [RFD 006](rfd/006-lookup-hot-path.md): the CPU a lookup spends decoding
-  its two pages.
+  its key page and its value pages.
 - [RFD 013](rfd/013-tail-latency.md): hedging, deadlines, and the bounds on
   loads.
 - [RFD 017](rfd/017-residency-tiers.md): the three residencies, the local
   directory, and the descriptors they hold.
 - [RFD 002](rfd/002-serving-layout-contract.md): the layout the table
   contract asks writers for.
+- [RFD 022](rfd/022-value-columns.md): value columns, and when to split a
+  row across them.

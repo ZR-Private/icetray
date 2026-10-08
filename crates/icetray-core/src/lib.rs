@@ -37,18 +37,18 @@ pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
-    FileReport, Finding, FindingCode, LookupCost, Penalty, TableReport, TableSummary,
-    WriterProperty, diagnose, judge,
+    Capping, ColumnCost, ColumnLevel, ColumnSummary, FileReport, Finding, FindingCode, LookupCost,
+    Penalty, TableReport, TableSummary, ValueColumnReport, WriterProperty, diagnose, judge,
 };
 pub use column::ColumnMismatch;
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
-    StandardField, StorageConfig, TableConfig,
+    StandardField, StorageConfig, TableConfig, ValueColumnConfig,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete};
-pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Value};
+pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Row};
 pub use index::{
     ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, PageHeaderFault, PageRef,
     ResidentBytes, WireType,
@@ -56,7 +56,9 @@ pub use index::{
 pub use key::{Key, KeyBytes, KeyType};
 pub use level::{FALL_PER_MILLE, Level, PAGE_CACHE_SAMPLE_INTERVAL, PER_MILLE, RECOVER_PER_MILLE};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
-pub use manifest::{Bucketing, DataFileEntry, TableLayout};
+pub use manifest::{
+    Bucketing, ColumnRequestFault, DataFileEntry, TableLayout, ValueColumnLayout, ValueType,
+};
 pub use open::{Applied, Opened, Refused, Tables, open};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, LocationError, LocationFault, Storage};

@@ -8,6 +8,11 @@
 > `strict` takes the meaning RFD 020 (Lookup levels) gives it, off by
 > default. A `lookups` the residency cannot reach is invalid.
 
+> Updated 2026-10-07: a table entry lists its value columns in
+> `value_columns`, which replaces `value_column` and may be empty; a name
+> listed twice, or the key column listed, is invalid. The server's
+> MultiGet limit is `server.max_multi_get_values`. See RFD 022.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -41,15 +46,22 @@ contract) says where the path comes from.
 
 The configuration covers the server, storage, and tables. For the server
 it holds the listen addresses, the interval at which RFD 005 (Generations
-and refresh) polls the ref, and the page cache budget. For storage it
+and refresh) polls the ref, the page cache budget, and the MultiGet
+limit `server.max_multi_get_values` of RFD 010 (Transport and client
+contract), which must be above zero. For storage it
 holds the endpoint and region, the prefix map for location rewriting, the
 hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
 static keys RFD 003 (One storage stack) lets configuration supply, and the
 optional local directory of RFD 012 (Deployment contract). Tables are a
 list of at least one, and each entry has a name, a source, a ref, a key
-column, a value column, `lookups` and `strict` (whose meanings are RFD
+column, `value_columns`, `lookups` and `strict` (whose meanings are RFD
 020 (Lookup levels)), and the `residency` and resident-bytes budget of RFD
-017 (Residency tiers). The source is one of four kinds: a static table
+017 (Residency tiers). `value_columns` is a required list of the column
+names the table serves (RFD 022 (Value columns)). It may be empty, for a
+table that answers only whether a key is present. A name listed twice,
+or the key column listed as a value, is invalid. Order carries no
+meaning, so two entries that list the same set in another order are
+equal. The source is one of four kinds: a static table
 root or metadata file, an Iceberg REST catalog, or a table in Glue or in S3
 Tables (RFD 019 (AWS catalog sources)). The prototype's TOML configuration had this shape
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).

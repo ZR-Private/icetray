@@ -24,7 +24,7 @@ use icetray_core::deletes::{
     CARDINALITY_PROPERTY, FILE_PATH_COLUMN, POS_COLUMN, REFERENCED_DATA_FILE_PROPERTY,
 };
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{Key, Value};
+use icetray_core::{Key, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
@@ -147,15 +147,13 @@ impl MergeOracle {
         Ok(Self { copies, deleted })
     }
 
-    /// What a lookup of `key` answers: its one live copy's value, or
-    /// `Absent` when every copy is deleted or there is none.
-    pub fn expected(&self, key: &Key) -> Value {
+    /// What a lookup of `key` naming the value column answers: its one
+    /// live copy's value, a null as `None`, or `Absent` when every copy is
+    /// deleted or there is none.
+    pub fn expected(&self, key: &Key) -> Row {
         match self.live_copy(key) {
-            Some(RowCopy {
-                value: Some(value), ..
-            }) => Value::Present(Bytes::from(value.clone())),
-            Some(RowCopy { value: None, .. }) => Value::Null,
-            None => Value::Absent,
+            Some(copy) => Row::Present(vec![copy.value.clone().map(Bytes::from)]),
+            None => Row::Absent,
         }
     }
 
@@ -444,7 +442,7 @@ mod tests {
             let expected = if live.contains(key) {
                 fixture.expected(key)
             } else {
-                Value::Absent
+                Row::Absent
             };
             assert_eq!(oracle.expected(key), expected, "key {key}");
         }
@@ -481,7 +479,7 @@ mod tests {
             assert_eq!(oracle.deleted_rows(), 2, "{form:?}");
             for id in [IN_FIRST, IN_SECOND] {
                 let key = fixture.key(id);
-                assert_eq!(oracle.expected(&key), Value::Absent, "{form:?}");
+                assert_eq!(oracle.expected(&key), Row::Absent, "{form:?}");
                 assert_eq!(oracle.copies(&key).len(), 1);
             }
             assert!(!fixture.ids().any(|id| id == IN_FIRST));
@@ -586,12 +584,12 @@ mod tests {
         let key = fixture.key(IN_FIRST);
         assert_eq!(
             MergeOracle::read(&fixture).await.unwrap().expected(&key),
-            Value::Absent
+            Row::Absent
         );
         fixture.move_ref(before).await.unwrap();
         let oracle = MergeOracle::read(&fixture).await.unwrap();
         assert_eq!(oracle.expected(&key), fixture.expected(&key));
-        assert_ne!(oracle.expected(&key), Value::Absent);
+        assert_ne!(oracle.expected(&key), Row::Absent);
         assert_agrees(&oracle, &fixture);
     }
 

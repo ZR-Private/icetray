@@ -14,8 +14,9 @@ package icetray.v1;
 // Lookups over the tables the server is configured to serve. Naming a table
 // the server does not serve is a NOT_FOUND error. Sending a key whose
 // variant does not match the table's key type, or a key with no variant
-// set, is an INVALID_ARGUMENT error. A key that is not in the table is a
-// normal answer, never an error.
+// set, is an INVALID_ARGUMENT error, and so is naming a value column the
+// table does not serve, or naming one twice. A key that is not in the table
+// is a normal answer, never an error.
 service Icetray {
   // Look up one key in one table. The answer carries the snapshot id it was
   // read from.
@@ -59,34 +60,53 @@ message GetRequest {
   // The key to look up. Its variant must match the table's key type; a
   // request that omits it is an INVALID_ARGUMENT error.
   Key key = 2;
+  // The value columns to read, by name, among those TableInfoResponse
+  // lists. The answer carries one value per name, in this order. An empty
+  // list asks whether the key is present and reads no value; there is no
+  // default column. A name the table does not serve, or a name given
+  // twice, is an INVALID_ARGUMENT error.
+  repeated string columns = 3;
 }
 
-// The outcome of one lookup. The three answered outcomes are distinct on
-// the wire: a key whose value is null is not an absent key.
+// Whether a key is in the snapshot. The two answered outcomes are distinct
+// on the wire, and a present key's values may each be null apart from it.
 enum Presence {
   // Never sent by the server. It is the proto3 default, so a message that
   // reads as unspecified was not answered.
   PRESENCE_UNSPECIFIED = 0;
-  // The key is in the snapshot and its value is not null; `value` carries
-  // the value's bytes.
+  // The key is in the snapshot; `values` carries one value per requested
+  // column.
   PRESENCE_PRESENT = 1;
-  // The key is in the snapshot and its value is null; `value` is empty.
-  // What a null value means is the table owner's rule.
-  PRESENCE_NULL = 2;
-  // The key is not in the snapshot; `value` is empty. A miss is a normal
+  // The key is not in the snapshot; `values` is empty. A miss is a normal
   // answer, not an error.
-  PRESENCE_ABSENT = 3;
+  PRESENCE_ABSENT = 2;
+}
+
+// An empty marker: the value is null.
+message NullValue {}
+
+// One column's value for a present key. Exactly one variant is set. A null
+// value is `null_value`; a value of zero length is `value` holding no
+// bytes; the two are distinct. What a null value means is the table owner's rule.
+message ColumnValue {
+  // Exactly one variant is set.
+  oneof kind {
+    // The value's bytes, unchanged from the table: a binary or fixed
+    // column's bytes, a string column's UTF-8.
+    bytes value = 1;
+    // The value is null.
+    NullValue null_value = 2;
+  }
 }
 
 // The answer to one lookup.
 message GetResponse {
-  // Whether the key is in the snapshot and, when it is, whether its value
-  // is null.
+  // Whether the key is in the snapshot.
   Presence presence = 1;
-  // The value's bytes, unchanged from the table, when presence is
-  // PRESENCE_PRESENT; empty otherwise. An empty value under
-  // PRESENCE_PRESENT is a present value of zero length.
-  bytes value = 2;
+  // When presence is PRESENCE_PRESENT, one value per column the request
+  // named, in the request's order: values[i] answers columns[i]. Empty
+  // otherwise, and empty for a request that named no column.
+  repeated ColumnValue values = 2;
   // The Iceberg snapshot id the answer was read from. Two answers carrying
   // different ids came from different snapshots of the table.
   int64 snapshot_id = 3;
@@ -100,18 +120,24 @@ message MultiGetRequest {
   // The keys to look up. Every variant must match the table's key type.
   // The response carries one result per key, in this order.
   repeated Key keys = 2;
+  // The value columns to read for every key, by name, as GetRequest.columns
+  // reads them: one list for the whole call, empty for presence alone, and
+  // a name not served or given twice an INVALID_ARGUMENT error. A call
+  // asking for more values than the server's limit, its keys times its
+  // columns with a presence-only call counting one per key, is an
+  // INVALID_ARGUMENT error before any key is looked up.
+  repeated string columns = 3;
 }
 
 // The answer to one key of a MultiGet. It carries no snapshot id of its
 // own: every result of a batch came from the one snapshot named on the
 // MultiGetResponse.
 message Hit {
-  // Whether the key is in the snapshot and, when it is, whether its value
-  // is null.
+  // Whether the key is in the snapshot.
   Presence presence = 1;
-  // The value's bytes, unchanged from the table, when presence is
-  // PRESENCE_PRESENT; empty otherwise.
-  bytes value = 2;
+  // When presence is PRESENCE_PRESENT, one value per column the request
+  // named, in the request's order; empty otherwise.
+  repeated ColumnValue values = 2;
 }
 
 // The answers to a MultiGet. The call fails as a whole when any key cannot
@@ -149,6 +175,31 @@ enum KeyType {
   KEY_TYPE_UUID = 4;
 }
 
+// The Iceberg type of a value column. Every type is served as its bytes
+// unchanged: a string as its UTF-8.
+enum ValueType {
+  // Never sent by the server. It is the proto3 default, so a message that
+  // reads as unspecified was not answered.
+  VALUE_TYPE_UNSPECIFIED = 0;
+  // Iceberg `binary`.
+  VALUE_TYPE_BINARY = 1;
+  // Iceberg `fixed`: every value is `ValueColumn.width` bytes.
+  VALUE_TYPE_FIXED = 2;
+  // Iceberg `string`.
+  VALUE_TYPE_STRING = 3;
+}
+
+// One value column the table serves, which a lookup may name.
+message ValueColumn {
+  // The name a lookup names the column by.
+  string name = 1;
+  // The column's type.
+  ValueType value_type = 2;
+  // The bytes of every value of a VALUE_TYPE_FIXED column; 0 for every
+  // other type.
+  uint32 width = 3;
+}
+
 // The snapshot the server currently serves for a table.
 message TableInfoResponse {
   // The name the table was requested under.
@@ -169,4 +220,8 @@ message TableInfoResponse {
   // The bytes resident in memory for this table's lookup index, as one
   // total with no breakdown.
   uint64 index_bytes = 7;
+  // The value columns a lookup may name, in name order, names compared as
+  // their UTF-8 bytes; empty for a table that answers only whether a key
+  // is present.
+  repeated ValueColumn value_columns = 8;
 }

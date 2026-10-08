@@ -5,21 +5,24 @@
 > copy and its live copy sit in different files, and a value of the key
 > alone would let a lookup that answered from the deleted copy pass.
 
+> Updated 2026-10-07: a cold hit costs one GET per column it names. See
+> RFD 022.
+
 ## Problem
 
-icetray's value is a set of cost promises: one GET per cold hit, none per
-miss, load paid per data file, refresh paid per changed file. A functional
-test cannot see any of them, because a lookup that issues three GETs
-returns the same bytes as one that issues one. The prototype showed two
-ways this goes wrong. Cost promises stated in comments had no test that
-counted them, and a review found regressions that a passing suite
-had missed. One refusal had no fixture that produced its input, so it
-could never fire
-([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
+icetray's value is a set of cost promises: one GET per column named on a
+cold hit, none per miss, load paid per data file, refresh paid per
+changed file. A functional test cannot see any of them, because a lookup
+that issues three GETs returns the same bytes as one that issues one.
+The prototype showed two ways this goes wrong. Cost promises stated in
+comments had no test that counted them, and a review found regressions
+that a passing suite had missed. One refusal had no fixture that
+produced its input, so it could never fire ([prototype findings, finding
+15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
 Latency asserted in milliseconds depends on the machine and the network.
-And real batch writers produce layouts that a hand-built fixture does not
-anticipate
-([prototype findings, finding 9](../analysis/2026-09-10-prototype-findings.md#9-spark-writes-several-sorted-files-per-bucket-sometimes-overlapping)).
+And real batch writers produce layouts that a hand-built fixture does
+not anticipate ([prototype findings, finding
+9](../analysis/2026-09-10-prototype-findings.md#9-spark-writes-several-sorted-files-per-bucket-sometimes-overlapping)).
 The project needs a rule for which layer proves what.
 
 ## Decision

@@ -5,8 +5,9 @@
 //! chunk file, or the key column's bloom filters. A lookup chooses its row
 //! group and key page from those exact keys and never from column
 //! statistics, decodes exactly one key page with parquet's column reader
-//! over bytes it already holds, and fetches at most one value page through
-//! the page cache; a miss inside the file's range fetches nothing.
+//! over bytes it already holds, and fetches one value page through the
+//! page cache for each value column a hit names (RFD 022); a miss inside
+//! the file's range fetches nothing.
 
 mod build;
 mod inspect;
@@ -32,7 +33,7 @@ use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::ColumnDescPtr;
 
 use crate::approx;
-use crate::cache::{PageCache, PageOrigin};
+use crate::cache::{Issue, PageCache, PageOrigin};
 use crate::config::Residency;
 use crate::deletes::DeleteFault;
 use crate::error::{Error, Recurrence, Recurs, RefusalReason, Result};
@@ -67,7 +68,7 @@ pub(crate) struct RowPosition(pub(crate) u64);
 /// is closed; a fault outside it is a library error, not a file fault.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FileFault {
-    /// The file has no offset index on the key or the value column; page
+    /// The file has no offset index on the key or a value column; page
     /// locations are how a lookup names the one page it decodes.
     #[error("no page index")]
     MissingPageIndex,
@@ -175,7 +176,7 @@ pub enum FileFault {
         /// The row group holding the value.
         row_group: usize,
     },
-    /// The value column's physical type is neither `BYTE_ARRAY` nor
+    /// A value column's physical type is neither `BYTE_ARRAY` nor
     /// `FIXED_LEN_BYTE_ARRAY`. The snapshot's schema admitted the column as
     /// binary, fixed, or string (`TableLayout::derive` refuses anything else
     /// as `RefusalReason::ValueTypeUnsupported`), and a spec-conformant
@@ -365,24 +366,29 @@ pub(crate) fn saturating_sum_all(values: impl IntoIterator<Item = Option<u64>>) 
 }
 
 /// The page a key would decode and, when it can be named without I/O, the
-/// value page its row would fetch; for tests and the doctor.
+/// row it holds the key at, whose value pages `FileIndex::value_page_offset`
+/// names; for tests and the doctor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageRef {
     /// The row group the fences name.
     pub row_group: usize,
     /// The key page within that row group the fences name.
     pub key_page: usize,
-    /// The file offset of the value page a hit on `key` would fetch. `Some`
-    /// only in the Full tier for a present key in a file that holds the
-    /// value column, where the key page is resident and decodes without
-    /// I/O; `None` for an absent key, for a file that answers the value
-    /// column's default and fetches no value page (RFD 023), and in the
-    /// Disk and Bloom tiers, where naming the value page would take a read.
-    pub value_page_offset: Option<u64>,
-    /// The position of `key`'s row in the file: `Some` only in the Full
-    /// tier for a present key, where the key page is resident and holds
-    /// the key, whether or not the file holds the value column.
+    /// `key`'s row: `Some` only in the Full tier for a present key, where
+    /// the key page is resident and decodes without I/O; `None` for an
+    /// absent key, and in the Disk and Bloom tiers, where naming the row
+    /// would take a read.
+    pub(crate) row: Option<RowRef>,
+    /// The position of `key`'s row in the file, with `row`.
     pub(crate) position: Option<RowPosition>,
+}
+
+impl PageRef {
+    /// Whether the page names its key's row: in the Full tier, whether the
+    /// key is present.
+    pub fn names_row(&self) -> bool {
+        self.row.is_some()
+    }
 }
 
 /// A decoded run of keys in file order, one arm per key type, holding the
@@ -575,7 +581,7 @@ enum ValueShape {
     Fixed,
 }
 
-/// The column a file holds under the configured value column's name (RFD
+/// The column a file holds under a configured value column's name (RFD
 /// 023): its leaf and how its values decode. A file's columns never
 /// change, so the column found by name is the same under every snapshot
 /// that serves the file; whether that snapshot's schema means it is the
@@ -607,12 +613,41 @@ struct GroupRange {
 }
 
 /// Where a lookup's page bytes come from: the store through the page cache
-/// (the value page in every tier, the key page in the Bloom tier), or the
-/// disk tier's chunk file.
+/// (the value page in every tier, the key page in the Bloom tier), each GET
+/// answering to the issue given (`Issue`), or the disk tier's chunk file.
 #[derive(Clone, Copy)]
 enum PageSource<'a> {
-    Store(Option<&'a PageCache>),
+    Store(Option<&'a PageCache>, Issue<'a>),
     Disk(&'a DiskChunks),
+}
+
+/// Where the pages one read took came from: the page it decodes, and the
+/// chunk's dictionary page when it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Origins {
+    page: PageOrigin,
+    dictionary: Option<PageOrigin>,
+}
+
+impl Origins {
+    /// Whether the page or the dictionary page came from object storage, a
+    /// fetch another lookup ran and this one joined included.
+    fn any_fetched(self) -> bool {
+        self.page == PageOrigin::Fetched || self.dictionary == Some(PageOrigin::Fetched)
+    }
+}
+
+/// One value column's value at one row (`FileIndex::read_column`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValueRead {
+    /// The bytes unchanged; `None` for a null, distinct from an absent key.
+    pub(crate) value: Option<Bytes>,
+    /// Where the value page came from.
+    pub(crate) origin: PageOrigin,
+    /// Whether the column's value page or its dictionary page came from
+    /// object storage for the read, a fetch another lookup ran and this one
+    /// joined included.
+    pub(crate) from_store: bool,
 }
 
 /// Everything resident for one data file, built once per generation and
@@ -621,14 +656,16 @@ enum PageSource<'a> {
 #[derive(Debug)]
 pub struct FileIndex {
     handle: Arc<FileHandle>,
-    /// The footer with the key column's page indexes and every column's
-    /// offset index; every other column index is dropped at build.
+    /// The footer with the key column's page indexes and the offset index
+    /// of every value column the table serves; every other column index and
+    /// offset index is dropped at build (`kept_footer`).
     metadata: Arc<ParquetMetaData>,
     key_leaf: usize,
     key_shape: KeyShape,
-    /// The value column; `None` for a file written before the column was
-    /// added, whose rows answer the generation's `value_default`.
-    value: Option<ValueColumn>,
+    /// Per value column of the table's layout, in its order, the column the
+    /// file holds; `None` for one the file was written before, whose rows
+    /// answer that column's default.
+    values: Vec<Option<ValueColumn>>,
     keys: KeyResidency,
     /// Per row group, the first key of every key page.
     fences: Vec<Vec<Key>>,
@@ -680,10 +717,11 @@ impl FileIndex {
     /// decoded), or fetches the chunks, verifies them, and writes them with
     /// that record; it keeps no key bytes in memory. Bloom fetches and
     /// verifies the chunks, drops them, and keeps the filters. Every tier
-    /// keeps the footer, both page indexes of the key column, every
-    /// column's offset index, and the fences; the column index of every
-    /// column but the key, the value column's above all, is never resident
-    /// (RFD 017).
+    /// keeps the footer, both page indexes of the key column, the offset
+    /// index of every value column the table serves, and the fences; the
+    /// column index of every column but the key, the value columns' above
+    /// all, and the offset index of every column the table does not serve,
+    /// are never resident (RFD 004, RFD 017, RFD 022).
     ///
     /// Only tests call this: the loader runs `inspect` and
     /// `Inspected::build` apart, so its budget check sits between them.
@@ -714,10 +752,16 @@ impl FileIndex {
         let key_type = layout.key_type;
         let loaded = handle.load_metadata().await?;
         let layout = Layout::inspect(table, &handle, &loaded, layout)?;
-        let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf));
+        let value_leaves = layout.held_value_leaves();
+        let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf, &value_leaves));
         drop(loaded);
-        let predicted =
-            Self::predicted_resident_bytes(&metadata, layout.key_leaf, key_type, &handle);
+        let predicted = Self::predicted_resident_bytes(
+            &metadata,
+            layout.key_leaf,
+            &value_leaves,
+            key_type,
+            &handle,
+        );
         tracing::debug!(
             path = %handle.location,
             full = predicted.full,
@@ -739,9 +783,10 @@ impl FileIndex {
     /// Every tier's resident bytes for the file `handle` opens, from its
     /// footer alone (RFD 017), the same given the footer as loaded or as
     /// `FileIndex` keeps it (`metadata()`): the column index of every column
-    /// but the key is never resident and is not counted either way, so a
-    /// budget check at the footer stage predicts what `resident_bytes` will
-    /// report. Exact: the footer and the page indexes kept
+    /// but the key, and the offset index of every column but the key and
+    /// `value_leaves`, are never resident and are not counted either way, so
+    /// a budget check at the footer stage predicts what `resident_bytes`
+    /// will report. Exact: the footer and the page indexes kept
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
     /// chunks (the footer's compressed sizes, which Full holds and Disk
     /// writes byte for byte; a chunk the footer cannot place, by a negative
@@ -767,11 +812,17 @@ impl FileIndex {
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
     ) -> ResidentBytes {
         tiers(&ResidentSet::from_footer(
-            metadata, key_leaf, key_type, handle, None,
+            metadata,
+            key_leaf,
+            value_leaves,
+            key_type,
+            handle,
+            None,
         ))
     }
 
@@ -798,8 +849,9 @@ impl FileIndex {
         &self.handle
     }
 
-    /// The footer as kept: both page indexes of the key column, every
-    /// column's offset index, and no other column's column index.
+    /// The footer as kept: both page indexes of the key column, the offset
+    /// index of every value column the table serves, and no other page
+    /// index.
     pub fn metadata(&self) -> &Arc<ParquetMetaData> {
         &self.metadata
     }
@@ -819,10 +871,29 @@ impl FileIndex {
         self.key_leaf
     }
 
-    /// The leaf column index of the value; `None` for a file written
-    /// before the value column was added, which holds no such column.
-    pub fn value_leaf(&self) -> Option<usize> {
-        self.value.map(|value| value.leaf)
+    /// The leaf column index of value column `column`, a position in the
+    /// table's layout; `None` for a file written before that column was
+    /// added, which holds no such column.
+    pub fn value_leaf(&self, column: usize) -> Option<usize> {
+        self.values[column].map(|value| value.leaf)
+    }
+
+    /// Every value column's leaf, in the layout's order.
+    pub fn value_leaves(&self) -> Vec<Option<usize>> {
+        self.values
+            .iter()
+            .map(|value| value.map(|value| value.leaf))
+            .collect()
+    }
+
+    /// The leaves of the value columns the file holds: those whose offset
+    /// index the footer keeps.
+    pub(crate) fn held_value_leaves(&self) -> Vec<usize> {
+        self.values
+            .iter()
+            .flatten()
+            .map(|value| value.leaf)
+            .collect()
     }
 
     /// Checks that the file still holds its columns as `layout`, a later
@@ -832,18 +903,16 @@ impl FileIndex {
     /// adds another under its name changes what the file's column means.
     /// Refuses as `column::resolve` does, and a key column the snapshot
     /// types otherwise than the index decodes its keys as is
-    /// `RefusalReason::KeyTypeMismatch`. The columns found by name are the
-    /// ones the index was built over, since names are matched the same way
-    /// in the same footer, so the index holds no answer that changes.
-    pub(crate) fn check_columns(&self, table: &str, layout: &TableLayout) -> Result<()> {
+    /// `RefusalReason::KeyTypeMismatch`. `Ok(true)` when the key and every
+    /// value column, by position, resolve to the leaves the index was built
+    /// over, so it holds no answer that changes; `Ok(false)` when they
+    /// resolve to others or `layout` names another count of columns, an
+    /// index that would answer a column from another's pages, which the
+    /// caller does not reuse.
+    pub(crate) fn check_columns(&self, table: &str, layout: &TableLayout) -> Result<bool> {
         let path = self.handle.location.as_str();
         let schema = self.metadata.file_metadata().schema_descr();
         let columns = crate::column::resolve(table, path, schema, layout)?;
-        debug_assert_eq!(
-            (columns.key_leaf, columns.value_leaf),
-            (self.key_leaf, self.value_leaf()),
-            "names resolve to the same leaves in the same footer"
-        );
         if layout.key_type != self.key_type() {
             return Err(Error::refused(
                 table,
@@ -854,7 +923,11 @@ impl FileIndex {
                 },
             ));
         }
-        Ok(())
+        let built = self
+            .values
+            .iter()
+            .map(|value| value.map(|value| value.leaf));
+        Ok(columns.key_leaf == self.key_leaf && columns.value_leaves.into_iter().eq(built))
     }
 
     /// The first key of every key page, per row group; a row group without
@@ -894,6 +967,7 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.key_leaf,
+            &self.held_value_leaves(),
             self.key_type(),
             &self.handle,
             Some(&self.fences),
@@ -913,23 +987,25 @@ impl FileIndex {
     /// Bloom asks the row group's filter first: a negative is `None` with no
     /// I/O; a positive fetches the one key page the fences name through
     /// `cache`, one GET, so a false positive costs exactly that (and a
-    /// dictionary-encoded key column its dictionary page besides). A key
-    /// outside the file's range costs nothing in every tier.
+    /// dictionary-encoded key column its dictionary page besides), each
+    /// GET answering to `issue`. A key outside the file's range costs
+    /// nothing in every tier.
     pub(crate) async fn find(
         &self,
         key: &Key,
         cache: Option<&PageCache>,
+        issue: Issue<'_>,
     ) -> Result<Option<RowRef>> {
         let Some((row_group, page)) = self.locate(key) else {
             return Ok(None);
         };
-        // Only the value page decides a lookup's label; a key page's origin
+        // Only the value pages decide a lookup's label; a key page's origin
         // is not kept.
         let chunk = self.key_column().group(row_group);
         let segments = match &self.keys {
             KeyResidency::Chunks(chunks) => Arc::clone(chunks),
             KeyResidency::Disk(disk) => {
-                let (segments, _origin) = self
+                let (segments, _origins) = self
                     .fetch_pages(chunk, page, PageSource::Disk(disk))
                     .await?;
                 segments
@@ -938,8 +1014,8 @@ impl FileIndex {
                 if !filters[row_group].check(&*key.as_bytes()) {
                     return Ok(None);
                 }
-                let (segments, _origin) = self
-                    .fetch_pages(chunk, page, PageSource::Store(cache))
+                let (segments, _origins) = self
+                    .fetch_pages(chunk, page, PageSource::Store(cache, issue))
                     .await?;
                 segments
             }
@@ -947,35 +1023,40 @@ impl FileIndex {
         self.search(key, row_group, page, segments)
     }
 
-    /// The value at `row` and where its page came from, `None` for a file
-    /// that holds no value column (`value_leaf`): the one value page
-    /// holding it through `cache` (one GET cold, none warm) and, when the
-    /// value column chunk has a dictionary page, that page too (the one
-    /// extra GET of RFD 007's penalty), then exactly one row decoded.
-    /// `Some` carries the bytes unchanged, a slice of the fetched page where
-    /// parquet decoded them in place and a copy otherwise (`value_bytes`);
-    /// `None` is a null value, distinct from an absent key. The origin is
-    /// the value page's: `Fetched` for the GET of a cold hit, `Cached` for a warm one; the dictionary page, when there
-    /// is one, does not decide it. A row outside every page of its row group
-    /// is `FileFault::PageOutOfRange`. The headers of the value page and of
-    /// its dictionary page are read from the fetched bytes before parquet
-    /// decodes them, and one that parquet would not read to the same
-    /// numbers or that declares more than its page can hold is
-    /// `FileFault::MalformedPageHeader` or `FileFault::PageHeaderOverBound`
-    /// (`check_value_page_headers`). A page parquet panics decoding is
-    /// `FileFault::DecoderPanicked`.
-    pub(crate) async fn read_value(
+    /// The value of value column `column`, a position in the table's
+    /// layout, at `row`, `None` for a file that does not hold that column
+    /// (`value_leaf`): the one value page holding it through `cache` (one
+    /// GET cold, none warm) and, when the column chunk has a dictionary
+    /// page, that page too (the one extra GET of RFD 007's penalty), the
+    /// two read together, each GET answering to `issue`, then exactly one
+    /// row decoded. The value carries
+    /// the bytes unchanged, a slice of the fetched page where parquet
+    /// decoded them in place and a copy otherwise (`value_bytes`); `None` is
+    /// a null value, distinct from an absent key. The origin is the value
+    /// page's: `Fetched` for the GET of a cold hit, `Cached` for a warm
+    /// one; `from_store` is whether either page came from object storage.
+    /// A row outside every
+    /// page of its row group is `FileFault::PageOutOfRange`. The headers of
+    /// the value page and of its dictionary page are read from the fetched
+    /// bytes before parquet decodes them, and one that parquet would not
+    /// read to the same numbers or that declares more than its page can
+    /// hold is `FileFault::MalformedPageHeader` or
+    /// `FileFault::PageHeaderOverBound` (`check_value_page_headers`). A page
+    /// parquet panics decoding is `FileFault::DecoderPanicked`.
+    pub(crate) async fn read_column(
         &self,
+        column: usize,
         row: RowRef,
         cache: Option<&PageCache>,
-    ) -> Result<Option<(Option<Bytes>, PageOrigin)>> {
-        let Some(value) = self.value else {
+        issue: Issue<'_>,
+    ) -> Result<Option<ValueRead>> {
+        let Some(value) = self.values[column] else {
             return Ok(None);
         };
         let page = self.value_page(value, row)?;
         let chunk = self.value_column(value).group(row.row_group);
-        let (segments, origin) = self
-            .fetch_pages(chunk, page, PageSource::Store(cache))
+        let (segments, origins) = self
+            .fetch_pages(chunk, page, PageSource::Store(cache, issue))
             .await?;
         check_value_page_headers(chunk, value.shape, page, &segments)?;
         let value = match value.shape {
@@ -988,12 +1069,47 @@ impl FileIndex {
                     .map(|value| value_bytes(&segments, value.data()))
             }
         };
-        Ok(Some((value, origin)))
+        Ok(Some(ValueRead {
+            value,
+            origin: origins.page,
+            from_store: origins.any_fetched(),
+        }))
+    }
+
+    /// `read_column` of the layout's first value column, as the value and
+    /// its page's origin: the shape the single-column tests read.
+    #[cfg(test)]
+    pub(crate) async fn read_value(
+        &self,
+        row: RowRef,
+        cache: Option<&PageCache>,
+    ) -> Result<Option<(Option<Bytes>, PageOrigin)>> {
+        Ok(self
+            .read_column(0, row, cache, Issue::default())
+            .await?
+            .map(|read| (read.value, read.origin)))
+    }
+
+    /// The file offset of the value page of value column `column`, a
+    /// position in the table's layout, that a hit on the key `page` names
+    /// would fetch: `Some` only where `page` names the key's row (in the
+    /// Full tier, for a present key) in a file that holds the column;
+    /// `None` for a file that answers the column's default and fetches no
+    /// value page (RFD 023).
+    pub fn value_page_offset(&self, column: usize, page: &PageRef) -> Option<u64> {
+        let value = self.values[column]?;
+        let row = page.row?;
+        self.value_page_index(value, row).map(|at| {
+            self.value_column(value)
+                .group(row.row_group)
+                .page_range(at)
+                .start
+        })
     }
 
     /// The key page `find` would decode for `key` and, in the Full tier for
-    /// a present key in a file that holds the value column, the value page
-    /// `read_value` would fetch. `None` when
+    /// a present key, the row it holds the key at, whose value pages
+    /// `value_page_offset` names. `None` when
     /// `find` would decode nothing: the key is outside the file's range,
     /// between two row groups, or ruled out by the Bloom tier's filter.
     /// Synchronous and free of I/O in every tier, so `Generation::plan` can
@@ -1014,14 +1130,7 @@ impl FileIndex {
         Some(PageRef {
             row_group,
             key_page,
-            value_page_offset: self.value.zip(row).and_then(|(value, row)| {
-                self.value_page_index(value, row).map(|page| {
-                    self.value_column(value)
-                        .group(row_group)
-                        .page_range(page)
-                        .start
-                })
-            }),
+            row,
             position: row.map(|row| self.position(row)),
         })
     }
@@ -1171,33 +1280,35 @@ impl FileIndex {
     /// chunk's start and its first data page, so the reader asks for exactly
     /// what is held. Both ranges are known before either read starts, so
     /// the two reads run together: the dictionary costs its GET or local
-    /// read, never a second round trip's wait. The origin returned is the
-    /// page's own; the dictionary page's is not kept.
+    /// read, never a second round trip's wait. The origins returned are the
+    /// page's and the dictionary page's.
     async fn fetch_pages(
         &self,
         chunk: ColumnChunk<'_>,
         page: usize,
         source: PageSource<'_>,
-    ) -> Result<(Arc<Segments>, PageOrigin)> {
+    ) -> Result<(Arc<Segments>, Origins)> {
         let range = chunk.page_range(page);
         let dictionary = chunk.dictionary_range();
         let read_dictionary = async {
             match dictionary.clone() {
-                Some(dictionary) => self
-                    .read_from(source, dictionary)
-                    .await
-                    .map(|(bytes, _origin)| Some(bytes)),
+                Some(dictionary) => self.read_from(source, dictionary).await.map(Some),
                 None => Ok(None),
             }
         };
-        let ((page_bytes, origin), dictionary_bytes) =
+        let ((page_bytes, origin), dictionary_read) =
             futures::try_join!(self.read_from(source, range.clone()), read_dictionary)?;
         let mut parts = Vec::with_capacity(2);
         parts.push((range, page_bytes));
-        if let (Some(dictionary), Some(bytes)) = (dictionary, dictionary_bytes) {
+        let mut origins = Origins {
+            page: origin,
+            dictionary: None,
+        };
+        if let (Some(dictionary), Some((bytes, origin))) = (dictionary, dictionary_read) {
             parts.push((dictionary, bytes));
+            origins.dictionary = Some(origin);
         }
-        Ok((Arc::new(Segments::new(parts, self.handle.size())), origin))
+        Ok((Arc::new(Segments::new(parts, self.handle.size())), origins))
     }
 
     /// One byte range of the file from `source`: a hedged lookup GET through
@@ -1209,7 +1320,7 @@ impl FileIndex {
         range: Range<u64>,
     ) -> Result<(Bytes, PageOrigin)> {
         match source {
-            PageSource::Store(cache) => self.handle.read_page(range, cache).await,
+            PageSource::Store(cache, issue) => self.handle.read_page(range, cache, issue).await,
             PageSource::Disk(disk) => disk
                 .page(range)
                 .await
@@ -1277,8 +1388,8 @@ impl<'a> ColumnChunk<'a> {
         self.column
             .metadata
             .offset_index()
-            .expect("build required an offset index on the key and value columns")[self.row_group]
-            [self.column.leaf]
+            .expect("build required an offset index on the key and every value column")
+            [self.row_group][self.column.leaf]
             .page_locations()
     }
 
@@ -1581,21 +1692,25 @@ mod tests {
             let cache = cache().await;
             let at = page_rows() + 1;
             let row = index
-                .find(&key_for(at, KeyType::Long), Some(&cache))
+                .find(&key_for(at, KeyType::Long), Some(&cache), Issue::default())
                 .await
                 .unwrap()
                 .unwrap();
             let (value, _) = index.read_value(row, Some(&cache)).await.unwrap().unwrap();
             let value = value.unwrap();
             assert_eq!(value, value_for(at).as_slice());
-            let value_column = index.value.unwrap();
+            let value_column = index.values[0].unwrap();
             let chunk = index.value_column(value_column).group(row.row_group);
             let page = index.value_page(value_column, row).unwrap();
-            let (cached, origin) = index
-                .fetch_pages(chunk, page, PageSource::Store(Some(&cache)))
+            let (cached, origins) = index
+                .fetch_pages(
+                    chunk,
+                    page,
+                    PageSource::Store(Some(&cache), Issue::default()),
+                )
                 .await
                 .unwrap();
-            assert_eq!(origin, PageOrigin::Cached);
+            assert_eq!(origins.page, PageOrigin::Cached);
             assert_eq!(shares_a_buffer(&cached, &value), shared, "{compression}");
         }
     }
@@ -1616,7 +1731,7 @@ mod tests {
         for i in 0..rows {
             let key = key_for(i, key_type);
             let row = index
-                .find(&key, Some(&cache))
+                .find(&key, Some(&cache), Issue::default())
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("key {key} not found"));
@@ -1706,12 +1821,25 @@ mod tests {
                 // groups: no page can hold it, so none is named.
                 let between_groups = (i + 1) % group_rows() == 0;
                 assert_eq!(index.page_of(&key).is_some(), !between_groups, "{key}");
-                assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None, "{key}");
+                assert_eq!(
+                    index
+                        .find(&key, Some(&cache), Issue::default())
+                        .await
+                        .unwrap(),
+                    None,
+                    "{key}"
+                );
             }
             for key in [below_range(key_type), above_range(key_type)] {
                 assert!(!index.may_contain(&key));
                 assert_eq!(index.page_of(&key), None);
-                assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None);
+                assert_eq!(
+                    index
+                        .find(&key, Some(&cache), Issue::default())
+                        .await
+                        .unwrap(),
+                    None
+                );
             }
             assert_eq!(stats.gets(), before);
             assert_eq!(cache.fetches(), 0);
@@ -1765,7 +1893,7 @@ mod tests {
         for i in 0..rows {
             let key = long_prefix_key(i, key_type);
             let row = index
-                .find(&key, Some(&cache))
+                .find(&key, Some(&cache), Issue::default())
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("key {key} not found in {residency}"));
@@ -1776,7 +1904,14 @@ mod tests {
         let group_rows = rows / MANY_ROW_GROUPS;
         for i in [0, group_rows - 1, group_rows, rows - 2] {
             let key = absent_after(&long_prefix_key(i, key_type));
-            assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None, "{key}");
+            assert_eq!(
+                index
+                    .find(&key, Some(&cache), Issue::default())
+                    .await
+                    .unwrap(),
+                None,
+                "{key}"
+            );
         }
     }
 
@@ -1817,7 +1952,14 @@ mod tests {
             let cache = cache().await;
             for i in [group_rows - 1, group_rows, 2 * group_rows - 1] {
                 let key = absent_after(&key_for(i, key_type));
-                assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None, "{key}");
+                assert_eq!(
+                    index
+                        .find(&key, Some(&cache), Issue::default())
+                        .await
+                        .unwrap(),
+                    None,
+                    "{key}"
+                );
             }
         }
     }
@@ -1836,7 +1978,7 @@ mod tests {
             let index = opened.index(key_type).await;
             let offset_index = index.metadata().offset_index().unwrap();
             let key_pages = offset_index[0][index.key_leaf()].page_locations().len();
-            let value_pages = offset_index[0][index.value_leaf().unwrap()]
+            let value_pages = offset_index[0][index.value_leaf(0).unwrap()]
                 .page_locations()
                 .len();
             assert!(
@@ -1846,7 +1988,7 @@ mod tests {
             let cache = cache().await;
             for i in 0..rows {
                 let row = index
-                    .find(&key_for(i, key_type), Some(&cache))
+                    .find(&key_for(i, key_type), Some(&cache), Issue::default())
                     .await
                     .unwrap()
                     .unwrap();
@@ -1858,7 +2000,7 @@ mod tests {
             }
             let total_value_pages: usize = (0..ROW_GROUPS)
                 .map(|row_group| {
-                    offset_index[row_group][index.value_leaf().unwrap()]
+                    offset_index[row_group][index.value_leaf(0).unwrap()]
                         .page_locations()
                         .len()
                 })
@@ -1888,7 +2030,7 @@ mod tests {
         );
         assert!(
             group
-                .column(index.value_leaf().unwrap())
+                .column(index.value_leaf(0).unwrap())
                 .dictionary_page_offset()
                 .is_some()
         );
@@ -1896,7 +2038,11 @@ mod tests {
         let before = stats.gets();
         let first = page_rows() + 1;
         let row = index
-            .find(&key_for(first, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(first, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1915,7 +2061,11 @@ mod tests {
         );
         let second = first + 1;
         let row = index
-            .find(&key_for(second, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(second, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1925,7 +2075,11 @@ mod tests {
         assert_eq!(stats.gets(), before + 2, "both pages cached");
         let other_page = 0;
         let row = index
-            .find(&key_for(other_page, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(other_page, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1959,7 +2113,11 @@ mod tests {
         let null_row = NULL_EVERY * 3;
         assert!(null_row < page_rows() && !edge_nulls.contains(&null_row));
         let row = index
-            .find(&key_for(null_row, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(null_row, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1974,7 +2132,11 @@ mod tests {
         );
         let present = null_row + 1;
         let row = index
-            .find(&key_for(present, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(present, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1983,7 +2145,7 @@ mod tests {
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(stats.gets(), before + 1, "and none warm");
         let row = index
-            .find(&key_for(0, KeyType::Long), Some(&cache))
+            .find(&key_for(0, KeyType::Long), Some(&cache), Issue::default())
             .await
             .unwrap()
             .unwrap();
@@ -2000,7 +2162,7 @@ mod tests {
             (group_rows() - 1, 1, PageOrigin::Cached),
         ] {
             let row = index
-                .find(&key_for(i, KeyType::Long), Some(&cache))
+                .find(&key_for(i, KeyType::Long), Some(&cache), Issue::default())
                 .await
                 .unwrap()
                 .unwrap();
@@ -2012,7 +2174,11 @@ mod tests {
             assert_eq!(stats.gets(), before + 1 + extra_gets, "row {i}");
             let neighbor = i - 1;
             let row = index
-                .find(&key_for(neighbor, KeyType::Long), Some(&cache))
+                .find(
+                    &key_for(neighbor, KeyType::Long),
+                    Some(&cache),
+                    Issue::default(),
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -2051,7 +2217,7 @@ mod tests {
             );
             assert!(
                 group
-                    .column(index.value_leaf().unwrap())
+                    .column(index.value_leaf(0).unwrap())
                     .dictionary_page_offset()
                     .is_none()
             );
@@ -2067,7 +2233,11 @@ mod tests {
             };
             let (gets, reads) = (stats.gets(), stats.local_reads());
             let row = index
-                .find(&key_for(first, KeyType::Long), Some(&cache))
+                .find(
+                    &key_for(first, KeyType::Long),
+                    Some(&cache),
+                    Issue::default(),
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -2087,7 +2257,11 @@ mod tests {
             );
             let (gets, reads) = (stats.gets(), stats.local_reads());
             let row = index
-                .find(&key_for(second, KeyType::Long), Some(&cache))
+                .find(
+                    &key_for(second, KeyType::Long),
+                    Some(&cache),
+                    Issue::default(),
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -2110,15 +2284,18 @@ mod tests {
         let stats = opened.stats();
         let before = stats.gets();
         let layout = crate::manifest::testing::layout(KeyType::Long, None);
-        index.check_columns(testing::TABLE, &layout).unwrap();
+        assert!(index.check_columns(testing::TABLE, &layout).unwrap());
         let renamed = TableLayout {
-            value_column: "renamed".to_string(),
+            value_columns: vec![crate::manifest::testing::binary_column(
+                "renamed",
+                crate::manifest::testing::VALUE_FIELD_ID,
+            )],
             ..layout.clone()
         };
         assert_eq!(
             testing::refusal_of(index.check_columns(testing::TABLE, &renamed)),
             RefusalReason::ColumnMismatch {
-                column: renamed.value_column.clone(),
+                column: "renamed".to_string(),
                 path: Some(opened.handle.location.clone()),
                 mismatch: crate::column::ColumnMismatch::AbsentWithoutFieldIds,
             }
@@ -2138,6 +2315,48 @@ mod tests {
         assert_eq!(stats.gets(), before, "the check reads nothing");
     }
 
+    /// A layout whose columns resolve, in the same footer, to other leaves
+    /// than the index was built over, or that names another count of
+    /// columns, is not one the index can answer: the check says so rather
+    /// than let one column be served from another's pages.
+    #[tokio::test]
+    async fn test_check_columns_a_layout_resolving_to_other_leaves_is_not_reusable() {
+        let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
+        let index = opened.index(KeyType::Long).await;
+        let layout = crate::manifest::testing::layout(KeyType::Long, None);
+        let other_leaf = TableLayout {
+            value_columns: vec![crate::manifest::testing::binary_column(
+                &layout.key_column,
+                crate::manifest::testing::KEY_FIELD_ID,
+            )],
+            ..layout.clone()
+        };
+        assert_eq!(
+            crate::column::resolve(
+                testing::TABLE,
+                &opened.handle.location,
+                index.metadata.file_metadata().schema_descr(),
+                &other_leaf
+            )
+            .unwrap()
+            .value_leaves,
+            [Some(index.key_leaf())],
+            "the column resolves, to the key's leaf"
+        );
+        assert!(!index.check_columns(testing::TABLE, &other_leaf).unwrap());
+        let fewer = TableLayout {
+            value_columns: Vec::new(),
+            ..layout.clone()
+        };
+        assert!(!index.check_columns(testing::TABLE, &fewer).unwrap());
+        let more = TableLayout {
+            value_columns: [layout.value_columns.clone(), layout.value_columns.clone()].concat(),
+            ..layout.clone()
+        };
+        assert!(!index.check_columns(testing::TABLE, &more).unwrap());
+        assert!(index.check_columns(testing::TABLE, &layout).unwrap());
+    }
+
     #[tokio::test]
     async fn test_find_fixed_width_binary_keys_as_binary() {
         let keys: Vec<Option<Key>> = (0..FEW_ROWS)
@@ -2155,7 +2374,11 @@ mod tests {
         );
         for (i, key) in keys.iter().enumerate() {
             let key = key.as_ref().unwrap();
-            let row = index.find(key, None).await.unwrap().unwrap();
+            let row = index
+                .find(key, None, Issue::default())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 row,
                 RowRef {
@@ -2166,7 +2389,13 @@ mod tests {
             let (value, origin) = index.read_value(row, None).await.unwrap().unwrap();
             assert_eq!(value.as_deref(), Some(value_for(i).as_slice()));
             assert_eq!(origin, PageOrigin::Fetched);
-            assert_eq!(index.find(&absent_after(key), None).await.unwrap(), None);
+            assert_eq!(
+                index
+                    .find(&absent_after(key), None, Issue::default())
+                    .await
+                    .unwrap(),
+                None
+            );
         }
     }
 
@@ -2178,7 +2407,7 @@ mod tests {
         let index = opened.index(KeyType::Long).await;
         for i in 0..FEW_ROWS {
             let row = index
-                .find(&key_for(i, KeyType::Long), None)
+                .find(&key_for(i, KeyType::Long), None, Issue::default())
                 .await
                 .unwrap()
                 .unwrap();
@@ -2196,7 +2425,7 @@ mod tests {
     async fn test_lookup_refuses_a_page_whose_rows_differ_from_its_offset_index() {
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
         let index = opened.index(KeyType::Long).await;
-        let (key_leaf, value_leaf) = (index.key_leaf(), index.value_leaf().unwrap());
+        let (key_leaf, value_leaf) = (index.key_leaf(), index.value_leaf(0).unwrap());
         let kept = (**index.metadata()).clone();
         let last_of_page_zero = page_rows() - 1;
 
@@ -2204,7 +2433,11 @@ mod tests {
         shifted_values[1].first_row_index -= 1;
         let index = index.with_metadata(with_pages(&kept, value_leaf, shifted_values));
         let row = index
-            .find(&key_for(last_of_page_zero, KeyType::Long), None)
+            .find(
+                &key_for(last_of_page_zero, KeyType::Long),
+                None,
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2223,7 +2456,11 @@ mod tests {
         assert_eq!(
             fault_of(
                 index
-                    .find(&key_for(last_of_page_zero, KeyType::Long), None)
+                    .find(
+                        &key_for(last_of_page_zero, KeyType::Long),
+                        None,
+                        Issue::default()
+                    )
                     .await
             ),
             FileFault::PageRowsMismatch {
@@ -2234,7 +2471,11 @@ mod tests {
         let restored = index.with_metadata(kept);
         assert_eq!(
             restored
-                .find(&key_for(last_of_page_zero, KeyType::Long), None)
+                .find(
+                    &key_for(last_of_page_zero, KeyType::Long),
+                    None,
+                    Issue::default()
+                )
                 .await
                 .unwrap(),
             Some(row)
@@ -2270,7 +2511,7 @@ mod tests {
         let before = stats.gets();
         let hit = group_rows + page_rows() + 1;
         let row = index
-            .find(&key_for(hit, key_type), Some(&cache))
+            .find(&key_for(hit, key_type), Some(&cache), Issue::default())
             .await
             .unwrap()
             .unwrap();
@@ -2282,7 +2523,7 @@ mod tests {
         assert_eq!(stats.gets(), before + 2, "a cold hit is two GETs");
         let warm = hit + 1;
         let row = index
-            .find(&key_for(warm, key_type), Some(&cache))
+            .find(&key_for(warm, key_type), Some(&cache), Issue::default())
             .await
             .unwrap()
             .unwrap();
@@ -2302,7 +2543,14 @@ mod tests {
             negatives += usize::from(!between_groups && !passes);
             assert_eq!(index.page_of(&key).is_some(), fetches_page, "{key}");
             let before = stats.gets();
-            assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None, "{key}");
+            assert_eq!(
+                index
+                    .find(&key, Some(&cache), Issue::default())
+                    .await
+                    .unwrap(),
+                None,
+                "{key}"
+            );
             assert_eq!(
                 stats.gets(),
                 before + u64::from(fetches_page),
@@ -2313,7 +2561,13 @@ mod tests {
         let before = stats.gets();
         for key in [below_range(key_type), above_range(key_type)] {
             assert_eq!(index.page_of(&key), None);
-            assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None);
+            assert_eq!(
+                index
+                    .find(&key, Some(&cache), Issue::default())
+                    .await
+                    .unwrap(),
+                None
+            );
         }
         assert_eq!(
             stats.gets(),
@@ -2361,7 +2615,7 @@ mod tests {
         let (gets, reads) = (stats.gets(), stats.local_reads());
         let hit = group_rows() + 1;
         let row = index
-            .find(&key_for(hit, KeyType::Long), Some(&cache))
+            .find(&key_for(hit, KeyType::Long), Some(&cache), Issue::default())
             .await
             .unwrap()
             .unwrap();
@@ -2381,7 +2635,11 @@ mod tests {
         );
         let warm = hit + 1;
         let row = index
-            .find(&key_for(warm, KeyType::Long), Some(&cache))
+            .find(
+                &key_for(warm, KeyType::Long),
+                Some(&cache),
+                Issue::default(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2394,7 +2652,13 @@ mod tests {
             "a warm hit is one local read for the key page and no GET"
         );
         let key = absent_after(&key_for(hit, KeyType::Long));
-        assert_eq!(index.find(&key, Some(&cache)).await.unwrap(), None);
+        assert_eq!(
+            index
+                .find(&key, Some(&cache), Issue::default())
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(
             (stats.gets(), stats.local_reads()),
             (gets + 1, reads + 3),
@@ -2402,7 +2666,7 @@ mod tests {
         );
         assert_eq!(
             index
-                .find(&below_range(KeyType::Long), Some(&cache))
+                .find(&below_range(KeyType::Long), Some(&cache), Issue::default())
                 .await
                 .unwrap(),
             None
@@ -2423,7 +2687,11 @@ mod tests {
         for i in [0, 1, page_rows() - 1, page_rows(), group_rows(), rows - 1] {
             let key = key_for(i, KeyType::String);
             let page = index.page_of(&key).unwrap();
-            let row = index.find(&key, None).await.unwrap().unwrap();
+            let row = index
+                .find(&key, None, Issue::default())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(page.row_group, row.row_group);
             let position = RowPosition(approx::count(i));
             assert_eq!(
@@ -2440,14 +2708,14 @@ mod tests {
                     .contains(&row.row)
             );
             let value_pages =
-                offset_index[row.row_group][index.value_leaf().unwrap()].page_locations();
+                offset_index[row.row_group][index.value_leaf(0).unwrap()].page_locations();
             let holding = value_pages
                 .iter()
                 .rev()
                 .find(|location| location.first_row_index <= row.row)
                 .unwrap();
             assert_eq!(
-                page.value_page_offset,
+                index.value_page_offset(0, &page),
                 Some(u64::try_from(holding.offset).unwrap())
             );
             let stats = opened.stats();
@@ -2464,7 +2732,7 @@ mod tests {
             (
                 page.row_group,
                 page.key_page,
-                page.value_page_offset,
+                index.value_page_offset(0, &page),
                 page.position
             ),
             (0, 1, None, None)
@@ -2486,7 +2754,7 @@ mod tests {
                 Some(PageRef {
                     row_group: 1,
                     key_page: 1,
-                    value_page_offset: None,
+                    row: None,
                     position: None,
                 })
             );
@@ -2560,7 +2828,7 @@ mod tests {
         claims: &[(HeaderField, i32)],
         group_rows: Option<i64>,
     ) -> FileIndex {
-        let value_leaf = index.value_leaf().unwrap();
+        let value_leaf = index.value_leaf(0).unwrap();
         let (chunk_start, _) = kept.row_group(0).column(value_leaf).byte_range();
         let at = approx::length(chunk_start) + header_at(kept, value_leaf, page);
         let patched = with_header_claims(&opened.file, at, claims);
@@ -2576,7 +2844,7 @@ mod tests {
 
     /// The header of `page` of row group 0's value chunk in `opened`'s file.
     fn value_header(index: &FileIndex, opened: &Opened, page: ChunkPage) -> PageHeader {
-        let value_leaf = index.value_leaf().unwrap();
+        let value_leaf = index.value_leaf(0).unwrap();
         let metadata = index.metadata();
         let (chunk_start, _) = metadata.row_group(0).column(value_leaf).byte_range();
         let at = approx::length(chunk_start) + header_at(metadata, value_leaf, page);
@@ -2886,7 +3154,7 @@ mod tests {
         let index = opened.index(KeyType::Long).await;
         let cache = cache().await;
         let key = key_for(1, KeyType::Long);
-        let find = index.find(&key, Some(&cache));
+        let find = index.find(&key, Some(&cache), Issue::default());
         assert_send(&find);
         let row = find.await.unwrap().unwrap();
         let read = index.read_value(row, Some(&cache));

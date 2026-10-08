@@ -96,6 +96,10 @@ struct Cli {
     /// The served table to ask; its key type must be string.
     #[arg(long)]
     table: String,
+    /// The value column whose bytes the truth file holds; every lookup
+    /// names it alone.
+    #[arg(long)]
+    column: String,
     /// The truth file: JSON Lines of `key` and `value_base64`.
     #[arg(long)]
     truth: PathBuf,
@@ -235,15 +239,25 @@ async fn scrape(location: &str, table: &str) -> Result<Counters, CheckError> {
 enum Failure {
     /// The call failed with a gRPC status.
     Status(tonic::Status),
-    /// A key answered with a presence that is neither present nor absent:
-    /// a null value, which a truth file cannot expect, or one the server
-    /// never sends.
+    /// A key answered with a presence that is neither present nor absent,
+    /// one the server never sends.
     Presence {
         /// The key.
         key: String,
         /// The presence answered, or its raw number when it is not one
         /// this client knows.
         presence: Result<Presence, i32>,
+    },
+    /// A present key answered other than one value of bytes: a null value,
+    /// which a truth file cannot expect, or another number of values than
+    /// the one column asked.
+    Values {
+        /// The key.
+        key: String,
+        /// The values answered.
+        answered: usize,
+        /// Whether the first of them is null.
+        null: bool,
     },
     /// A `MultiGet` answered a different number of results than it asked.
     Results {
@@ -262,6 +276,11 @@ impl Failure {
                 Ok(presence) => format!("{key} answered {}", presence.as_str_name()),
                 Err(raw) => format!("{key} answered unknown presence {raw}"),
             },
+            Self::Values {
+                key,
+                answered,
+                null,
+            } => format!("{key} answered {answered} values, the first null: {null}"),
             Self::Results { asked, answered } => {
                 format!("asked {asked} keys, answered {answered}")
             }
@@ -269,13 +288,31 @@ impl Failure {
     }
 }
 
-/// One answered key as the check reads it: `Some` bytes for present,
-/// `None` for absent, or why it is neither.
-fn answered(key: &str, presence: i32, value: Bytes) -> Result<Option<Bytes>, Failure> {
+/// One answered key as the check reads it: `Some` bytes for present with
+/// its one value, `None` for absent, or why it is neither.
+fn answered(
+    key: &str,
+    presence: i32,
+    values: Vec<v1::ColumnValue>,
+) -> Result<Option<Bytes>, Failure> {
     match Presence::try_from(presence) {
-        Ok(Presence::Present) => Ok(Some(value)),
+        Ok(Presence::Present) => {
+            let null = values
+                .first()
+                .is_some_and(|value| !matches!(value.kind, Some(v1::column_value::Kind::Value(_))));
+            let answered = values.len();
+            match values.into_iter().next().and_then(|value| value.kind) {
+                Some(v1::column_value::Kind::Value(bytes)) if answered == 1 => Ok(Some(bytes)),
+                Some(v1::column_value::Kind::Value(_) | v1::column_value::Kind::NullValue(_))
+                | None => Err(Failure::Values {
+                    key: key.to_string(),
+                    answered,
+                    null,
+                }),
+            }
+        }
         Ok(Presence::Absent) => Ok(None),
-        Ok(other @ (Presence::Null | Presence::Unspecified)) => Err(Failure::Presence {
+        Ok(other @ Presence::Unspecified) => Err(Failure::Presence {
             key: key.to_string(),
             presence: Ok(other),
         }),
@@ -304,7 +341,7 @@ struct Call {
 /// compares each answer with its entry.
 async fn call(
     client: &mut IcetrayClient<Channel>,
-    table: &str,
+    (table, column): (&str, &str),
     mode: Mode,
     entries: &[Entry],
     unit: Range<usize>,
@@ -312,10 +349,10 @@ async fn call(
     let asked = &entries[unit.clone()];
     let started = Instant::now();
     let answers = match mode {
-        Mode::Get => get(client, table, &asked[0])
+        Mode::Get => get(client, (table, column), &asked[0])
             .await
             .map(|answer| vec![answer]),
-        Mode::MultiGet => multi_get(client, table, asked).await,
+        Mode::MultiGet => multi_get(client, (table, column), asked).await,
     };
     let elapsed = started.elapsed();
     let outcomes = answers.map(|answers| {
@@ -334,29 +371,31 @@ async fn call(
 
 async fn get(
     client: &mut IcetrayClient<Channel>,
-    table: &str,
+    (table, column): (&str, &str),
     entry: &Entry,
 ) -> Result<Option<Bytes>, Failure> {
     let response = client
         .get(GetRequest {
             table: table.to_string(),
             key: Some(wire_key(entry)),
+            columns: vec![column.to_string()],
         })
         .await
         .map_err(Failure::Status)?
         .into_inner();
-    answered(&entry.key, response.presence, response.value)
+    answered(&entry.key, response.presence, response.values)
 }
 
 async fn multi_get(
     client: &mut IcetrayClient<Channel>,
-    table: &str,
+    (table, column): (&str, &str),
     asked: &[Entry],
 ) -> Result<Vec<Option<Bytes>>, Failure> {
     let response = client
         .multi_get(MultiGetRequest {
             table: table.to_string(),
             keys: asked.iter().map(wire_key).collect(),
+            columns: vec![column.to_string()],
         })
         .await
         .map_err(Failure::Status)?
@@ -370,7 +409,7 @@ async fn multi_get(
     asked
         .iter()
         .zip(response.results)
-        .map(|(entry, hit)| answered(&entry.key, hit.presence, hit.value))
+        .map(|(entry, hit)| answered(&entry.key, hit.presence, hit.values))
         .collect()
 }
 
@@ -396,7 +435,7 @@ fn units(entries: usize, mode: Mode, batch: usize) -> Vec<Range<usize>> {
 /// time.
 async fn pass(
     client: &IcetrayClient<Channel>,
-    table: &Arc<str>,
+    (table, column): (&Arc<str>, &Arc<str>),
     mode: Mode,
     entries: &Arc<Vec<Entry>>,
     units: &Arc<Vec<Range<usize>>>,
@@ -406,12 +445,18 @@ async fn pass(
     let tasks: Vec<_> = (0..concurrency)
         .map(|task| {
             let mut client = client.clone();
-            let (table, entries, units) =
-                (Arc::clone(table), Arc::clone(entries), Arc::clone(units));
+            let (table, column, entries, units) = (
+                Arc::clone(table),
+                Arc::clone(column),
+                Arc::clone(entries),
+                Arc::clone(units),
+            );
             tokio::spawn(async move {
                 let mut calls = Vec::new();
                 for unit in units.iter().skip(task).step_by(concurrency) {
-                    calls.push(call(&mut client, &table, mode, &entries, unit.clone()).await);
+                    calls.push(
+                        call(&mut client, (&table, &column), mode, &entries, unit.clone()).await,
+                    );
                 }
                 calls
             })
@@ -685,12 +730,21 @@ async fn main() -> Result<ExitCode, CheckError> {
 
     let before = scrape(&cli.metrics, &cli.table).await?;
     let table: Arc<str> = Arc::from(cli.table.as_str());
+    let column: Arc<str> = Arc::from(cli.column.as_str());
     let units = Arc::new(units(entries.len(), cli.mode, approx::length(cli.batch)));
     let entries = Arc::new(entries);
     let concurrency = approx::length(cli.concurrency);
     let mut passes = Vec::new();
     for pass_number in 1..=cli.passes {
-        let (calls, wall) = pass(&client, &table, cli.mode, &entries, &units, concurrency).await?;
+        let (calls, wall) = pass(
+            &client,
+            (&table, &column),
+            cli.mode,
+            &entries,
+            &units,
+            concurrency,
+        )
+        .await?;
         let report = PassReport::of(pass_number, cli.mode, &entries, calls, wall);
         report.print();
         passes.push(report);

@@ -25,6 +25,12 @@
 > kernel which of their pages it holds (RFD 020), and no byte is read
 > through a mapping.
 
+> Updated 2026-10-07: the routing set keeps the offset index of the key
+> and of each configured value column a file holds, and every other
+> column's page indexes are dropped at build. A hit's value-page GETs
+> are one per column it names, on top of what each tier spends finding
+> the row. See RFD 022.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -55,30 +61,35 @@ the footer stage; the same local directory will hold a size-bounded disk
 level of the page cache, keyed by file and offset and never evicted for
 staleness.
 
-`full`, the default, is RFD 004 as stated: one GET per hit, none per miss,
-and a few bytes of memory per key. `disk` writes the chunks to a file in a
-local directory as they stream through verification, and keeps the
-routing set in memory without the key chunks. A lookup reads one key page
-from local disk, a hit still costs one GET and a miss none, and memory per
-key falls to the fence array, a fraction of a byte. `bloom` keeps the
-routing set and the key column's bloom filters and needs no local disk. A
-hit costs two GETs (the key page, then the value page), and a miss costs a
-GET at the filter's false-positive rate, which the writer's filter size
-sets
-([bloom residency tier, results](../analysis/2026-09-10-bloom-residency-tier.md#results)).
+`full`, the default, is RFD 004 as stated: one GET per hit, none per
+miss, and a few bytes of memory per key. A hit's count here is for one
+named column; each further column a lookup names adds one value-page GET
+under every tier, and a presence-only hit costs only finding the row
+(RFD 022 (Value columns)). `disk` writes the chunks to a file in a local
+directory as they stream through verification, and keeps the routing set
+in memory without the key chunks. A lookup reads one key page from local
+disk, a hit still costs one GET and a miss none, and memory per key
+falls to the fence array, a fraction of a byte. `bloom` keeps the
+routing set and the key column's bloom filters and needs no local disk.
+A hit costs two GETs (the key page, then the value page), and a miss
+costs a GET at the filter's false-positive rate, which the writer's
+filter size sets ([bloom residency tier,
+results](../analysis/2026-09-10-bloom-residency-tier.md#results)).
 
 The routing set every tier keeps is the footer, the key column's page
-indexes and the value column's offset index, each file's exact key range
-and row-group bounds, and the fence array. `bloom` adds the filters to it,
-and `full` adds the chunks. Every tier streams the chunks once at load for
-the same refusals (RFD 007 (Serving tiers)), so the tier changes what
-stays resident and leaves what is checked alone. Two of RFD 007's
-refusals belong to this RFD: a `full` load over its resident-bytes budget,
-and `bloom` on a table whose files carry no key bloom filter. A `disk`
-table with no local directory configured is a configuration violation and
-sits outside RFD 007's refusals. The configuration parser refuses it, and
-the loader raises the same violation for a caller that built the
-configuration by hand.
+indexes and the offset index of each configured value column the file
+holds, each file's exact key range and row-group bounds, and the fence
+array. Every other column's page indexes are dropped at build, so a
+column the table does not serve costs nothing resident. `bloom` adds the
+filters to it, and `full` adds the chunks. Every tier streams the chunks
+once at load for the same refusals (RFD 007 (Serving tiers)), so the
+tier changes what stays resident and leaves what is checked alone. Two
+of RFD 007's refusals belong to this RFD: a `full` load over its
+resident-bytes budget, and `bloom` on a table whose files carry no key
+bloom filter. A `disk` table with no local directory configured is a
+configuration violation and sits outside RFD 007's refusals. The
+configuration parser refuses it, and the loader raises the same
+violation for a caller that built the configuration by hand.
 
 Once it has read the footers, and before it fetches any key chunk, the
 loader knows every tier's resident bytes. The doctor reports them (RFD 016

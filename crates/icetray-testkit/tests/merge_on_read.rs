@@ -12,10 +12,10 @@ use std::sync::Arc;
 use iceberg::puffin::DELETION_VECTOR_V1;
 use iceberg::spec::{DataFile, FormatVersion, Struct};
 use icetray_core::approx::count;
-use icetray_core::config::{LocalConfig, Residency, TableConfig};
+use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
     BlobFraming, Budget, DeleteFault, Error, ErrorKind, FileFault, Generation, Key, KeyType,
-    LocalDir, RefusalReason, Storage, TableSource, TableState, Value,
+    RefusalReason, Row, TableSource, TableState,
 };
 use icetray_testkit::delete_files::{
     PositionDeletes, RawBlob, VECTOR_FRAME_BYTES, Vector, encode_vector, vector_entry,
@@ -25,6 +25,7 @@ use icetray_testkit::fixture::{
     IDS_2K, NAMESPACE, STRAY_IDS, TWO_BUCKETS, UNPARTITIONED_FILE_BYTES, local_catalog,
 };
 use icetray_testkit::keys::FIRST_VERSION;
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, HINT_POLL_GETS, METADATA_FILE_GETS, SeenPages, Served};
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, Result, TestkitError,
@@ -151,28 +152,15 @@ async fn built_in(
     scratch: &Path,
     budget: Option<u64>,
 ) -> Result<Served> {
-    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = match residency {
-        Residency::Disk => Some(Arc::new(LocalDir::open(
-            &LocalConfig {
-                dir: scratch.join(fixture.spec().name.as_str()),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            storage.stats(),
-        )?)),
-        Residency::Full | Residency::Bloom => None,
-    };
     let source = fixture.root_source();
     let config = TableConfig {
         source: source.clone(),
         ..fixture.config_with_budget(residency, false, budget)
     };
-    verify::build(
-        storage,
+    verify::build_in(
         config,
         TableSource::from_config(&source).await?,
-        local,
+        &scratch.join(fixture.spec().name.as_str()),
         verify::TEST_PAGE_CACHE_BYTES,
     )
     .await
@@ -204,7 +192,7 @@ async fn check(tiers: &mut Tiers, fixture: &Fixture) -> Result<MergeOracle> {
         for key in &keys {
             let expected = expected_gets(&full, &generation, &oracle, key, seen);
             let before = stats.gets();
-            let answer = served.table.get(key).await?.value;
+            let answer = served.table.get(key, &[VALUE_COLUMN]).await?.row;
             assert_eq!(answer, oracle.expected(key), "{residency} key {key}");
             assert_eq!(
                 stats.gets() - before,
@@ -233,7 +221,7 @@ fn expected_gets(
             .expect("the plan names a live key's file");
         assert_eq!(file.entry.path, live.path, "the plan skips deleted copies");
     }
-    verify::expected_lookup_gets(full, generation, key, live.is_some(), seen)
+    verify::expected_lookup_gets(full, generation, VALUE_COLUMN, key, live.is_some(), seen)
 }
 
 /// The GETs `served` issues while `work` runs.
@@ -259,7 +247,7 @@ async fn test_each_delete_kind_is_served_in_every_tier() -> Result<()> {
         let oracle = check(&mut tiers, &fixture).await?;
         assert_eq!(oracle.deleted_rows(), count(TOUCHED.len()), "{form:?}");
         for id in TOUCHED {
-            assert_eq!(oracle.expected(&fixture.key(id)), Value::Absent);
+            assert_eq!(oracle.expected(&fixture.key(id)), Row::Absent);
         }
         // One Puffin file holds both vectors: one footer, two blobs.
         let fresh = built_in(&fixture, Residency::Full, tiers.scratch.path(), None).await?;
@@ -353,10 +341,10 @@ async fn test_a_vector_beside_position_deletes_masks_them() -> Result<()> {
         .await?;
     let mut tiers = Tiers::serve(&fixture).await?;
     let oracle = check(&mut tiers, &fixture).await?;
-    assert_eq!(oracle.expected(&fixture.key(kept)), Value::Absent);
+    assert_eq!(oracle.expected(&fixture.key(kept)), Row::Absent);
     assert_ne!(
         oracle.expected(&fixture.key(masked)),
-        Value::Absent,
+        Row::Absent,
         "the vector masks the position delete"
     );
     Ok(())
@@ -520,8 +508,8 @@ async fn test_a_deleted_row_in_a_later_row_group_counts_from_the_files_first_row
     );
     let oracle = check(&mut tiers, &fixture).await?;
     for id in late {
-        assert_eq!(oracle.expected(&fixture.key(id)), Value::Absent);
-        assert_ne!(oracle.expected(&fixture.key(id - 1)), Value::Absent);
+        assert_eq!(oracle.expected(&fixture.key(id)), Row::Absent);
+        assert_ne!(oracle.expected(&fixture.key(id - 1)), Row::Absent);
     }
     Ok(())
 }
@@ -584,8 +572,8 @@ async fn test_a_deleted_keys_bloom_miss_costs_a_key_page_per_deleted_copy() -> R
         copies.is_subset(&positives),
         "a deleted row stays in its filter"
     );
-    let (answer, gets) = gets_during(&bloom, bloom.table.get(&key)).await;
-    assert_eq!(answer?.value, Value::Absent);
+    let (answer, gets) = gets_during(&bloom, bloom.table.get(&key, &[VALUE_COLUMN])).await;
+    assert_eq!(answer?.row, Row::Absent);
     assert_eq!(
         gets,
         count(positives.len()),
@@ -593,8 +581,8 @@ async fn test_a_deleted_keys_bloom_miss_costs_a_key_page_per_deleted_copy() -> R
     );
     for (residency, extra) in [(Residency::Full, 0), (Residency::Disk, 0)] {
         let served = serve_in(&fixture, residency, scratch.path(), None).await?;
-        let (answer, gets) = gets_during(&served, served.table.get(&key)).await;
-        assert_eq!(answer?.value, Value::Absent);
+        let (answer, gets) = gets_during(&served, served.table.get(&key, &[VALUE_COLUMN])).await;
+        assert_eq!(answer?.row, Row::Absent);
         assert_eq!(gets, extra, "{residency}: a deleted key's miss");
     }
     Ok(())
@@ -694,7 +682,11 @@ async fn test_a_ref_moved_back_past_a_vector_refuses_two_live_copies() -> Result
         };
         assert_eq!(key, fixture.key(id));
         assert_eq!(
-            table.table.get(&fixture.key(id)).await?.value,
+            table
+                .table
+                .get(&fixture.key(id), &[VALUE_COLUMN])
+                .await?
+                .row,
             served,
             "{residency} keeps serving the snapshot with the vector"
         );
@@ -737,7 +729,7 @@ async fn test_a_vector_of_consecutive_rows_serves_through_a_run_container() -> R
     let mut tiers = Tiers::serve(&fixture).await?;
     let oracle = check(&mut tiers, &fixture).await?;
     for id in run {
-        assert_eq!(oracle.expected(&fixture.key(id)), Value::Absent);
+        assert_eq!(oracle.expected(&fixture.key(id)), Row::Absent);
     }
     Ok(())
 }
@@ -760,7 +752,7 @@ async fn test_a_ref_moved_back_past_a_vector_serves_a_revived_only_copy() -> Res
             oracle.expected(&fixture.key(id)),
             fixture.expected(&fixture.key(id))
         );
-        assert_ne!(oracle.expected(&fixture.key(id)), Value::Absent);
+        assert_ne!(oracle.expected(&fixture.key(id)), Row::Absent);
     }
     Ok(())
 }
@@ -1103,7 +1095,7 @@ async fn test_a_refresh_moves_a_file_from_its_position_deletes_to_a_vector_holdi
     }
     let oracle = check(&mut tiers, &fixture).await?;
     for id in [first, second] {
-        assert_eq!(oracle.expected(&fixture.key(id)), Value::Absent);
+        assert_eq!(oracle.expected(&fixture.key(id)), Row::Absent);
     }
     Ok(())
 }

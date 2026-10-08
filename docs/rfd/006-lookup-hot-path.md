@@ -1,20 +1,27 @@
 # Lookup hot path
 
+> Updated 2026-10-07: a lookup reads the value page of each column it
+> names, concurrently, and none for a presence-only lookup; a column a
+> file answers by its default costs no read. See RFD 022.
+
 ## Problem
 
 RFD 004 (Resident key-chunk index) settles what stays in memory for each
 data file, and the page cache settles where a value page comes from.
-Between them sits the work a lookup does with the bytes it already holds.
-It has to find the key's row inside one key page and then pull one row out
-of one value page. Two things about that work are undecided: which decoder
-does it, and what happens when the decoder wants a byte it was not given.
+Between them sits the work a lookup does with the bytes it already
+holds. It has to find the key's row inside one key page and then pull
+one row out of the value page of each column the lookup names. Two
+things about that work are undecided: which decoder does it, and what
+happens when the decoder wants a byte it was not given.
 
-Both bear on what a lookup spends. The workloads icetray is built for are
-billed per GET and are meant to pay nothing for a miss
-([workload archetypes, the cost shape](../analysis/2026-09-09-workload-archetypes.md#the-cost-shape)),
-and RFD 004 promises one GET per cold hit and none per miss, a promise the
-prototype kept on every layout
-([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
+Both bear on what a lookup spends. The workloads icetray is built for
+are billed per GET and are meant to pay nothing for a miss ([workload
+archetypes, the cost
+shape](../analysis/2026-09-09-workload-archetypes.md#the-cost-shape)),
+and RFD 004 promises one GET per named column on a cold hit and none per
+miss, a promise the prototype kept on every layout ([prototype findings,
+finding
+1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
 A general-purpose Parquet reader fetches whatever it needs, and a single
 such fetch turns an exact count into an estimate. The decoder also sets
 the CPU a lookup spends beside its GET.
@@ -32,14 +39,19 @@ The path is the same for every table whose key chunks are resident:
 1. The fence array picks the one key page that can hold the key.
 2. The column reader decodes that page from the resident key chunk and
    either finds the row or answers the miss. A miss ends here, before any
-   value page is read.
-3. The offset index locates the value page and the page cache supplies it.
-   A cold hit costs one GET, a warm hit costs none, and concurrent lookups
-   for one page share one GET.
-4. The column reader decodes one row from that page and returns the value.
+   value page is read, and so does a presence-only lookup, which names no
+   column.
+3. For each column the lookup names (RFD 022 (Value columns)), that
+   column's offset index locates its value page and the page cache
+   supplies it, the columns concurrently. A cold read costs one GET per
+   column, a warm one costs none, and concurrent lookups for one page
+   share one GET. A column the file answers by its default (RFD 023
+   (Column resolution)) reads nothing.
+4. The column reader decodes one row from each page and returns the
+   values in the order the lookup named their columns.
 
 Two more segments are intended reads, counted as reads rather than raised
-as errors. One is the value column's dictionary page when one exists, which
+as errors. One is a value column's dictionary page when one exists, which
 is the extra GET that RFD 007 (Serving tiers) counts as its penalty. The other is the key page
 itself under the disk and bloom tiers of RFD 017 (Residency tiers), which
 fixes where that page comes from and what it costs.
@@ -72,13 +84,14 @@ cheaper than another.
 
 ## Consequences
 
-Per-lookup CPU is two pages: one key page decoded and one value page
-decompressed. On a warm hit nearly all of the time goes to decoding those
-two pages, and little to the lookup itself; which page dominates depends
-on whether the values compress
-([prototype findings, finding 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)).
-That is why RFD 002 (Serving layout contract) bounds value pages by bytes
-for large values, and why large key pages are an inefficient finding
+Per-lookup CPU is one key page decoded and one value page decompressed
+per named column. On a warm hit of one column nearly all of the time
+goes to decoding those two pages, and little to the lookup itself; which
+page dominates depends on whether the values compress ([prototype
+findings, finding
+4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)). That
+is why RFD 002 (Serving layout contract) bounds value pages by bytes for
+large values, and why large key pages are an inefficient finding
 measured in RFD 007.
 
 A layout the resident index does not cover fails loudly, as an error in

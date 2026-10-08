@@ -431,7 +431,7 @@ mod tests {
 name = "kv"
 ref = "main"
 key_column = "id"
-value_column = "payload"
+value_columns = ["payload"]
 [tables.source]
 type = "static"
 location = "s3://warehouse/kv"

@@ -13,13 +13,15 @@ use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::metric;
 use icetray_core::{
-    Error, ErrorKind, FindingCode, KeyType, Level, RefusalReason, TableSource, TableState, Value,
+    Capping, Error, ErrorKind, FindingCode, KeyType, Level, RefusalReason, Row, TableSource,
+    TableState,
 };
 use icetray_testkit::fixture::{
     APPENDED_4K_6K, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
     THREE_FILES, TWO_FILES, local_catalog, residue_class,
 };
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, HINT_POLL_GETS, LOAD_GETS_PER_FILE, Served};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
 
@@ -66,7 +68,10 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let v1 = served.current();
     let new_key = fixture.key(FUTURE_ID);
-    assert_eq!(served.table.get(&new_key).await?.value, Value::Absent);
+    assert_eq!(
+        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
+        Row::Absent
+    );
     let stats = served.storage.stats();
     let before = stats.gets();
     assert!(!served.table.refresh().await?, "nothing moved yet");
@@ -97,12 +102,12 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
         "metadata file, manifest list, two manifests, then a footer and a chunk per new file"
     );
 
-    let lookup = served.table.get(&new_key).await?;
+    let lookup = served.table.get(&new_key, &[VALUE_COLUMN]).await?;
     assert_eq!(lookup.snapshot_id, v2.snapshot_id);
-    assert_eq!(lookup.value, fixture.expected(&new_key));
+    assert_eq!(lookup.row, fixture.expected(&new_key));
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
     Ok(())
@@ -134,7 +139,7 @@ async fn test_refresh_follows_a_static_root_through_its_hint() -> Result<()> {
     assert_ne!(served.current().snapshot_id, v1.snapshot_id);
     let new_key = fixture.key(NEW_ID);
     assert_eq!(
-        served.table.get(&new_key).await?.value,
+        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&new_key)
     );
     Ok(())
@@ -168,7 +173,7 @@ async fn test_refresh_refuses_duplicate_keys_and_keeps_serving() -> Result<()> {
     assert_eq!(served.current().snapshot_id, v1);
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
     assert!(
@@ -240,7 +245,10 @@ async fn test_refresh_recovers_when_the_offending_file_is_dropped() -> Result<()
     assert_ne!(served.current().snapshot_id, v1.snapshot_id);
     for id in SAMPLE_4K {
         let key = fixture.key(id);
-        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            fixture.expected(&key)
+        );
     }
     let appended_error = fixture
         .append(catalog.as_ref(), [OLD_ID], "again")
@@ -378,6 +386,7 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
                 declared,
                 achieved,
                 findings,
+                ..
             },
         ..
     } = error
@@ -385,7 +394,13 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
         panic!("expected a below_level refusal, got {error:?}");
     };
     assert_eq!((declared, achieved), (Level::Optimal, Level::Permissive));
-    assert_eq!(findings, [FindingCode::OverlappingFiles]);
+    assert_eq!(
+        findings,
+        [Capping {
+            code: FindingCode::OverlappingFiles,
+            column: None,
+        }]
+    );
     let TableState::Held { serving, level, .. } = served.table.state() else {
         panic!("expected Held, got {:?}", served.table.state());
     };
@@ -399,7 +414,10 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
         [Some(below), Some(permissive), Some(optimal)]
     );
     let held_key = fixture.key(appended[0]);
-    assert_eq!(served.table.get(&held_key).await?.value, Value::Absent);
+    assert_eq!(
+        served.table.get(&held_key, &[VALUE_COLUMN]).await?.row,
+        Row::Absent
+    );
     assert!(
         !served.table.refresh().await?,
         "the refused snapshot is not built again"
@@ -417,7 +435,7 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
         [Some(at_level), Some(optimal), Some(optimal)]
     );
     assert_eq!(
-        served.table.get(&held_key).await?.value,
+        served.table.get(&held_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&held_key)
     );
     Ok(())

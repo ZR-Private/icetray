@@ -19,6 +19,7 @@ use icetray_testkit::fixture::{
     local_catalog, residue_class,
 };
 use icetray_testkit::layout::KEY_BLOOM_FPP;
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{Fixture, FixtureSpec, Result, TestkitError, write_fixture};
 
@@ -62,7 +63,7 @@ fn row_groups<'a>(files: impl IntoIterator<Item = &'a Arc<LoadedFile>>) -> u64 {
 /// for it. On a fixture without overlap it is `expected_key_pages` plus
 /// `expected_cold_gets`.
 fn expected_bloom_cold_gets(full: &Generation, bloom: &Generation, keys: &[Key]) -> Result<u64> {
-    let value_pages = verify::expected_cold_gets(full, keys)?;
+    let value_pages = verify::expected_cold_gets(full, keys, &[VALUE_COLUMN])?;
     let mut key_pages = HashSet::new();
     for (key, holder) in keys.iter().zip(full.plan(keys)) {
         let (holder, _page) = holder.expect("every sample key is present");
@@ -106,8 +107,8 @@ async fn test_bloom_cold_hit_is_two_gets_warm_none() -> Result<()> {
         "no other candidate to probe"
     );
     let keys = fixture.keys_at(&SAMPLE);
-    let expected =
-        verify::expected_key_pages(&full, &keys) + verify::expected_cold_gets(&full, &keys)?;
+    let expected = verify::expected_key_pages(&full, &keys)
+        + verify::expected_cold_gets(&full, &keys, &[VALUE_COLUMN])?;
     assert_eq!(
         expected,
         expected_bloom_cold_gets(&full, &tiers.bloom.current(), &keys)?
@@ -130,8 +131,12 @@ async fn test_expected_cold_gets_needs_the_full_tier() -> Result<()> {
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Bloom, false).await?;
-    let error =
-        verify::expected_cold_gets(&served.current(), &fixture.keys_at(&[OLD_ID])).unwrap_err();
+    let error = verify::expected_cold_gets(
+        &served.current(),
+        &fixture.keys_at(&[OLD_ID]),
+        &[VALUE_COLUMN],
+    )
+    .unwrap_err();
     assert!(
         matches!(
             error,
@@ -168,8 +173,8 @@ async fn test_bloom_misses_cost_exactly_what_the_plan_predicts() -> Result<()> {
     let before = stats.gets();
     for key in &probes {
         assert_eq!(
-            served.table.get(key).await?.value,
-            icetray_core::Value::Absent,
+            served.table.get(key, &[VALUE_COLUMN]).await?.row,
+            icetray_core::Row::Absent,
             "key {key}"
         );
     }
@@ -376,7 +381,7 @@ async fn test_bloom_refuses_duplicate_keys_on_refresh() -> Result<()> {
     );
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
     Ok(())

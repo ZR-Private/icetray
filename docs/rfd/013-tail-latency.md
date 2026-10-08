@@ -3,18 +3,25 @@
 > Updated 2026-09-24: bounds on the live and background paths, for an
 > object store or catalog that stops answering.
 
+> Updated 2026-10-07: a hit reads one value page per column it names,
+> each GET hedged on its own, and the hedge-rate ceiling counts GETs. A
+> MultiGet carries at most 1000 values, keys times columns, and its
+> fan-out bounds GETs in flight across the batch rather than lookups.
+> See RFD 022.
+
 ## Problem
 
-A cold hit costs one GET, and the latency of that GET belongs to the
-object store. First-byte time for a range read varies with the size of the
-data file and carries a tail even at the file sizes RFD 002 (Serving
-layout contract) targets
-([range-GET latency analysis, what the evidence implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)).
-It varies more with how recently the file was read: in-region, a file read
-moments before answers in tens of milliseconds at the median, one read
-hours before takes several times as long, and one never read takes longer
-still
-([cold range-GET latency, results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
+A cold hit costs one GET per value column it names, and the latency of
+those GETs belongs to the object store. First-byte time for a range read
+varies with the size of the data file and carries a tail even at the
+file sizes RFD 002 (Serving layout contract) targets ([range-GET latency
+analysis, what the evidence
+implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)).
+It varies more with how recently the file was read: in-region, a file
+read moments before answers in tens of milliseconds at the median, one
+read hours before takes several times as long, and one never read takes
+longer still ([cold range-GET latency,
+results](../analysis/2026-09-29-cold-range-get-latency.md#results)).
 
 The tail matters because of where icetray sits. The workload it is built
 around puts it behind a small online store, answering the fall-through
@@ -47,9 +54,12 @@ A hedge is a GET. It passes through the storage layer of RFD 003 (One
 storage stack), is counted there, and increments its own counter, so its
 cost is visible in the metrics of RFD 012 (Deployment contract).
 
-The GETs a client waits on are eligible: the value-page GET of a cold hit,
-and under the bloom tier of RFD 017 (Residency tiers) the key-page GET
-before it. Load reads, the footers and key column chunks read while a
+The GETs a client waits on are eligible: each value-page GET of a cold
+hit, one per column it names (RFD 022 (Value columns)), and under the
+bloom tier of RFD 017 (Residency tiers) the key-page GET before it. Each
+GET is hedged on its own, in the table's one window, and the ceiling's
+share counts GETs, so a hit that names several columns spends the ceiling
+once per GET. Load reads, the footers and key column chunks read while a
 generation is built, are bulk work nobody waits on, and they are never
 hedged.
 
@@ -72,13 +82,19 @@ over a store that has stopped answering a batch fails at 5 seconds rather
 than 15.
 
 At most 1024 requests run at once, and one more is refused with
-`RESOURCE_EXHAUSTED` rather than queued. A `MultiGet` carries at most 1000
-keys and runs 32 of its lookups at a time. A live lookup expects well
-under 200 ms, so 5 seconds is already a failure, and the refusals keep a
-wedged store from piling up requests until the process runs out of memory.
-The cap counts requests, and a page GET can outlast the request that
-started it by at most one `Get` deadline: the request was open when the
-fetch began, and the fetch ends 5 seconds after that.
+`RESOURCE_EXHAUSTED` rather than queued. A `MultiGet` carries at most
+1000 values, its keys times the columns it names with a presence-only
+call counting one per key, and holds at most 32 GETs in flight across
+the batch: each GET a lookup issues, a key page under `bloom`, a value
+page, and a dictionary page alike, holds one slot from before it starts
+until it ends, and none waits for a slot while holding one, so a batch
+holds no more GETs open whatever its keys and columns, each with at most
+one hedge beside it. A live lookup expects well under 200 ms, so 5
+seconds is already a failure, and the refusals keep a wedged store from
+piling up requests until the process runs out of memory. The cap counts
+requests, and a page GET can outlast the request that started it by at
+most one `Get` deadline: the request was open when the fetch began, and
+the fetch ends 5 seconds after that.
 
 The background path, loads and refreshes, is patient but bounded. A
 catalog call has 30 seconds, a first load 30 minutes, and a refresh 5
@@ -104,7 +120,7 @@ The deadlines, the two limits, the retry count, and the connect and
 catalog timeouts are configuration with these defaults (RFD 011). The
 retry window, the per-attempt timeout, and the fan-out of 32 are
 constants, the first two because the credential margin bounds their sum.
-The 1024 requests in flight and 1000 keys per batch are single-pod
+The 1024 requests in flight and 1000 values per batch are single-pod
 guesses, and how they hold under concurrent load is open.
 
 ## Alternatives Considered

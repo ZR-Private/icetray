@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
     Config, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig, SourceConfig,
-    StorageConfig, TableConfig,
+    StorageConfig, TableConfig, ValueColumnConfig,
 };
 
 use crate::error::{
@@ -36,9 +36,6 @@ pub const LOCATION_FALLBACK_TABLE_NAME: &str = "table";
 
 /// The key column of a `--location` table when `--key-column` says nothing.
 pub const DEFAULT_KEY_COLUMN: &str = "key";
-
-/// The value column of a `--location` table when `--value-column` says nothing.
-pub const DEFAULT_VALUE_COLUMN: &str = "value";
 
 /// The ref of a `--location` table when `--ref` says nothing: Iceberg's main
 /// branch, the value of `iceberg::spec::MAIN_BRANCH`, which this crate does
@@ -97,7 +94,7 @@ fn footer() -> String {
   {EXIT_USAGE:<3} Usage error
 
 {heading}Examples:{heading:#}
-  icetray get --location s3://warehouse/db/kv 42 43
+  icetray get --location s3://warehouse/db/kv --value-column payload --column payload 42 43
   icetray doctor --config icetray.toml
   icetray serve --config icetray.toml"
     )
@@ -163,8 +160,9 @@ pub enum Command {
     /// Look up keys in one table.
     ///
     /// Prints one JSON lookup line per key, in the order given, saying
-    /// whether the key is present, null, or absent. An absent key is an
-    /// answer, not a failure: the exit status is 0.
+    /// whether the key is present or absent and, for a present key, the
+    /// value of each column named with --column, a null as null. An absent
+    /// key is an answer, not a failure: the exit status is 0.
     Get {
         /// Where the tables come from.
         #[command(flatten)]
@@ -172,6 +170,14 @@ pub enum Command {
         /// The table to read; needed when more than one is configured.
         #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
+        /// A value column to read for every key; repeatable, read in the
+        /// order given.
+        ///
+        /// With none, each lookup line says only whether its key is
+        /// present, and no value page is read. A column the table does not
+        /// serve, or one named twice, fails the run.
+        #[arg(long = "column", value_name = "COLUMN")]
+        columns: Vec<String>,
         /// Keys to look up, each as text of the table's key type.
         ///
         /// A long is its digits, with a leading - when negative. A string
@@ -209,8 +215,9 @@ pub enum Command {
 /// pass together, and the conflict alone would let `--key-column` pass with
 /// no target and go unread under the variable. Their defaults are clap's,
 /// and a defaulted argument counts as absent to both checks, so the
-/// defaults stand under `--config` without tripping either. Each field's
-/// doc comment is its help.
+/// defaults stand under `--config` without tripping either; `--value-column`
+/// has no default, so a located table serves no value column unless one is
+/// named. Each field's doc comment is its help.
 #[derive(Args, Debug)]
 pub struct Target {
     /// The configuration file listing the tables.
@@ -259,16 +266,17 @@ pub struct Target {
         help_heading = HEADING_LOCATED
     )]
     pub key_column: String,
-    /// The value column of the located table.
+    /// A value column the located table serves; repeatable.
+    ///
+    /// With none, the table answers only whether a key is present.
     #[arg(
-        long,
+        long = "value-column",
         value_name = "COLUMN",
         requires = "location",
         conflicts_with = "config",
-        default_value = DEFAULT_VALUE_COLUMN,
         help_heading = HEADING_LOCATED
     )]
-    pub value_column: String,
+    pub value_columns: Vec<String>,
     /// The branch or tag of the located table to read.
     #[arg(
         long,
@@ -510,7 +518,11 @@ impl Target {
                 source: SourceConfig::Static { location },
                 r#ref: self.r#ref.clone(),
                 key_column: self.key_column.clone(),
-                value_column: self.value_column.clone(),
+                value_columns: self
+                    .value_columns
+                    .iter()
+                    .map(|name| ValueColumnConfig::named(name))
+                    .collect(),
                 strict: false,
                 lookups: None,
                 residency: self.residency,
@@ -577,7 +589,7 @@ mod tests {
                 },
                 r#ref: DEFAULT_REF.to_string(),
                 key_column: DEFAULT_KEY_COLUMN.to_string(),
-                value_column: DEFAULT_VALUE_COLUMN.to_string(),
+                value_columns: Vec::new(),
                 strict: false,
                 lookups: None,
                 residency: Residency::Full,
@@ -596,6 +608,8 @@ mod tests {
             "id",
             "--value-column",
             "payload",
+            "--value-column",
+            "embedding",
             "--ref",
             "serving",
             "--residency",
@@ -605,7 +619,7 @@ mod tests {
         let config = target(cli).config(None).unwrap();
         let table = &config.tables[0];
         assert_eq!(table.key_column, "id");
-        assert_eq!(table.value_column, "payload");
+        assert_eq!(table.value_column_names(), ["embedding", "payload"]);
         assert_eq!(table.r#ref, "serving");
         assert_eq!(table.residency, Residency::Bloom);
         assert!(!table.strict);
@@ -645,7 +659,7 @@ mod tests {
         ] {
             let parsed = target(parse(args).unwrap());
             assert_eq!(parsed.key_column, DEFAULT_KEY_COLUMN, "{args:?}");
-            assert_eq!(parsed.value_column, DEFAULT_VALUE_COLUMN, "{args:?}");
+            assert!(parsed.value_columns.is_empty(), "{args:?}");
             assert_eq!(parsed.r#ref, DEFAULT_REF, "{args:?}");
             assert_eq!(parsed.residency, DEFAULT_RESIDENCY, "{args:?}");
         }
@@ -659,7 +673,7 @@ name = "kv"
 source = { type = "static", location = "s3://warehouse/db/kv" }
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 "#;
 
     #[test]

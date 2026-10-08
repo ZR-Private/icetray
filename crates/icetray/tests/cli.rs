@@ -26,10 +26,10 @@ use icetray_core::metric::{
 use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
 use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{
-    IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS, TWO_BUCKETS,
-    UNPARTITIONED_FILE_BYTES,
+    IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS,
+    TWO_BUCKETS, UNPARTITIONED_FILE_BYTES,
 };
-use icetray_testkit::layout::Layout;
+use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::verify::series_value;
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture,
@@ -139,15 +139,23 @@ async fn local_fixture(dir: &Path, spec: FixtureSpec) -> Result<Fixture, BoxErro
 }
 
 /// `--location <the fixture's metadata file>`.
-fn location(fixture: &Fixture) -> [&str; 2] {
-    ["--location", fixture.metadata_location()]
+fn location(fixture: &Fixture) -> [&str; 4] {
+    [
+        "--location",
+        fixture.metadata_location(),
+        "--value-column",
+        VALUE_COLUMN,
+    ]
 }
+
+/// The flags of a `get` that reads the fixture's value column.
+const READ_VALUE: [&str; 2] = ["--column", VALUE_COLUMN];
 
 /// A table of the two-table configuration, in TOML, pinned to `fixture`,
 /// with `strict` left out, so the table takes the default, off.
 fn toml_table(name: &str, fixture: &Fixture) -> String {
     format!(
-        "[[tables]]\nname = \"{name}\"\nsource = {{ type = \"static\", location = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n",
+        "[[tables]]\nname = \"{name}\"\nsource = {{ type = \"static\", location = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n",
         fixture.metadata_location()
     )
 }
@@ -165,7 +173,7 @@ fn json_table(name: &str, fixture: &Fixture) -> Json {
         "source": {"type": "static", "location": fixture.metadata_location()},
         "ref": "main",
         "key_column": "key",
-        "value_column": "value"
+        "value_columns": ["value"]
     })
 }
 
@@ -354,7 +362,7 @@ async fn test_info_reads_a_glue_table_through_its_catalog() -> TestResult {
     );
     let key_id = "AKIAICETRAYCLI";
     let text = format!(
-        "[storage.s3]\naccess_key_id = \"{key_id}\"\nsecret_access_key = \"icetray-cli-secret\"\n\n[[tables]]\nname = \"{name}\"\nsource = {{ type = \"glue\", database = \"{NAMESPACE}\", table = \"{name}\", region = \"us-test-1\", endpoint = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n",
+        "[storage.s3]\naccess_key_id = \"{key_id}\"\nsecret_access_key = \"icetray-cli-secret\"\n\n[[tables]]\nname = \"{name}\"\nsource = {{ type = \"glue\", database = \"{NAMESPACE}\", table = \"{name}\", region = \"us-test-1\", endpoint = \"{}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n",
         catalog.url()
     );
     let config = write_file(dir.path(), "glue.toml", &text)?;
@@ -710,6 +718,7 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
         &[
             &["get"][..],
             &location(&fixture),
+            &READ_VALUE,
             &keys.iter().map(String::as_str).collect::<Vec<_>>(),
         ]
         .concat(),
@@ -726,19 +735,43 @@ async fn test_get_answers_present_null_and_absent() -> TestResult {
     }
     assert_eq!(got[0]["presence"], "present");
     assert_eq!(
-        got[0]["value_base64"],
+        got[0]["values"][VALUE_COLUMN]["base64"],
         Json::String(base64::engine::general_purpose::STANDARD.encode(&value))
     );
-    assert_eq!(got[0]["value_bytes"], Json::from(value.len()));
+    assert_eq!(
+        got[0]["values"][VALUE_COLUMN]["bytes"],
+        Json::from(value.len())
+    );
     assert_eq!(got[0]["gets"], Json::from(1));
-    assert_eq!(got[1]["presence"], "null");
-    assert!(got[1].get("value_base64").is_none());
-    assert_eq!(got[1]["value_bytes"], Json::from(0));
+    assert_eq!(got[1]["presence"], "present");
+    assert_eq!(got[1]["values"][VALUE_COLUMN], Json::Null, "a null is null");
     assert_eq!(got[1]["gets"], Json::from(1));
     assert_eq!(got[2]["presence"], "absent");
-    assert!(got[2].get("value_base64").is_none());
-    assert_eq!(got[2]["value_bytes"], Json::from(0));
+    assert!(got[2].get("values").is_none());
     assert_eq!(got[2]["gets"], Json::from(0));
+
+    let presence_only = run(
+        &[
+            &["get"][..],
+            &location(&fixture),
+            &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        ]
+        .concat(),
+        &[],
+    );
+    assert_exit(&presence_only, EXIT_OK);
+    let got = lines(&presence_only.stdout);
+    assert_eq!(got[0]["presence"], "present");
+    assert_eq!(got[0]["values"], serde_json::json!({}));
+    assert_eq!(got[1]["presence"], "present");
+    assert_eq!(got[2]["presence"], "absent");
+    for line in &got {
+        assert_eq!(
+            line["gets"],
+            Json::from(0),
+            "no --column reads no value page"
+        );
+    }
     Ok(())
 }
 
@@ -760,7 +793,10 @@ async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
             Key::Str(text) => text.clone(),
             Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => key.to_string(),
         };
-        let first = run(&[&["get"][..], &location(&fixture), &[&text]].concat(), &[]);
+        let first = run(
+            &[&["get"][..], &location(&fixture), &READ_VALUE, &[&text]].concat(),
+            &[],
+        );
         assert_exit(&first, EXIT_OK);
         let first = lines(&first.stdout);
         assert_eq!(first.len(), 1, "{name}");
@@ -772,7 +808,7 @@ async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
             panic!("{name}: the key is a JSON string in {}", first[0]);
         };
         let again = run(
-            &[&["get"][..], &location(&fixture), &[printed]].concat(),
+            &[&["get"][..], &location(&fixture), &READ_VALUE, &[printed]].concat(),
             &[],
         );
         assert_exit(&again, EXIT_OK);
@@ -780,7 +816,7 @@ async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
         assert_eq!(again.len(), 1, "{name}");
         assert_eq!(again[0]["presence"], "present", "{name}");
         assert_eq!(again[0]["key"], first[0]["key"], "{name}");
-        assert_eq!(again[0]["value_base64"], first[0]["value_base64"], "{name}");
+        assert_eq!(again[0]["values"], first[0]["values"], "{name}");
 
         if let Key::Bytes(_) = &key {
             let uppercase = text.trim_start_matches("0x").to_uppercase();
@@ -834,6 +870,80 @@ async fn test_get_rejects_a_key_that_does_not_parse_before_the_load() -> TestRes
     let bad_key = run(&[&["get"][..], &location(&fixture), &["abc"]].concat(), &[]);
     assert_exit(&bad_key, EXIT_USAGE);
     assert!(bad_key.stdout.is_empty());
+    Ok(())
+}
+
+/// A `--column` the table does not serve, or one given twice, is a usage
+/// error found from the configuration alone, before the load: with every
+/// data file gone, so a load fails with exit 1, it still exits 64.
+#[tokio::test]
+async fn test_get_rejects_an_unserved_or_repeated_column_before_the_load() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(
+        dir.path(),
+        FixtureSpec::small("kv_badcolumn", KeyType::Long),
+    )
+    .await?;
+    assert!(remove_data_files(dir.path())? > 0);
+    let key = fixture.key(SAMPLE[0]).to_string();
+    let unserved = ["--column", "absent"];
+    let repeated = ["--column", VALUE_COLUMN, "--column", VALUE_COLUMN];
+    for columns in [&unserved[..], &repeated[..]] {
+        let output = run(
+            &[&["get"][..], &location(&fixture), columns, &[&key]].concat(),
+            &[],
+        );
+        assert_exit(&output, EXIT_USAGE);
+        assert!(output.stdout.is_empty());
+        assert_plain_error(&output);
+    }
+    Ok(())
+}
+
+/// `get` naming two columns prints each one's value under its name, in
+/// the order named, and a cold hit costs one GET per column.
+#[tokio::test]
+async fn test_get_two_columns_prints_their_values_in_the_order_named() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let spec = FixtureSpec {
+        second_value: true,
+        ..FixtureSpec::small("kv_two_columns", KeyType::Long)
+    };
+    let fixture = local_fixture(dir.path(), spec).await?;
+    let key = fixture.key(SAMPLE[0]);
+    let encoded = |bytes: Option<Vec<u8>>| {
+        Json::String(
+            base64::engine::general_purpose::STANDARD.encode(bytes.expect("a present value")),
+        )
+    };
+    let value = encoded(fixture.value(&key));
+    let detail = encoded(fixture.second_value(&key));
+    assert_ne!(value, detail, "the columns hold different bytes");
+    for order in [
+        [VALUE_COLUMN, SECOND_VALUE_COLUMN],
+        [SECOND_VALUE_COLUMN, VALUE_COLUMN],
+    ] {
+        let output = run(
+            &[
+                &["get"][..],
+                &location(&fixture),
+                &["--value-column", SECOND_VALUE_COLUMN],
+                &["--column", order[0], "--column", order[1]],
+                &[&key.to_string()],
+            ]
+            .concat(),
+            &[],
+        );
+        assert_exit(&output, EXIT_OK);
+        let got = lines(&output.stdout);
+        assert_eq!(got[0]["values"][VALUE_COLUMN]["base64"], value);
+        assert_eq!(got[0]["values"][SECOND_VALUE_COLUMN]["base64"], detail);
+        assert_eq!(got[0]["gets"], Json::from(order.len()), "a GET per column");
+        let text = String::from_utf8(output.stdout)?;
+        let at = |column: &str| text.find(&format!("\"{column}\":"));
+        assert!(at(order[0]) < at(order[1]), "{order:?} in {text}");
+        assert!(at(order[0]).is_some());
+    }
     Ok(())
 }
 
@@ -1060,7 +1170,7 @@ fn test_a_location_no_store_serves_is_usage_on_the_command_line_and_failure_in_t
     assert_exit(&located, EXIT_USAGE);
     assert!(!assert_plain_error(&located), "{}", stderr(&located));
     let text = format!(
-        "[[tables]]\nname = \"kv\"\nsource = {{ type = \"static\", location = \"{unserved}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n"
+        "[[tables]]\nname = \"kv\"\nsource = {{ type = \"static\", location = \"{unserved}\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n"
     );
     let config = write_file(dir.path(), "unserved.toml", &text)?;
     let configured = run(&["info", "--config", &config], &[]);
@@ -1078,7 +1188,7 @@ fn test_an_empty_location_is_usage_on_the_command_line_and_failure_in_the_file()
     let located = run(&["info", "--location", ""], &[]);
     assert_exit(&located, EXIT_USAGE);
     assert!(located.stdout.is_empty(), "{}", stderr(&located));
-    let text = "[[tables]]\nname = \"kv\"\nsource = { type = \"static\", location = \"\" }\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n";
+    let text = "[[tables]]\nname = \"kv\"\nsource = { type = \"static\", location = \"\" }\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n";
     let config = write_file(dir.path(), "empty-location.toml", text)?;
     let configured = run(&["info", "--config", &config], &[]);
     assert_exit(&configured, EXIT_FAILURE);

@@ -14,12 +14,13 @@ use icetray_core::approx::count;
 use icetray_core::config::{Config, LocalConfig, StorageConfig};
 use icetray_core::{
     Error, Finding, FindingCode, FindingLog, Generation, Key, Level, LookupCost, RefusalReason,
-    Residency, Storage, Table, TableReport, Value, diagnose, open,
+    Residency, Row, Storage, Table, TableReport, diagnose, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MOR_DELETED_IDS, MOR_UPDATED_IDS,
     WIDE_REPEATS,
 };
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, SeenPages};
 use icetray_testkit::{Result, absent_key_from};
 
@@ -112,9 +113,9 @@ async fn hits(golden: &Golden, keys: &[Key], expected: impl Fn(&Key) -> Vec<u8>)
     let stats = golden.storage.stats();
     let before = stats.gets();
     for key in keys {
-        let lookup = golden.table.get(key).await?;
-        let Value::Present(bytes) = lookup.value else {
-            panic!("key {key} is {:?}", lookup.value);
+        let lookup = golden.table.get(key, &[VALUE_COLUMN]).await?;
+        let Some(bytes) = verify::one_value(&lookup.row) else {
+            panic!("key {key} is {:?}", lookup.row);
         };
         assert_eq!(&bytes[..], &expected(key)[..], "value for key {key}");
     }
@@ -127,8 +128,8 @@ async fn misses(golden: &Golden, keys: &[Key]) -> Result<()> {
     let before = stats.gets();
     for key in keys {
         assert_eq!(
-            golden.table.get(key).await?.value,
-            Value::Absent,
+            golden.table.get(key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "key {key}"
         );
     }
@@ -145,7 +146,7 @@ async fn verify_contract_hits(
     expected: impl Fn(&Key) -> Vec<u8>,
 ) -> Result<()> {
     let generation = golden.current();
-    let cold = verify::expected_cold_gets(&generation, keys)?;
+    let cold = verify::expected_cold_gets(&generation, keys, &[VALUE_COLUMN])?;
     assert!(cold > 0);
     assert_eq!(hits(golden, keys, expected).await?, cold);
     let absent: Vec<Key> = keys.iter().map(absent_key_from).collect();
@@ -169,7 +170,16 @@ fn string_text(key: &Key) -> String {
 }
 
 fn capping_codes(golden: &Golden) -> Vec<FindingCode> {
-    golden.report().capping_codes()
+    codes_of(&golden.report())
+}
+
+/// The codes of `report`'s capping findings, in order.
+fn codes_of(report: &TableReport) -> Vec<FindingCode> {
+    report
+        .capping()
+        .into_iter()
+        .map(|capping| capping.code)
+        .collect()
 }
 
 fn advice_codes(golden: &Golden) -> Vec<FindingCode> {
@@ -197,7 +207,7 @@ fn assert_lookup_cost(golden: &Golden, keys: &[Key], expected: LookupCost) -> Re
     assert_eq!(generation.lookup_cost, expected);
     for key in keys {
         assert_eq!(
-            verify::expected_cold_gets(&generation, std::slice::from_ref(key))?,
+            verify::expected_cold_gets(&generation, std::slice::from_ref(key), &[VALUE_COLUMN])?,
             expected.gets_per_hit,
             "key {key}"
         );
@@ -259,7 +269,8 @@ async fn test_golden_bin16_contract_serves() -> Result<()> {
     assert!(!keys.is_empty());
     let stats = golden.storage.stats();
     for key in &keys {
-        let Value::Present(bytes) = golden.table.get(key).await?.value else {
+        let row = golden.table.get(key, &[VALUE_COLUMN]).await?.row;
+        let Some(bytes) = verify::one_value(&row) else {
             panic!("key {key} is absent");
         };
         assert_eq!(bytes.len(), CONTRACT_REPEATS * HEX_DIGEST_BYTES);
@@ -280,8 +291,8 @@ async fn test_golden_bin16_contract_serves() -> Result<()> {
     let before = stats.gets();
     for key in &flipped {
         assert_eq!(
-            golden.table.get(key).await?.value,
-            Value::Absent,
+            golden.table.get(key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "key {key}"
         );
     }
@@ -322,7 +333,7 @@ async fn test_golden_format_v3_contract_serves_one_get_per_hit() -> Result<()> {
     assert_eq!(metadata.format_version(), FormatVersion::V3);
     let report = golden.report();
     assert_eq!(report.summary.level, Level::Optimal);
-    assert!(report.capping_codes().is_empty(), "{:?}", report.findings);
+    assert!(report.capping().is_empty(), "{:?}", report.findings);
     let keys: Vec<Key> = IDS_50K.iter().map(|&id| golden::long_key(id)).collect();
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
@@ -333,7 +344,7 @@ async fn test_golden_default_layout_is_balanced() -> Result<()> {
     let golden = open_golden(GoldenTable::DefaultLayout1m, false).await?;
     let report = golden.report();
     assert_eq!(report.summary.level, Level::Balanced);
-    assert!(report.capping_codes().contains(&FindingCode::LargeKeyPages));
+    assert!(codes_of(&report).contains(&FindingCode::LargeKeyPages));
     let advice = advice_codes(&golden);
     assert!(advice.contains(&FindingCode::NoBloomFilter), "{advice:?}");
     assert!(advice.contains(&FindingCode::LargeValuePages), "{advice:?}");
@@ -360,7 +371,9 @@ async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {
         panic!("strict refuses the default layout: {error:?}");
     };
     assert!(
-        findings.contains(&FindingCode::LargeKeyPages),
+        findings
+            .iter()
+            .any(|capping| capping.code == FindingCode::LargeKeyPages),
         "{findings:?}"
     );
     Ok(())
@@ -385,7 +398,7 @@ async fn test_golden_overlap_serves_and_reports_overlap_permissive() -> Result<(
         .map(|&id| golden::permuted_key(id))
         .collect();
     let generation = golden.current();
-    let cold = verify::expected_cold_gets(&generation, &keys)?;
+    let cold = verify::expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
     assert_eq!(
         hits(&golden, &keys, |key| golden::wide_value(&long_text(key))).await?,
         cold
@@ -493,20 +506,21 @@ async fn assert_merge_on_read_serves(table: GoldenTable) -> Result<()> {
             let gets = verify::expected_lookup_gets(
                 &full,
                 &generation,
+                VALUE_COLUMN,
                 &key,
                 expected.is_some(),
                 &mut seen,
             );
             let before = stats.gets();
-            let answer = served.table.get(&key).await?.value;
+            let answer = served.table.get(&key, &[VALUE_COLUMN]).await?.row;
             match &expected {
                 Some(value) => {
-                    let Value::Present(bytes) = &answer else {
+                    let Some(bytes) = verify::one_value(&answer) else {
                         panic!("{table} {residency} key {key} is {answer:?}");
                     };
                     assert_eq!(&bytes[..], &value[..], "{table} {residency} key {key}");
                 }
-                None => assert_eq!(answer, Value::Absent, "{table} {residency} key {key}"),
+                None => assert_eq!(answer, Row::Absent, "{table} {residency} key {key}"),
             }
             assert_eq!(
                 stats.gets() - before,
@@ -635,7 +649,7 @@ async fn test_golden_merge_on_read_updates_overlap_permissive() -> Result<()> {
         );
         let report = golden.report();
         assert_eq!(report.summary.level, Level::Permissive, "{table}");
-        let capping = report.capping_codes();
+        let capping = codes_of(&report);
         assert!(
             capping.contains(&FindingCode::OverlappingFiles),
             "{table} {capping:?}"
@@ -673,11 +687,7 @@ async fn test_golden_merge_on_read_compaction_restores_optimal() -> Result<()> {
         let golden = open_golden(table, false).await?;
         let report = golden.report();
         assert_eq!(report.summary.level, Level::Optimal, "{table}");
-        assert!(
-            report.capping_codes().is_empty(),
-            "{table} {:?}",
-            report.findings
-        );
+        assert!(report.capping().is_empty(), "{table} {:?}", report.findings);
         let advice = advice_codes(&golden);
         assert!(
             !advice.contains(&FindingCode::DeletesPending),

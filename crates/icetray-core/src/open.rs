@@ -971,6 +971,140 @@ mod tests {
         assert!(after.current().is_some());
     }
 
+    /// The value columns `columns` names, as an entry lists them.
+    fn listing(columns: &[&str]) -> Vec<crate::config::ValueColumnConfig> {
+        columns
+            .iter()
+            .map(|&column| crate::config::ValueColumnConfig::named(column))
+            .collect()
+    }
+
+    /// A loaded table of one file holding `DETAIL_COLUMN` beside the value
+    /// column, opened from one entry serving `columns`: its fixture, the
+    /// opened tables, the entry, and a key it holds.
+    async fn two_column_table(columns: &[&str]) -> (Fixture, Opened, TableConfig, crate::key::Key) {
+        let mut fixture = Fixture::with_detail(
+            crate::key::KeyType::Long,
+            crate::manifest::testing::bucket_spec(1),
+        );
+        let keys = keys_from(0, E2E_KEYS);
+        fixture.add_long_file("f", &keys, 0).await;
+        fixture
+            .commit(
+                FIRST_SNAPSHOT,
+                None,
+                crate::generation::testing::FIRST_SEQUENCE,
+                crate::generation::testing::FIRST_VERSION,
+            )
+            .await;
+        let entry = TableConfig {
+            value_columns: listing(columns),
+            ..named(FIRST_TABLE, &fixture, Residency::Full)
+        };
+        let opened = loaded(&config(vec![entry.clone()])).await;
+        (fixture, opened, entry, crate::key::Key::Long(keys[0]))
+    }
+
+    /// A reload that only reorders a table's value columns changes nothing:
+    /// the table keeps serving its generation, and a retune beside the
+    /// reorder still reads each column by name (RFD 018, RFD 022).
+    #[tokio::test]
+    async fn test_apply_reordering_value_columns_is_no_change() {
+        let value = crate::manifest::testing::VALUE_COLUMN;
+        let detail = crate::generation::testing::DETAIL_COLUMN;
+        let (_fixture, opened, both, key) = two_column_table(&[value, detail]).await;
+        let before = table_named(&opened, FIRST_TABLE).unwrap();
+        let serving = before.current().unwrap();
+        let expected = before.get(&key, &[detail, value]).await.unwrap().row;
+
+        let reordered = TableConfig {
+            value_columns: listing(&[detail, value]),
+            ..both
+        };
+        let applied = opened
+            .apply(std::slice::from_ref(&reordered))
+            .await
+            .unwrap();
+        assert_eq!((applied.kept, applied.started.len()), (1, 0), "no change");
+        assert!(applied.retuned.is_empty());
+        let after = table_named(&opened, FIRST_TABLE).unwrap();
+        assert!(Arc::ptr_eq(&after, &before));
+        assert!(Arc::ptr_eq(&after.current().unwrap(), &serving));
+
+        let retuned = TableConfig {
+            lookups: Some(Level::Permissive),
+            ..reordered
+        };
+        let applied = opened.apply(std::slice::from_ref(&retuned)).await.unwrap();
+        assert_eq!(applied.retuned.len(), 1, "a retune beside the reorder");
+        assert_eq!(
+            after.get(&key, &[detail, value]).await.unwrap().row,
+            expected,
+            "the columns still answer by name"
+        );
+    }
+
+    /// A reload that adds a value column, `[value]` to `[value, detail]`,
+    /// builds and loads the table anew and serves the added column; one
+    /// that removes it does too, and refuses the column it removed (RFD
+    /// 018, RFD 022).
+    #[tokio::test]
+    async fn test_apply_adding_or_removing_a_value_column_reloads() {
+        let value = crate::manifest::testing::VALUE_COLUMN;
+        let detail = crate::generation::testing::DETAIL_COLUMN;
+        let (_fixture, opened, value_only, key) = two_column_table(&[value]).await;
+        let before = table_named(&opened, FIRST_TABLE).unwrap();
+        assert!(matches!(
+            before.get(&key, &[detail]).await,
+            Err(crate::error::Error::ColumnRequest { .. })
+        ));
+
+        let both = TableConfig {
+            value_columns: listing(&[value, detail]),
+            ..value_only.clone()
+        };
+        let applied = opened.apply(std::slice::from_ref(&both)).await.unwrap();
+        assert_eq!(
+            names_of(&applied.started),
+            [FIRST_TABLE],
+            "a column added reloads"
+        );
+        let added = table_named(&opened, FIRST_TABLE).unwrap();
+        assert!(!Arc::ptr_eq(&added, &before));
+        let crate::generation::Row::Present(values) =
+            added.get(&key, &[detail, value]).await.unwrap().row
+        else {
+            panic!("the key is present");
+        };
+        let value_bytes = values[1].clone().expect("a present value");
+        assert_eq!(
+            values,
+            [
+                Some(bytes::Bytes::from(crate::generation::testing::detail_of(
+                    &value_bytes
+                ))),
+                Some(value_bytes.clone()),
+            ]
+        );
+        assert_ne!(values[0], values[1], "the columns differ");
+
+        let applied = opened
+            .apply(std::slice::from_ref(&value_only))
+            .await
+            .unwrap();
+        assert_eq!(
+            names_of(&applied.started),
+            [FIRST_TABLE],
+            "a column removed reloads"
+        );
+        let removed = table_named(&opened, FIRST_TABLE).unwrap();
+        assert!(!Arc::ptr_eq(&removed, &added));
+        assert!(matches!(
+            removed.get(&key, &[detail]).await,
+            Err(crate::error::Error::ColumnRequest { .. })
+        ));
+    }
+
     /// The snapshot a `Serving` state carries; any other state fails.
     fn serving_snapshot(table: &Table) -> SnapshotId {
         let TableState::Serving { snapshot_id, .. } = table.state() else {
@@ -1183,7 +1317,14 @@ mod tests {
             RefusalReason::BelowLevel {
                 declared: Level::Balanced,
                 achieved: Level::Permissive,
-                findings: vec![FindingCode::OverlappingFiles],
+                columns: vec![crate::check::ColumnLevel {
+                    column: crate::manifest::testing::VALUE_COLUMN.to_string(),
+                    level: Level::Permissive,
+                }],
+                findings: vec![crate::check::Capping {
+                    code: FindingCode::OverlappingFiles,
+                    column: None,
+                }],
             },
             "the refused snapshot is built again under the new entry"
         );

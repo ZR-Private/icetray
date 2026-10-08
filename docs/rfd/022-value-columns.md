@@ -30,15 +30,17 @@ a second key index.
 ## Decision
 
 Rows read by several kinds of caller will be served by letting a table
-name several value columns, each read only when a lookup names it, all
-from one key index and one generation.
+name several value columns, or none, each read only when a lookup names
+it, all from one key index and one generation.
 
 - **Configuration.** `value_columns` lists the columns a table serves
   and replaces `value_column`. The list may be empty, for a table that
   answers only whether a key is present. A name listed twice, or the
-  key column listed as a value, is a configuration error. Order carries
-  no meaning, so a reordered list is not a change. A change to the set
-  reloads the whole table under RFD 018 (Configuration reload),
+  key column listed as a value, is a configuration error, and so is an
+  empty name. Order carries no meaning: a generation holds the columns
+  in name order, names compared as their bytes, so a reordered list is
+  not a change and keeps the generation and its indexes. A change to the
+  set reloads the whole table under RFD 018 (Configuration reload),
   accepted because a table's columns change rarely.
 - **Types.** Each column is `binary`, `fixed`, or `string`, served as
   bytes unchanged. A column of any other type refuses the table as
@@ -52,9 +54,11 @@ from one key index and one generation.
   the order requested, each its bytes or null, in a message of its own
   since a proto3 list of bytes cannot hold a null. Presence and null
   are separate answers, so RFD 010's (Transport and client contract)
-  combined presence enum splits in two. TableInfo lists the columns,
-  each with its type as an enum and a `fixed` column's width. The
-  operator subcommands name columns the same way.
+  combined presence enum splits in two. TableInfo lists the columns in
+  name order, each with its type as an enum and a `fixed` column's
+  width, and the doctor lists them in the same order. The operator
+  subcommands name columns the same way: `get --column`, repeated, and
+  `--value-column`, repeated, for a table opened by `--location`.
 - **Cost.** A hit costs finding the row in its residency (RFD 017
   (Residency tiers)), then one GET per column it names, two for a
   dictionary-encoded column, issued concurrently, except a column RFD
@@ -66,30 +70,39 @@ from one key index and one generation.
 - **Bounds.** `server.max_multi_get_keys` becomes
   `server.max_multi_get_values` and counts keys times columns, a
   presence-only key counting one, and the batch fan-out bounds GETs in
-  flight rather than lookups, so a batch holds no more GETs open than
-  today. Each GET is hedged on its own, in the table's one hedge window,
-  and the hedge-rate ceiling counts GETs.
+  flight rather than lookups: each GET a lookup issues, a key page, a
+  value page, or a dictionary page, holds one slot until it ends, and
+  none waits for a slot while holding one, so a batch holds no more
+  GETs open than today whatever its keys and columns. Each GET is hedged
+  on its own, in the table's one hedge window, and the hedge-rate
+  ceiling counts GETs.
 - **Index.** A file keeps resident the offset index of the key and of
   each configured column and drops the rest at build, the resident set
-  RFD 004 (Resident key-chunk index) describes; the code today keeps
-  every column's.
-- **Findings and levels.** RFD 016's (Doctor) value-column findings
-  (dictionary encoding, value-page size, the type refusal) are made per
-  column and name it, in the doctor's report, in `BelowLevel`, and in a
-  `column` label that `icetray_findings` carries for those codes alone.
-  Each column has a level under RFD 020 (Lookup levels), published as
-  `icetray_table_column_level`. The table's level is the dearest
-  column's, since any column may be asked for, and a table of no
-  columns has the level of finding the row. RFD 020's alert series stay
-  one per table.
-- **Metrics.** `icetray_value_page_gets_total` counts value-page GETs
-  by table and column, hedges left to `icetray_hedges_total`; it is
-  what a caller budgets with. `icetray_table_gets_per_hit` predicts
-  finding the row and reading the dearest column, and
+  RFD 004 (Resident key-chunk index) describes.
+- **Findings and levels.** RFD 016's (Doctor) value-column findings,
+  `dictionary_encoded_value`, `large_value_pages`,
+  `value_pages_over_ceiling`, and the advice `column_default`, are made
+  per column and name it, in the doctor's report, in `BelowLevel`, and
+  in a `column` label that `icetray_findings` carries for those codes
+  alone; the doctor's per-file report lists each column's facts. The
+  type refusal, `value_type_unsupported`, names its column in its
+  message. Each column has a level under RFD 020 (Lookup levels),
+  published as `icetray_table_column_level`, measured on the same
+  snapshot as the table's level, so while a table is held its column
+  series describe the refused snapshot. The table's level is the
+  dearest column's, since any column may be asked for, and a table of
+  no columns has the level of finding the row. RFD 020's alert series
+  stay one per table.
+- **Metrics.** `icetray_value_page_gets_total` counts the value-page
+  and dictionary-page GETs issued, by table and column, each once where
+  it is issued, hedges left to `icetray_hedges_total`; it is what a
+  caller budgets with. `icetray_table_gets_per_hit` predicts finding the
+  row and reading the dearest column, and
   `icetray_table_column_gets_per_hit` each column's own GETs, so a
-  caller can add up a request. A hit stays cold when a value page came
-  from object storage and warm otherwise, so a presence-only hit is
-  warm. Naming several columns costs several columns by the caller's
+  caller can add up a request. A hit is cold when a value or dictionary
+  page of a column it names came from object storage, a fetch another
+  lookup started included, and warm otherwise, so a presence-only hit
+  is warm. Naming several columns costs several columns by the caller's
   choice, which is not a finding.
 
 One packed column performs best, and RFD 002's recipe stays the

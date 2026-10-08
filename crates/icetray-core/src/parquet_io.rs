@@ -20,7 +20,7 @@ use parquet::file::metadata::{
 use parquet::file::reader::{ChunkReader, Length};
 
 use crate::approx;
-use crate::cache::{PageCache, PageOrigin};
+use crate::cache::{Issue, PageCache, PageOrigin};
 use crate::error::{Error, Result};
 use crate::index::{DecodedPart, decoder_panicked};
 use crate::local::{self, DIGEST_BYTES};
@@ -118,23 +118,25 @@ impl FileHandle {
     /// always addressed at their offset-index position, so a page is one
     /// entry however it is reached, and concurrent lookups for one page
     /// share one fetch. That fetch, and every read without a cache, is one
-    /// hedged lookup GET, so a read without a cache is always `Fetched`.
+    /// hedged lookup GET answering to `issue` where it is issued, so a read
+    /// without a cache is always `Fetched` and always admitted.
     pub(crate) async fn read_page(
         self: &Arc<Self>,
         range: Range<u64>,
         cache: Option<&PageCache>,
+        issue: Issue<'_>,
     ) -> Result<(Bytes, PageOrigin)> {
         let Some(cache) = cache else {
+            let _permit = issue.admit().await;
             let page = self.read_range_hedged(range).await?;
             return Ok((page, PageOrigin::Fetched));
         };
         let handle = Arc::clone(self);
         let key = (Arc::clone(&self.file_id), range.start);
         cache
-            .get_or_fetch(
-                key,
-                move || async move { handle.read_range_hedged(range).await },
-            )
+            .get_or_fetch(key, issue, move || async move {
+                handle.read_range_hedged(range).await
+            })
             .await
     }
 
@@ -732,14 +734,20 @@ mod tests {
         let cache = cache().await;
         let before = stats.gets();
 
-        let (cold, origin) = handle.read_page(range.clone(), Some(&cache)).await.unwrap();
+        let (cold, origin) = handle
+            .read_page(range.clone(), Some(&cache), Issue::default())
+            .await
+            .unwrap();
         assert_eq!(&cold[..], file_slice(&file, &range));
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(stats.gets(), before + 1);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let (warm, origin) = handle.read_page(range.clone(), Some(&cache)).await.unwrap();
+        let (warm, origin) = handle
+            .read_page(range.clone(), Some(&cache), Issue::default())
+            .await
+            .unwrap();
         assert_eq!(&warm[..], file_slice(&file, &range));
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(stats.gets(), before + 1);
@@ -757,8 +765,11 @@ mod tests {
         let cache = cache().await;
         let before = stats.gets();
 
-        let pages =
-            join_all((0..CONCURRENT).map(|_| handle.read_page(range.clone(), Some(&cache)))).await;
+        let pages = join_all(
+            (0..CONCURRENT)
+                .map(|_| handle.read_page(range.clone(), Some(&cache), Issue::default())),
+        )
+        .await;
         assert_eq!(pages.len(), CONCURRENT);
         for page in pages {
             let (page, origin) = page.unwrap();
@@ -778,11 +789,17 @@ mod tests {
         let range = first_value_page(&metadata);
         let before = stats.gets();
 
-        let (first, origin) = handle.read_page(range.clone(), None).await.unwrap();
+        let (first, origin) = handle
+            .read_page(range.clone(), None, Issue::default())
+            .await
+            .unwrap();
         assert_eq!(&first[..], file_slice(&file, &range));
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(stats.gets(), before + 1);
-        let (second, origin) = handle.read_page(range.clone(), None).await.unwrap();
+        let (second, origin) = handle
+            .read_page(range.clone(), None, Issue::default())
+            .await
+            .unwrap();
         assert_eq!(&second[..], file_slice(&file, &range));
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(stats.gets(), before + 2);
@@ -818,7 +835,10 @@ mod tests {
         assert_eq!(window.delay(), None);
         assert_eq!(stats.hedges(), 0);
 
-        let (looked_up, _) = handle.read_page(range.clone(), None).await.unwrap();
+        let (looked_up, _) = handle
+            .read_page(range.clone(), None, Issue::default())
+            .await
+            .unwrap();
         assert_eq!(&looked_up[..], file_slice(&file, &range));
         assert_eq!(stats.gets(), before + 4);
         assert!(window.delay().is_some());

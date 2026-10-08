@@ -18,6 +18,7 @@ use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
+use crate::manifest;
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -120,11 +121,12 @@ const DEFAULT_MULTI_GET_DEADLINE: Duration = Duration::from_secs(15);
 /// measurement (RFD 013).
 const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 
-/// Keys one `MultiGet` may carry when the file says nothing: 1000. A larger
-/// batch is refused before any lookup, so the work one request can ask for,
-/// and the answer it holds in memory, is bounded. A single-pod guess, to
-/// revisit with measurement (RFD 013).
-const DEFAULT_MAX_MULTI_GET_KEYS: usize = 1000;
+/// Values one `MultiGet` may ask for when the file says nothing: 1000, its
+/// keys times the columns it names, a key of a presence-only call counting
+/// one (RFD 022). A larger batch is refused before any lookup, so the work
+/// one request can ask for, and the answer it holds in memory, is bounded.
+/// A single-pod guess, to revisit with measurement (RFD 013).
+const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after
@@ -332,6 +334,29 @@ pub enum ConfigViolation {
         /// The table's position in `tables`.
         index: usize,
     },
+    /// A table lists a value column with an empty name (RFD 022).
+    #[error("tables[{index}].value_columns lists an empty name")]
+    EmptyValueColumn {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// A table lists one value column twice (RFD 022).
+    #[error("tables[{index}].value_columns lists {column:?} more than once")]
+    DuplicateValueColumn {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The column listed twice.
+        column: String,
+    },
+    /// A table lists its key column as a value column (RFD 022): a lookup
+    /// already names the key, so serving it again carries nothing.
+    #[error("tables[{index}].value_columns lists the key column {column:?}")]
+    KeyColumnAsValue {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The key column's name.
+        column: String,
+    },
     /// A table has the name of a table before it.
     #[error("tables[{index}].name {name} is configured more than once")]
     DuplicateTableName {
@@ -466,9 +491,10 @@ pub enum ConfigViolation {
     /// No request may be in flight, so every request would be refused.
     #[error("server.max_in_flight 0 is not above zero")]
     MaxInFlightZero,
-    /// No key may be in a `MultiGet`, so every batch would be refused.
-    #[error("server.max_multi_get_keys 0 is not above zero")]
-    MaxMultiGetKeysZero,
+    /// No value may be asked for in a `MultiGet`, so every batch would be
+    /// refused.
+    #[error("server.max_multi_get_values 0 is not above zero")]
+    MaxMultiGetValuesZero,
     /// A load deadline of zero, which would fail every first load
     /// unstarted.
     #[error("server.load_deadline 0s is not above zero")]
@@ -689,7 +715,7 @@ impl Config {
             get_deadline,
             multi_get_deadline,
             max_in_flight,
-            max_multi_get_keys,
+            max_multi_get_values,
             load_deadline,
             refresh_deadline,
             drain_deadline,
@@ -730,8 +756,8 @@ impl Config {
                 *max_in_flight == server.max_in_flight,
             ),
             (
-                "server.max_multi_get_keys",
-                *max_multi_get_keys == server.max_multi_get_keys,
+                "server.max_multi_get_values",
+                *max_multi_get_values == server.max_multi_get_values,
             ),
             (
                 "server.load_deadline",
@@ -809,9 +835,10 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_tables(config)
 }
 
-/// Each table has a name of its own, a residency its settings fit, a
-/// `lookups` level its residency reaches, and a source whose settings
-/// `validate_source` accepts.
+/// Each table has a name of its own, a residency its settings fit, value
+/// columns listed once each and apart from the key, a `lookups` level its
+/// residency reaches, and a source whose settings `validate_source`
+/// accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
@@ -842,6 +869,7 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
                 index: Some(index),
             });
         }
+        table.check_value_columns(index)?;
         table.check_lookups(Some(index))?;
         validate_source(index, &table.source, &config.storage)?;
     }
@@ -994,8 +1022,8 @@ fn validate_bounds(
     let limits = [
         (server.max_in_flight, ConfigViolation::MaxInFlightZero),
         (
-            server.max_multi_get_keys,
-            ConfigViolation::MaxMultiGetKeysZero,
+            server.max_multi_get_values,
+            ConfigViolation::MaxMultiGetValuesZero,
         ),
     ];
     if let Some((_, violation)) = durations
@@ -1055,7 +1083,7 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
 /// surface. Every duration is written as a friendly duration such as
 /// `"5s"`. `Config::validated` holds `poll_interval` between one second
 /// and one day, and every other duration, `max_in_flight`, and
-/// `max_multi_get_keys` above zero.
+/// `max_multi_get_values` above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -1090,9 +1118,10 @@ pub struct ServerConfig {
     /// Requests, `Get` and `MultiGet` together, in flight at once; one more
     /// is refused at once as `RESOURCE_EXHAUSTED`, never queued.
     pub max_in_flight: usize,
-    /// Keys one `MultiGet` may carry; more is `INVALID_ARGUMENT` before any
-    /// lookup.
-    pub max_multi_get_keys: usize,
+    /// Values one `MultiGet` may ask for: its keys times the columns it
+    /// names, a key of a call that names none counting one (RFD 022); more
+    /// is `INVALID_ARGUMENT` before any lookup.
+    pub max_multi_get_values: usize,
     /// How long a build from no serving generation, a table's first load
     /// or a retry after one failed, may run before it fails and the table
     /// is `Degraded`; the next poll tries again.
@@ -1120,7 +1149,7 @@ impl Default for ServerConfig {
             get_deadline: DEFAULT_GET_DEADLINE,
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
-            max_multi_get_keys: DEFAULT_MAX_MULTI_GET_KEYS,
+            max_multi_get_values: DEFAULT_MAX_MULTI_GET_VALUES,
             load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
@@ -1383,7 +1412,8 @@ impl Default for StorageConfig {
 
 /// One served table. Two entries are equal when every setting is, `lookups`
 /// compared as `TableConfig::lookups` resolves it, so an entry that spells
-/// out the default equals one that leaves it out.
+/// out the default equals one that leaves it out, and `value_columns`
+/// compared as the set of names it lists, so a reordered list is no change.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableConfig {
@@ -1395,8 +1425,12 @@ pub struct TableConfig {
     pub r#ref: String,
     /// The key column; its Iceberg type is one of `KeyType`.
     pub key_column: String,
-    /// The value column; Iceberg binary, fixed, or string.
-    pub value_column: String,
+    /// The columns the table serves, each Iceberg binary, fixed, or string
+    /// and read only when a lookup names it (RFD 022); empty for a table
+    /// that answers only whether a key is present. A name listed twice, or
+    /// the key column listed, is a violation. Order carries no meaning: two
+    /// entries that list the same columns in another order are equal.
+    pub value_columns: Vec<ValueColumnConfig>,
     /// Whether falling below `lookups` for a reason in the snapshot's
     /// layout is an error rather than a warning (RFD 020): a strict table
     /// refuses such a snapshot, failing the start when it is the first and
@@ -1416,7 +1450,76 @@ pub struct TableConfig {
     pub resident_budget_bytes: Option<u64>,
 }
 
+/// One column a table serves (RFD 022), written in the file as its name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(transparent)]
+pub struct ValueColumnConfig {
+    /// The column's top-level name in the table's schema.
+    pub name: String,
+}
+
+impl ValueColumnConfig {
+    /// The column named `name`.
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
+    }
+}
+
 impl TableConfig {
+    /// The value columns' names, ascending: the order a generation's layout
+    /// holds them in and a lookup names them by position, so that the order
+    /// the file lists them in, which carries no meaning, never reaches a
+    /// lookup.
+    pub fn value_column_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .value_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Checks the columns `names` names for a lookup of this table against
+    /// the configured value columns, as a lookup is checked against the
+    /// serving generation's (`Error::ColumnRequest`), so a caller can refuse
+    /// a request before a load.
+    pub fn check_column_request(&self, names: &[&str]) -> Result<()> {
+        let served = self.value_column_names();
+        manifest::select_columns(&self.name, names, |name| {
+            served.iter().position(|&column| column == name)
+        })
+        .map(drop)
+    }
+
+    /// `ConfigViolation::EmptyValueColumn` for a column of an empty name,
+    /// `ConfigViolation::DuplicateValueColumn` for a column listed twice,
+    /// and `ConfigViolation::KeyColumnAsValue` for the key column listed as
+    /// a value; `index` is the table's place in `tables`.
+    fn check_value_columns(&self, index: usize) -> std::result::Result<(), ConfigViolation> {
+        let mut seen = HashSet::new();
+        for column in &self.value_columns {
+            if column.name.is_empty() {
+                return Err(ConfigViolation::EmptyValueColumn { index });
+            }
+            if column.name == self.key_column {
+                return Err(ConfigViolation::KeyColumnAsValue {
+                    index,
+                    column: column.name.clone(),
+                });
+            }
+            if !seen.insert(column.name.as_str()) {
+                return Err(ConfigViolation::DuplicateValueColumn {
+                    index,
+                    column: column.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The declared lookup level: `lookups` when set, else the best level
     /// the residency reaches (`Residency::best_level`).
     pub fn lookups(&self) -> Level {
@@ -1474,7 +1577,7 @@ impl PartialEq for TableConfig {
             source,
             r#ref,
             key_column,
-            value_column,
+            value_columns: _,
             strict,
             lookups: _,
             residency,
@@ -1484,7 +1587,7 @@ impl PartialEq for TableConfig {
             && *source == other.source
             && *r#ref == other.r#ref
             && *key_column == other.key_column
-            && *value_column == other.value_column
+            && self.value_column_names() == other.value_column_names()
             && *strict == other.strict
             && self.lookups() == other.lookups()
             && *residency == other.residency
@@ -1511,13 +1614,14 @@ fn default_residency() -> Residency {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Residency {
-    /// Key chunks in memory: one GET per hit, none per miss.
+    /// Key chunks in memory: one GET per column a hit names, none per miss.
     Full,
-    /// Key chunks in a local file, fences in memory: one GET and one local
-    /// read per hit, one local read per miss.
+    /// Key chunks in a local file, fences in memory: one GET per column a
+    /// hit names and one local read per hit, one local read per miss.
     Disk,
-    /// Bloom filters in memory, no local disk: two GETs per hit, a GET per
-    /// miss at the filter's false-positive rate.
+    /// Bloom filters in memory, no local disk: the key page's GET and one
+    /// per column a hit names, a GET per miss at the filter's
+    /// false-positive rate.
     Bloom,
 }
 
@@ -1547,7 +1651,7 @@ impl Residency {
 
     /// The best lookup level the tier reaches (RFD 020): `optimal` for
     /// `full` and `disk`; `balanced` for `bloom`, whose hit fetches its key
-    /// page besides the value page.
+    /// page besides its value pages.
     pub(crate) const fn best_level(self) -> Level {
         match self {
             Self::Full | Self::Disk => Level::Optimal,
@@ -1712,8 +1816,8 @@ mod tests {
     const FIXTURE_MULTI_GET_DEADLINE: Duration = Duration::from_secs(8);
     /// The in-flight request limit the full fixture names.
     const FIXTURE_MAX_IN_FLIGHT: usize = 512;
-    /// The `MultiGet` key limit the full fixture names.
-    const FIXTURE_MAX_MULTI_GET_KEYS: usize = 500;
+    /// The `MultiGet` value limit the full fixture names.
+    const FIXTURE_MAX_MULTI_GET_VALUES: usize = 500;
     /// The load deadline the full fixture names, `"45m"`.
     const FIXTURE_LOAD_DEADLINE: Duration = Duration::from_mins(45);
     /// The refresh deadline the full fixture names, `"10m"`.
@@ -1772,7 +1876,7 @@ page_cache_bytes = {FIXTURE_PAGE_CACHE_BYTES}
 get_deadline = "2s"
 multi_get_deadline = "8s"
 max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
-max_multi_get_keys = {FIXTURE_MAX_MULTI_GET_KEYS}
+max_multi_get_values = {FIXTURE_MAX_MULTI_GET_VALUES}
 load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
@@ -1816,7 +1920,7 @@ page_cache_disk_bytes = {FIXTURE_PAGE_CACHE_DISK_BYTES}
 name = "orders"
 ref = "main"
 key_column = "id"
-value_column = "payload"
+value_columns = ["summary", "payload"]
 strict = true
 lookups = "balanced"
 residency = "full"
@@ -1830,7 +1934,7 @@ location = "s3://example-warehouse/db/orders/metadata/v3.metadata.json"
 name = "profiles"
 ref = "serving"
 key_column = "user_id"
-value_column = "vector"
+value_columns = ["vector"]
 residency = "disk"
 
 [tables.source]
@@ -1844,7 +1948,7 @@ table = "profiles"
 name = "sessions"
 ref = "main"
 key_column = "id"
-value_column = "payload"
+value_columns = ["payload"]
 
 [tables.source]
 type = "glue"
@@ -1858,7 +1962,7 @@ endpoint = "https://glue.example"
 name = "events"
 ref = "main"
 key_column = "id"
-value_column = "payload"
+value_columns = ["payload"]
 
 [tables.source]
 type = "s3tables"
@@ -1882,7 +1986,7 @@ endpoint = "https://s3tables.example"
                 "get_deadline": "2s",
                 "multi_get_deadline": "8s",
                 "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
-                "max_multi_get_keys": FIXTURE_MAX_MULTI_GET_KEYS,
+                "max_multi_get_values": FIXTURE_MAX_MULTI_GET_VALUES,
                 "load_deadline": "45m",
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
@@ -1932,7 +2036,7 @@ endpoint = "https://s3tables.example"
                 },
                 "ref": "main",
                 "key_column": "id",
-                "value_column": "payload",
+                "value_columns": ["summary", "payload"],
                 "strict": true,
                 "lookups": "balanced",
                 "residency": "full",
@@ -1949,7 +2053,7 @@ endpoint = "https://s3tables.example"
                 },
                 "ref": "serving",
                 "key_column": "user_id",
-                "value_column": "vector",
+                "value_columns": ["vector"],
                 "residency": "disk"
             },
             {
@@ -1964,7 +2068,7 @@ endpoint = "https://s3tables.example"
                 },
                 "ref": "main",
                 "key_column": "id",
-                "value_column": "payload"
+                "value_columns": ["payload"]
             },
             {
                 "name": "events",
@@ -1978,7 +2082,7 @@ endpoint = "https://s3tables.example"
                 },
                 "ref": "main",
                 "key_column": "id",
-                "value_column": "payload"
+                "value_columns": ["payload"]
             }
         ])
     }
@@ -1992,7 +2096,7 @@ name = "kv"
 source = { type = "static", location = "s3://example-warehouse/db/kv" }
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 "#;
 
     /// The value `toml_full` and `json_full` both denote.
@@ -2013,7 +2117,7 @@ value_column = "value"
                 get_deadline: FIXTURE_GET_DEADLINE,
                 multi_get_deadline: FIXTURE_MULTI_GET_DEADLINE,
                 max_in_flight: FIXTURE_MAX_IN_FLIGHT,
-                max_multi_get_keys: FIXTURE_MAX_MULTI_GET_KEYS,
+                max_multi_get_values: FIXTURE_MAX_MULTI_GET_VALUES,
                 load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
                 drain_deadline: FIXTURE_DRAIN_DEADLINE,
@@ -2061,7 +2165,10 @@ value_column = "value"
                 },
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
-                value_column: "payload".to_string(),
+                value_columns: vec![
+                    ValueColumnConfig::named("summary"),
+                    ValueColumnConfig::named("payload"),
+                ],
                 strict: true,
                 lookups: Some(Level::Balanced),
                 residency: Residency::Full,
@@ -2077,7 +2184,7 @@ value_column = "value"
                 },
                 r#ref: "serving".to_string(),
                 key_column: "user_id".to_string(),
-                value_column: "vector".to_string(),
+                value_columns: vec![ValueColumnConfig::named("vector")],
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: Residency::Disk,
@@ -2094,7 +2201,7 @@ value_column = "value"
                 },
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
-                value_column: "payload".to_string(),
+                value_columns: vec![ValueColumnConfig::named("payload")],
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
@@ -2111,7 +2218,7 @@ value_column = "value"
                 },
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
-                value_column: "payload".to_string(),
+                value_columns: vec![ValueColumnConfig::named("payload")],
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
@@ -2150,7 +2257,10 @@ value_column = "value"
         assert_eq!(config.server.get_deadline, DEFAULT_GET_DEADLINE);
         assert_eq!(config.server.multi_get_deadline, DEFAULT_MULTI_GET_DEADLINE);
         assert_eq!(config.server.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
-        assert_eq!(config.server.max_multi_get_keys, DEFAULT_MAX_MULTI_GET_KEYS);
+        assert_eq!(
+            config.server.max_multi_get_values,
+            DEFAULT_MAX_MULTI_GET_VALUES
+        );
         assert_eq!(config.server.load_deadline, DEFAULT_LOAD_DEADLINE);
         assert_eq!(config.server.refresh_deadline, DEFAULT_REFRESH_DEADLINE);
         assert_eq!(config.server.drain_deadline, DEFAULT_DRAIN_DEADLINE);
@@ -2238,7 +2348,7 @@ value_column = "value"
 name = "kv"
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 
 [tables.source]
 type = "static"
@@ -2256,7 +2366,7 @@ locaton = "typo"
         let toml = TOML_MINIMAL.replace("ref = \"main\"\n", "");
         let at_first_table = [key("tables"), At::Index(0)];
         assert_eq!(schema_fault_at(&toml), at_first_table);
-        let json = r#"{"tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "key_column": "key", "value_column": "value"}]}"#;
+        let json = r#"{"tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "key_column": "key", "value_columns": ["value"]}]}"#;
         assert_eq!(schema_fault_at(json), at_first_table);
     }
 
@@ -2435,6 +2545,55 @@ locaton = "typo"
                 name: "kv".to_string(),
             }
         );
+    }
+
+    /// `TOML_MINIMAL` with its value columns listed as `columns`, a TOML
+    /// array.
+    fn with_value_columns(columns: &str) -> String {
+        TOML_MINIMAL.replace(
+            r#"value_columns = ["value"]"#,
+            &format!("value_columns = {columns}"),
+        )
+    }
+
+    #[test]
+    fn test_parse_value_columns_may_be_empty_and_refuse_an_empty_name_a_repeat_or_the_key() {
+        let presence_only = Config::parse(&with_value_columns("[]")).unwrap();
+        assert!(presence_only.tables[0].value_columns.is_empty());
+        assert_eq!(
+            violation(&with_value_columns(r#"["value", ""]"#)),
+            ConfigViolation::EmptyValueColumn { index: 0 }
+        );
+        assert_eq!(
+            violation(&with_value_columns(r#"["value", "detail", "value"]"#)),
+            ConfigViolation::DuplicateValueColumn {
+                index: 0,
+                column: "value".to_string(),
+            }
+        );
+        assert_eq!(
+            violation(&with_value_columns(r#"["value", "key"]"#)),
+            ConfigViolation::KeyColumnAsValue {
+                index: 0,
+                column: "key".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eq_table_config_compares_value_columns_as_a_set() {
+        let entry =
+            |columns: &str| Config::parse(&with_value_columns(columns)).unwrap().tables[0].clone();
+        let two = entry(r#"["value", "detail"]"#);
+        let reordered = entry(r#"["detail", "value"]"#);
+        assert_eq!(two, reordered, "order carries no meaning");
+        assert!(two.same_but_levels(&reordered));
+        assert_eq!(two.value_column_names(), ["detail", "value"]);
+        assert_eq!(reordered.value_column_names(), ["detail", "value"]);
+        let one = entry(r#"["value"]"#);
+        assert_ne!(two, one, "a column added is a change");
+        assert!(!two.same_but_levels(&one));
+        assert_ne!(one, entry("[]"));
     }
 
     #[test]
@@ -2907,7 +3066,10 @@ locaton = "typo"
         }
         let limits = [
             ("max_in_flight", ConfigViolation::MaxInFlightZero),
-            ("max_multi_get_keys", ConfigViolation::MaxMultiGetKeysZero),
+            (
+                "max_multi_get_values",
+                ConfigViolation::MaxMultiGetValuesZero,
+            ),
         ];
         for (key, expected) in limits {
             let text = format!("{TOML_MINIMAL}\n[server]\n{key} = 0\n");

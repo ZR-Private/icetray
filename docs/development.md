@@ -74,13 +74,13 @@ pip install 'pyspark==4.1.*'
 python3 dev/golden-tables.py --warehouse "file://$PWD/target/golden-warehouse"
 ```
 
-The first run of either downloads the Iceberg runtime from Maven Central.
-Both groups together are about 4.3 GB, most of it the two tables of 16 KiB
-values. The tables are also the quickest way to try the binary:
-`icetray get --location target/golden-warehouse/db/long_2m 42` answers
-from one of them, and the README's
-[Try it locally](../README.md#try-it-locally) walks through `get`,
-`doctor`, and `serve`.
+The first run of either downloads the Iceberg runtime from Maven
+Central. Both groups together are about 4.3 GB, most of it the two
+tables of 16 KiB values. The tables are also the quickest way to try the
+binary: `icetray get --location target/golden-warehouse/db/long_2m
+--value-column value --column value 42` answers from one of them, and
+the README's [Try it locally](../README.md#try-it-locally) walks through
+`get`, `doctor`, and `serve`.
 
 ## Scale probe
 

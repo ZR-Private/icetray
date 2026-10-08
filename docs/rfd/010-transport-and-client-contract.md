@@ -3,6 +3,12 @@
 > Updated 2026-09-24: a MultiGet carries at most `server.max_multi_get_keys`
 > keys, 1000 by default. See RFD 013.
 
+> Updated 2026-10-07: Get and MultiGet name the value columns to read,
+> and a present result carries one value per named column, each its bytes
+> or null, so presence and null are separate answers. TableInfo lists the
+> table's value columns, and the MultiGet limit is
+> `server.max_multi_get_values`, counting keys times columns. See RFD 022.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -38,21 +44,31 @@ type says how its bytes are read. The variant must match the table's key
 type, and a key sent in the wrong one is an invalid-argument error. Naming
 a table the server does not serve is a not-found error.
 
-Every result names one of three outcomes, each distinct on the wire:
-present with the value's bytes, present with a null value, or absent. A
-miss is a normal answer rather than an error, and what a null value means
-is the table owner's rule (RFD 002 (Serving layout contract)).
+Get and MultiGet each carry one list of value columns (RFD 022 (Value
+columns)), applied to every key of the call, with no default: an empty
+list asks whether the key is present and nothing more. A name the table
+does not serve, or a name given twice, is an invalid-argument error.
 
-Get returns the outcome, the value, and the snapshot id. MultiGet answers
+Every result says whether the key is present or absent. A present result
+carries one value per requested column, in the order requested, and each
+value is either its bytes or null, in a message of its own, since a
+proto3 list of bytes cannot hold a null. A null value, a zero-length
+value, and an absent key are distinct on the wire. An absent result
+carries no values, and neither does a present result of a presence-only
+request. A miss is a normal answer rather than an error, and what a null
+value means is the table owner's rule (RFD 002 (Serving layout contract)).
+
+Get returns the outcome, the values, and the snapshot id. MultiGet answers
 every key in the batch from one generation, so a batch is consistent with
 itself. It carries one snapshot id for the whole batch, and its results
 come back in the order the keys were sent, each with only the outcome and
-the value. When any key in a MultiGet cannot be answered, the whole call
+the values. When any key in a MultiGet cannot be answered, the whole call
 fails and the caller retries it.
 
 TableInfo reports the snapshot id, bucket count, file count, row count, key
-type, and resident index bytes. The key type is an enum, so clients switch
-on it.
+type, resident index bytes, and the table's value columns in name order,
+each with its type and a `fixed` column's width. The key type and each
+column's type are enums, so clients switch on them.
 
 Field comments in the proto describe what a caller can rely on and leave
 the server's internal structures out.
@@ -90,9 +106,11 @@ subcommands of RFD 012 (Deployment contract) and reads their JSON.
 Because every answer names its snapshot, a caller can tell when two answers
 straddle a generation swap. A single MultiGet batch never straddles one.
 
-A MultiGet carries at most `server.max_multi_get_keys` keys, 1000 by
-default, and a larger batch is `INVALID_ARGUMENT` before any lookup runs,
-which bounds the lookups one call can ask for (RFD 013 (Tail latency)). The
+A MultiGet carries at most `server.max_multi_get_values` values, 1000 by
+default, counted as its keys times the columns it names, a presence-only
+call counting one per key. A larger batch is `INVALID_ARGUMENT` before any
+lookup runs, which bounds the value reads one call can ask for (RFD 013
+(Tail latency)). The
 1000 is a single-pod guess. How lookups behave under concurrent load,
 MultiGet fan-out included, is an open question
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),

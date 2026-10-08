@@ -136,6 +136,9 @@ pub(super) fn value_for(i: usize) -> Vec<u8> {
     value_of_len(i, VALUE_BYTES)
 }
 
+/// The name prefix of a fixture's extra columns (`Fixture::extra_columns`).
+pub(super) const EXTRA_COLUMN: &str = "extra";
+
 /// How a fixture's value column is typed in arrow; `Int64` is the type
 /// the contract refuses.
 #[derive(Clone, Copy)]
@@ -216,6 +219,10 @@ pub(super) struct Fixture {
     key_column: KeyColumn,
     pub(super) nullable_key: bool,
     pub(super) value_column: ValueColumn,
+    /// Binary columns written after the value column, named
+    /// `EXTRA_COLUMN` and a number, each holding the values: columns no
+    /// table layout of the tests serves.
+    pub(super) extra_columns: usize,
     keys: Vec<Option<Key>>,
     pub(super) values: Vec<Option<Vec<u8>>>,
     pub(super) layout: Layout,
@@ -237,6 +244,7 @@ impl Fixture {
             key_column,
             nullable_key: false,
             value_column: ValueColumn::Binary,
+            extra_columns: 0,
             keys,
             values,
             layout: Layout::contract(),
@@ -246,22 +254,28 @@ impl Fixture {
     pub(super) fn write(&self) -> Bytes {
         let key_nullable = self.nullable_key || self.keys.iter().any(Option::is_none);
         let value_nullable = self.values.iter().any(Option::is_none);
-        let schema = Arc::new(Schema::new(vec![
+        let mut fields = vec![
             Field::new(KEY_COLUMN, key_data_type(self.key_column), key_nullable),
             Field::new(
                 VALUE_COLUMN,
                 value_data_type(self.value_column),
                 value_nullable,
             ),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                key_array(self.key_column, &self.keys),
-                value_array(self.value_column, &self.values),
-            ],
-        )
-        .unwrap();
+        ];
+        let mut arrays = vec![
+            key_array(self.key_column, &self.keys),
+            value_array(self.value_column, &self.values),
+        ];
+        for at in 0..self.extra_columns {
+            fields.push(Field::new(
+                format!("{EXTRA_COLUMN}{at}"),
+                DataType::Binary,
+                value_nullable,
+            ));
+            arrays.push(value_array(ValueColumn::Binary, &self.values));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
         let mut out = Vec::new();
         let mut writer =
             ArrowWriter::try_new(&mut out, schema, Some(self.layout.properties())).unwrap();
@@ -465,6 +479,7 @@ pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(
         index.metadata(),
         index.key_leaf(),
+        &index.held_value_leaves(),
         index.key_type(),
         index.handle(),
     )

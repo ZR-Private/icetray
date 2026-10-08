@@ -10,6 +10,11 @@
 > against residency, which closes the open question
 > ([analysis](../analysis/2026-10-07-page-cache-residency.md)).
 
+> Updated 2026-10-07: `optimal` and the cost gauges describe one column
+> read, each value column has a level of its own, and a table's level is
+> its dearest column's; a table of no value columns has the level of
+> finding the row. See RFD 022.
+
 ## Problem
 
 RFD 007 (Serving tiers) sorts what the doctor finds into refusals,
@@ -43,10 +48,10 @@ every condition an operator alerts on exposed as a single series.
 A level is stated in what a lookup costs, so it means the same on every
 table:
 
-- `optimal`: a hit costs one object-store GET, a miss costs none, a lookup
-  probes one file, decodes one key page of ordinary size, and reads its
-  key chunks from memory or the kernel's page cache, never from the
-  device.
+- `optimal`: a hit costs one object-store GET for each column it reads,
+  a miss costs none, a lookup probes one file, decodes one key page of
+  ordinary size, and reads its key chunks from memory or the kernel's
+  page cache, never from the device.
 - `balanced`: a lookup still probes one file, with a fixed extra cost:
   extra GETs per hit, GETs on a miss at a filter's false-positive rate
   or for a deleted key (RFD 021), larger key pages, or device reads of key
@@ -70,6 +75,14 @@ conditions sets:
 | `balanced` | a `disk` table's key chunks out of the page cache |
 | `permissive` | `overlapping_files` |
 | `permissive` | `no_bucket_partition` |
+
+Each value column (RFD 022 (Value columns)) has a level: the caps its own
+findings set, such as `dictionary_encoded_value` for that column, with
+the caps of every finding that names no column and the best level the
+residency reaches. A table's level is its dearest column's, since any
+column may be asked for, and a table of no value columns has the level of
+finding the row. Under `strict`, one column below the declared level
+refuses the snapshot for the whole table.
 
 Advice findings cap nothing. A key page counts as large where the doctor's
 `large_key_pages` finding says so, not at the contract's recommended size,
@@ -173,29 +186,38 @@ turned on or off. Every alert is one series compared with a constant:
 
 For dashboards, `icetray_table_level{table}` is the level achieved and
 `icetray_table_declared_level{table}` the level declared, each 0 for
-optimal, 1 for balanced, 2 for permissive. The level series appear with
-the table's first swap, like the other per-generation gauges (RFD 018). A
+optimal, 1 for balanced, 2 for permissive.
+`icetray_table_column_level{table,column}` is the level a lookup naming
+that column achieves, capped by the page cache as the table's is, on
+the same snapshot the table's level describes, so while a table is held
+its column series name the column that put the refused snapshot below.
+The alert series stay one per table. The level series appear with the
+table's first swap, like the other per-generation gauges (RFD 018). A
 snapshot refused for a reason outside the levels, such as unsorted keys,
 leaves them as they were.
 
-The measurements behind a level are per-table gauges, so a dashboard shows
-cost rising before a table changes level: the GETs per hit and per miss
-and the files probed per lookup that the layout predicts for a cold
-lookup, and the resident fraction of chunk files. Observed traffic stays
-in `icetray_lookups_total`, where warm hits make the GETs paid per hit
-read below the predicted cost.
+The measurements behind a level are per-table gauges, so a dashboard
+shows cost rising before a table changes level: the GETs per hit and per
+miss and the files probed per lookup that the layout predicts for a cold
+lookup, and the resident fraction of chunk files. The GETs per hit are
+finding the row and reading the dearest column, and each column's own
+value-page GETs are a gauge of their own, so a request's cold cost is
+the GETs per miss plus the figures of the columns it names. Observed
+traffic stays in `icetray_lookups_total`, where warm hits make the GETs
+paid per hit read below the predicted cost.
 
 ### Doctor
 
 The doctor reports, per table, the declared level (`lookups`), the level
-its layout achieves (`level`, replacing `serviceability`), and for each
-finding the level it caps. For each residency that can load the table it
-reports the level the layout reaches there (`level_by_residency`), beside
-what each costs in memory and disk. Its exit codes follow the level: 0
-for a table at or above its declared level, 2 for one below it that would
-be served, 1 for one that would be refused, whether for a refusal or for
-its level under `strict`. A refusal for the level carries the reason
-`below_level`, which replaces `inefficient` in the output contract and in
+its layout achieves (`level`, replacing `serviceability`), each value
+column's level, and for each finding the level it caps. For each
+residency that can load the table it reports the level the layout
+reaches there (`level_by_residency`), beside what each costs in memory
+and disk. Its exit codes follow the level: 0 for a table at or above its
+declared level, 2 for one below it that would be served, 1 for one that
+would be refused, whether for a refusal or for its level under `strict`.
+A refusal for the level carries the reason `below_level`, which replaces
+`inefficient` in the output contract and in
 `icetray_refresh_errors_total`. The doctor judges the layout only. The
 page cache is a condition of the serving process, which the doctor runs
 apart from, and it never decides a refusal, so the doctor still never

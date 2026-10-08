@@ -101,7 +101,7 @@ CONFIG="$OUT_DIR/icetray.toml"
     echo "name = \"$name\""
     echo "ref = \"main\""
     echo "key_column = \"key\""
-    echo "value_column = \"value\""
+    echo "value_columns = [\"value\"]"
     echo
     echo "[tables.source]"
     echo "type = \"static\""
@@ -159,12 +159,12 @@ done
 # string, which protobuf's JSON mapping accepts for an int64; a MultiGet's
 # keys are written out one template each.
 KEY_TEMPLATE="{\"long\":\"{{mul $KEY_STEP (randomInt 0 $ROWS)}}\"}"
-GET_DATA="{\"table\":\"long\",\"key\":$KEY_TEMPLATE}"
+GET_DATA="{\"table\":\"long\",\"key\":$KEY_TEMPLATE,\"columns\":[\"value\"]}"
 MULTI_KEYS="$KEY_TEMPLATE"
 for ((i = 1; i < MULTI_GET_KEYS; i++)); do
   MULTI_KEYS="$MULTI_KEYS,$KEY_TEMPLATE"
 done
-MULTI_DATA="{\"table\":\"long\",\"keys\":[$MULTI_KEYS]}"
+MULTI_DATA="{\"table\":\"long\",\"keys\":[$MULTI_KEYS],\"columns\":[\"value\"]}"
 
 ghz_run() {
   local name="$1"

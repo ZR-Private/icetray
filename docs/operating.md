@@ -68,20 +68,30 @@ The client contract is `crates/icetray-proto/proto/icetray.proto`.
 Clients are generated from it; the server offers no reflection, so a tool
 such as grpcurl is given the file with `-proto`. Three calls:
 
-- `Get` looks one key up in one table and returns a presence
-  (`PRESENCE_PRESENT` with the value's bytes, `PRESENCE_NULL`, or
-  `PRESENCE_ABSENT`) and the snapshot id it was read from.
+- `Get` looks one key up in one table, reading the value columns its
+  `columns` names, and returns a presence (`PRESENCE_PRESENT` or
+  `PRESENCE_ABSENT`), the values, and the snapshot id it was read from. A
+  present result carries one `ColumnValue` per requested column in
+  request order, each its bytes as `value` or a null as `null_value`; a
+  zero-length value is a `value` of length zero, distinct from
+  `null_value`. An absent result carries
+  none, and so does a present one when `columns` is empty, which asks
+  only whether the key is present.
 - `MultiGet` answers many keys in request order from one snapshot, named
-  once on the response. If any key cannot be answered the whole call
-  fails.
+  once on the response, reading the same `columns` for every key. If any
+  key cannot be answered the whole call fails.
 - `TableInfo` reports the served snapshot id, bucket count, data file
-  count, row count, key type, and resident index bytes.
+  count, row count, key type, resident index bytes, and the table's value
+  columns in name order, names compared as their UTF-8 bytes, each with
+  its `value_type` and a `fixed` column's `width`.
 
 Keys, errors, and limits:
 
 - A key is a oneof of `long`, `str`, and `bin`; `bin` carries binary,
   fixed, and uuid keys. The wrong variant is `INVALID_ARGUMENT`.
 - An unserved table is `NOT_FOUND`. A miss is a normal answer.
+- A column the table does not serve, or a column named twice, is
+  `INVALID_ARGUMENT`. There is no default column.
 - A `Get` or `MultiGet` still running at `server.get_deadline` or
   `server.multi_get_deadline` is `DEADLINE_EXCEEDED`. A client-sent
   deadline is enforced by the gRPC layer (a tonic client reports
@@ -89,8 +99,9 @@ Keys, errors, and limits:
 - `Get` and `MultiGet` share `server.max_in_flight` slots, each held until
   its call ends. A call that finds none free is `RESOURCE_EXHAUSTED` at
   once. `TableInfo` takes no slot.
-- A `MultiGet` of more than `server.max_multi_get_keys` keys is
-  `INVALID_ARGUMENT` before any lookup.
+- A `MultiGet` asking for more than `server.max_multi_get_values`
+  values, its keys times the columns it names, a presence-only call
+  counting one per key, is `INVALID_ARGUMENT` before any lookup.
 - `UNAVAILABLE` is a failure a retry can clear: an object-store or local
   read that failed, a table not yet ready, a canceled lookup.
 - `INTERNAL` is a failure of the data itself, such as a malformed file or
@@ -121,6 +132,7 @@ Counters and histograms:
 | `icetray_page_cache_hits_total` | | yes | Value pages served from the page cache. |
 | `icetray_page_cache_fetches_total` | | yes | Value-page fetches the cache ran, after coalescing. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups answered. |
+| `icetray_value_page_gets_total` | `table`, `column` | every table and value column | Value-page and dictionary-page GETs issued for the column, hedges excluded: each GET counts once, when it is issued, whether or not its lookup succeeds. Hedges are `icetray_hedges_total`. What a caller budgets a column by. |
 | `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. A failure the table remembers is counted once, when met ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
@@ -146,10 +158,12 @@ Gauges, written at each scrape:
 | `icetray_max_in_flight` | | `server.max_in_flight`. A call that finds every slot held is `RESOURCE_EXHAUSTED`. |
 | `icetray_table_state` | `table`, `state` | 1 for the table's current state, 0 for the others. |
 | `icetray_table_below_level` | `table` | 1 while the table is below its `lookups` level, else 0: for its layout, judged on the newest snapshot it measured, the one serving or, while the table is held, the one it refused; or for the page cache, judged on the serving generation's chunk files. |
-| `icetray_table_level` | `table` | The [level](configuration.md#choosing-a-level) the table achieves: that snapshot's layout's level, raised to `balanced` while a `disk` table's chunk files are short of the page cache; 0 for `optimal`, 1 for `balanced`, 2 for `permissive`. |
+| `icetray_table_level` | `table` | The [level](configuration.md#choosing-a-level) the table achieves: that snapshot's layout's level, the dearest value column's, raised to `balanced` while a `disk` table's chunk files are short of the page cache; 0 for `optimal`, 1 for `balanced`, 2 for `permissive`. |
+| `icetray_table_column_level` | `table`, `column` | The level a lookup naming the column achieves on the snapshot `icetray_table_level` measures, the one serving or, while the table is held, the one it refused, capped by the page cache as `icetray_table_level` is, in the same numbers. |
 | `icetray_table_declared_level` | `table` | The table's `lookups`, in the same numbers. |
 | `icetray_table_chunk_resident_fraction` | `table` | The fraction of a `disk` table's chunk-file pages, in its serving generation, that the kernel's page cache held at the last sample. The table falls short below 0.95 and recovers above 0.99. Absent while the residency cannot be observed. |
-| `icetray_table_gets_per_hit` | `table` | GETs one cold hit makes at worst on the serving generation's layout and residency: the value page, a dictionary-encoded value column's dictionary page, and under `bloom` the key page of every file probed, with a dictionary-encoded key column's dictionary page. Counted before hedges, unlike `icetray_object_gets_total`. Observed traffic is in `icetray_lookups_total`, where warm hits read below the prediction. |
+| `icetray_table_gets_per_hit` | `table` | GETs one cold hit makes at worst on the serving generation's layout and residency, finding the row and reading the dearest value column: that column's value page and its dictionary page when dictionary-encoded, and under `bloom` the key page of every file probed, with a dictionary-encoded key column's dictionary page. For a table of no value columns, finding the row alone. Counted before hedges, unlike `icetray_object_gets_total`. Observed traffic is in `icetray_lookups_total` and `icetray_value_page_gets_total`, where warm hits read below the prediction. |
+| `icetray_table_column_gets_per_hit` | `table`, `column` | The value-page GETs one cold hit spends on the column alone: 1, or 2 when any file's chunk of it is dictionary-encoded. A request's cold cost is `icetray_table_gets_per_miss`, finding the row, plus the figures of the columns it names. |
 | `icetray_table_gets_per_miss` | `table` | GETs one miss makes at worst on the serving generation's layout and residency: 0 under `full` and `disk`, and under `bloom` the key page of every file probed, each filter answering yes, with a dictionary-encoded key column's dictionary page. Counted before hedges, unlike `icetray_object_gets_total`. |
 | `icetray_table_files_probed_per_lookup` | `table` | Files one cold lookup probes at worst on the serving generation: the files its key routes to whose exact ranges cover it, 1 where no files overlap. On a table whose files were written under two or more bucketings it is an upper bound. |
 | `icetray_table_deleted_rows` | `table` | Rows the serving generation's [deletes](table-contract.md) remove, counting only deletes that apply to a data file it holds, so the dangling deletes a compaction leaves behind are not counted. |
@@ -160,17 +174,18 @@ Gauges, written at each scrape:
 | `icetray_generation_age_seconds` | `table` | Seconds since the serving snapshot was committed, by its timestamp. A table written once a day reads up to a day between writes; it is not a replication lag. |
 | `icetray_generation_sequence_number` | `table` | The serving snapshot's sequence number. |
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
-| `icetray_findings` | `table`, `code` | The serving generation's findings of each code, 0 for a code it does not raise. |
+| `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The serving generation's findings of each code, 0 for a code it does not raise. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
 | `icetray_page_cache_bytes` | | Bytes the page cache's memory level holds against `server.page_cache_bytes`, after evictions. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the system; `retained` is address space only. |
 
-The three level gauges appear with the table's first swap, like the
-generation gauges. A snapshot refused as `below_level` was measured, so
-they take its level; a snapshot refused for any other reason leaves them
-as they were. A reload that changes `lookups` sets
+The level gauges, `icetray_table_column_level` included, appear with
+the table's first swap, like the generation gauges. A snapshot refused
+as `below_level` was measured, so they take its level and each of its
+columns' levels; a snapshot refused for any other reason leaves them as
+they were. A reload that changes `lookups` sets
 `icetray_table_declared_level` at once.
 
 The server samples which pages of every `disk` table's chunk files the
@@ -197,9 +212,11 @@ The label values:
   generation is built) and `lookup` (value pages, and key pages under
   `bloom` residency).
 - `result` of `icetray_lookups_total` and `icetray_lookup_seconds`:
-  `cold_hit` (the value page was fetched), `warm_hit` (the page cache
-  served it, or the row's file was written before its value column was
-  added and answered the column's default with no page read), `miss`.
+  `cold_hit` (a value or dictionary page of a column named came from
+  object storage, a fetch another lookup started included), `warm_hit`
+  (otherwise: the page cache served every page, a column answered its
+  default with no page read, or the lookup named no column), `miss` (the
+  key is absent).
 - `result` of `icetray_config_reloads_total`: `applied`, `refused`.
 - `state`: `loading`, `serving`, `degraded`, `held` ([Refresh and
   reload](#refresh-and-reload)).
@@ -209,10 +226,14 @@ The label values:
   `value_pages_over_ceiling`, `long_keys`, `large_file`,
   `many_files_per_bucket`, `no_bloom_filter`, `bloom_oversized`,
   `bloom_undersized`, `deletes_pending`, `column_default`.
+  `dictionary_encoded_value`, `large_value_pages`,
+  `value_pages_over_ceiling`, and `column_default` are about one value
+  column and carry the `column` label; the other codes carry none.
   `column_default` is one finding per column, so
-  `icetray_findings{code="column_default"}` reads 1 however many files
-  answer the value column by its default; the file count is in the
-  finding's message.
+  `icetray_findings{code="column_default",column="..."}` reads 1 however
+  many files answer that column by its default; the file count is in the
+  finding's message and in the doctor's `files_answering_default`.
+- `column`: a configured value column's name.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
   `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`,
@@ -300,12 +321,13 @@ new one has swapped in, so a table rewritten wholesale wants about twice
 its steady footprint, the doctor's `predicted.disk_bytes`.
 
 A lookup in a `disk` table costs one local read and, on a cold hit, one
-GET. The local read is a memory copy while the kernel's page cache holds
-the chunk file, and a device read when it does not, so a `disk` table
-serves at memory speed only with room for its chunk files in that cache
-([Memory](#memory)). On Linux, put the directory on a mounted volume with a
-filesystem such as ext4; a container's overlay filesystem forces every
-local read onto another thread.
+GET per value column it names. The local read is a memory copy while the
+kernel's page cache holds the chunk file, and a device read when it does
+not, so a `disk` table serves at memory speed only with room for its
+chunk files in that cache ([Memory](#memory)). On Linux, put the
+directory on a mounted volume with a filesystem such as ext4; a
+container's overlay filesystem forces every local read onto another
+thread.
 
 Everything in the directory is a copy of bytes in object storage, checked
 against its data file's identity and rebuilt on demand. A restarted
@@ -459,7 +481,9 @@ SIGHUP. A change to its tables applies without a restart
 
 - A table whose entry is unchanged keeps serving untouched. An entry
   that spells out the default `lookups` is unchanged from one that leaves
-  it out.
+  it out, and one whose `value_columns` lists the same columns in another
+  order is unchanged too. A change to the set of value columns is a
+  changed entry, which loads the table anew.
 - A table whose entry changed only in `lookups` or `strict` is retuned in
   place: its generation keeps serving and nothing is loaded, since the
   level is judged from the layout the generation already holds. A strict
@@ -716,13 +740,15 @@ constant, so each reaches its owner without a join.
   there: a writer changed the layout, or a compaction is overdue, and
   this is the table owner's alert. It reads the same with `strict` on or
   off, since it measures the newest snapshot whether it serves or was
-  refused. `icetray_table_level` and the table's findings say what put it
-  there. When the findings cap nothing, the cause is the server instead:
-  a `disk` table's chunk files do not fit the page cache beside
-  everything else under the memory limit ([Memory](#memory)). Such a
-  table fell below when `icetray_table_chunk_resident_fraction` dropped
-  under 0.95, and stays below until the fraction rises above 0.99, so a
-  fraction between the two can read either way.
+  refused. `icetray_table_level` and the table's findings say what put
+  it there, and `icetray_table_column_level` which value column, of the
+  same snapshot: the table's level is its dearest column's. When the
+  findings cap nothing, the cause is the server instead: a `disk`
+  table's chunk files do not fit the page cache beside everything else
+  under the memory limit ([Memory](#memory)). Such a table fell below
+  when `icetray_table_chunk_resident_fraction` dropped under 0.95, and
+  stays below until the fraction rises above 0.99, so a fraction between
+  the two can read either way.
 - `icetray_table_state{state="degraded"} == 1` for longer than a few
   polls: a table's refreshes are failing, or its ref names a snapshot it
   refused for a reason other than its level, and it serves an old
@@ -762,4 +788,5 @@ the pod it competes with the server for CPU and memory, and it shares the
 server's local directory: it opens the same page cache disk level and
 writes chunk files beside the server's. Give the doctor's pod its own
 `emptyDir` for `storage.local.dir`, or run it with `--location`, which
-uses no local directory.
+uses no local directory and checks only the value columns its
+`--value-column` flags name.

@@ -227,7 +227,7 @@ pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableC
         },
         r#ref: BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
-        value_column: VALUE_COLUMN.to_string(),
+        value_columns: vec![icetray_core::ValueColumnConfig::named(VALUE_COLUMN)],
         strict,
         lookups: None,
         residency: Residency::Full,

@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use icetray_core::approx;
 use icetray_core::config::Residency;
-use icetray_core::{KeyType, Value};
+use icetray_core::{KeyType, Row};
 use icetray_testkit::fixture::{NAMESPACE, local_catalog};
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify;
 use icetray_testkit::{FixtureSpec, Result, write_fixture};
 
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     for i in 0..u64::from(LOOKUPS) {
         let key = fixture.key(i * LOOKUP_STRIDE % ROWS);
         assert!(
-            matches!(served.table.get(&key).await?.value, Value::Present(_)),
+            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
             "a written key answers present"
         );
     }
@@ -89,8 +90,8 @@ async fn main() -> Result<()> {
     for i in 0..u64::from(LOOKUPS) {
         let key = fixture.absent_near(i * LOOKUP_STRIDE % ROWS);
         assert_eq!(
-            served.table.get(&key).await?.value,
-            Value::Absent,
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "an unwritten key answers absent"
         );
     }

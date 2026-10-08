@@ -41,7 +41,7 @@ page_cache_disk_bytes = 8589934592
 name = "kv"
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 
 [tables.source]
 type = "static"
@@ -51,7 +51,7 @@ location = "s3://warehouse/db/kv"
 name = "profiles"
 ref = "serving"
 key_column = "user_id"
-value_column = "vector"
+value_columns = ["properties", "embedding"]
 residency = "disk"
 
 [tables.source]
@@ -101,7 +101,7 @@ table = "profiles"
 | `get_deadline` | duration | `"5s"` | The longest a `Get` may run, and the longest each page fetch of any lookup may run, in a `MultiGet` too. Past it the call is `DEADLINE_EXCEEDED`. |
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
 | `max_in_flight` | count | `1024` | `Get` and `MultiGet` calls in flight at once. One more is refused at once as `RESOURCE_EXHAUSTED`, never queued. |
-| `max_multi_get_keys` | count | `1000` | Keys one `MultiGet` may carry. More is `INVALID_ARGUMENT` before any lookup. |
+| `max_multi_get_values` | count | `1000` | Values one `MultiGet` may ask for: its keys times the columns it names, a presence-only call counting one per key. More is `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
 | `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table serves: a first load, or a retry after one failed. |
 | `refresh_deadline` | duration | `"5m"` | The longest one refresh over a serving generation may run. Past it the table is [degraded](glossary.md) and the next poll retries. |
 | `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls before it stops waiting. |
@@ -221,7 +221,7 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `name` | string | required | The name clients use. Unique and not empty. |
 | `ref` | string | required | The Iceberg branch or tag to serve, such as `"main"`. |
 | `key_column` | string | required | The key column: a top-level field of the snapshot's schema, found in each data file by its name and field id ([Changing the schema](table-contract.md#changing-the-schema)). |
-| `value_column` | string | required | The value column, a top-level field found the same way. |
+| `value_columns` | list of strings | required | The value columns the table serves, each a top-level field found the same way and each read only when a lookup names it ([Value columns](table-contract.md#value-columns)). The list may be empty, `value_columns = []`, for a table that answers only whether a key is present. Each column must be of Iceberg type `binary`, `fixed`, or `string`, or the snapshot is refused as `value_type_unsupported`, naming the column. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. Order carries no meaning: a reload that only reorders the list changes nothing, and one that changes the set loads the table anew. |
 | `source` | table | required | Where the table's metadata comes from, below. |
 | `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
@@ -356,8 +356,9 @@ The decision is recorded in [RFD 017](rfd/017-residency-tiers.md).
 A table's `lookups` is the lookup cost its owner accepts. A level is
 stated in what a lookup costs, so it means the same on every table:
 
-- `optimal`: a hit costs one GET and a miss none, and a lookup probes one
-  file and decodes one key page of ordinary size.
+- `optimal`: a hit costs one GET for each column it reads and a miss
+  none, and a lookup probes one file and decodes one key page of ordinary
+  size.
 - `balanced`: a lookup still probes one file, with a fixed extra cost: an
   extra GET per hit, a GET for a miss the bloom filter passes, larger key
   pages, or key pages read from the device instead of the page cache.
@@ -366,9 +367,15 @@ stated in what a lookup costs, so it means the same on every table:
 
 The level a snapshot achieves is the costliest level that its residency
 or any of its findings caps it at. `bloom` residency caps it at
-`balanced`; the findings that cap it, and at which level, are in
-[the table contract](table-contract.md#requirements). Advice caps
-nothing. The doctor prints the level as `level`, and under `level_by_residency` the
+`balanced`; the findings that cap it, and at which level, are in [the
+table contract](table-contract.md#requirements). Advice caps nothing.
+Each value column has a level of its own: the caps of its own findings,
+such as `dictionary_encoded_value` on that column, with those of every
+finding about the row or the table. The table's level is its dearest
+column's, and a table of no value columns has the level of finding the
+row. Under `strict`, one column below the declared level refuses the
+snapshot for the whole table. The doctor prints the level as `level`,
+each column's under `value_columns`, and under `level_by_residency` the
 level each residency would reach with the same files, beside what each
 costs under `predicted`. A serving `disk` table also falls to `balanced`
 while the kernel's page cache holds too little of its chunk files
@@ -426,8 +433,8 @@ examples. `icetray --version` prints the version.
 icetray serve --config icetray.toml
 icetray doctor --config icetray.toml
 icetray info --config icetray.toml --table kv
-icetray get --config icetray.toml --table kv 42 43
-icetray get --location s3://warehouse/db/kv 42
+icetray get --config icetray.toml --table kv --column value 42 43
+icetray get --location s3://warehouse/db/kv --value-column payload --column payload 42 43
 ```
 
 - `serve` takes `-c, --config <PATH>` and nothing else. It is described
@@ -440,7 +447,11 @@ icetray get --location s3://warehouse/db/kv 42
   which a load does not, so it takes longer than `info` on the same table.
 - `info` loads each table and prints its `table` line.
 - `get` loads one table and prints a `lookup` line per key, in the order
-  given.
+  given. It takes a repeatable `--column <COLUMN>`, the value columns to
+  read for every key, in the order given, with no default: with none,
+  each line says only whether its key is present and no value page is
+  read. A column the table does not serve, or one named twice, fails the
+  run.
 
 ### Choosing the tables
 
@@ -460,7 +471,7 @@ The one-shots share one set of flags, grouped in their help as follows.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--key-column <COLUMN>` | `key` | The key column. |
-| `--value-column <COLUMN>` | `value` | The value column. |
+| `--value-column <COLUMN>` | none | A value column the table serves; repeatable. With none, the table answers only whether a key is present. |
 | `--ref <REF>` | `main` | The branch or tag to read. |
 | `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` needs a local directory and is available through a configuration file. |
 
@@ -498,15 +509,17 @@ root. The table is named after the table root's last directory: `kv` for
 directory to name it after, such as a bare bucket, opens as `table`.
 
 A located table runs with every `[server]` and `[storage]` default. Its
+value columns are the ones its `--value-column` flags name, none when
+there are none, so the doctor checks only those columns' layout. Its
 `lookups` is the best level its `--residency` reaches, `optimal` for
 `full` and `balanced` for `bloom`, and it is never strict, so the doctor
 reports a located table below that level with exit 2 rather than refusing
 it.
 
 ```sh
-icetray doctor --location s3://warehouse/db/kv
-icetray get --location s3://warehouse/db/kv/metadata/v3.metadata.json 42
-icetray info --location target/golden-warehouse/db/long_2m
+icetray doctor --location s3://warehouse/db/kv --value-column value
+icetray get --location s3://warehouse/db/kv/metadata/v3.metadata.json --value-column value --column value 42
+icetray info --location target/golden-warehouse/db/long_2m --value-column value
 ```
 
 ### Rewrite rules on the command line
@@ -575,13 +588,13 @@ Two conventions hold for every line:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 | Key | Value |
 |---|---|
 | `snapshot_id` | The snapshot loaded. |
-| `level` | The [level](#choosing-a-level) the snapshot achieves in the loaded residency: `optimal`, `balanced`, or `permissive`, the costliest level that the residency or any finding caps it at. |
+| `level` | The [level](#choosing-a-level) the snapshot achieves in the loaded residency: `optimal`, `balanced`, or `permissive`, the costliest level that the residency or any finding caps it at, which is its dearest value column's. |
 | `lookups` | The level the table declares: its configured `lookups`, or for a located table the best level its residency reaches. |
 | `residency` | The residency the table was loaded in. |
 | `file_count` | Live data files in the snapshot. |
@@ -598,9 +611,14 @@ One per table, from `info` and from `doctor`:
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
 | `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
 | `level_by_residency` | For each residency that can load the table, the level its files would reach there. A residency that cannot load the table is left out, as `bloom` is when `predicted.bloom` is `null`. |
-| `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, as `icetray_table_gets_per_hit` reports it while the snapshot serves. |
+| `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, finding the row and reading the dearest value column, as `icetray_table_gets_per_hit` reports it while the snapshot serves. For a table of no value columns, finding the row alone. |
 | `lookup_cost.gets_per_miss` | GETs one miss makes at worst, as `icetray_table_gets_per_miss` reports it. |
 | `lookup_cost.files_probed` | Files one lookup probes at worst, as `icetray_table_files_probed_per_lookup` reports it. |
+| `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes; empty for a table of none. |
+| `value_columns[].column` | The column's name. |
+| `value_columns[].level` | The level a lookup naming the column achieves, as `icetray_table_column_level` reports it. |
+| `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it names. |
+| `value_columns[].files_answering_default` | Data files written before the column was added, which answer its default. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
 | `deletes.fraction` | `deletes.rows` over `records`, as `icetray_table_deleted_fraction` reports it. |
@@ -618,6 +636,7 @@ One per finding, from `doctor`, capping findings first:
 | `code` | The finding's code, such as `large_key_pages`; the codes are in [the table contract](table-contract.md#requirements). |
 | `message` | What was measured, for a person. |
 | `file` | The data file's location, or `null` for a table-level finding. |
+| `column` | The value column the finding is about, for `dictionary_encoded_value`, `large_value_pages`, `value_pages_over_ceiling`, and `column_default`; `null` for a finding about the row or the table. |
 | `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
 | `property` | The writer property that fixes it, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
 
@@ -631,12 +650,16 @@ One per data file, from `doctor --files`:
 | `bucket` | The bucket the file holds. |
 | `key_type` | `long`, `string`, `binary`, or `uuid`. |
 | `rows`, `row_groups` | Rows and row groups in the file. |
-| `key_pages`, `value_pages` | Data pages of each column across every row group. |
+| `key_pages` | Data pages of the key column across every row group. |
 | `max_key_page_rows` | Rows in the largest key page: the keys a lookup there decodes. |
 | `max_key_bytes` | The longest key, in bytes. |
-| `avg_value_page_bytes` | Mean uncompressed bytes of a value page: what a cold hit decompresses. |
-| `avg_value_bytes` | Mean uncompressed bytes of one value. |
-| `pages_aligned` | Whether every value page starts on the same row as a key page. |
+| `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes. |
+| `value_columns[].column` | The column's name. |
+| `value_columns[].answers_default` | Whether the file was written before the column was added and answers its default; its counts are then zero. |
+| `value_columns[].value_pages` | Data pages of the column across every row group. |
+| `value_columns[].avg_value_page_bytes` | Mean uncompressed bytes of the column's value page: what a cold hit naming it decompresses. |
+| `value_columns[].avg_value_bytes` | Mean uncompressed bytes of one of the column's values. |
+| `value_columns[].pages_aligned` | Whether every page of the column starts on the same row as a key page. |
 | `dictionary_columns` | The columns, key or value, that a row group dictionary-encodes. |
 | `bloom_bytes`, `bloom_bits_per_key` | The key's bloom filter size and bits per row; `null` when a row group has none. |
 | `key_chunk_bytes` | The key column's compressed bytes. |
@@ -655,7 +678,7 @@ for it:
 
 | Key | Value |
 |---|---|
-| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`; or `load_failed` when an error rather than a rule stopped the load. |
+| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
 | `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
@@ -667,16 +690,18 @@ for it:
 One per key, from `get`:
 
 ```json
-{"kind":"lookup","table":"long_2m","key":"43","presence":"absent","value_bytes":0,"snapshot_id":"7128216514704790069","gets":0,"elapsed_micros":0}
+{"kind":"lookup","table":"long_2m","key":"42","presence":"present","values":{"value":{"base64":"NzM0NzVj…","utf8":"73475cb4…","bytes":192}},"snapshot_id":"7128216514704790069","gets":1,"elapsed_micros":342}
+{"kind":"lookup","table":"long_2m","key":"43","presence":"absent","snapshot_id":"7128216514704790069","gets":0,"elapsed_micros":0}
 ```
 
 | Key | Value |
 |---|---|
 | `key` | A string holding the key in the form `get` takes for it ([Keys](#keys)): a long as its digits, with a leading `-` when negative; a string as its text, with no escapes but JSON's own (`"abc"`, so `jq -r .key` gives `abc`); a binary key as `0x` and lowercase hex; a uuid hyphenated. Passed back to `get`, it looks up the same key. |
-| `presence` | `present`, `null` (the key is in the table with a null value), or `absent`. |
-| `value_base64` | The value in standard base64 with padding. Present only when `presence` is `present`. |
-| `value_utf8` | The value as text. Present only when the value is present and its bytes are UTF-8. |
-| `value_bytes` | The value's length in bytes; `0` for a null or absent key. |
+| `presence` | `present` or `absent`. |
+| `values` | For a present key, an object keyed by the `--column` names in the order given, each value an object or `null` for a null value; `{}` when no column was named. Absent for an absent key. |
+| `values.<column>.base64` | The value in standard base64 with padding. |
+| `values.<column>.utf8` | The value as text. Present only when its bytes are UTF-8. |
+| `values.<column>.bytes` | The value's length in bytes; `0` for a zero-length value, which is distinct from `null`. |
 | `snapshot_id` | The snapshot the answer came from. |
 | `gets` | The GETs this lookup issued. |
 | `elapsed_micros` | The lookup's time, in microseconds. |

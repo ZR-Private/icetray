@@ -25,6 +25,12 @@ pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
+/// Value-page GETs lookups issued to object storage, by `table` and
+/// `column` (RFD 022): each GET of a column's value page or dictionary
+/// page, counted once where it is issued, whether or not its lookup then
+/// succeeds; a fetch another lookup joins is not counted again, and hedges
+/// are `HEDGES_TOTAL`'s.
+pub const VALUE_PAGE_GETS_TOTAL: &str = "icetray_value_page_gets_total";
 /// Refreshes that failed and left the previous generation serving, by
 /// `table` and `reason`.
 pub const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
@@ -66,7 +72,9 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
 /// Bytes the page cache holds.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
-/// Findings the doctor raised on the serving generation, by `table` and `code`.
+/// Findings the doctor raised on the serving generation, by `table` and
+/// `code`, and by `column` for a code about one value column (RFD 022,
+/// `FindingCode::per_column`).
 pub const FINDINGS: &str = "icetray_findings";
 /// Seconds from the served snapshot's timestamp to now, by `table`.
 pub const GENERATION_AGE_SECONDS: &str = "icetray_generation_age_seconds";
@@ -89,13 +97,24 @@ pub const TABLE_BELOW_LEVEL: &str = "icetray_table_below_level";
 pub const TABLE_LEVEL: &str = "icetray_table_level";
 /// The level the table declares, by `table`, in `TABLE_LEVEL`'s numbers.
 pub const TABLE_DECLARED_LEVEL: &str = "icetray_table_declared_level";
+/// The level a lookup naming one value column achieves on the serving
+/// generation, by `table` and `column` (RFD 022, `ColumnCost::level`),
+/// capped by the page cache as `TABLE_LEVEL` is, in its numbers; the
+/// table's level is the dearest column's.
+pub const TABLE_COLUMN_LEVEL: &str = "icetray_table_column_level";
 /// The fraction of the serving generation's chunk-file pages the kernel's
 /// page cache held at the last sample, by `table`, present only while that
 /// residency is observed (RFD 020, `Generation::chunk_residency`).
 pub const TABLE_CHUNK_RESIDENT_FRACTION: &str = "icetray_table_chunk_resident_fraction";
 /// GETs one cold hit makes at worst on the serving generation's layout and
-/// residency, by `table` (RFD 020, `LookupCost::gets_per_hit`).
+/// residency finding its row and reading the dearest value column, by
+/// `table` (RFD 020, RFD 022, `LookupCost::gets_per_hit`).
 pub const TABLE_GETS_PER_HIT: &str = "icetray_table_gets_per_hit";
+/// GETs one cold hit spends at worst on one value column, by `table` and
+/// `column` (RFD 022, `ColumnCost::gets_per_hit`): a hit naming several
+/// columns costs `TABLE_GETS_PER_MISS`, finding the row, and each named
+/// column's figure.
+pub const TABLE_COLUMN_GETS_PER_HIT: &str = "icetray_table_column_gets_per_hit";
 /// GETs one miss makes at worst on the serving generation, by `table`
 /// (`LookupCost::gets_per_miss`).
 pub const TABLE_GETS_PER_MISS: &str = "icetray_table_gets_per_miss";
@@ -141,7 +160,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 45] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -186,6 +205,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
         LOOKUPS_TOTAL,
         Kind::Counter,
         "Lookups answered, by table and result.",
+    ),
+    (
+        VALUE_PAGE_GETS_TOTAL,
+        Kind::Counter,
+        "Value-page and dictionary-page GETs issued, hedges excluded, by table and column.",
     ),
     (
         REFRESH_ERRORS_TOTAL,
@@ -255,7 +279,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
     (
         FINDINGS,
         Kind::Gauge,
-        "Findings the doctor raised on the serving generation, by table and code.",
+        "Findings the doctor raised on the serving generation, by table and code, and by column for a code about one value column.",
     ),
     (
         GENERATION_AGE_SECONDS,
@@ -293,6 +317,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
         "The lookup level the table declares, 0 optimal, 1 balanced, 2 permissive, by table.",
     ),
     (
+        TABLE_COLUMN_LEVEL,
+        Kind::Gauge,
+        "The lookup level a lookup naming one value column achieves, 0 optimal, 1 balanced, 2 permissive, by table and column.",
+    ),
+    (
         TABLE_CHUNK_RESIDENT_FRACTION,
         Kind::Gauge,
         "The fraction of the serving generation's chunk-file pages in the page cache at the last sample, by table.",
@@ -300,7 +329,12 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 42] = [
     (
         TABLE_GETS_PER_HIT,
         Kind::Gauge,
-        "GETs one cold hit makes at worst on the serving generation's layout and residency, by table.",
+        "GETs one cold hit makes at worst finding its row and reading the dearest value column on the serving generation, by table.",
+    ),
+    (
+        TABLE_COLUMN_GETS_PER_HIT,
+        Kind::Gauge,
+        "GETs one cold hit spends at worst on one value column of the serving generation, by table and column.",
     ),
     (
         TABLE_GETS_PER_MISS,
@@ -373,6 +407,8 @@ pub const LABEL_CALL: &str = "call";
 pub const LABEL_KIND: &str = "kind";
 /// The `table` label: the table's configured name.
 pub const LABEL_TABLE: &str = "table";
+/// The `column` label: a value column's configured name (RFD 022).
+pub const LABEL_COLUMN: &str = "column";
 /// The `result` label: a lookup's outcome, from `LookupResult`, or a
 /// reload's.
 pub const LABEL_RESULT: &str = "result";
@@ -412,11 +448,13 @@ impl fmt::Display for ReadKind {
 /// Display gives the `snake_case` label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LookupResult {
-    /// The key was present and its value page was fetched.
+    /// The key was present and a value or dictionary page of a column it
+    /// named came from object storage, a fetch it joined included.
     ColdHit,
-    /// The key was present and its value page was already cached, or its
-    /// file predates the value column and answered the column's default
-    /// with no page read (RFD 023).
+    /// The key was present and no value page came from object storage:
+    /// every one was cached, its file predates a column and answered that
+    /// column's default with no page read (RFD 023), or the lookup named no
+    /// column (RFD 022).
     WarmHit,
     /// The key was absent.
     Miss,

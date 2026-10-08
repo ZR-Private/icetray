@@ -1,5 +1,10 @@
 # Resident key-chunk index
 
+> Updated 2026-10-07: a file keeps the offset index of the key and of
+> each configured value column it holds, and every other column's page
+> indexes are dropped at build. A hit fetches one value page per column
+> it names. See RFD 022.
+
 ## Problem
 
 A server that reads Iceberg tables in place pays one GET for every byte it
@@ -15,9 +20,10 @@ what to keep per data file.
 ## Decision
 
 Each served data file will keep its footer, the key column's page indexes
-and the value column's offset index, its compressed key column chunks, its
-exact key range, and its fence array resident in memory, so that a lookup
-decodes exactly one key page and fetches at most one value page, and a miss
+and the offset index of each configured value column (RFD 022 (Value
+columns)), its compressed key column chunks, its exact key range, and its
+fence array resident in memory, so that a lookup decodes exactly one key
+page and fetches at most one value page per column it names, and a miss
 fetches nothing.
 
 This set is the resident index.
@@ -32,7 +38,8 @@ Parquet column-chunk statistics. Choosing from statistics would let a file
 written without them produce a false miss
 ([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
 The fence array picks the one key page to decode, and the key's position
-in that page names the one value page to fetch on a cold hit. RFD 006
+in that page names the one value page of each named column to fetch on a
+cold hit. RFD 006
 (Lookup hot path) covers the decode.
 
 Load issues one GET per file for the footer, with a tail prefetch that
@@ -41,11 +48,14 @@ contract-shaped file has one row group, so it costs two GETs. Memory per
 key is a small multiple of the compressed key bytes
 ([prototype findings, finding 2](../analysis/2026-09-10-prototype-findings.md#2-resident-index-size)).
 
-The resident set leaves out the value column's column index and keeps
-only its offset index. The reader never consults value minimums and
-maximums, and for large-value tables that structure would otherwise
-dominate the index
+The resident set leaves out every value column's column index and keeps
+only the offset index of each configured value column the file holds.
+The reader never consults value minimums and maximums, and for
+large-value tables that structure would otherwise dominate the index
 ([bloom residency tier, observations](../analysis/2026-09-10-bloom-residency-tier.md#observations)).
+Every other column's page indexes are dropped at build, so a column the
+table does not serve costs nothing resident, and the resident set scales
+with what is served rather than with the table's width.
 
 Tables whose keys are too costly to hold in memory choose another
 residency, on local disk or as bloom filters, under RFD 017 (Residency
@@ -139,7 +149,7 @@ whose keys run far past the cap can meet this refusal before the
 key-length one.
 
 A lookup applies the same checks to the value side. Before parquet decodes
-them, it reads the headers of the value page it fetched, and of the value
+them, it reads the headers of each value page it fetched, and of that
 column's dictionary page when there is one, from those same bytes. It
 refuses as a file fault the same faults under a 64 MiB value page ceiling:
 a header parquet would read to different numbers, an uncompressed size

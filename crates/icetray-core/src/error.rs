@@ -10,13 +10,14 @@ use std::time::Duration;
 use crate::aws_catalog::AwsCatalogError;
 use crate::cache::CacheError;
 use crate::catalog::TableFault;
-use crate::check::FindingCode;
+use crate::check::{Capping, ColumnLevel};
 use crate::column::ColumnMismatch;
 use crate::config::ConfigError;
 use crate::index::FileFault;
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::local::LocalFault;
+use crate::manifest::ColumnRequestFault;
 use crate::storage::LocationError;
 
 /// Every failure a caller of this crate can observe. A caller decides what
@@ -75,6 +76,17 @@ pub enum Error {
         expected: KeyType,
         /// The key type the caller sent.
         got: KeyType,
+    },
+    /// A lookup named a column the table does not serve, or named one twice
+    /// (RFD 022); checked against the serving generation before any read.
+    #[error("table {table}: column {column} {fault}")]
+    ColumnRequest {
+        /// The table's configured name.
+        table: String,
+        /// The column as the caller named it.
+        column: String,
+        /// What is wrong with naming it.
+        fault: ColumnRequestFault,
     },
     /// The table's metadata makes it unusable before any data file is read;
     /// the fault set is closed.
@@ -221,6 +233,7 @@ impl Error {
             | Self::Cache(_)
             | Self::Refused { .. }
             | Self::KeyType { .. }
+            | Self::ColumnRequest { .. }
             | Self::Table { .. }
             | Self::File { .. }
             | Self::NotReady { .. }
@@ -256,6 +269,7 @@ impl Error {
             Self::Cache(_) => ErrorKind::Cache,
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
             Self::KeyType { .. } => ErrorKind::KeyType,
+            Self::ColumnRequest { .. } => ErrorKind::ColumnRequest,
             Self::Table { .. } => ErrorKind::Table,
             Self::File { .. } => ErrorKind::File,
             Self::NotReady { .. } => ErrorKind::NotReady,
@@ -297,6 +311,8 @@ pub enum ErrorKind {
     Refused(RefusalReason),
     /// `Error::KeyType`.
     KeyType,
+    /// `Error::ColumnRequest`.
+    ColumnRequest,
     /// `Error::Table`.
     Table,
     /// `Error::File`.
@@ -370,8 +386,9 @@ impl Recurs for Error {
             // The configuration document and the process's settings, which
             // a reload or a restart reads again.
             | Self::Config(_)
-            // A lookup's own key, never a build's.
+            // A lookup's own key and columns, never a build's.
             | Self::KeyType { .. }
+            | Self::ColumnRequest { .. }
             | Self::ObjectStore(_)
             | Self::NotReady { .. }
             | Self::CatalogTimeout { .. }
@@ -397,6 +414,7 @@ impl fmt::Display for ErrorKind {
             Self::Location => "location",
             Self::Cache => "cache",
             Self::KeyType => "key_type",
+            Self::ColumnRequest => "column_request",
             Self::Table => "table",
             Self::File => "file",
             Self::NotReady => "not_ready",
@@ -447,7 +465,9 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             expected,
             got,
         } => format!("{reason} (file {path}, expected {expected}, got {got})"),
-        RefusalReason::ValueTypeUnsupported { got } => format!("{reason} (got {got})"),
+        RefusalReason::ValueTypeUnsupported { column, got } => {
+            format!("{reason} (column {column}, got {got})")
+        }
         RefusalReason::ColumnMismatch {
             column,
             path: Some(path),
@@ -483,6 +503,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             declared,
             achieved,
             findings,
+            columns: _,
         } => format!(
             "{reason} (lookups {declared}, the layout achieves {achieved}: {})",
             finding_list(findings)
@@ -491,9 +512,10 @@ fn refusal_detail(reason: &RefusalReason) -> String {
     }
 }
 
-/// The finding codes of a `BelowLevel` refusal as one comma-separated list.
-fn finding_list(codes: &[FindingCode]) -> String {
-    codes
+/// The capping findings of a `BelowLevel` refusal as one comma-separated
+/// list, each code with the column it is about when it is about one.
+fn finding_list(findings: &[Capping]) -> String {
+    findings
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
@@ -580,12 +602,14 @@ pub enum RefusalReason {
         /// Which case it is.
         mismatch: ColumnMismatch,
     },
-    /// The value column's Iceberg type in the snapshot's schema is none of
+    /// A value column's Iceberg type in the snapshot's schema is none of
     /// binary, fixed, or string, so its bytes have no defined encoding on the
-    /// wire (RFD 002, RFD 010). Raised by `TableLayout::derive`; a data file
-    /// whose physical type contradicts an admitted schema type is
+    /// wire (RFD 002, RFD 010, RFD 022). Raised by `TableLayout::derive`; a
+    /// data file whose physical type contradicts an admitted schema type is
     /// `FileFault::ValuePhysicalType`, a malformed file rather than a refusal.
     ValueTypeUnsupported {
+        /// The value column as configured.
+        column: String,
         /// The Iceberg type's `Display`, held as text because
         /// `iceberg::spec::Type` does not implement `Hash`.
         got: String,
@@ -642,9 +666,14 @@ pub enum RefusalReason {
         declared: Level,
         /// The level the layout achieves in the table's residency.
         achieved: Level,
-        /// The distinct codes of the capping findings whose cap does not
-        /// meet `declared`, in the doctor's order.
-        findings: Vec<FindingCode>,
+        /// Each value column's level from the measurement that gave
+        /// `achieved`, in the layout's order: what the column level gauges
+        /// show while the table is held on the snapshot.
+        columns: Vec<ColumnLevel>,
+        /// The distinct capping findings whose cap does not meet
+        /// `declared`, each by its code and the column it is about, in the
+        /// doctor's order.
+        findings: Vec<Capping>,
     },
 }
 
@@ -768,6 +797,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::check::FindingCode;
     use crate::config::ConfigViolation;
     use crate::deletes::{BlobFraming, DeleteFault};
     use crate::generation::testing::TABLE;
@@ -826,32 +856,6 @@ mod tests {
             ),
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
             (
-                RefusalReason::ColumnMismatch {
-                    column: "value".to_string(),
-                    path: Some(FILE_PATH.to_string()),
-                    mismatch: ColumnMismatch::OtherFieldId {
-                        expected: 2,
-                        found: 3,
-                    },
-                },
-                "column_mismatch",
-            ),
-            (
-                RefusalReason::ColumnMismatch {
-                    column: "value".to_string(),
-                    path: None,
-                    mismatch: ColumnMismatch::UnreadableDefault,
-                },
-                "column_mismatch",
-            ),
-            (
-                RefusalReason::ValueTypeUnsupported {
-                    got: iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long)
-                        .to_string(),
-                },
-                "value_type_unsupported",
-            ),
-            (
                 RefusalReason::KeyTooLong {
                     path: FILE_PATH.to_string(),
                     bytes: 1,
@@ -877,14 +881,53 @@ mod tests {
                 RefusalReason::BelowLevel {
                     declared: Level::Optimal,
                     achieved: Level::Balanced,
-                    findings: vec![FindingCode::DictionaryEncodedValue],
+                    columns: Vec::new(),
+                    findings: vec![Capping {
+                        code: FindingCode::DictionaryEncodedValue,
+                        column: Some("value".to_string()),
+                    }],
                 },
                 "below_level",
             ),
         ]
         .into_iter()
+        .chain(column_reason_cases())
         .chain(delete_reason_cases())
         .collect()
+    }
+
+    /// One refusal of a configured column of every reason, beside its
+    /// label.
+    fn column_reason_cases() -> Vec<(RefusalReason, &'static str)> {
+        vec![
+            (
+                RefusalReason::ColumnMismatch {
+                    column: "value".to_string(),
+                    path: Some(FILE_PATH.to_string()),
+                    mismatch: ColumnMismatch::OtherFieldId {
+                        expected: 2,
+                        found: 3,
+                    },
+                },
+                "column_mismatch",
+            ),
+            (
+                RefusalReason::ColumnMismatch {
+                    column: "value".to_string(),
+                    path: None,
+                    mismatch: ColumnMismatch::UnreadableDefault,
+                },
+                "column_mismatch",
+            ),
+            (
+                RefusalReason::ValueTypeUnsupported {
+                    column: "value".to_string(),
+                    got: iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long)
+                        .to_string(),
+                },
+                "value_type_unsupported",
+            ),
+        ]
     }
 
     /// One delete refusal of every reason and kind, beside its label.
@@ -1363,6 +1406,7 @@ mod tests {
             | Error::Config(_)
             | Error::Location { .. }
             | Error::KeyType { .. }
+            | Error::ColumnRequest { .. }
             | Error::NotReady { .. }
             | Error::CatalogTimeout { .. }
             | Error::Catalog { .. }
@@ -1470,18 +1514,14 @@ mod tests {
                     reason: RefusalReason::BelowLevel {
                         declared: Level::Optimal,
                         achieved: Level::Permissive,
-                        findings: vec![FindingCode::OverlappingFiles],
+                        columns: Vec::new(),
+                        findings: vec![Capping {
+                            code: FindingCode::OverlappingFiles,
+                            column: None,
+                        }],
                     },
                 },
                 "below_level",
-            ),
-            (
-                Error::KeyType {
-                    table: TABLE.to_string(),
-                    expected: KeyType::Long,
-                    got: KeyType::String,
-                },
-                "key_type",
             ),
             (
                 Error::Table {
@@ -1546,6 +1586,32 @@ mod tests {
                     source: canceled_task(),
                 },
                 "lookup_canceled",
+            ),
+        ]
+        .into_iter()
+        .chain(lookup_cases())
+        .collect()
+    }
+
+    /// One error of every variant a lookup's own request raises, each
+    /// beside its `reason` label.
+    fn lookup_cases() -> Vec<(Error, &'static str)> {
+        vec![
+            (
+                Error::KeyType {
+                    table: TABLE.to_string(),
+                    expected: KeyType::Long,
+                    got: KeyType::String,
+                },
+                "key_type",
+            ),
+            (
+                Error::ColumnRequest {
+                    table: TABLE.to_string(),
+                    column: "absent".to_string(),
+                    fault: ColumnRequestFault::NotServed,
+                },
+                "column_request",
             ),
         ]
     }

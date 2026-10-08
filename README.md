@@ -26,7 +26,9 @@ costs one range GET.
   chosen per table.
 - A lookup finds its bucket with the Iceberg bucket transform, its file by
   key range, and its page by binary search.
-- A hit reads one value page, from the page cache or with one range GET.
+- A hit reads one value page for each value column it names, from the
+  page cache or with one range GET, the columns concurrently. A lookup
+  that names none answers only whether the key is present.
 - When the ref moves, icetray loads the new snapshot beside the current one,
   reuses the index of every unchanged file, verifies it, and swaps it in
   atomically. Each answer carries the id of the snapshot it came from.
@@ -48,9 +50,10 @@ few relationships:
   `disk` keeps a fraction of a byte per key in memory and the key chunks
   on local disk. `bloom` keeps the writer's bloom filters, some bits per
   key, and pays extra GETs instead.
-- A cold hit costs one GET under `full` and `disk`, and two under
-  `bloom`. A warm hit, served from the page cache, costs none, and so does
-  a miss, except under `bloom` when the filter passes an absent key.
+- A cold hit costs one GET for each value column it reads under `full`
+  and `disk`, and one more under `bloom`. A warm hit, served from the
+  page cache, costs none, and so does a miss, except under `bloom` when
+  the filter passes an absent key.
 - A lookup whose pages are in memory takes microseconds, and a cold read
   from object storage takes tens of milliseconds, so a table's latency
   follows the share of hits its page cache answers.
@@ -103,27 +106,29 @@ Its keys are multiples of three, so 42 is present and 43 is absent.
 of it one table of 16 KiB values.
 
 Look keys up. `get` opens the table at a path, loads it, and prints one
-JSON line per key. The value fields are shortened here, and your snapshot
-ids and timings will differ:
+JSON line per key. `--value-column` names a column the table serves, and
+`--column` a column to read for each key; with no `--column`, a line says
+only whether its key is present. The value fields are shortened here, and
+your snapshot ids and timings will differ:
 
 ```sh
-icetray get --location target/golden-warehouse/db/long_2m 42 43
+icetray get --location target/golden-warehouse/db/long_2m --value-column value --column value 42 43
 ```
 
 ```json
-{"kind":"lookup","table":"long_2m","key":"42","presence":"present","value_base64":"NzM0NzVj…","value_utf8":"73475cb4…","value_bytes":192,"snapshot_id":"7128216514704790069","gets":1,"elapsed_micros":342}
-{"kind":"lookup","table":"long_2m","key":"43","presence":"absent","value_bytes":0,"snapshot_id":"7128216514704790069","gets":0,"elapsed_micros":8}
+{"kind":"lookup","table":"long_2m","key":"42","presence":"present","values":{"value":{"base64":"NzM0NzVj…","utf8":"73475cb4…","bytes":192}},"snapshot_id":"7128216514704790069","gets":1,"elapsed_micros":342}
+{"kind":"lookup","table":"long_2m","key":"43","presence":"absent","snapshot_id":"7128216514704790069","gets":0,"elapsed_micros":8}
 ```
 
 The hit cost one GET and the miss none. Check the table against the
 [table contract](docs/table-contract.md):
 
 ```sh
-icetray doctor --location target/golden-warehouse/db/long_2m
+icetray doctor --location target/golden-warehouse/db/long_2m --value-column value
 ```
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 It exits 0, with no finding: the table reaches the `optimal`
@@ -141,7 +146,7 @@ cat > target/icetray.toml <<EOF
 name = "long_2m"
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 
 [tables.source]
 type = "static"
@@ -158,14 +163,18 @@ and the snapshot id is your table's):
 
 ```sh
 grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
-  -d '{"table": "long_2m", "key": {"long": "42"}}' \
+  -d '{"table": "long_2m", "key": {"long": "42"}, "columns": ["value"]}' \
   127.0.0.1:7433 icetray.v1.Icetray/Get
 ```
 
 ```json
 {
   "presence": "PRESENCE_PRESENT",
-  "value": "NzM0NzVj…",
+  "values": [
+    {
+      "value": "NzM0NzVj…"
+    }
+  ],
   "snapshotId": "7128216514704790069"
 }
 ```
@@ -198,7 +207,7 @@ ALTER TABLE db.kv WRITE LOCALLY ORDERED BY key;
 Check it:
 
 ```sh
-icetray doctor --location s3://warehouse/db/kv
+icetray doctor --location s3://warehouse/db/kv --value-column value
 ```
 
 The doctor exits 0 for a table that meets its
@@ -221,7 +230,7 @@ metrics_listen = "0.0.0.0:9433"
 name = "kv"
 ref = "main"
 key_column = "key"
-value_column = "value"
+value_columns = ["value"]
 
 [tables.source]
 type = "static"
@@ -237,7 +246,7 @@ Look a key up with any client generated from
 command line, which loads the table itself:
 
 ```sh
-icetray get --location s3://warehouse/db/kv 42
+icetray get --location s3://warehouse/db/kv --value-column value --column value 42
 ```
 
 ## Not a fit if
@@ -247,9 +256,9 @@ icetray get --location s3://warehouse/db/kv 42
   serve; a snapshot with an equality delete that may apply is refused.
   Such a table can be served from a tag or branch that a compaction moves
   after rewriting the deletes into data files.
-- **A key needs more than one value column.** icetray serves one value
-  column per table; several fields are packed into one binary value at
-  write time.
+- **Callers need typed values.** icetray serves each value column as
+  bytes, of Iceberg type `binary`, `fixed`, or `string`; a number or a
+  struct is packed into a binary value at write time.
 - **You need writes, scans, or range queries.** icetray is read-only and
   answers lookups by exact key.
 - **The server itself must speak TLS or authenticate callers.** The gRPC

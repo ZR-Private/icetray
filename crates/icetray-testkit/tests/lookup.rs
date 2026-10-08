@@ -8,7 +8,7 @@
 use icetray_core::approx::{count, length};
 use icetray_core::config::Residency;
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
-use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Level, Value, diagnose};
+use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Level, Row, diagnose};
 use icetray_testkit::error::{Precondition, SpecFault};
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, SAMPLE, SAMPLE_4K,
@@ -16,6 +16,7 @@ use icetray_testkit::fixture::{
     local_catalog,
 };
 use icetray_testkit::keys::SCATTERED_ID_SPACE;
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify;
 use icetray_testkit::{
     Fixture, FixtureSpec, KeyShape, Layout, Nulls, Result, TestkitError, scattered_key_at,
@@ -62,7 +63,7 @@ fn row_bounded_page_min_bytes() -> u64 {
 /// The plan names one value page per `SAMPLE` id, so a cold batch over it
 /// costs one GET per id.
 fn assert_sample_pages_distinct(fixture: &Fixture, generation: &Generation) -> Result<()> {
-    let cold = verify::expected_cold_gets(generation, &fixture.keys_at(&SAMPLE))?;
+    let cold = verify::expected_cold_gets(generation, &fixture.keys_at(&SAMPLE), &[VALUE_COLUMN])?;
     assert_eq!(
         cold,
         count(SAMPLE.len()),
@@ -99,7 +100,7 @@ async fn round_trip(spec: FixtureSpec) -> Result<()> {
     for id in fixture.id_range().step_by(SWEEP_STRIDE) {
         let key = fixture.key(id);
         assert!(
-            matches!(served.table.get(&key).await?.value, Value::Present(_)),
+            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
             "key {key}"
         );
     }
@@ -170,7 +171,12 @@ async fn test_multi_get_coalesces_one_page_and_answers_from_one_snapshot() -> Re
             .into_iter()
             .next()
             .flatten()
-            .map(|(file, page)| (file.entry.path.clone(), page.value_page_offset))
+            .map(|(file, page)| {
+                (
+                    file.entry.path.clone(),
+                    file.index.value_page_offset(0, &page),
+                )
+            })
     };
     let first = fixture.key(SAMPLE[0]);
     let target = page_of(&first).expect("the first sample key is present");
@@ -183,23 +189,23 @@ async fn test_multi_get_coalesces_one_page_and_answers_from_one_snapshot() -> Re
     let stats = served.storage.stats();
 
     let before = stats.gets();
-    let multi = served.table.multi_get(&same_page).await?;
+    let multi = served.table.multi_get(&same_page, &[VALUE_COLUMN]).await?;
     assert_eq!(stats.gets() - before, 1, "one page, one GET, ten lookups");
     assert_eq!(multi.snapshot_id, generation.snapshot_id);
-    for (key, value) in same_page.iter().zip(&multi.values) {
+    for (key, value) in same_page.iter().zip(&multi.rows) {
         assert_eq!(*value, fixture.expected(key), "key {key}");
     }
 
     let keys = fixture.keys_at(&SAMPLE);
-    let expected = verify::expected_cold_gets(&generation, &keys)?;
+    let expected = verify::expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
     let before = stats.gets();
-    let multi = served.table.multi_get(&keys).await?;
+    let multi = served.table.multi_get(&keys, &[VALUE_COLUMN]).await?;
     assert_eq!(
         stats.gets() - before,
         expected - 1,
         "one GET per distinct page, the shared one already cached"
     );
-    for (key, value) in keys.iter().zip(&multi.values) {
+    for (key, value) in keys.iter().zip(&multi.rows) {
         assert_eq!(*value, fixture.expected(key), "key {key}");
     }
     Ok(())
@@ -218,7 +224,7 @@ async fn test_get_refuses_a_key_of_another_type() -> Result<()> {
     let before = served.storage.stats().gets();
     let error = served
         .table
-        .get(&Key::Str(OTHER_TYPE_KEY.to_string()))
+        .get(&Key::Str(OTHER_TYPE_KEY.to_string()), &[VALUE_COLUMN])
         .await
         .unwrap_err();
     assert!(
@@ -251,7 +257,10 @@ async fn test_verify_hit_cost_refuses_a_warm_cache() -> Result<()> {
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    served.table.get(&fixture.key(SAMPLE_4K[0])).await?;
+    served
+        .table
+        .get(&fixture.key(SAMPLE_4K[0]), &[VALUE_COLUMN])
+        .await?;
     let error = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K)
         .await
         .err()
@@ -379,25 +388,28 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     let stats = served.storage.stats();
     let null_key = fixture.key(NULL_ID);
-    assert_eq!(fixture.expected(&null_key), Value::Null);
+    assert_eq!(fixture.expected(&null_key), Row::Present(vec![None]));
     let before = stats.gets();
-    assert_eq!(served.table.get(&null_key).await?.value, Value::Null);
+    assert_eq!(
+        served.table.get(&null_key, &[VALUE_COLUMN]).await?.row,
+        Row::Present(vec![None])
+    );
     assert_eq!(stats.gets() - before, 1, "a null costs its value page cold");
     let before = stats.gets();
-    assert_eq!(served.table.get(&null_key).await?.value, Value::Null);
+    assert_eq!(
+        served.table.get(&null_key, &[VALUE_COLUMN]).await?.row,
+        Row::Present(vec![None])
+    );
     assert_eq!(stats.gets(), before, "and nothing warm");
     let present = fixture.key(PRESENT_ID);
-    assert!(matches!(
-        served.table.get(&present).await?.value,
-        Value::Present(_)
-    ));
+    assert!(verify::one_value(&served.table.get(&present, &[VALUE_COLUMN]).await?.row).is_some());
     assert_eq!(
         served
             .table
-            .get(&fixture.absent_near(PRESENT_ID))
+            .get(&fixture.absent_near(PRESENT_ID), &[VALUE_COLUMN])
             .await?
-            .value,
-        Value::Absent
+            .row,
+        Row::Absent
     );
     Ok(())
 }
@@ -431,7 +443,10 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         for id in SAMPLE_4K {
             let key = fixture.key(id);
             let before = stats.gets();
-            assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+            assert_eq!(
+                served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+                fixture.expected(&key)
+            );
             assert!(stats.gets() - before <= 1, "a hit is at most one GET");
         }
         let gets = stats.gets() - gets_before;
@@ -453,7 +468,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
                 assert_eq!(
                     row_group[file
                         .index
-                        .value_leaf()
+                        .value_leaf(0)
                         .expect("every file holds the value column")],
                     ColumnIndexMetaData::NONE,
                     "{}: the value column's column index is dropped on load",

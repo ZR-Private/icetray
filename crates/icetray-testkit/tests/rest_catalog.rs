@@ -11,11 +11,12 @@ use iceberg::CatalogBuilder as _;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use icetray_core::KeyType;
+use icetray_core::TableSource;
 use icetray_core::approx;
 use icetray_core::config::{Residency, SourceConfig, TableConfig};
-use icetray_core::{TableSource, Value};
 use icetray_testkit::error::{Precondition, REST_URI_VAR, required_var};
 use icetray_testkit::fixture::{APPENDED_4K_6K, IDS_4K, NEW_ID, OLD_ID};
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify;
 use icetray_testkit::{FixtureSpec, Result, write_fixture};
 
@@ -64,7 +65,7 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
     assert_eq!(generation.records, approx::count(fixture.ids().count()));
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
 
@@ -79,12 +80,9 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
     assert!(served.table.refresh().await?);
     let new_key = fixture.key(NEW_ID);
     assert_eq!(
-        served.table.get(&new_key).await?.value,
+        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&new_key)
     );
-    assert!(matches!(
-        served.table.get(&old_key).await?.value,
-        Value::Present(_)
-    ));
+    assert!(verify::one_value(&served.table.get(&old_key, &[VALUE_COLUMN]).await?.row).is_some());
     Ok(())
 }

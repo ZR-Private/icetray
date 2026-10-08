@@ -19,6 +19,7 @@ use foyer::{
     HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, Source,
 };
 use metrics::Counter;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::approx;
 use crate::config::ConfigViolation;
@@ -370,10 +371,13 @@ impl PageCache {
     /// cached. The disk level's read is not bounded by it.
     /// The origin is what the `result` label of a lookup is decided by, per
     /// call rather than by differencing the process-wide counters, which
-    /// concurrent lookups would confuse.
+    /// concurrent lookups would confuse. A fetch the cache runs answers to
+    /// `issue` (`Issue`); a page served without one, or a fetch joined,
+    /// takes nothing of it.
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: (Arc<str>, u64),
+        issue: Issue<'_>,
         fetch: F,
     ) -> Result<(Bytes, PageOrigin)>
     where
@@ -381,10 +385,12 @@ impl PageCache {
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
         let key = PageKey(key.0, key.1);
-        let run = Run {
+        // Built only once foyer decides to fetch, so a hit clones nothing.
+        let run = || Run {
             page: key.clone(),
             fetches: Arc::clone(&self.fetches),
             deadline: self.fetch_deadline,
+            admission: issue.admission(),
         };
         // One call to foyer and not a `get` first: foyer's `get` reports a
         // disk level that fails to read as an error while its `get_or_fetch`
@@ -394,14 +400,14 @@ impl PageCache {
         let (served, stats) = match self.level.as_ref() {
             Level::Memory(cache) => (
                 cache
-                    .get_or_fetch(&key, || run.fetch(fetch()))
+                    .get_or_fetch(&key, || run().fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 None,
             ),
             Level::Hybrid { cache, stats } => (
                 cache
-                    .get_or_fetch(&key, || run.fetch(fetch()))
+                    .get_or_fetch(&key, || run().fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 Some(stats.as_ref()),
@@ -646,24 +652,87 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
     value.0.len() + ENTRY_OVERHEAD_BYTES
 }
 
+/// What a lookup's GET answers to beside the fetch deadline of the handle
+/// it goes through (RFD 013, RFD 022). It applies where the GET is issued:
+/// a page served from memory or from the disk level, or a fetch another
+/// lookup ran and this one joined, issues none and takes nothing of it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Issue<'a> {
+    /// The fan-out of the `multi_get` the lookup is one of
+    /// (`MULTI_GET_FAN_OUT`): the GET takes one of its permits before it
+    /// starts, so the wait for one is not charged against the deadline,
+    /// and holds it until it ends, on the task the GET runs on, so a lookup
+    /// dropped first frees nothing while its GET runs on. Its hedge runs
+    /// under the same permit. `None` for a `get`, one call of its own.
+    pub(crate) fan_out: Option<&'a Arc<Semaphore>>,
+    /// Counted once as the GET is issued, its hedge not: a value column's
+    /// `value_page_gets_total` for the column's value or dictionary page,
+    /// `None` for a key page.
+    pub(crate) counted: Option<&'a Counter>,
+}
+
+impl Issue<'_> {
+    /// What the GET's task holds of this issue, owned.
+    fn admission(self) -> Admission {
+        Admission {
+            fan_out: self.fan_out.map(Arc::clone),
+            counted: self.counted.cloned(),
+        }
+    }
+
+    /// Waits for the GET's permit when it has a fan-out, then counts the
+    /// GET; the GET holds the returned permit while it runs.
+    pub(crate) async fn admit(self) -> Option<OwnedSemaphorePermit> {
+        self.admission().admit().await
+    }
+}
+
+/// An `Issue` owned by the task a GET runs on.
+struct Admission {
+    fan_out: Option<Arc<Semaphore>>,
+    counted: Option<Counter>,
+}
+
+impl Admission {
+    async fn admit(self) -> Option<OwnedSemaphorePermit> {
+        let permit = match self.fan_out {
+            Some(fan_out) => Some(
+                fan_out
+                    .acquire_owned()
+                    .await
+                    .expect("a batch's fan-out semaphore is never closed"),
+            ),
+            None => None,
+        };
+        if let Some(counted) = self.counted {
+            counted.increment(1);
+        }
+        permit
+    }
+}
+
 /// What one caller's fetch runs with, should foyer run it: the page it is
-/// for, the counter it counts in, and the deadline of the handle it came
-/// through.
+/// for, the counter it counts in, the deadline of the handle it came
+/// through, and the issue it answers to.
 struct Run {
     page: PageKey,
     fetches: Arc<Fetches>,
     deadline: Option<Duration>,
+    admission: Admission,
 }
 
 impl Run {
     /// Runs a caller's fetch once foyer has decided the page must come from
-    /// outside, counting the run as it starts so that a fetch that fails
-    /// still counts. With a deadline, `fut` is dropped when it passes, and
-    /// the run fails as `FetchFailed::Deadline`.
+    /// outside: admitted under its issue first (`Issue`), then counted as
+    /// it starts so that a fetch that fails still counts. With a deadline,
+    /// `fut` is dropped when it passes, measured from admission, and the
+    /// run fails as `FetchFailed::Deadline`. The permit is held until the
+    /// run ends either way.
     async fn fetch<Fut>(self, fut: Fut) -> std::result::Result<PageValue, FetchFailed>
     where
         Fut: Future<Output = Result<Bytes>>,
     {
+        let _permit = self.admission.admit().await;
         self.fetches.record();
         let fetched = match self.deadline {
             None => fut.await,
@@ -887,7 +956,11 @@ mod tests {
     {
         let callers = (0..CONCURRENT).map(|_| {
             let fut = fetch();
-            async move { cache.get_or_fetch(key(offset), move || fut).await }
+            async move {
+                cache
+                    .get_or_fetch(key(offset), Issue::default(), move || fut)
+                    .await
+            }
         });
         let (answers, ()) = join(join_all(callers), async { gate.notify_one() }).await;
         answers
@@ -901,13 +974,17 @@ mod tests {
     /// wait is queued after it. A multi-thread runtime would race the two.
     async fn evict_to_disk(cache: &PageCache, runs: &Arc<AtomicU64>) {
         cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, runs)
+            })
             .await
             .unwrap();
         let displacing =
             offset_sharing_shard(hybrid(cache), &PageKey(Arc::from(FILE_ID), FIRST_OFFSET));
         cache
-            .get_or_fetch(key(displacing), || answering(OTHER_PAGE, runs))
+            .get_or_fetch(key(displacing), Issue::default(), || {
+                answering(OTHER_PAGE, runs)
+            })
             .await
             .unwrap();
         hybrid(cache).storage().wait().await;
@@ -1042,7 +1119,9 @@ mod tests {
                 assert_eq!(value(metric::PAGE_CACHE_BYTES), None, "set by a scrape");
                 let runs = Arc::new(AtomicU64::new(0));
                 cache
-                    .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                        answering(PAGE, &runs)
+                    })
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1097,7 +1176,9 @@ mod tests {
                 let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
                 let runs = Arc::new(AtomicU64::new(0));
                 cache
-                    .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                        answering(PAGE, &runs)
+                    })
                     .await
                     .unwrap();
                 let tasks: Vec<_> = (0..workers)
@@ -1105,7 +1186,10 @@ mod tests {
                         let cache = cache.clone();
                         tokio::spawn(async move {
                             for _ in 0..hits_per_task {
-                                cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+                                cache
+                                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+                                    .await
+                                    .unwrap();
                             }
                         })
                     })
@@ -1120,7 +1204,10 @@ mod tests {
                 assert_eq!(published(), hit);
                 cache.publish_hit_counts();
                 assert_eq!(published(), 0, "nothing is published twice");
-                cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+                cache
+                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+                    .await
+                    .unwrap();
                 let clone = cache.clone();
                 drop(cache);
                 assert_eq!(published(), 0, "a clone still holds the counts");
@@ -1140,7 +1227,9 @@ mod tests {
         let buffer = Bytes::from([PAGE, OTHER_PAGE].concat());
         let slice = buffer.slice(..PAGE.len());
         let (page, _) = cache
-            .get_or_fetch(key(FIRST_OFFSET), move || async move { Ok(slice) })
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), move || async move {
+                Ok(slice)
+            })
             .await
             .unwrap();
         assert_eq!(page, PAGE);
@@ -1156,12 +1245,17 @@ mod tests {
         assert!(matches!(cache.level.as_ref(), Level::Memory(_)));
         let runs = Arc::new(AtomicU64::new(0));
         let (page, origin) = cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
         assert_eq!(origin, PageOrigin::Fetched);
-        let (again, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -1174,11 +1268,16 @@ mod tests {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         cache.close().await.unwrap();
-        let (again, _) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, _) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
@@ -1200,7 +1299,10 @@ mod tests {
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let (again, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(cache.fetches(), 1);
@@ -1228,7 +1330,9 @@ mod tests {
         assert_eq!(cache.hits(), 0);
 
         let (page, _) = cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
@@ -1273,7 +1377,9 @@ mod tests {
         assert_eq!(cache.fetches(), 1);
 
         let (page, origin) = cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);
@@ -1287,12 +1393,16 @@ mod tests {
         assert_eq!(cache.usage(), 0);
         let runs = Arc::new(AtomicU64::new(0));
         cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(cache.usage(), PAGE.len() + ENTRY_OVERHEAD_BYTES);
         cache
-            .get_or_fetch(key(SECOND_OFFSET), || answering(OTHER_PAGE, &runs))
+            .get_or_fetch(key(SECOND_OFFSET), Issue::default(), || {
+                answering(OTHER_PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(
@@ -1308,13 +1418,18 @@ mod tests {
         let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         cache
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 0);
 
-        let (page, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&page[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -1334,7 +1449,10 @@ mod tests {
         assert_eq!(cache.hits(), 0);
         assert_eq!(stats.local_reads(), 0);
 
-        let (page, origin) = cache.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&page[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
@@ -1389,7 +1507,10 @@ mod tests {
 
         let (level, stats) = disk_level(dir.path());
         let second = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
-        let (page, origin) = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (page, origin) = second
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&page[..], PAGE);
         assert_eq!(origin, PageOrigin::Cached);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
@@ -1398,7 +1519,10 @@ mod tests {
         assert_eq!(stats.local_reads(), 1);
         assert_eq!(stats.local_bytes(), page_bytes(PAGE));
 
-        let (again, _) = second.get_or_fetch(key(FIRST_OFFSET), never).await.unwrap();
+        let (again, _) = second
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
         assert_eq!(&again[..], PAGE);
         assert_eq!(second.hits(), 2);
         assert_eq!(stats.local_reads(), 1);
@@ -1424,7 +1548,9 @@ mod tests {
         let (level, stats) = disk_level(dir.path());
         let second = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
         let (page, origin) = second
-            .get_or_fetch(key(FIRST_OFFSET), || answering(PAGE, &runs))
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
             .await
             .unwrap();
         assert_eq!(&page[..], PAGE);

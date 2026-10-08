@@ -15,11 +15,11 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::TableIdent;
 use iceberg::spec::{FormatVersion, Literal, PrimitiveType, Struct};
 use icetray_core::approx::{self, count};
-use icetray_core::config::{LocalConfig, Residency, TableConfig};
+use icetray_core::config::{Residency, TableConfig, ValueColumnConfig};
 use icetray_core::metric::{self, LookupResult};
 use icetray_core::{
-    ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason,
-    TableFault, TableSource, TableState, Value, diagnose,
+    ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
+    TableFault, TableSource, TableState, diagnose,
 };
 use icetray_testkit::error::SpecFault;
 use icetray_testkit::fixture::{
@@ -90,52 +90,43 @@ async fn two_bucket_fixture(
     Ok((dir, fixture))
 }
 
-/// `fixture`'s table entry in `residency` naming `value_column`, from its
-/// root followed through the version hint, and the source it names.
+/// `fixture`'s table entry in `residency` serving `columns`, from its root
+/// followed through the version hint, and the source it names.
 async fn root_entry(
     fixture: &Fixture,
-    value_column: &str,
+    columns: &[&str],
     residency: Residency,
 ) -> Result<(TableConfig, TableSource)> {
     let source = fixture.root_source();
     let config = TableConfig {
         source: source.clone(),
-        value_column: value_column.to_string(),
+        value_columns: columns
+            .iter()
+            .map(|&column| ValueColumnConfig::named(column))
+            .collect(),
         ..fixture.config(residency, false)
     };
     Ok((config, TableSource::from_config(&source).await?))
 }
 
-/// `fixture` served from its root in `residency` naming `value_column`,
-/// over a fresh storage, with a local directory under `scratch` in the
-/// Disk tier.
+/// `fixture` served from its root in `residency` serving `columns`, over a
+/// fresh storage, with a local directory under `scratch` in the Disk tier.
 async fn serve_root_in(
     fixture: &Fixture,
-    value_column: &str,
+    columns: &[&str],
     residency: Residency,
     scratch: &Path,
 ) -> Result<Served> {
-    let (config, source) = root_entry(fixture, value_column, residency).await?;
-    let storage = Arc::new(icetray_core::Storage::new(
-        verify::storage_config_for_tests(),
-    ));
-    let local = match residency {
-        Residency::Disk => Some(Arc::new(LocalDir::open(
-            &LocalConfig {
-                dir: scratch.to_path_buf(),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            storage.stats(),
-        )?)),
-        Residency::Full | Residency::Bloom => None,
-    };
-    verify::serve_over(storage, config, source, local).await
+    let (config, source) = root_entry(fixture, columns, residency).await?;
+    verify::build_in(config, source, scratch, verify::TEST_PAGE_CACHE_BYTES)
+        .await?
+        .load()
+        .await
 }
 
-/// `fixture` served from its root in the Full tier naming `value_column`.
-async fn serve_root(fixture: &Fixture, value_column: &str) -> Result<Served> {
-    let (config, source) = root_entry(fixture, value_column, Residency::Full).await?;
+/// `fixture` served from its root in the Full tier serving `columns`.
+async fn serve_root(fixture: &Fixture, columns: &[&str]) -> Result<Served> {
+    let (config, source) = root_entry(fixture, columns, Residency::Full).await?;
     verify::serve(config, source, verify::storage_config_for_tests()).await
 }
 
@@ -161,10 +152,10 @@ async fn load_error(config: TableConfig, source: TableSource) -> Result<Error> {
     Ok(error)
 }
 
-/// The error the first load of `fixture` from its root naming
-/// `value_column` fails with.
+/// The error the first load of `fixture` from its root serving
+/// `value_column` alone fails with.
 async fn first_load_error(fixture: &Fixture, value_column: &str) -> Result<Error> {
-    let (config, source) = root_entry(fixture, value_column, Residency::Full).await?;
+    let (config, source) = root_entry(fixture, &[value_column], Residency::Full).await?;
     load_error(config, source).await
 }
 
@@ -294,19 +285,25 @@ async fn add_column_then_rows(fixture: &mut Fixture, default: StatedDefault) -> 
     Ok(later)
 }
 
-/// Looks up every one of `ids` in `served`, asserting each answers
-/// `expected` of its key, and returns the GETs the lookups made.
+/// Looks up every one of `ids` in `served` naming `columns`, asserting
+/// each answers `expected` of its key, and returns the GETs the lookups
+/// made.
 async fn gets_answering(
     served: &Served,
     fixture: &Fixture,
     ids: &[u64],
-    expected: impl Fn(&Key) -> Value,
+    columns: &[&str],
+    expected: impl Fn(&Key) -> Row,
 ) -> Result<u64> {
     let stats = served.storage.stats();
     let before = stats.gets();
     for &id in ids {
         let key = fixture.key(id);
-        assert_eq!(served.table.get(&key).await?.value, expected(&key), "{id}");
+        assert_eq!(
+            served.table.get(&key, columns).await?.row,
+            expected(&key),
+            "{id}"
+        );
     }
     Ok(stats.gets() - before)
 }
@@ -319,25 +316,61 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     fixture
         .delete(&[DELETED_ID], DeleteForm::ScopedPositions, "gone")
         .await?;
-    let served = serve_root(&fixture, SECOND_VALUE_COLUMN).await?;
+    let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
     assert_eq!(
-        gets_answering(&served, &fixture, &FIRST_BUILD_SAMPLE, |_| Value::Null).await?,
+        gets_answering(
+            &served,
+            &fixture,
+            &FIRST_BUILD_SAMPLE,
+            &[SECOND_VALUE_COLUMN],
+            |_| Row::Present(vec![None]),
+        )
+        .await?,
         0,
         "a row answered by its default reads no value page"
     );
     assert_eq!(
-        served.table.get(&fixture.key(DELETED_ID)).await?.value,
-        Value::Absent,
+        served
+            .table
+            .get(&fixture.key(DELETED_ID), &[SECOND_VALUE_COLUMN])
+            .await?
+            .row,
+        Row::Absent,
         "a deleted row is deleted whatever its column answers"
     );
-    let gets = gets_answering(&served, &fixture, &later, |key| {
-        Value::Present(fixture.second_value(key).unwrap().into())
+    let gets = gets_answering(&served, &fixture, &later, &[SECOND_VALUE_COLUMN], |key| {
+        fixture.expected_of(key, &[SECOND_VALUE_COLUMN])
     })
     .await?;
     assert!(
         gets > 0,
         "the later files' values are read from their pages"
     );
+
+    // Each column is resolved on its own (RFD 022): an earlier file serves
+    // the value column from its pages and answers the added one by its
+    // default, one value-page GET for the column it holds and none for the
+    // other, while a later file serves both.
+    let both = [VALUE_COLUMN, SECOND_VALUE_COLUMN];
+    let served_both = serve_root(&fixture, &both).await?;
+    let one_column_gets = verify::expected_cold_gets(
+        &served_both.current(),
+        &fixture.keys_at(&FIRST_BUILD_SAMPLE),
+        &[VALUE_COLUMN],
+    )?;
+    assert!(one_column_gets > 0);
+    let earlier_gets = gets_answering(&served_both, &fixture, &FIRST_BUILD_SAMPLE, &both, |key| {
+        Row::Present(vec![fixture.value(key).map(Into::into), None])
+    })
+    .await?;
+    assert_eq!(
+        earlier_gets, one_column_gets,
+        "the column a file holds costs its pages, the defaulted one none"
+    );
+    gets_answering(&served_both, &fixture, &later, &both, |key| {
+        fixture.expected_of(key, &both)
+    })
+    .await?;
 
     let generation = served.current();
     let report = diagnose(&generation, Level::Optimal);
@@ -351,14 +384,15 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     let without_column = generation
         .files
         .iter()
-        .filter(|file| file.index.value_leaf().is_none())
+        .filter(|file| file.index.value_leaf(0).is_none())
         .count();
     assert_eq!(without_column, earlier);
     assert_eq!(
         report
             .files
             .iter()
-            .filter(|file| file.value_pages == 0)
+            .filter(|file| file.value_columns[0].answers_default
+                && file.value_columns[0].value_pages == 0)
             .count(),
         earlier,
         "a file answering by default has no value pages to measure"
@@ -376,7 +410,7 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
         two_bucket_fixture("kv_added_tiers", FormatVersion::V2, false).await?;
     let later = add_column_then_rows(&mut fixture, StatedDefault::None).await?;
     let scratch = tempfile::tempdir()?;
-    let full = serve_root(&fixture, SECOND_VALUE_COLUMN).await?;
+    let full = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
     let full_generation = full.current();
     let earlier: Vec<Key> = FIRST_BUILD_SAMPLE
         .iter()
@@ -384,16 +418,30 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
         .collect();
     for residency in [Residency::Bloom, Residency::Disk] {
         let served =
-            serve_root_in(&fixture, SECOND_VALUE_COLUMN, residency, scratch.path()).await?;
+            serve_root_in(&fixture, &[SECOND_VALUE_COLUMN], residency, scratch.path()).await?;
         let generation = served.current();
         let mut seen = SeenPages::default();
         let expected: u64 = earlier
             .iter()
             .map(|key| {
-                verify::expected_lookup_gets(&full_generation, &generation, key, true, &mut seen)
+                verify::expected_lookup_gets(
+                    &full_generation,
+                    &generation,
+                    SECOND_VALUE_COLUMN,
+                    key,
+                    true,
+                    &mut seen,
+                )
             })
             .sum();
-        let gets = gets_answering(&served, &fixture, &FIRST_BUILD_SAMPLE, |_| Value::Null).await?;
+        let gets = gets_answering(
+            &served,
+            &fixture,
+            &FIRST_BUILD_SAMPLE,
+            &[SECOND_VALUE_COLUMN],
+            |_| Row::Present(vec![None]),
+        )
+        .await?;
         assert_eq!(gets, expected, "{residency}");
         match residency {
             Residency::Bloom => {
@@ -411,16 +459,22 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
 
     let later: Vec<Key> = later.iter().map(|&id| fixture.key(id)).collect();
     let mixed: Vec<Key> = earlier.iter().chain(&later).cloned().collect();
-    let expected: Vec<Value> = earlier
+    let expected: Vec<Row> = earlier
         .iter()
-        .map(|_| Value::Null)
+        .map(|_| Row::Present(vec![None]))
         .chain(
             later
                 .iter()
-                .map(|key| Value::Present(fixture.second_value(key).unwrap().into())),
+                .map(|key| fixture.expected_of(key, &[SECOND_VALUE_COLUMN])),
         )
         .collect();
-    assert_eq!(full.table.multi_get(&mixed).await?.values, expected);
+    assert_eq!(
+        full.table
+            .multi_get(&mixed, &[SECOND_VALUE_COLUMN])
+            .await?
+            .rows,
+        expected
+    );
     Ok(())
 }
 
@@ -431,8 +485,15 @@ async fn test_a_default_answer_is_counted_a_warm_hit() -> Result<()> {
     let recorder = icetray::telemetry::install().expect("the recorder installs");
     let (_dir, mut fixture) = two_bucket_fixture("kv_added_warm", FormatVersion::V2, false).await?;
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
-    let served = serve_root(&fixture, SECOND_VALUE_COLUMN).await?;
-    gets_answering(&served, &fixture, &FIRST_BUILD_SAMPLE, |_| Value::Null).await?;
+    let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
+    gets_answering(
+        &served,
+        &fixture,
+        &FIRST_BUILD_SAMPLE,
+        &[SECOND_VALUE_COLUMN],
+        |_| Row::Present(vec![None]),
+    )
+    .await?;
     served.table.publish_lookup_counts();
     let scrape = recorder.render();
     let lookups = |result: &str| {
@@ -465,11 +526,15 @@ async fn test_a_column_added_with_a_v3_initial_default_answers_its_bytes() -> Re
         StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
     )
     .await?;
-    let served = serve_root(&fixture, SECOND_VALUE_COLUMN).await?;
+    let served = serve_root(&fixture, &[SECOND_VALUE_COLUMN]).await?;
     assert_eq!(
-        gets_answering(&served, &fixture, &FIRST_BUILD_SAMPLE, |_| {
-            Value::Present(DEFAULT_BYTES.into())
-        })
+        gets_answering(
+            &served,
+            &fixture,
+            &FIRST_BUILD_SAMPLE,
+            &[SECOND_VALUE_COLUMN],
+            |_| { Row::Present(vec![Some(DEFAULT_BYTES.into())]) }
+        )
         .await?,
         0,
         "a row answered by its default reads no value page"
@@ -527,7 +592,7 @@ async fn test_a_default_that_does_not_read_is_refused_through_a_catalog() -> Res
         .register_table(&ident, fixture.metadata_location().to_string())
         .await?;
     let config = TableConfig {
-        value_column: SECOND_VALUE_COLUMN.to_string(),
+        value_columns: vec![ValueColumnConfig::named(SECOND_VALUE_COLUMN)],
         ..fixture.config(Residency::Full, false)
     };
     let error = load_error(config, TableSource::Catalog { catalog, ident }).await?;
@@ -546,7 +611,7 @@ async fn test_a_default_that_does_not_read_is_refused_through_a_catalog() -> Res
 async fn test_a_reused_file_under_a_dropped_and_readded_name_is_refused_on_refresh() -> Result<()> {
     let (_dir, mut fixture) = two_bucket_fixture("kv_readd", FormatVersion::V2, false).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture, VALUE_COLUMN).await?;
+    let served = serve_root(&fixture, &[VALUE_COLUMN]).await?;
     let first = served.current().snapshot_id;
 
     fixture
@@ -591,7 +656,7 @@ async fn test_a_reused_file_under_a_dropped_and_readded_name_is_refused_on_refre
     );
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
     assert!(
@@ -713,8 +778,8 @@ async fn test_a_file_without_field_ids_holding_the_name_is_served() -> Result<()
     for key in RAW_KEYS {
         let key = Key::Long(key);
         assert_eq!(
-            served.table.get(&key).await?.value,
-            Value::Present(value_for(&key).into())
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            Row::Present(vec![Some(value_for(&key).into())])
         );
     }
     Ok(())

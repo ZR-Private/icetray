@@ -7,7 +7,8 @@
 //! listed it is classified by its content and format rather than skipped.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -62,8 +63,9 @@ impl Bucketing {
     }
 }
 
-/// What routing needs to know about a table, derived once per generation
-/// from the snapshot's own schema and the table's default partition spec.
+/// What routing and lookups need to know about a table, derived once per
+/// generation from the snapshot's own schema and the table's default
+/// partition spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableLayout {
     /// The bucket transform on the key in the default partition spec, the
@@ -80,17 +82,72 @@ pub struct TableLayout {
     /// The width of every key of a `fixed` key column; `None` for every
     /// other key type.
     pub key_width: Option<u64>,
-    /// The value column's name.
-    pub value_column: String,
-    /// The value column's field id in the snapshot's schema.
-    pub value_field_id: i32,
-    /// The width of every value of a `fixed` value column; `None` for
-    /// binary and string, whose values have any length.
-    pub value_width: Option<u64>,
-    /// What a data file written before the value column was added answers
-    /// for it (RFD 023): the column's `initial-default` in the snapshot's
-    /// schema as bytes, or `None`, a null, when the schema gives none.
-    pub value_default: Option<Bytes>,
+    /// The columns the table serves (RFD 022), in the order the
+    /// configuration's `TableConfig::value_column_names` gives, ascending
+    /// by name; a lookup names each by its position here, and every file's
+    /// index holds its columns in this order.
+    pub value_columns: Vec<ValueColumnLayout>,
+}
+
+/// One served value column as a snapshot's schema gives it (RFD 022, RFD
+/// 023).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValueColumnLayout {
+    /// The column's configured name.
+    pub name: String,
+    /// The column's field id in the snapshot's schema.
+    pub field_id: i32,
+    /// The column's Iceberg type.
+    pub value_type: ValueType,
+    /// What a data file written before the column was added answers for it
+    /// (RFD 023): the column's `initial-default` in the snapshot's schema
+    /// as bytes, or `None`, a null, when the schema gives none.
+    pub default: Option<Bytes>,
+}
+
+impl ValueColumnLayout {
+    /// The width of every value of a `fixed` column; `None` for binary and
+    /// string, whose values have any length.
+    pub fn width(&self) -> Option<u64> {
+        match self.value_type {
+            ValueType::Fixed { width } => Some(width),
+            ValueType::Binary | ValueType::String => None,
+        }
+    }
+}
+
+/// The Iceberg types a value column may have, each served as its bytes
+/// unchanged (RFD 002, RFD 022): a string as its UTF-8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ValueType {
+    /// `binary`.
+    Binary,
+    /// `fixed[width]`.
+    Fixed {
+        /// The bytes of every value.
+        width: u64,
+    },
+    /// `string`.
+    String,
+}
+
+/// What is wrong with a column a lookup names (RFD 022). Display gives the
+/// fault for `Error::ColumnRequest`'s message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColumnRequestFault {
+    /// The table serves no column of that name.
+    NotServed,
+    /// The lookup names the column more than once.
+    Repeated,
+}
+
+impl fmt::Display for ColumnRequestFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotServed => "is not served",
+            Self::Repeated => "is named more than once",
+        })
+    }
 }
 
 impl TableLayout {
@@ -102,23 +159,27 @@ impl TableLayout {
     /// whose type `KeyType::from_iceberg` does not admit as
     /// `RefusalReason::KeyTypeUnsupported` and a value column that is not
     /// binary, fixed, or string as `RefusalReason::ValueTypeUnsupported`
-    /// (RFD 002). Each column is a top-level field of the schema (RFD 023):
-    /// a name the schema holds only nested, such as a dotted name, is
-    /// `RefusalReason::ColumnMismatch` with `ColumnMismatch::NotTopLevel`,
-    /// and a name it lacks altogether `TableFault::ColumnMissing`. The value
-    /// column's default is its `initial-default` (`column::value_default`);
-    /// one `unread` names, which the metadata states but the parse dropped,
-    /// is `ColumnMismatch::UnreadableDefault`. A schema id the metadata
-    /// lacks is `TableFault::SchemaMissing`. Bucketing comes from `md`'s
-    /// default partition spec, since a snapshot records no spec of its own;
-    /// a bucket count of zero there is `TableFault::ZeroBuckets`.
+    /// naming it (RFD 002, RFD 022). Each column is a top-level field of the
+    /// schema (RFD 023): a name the schema holds only nested, such as a
+    /// dotted name, is `RefusalReason::ColumnMismatch` with
+    /// `ColumnMismatch::NotTopLevel`, and a name it lacks altogether
+    /// `TableFault::ColumnMissing`. Each value column's default is its
+    /// `initial-default` (`column::value_default`); one `unread` names,
+    /// which the metadata states but the parse dropped, is
+    /// `ColumnMismatch::UnreadableDefault`. The value columns are kept in
+    /// the order `value_columns` gives them, which
+    /// `TableConfig::value_column_names` makes ascending by name. A schema
+    /// id the metadata lacks is `TableFault::SchemaMissing`. Bucketing comes
+    /// from `md`'s default partition spec, since a snapshot records no spec
+    /// of its own; a bucket count of zero there is
+    /// `TableFault::ZeroBuckets`.
     pub(crate) fn derive(
         table: &str,
         md: &TableMetadata,
         unread: &UnreadDefaults,
         snapshot: &Snapshot,
         key_column: &str,
-        value_column: &str,
+        value_columns: &[&str],
     ) -> Result<Self> {
         let schema = match snapshot.schema_id() {
             Some(schema_id) => md.schema_by_id(schema_id).ok_or_else(|| {
@@ -149,17 +210,31 @@ impl TableLayout {
             )),
         };
         let key_field = column(key_column)?;
-        let value_field = column(value_column)?;
         let key_type = KeyType::from_iceberg(&key_field.field_type)
             .ok_or_else(|| Error::refused(table, RefusalReason::KeyTypeUnsupported))?;
-        check_value_type(table, &value_field.field_type)?;
-        let value_width = fixed_width(&value_field.field_type);
-        let value_default = column::value_default(
-            value_field,
-            value_width,
-            unread.contains(schema.schema_id(), value_field.id),
-        )
-        .map_err(|cause| mismatch(value_column, cause))?;
+        let value_columns = value_columns
+            .iter()
+            .map(|&name| {
+                let field = column(name)?;
+                let value_type = value_type(table, name, &field.field_type)?;
+                let width = match value_type {
+                    ValueType::Fixed { width } => Some(width),
+                    ValueType::Binary | ValueType::String => None,
+                };
+                let default = column::value_default(
+                    field,
+                    width,
+                    unread.contains(schema.schema_id(), field.id),
+                )
+                .map_err(|cause| mismatch(name, cause))?;
+                Ok(ValueColumnLayout {
+                    name: name.to_string(),
+                    field_id: field.id,
+                    value_type,
+                    default,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let bucketing = bucket_field(table, md.default_partition_spec(), key_field.id)?
             .map(|field| field.bucketing);
         Ok(Self {
@@ -168,12 +243,52 @@ impl TableLayout {
             key_field_id: key_field.id,
             key_type,
             key_width: fixed_width(&key_field.field_type),
-            value_column: value_column.to_string(),
-            value_field_id: value_field.id,
-            value_width,
-            value_default,
+            value_columns,
         })
     }
+
+    /// The position in `value_columns` of the column named `name`; `None`
+    /// for a name the table does not serve.
+    pub fn value_column(&self, name: &str) -> Option<usize> {
+        self.value_columns
+            .iter()
+            .position(|column| column.name == name)
+    }
+
+    /// The positions of the columns `names` names, in its order, for a
+    /// lookup of `table` (`select_columns`).
+    pub(crate) fn select(&self, table: &str, names: &[&str]) -> Result<Vec<usize>> {
+        select_columns(table, names, |name| self.value_column(name))
+    }
+}
+
+/// The positions `position` gives the columns `names` names, in its order,
+/// for a lookup of `table`: a name `position` places nowhere, one the table
+/// does not serve, is `Error::ColumnRequest` with
+/// `ColumnRequestFault::NotServed`, a name given twice the same with
+/// `ColumnRequestFault::Repeated`, the first such name in `names` reported.
+pub(crate) fn select_columns(
+    table: &str,
+    names: &[&str],
+    position: impl Fn(&str) -> Option<usize>,
+) -> Result<Vec<usize>> {
+    let mut seen = HashSet::with_capacity(names.len());
+    names
+        .iter()
+        .map(|&name| {
+            let fault = |fault| Error::ColumnRequest {
+                table: table.to_string(),
+                column: name.to_string(),
+                fault,
+            };
+            let at = position(name).ok_or_else(|| fault(ColumnRequestFault::NotServed))?;
+            if seen.insert(at) {
+                Ok(at)
+            } else {
+                Err(fault(ColumnRequestFault::Repeated))
+            }
+        })
+        .collect()
 }
 
 /// The width of a `fixed` type; `None` for every other type.
@@ -184,17 +299,22 @@ fn fixed_width(ty: &Type) -> Option<u64> {
     }
 }
 
-/// The value column is served as opaque bytes (RFD 010), so its Iceberg
-/// type must be one whose bytes are the value: binary, fixed, or string.
-/// Anything else is `RefusalReason::ValueTypeUnsupported`, carrying the
-/// type's `Display`.
-fn check_value_type(table: &str, ty: &Type) -> Result<()> {
+/// A value column is served as opaque bytes (RFD 010), so its Iceberg type
+/// must be one whose bytes are the value: binary, fixed, or string, a
+/// fixed one no wider than a Parquet `FIXED_LEN_BYTE_ARRAY` can store,
+/// whose type length is an `i32`, as Iceberg's fixed length is a Java
+/// `int`. Anything else is `RefusalReason::ValueTypeUnsupported` naming
+/// the column `name` and carrying the type's `Display`.
+fn value_type(table: &str, name: &str, ty: &Type) -> Result<ValueType> {
     match ty {
+        Type::Primitive(PrimitiveType::Binary) => Ok(ValueType::Binary),
+        Type::Primitive(PrimitiveType::Fixed(width)) if i32::try_from(*width).is_ok() => {
+            Ok(ValueType::Fixed { width: *width })
+        }
+        Type::Primitive(PrimitiveType::String) => Ok(ValueType::String),
         Type::Primitive(
-            PrimitiveType::Binary | PrimitiveType::Fixed(_) | PrimitiveType::String,
-        ) => Ok(()),
-        Type::Primitive(
-            PrimitiveType::Boolean
+            PrimitiveType::Fixed(_)
+            | PrimitiveType::Boolean
             | PrimitiveType::Int
             | PrimitiveType::Long
             | PrimitiveType::Float
@@ -213,6 +333,7 @@ fn check_value_type(table: &str, ty: &Type) -> Result<()> {
         | Type::Map(_) => Err(Error::refused(
             table,
             RefusalReason::ValueTypeUnsupported {
+                column: name.to_string(),
                 got: ty.to_string(),
             },
         )),
@@ -794,7 +915,7 @@ pub(crate) mod testing {
         TableMetadata, TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
     };
 
-    use super::{Bucketing, TableLayout};
+    use super::{Bucketing, TableLayout, ValueColumnLayout, ValueType};
     use crate::catalog::{METADATA_DIR, hint_location, version_file};
     use crate::key::{Key, KeyType};
     use crate::time;
@@ -852,10 +973,17 @@ pub(crate) mod testing {
             key_field_id: KEY_FIELD_ID,
             key_type,
             key_width: None,
-            value_column: VALUE_COLUMN.to_string(),
-            value_field_id: VALUE_FIELD_ID,
-            value_width: None,
-            value_default: None,
+            value_columns: vec![binary_column(VALUE_COLUMN, VALUE_FIELD_ID)],
+        }
+    }
+
+    /// A binary value column named `name` at `field_id`, with no default.
+    pub(crate) fn binary_column(name: &str, field_id: i32) -> ValueColumnLayout {
+        ValueColumnLayout {
+            name: name.to_string(),
+            field_id,
+            value_type: ValueType::Binary,
+            default: None,
         }
     }
 
@@ -1294,7 +1422,7 @@ mod tests {
             &UnreadDefaults::default(),
             snapshot,
             KEY_COLUMN,
-            VALUE_COLUMN,
+            &[VALUE_COLUMN],
         )
     }
 
@@ -1385,10 +1513,7 @@ mod tests {
                     key_field_id: KEY_FIELD_ID,
                     key_type: expected,
                     key_width,
-                    value_column: VALUE_COLUMN.to_string(),
-                    value_field_id: VALUE_FIELD_ID,
-                    value_width: None,
-                    value_default: None,
+                    value_columns: vec![testing::binary_column(VALUE_COLUMN, VALUE_FIELD_ID)],
                 }
             );
         }
@@ -1430,10 +1555,12 @@ mod tests {
             );
             assert!(derive(&md, &snapshot_with_schema(None)).is_ok());
         }
+        let wider_than_parquet_stores = u64::try_from(i32::MAX).unwrap() + 1;
         for refused in [
             Type::Primitive(PrimitiveType::Long),
             Type::Primitive(PrimitiveType::Uuid),
             Type::Primitive(PrimitiveType::Double),
+            Type::Primitive(PrimitiveType::Fixed(wider_than_parquet_stores)),
         ] {
             let md = testing::metadata(
                 &root,
@@ -1443,8 +1570,134 @@ mod tests {
             assert_eq!(
                 refusal_of(derive(&md, &snapshot_with_schema(None))),
                 RefusalReason::ValueTypeUnsupported {
+                    column: VALUE_COLUMN.to_string(),
                     got: refused.to_string(),
                 }
+            );
+        }
+    }
+
+    /// A schema of the key, the binary `VALUE_COLUMN`, and the string
+    /// `RENAMED_VALUE_COLUMN`: a table of two value columns.
+    fn two_value_schema(second: Type) -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    KEY_FIELD_ID,
+                    KEY_COLUMN,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::optional(
+                    VALUE_FIELD_ID,
+                    VALUE_COLUMN,
+                    Type::Primitive(PrimitiveType::Binary),
+                )
+                .into(),
+                NestedField::optional(RENAMED_VALUE_FIELD_ID, RENAMED_VALUE_COLUMN, second).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_derive_takes_every_value_column_in_the_order_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = testing::metadata(
+            &testing::file_root(dir.path()),
+            two_value_schema(Type::Primitive(PrimitiveType::String)),
+            testing::unpartitioned(),
+        );
+        let snapshot = snapshot_with_schema(None);
+        let derive_columns = |columns: &[&str]| {
+            TableLayout::derive(
+                TABLE,
+                &md,
+                &UnreadDefaults::default(),
+                &snapshot,
+                KEY_COLUMN,
+                columns,
+            )
+        };
+        let layout = derive_columns(&[RENAMED_VALUE_COLUMN, VALUE_COLUMN]).unwrap();
+        let columns: Vec<(&str, i32, ValueType)> = layout
+            .value_columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.field_id, column.value_type))
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                (
+                    RENAMED_VALUE_COLUMN,
+                    RENAMED_VALUE_FIELD_ID,
+                    ValueType::String
+                ),
+                (VALUE_COLUMN, VALUE_FIELD_ID, ValueType::Binary),
+            ]
+        );
+        assert!(derive_columns(&[]).unwrap().value_columns.is_empty());
+        let unsupported = TableLayout::derive(
+            TABLE,
+            &testing::metadata(
+                &testing::file_root(dir.path()),
+                two_value_schema(Type::Primitive(PrimitiveType::Long)),
+                testing::unpartitioned(),
+            ),
+            &UnreadDefaults::default(),
+            &snapshot,
+            KEY_COLUMN,
+            &[VALUE_COLUMN, RENAMED_VALUE_COLUMN],
+        );
+        assert_eq!(
+            refusal_of(unsupported),
+            RefusalReason::ValueTypeUnsupported {
+                column: RENAMED_VALUE_COLUMN.to_string(),
+                got: Type::Primitive(PrimitiveType::Long).to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_select_names_columns_by_position_and_refuses_an_unserved_or_repeated_name() {
+        let layout = TableLayout {
+            value_columns: vec![
+                testing::binary_column(RENAMED_VALUE_COLUMN, RENAMED_VALUE_FIELD_ID),
+                testing::binary_column(VALUE_COLUMN, VALUE_FIELD_ID),
+            ],
+            ..testing::layout(KeyType::Long, None)
+        };
+        assert_eq!(
+            layout
+                .select(TABLE, &[VALUE_COLUMN, RENAMED_VALUE_COLUMN])
+                .unwrap(),
+            [1, 0]
+        );
+        assert_eq!(layout.select(TABLE, &[]).unwrap(), Vec::<usize>::new());
+        let cases = [
+            (
+                &[VALUE_COLUMN, ABSENT_COLUMN][..],
+                ABSENT_COLUMN,
+                ColumnRequestFault::NotServed,
+            ),
+            (
+                &[VALUE_COLUMN, RENAMED_VALUE_COLUMN, VALUE_COLUMN][..],
+                VALUE_COLUMN,
+                ColumnRequestFault::Repeated,
+            ),
+        ];
+        for (names, named, expected) in cases {
+            let Err(Error::ColumnRequest {
+                table,
+                column,
+                fault,
+            }) = layout.select(TABLE, names)
+            else {
+                panic!("{names:?} is refused");
+            };
+            assert_eq!(
+                (table.as_str(), column.as_str(), fault),
+                (TABLE, named, expected)
             );
         }
     }
@@ -1468,7 +1721,7 @@ mod tests {
                     &UnreadDefaults::default(),
                     &snapshot,
                     key_column,
-                    value_column
+                    &[value_column]
                 )),
                 TableFault::ColumnMissing {
                     column: ABSENT_COLUMN.to_string(),
@@ -1522,7 +1775,7 @@ mod tests {
 
         // A snapshot written under the first schema still finds `value`.
         let old = derive(&md, &snapshot_with_schema(Some(first_schema_id))).unwrap();
-        assert_eq!(old.value_field_id, VALUE_FIELD_ID);
+        assert_eq!(old.value_columns[0].field_id, VALUE_FIELD_ID);
         // One written under the current schema does not.
         assert_eq!(
             fault_of(derive(&md, &snapshot_with_schema(Some(current_schema_id)))),
@@ -1536,10 +1789,10 @@ mod tests {
             &UnreadDefaults::default(),
             &snapshot_with_schema(Some(current_schema_id)),
             KEY_COLUMN,
-            RENAMED_VALUE_COLUMN,
+            &[RENAMED_VALUE_COLUMN],
         )
         .unwrap();
-        assert_eq!(renamed.value_field_id, RENAMED_VALUE_FIELD_ID);
+        assert_eq!(renamed.value_columns[0].field_id, RENAMED_VALUE_FIELD_ID);
         // A snapshot without a schema id uses the current schema.
         let by_default = TableLayout::derive(
             TABLE,
@@ -1547,10 +1800,10 @@ mod tests {
             &UnreadDefaults::default(),
             &snapshot_with_schema(None),
             KEY_COLUMN,
-            RENAMED_VALUE_COLUMN,
+            &[RENAMED_VALUE_COLUMN],
         )
         .unwrap();
-        assert_eq!(by_default.value_field_id, RENAMED_VALUE_FIELD_ID);
+        assert_eq!(by_default.value_columns[0].field_id, RENAMED_VALUE_FIELD_ID);
         assert_eq!(
             fault_of(derive(&md, &snapshot_with_schema(Some(ABSENT_SCHEMA_ID)))),
             TableFault::SchemaMissing {
@@ -1606,7 +1859,7 @@ mod tests {
                 &UnreadDefaults::default(),
                 &snapshot,
                 KEY_COLUMN,
-                value_column,
+                &[value_column],
             )
         };
         let dotted = format!("{NESTED_OUTER}.{NESTED_INNER}");
@@ -1655,8 +1908,8 @@ mod tests {
         );
         let snapshot = snapshot_with_schema(None);
         let layout = derive(&md, &snapshot).unwrap();
-        assert_eq!(layout.value_width, Some(FIXED_VALUE_BYTES));
-        assert_eq!(layout.value_default, Some(Bytes::from(default)));
+        assert_eq!(layout.value_columns[0].width(), Some(FIXED_VALUE_BYTES));
+        assert_eq!(layout.value_columns[0].default, Some(Bytes::from(default)));
         let unread = UnreadDefaults::naming(md.current_schema_id(), VALUE_FIELD_ID);
         assert_eq!(
             refusal_of(TableLayout::derive(
@@ -1665,7 +1918,7 @@ mod tests {
                 &unread,
                 &snapshot,
                 KEY_COLUMN,
-                VALUE_COLUMN,
+                &[VALUE_COLUMN],
             )),
             RefusalReason::ColumnMismatch {
                 column: VALUE_COLUMN.to_string(),

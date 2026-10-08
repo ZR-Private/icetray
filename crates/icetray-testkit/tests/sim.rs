@@ -13,8 +13,9 @@ use std::time::Duration;
 use iceberg::memory::MemoryCatalog;
 use icetray_core::approx;
 use icetray_core::config::{HedgeConfig, Residency, RewriteRule, StorageConfig, TableConfig};
-use icetray_core::{Key, KeyType, Storage, TableSource, Value};
+use icetray_core::{Key, KeyType, Row, Storage, TableSource};
 use icetray_testkit::fixture::{APPENDED_4K_6K, IDS_4K, NAMESPACE, NEW_ID};
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::sim::{SlowEvery, serve_s3_with, sim_s3_store};
 use icetray_testkit::verify::{
     self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served,
@@ -222,15 +223,15 @@ fn run_cold(seed: u64, written: &Written) -> Outcome {
 
         let before = stats.gets();
         let started = turmoil::elapsed();
-        let lookup = served.table.get(&key).await?;
+        let lookup = served.table.get(&key, &[VALUE_COLUMN]).await?;
         let hit = turmoil::elapsed().saturating_sub(started);
         let hit_gets = stats.gets() - before;
-        assert_eq!(lookup.value, expected);
+        assert_eq!(lookup.row, expected);
 
         let started = turmoil::elapsed();
-        let miss_value = served.table.get(&absent).await?.value;
+        let miss_value = served.table.get(&absent, &[VALUE_COLUMN]).await?.row;
         let miss = turmoil::elapsed().saturating_sub(started);
-        assert_eq!(miss_value, Value::Absent);
+        assert_eq!(miss_value, Row::Absent);
 
         tx.send(Outcome {
             load,
@@ -321,15 +322,15 @@ fn run_tail(
         let stats = storage.stats();
         let served = serve_in_sim(storage, config, TableSource::Static { location }).await?;
         let generation = served.current();
-        let expected_gets = verify::expected_cold_gets(&generation, &keys)?;
+        let expected_gets = verify::expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
         let (gets_before, hedges_before) = (stats.gets(), stats.hedges());
         let mut max = Duration::ZERO;
         let mut total = Duration::ZERO;
         for (at, key) in keys.iter().enumerate() {
             let started = turmoil::elapsed();
-            let lookup = served.table.get(key).await?;
+            let lookup = served.table.get(key, &[VALUE_COLUMN]).await?;
             let elapsed = turmoil::elapsed().saturating_sub(started);
-            assert!(matches!(lookup.value, Value::Present(_)), "key {key}");
+            assert!(verify::one_value(&lookup.row).is_some(), "key {key}");
             if at >= HEDGE_WINDOW {
                 max = max.max(elapsed);
                 total += elapsed;
@@ -496,10 +497,13 @@ fn test_load_reads_never_hedge() -> Result<()> {
         assert_eq!(served.current().metadata_location, v1_location);
         assert_eq!(stats.hedges(), 0, "a load never hedges");
         assert_eq!(
-            served.table.get(&old_key).await?.value,
+            served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
             fixture.expected(&old_key)
         );
-        assert_eq!(served.table.get(&new_key).await?.value, Value::Absent);
+        assert_eq!(
+            served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent
+        );
 
         fixture.write_hint().await?;
         let gets_before = stats.gets();
@@ -513,7 +517,7 @@ fn test_load_reads_never_hedge() -> Result<()> {
         // The lookup GETs after the refresh may hedge under these eager
         // settings; only the load's count is the invariant.
         assert_eq!(
-            served.table.get(&new_key).await?.value,
+            served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
             fixture.expected(&new_key)
         );
         tx.send(hedges_after_refresh)

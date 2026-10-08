@@ -32,6 +32,10 @@
 > serving an unchanged file's old column; a file that lacks the column
 > is no longer a file fault. See RFD 023.
 
+> Updated 2026-10-07: a generation takes the table's key column and each
+> of its configured value columns, of which there may be none, and
+> resolves each value column in every data file on its own. See RFD 022.
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -61,14 +65,16 @@ hint file, or a catalog. A poll compares the metadata location it knows
 against the current one and stops when they match
 ([prototype findings, finding 5](../analysis/2026-09-10-prototype-findings.md#5-snapshot-advance-on-s3)).
 
-A generation takes its key column, value column, and bucket transform from
-the snapshot's own schema and from each manifest's partition spec, so a
-schema or spec change between snapshots cannot misroute a key. The
-table's current schema and default spec play no part
-([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
+A generation takes its key column, each configured value column (RFD 022
+(Value columns)), and its bucket transform from the snapshot's own
+schema and from each manifest's partition spec, so a schema or spec
+change between snapshots cannot misroute a key. The table's current
+schema and default spec play no part ([prototype findings, finding
+15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
 Each column is then found in every data file by its name and checked
 against the field id that schema gives it, as RFD 023 (Column
-resolution) decides.
+resolution) decides. Each value column is resolved on its own, so one
+column may answer its default in a file where another is served.
 
 A data file that the new snapshot still references by the same path, at
 the same size and data sequence number, keeps its resident index from the

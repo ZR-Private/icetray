@@ -7,9 +7,10 @@
 //! Every call is signed with the storage's own static keys.
 
 use icetray_core::config::{Residency, S3Config, SourceConfig, StorageConfig, TableConfig};
-use icetray_core::{Error, KeyType, TableFault, TableSource, Value};
+use icetray_core::{Error, KeyType, TableFault, TableSource};
 use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{APPENDED_4K_6K, IDS_4K, NAMESPACE, NEW_ID, OLD_ID, local_catalog};
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{Fixture, FixtureSpec, Result, TestkitError, write_fixture};
 
@@ -100,7 +101,7 @@ async fn test_glue_source_loads_answers_polls_with_one_call_and_follows_a_move()
     assert_eq!(catalog.calls(), 1, "the load asked the catalog once");
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
 
@@ -122,13 +123,10 @@ async fn test_glue_source_loads_answers_polls_with_one_call_and_follows_a_move()
     assert_eq!(catalog.calls(), 3);
     let new_key = fixture.key(NEW_ID);
     assert_eq!(
-        served.table.get(&new_key).await?.value,
+        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&new_key)
     );
-    assert!(matches!(
-        served.table.get(&old_key).await?.value,
-        Value::Present(_)
-    ));
+    assert!(verify::one_value(&served.table.get(&old_key, &[VALUE_COLUMN]).await?.row).is_some());
     assert_signed_with_storage_keys(&catalog);
     Ok(())
 }
@@ -146,7 +144,7 @@ async fn test_s3tables_source_loads_answers_and_polls_with_one_call() -> Result<
     let served = serve(&fixture, s3tables(&catalog, &fixture)).await?;
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key).await?.value,
+        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
         fixture.expected(&old_key)
     );
     let stats = served.storage.stats();

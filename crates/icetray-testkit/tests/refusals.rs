@@ -16,8 +16,8 @@ use icetray_core::approx::count;
 use icetray_core::config::{ConfigError, ConfigViolation, LocalConfig, Residency, TableConfig};
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::{
-    Budget, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason, Storage,
-    TableSource, TableState, UnsupportedDelete, Value, bucket,
+    Budget, Capping, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason,
+    Row, Storage, TableSource, TableState, UnsupportedDelete, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -440,13 +440,16 @@ async fn test_avro_position_deletes_a_vector_masks_are_ignored() -> Result<()> {
     );
     for id in fixture.ids() {
         let key = fixture.key(id);
-        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            fixture.expected(&key)
+        );
     }
     for id in one_per_file {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key).await?.value,
-            Value::Absent,
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "id {id}"
         );
     }
@@ -512,7 +515,10 @@ async fn test_equality_delete_is_refused_while_live_and_served_once_dangling() -
     assert_eq!(served_paths, compacted, "the compacted files alone serve");
     for id in SAMPLE_4K.into_iter().filter(|id| IDS_2K.contains(id)) {
         let key = fixture.key(id);
-        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            fixture.expected(&key)
+        );
     }
     Ok(())
 }
@@ -703,7 +709,14 @@ async fn test_strict_table_below_its_level_is_refused_before_any_chunk() -> Resu
         RefusalReason::BelowLevel {
             declared: Level::Optimal,
             achieved: Level::Balanced,
-            findings: vec![FindingCode::DictionaryEncodedValue],
+            columns: vec![icetray_core::ColumnLevel {
+                column: VALUE_COLUMN.to_string(),
+                level: Level::Balanced,
+            }],
+            findings: vec![Capping {
+                code: FindingCode::DictionaryEncodedValue,
+                column: Some(VALUE_COLUMN.to_string()),
+            }],
         }
     );
     assert_eq!(
@@ -752,6 +765,7 @@ async fn test_strict_disk_table_with_overlapping_files_writes_no_chunk_file() ->
                 declared,
                 achieved,
                 findings,
+                ..
             },
         ..
     })) = served
@@ -759,7 +773,13 @@ async fn test_strict_disk_table_with_overlapping_files_writes_no_chunk_file() ->
         panic!("expected a below_level refusal");
     };
     assert_eq!((declared, achieved), (Level::Optimal, Level::Permissive));
-    assert_eq!(findings, [FindingCode::OverlappingFiles]);
+    assert_eq!(
+        findings,
+        [Capping {
+            code: FindingCode::OverlappingFiles,
+            column: None,
+        }]
+    );
     assert_eq!(local.index_bytes_in_use()?, 0, "no chunk file was written");
     Ok(())
 }

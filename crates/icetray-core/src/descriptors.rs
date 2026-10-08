@@ -194,7 +194,7 @@ mod tests {
             },
             r#ref: "main".to_string(),
             key_column: "key".to_string(),
-            value_column: "value".to_string(),
+            value_columns: vec![crate::config::ValueColumnConfig::named("value")],
             strict: true,
             lookups: None,
             residency: Residency::Full,

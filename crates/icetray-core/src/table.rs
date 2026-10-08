@@ -28,11 +28,11 @@ use crate::approx;
 use crate::blocking::on_blocking_pool;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
-use crate::check::{self, Finding, FindingCode, LookupCost};
+use crate::check::{self, ColumnCost, ColumnLevel, Finding, FindingCode, LookupCost};
 use crate::config::{Residency, TableConfig};
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
-use crate::generation::{Generation, Lookup, MultiLookup, Value};
+use crate::generation::{Generation, Lookup, MultiLookup, Row};
 use crate::key::{Key, KeyType};
 use crate::level::{Level, PageCacheCondition};
 use crate::local::{LocalDir, ResidentPages, Unobserved};
@@ -43,14 +43,18 @@ use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
-/// The lookups of one `multi_get` in flight at once: 32, across every task
-/// the batch runs on, each lookup holding one of the batch's permits while
-/// it runs. A lookup waits on one GET at a time, and at most one hedge
+/// The GETs one `multi_get` holds in flight at once: 32, across every task
+/// the batch runs on (RFD 013, RFD 022). Each GET a lookup issues, a
+/// Bloom-tier key page, a column's value page, and its dictionary page each
+/// one, takes one of the batch's permits before it starts and holds it
+/// until it ends, on the task the page cache runs it on (`cache::Issue`),
+/// and no GET holds one while waiting for another, so a lookup naming more
+/// columns than the bound still runs. Each GET has at most one hedge
 /// beside it, so a batch holds at most twice this many GETs open on the
-/// store however many keys it carries, rather than one per key. A full
-/// batch of cold hits takes about thirty GET round trips, inside the
-/// `MultiGet` deadline at the latency a live lookup expects, well under
-/// 200 ms each (RFD 013).
+/// store however many keys and columns it carries. A full batch of cold
+/// hits takes about thirty GET round trips, inside the `MultiGet` deadline
+/// at the latency a live lookup expects, well under 200 ms each; the wait
+/// for a permit is not charged against a fetch's `get_deadline`.
 const MULTI_GET_FAN_OUT: usize = 32;
 
 /// The fewest keys one task of a `multi_get` is given: 8. A warm hit's
@@ -365,15 +369,20 @@ struct Gauges {
 }
 
 /// What the level gauges show (RFD 020): the level the newest snapshot the
-/// table measured achieves, the one serving or the one held, with the
-/// page cache's condition of the serving generation, against the level the
-/// table declares. The layout's level is set at a swap and at a
-/// `below_level` refusal; a refusal for any other reason measured nothing
-/// new and leaves it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// table measured achieves, the one serving or the one held, and each of
+/// its value columns' (RFD 022), with the page cache's condition of the
+/// serving generation, against the level the table declares. The layout's
+/// levels are set together, from one measurement, at a swap and at a
+/// `below_level` refusal, so the column levels describe the snapshot the
+/// table level does; a refusal for any other reason measured nothing new
+/// and leaves them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LevelGauges {
     /// The newest measured snapshot's level for its layout.
     measured: Level,
+    /// The newest measured snapshot's level for each value column, from
+    /// the measurement that gave `measured`, in the layout's order.
+    columns: Vec<ColumnLevel>,
     /// The table's `lookups`.
     declared: Level,
     /// The page cache's condition of the serving generation's chunk files,
@@ -387,7 +396,7 @@ impl LevelGauges {
     /// The level the table achieves: its layout's, capped by the page
     /// cache's condition. The one place a server condition joins the
     /// layout's level; `strict` reads the layout's alone.
-    fn achieved(self) -> Level {
+    fn achieved(&self) -> Level {
         self.measured.max(
             self.page_cache
                 .map_or(Level::Optimal, PageCacheCondition::cap),
@@ -395,7 +404,7 @@ impl LevelGauges {
     }
 
     /// Whether the table is below its declared level.
-    fn below_level(self) -> bool {
+    fn below_level(&self) -> bool {
         !self.achieved().meets(self.declared)
     }
 }
@@ -404,12 +413,18 @@ impl LevelGauges {
 /// its swap publishes them then.
 struct GenerationGauges {
     index_bytes: usize,
-    findings: BTreeMap<FindingCode, u64>,
+    findings: FindingCounts,
     sequence_number: SequenceNumber,
     swapped_at: f64,
     lookup_cost: LookupCost,
+    /// Each value column's name and cost, in the layout's order.
+    columns: Vec<(String, ColumnCost)>,
     deletes: DeleteSummary,
 }
+
+/// An admitted generation's findings counted by code and, for a code about
+/// one value column, by that column (`FindingCode::per_column`).
+type FindingCounts = BTreeMap<(FindingCode, Option<String>), u64>;
 
 /// What a lookup needs beside its generation: the table's page cache
 /// handle, its lookup metrics, and the calls in flight it counts among.
@@ -459,38 +474,53 @@ impl Lookups {
         }
     }
 
-    /// One lookup through `generation`, timed and counted under its result;
-    /// the one path `get` and `multi_get` share.
-    async fn one(&self, generation: &Generation, key: &Key) -> Result<Value> {
+    /// One lookup through `generation` reading the value columns at the
+    /// positions `columns` gives, timed and counted under its result, each
+    /// value or dictionary page GET it issues counted under its column's
+    /// `value_page_gets_total` and, in a batch, holding a permit of
+    /// `fan_out` while it runs (`Generation::lookup`); the one path `get`
+    /// and `multi_get` share.
+    async fn one(
+        &self,
+        generation: &Generation,
+        key: &Key,
+        columns: &[usize],
+        fan_out: Option<&Arc<Semaphore>>,
+    ) -> Result<Row> {
         let started = Instant::now();
-        let (value, result) = generation.lookup(key, &self.cache).await?;
+        let (row, result) = generation
+            .lookup(
+                key,
+                columns,
+                &self.cache,
+                fan_out,
+                &self.metrics.value_page_gets,
+            )
+            .await?;
         self.metrics.record(result, started.elapsed());
-        Ok(value)
+        Ok(row)
     }
 
-    /// `keys` looked up through `generation` and answered in their order.
-    /// Each lookup runs holding a permit of `fan_out`, the batch's bound,
-    /// so the batch's tasks together run at most `MULTI_GET_FAN_OUT` at
-    /// once; this task waits on at most that many permits itself. The
-    /// first failure ends the run.
+    /// `keys` looked up through `generation`, each reading the value
+    /// columns at the positions `columns` gives, and answered in their
+    /// order. Every GET a lookup issues holds one permit of `fan_out`, the
+    /// batch's bound (`MULTI_GET_FAN_OUT`), while it runs, so the batch's
+    /// tasks together hold at most that many GETs in flight; this task
+    /// waits on at most that many lookups itself. The first failure ends
+    /// the run.
     async fn run(
         &self,
         generation: &Generation,
         keys: &[Key],
-        fan_out: &Semaphore,
-    ) -> Result<Vec<Value>> {
+        columns: &[usize],
+        fan_out: &Arc<Semaphore>,
+    ) -> Result<Vec<Row>> {
         // The lookups are built before the stream, unpolled, so no closure
         // taking a key by reference lives in the returned future; one would
         // make it unprovably `Send`, and the gRPC service needs it `Send`.
         let lookups: Vec<_> = keys
             .iter()
-            .map(|key| async move {
-                let _permit = fan_out
-                    .acquire()
-                    .await
-                    .expect("a batch's semaphore is never closed");
-                self.one(generation, key).await
-            })
+            .map(|key| self.one(generation, key, columns, Some(fan_out)))
             .collect();
         stream::iter(lookups)
             .buffered(MULTI_GET_FAN_OUT)
@@ -500,12 +530,14 @@ impl Lookups {
 }
 
 /// A table's lookup metric handles, one pair per `LookupResult` under the
-/// table's name, registered once when the table is built, with the
-/// recorder current then, so a lookup clones no name, formats no label, and looks up no
+/// table's name and one `value_page_gets_total` per value column,
+/// registered once when the table is built, with the recorder current
+/// then, so a lookup clones no name, formats no label, and looks up no
 /// series. A lookup's count goes to its thread's shard of `counts` and
 /// reaches `lookups_total` at `publish`, which a scrape runs first and a
 /// dropped table runs last, so a scrape reads every lookup counted before
-/// it. The latency histogram is recorded per lookup, as it happens.
+/// it. The latency histogram is recorded per lookup, as it happens, and so
+/// is a value-page GET, far rarer than a lookup.
 struct LookupMetrics {
     cold_hit: ResultMetrics,
     warm_hit: ResultMetrics,
@@ -513,6 +545,10 @@ struct LookupMetrics {
     /// One shard per worker thread when the workers are the threads that
     /// count.
     counts: Sharded<Counts>,
+    /// Per value column, by its position in the layout, which is
+    /// `TableConfig::value_column_names`' order, the column's
+    /// `value_page_gets_total`.
+    value_page_gets: Vec<Counter>,
 }
 
 /// `lookups_total` and `lookup_seconds` of one table and result.
@@ -540,7 +576,9 @@ impl Counts {
 }
 
 impl LookupMetrics {
-    fn new(table: &str) -> Self {
+    /// The handles of `table`, whose value columns `columns` names in the
+    /// layout's order.
+    fn new(table: &str, columns: &[&str]) -> Self {
         let of = |result: LookupResult| ResultMetrics {
             total: metrics::counter!(
                 metric::LOOKUPS_TOTAL,
@@ -558,6 +596,16 @@ impl LookupMetrics {
             warm_hit: of(LookupResult::WarmHit),
             miss: of(LookupResult::Miss),
             counts: Sharded::new(),
+            value_page_gets: columns
+                .iter()
+                .map(|&column| {
+                    metrics::counter!(
+                        metric::VALUE_PAGE_GETS_TOTAL,
+                        metric::LABEL_TABLE => table.to_string(),
+                        metric::LABEL_COLUMN => column.to_string()
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -657,7 +705,7 @@ impl Table {
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
-            metrics: LookupMetrics::new(&config.name),
+            metrics: LookupMetrics::new(&config.name, &config.value_column_names()),
             in_flight: calls,
         });
         let swaps = metrics::counter!(
@@ -730,7 +778,7 @@ impl Table {
         if let Some(generation) = &gauges.generation {
             self.write_generation(generation);
         }
-        if let Some(level) = gauges.level {
+        if let Some(level) = &gauges.level {
             self.write_level(level);
         }
     }
@@ -758,6 +806,7 @@ impl Table {
         {
             return;
         }
+        let shown = gauges.shown;
         let Some(level) = gauges.level.as_mut() else {
             return;
         };
@@ -768,8 +817,7 @@ impl Table {
             .unwrap_or(PageCacheCondition::Unjudged)
             .next(sample.as_ref().ok().copied());
         level.page_cache = Some(now);
-        let level = *level;
-        if gauges.shown {
+        if shown {
             self.write_level(level);
         }
         let was_unobserved = gauges.page_cache_unobserved;
@@ -919,7 +967,7 @@ impl Table {
                 &resolved.unread_defaults,
                 &snapshot,
                 &config.key_column,
-                &config.value_column,
+                &config.value_column_names(),
             )?;
             Ok(layout.key_type)
         })
@@ -927,10 +975,13 @@ impl Table {
         .map_err(|failed| *failed.error)
     }
 
-    /// One lookup against the serving generation. `Error::NotReady` with no
-    /// generation; `Error::KeyType` for a key of another type than the
-    /// table's, before any read.
-    pub async fn get(&self, key: &Key) -> Result<Lookup> {
+    /// One lookup against the serving generation, reading the value
+    /// columns `columns` names, answered in that order; none answers
+    /// presence alone (RFD 022). `Error::NotReady` with no generation;
+    /// `Error::KeyType` for a key of another type than the table's and
+    /// `Error::ColumnRequest` for a column the generation does not serve or
+    /// one named twice, each before any read.
+    pub async fn get(&self, key: &Key, columns: &[&str]) -> Result<Lookup> {
         let _in_flight = self.lookups.enter();
         // A guard held across the lookup's awaits stays correct wherever
         // the task resumes. While held it occupies one of the loading
@@ -940,9 +991,10 @@ impl Table {
         let current = self.current.load();
         let generation = current.as_deref().ok_or_else(|| self.not_ready())?;
         self.check_key_type(generation, key)?;
-        let value = self.lookups.one(generation, key).await?;
+        let columns = generation.layout.select(&self.name, columns)?;
+        let row = self.lookups.one(generation, key, &columns, None).await?;
         Ok(Lookup {
-            value,
+            row,
             snapshot_id: generation.snapshot_id,
         })
     }
@@ -962,37 +1014,45 @@ impl Table {
         &self.lookups.in_flight
     }
 
-    /// Several lookups against one generation, answered in key order. Every
-    /// key's type is checked before any read, so a mismatch anywhere fails
-    /// the whole call and issues nothing; any failure fails the whole call
-    /// (RFD 010). While fewer `get` and `multi_get` calls than worker
-    /// threads are in flight on the tables sharing this one's
-    /// `TableHandles::calls`, this one included, the keys are split, in
-    /// order, into up to one run per worker thread (`shard::workers`) of at
-    /// least `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a
-    /// batch's decodes run on several cores (`Lookups::runs`). A batch that
-    /// makes one run, as a batch does once that many calls are in flight,
-    /// is looked up here, unspawned. `open_with` gives every table of a
-    /// process one count, so calls to any of them count toward holding a
-    /// batch back from splitting. The runs share one bound of `MULTI_GET_FAN_OUT` lookups
-    /// in flight. Dropping the returned future, as a deadline does,
-    /// aborts the runs still going. A run's panic is resumed here; a run
-    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
-    pub async fn multi_get(&self, keys: &[Key]) -> Result<MultiLookup> {
+    /// Several lookups against one generation, each reading the value
+    /// columns `columns` names, answered in key order (RFD 022). Every
+    /// key's type and the columns are checked before any read, as `get`
+    /// checks them, so a mismatch anywhere fails the whole call and issues
+    /// nothing; any failure fails the whole call (RFD 010). While fewer
+    /// `get` and `multi_get` calls than worker threads are in flight on the
+    /// tables sharing this one's `TableHandles::calls`, this one included,
+    /// the keys are split, in order, into up to one run per worker thread
+    /// (`shard::workers`) of at least `MULTI_GET_TASK_KEYS_MIN` keys, each
+    /// spawned as a task so a batch's decodes run on several cores
+    /// (`Lookups::runs`). A batch that makes one run, as a batch does once
+    /// that many calls are in flight, is looked up here, unspawned.
+    /// `open_with` gives every table of a process one count, so calls to
+    /// any of them count toward holding a batch back from splitting. The
+    /// runs share one bound of `MULTI_GET_FAN_OUT` GETs in flight, each GET
+    /// holding a permit while it runs (`Lookups::run`). Dropping the
+    /// returned future, as a deadline does, aborts the runs still going; a
+    /// GET already issued runs on, holding its permit. A run's panic is
+    /// resumed here; a run canceled under a runtime shutdown is
+    /// `Error::LookupCanceled`.
+    pub async fn multi_get(&self, keys: &[Key], columns: &[&str]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
+        let columns = generation.layout.select(&self.name, columns)?;
         let fan_out = Arc::new(Semaphore::new(MULTI_GET_FAN_OUT));
         let runs = self.lookups.runs(keys.len());
-        let values = if runs <= 1 {
-            self.lookups.run(&generation, keys, &fan_out).await?
+        let rows = if runs <= 1 {
+            self.lookups
+                .run(&generation, keys, &columns, &fan_out)
+                .await?
         } else {
-            self.run_spawned(&generation, keys, runs, &fan_out).await?
+            self.run_spawned(&generation, keys, &columns, runs, &fan_out)
+                .await?
         };
         Ok(MultiLookup {
-            values,
+            rows,
             snapshot_id: generation.snapshot_id,
         })
     }
@@ -1005,19 +1065,27 @@ impl Table {
         &self,
         generation: &Arc<Generation>,
         keys: &[Key],
+        columns: &[usize],
         runs: usize,
         fan_out: &Arc<Semaphore>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<Row>> {
         let per_run = keys.len().div_ceil(runs);
+        let columns: Arc<[usize]> = Arc::from(columns);
         let mut tasks = JoinSet::new();
         for (index, part) in keys.chunks(per_run).enumerate() {
             let lookups = Arc::clone(&self.lookups);
             let generation = Arc::clone(generation);
+            let columns = Arc::clone(&columns);
             let fan_out = Arc::clone(fan_out);
             let part = part.to_vec();
-            tasks.spawn(async move { (index, lookups.run(&generation, &part, &fan_out).await) });
+            tasks.spawn(async move {
+                (
+                    index,
+                    lookups.run(&generation, &part, &columns, &fan_out).await,
+                )
+            });
         }
-        let mut answered: Vec<Vec<Value>> = vec![Vec::new(); tasks.len()];
+        let mut answered: Vec<Vec<Row>> = vec![Vec::new(); tasks.len()];
         while let Some(joined) = tasks.join_next().await {
             let (index, values) = joined.map_err(|error| match error.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
@@ -1075,10 +1143,10 @@ impl Table {
         self.config.store(Arc::new(config));
         {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+            let shown = gauges.shown;
             if let Some(level) = gauges.level.as_mut() {
                 level.declared = declared;
-                let level = *level;
-                if gauges.shown {
+                if shown {
                     self.write_level(level);
                 }
             }
@@ -1263,7 +1331,10 @@ impl Table {
     /// snapshot's level still measured). A `Degraded` or `Held` state an
     /// earlier poll left ends, since the last refresh succeeded.
     fn in_step(&self, current: &Generation) {
-        self.measured(current.level);
+        self.measured(
+            current.level,
+            check::column_levels(&current.layout, &current.column_costs),
+        );
         if matches!(
             self.state(),
             TableState::Degraded { .. } | TableState::Held { .. }
@@ -1292,16 +1363,14 @@ impl Table {
     /// for the `findings` gauge; a refused generation's reach the logs and
     /// the error and never the gauge, which describes the serving
     /// generation.
-    fn gate(
-        &self,
-        generation: &Generation,
-        config: &TableConfig,
-    ) -> Result<BTreeMap<FindingCode, u64>> {
+    fn gate(&self, generation: &Generation, config: &TableConfig) -> Result<FindingCounts> {
         let declared = config.lookups();
         let report = check::diagnose(generation, declared);
-        let mut counts: BTreeMap<FindingCode, u64> = BTreeMap::new();
+        let mut counts = FindingCounts::new();
         for finding in &report.findings {
-            *counts.entry(finding.code()).or_default() += 1;
+            *counts
+                .entry((finding.code(), finding.column().map(str::to_string)))
+                .or_default() += 1;
             log_finding(self.name(), finding, self.findings, declared);
         }
         generation.judge(declared, config.strict)?;
@@ -1320,7 +1389,7 @@ impl Table {
         &self,
         generation: Generation,
         previous: Option<&Arc<Generation>>,
-        findings: &BTreeMap<FindingCode, u64>,
+        findings: &FindingCounts,
         declared: Level,
     ) {
         let reused = previous.map_or(0, |previous| {
@@ -1346,6 +1415,13 @@ impl Table {
             sequence_number: generation.sequence_number,
             swapped_at: time::unix_seconds(time::now()),
             lookup_cost: generation.lookup_cost,
+            columns: generation
+                .layout
+                .value_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .zip(generation.column_costs.iter().copied())
+                .collect(),
             deletes: generation.delete_summary(),
         };
         let snapshot_id = generation.snapshot_id;
@@ -1353,12 +1429,13 @@ impl Table {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
             let level = LevelGauges {
                 measured: generation.level,
+                columns: check::column_levels(&generation.layout, &generation.column_costs),
                 declared,
-                page_cache: gauges.level.and_then(|level| level.page_cache),
+                page_cache: gauges.level.as_ref().and_then(|level| level.page_cache),
             };
             if gauges.shown {
                 self.write_generation(&published);
-                self.write_level(level);
+                self.write_level(&level);
             }
             gauges.generation = Some(published);
             gauges.level = Some(level);
@@ -1374,14 +1451,18 @@ impl Table {
     /// Records the failure as the table's state and hands its error back
     /// to the caller, which logs it. The current generation is untouched. A
     /// `below_level` refusal measured a snapshot, so the level gauges take
-    /// its level once the table has swapped one in, and it makes the table
+    /// its level and its columns' once the table has swapped one in, and it
+    /// makes the table
     /// `Held` on the snapshot it was met building whenever a generation
     /// serves, from a poll or a `load` alike (`failed_state`); every other
     /// failure, and a first load below its level, makes it `Degraded`.
     fn fail(&self, Failed { error, snapshot_id }: Failed) -> Error {
         let reason = error.kind();
-        if let ErrorKind::Refused(RefusalReason::BelowLevel { achieved, .. }) = &reason {
-            self.measured(*achieved);
+        if let ErrorKind::Refused(RefusalReason::BelowLevel {
+            achieved, columns, ..
+        }) = &reason
+        {
+            self.measured(*achieved, columns.clone());
         }
         self.set_state(self.failed_state(&Refusal {
             snapshot_id,
@@ -1462,20 +1543,22 @@ impl Table {
         }
     }
 
-    /// Takes `measured` as the newest measured snapshot's level for the
-    /// level gauges, once a swap made them appear, and writes them while
-    /// the table shows its gauges and the level changed.
-    fn measured(&self, measured: Level) {
+    /// Takes `measured` and `columns` as the newest measured snapshot's
+    /// level and its value columns' for the level gauges, once a swap made
+    /// them appear, and writes them while the table shows its gauges and a
+    /// level changed.
+    fn measured(&self, measured: Level, columns: Vec<ColumnLevel>) {
         let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        let shown = gauges.shown;
         let Some(level) = gauges.level.as_mut() else {
             return;
         };
-        if level.measured == measured {
+        if level.measured == measured && level.columns == columns {
             return;
         }
         level.measured = measured;
-        let level = *level;
-        if gauges.shown {
+        level.columns = columns;
+        if shown {
             self.write_level(level);
         }
     }
@@ -1543,22 +1626,44 @@ impl Table {
 
     /// Writes the generation gauges from `generation`; called with the
     /// gauges' lock held. The `findings` gauge is set for every code, zero
-    /// for the absent ones, so a code that cleared on the swap reads zero.
+    /// for the absent ones, so a code that cleared on the swap reads zero:
+    /// a code about the row or the table under `{table, code}`, and a code
+    /// about one value column (`FindingCode::per_column`) under `{table,
+    /// code, column}` for every column the table serves (RFD 022).
     fn write_generation(&self, generation: &GenerationGauges) {
         metrics::gauge!(
             metric::INDEX_BYTES,
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge_len(generation.index_bytes));
-        for code in FindingCode::ALL {
-            metrics::gauge!(
-                metric::FINDINGS,
-                metric::LABEL_TABLE => self.name.clone(),
-                metric::LABEL_CODE => code.to_string()
+        let count = |code: FindingCode, column: Option<&str>| {
+            approx::gauge(
+                generation
+                    .findings
+                    .get(&(code, column.map(str::to_string)))
+                    .copied()
+                    .unwrap_or(0),
             )
-            .set(approx::gauge(
-                generation.findings.get(&code).copied().unwrap_or(0),
-            ));
+        };
+        for code in FindingCode::ALL {
+            if code.per_column() {
+                for (column, _) in &generation.columns {
+                    metrics::gauge!(
+                        metric::FINDINGS,
+                        metric::LABEL_TABLE => self.name.clone(),
+                        metric::LABEL_CODE => code.to_string(),
+                        metric::LABEL_COLUMN => column.clone()
+                    )
+                    .set(count(code, Some(column)));
+                }
+            } else {
+                metrics::gauge!(
+                    metric::FINDINGS,
+                    metric::LABEL_TABLE => self.name.clone(),
+                    metric::LABEL_CODE => code.to_string()
+                )
+                .set(count(code, None));
+            }
         }
         metrics::gauge!(
             metric::GENERATION_SEQUENCE_NUMBER,
@@ -1581,6 +1686,14 @@ impl Table {
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge(cost.gets_per_miss));
+        for (column, cost) in &generation.columns {
+            metrics::gauge!(
+                metric::TABLE_COLUMN_GETS_PER_HIT,
+                metric::LABEL_TABLE => self.name.clone(),
+                metric::LABEL_COLUMN => column.clone()
+            )
+            .set(approx::gauge(cost.gets_per_hit));
+        }
         metrics::gauge!(
             metric::TABLE_FILES_PROBED_PER_LOOKUP,
             metric::LABEL_TABLE => self.name.clone()
@@ -1609,11 +1722,23 @@ impl Table {
         .set(approx::gauge_len(deletes.state_bytes));
     }
 
-    /// Writes the level gauges from `level`, and the resident fraction of
-    /// the chunk files while the page cache's condition is judged, which
-    /// the binary's recorder then drops at the next scrape; called with the
-    /// gauges' lock held.
-    fn write_level(&self, level: LevelGauges) {
+    /// Writes the level gauges from `level`, each value column's level
+    /// capped by the page cache's condition as the table's is, and the
+    /// resident fraction of the chunk files while the page cache's
+    /// condition is judged, which the binary's recorder then drops at the
+    /// next scrape; called with the gauges' lock held.
+    fn write_level(&self, level: &LevelGauges) {
+        let cap = level
+            .page_cache
+            .map_or(Level::Optimal, PageCacheCondition::cap);
+        for column in &level.columns {
+            metrics::gauge!(
+                metric::TABLE_COLUMN_LEVEL,
+                metric::LABEL_TABLE => self.name.clone(),
+                metric::LABEL_COLUMN => column.column.clone()
+            )
+            .set(column.level.max(cap).gauge());
+        }
         metrics::gauge!(
             metric::TABLE_BELOW_LEVEL,
             metric::LABEL_TABLE => self.name.clone()
@@ -1757,8 +1882,10 @@ mod tests {
 
     use super::*;
     use crate::catalog::TableFault;
+    use crate::check::Capping;
     use crate::config::{Residency, ServerConfig};
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
+    use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
     use crate::generation::testing::{
         Bloom, Bounds, Dictionary, E2E_KEYS, FILE_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT,
         FIRST_VERSION, FileSpec, KEY_STEP, POLL_GETS, RESOLVE_GETS, SECOND_SEQUENCE,
@@ -1774,7 +1901,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::local::testing::evict;
     use crate::local::testing::{chunks_offset, overwrite};
-    use crate::manifest::testing::{self as manifest_testing, Partition};
+    use crate::manifest::ColumnRequestFault;
+    use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN};
     use crate::metric::LookupResult;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
@@ -1972,8 +2100,8 @@ mod tests {
         }
     }
 
-    fn present(key: i64) -> Value {
-        Value::Present(Bytes::from(value_for(key)))
+    fn present(key: i64) -> Row {
+        testing::one_value(Bytes::from(value_for(key)))
     }
 
     /// The snapshot id a `Serving` state carries; any other state fails.
@@ -2056,7 +2184,10 @@ mod tests {
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         assert!(matches!(table.state(), TableState::Loading));
         assert!(table.current().is_none());
-        let error = table.get(&Key::Long(all[0])).await.unwrap_err();
+        let error = table
+            .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::NotReady { table: ref name } if name == TABLE));
         assert_eq!(fixture.gets(), 0);
     }
@@ -2096,16 +2227,22 @@ mod tests {
         assert_eq!(snapshot_id, SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(table.current().unwrap().snapshot_id, snapshot_id);
         assert_eq!(
-            table.get(&Key::Long(all[0])).await.unwrap(),
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap(),
             Lookup {
-                value: present(all[0]),
+                row: present(all[0]),
                 snapshot_id,
             }
         );
         assert_eq!(
-            table.get(&Key::Long(all[0] + 1)).await.unwrap(),
+            table
+                .get(&Key::Long(all[0] + 1), &[VALUE_COLUMN])
+                .await
+                .unwrap(),
             Lookup {
-                value: Value::Absent,
+                row: Row::Absent,
                 snapshot_id,
             }
         );
@@ -2132,12 +2269,12 @@ mod tests {
         let batch = tokio::spawn({
             let table = Arc::clone(&table);
             let keys = vec![Key::Long(all[0])];
-            async move { table.multi_get(&keys).await }
+            async move { table.multi_get(&keys, &[VALUE_COLUMN]).await }
         });
-        assert_eq!(batch.await.unwrap().unwrap().values, [present(all[0])]);
+        assert_eq!(batch.await.unwrap().unwrap().rows, [present(all[0])]);
         let key = Key::Long(all[0]);
-        let looked_up = tokio::spawn(async move { table.get(&key).await });
-        assert_eq!(looked_up.await.unwrap().unwrap().value, present(all[0]));
+        let looked_up = tokio::spawn(async move { table.get(&key, &[VALUE_COLUMN]).await });
+        assert_eq!(looked_up.await.unwrap().unwrap().row, present(all[0]));
     }
 
     #[tokio::test]
@@ -2146,7 +2283,10 @@ mod tests {
         let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
         table.load().await.unwrap();
         let before = fixture.gets();
-        let error = table.get(&Key::Str("k".to_string())).await.unwrap_err();
+        let error = table
+            .get(&Key::Str("k".to_string()), &[VALUE_COLUMN])
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             Error::KeyType {
@@ -2165,9 +2305,9 @@ mod tests {
         table.load().await.unwrap();
         let keys = [Key::Long(all[0]), Key::Long(all[0] + 1), Key::Long(all[1])];
         assert_eq!(
-            table.multi_get(&keys).await.unwrap(),
+            table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap(),
             MultiLookup {
-                values: vec![present(all[0]), Value::Absent, present(all[1])],
+                rows: vec![present(all[0]), Row::Absent, present(all[1])],
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
             }
         );
@@ -2252,13 +2392,567 @@ mod tests {
         // never passes the gate: its page fetches end at the get deadline
         // and the call fails.
         gauged.fill_to(MULTI_GET_FAN_OUT);
-        let answered = table.multi_get(&keys).await.unwrap();
-        let expected: Vec<Value> = all.iter().map(|key| present(*key)).collect();
-        assert_eq!(answered.values, expected);
+        let answered = table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap();
+        let expected: Vec<Row> = all.iter().map(|key| present(*key)).collect();
+        assert_eq!(answered.rows, expected);
         assert_eq!(
             gauged.high_water(),
             MULTI_GET_FAN_OUT,
             "the batch fills the bound and never passes it"
+        );
+    }
+
+    /// `one_row_per_page` with `DETAIL_COLUMN` beside the value column:
+    /// every key's two values each on a page of its own.
+    async fn two_columns_one_row_per_page(
+        key_count: usize,
+    ) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
+        two_columns_one_row_per_page_in(key_count, Dictionary::Off).await
+    }
+
+    /// `two_columns_one_row_per_page` with the columns `dictionary` names
+    /// dictionary-encoded.
+    async fn two_columns_one_row_per_page_in(
+        key_count: usize,
+        dictionary: Dictionary,
+    ) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
+        let all = keys_from(0, i64::try_from(key_count).unwrap());
+        let keys = long_keys(&all);
+        let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
+        fixture
+            .add_file(FileSpec {
+                name: "f",
+                keys: &keys,
+                values: values_of(&all),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout {
+                    page_rows: 1,
+                    dictionary,
+                    ..WriterLayout::contract()
+                },
+            })
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
+        fixture
+            .storage
+            .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
+        let table = table_over(&fixture, lenient(&fixture)).await;
+        table.load().await.unwrap();
+        (table, fixture, all, gauged)
+    }
+
+    /// What a lookup naming the value column and then `DETAIL_COLUMN`
+    /// answers for the fixture key `key`.
+    fn both(key: i64) -> Row {
+        let value = value_for(key);
+        Row::Present(vec![
+            Some(Bytes::from(detail_of(&value))),
+            Some(Bytes::from(value)),
+        ])
+    }
+
+    /// A batch naming two columns holds one permit per column a lookup
+    /// reads, so it reaches exactly `MULTI_GET_FAN_OUT` value-page GETs in
+    /// flight, half as many lookups, and never passes it (RFD 022).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_get_naming_two_columns_holds_the_fan_out_bound_of_gets() {
+        let batches_of_the_bound = 3;
+        let (table, _fixture, all, gauged) =
+            two_columns_one_row_per_page(MULTI_GET_FAN_OUT * batches_of_the_bound).await;
+        let keys = long_keys(&all);
+        gauged.fill_to(MULTI_GET_FAN_OUT);
+        let answered = table
+            .multi_get(&keys, &[DETAIL_COLUMN, VALUE_COLUMN])
+            .await
+            .unwrap();
+        let expected: Vec<Row> = all.iter().map(|key| both(*key)).collect();
+        assert_eq!(answered.rows, expected, "every key, both columns, in order");
+        assert_eq!(
+            gauged.high_water(),
+            MULTI_GET_FAN_OUT,
+            "the batch fills the bound of GETs and never passes it"
+        );
+    }
+
+    /// The samples the hedging test fills its table's window with, so the
+    /// delay, their percentile, is this.
+    const FAST_SAMPLE: Duration = Duration::from_micros(1);
+
+    /// A cold hit naming two columns hedges each column's GET on its own:
+    /// its two value-page GETs are held until four GETs are in flight,
+    /// which only a hedge beside each brings, and `value_page_gets_total`
+    /// counts the two GETs and neither hedge (RFD 013, RFD 022).
+    #[test]
+    fn test_get_hedges_each_columns_get_on_its_own_and_counts_no_hedge() {
+        let ((gets, hedges), series) = recorded(async {
+            let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
+            let all = keys_from(0, FILE_KEYS);
+            fixture
+                .add_file(FileSpec {
+                    name: "f",
+                    keys: &long_keys(&all),
+                    values: values_of(&all),
+                    partition: Partition::Bucket(0),
+                    bounds: Bounds::Exact,
+                    layout: WriterLayout::contract(),
+                })
+                .await;
+            fixture
+                .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+                .await;
+            let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
+            fixture
+                .storage
+                .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+            for _ in 0..table.storage.hedge_config().window {
+                table.hedge.record(FAST_SAMPLE, false);
+            }
+            let pairs = 2;
+            gauged.fill_to(2 * pairs);
+            let stats = fixture.storage.stats();
+            let before = (stats.gets(), stats.hedges());
+            assert_eq!(
+                table
+                    .get(&Key::Long(all[0]), &[DETAIL_COLUMN, VALUE_COLUMN])
+                    .await
+                    .unwrap()
+                    .row,
+                both(all[0])
+            );
+            table.publish_lookup_counts();
+            (stats.gets() - before.0, stats.hedges() - before.1)
+        });
+        assert_eq!(hedges, 2, "one hedge per column's GET");
+        assert_eq!(gets, 4, "two value-page GETs and their hedges");
+        for column in [VALUE_COLUMN, DETAIL_COLUMN] {
+            assert_eq!(
+                series.counter(
+                    metric::VALUE_PAGE_GETS_TOTAL,
+                    &[table_label(), (metric::LABEL_COLUMN, column.to_string())]
+                ),
+                1,
+                "{column}: its GET, not its hedge"
+            );
+        }
+    }
+
+    /// `keys` of `table` looked up as one run naming `columns` under a
+    /// fan-out of `permits`, the bound `multi_get` gives a batch.
+    async fn run_under(table: &Table, keys: &[Key], columns: &[&str], permits: usize) -> Vec<Row> {
+        let generation = table.current().unwrap();
+        let columns = generation.layout.select(&table.name, columns).unwrap();
+        let fan_out = Arc::new(Semaphore::new(permits));
+        table
+            .lookups
+            .run(&generation, keys, &columns, &fan_out)
+            .await
+            .unwrap()
+    }
+
+    /// Each GET takes a permit of its own and none waits holding one, so a
+    /// lookup naming more columns than the fan-out has permits runs, never
+    /// holding more GETs in flight than the permits; with a permit per
+    /// column its GETs run together (RFD 022).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_a_lookup_naming_more_columns_than_the_fan_out_stays_within_it() {
+        let names = [DETAIL_COLUMN, VALUE_COLUMN];
+        for permits in [1, names.len()] {
+            let (table, _fixture, all, gauged) = two_columns_one_row_per_page(1).await;
+            gauged.fill_to(permits);
+            assert_eq!(
+                run_under(&table, &long_keys(&all), &names, permits).await,
+                [both(all[0])]
+            );
+            assert_eq!(gauged.high_water(), permits, "{permits} permits");
+        }
+    }
+
+    /// A dictionary-encoded column's value page and dictionary page are two
+    /// GETs, each holding a permit of its own: under one permit they run
+    /// one after the other, under two together (RFD 022).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_counts_a_dictionary_page_as_a_get_against_the_fan_out() {
+        let pages = 2;
+        for permits in [1, pages] {
+            let (table, fixture, all, gauged) =
+                two_columns_one_row_per_page_in(1, Dictionary::Value).await;
+            gauged.fill_to(permits);
+            let before = fixture.gets();
+            assert_eq!(
+                run_under(&table, &long_keys(&all), &[VALUE_COLUMN], permits).await,
+                [Row::Present(vec![Some(Bytes::from(value_for(all[0])))])]
+            );
+            assert_eq!(fixture.gets() - before, approx::count(pages));
+            assert_eq!(gauged.high_water(), permits, "{permits} permits");
+        }
+    }
+
+    /// `value_page_gets_total` counts the GETs issued, where they are
+    /// issued: a dictionary-encoded column's two, and a fetch two lookups
+    /// share once, while both lookups are cold hits (RFD 022).
+    #[test]
+    fn test_get_counts_each_value_page_get_once_where_it_is_issued() {
+        let (gets, series) = recorded(async {
+            let (table, fixture, all) = two_column_table(WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            })
+            .await;
+            let before = fixture.gets();
+            let key = Key::Long(all[0]);
+            // On the current-thread runtime the second lookup reaches the
+            // page cache while the first one's fetch is still in flight, so
+            // it joins that fetch.
+            let (first, second) = futures::join!(
+                table.get(&key, &[DETAIL_COLUMN, VALUE_COLUMN]),
+                table.get(&key, &[DETAIL_COLUMN, VALUE_COLUMN])
+            );
+            assert_eq!(first.unwrap().row, both(all[0]));
+            assert_eq!(second.unwrap().row, both(all[0]));
+            table.publish_lookup_counts();
+            fixture.gets() - before
+        });
+        assert_eq!(gets, 3, "detail's page, value's page and its dictionary");
+        let counted = |column: &str| {
+            series.counter(
+                metric::VALUE_PAGE_GETS_TOTAL,
+                &[table_label(), (metric::LABEL_COLUMN, column.to_string())],
+            )
+        };
+        assert_eq!(counted(DETAIL_COLUMN), 1);
+        assert_eq!(counted(VALUE_COLUMN), 2);
+        assert_eq!(
+            series.counter(
+                metric::LOOKUPS_TOTAL,
+                &[
+                    table_label(),
+                    (metric::LABEL_RESULT, LookupResult::ColdHit.to_string())
+                ],
+            ),
+            2,
+            "a joined fetch is a cold hit"
+        );
+    }
+
+    /// A loaded lenient table of one file of `FILE_KEYS` keys in `layout`
+    /// with `DETAIL_COLUMN` beside the value column, its fixture, and its
+    /// keys.
+    async fn two_column_table(layout: WriterLayout) -> (Table, Fixture, Vec<i64>) {
+        let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
+        let all = keys_from(0, FILE_KEYS);
+        fixture
+            .add_file(FileSpec {
+                name: "f",
+                keys: &long_keys(&all),
+                values: values_of(&all),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout,
+            })
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let table = table_over(&fixture, lenient(&fixture)).await;
+        table.load().await.unwrap();
+        (table, fixture, all)
+    }
+
+    /// A lookup reads the columns it names in the order it names them, one
+    /// GET per column cold and none warm; naming none answers presence
+    /// alone with no read; and each column's GETs are counted under its
+    /// own `value_page_gets_total` (RFD 022).
+    #[test]
+    fn test_get_reads_the_columns_named_in_order_and_counts_their_gets() {
+        let ((), series) = recorded(async {
+            let (table, fixture, all) = two_column_table(WriterLayout::contract()).await;
+            let key = Key::Long(all[0]);
+            let before = fixture.gets();
+            let read = table
+                .get(&key, &[DETAIL_COLUMN, VALUE_COLUMN])
+                .await
+                .unwrap();
+            assert_eq!(read.row, both(all[0]));
+            assert_eq!(fixture.gets() - before, 2, "one GET per column cold");
+            let Row::Present(mut reversed) = both(all[0]) else {
+                unreachable!("both is present");
+            };
+            reversed.reverse();
+            assert_eq!(
+                table
+                    .get(&key, &[VALUE_COLUMN, DETAIL_COLUMN])
+                    .await
+                    .unwrap()
+                    .row,
+                Row::Present(reversed),
+                "the other order answers the other order"
+            );
+            assert_eq!(
+                table.get(&key, &[]).await.unwrap().row,
+                Row::Present(Vec::new()),
+                "presence alone"
+            );
+            assert_eq!(
+                table.get(&Key::Long(all[0] + 1), &[]).await.unwrap().row,
+                Row::Absent
+            );
+            assert_eq!(
+                fixture.gets() - before,
+                2,
+                "warm hits and presence read nothing"
+            );
+            table.publish_lookup_counts();
+        });
+        for column in [VALUE_COLUMN, DETAIL_COLUMN] {
+            assert_eq!(
+                series.counter(
+                    metric::VALUE_PAGE_GETS_TOTAL,
+                    &[table_label(), (metric::LABEL_COLUMN, column.to_string())]
+                ),
+                1,
+                "{column}"
+            );
+        }
+        let lookups = |result: LookupResult| {
+            series.counter(
+                metric::LOOKUPS_TOTAL,
+                &[table_label(), (metric::LABEL_RESULT, result.to_string())],
+            )
+        };
+        assert_eq!(lookups(LookupResult::ColdHit), 1);
+        assert_eq!(
+            lookups(LookupResult::WarmHit),
+            2,
+            "a presence-only hit is warm"
+        );
+        assert_eq!(lookups(LookupResult::Miss), 1);
+    }
+
+    /// A column the generation does not serve, and one named twice, are
+    /// refused before any read, on `get` and `multi_get` alike (RFD 022).
+    #[tokio::test]
+    async fn test_get_and_multi_get_refuse_an_unserved_or_repeated_column_before_any_read() {
+        let (table, fixture, all) = two_column_table(WriterLayout::contract()).await;
+        let key = Key::Long(all[0]);
+        let before = fixture.gets();
+        for (names, column, fault) in [
+            (&["absent"][..], "absent", ColumnRequestFault::NotServed),
+            (
+                &[VALUE_COLUMN, DETAIL_COLUMN, VALUE_COLUMN][..],
+                VALUE_COLUMN,
+                ColumnRequestFault::Repeated,
+            ),
+        ] {
+            let refused = [
+                table.get(&key, names).await.unwrap_err(),
+                table
+                    .multi_get(std::slice::from_ref(&key), names)
+                    .await
+                    .unwrap_err(),
+            ];
+            for error in refused {
+                let Error::ColumnRequest {
+                    column: named,
+                    fault: got,
+                    ..
+                } = error
+                else {
+                    panic!("expected a column request fault, got {error:?}");
+                };
+                assert_eq!((named.as_str(), got), (column, fault));
+            }
+        }
+        assert_eq!(fixture.gets(), before, "a refused request reads nothing");
+    }
+
+    /// One column dictionary-encoded beside one that is not: each column
+    /// has its own level and cost, the table's level is the dearest
+    /// column's, the findings name the column, and under `strict` the one
+    /// column below the level refuses the table (RFD 020, RFD 022).
+    #[tokio::test]
+    async fn test_levels_and_findings_are_per_column() {
+        let (table, _fixture, _all) = two_column_table(WriterLayout {
+            dictionary: Dictionary::Value,
+            ..WriterLayout::contract()
+        })
+        .await;
+        let generation = table.current().unwrap();
+        assert_eq!(
+            generation
+                .layout
+                .value_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [DETAIL_COLUMN, VALUE_COLUMN],
+            "the layout holds the columns by name"
+        );
+        assert_eq!(
+            generation.column_costs,
+            [
+                ColumnCost {
+                    level: Level::Optimal,
+                    gets_per_hit: 1,
+                },
+                ColumnCost {
+                    level: Level::Balanced,
+                    gets_per_hit: 2,
+                },
+            ]
+        );
+        assert_eq!(generation.level, Level::Balanced, "the dearest column's");
+        assert_eq!(generation.lookup_cost.gets_per_hit, 2);
+        let report = check::diagnose(&generation, Level::Optimal);
+        let dictionary: Vec<Option<&str>> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.code() == FindingCode::DictionaryEncodedValue)
+            .map(Finding::column)
+            .collect();
+        assert_eq!(dictionary, [Some(VALUE_COLUMN)]);
+        assert_eq!(
+            generation
+                .judge(Level::Optimal, true)
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::Refused(RefusalReason::BelowLevel {
+                declared: Level::Optimal,
+                achieved: Level::Balanced,
+                columns: vec![
+                    crate::check::ColumnLevel {
+                        column: DETAIL_COLUMN.to_string(),
+                        level: Level::Optimal,
+                    },
+                    crate::check::ColumnLevel {
+                        column: VALUE_COLUMN.to_string(),
+                        level: Level::Balanced,
+                    },
+                ],
+                findings: vec![Capping {
+                    code: FindingCode::DictionaryEncodedValue,
+                    column: Some(VALUE_COLUMN.to_string()),
+                }],
+            })),
+            "one column below the level refuses the table under strict"
+        );
+    }
+
+    /// The per-column series of a table of one dictionary-encoded column
+    /// beside one that is not: `icetray_findings` carries the column for
+    /// a column's code, and each column's level and cost gauges read its
+    /// own, beside the table's (RFD 022).
+    #[test]
+    fn test_metrics_levels_findings_and_costs_are_per_column() {
+        let ((), series) = recorded(async {
+            let (table, _fixture, _all) = two_column_table(WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            })
+            .await;
+            table.publish_gauges();
+        });
+        let column = |name: &str| (metric::LABEL_COLUMN, name.to_string());
+        let gauge = |name: &str, labels: &[(&str, String)]| series.gauge(name, labels).to_bits();
+        let dictionary = (
+            metric::LABEL_CODE,
+            FindingCode::DictionaryEncodedValue.to_string(),
+        );
+        let cases = [
+            (
+                metric::FINDINGS,
+                vec![table_label(), dictionary.clone(), column(VALUE_COLUMN)],
+                approx::gauge(1),
+            ),
+            (
+                metric::FINDINGS,
+                vec![table_label(), dictionary, column(DETAIL_COLUMN)],
+                approx::gauge(0),
+            ),
+            (
+                metric::TABLE_COLUMN_LEVEL,
+                vec![table_label(), column(VALUE_COLUMN)],
+                Level::Balanced.gauge(),
+            ),
+            (
+                metric::TABLE_COLUMN_LEVEL,
+                vec![table_label(), column(DETAIL_COLUMN)],
+                Level::Optimal.gauge(),
+            ),
+            (
+                metric::TABLE_LEVEL,
+                vec![table_label()],
+                Level::Balanced.gauge(),
+            ),
+            (
+                metric::TABLE_COLUMN_GETS_PER_HIT,
+                vec![table_label(), column(VALUE_COLUMN)],
+                approx::gauge(2),
+            ),
+            (
+                metric::TABLE_COLUMN_GETS_PER_HIT,
+                vec![table_label(), column(DETAIL_COLUMN)],
+                approx::gauge(1),
+            ),
+            (
+                metric::TABLE_GETS_PER_HIT,
+                vec![table_label()],
+                approx::gauge(2),
+            ),
+        ];
+        for (name, labels, expected) in cases {
+            assert_eq!(
+                gauge(name, &labels),
+                expected.to_bits(),
+                "{name} {labels:?}"
+            );
+        }
+    }
+
+    /// A table that serves no value column answers whether a key is
+    /// present and reads no value page, at the level and cost of finding
+    /// the row (RFD 022).
+    #[tokio::test]
+    async fn test_a_table_of_no_value_columns_answers_presence_alone() {
+        let (fixture, all) = two_bucket_table().await;
+        let config = TableConfig {
+            value_columns: Vec::new(),
+            ..fixture.config(Residency::Full, None)
+        };
+        let table = table_over(&fixture, config).await;
+        table.load().await.unwrap();
+        let generation = table.current().unwrap();
+        assert!(generation.column_costs.is_empty());
+        assert_eq!(generation.level, Level::Optimal);
+        assert_eq!(
+            generation.lookup_cost.gets_per_hit, 0,
+            "finding the row alone"
+        );
+        let before = fixture.gets();
+        let keys = [Key::Long(all[0]), Key::Long(all[0] + 1)];
+        assert_eq!(
+            table.multi_get(&keys, &[]).await.unwrap().rows,
+            [Row::Present(Vec::new()), Row::Absent]
+        );
+        assert_eq!(fixture.gets(), before, "no value page is read");
+        assert!(matches!(
+            table.get(&keys[0], &[VALUE_COLUMN]).await,
+            Err(Error::ColumnRequest {
+                fault: ColumnRequestFault::NotServed,
+                ..
+            })
+        ));
+        let report = check::diagnose(&generation, Level::Optimal);
+        assert!(report.summary.value_columns.is_empty());
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|file| file.value_columns.is_empty())
         );
     }
 
@@ -2352,7 +3046,7 @@ mod tests {
         let mut held = JoinSet::new();
         for key in long_keys(beside) {
             let other = Arc::clone(&other);
-            held.spawn(async move { other.get(&key).await });
+            held.spawn(async move { other.get(&key, &[VALUE_COLUMN]).await });
         }
         // Before the fetches end at the get deadline, which would end the
         // calls.
@@ -2374,7 +3068,7 @@ mod tests {
             Arc::strong_count(&batch_table.current().unwrap()) - holders_of_an_inline_batch
         };
         tokio::select! {
-            answered = batch_table.multi_get(&keys) => panic!("the store holds every GET: {answered:?}"),
+            answered = batch_table.multi_get(&keys, &[VALUE_COLUMN]) => panic!("the store holds every GET: {answered:?}"),
             spawned = every_get_held => spawned,
         }
     }
@@ -2408,7 +3102,7 @@ mod tests {
             Arc::strong_count(&table.current().unwrap()) - holders_of_an_inline_batch
         };
         tokio::select! {
-            answered = table.multi_get(&keys) => panic!("the store holds every GET: {answered:?}"),
+            answered = table.multi_get(&keys, &[VALUE_COLUMN]) => panic!("the store holds every GET: {answered:?}"),
             spawned = every_get_held => spawned,
         }
     }
@@ -2420,7 +3114,7 @@ mod tests {
         table.load().await.unwrap();
         let before = fixture.gets();
         let keys = [Key::Long(all[2]), Key::Str("k".to_string())];
-        let error = table.multi_get(&keys).await.unwrap_err();
+        let error = table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap_err();
         assert!(matches!(
             error,
             Error::KeyType {
@@ -2448,7 +3142,10 @@ mod tests {
         assert_eq!(serving, None);
         assert_eq!(kept, ErrorKind::Refused(reason));
         assert!(table.current().is_none());
-        let error = table.get(&Key::Long(all[0])).await.unwrap_err();
+        let error = table
+            .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::NotReady { .. }));
     }
 
@@ -2534,7 +3231,11 @@ mod tests {
         let serving = Some(SnapshotId(FIRST_SNAPSHOT));
         assert_eq!(degraded(&table), (serving, ErrorKind::RefreshDeadline));
         assert_eq!(
-            table.get(&Key::Long(all[0])).await.unwrap().value,
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap()
+                .row,
             present(all[0]),
             "the generation loaded before the stall keeps answering"
         );
@@ -2582,9 +3283,12 @@ mod tests {
         }
         assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
         assert_eq!(
-            table.get(&Key::Long(appended[0])).await.unwrap(),
+            table
+                .get(&Key::Long(appended[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap(),
             Lookup {
-                value: present(appended[0]),
+                row: present(appended[0]),
                 snapshot_id: SnapshotId(SECOND_SNAPSHOT),
             }
         );
@@ -2611,9 +3315,12 @@ mod tests {
             SnapshotId(FIRST_SNAPSHOT)
         );
         assert_eq!(
-            table.get(&Key::Long(all[0])).await.unwrap(),
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap(),
             Lookup {
-                value: present(all[0]),
+                row: present(all[0]),
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
             }
         );
@@ -2815,7 +3522,13 @@ mod tests {
         let repeats = 2;
         let repeated = string_keys(file_keys..2 * file_keys, repeats);
         let short = string_file("short", &repeated, Dictionary::Key);
-        let written = parquet(KeyType::String, short.keys, &short.values, &short.layout);
+        let written = parquet(
+            KeyType::String,
+            short.keys,
+            &short.values,
+            false,
+            &short.layout,
+        );
         fixture.add_file(short).await;
         let key_leaf = 0;
         let (patched, _) = with_dictionary_one_entry_short(&written, key_leaf);
@@ -2853,9 +3566,9 @@ mod tests {
         assert_eq!(kept, ErrorKind::File);
         let first = served[0].clone();
         assert_eq!(
-            table.get(&first).await.unwrap(),
+            table.get(&first, &[VALUE_COLUMN]).await.unwrap(),
             Lookup {
-                value: present(0),
+                row: present(0),
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
             }
         );
@@ -2867,7 +3580,14 @@ mod tests {
         RefusalReason::BelowLevel {
             declared: Level::Optimal,
             achieved: Level::Balanced,
-            findings: vec![FindingCode::DictionaryEncodedValue],
+            columns: vec![crate::check::ColumnLevel {
+                column: VALUE_COLUMN.to_string(),
+                level: Level::Balanced,
+            }],
+            findings: vec![Capping {
+                code: FindingCode::DictionaryEncodedValue,
+                column: Some(VALUE_COLUMN.to_string()),
+            }],
         }
     }
 
@@ -2920,9 +3640,19 @@ mod tests {
             RefusalReason::BelowLevel {
                 declared: Level::Optimal,
                 achieved: Level::Permissive,
+                columns: vec![crate::check::ColumnLevel {
+                    column: VALUE_COLUMN.to_string(),
+                    level: Level::Permissive,
+                }],
                 findings: vec![
-                    FindingCode::DictionaryEncodedValue,
-                    FindingCode::OverlappingFiles
+                    Capping {
+                        code: FindingCode::DictionaryEncodedValue,
+                        column: Some(VALUE_COLUMN.to_string()),
+                    },
+                    Capping {
+                        code: FindingCode::OverlappingFiles,
+                        column: None,
+                    },
                 ],
             }
         );
@@ -3011,7 +3741,11 @@ mod tests {
             SnapshotId(FIRST_SNAPSHOT)
         );
         assert_eq!(
-            table.get(&Key::Long(all[0])).await.unwrap().value,
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap()
+                .row,
             present(all[0])
         );
         assert_eq!(held(&table), HELD_AT_BALANCED);
@@ -3149,7 +3883,11 @@ mod tests {
         assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
         assert_eq!(kept, ErrorKind::Refused(expected));
         assert_eq!(
-            table.get(&Key::Long(all[0])).await.unwrap().value,
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap()
+                .row,
             present(all[0])
         );
     }
@@ -3248,9 +3986,18 @@ mod tests {
             let (mut fixture, all) = two_bucket_table().await;
             let table = table_over(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
-            table.get(&Key::Long(all[0])).await.unwrap();
-            table.get(&Key::Long(all[0])).await.unwrap();
-            table.get(&Key::Long(all[0] + 1)).await.unwrap();
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap();
+            table
+                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .await
+                .unwrap();
+            table
+                .get(&Key::Long(all[0] + 1), &[VALUE_COLUMN])
+                .await
+                .unwrap();
             append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
             assert!(table.refresh().await.unwrap());
             let reason = commit_duplicate(
@@ -3357,7 +4104,10 @@ mod tests {
                         let absent = absent.clone();
                         tokio::spawn(async move {
                             for _ in 0..lookups_per_task {
-                                assert_eq!(table.get(&absent).await.unwrap().value, Value::Absent);
+                                assert_eq!(
+                                    table.get(&absent, &[VALUE_COLUMN]).await.unwrap().row,
+                                    Row::Absent
+                                );
                             }
                         })
                     })
@@ -3370,7 +4120,7 @@ mod tests {
                 assert_eq!(published(), approx::count(workers * lookups_per_task));
                 table.publish_lookup_counts();
                 assert_eq!(published(), 0, "nothing is published twice");
-                table.get(&absent).await.unwrap();
+                table.get(&absent, &[VALUE_COLUMN]).await.unwrap();
                 drop(table);
                 assert_eq!(published(), 1, "a dropped table publishes what it counted");
             });
@@ -4117,6 +4867,84 @@ mod tests {
         );
     }
 
+    /// While a strict table is held on a snapshot one of whose columns
+    /// turned dictionary-encoded, each column's level gauge describes the
+    /// held snapshot, as the table's does: the table and that column read
+    /// balanced, the other column optimal (RFD 020, RFD 022).
+    #[test]
+    fn test_metrics_column_levels_judge_the_held_snapshot() {
+        /// A contract-layout file of `keys`, the long keys `all`, in bucket 0,
+        /// with the columns `dictionary` names dictionary-encoded.
+        fn file<'a>(
+            name: &'a str,
+            keys: &'a [Key],
+            all: &[i64],
+            dictionary: Dictionary,
+        ) -> FileSpec<'a> {
+            FileSpec {
+                name,
+                keys,
+                values: values_of(all),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout {
+                    dictionary,
+                    ..WriterLayout::contract()
+                },
+            }
+        }
+        let ((), series) = recorded(async {
+            let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
+            let all = keys_from(0, FILE_KEYS);
+            fixture
+                .add_file(file("f", &long_keys(&all), &all, Dictionary::Off))
+                .await;
+            fixture
+                .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+                .await;
+            let table = table_over(&fixture, fixture.config(Residency::Full, None)).await;
+            table.load().await.unwrap();
+            let appended = keys_from(all.last().unwrap() + KEY_STEP, FILE_KEYS);
+            fixture
+                .add_file(file(
+                    "dict",
+                    &long_keys(&appended),
+                    &appended,
+                    Dictionary::Value,
+                ))
+                .await;
+            fixture
+                .commit(
+                    SECOND_SNAPSHOT,
+                    Some(FIRST_SNAPSHOT),
+                    SECOND_SEQUENCE,
+                    SECOND_VERSION,
+                )
+                .await;
+            assert!(matches!(
+                refusal_of(table.refresh().await),
+                RefusalReason::BelowLevel { .. }
+            ));
+            assert!(matches!(table.state(), TableState::Held { .. }));
+        });
+        let level =
+            |labels: &[(&str, String)]| series.gauge(metric::TABLE_COLUMN_LEVEL, labels).to_bits();
+        let column = |name: &str| (metric::LABEL_COLUMN, name.to_string());
+        assert_eq!(
+            level_gauges(&series),
+            level_bits(1, Level::Balanced, Level::Optimal)
+        );
+        assert_eq!(
+            level(&[table_label(), column(VALUE_COLUMN)]),
+            Level::Balanced.gauge().to_bits(),
+            "the column dictionary-encoded in the held snapshot"
+        );
+        assert_eq!(
+            level(&[table_label(), column(DETAIL_COLUMN)]),
+            Level::Optimal.gauge().to_bits()
+        );
+    }
+
     #[test]
     fn test_metrics_refusal_outside_the_levels_leaves_the_level_series() {
         let ((), series) = recorded(async {
@@ -4190,7 +5018,11 @@ mod tests {
             assert_eq!(serving, Some(SnapshotId(FIRST_SNAPSHOT)));
             assert_eq!(kept, ErrorKind::ObjectStore);
             assert_eq!(
-                table.get(&Key::Long(all[0])).await.unwrap().value,
+                table
+                    .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                    .await
+                    .unwrap()
+                    .row,
                 present(all[0])
             );
 
@@ -4273,9 +5105,12 @@ mod tests {
             assert_eq!(fixture.gets(), before + POLL_GETS);
             assert_eq!(degraded(&table), (serving, refused.clone()));
             assert_eq!(
-                table.get(&Key::Long(all[0])).await.unwrap(),
+                table
+                    .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                    .await
+                    .unwrap(),
                 Lookup {
-                    value: present(all[0]),
+                    row: present(all[0]),
                     snapshot_id: SnapshotId(FIRST_SNAPSHOT),
                 }
             );
@@ -4413,13 +5248,14 @@ mod tests {
 
     /// The `findings` gauge of `code` for the table `table`.
     fn findings_gauge(series: &Series, table: &str, code: FindingCode) -> f64 {
-        series.gauge(
-            metric::FINDINGS,
-            &[
-                (metric::LABEL_TABLE, table.to_string()),
-                (metric::LABEL_CODE, code.to_string()),
-            ],
-        )
+        let mut labels = vec![
+            (metric::LABEL_TABLE, table.to_string()),
+            (metric::LABEL_CODE, code.to_string()),
+        ];
+        if code.per_column() {
+            labels.push((metric::LABEL_COLUMN, VALUE_COLUMN.to_string()));
+        }
+        series.gauge(metric::FINDINGS, &labels)
     }
 
     #[test]
@@ -4507,19 +5343,19 @@ mod tests {
         let key = Key::Long(all[0]);
         gate.fill_to(2);
         assert!(
-            table.get(&key).now_or_never().is_none(),
+            table.get(&key, &[VALUE_COLUMN]).now_or_never().is_none(),
             "a cold hit waits on its page's read"
         );
         gate.fill_to(0);
-        table.get(&key).await.unwrap();
-        let warm = table.get(&key).now_or_never();
+        table.get(&key, &[VALUE_COLUMN]).await.unwrap();
+        let warm = table.get(&key, &[VALUE_COLUMN]).now_or_never();
         assert_eq!(
-            warm.expect("a warm hit is ready").unwrap().value,
+            warm.expect("a warm hit is ready").unwrap().row,
             present(all[0])
         );
         let absent = Key::Long(all.iter().max().unwrap() + 1);
-        let miss = table.get(&absent).now_or_never();
-        assert_eq!(miss.expect("a miss is ready").unwrap().value, Value::Absent);
+        let miss = table.get(&absent, &[VALUE_COLUMN]).now_or_never();
+        assert_eq!(miss.expect("a miss is ready").unwrap().row, Row::Absent);
     }
 
     /// A table built hidden over `fixture`, as a reload builds one.

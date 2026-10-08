@@ -1,15 +1,17 @@
 //! The contract's wire behavior: every message survives an encode/decode
-//! round trip with every field set, the bytes key variant has one fixed
-//! encoding a client in another language can be checked against, each enum
-//! value maps to the integer `icetray.proto` declares, and the service
-//! carries its full name.
+//! round trip with every field set, the bytes key variant, a column value,
+//! a request naming columns, a present answer, and a value column each have
+//! one fixed encoding a client in another language can be checked against,
+//! each enum value maps to the integer `icetray.proto` declares, and the
+//! service carries its full name.
 
 use std::fmt::Debug;
 
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
-    GetRequest, GetResponse, Hit, Key, KeyType, MultiGetRequest, MultiGetResponse, Presence,
-    TableInfoRequest, TableInfoResponse, key,
+    ColumnValue, GetRequest, GetResponse, Hit, Key, KeyType, MultiGetRequest, MultiGetResponse,
+    NullValue, Presence, TableInfoRequest, TableInfoResponse, ValueColumn, ValueType, column_value,
+    key,
 };
 use prost::bytes::Bytes;
 use prost::{Message, UnknownEnumValue};
@@ -40,6 +42,47 @@ const BIN_KEY_LEN: u8 = 4;
 /// A value's bytes; not valid UTF-8, so the value is proven opaque.
 const VALUE: &[u8] = &[0x00, 0xff, 0x10];
 
+/// The value columns the fixture requests name, in request order.
+const COLUMNS: [&str; 2] = ["payload", "embedding"];
+
+/// The width of the fixture table's `fixed` value column; under 128, so
+/// its varint is the one byte of its value.
+const FIXED_WIDTH: u32 = 16;
+
+/// The tag byte that opens a length-delimited field 1 (wire type 2),
+/// encoded as `(1 << 3) | 2`: `ColumnValue.value` and `ValueColumn.name`.
+const FIELD_1_LEN_TAG: u8 = 0x0a;
+
+/// The tag byte that opens a length-delimited field 2, `(2 << 3) | 2`:
+/// `ColumnValue.null_value` and `GetResponse.values`.
+const FIELD_2_LEN_TAG: u8 = 0x12;
+
+/// The tag byte that opens a length-delimited field 3, `(3 << 3) | 2`:
+/// each name of `GetRequest.columns`.
+const FIELD_3_LEN_TAG: u8 = 0x1a;
+
+/// The tag byte that opens a length-delimited field 8, `(8 << 3) | 2`:
+/// each of `TableInfoResponse.value_columns`.
+const FIELD_8_LEN_TAG: u8 = 0x42;
+
+/// The tag byte that opens a varint field 1 (wire type 0), `1 << 3`:
+/// `GetResponse.presence`.
+const FIELD_1_VARINT_TAG: u8 = 0x08;
+
+/// The tag byte that opens a varint field 2, `2 << 3`:
+/// `ValueColumn.value_type`.
+const FIELD_2_VARINT_TAG: u8 = 0x10;
+
+/// The tag byte that opens a varint field 3, `3 << 3`:
+/// `GetResponse.snapshot_id` and `ValueColumn.width`.
+const FIELD_3_VARINT_TAG: u8 = 0x18;
+
+/// A snapshot id under 128, whose varint is the one byte of its value.
+const SMALL_SNAPSHOT_ID: u8 = 7;
+
+/// The length prefix of an empty message or of zero bytes.
+const EMPTY_LEN: u8 = 0;
+
 /// The largest snapshot id the field carries; a lost high bit would show.
 const SNAPSHOT_ID: i64 = i64::MAX;
 
@@ -60,8 +103,15 @@ const INDEX_BYTES: u64 = 65_536;
 const PRESENCE_NUMBERS: &[(Presence, i32)] = &[
     (Presence::Unspecified, 0),
     (Presence::Present, 1),
-    (Presence::Null, 2),
-    (Presence::Absent, 3),
+    (Presence::Absent, 2),
+];
+
+/// Every `ValueType` value beside the integer `icetray.proto` gives it.
+const VALUE_TYPE_NUMBERS: &[(ValueType, i32)] = &[
+    (ValueType::Unspecified, 0),
+    (ValueType::Binary, 1),
+    (ValueType::Fixed, 2),
+    (ValueType::String, 3),
 ];
 
 /// Every `KeyType` value beside the integer `icetray.proto` gives it.
@@ -117,6 +167,31 @@ fn key_bin_wire() -> Vec<u8> {
     wire
 }
 
+/// The request's column names.
+fn columns() -> Vec<String> {
+    COLUMNS.iter().map(|&column| column.to_owned()).collect()
+}
+
+/// A present value of `bytes`.
+fn bytes_value(bytes: &'static [u8]) -> ColumnValue {
+    ColumnValue {
+        kind: Some(column_value::Kind::Value(Bytes::from_static(bytes))),
+    }
+}
+
+/// A null value.
+fn null_value() -> ColumnValue {
+    ColumnValue {
+        kind: Some(column_value::Kind::NullValue(NullValue {})),
+    }
+}
+
+/// The values a present answer to `COLUMNS` carries: the value's bytes,
+/// then a null.
+fn values() -> Vec<ColumnValue> {
+    vec![bytes_value(VALUE), null_value()]
+}
+
 /// One integer past the highest value in a mapping table: an integer no
 /// variant has.
 fn unknown_number<E: Copy>(numbers: &[(E, i32)]) -> i32 {
@@ -148,6 +223,7 @@ fn test_round_trip_get_request_all_fields() {
     assert_round_trips(&GetRequest {
         table: TABLE.to_owned(),
         key: Some(bin_key()),
+        columns: columns(),
     });
 }
 
@@ -156,7 +232,7 @@ fn test_round_trip_get_response_every_presence() {
     for &(presence, _) in PRESENCE_NUMBERS {
         let response = GetResponse {
             presence: i32::from(presence),
-            value: Bytes::from_static(VALUE),
+            values: values(),
             snapshot_id: SNAPSHOT_ID,
         };
         assert_round_trips(&response);
@@ -169,6 +245,7 @@ fn test_round_trip_multi_get_request_every_key_variant() {
     assert_round_trips(&MultiGetRequest {
         table: TABLE.to_owned(),
         keys: vec![long_key(), str_key(), bin_key()],
+        columns: columns(),
     });
 }
 
@@ -177,7 +254,7 @@ fn test_round_trip_hit_every_presence() {
     for &(presence, _) in PRESENCE_NUMBERS {
         let hit = Hit {
             presence: i32::from(presence),
-            value: Bytes::from_static(VALUE),
+            values: values(),
         };
         assert_round_trips(&hit);
         assert_eq!(round_trip(&hit).presence(), presence);
@@ -190,7 +267,7 @@ fn test_round_trip_multi_get_response_every_presence() {
         .iter()
         .map(|&(presence, _)| Hit {
             presence: i32::from(presence),
-            value: Bytes::from_static(VALUE),
+            values: values(),
         })
         .collect();
     let response = MultiGetResponse {
@@ -219,6 +296,18 @@ fn test_round_trip_table_info_response_every_key_type() {
             records: RECORDS,
             key_type: i32::from(key_type),
             index_bytes: INDEX_BYTES,
+            value_columns: VALUE_TYPE_NUMBERS
+                .iter()
+                .map(|&(value_type, _)| ValueColumn {
+                    name: value_type.as_str_name().to_owned(),
+                    value_type: i32::from(value_type),
+                    width: if value_type == ValueType::Fixed {
+                        FIXED_WIDTH
+                    } else {
+                        0
+                    },
+                })
+                .collect(),
         };
         assert_round_trips(&response);
         assert_eq!(round_trip(&response).key_type(), key_type);
@@ -262,6 +351,113 @@ fn test_key_type_as_i32_matches_proto() {
 fn test_key_type_try_from_unknown_is_err() {
     let unknown = unknown_number(KEY_TYPE_NUMBERS);
     assert_eq!(KeyType::try_from(unknown), Err(UnknownEnumValue(unknown)));
+}
+
+#[test]
+fn test_value_type_as_i32_matches_proto() {
+    for &(value_type, number) in VALUE_TYPE_NUMBERS {
+        assert_eq!(value_type as i32, number);
+        assert_eq!(ValueType::try_from(number), Ok(value_type));
+    }
+}
+
+#[test]
+fn test_value_type_try_from_unknown_is_err() {
+    let unknown = unknown_number(VALUE_TYPE_NUMBERS);
+    assert_eq!(ValueType::try_from(unknown), Err(UnknownEnumValue(unknown)));
+}
+
+/// A null and a value of zero length are distinct on the wire and read back
+/// as what was sent: a null is the empty `null_value` message, a
+/// zero-length value is `value` holding nothing, and a value with neither
+/// variant set
+/// is the empty message, which the server never sends.
+#[test]
+fn test_encode_column_value_null_and_zero_length_bytes_differ() {
+    let null = null_value();
+    let empty = bytes_value(&[]);
+    assert_eq!(null.encode_to_vec(), [FIELD_2_LEN_TAG, EMPTY_LEN]);
+    assert_eq!(empty.encode_to_vec(), [FIELD_1_LEN_TAG, EMPTY_LEN]);
+    assert_round_trips(&null);
+    assert_round_trips(&empty);
+    assert_ne!(round_trip(&null), round_trip(&empty));
+    assert!(ColumnValue { kind: None }.encode_to_vec().is_empty());
+}
+
+/// `bytes` length-delimited under `tag`: the tag, the one-byte length,
+/// the bytes.
+fn delimited(tag: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut wire = vec![
+        tag,
+        u8::try_from(bytes.len()).expect("a fixture field is under 128 bytes, a one-byte length"),
+    ];
+    wire.extend_from_slice(bytes);
+    wire
+}
+
+/// A request naming columns carries each name, in request order, as its
+/// own field 3.
+#[test]
+fn test_encode_get_request_columns_exact_bytes() {
+    let request = GetRequest {
+        columns: columns(),
+        ..GetRequest::default()
+    };
+    let wire: Vec<u8> = COLUMNS
+        .iter()
+        .flat_map(|column| delimited(FIELD_3_LEN_TAG, column.as_bytes()))
+        .collect();
+    assert_eq!(request.encode_to_vec(), wire);
+    assert_eq!(GetRequest::decode(wire.as_slice()).unwrap(), request);
+}
+
+/// A present answer carries its presence, then each value as its own
+/// field 2 in request order, bytes and null alike, then the snapshot id.
+#[test]
+fn test_encode_get_response_present_with_bytes_and_null_exact_bytes() {
+    let response = GetResponse {
+        presence: i32::from(Presence::Present),
+        values: values(),
+        snapshot_id: i64::from(SMALL_SNAPSHOT_ID),
+    };
+    let present = u8::try_from(i32::from(Presence::Present)).unwrap();
+    let wire = [
+        vec![FIELD_1_VARINT_TAG, present],
+        delimited(FIELD_2_LEN_TAG, &delimited(FIELD_1_LEN_TAG, VALUE)),
+        delimited(FIELD_2_LEN_TAG, &[FIELD_2_LEN_TAG, EMPTY_LEN]),
+        vec![FIELD_3_VARINT_TAG, SMALL_SNAPSHOT_ID],
+    ]
+    .concat();
+    assert_eq!(response.encode_to_vec(), wire);
+    assert_eq!(GetResponse::decode(wire.as_slice()).unwrap(), response);
+}
+
+/// A `fixed` value column in `TableInfoResponse` carries its name, its
+/// type, and its width, as field 8.
+#[test]
+fn test_encode_table_info_value_column_exact_bytes() {
+    let name = COLUMNS[1];
+    let response = TableInfoResponse {
+        value_columns: vec![ValueColumn {
+            name: name.to_owned(),
+            value_type: i32::from(ValueType::Fixed),
+            width: FIXED_WIDTH,
+        }],
+        ..TableInfoResponse::default()
+    };
+    let fixed = u8::try_from(i32::from(ValueType::Fixed)).unwrap();
+    let column = [
+        delimited(FIELD_1_LEN_TAG, name.as_bytes()),
+        vec![FIELD_2_VARINT_TAG, fixed],
+        vec![FIELD_3_VARINT_TAG, u8::try_from(FIXED_WIDTH).unwrap()],
+    ]
+    .concat();
+    let wire = delimited(FIELD_8_LEN_TAG, &column);
+    assert_eq!(response.encode_to_vec(), wire);
+    assert_eq!(
+        TableInfoResponse::decode(wire.as_slice()).unwrap(),
+        response
+    );
 }
 
 #[test]

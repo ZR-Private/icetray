@@ -1,7 +1,9 @@
-//! The doctor (RFD 007, RFD 016, RFD 020, RFD 021): the finding codes, the
-//! levels they cap, penalties, and thresholds by which a table is
-//! classified, applied identically at every load and in the `doctor`
-//! subcommand. `diagnose` is a pure function of a loaded `Generation` and
+//! The doctor (RFD 007, RFD 016, RFD 020, RFD 021, RFD 022): the finding
+//! codes, the levels they cap, penalties, and thresholds by which a table
+//! is classified, applied identically at every load and in the `doctor`
+//! subcommand. A value-column finding is made per column and names it, and
+//! each column has a level of its own; the table's level is the dearest
+//! column's. `diagnose` is a pure function of a loaded `Generation` and
 //! the table's declared level: it reads the footers, page indexes, fences,
 //! manifest entries, and applied delete state the generation holds and
 //! nothing else, so the same generation always gets the same report.
@@ -10,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use parquet::basic::Encoding;
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetOffsetIndex};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 
 use crate::approx;
@@ -24,7 +26,7 @@ use crate::index::{
 };
 use crate::key::{Key, KeyType};
 use crate::level::Level;
-use crate::manifest::{DataFileEntry, TableLayout};
+use crate::manifest::{DataFileEntry, TableLayout, ValueColumnLayout};
 use crate::snapshot::SnapshotId;
 
 /// The thresholds, in one place (RFD 016): each derives from `contract`
@@ -115,7 +117,8 @@ pub mod thresholds {
 /// on each file whose filter answers yes (RFD 017).
 const DICTIONARY_PAGE_GETS: u64 = 1;
 
-/// The GETs a cold hit spends on its value page (RFD 006).
+/// The GETs a cold hit spends on the value page of each column it names
+/// (RFD 006, RFD 022).
 const VALUE_PAGE_GETS: u64 = 1;
 
 /// The GETs a cold lookup under `bloom` spends on the key page of each file
@@ -166,10 +169,14 @@ impl Penalty {
 /// less than `gets_per_hit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LookupCost {
-    /// GETs a cold hit makes: its value page, the value column's dictionary
-    /// page when any file's is dictionary-encoded, and under `bloom` the key
-    /// page of every file probed, each filter answering yes, with the key
-    /// column's dictionary page when any file's is dictionary-encoded.
+    /// GETs a cold hit makes finding its row and reading the dearest value
+    /// column (RFD 022): under `bloom` the key page of every file probed,
+    /// each filter answering yes, with the key column's dictionary page
+    /// when any file's is dictionary-encoded, and that column's value page
+    /// and, when any file's chunk of it is dictionary-encoded, its
+    /// dictionary page. A table of no value columns pays finding the row
+    /// alone; a hit naming several columns pays finding the row once, which
+    /// is `gets_per_miss`, and each column's `ColumnCost::gets_per_hit`.
     pub gets_per_hit: u64,
     /// GETs a miss makes: none under `full` and `disk`; under `bloom` the
     /// key pages a hit spends, every filter answering yes.
@@ -179,6 +186,68 @@ pub struct LookupCost {
     /// one bucket), one where no files overlap; an upper bound where files
     /// were written under two or more bucketings.
     pub files_probed: usize,
+}
+
+/// One value column's level and cost on a layout in a residency (RFD 020,
+/// RFD 022), what `icetray_table_column_level` and
+/// `icetray_table_column_gets_per_hit` show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ColumnCost {
+    /// The level a lookup naming the column achieves: the column's own caps
+    /// together with those of finding the row and the residency's best
+    /// level.
+    pub level: Level,
+    /// The GETs a cold hit spends on the column alone: its value page, and
+    /// its dictionary page when any file's chunk of it is
+    /// dictionary-encoded. A file that answers the column's default spends
+    /// none, which this worst case does not count.
+    pub gets_per_hit: u64,
+}
+
+/// One value column's level for a snapshot's layout as a `below_level`
+/// refusal carries it, from the measurement that gave the table's level
+/// (RFD 020, RFD 022).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ColumnLevel {
+    /// The column's configured name.
+    pub column: String,
+    /// The level a lookup naming the column achieves.
+    pub level: Level,
+}
+
+/// Each of `layout`'s value columns with its level in `costs`, which is in
+/// the layout's order.
+pub(crate) fn column_levels(layout: &TableLayout, costs: &[ColumnCost]) -> Vec<ColumnLevel> {
+    layout
+        .value_columns
+        .iter()
+        .zip(costs)
+        .map(|(column, cost)| ColumnLevel {
+            column: column.name.clone(),
+            level: cost.level,
+        })
+        .collect()
+}
+
+/// A capping finding as a `below_level` refusal names it: its code and the
+/// value column it is about, `None` for a finding about the row or the
+/// table (RFD 022). Display gives the code, then the column in
+/// parentheses when there is one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct Capping {
+    /// The finding's code.
+    pub code: FindingCode,
+    /// The value column the finding is about.
+    pub column: Option<String>,
+}
+
+impl fmt::Display for Capping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.column {
+            Some(column) => write!(f, "{} (column {column})", self.code),
+            None => self.code.fmt(f),
+        }
+    }
 }
 
 /// A finding's code (RFD 016). Display and serde give the `snake_case` code
@@ -192,8 +261,8 @@ pub struct LookupCost {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCode {
-    /// The value column is dictionary-encoded; its dictionary page costs one
-    /// extra GET per hit.
+    /// A value column is dictionary-encoded; its dictionary page costs one
+    /// extra GET per hit that names it.
     DictionaryEncodedValue,
     /// Key pages hold more rows than `thresholds::KEY_PAGE_ROWS_LARGE`;
     /// a lookup decodes them all.
@@ -210,9 +279,10 @@ pub enum FindingCode {
     /// The key column's column index is truncated: too few page minimums
     /// are distinct.
     ColumnIndexTruncated,
-    /// The mean uncompressed value page is above the advice threshold.
+    /// A value column's mean uncompressed value page is above the advice
+    /// threshold.
     LargeValuePages,
-    /// The mean uncompressed value page is above
+    /// A value column's mean uncompressed value page is above
     /// `thresholds::MOST_VALUE_PAGE_BYTES`, the most a value page a lookup
     /// reads may declare; a lookup into a page over it is refused with a
     /// file fault.
@@ -236,7 +306,7 @@ pub enum FindingCode {
     /// compaction would remove them and their delete files, and the state
     /// they hold.
     DeletesPending,
-    /// Data files written before the value column was added answer its
+    /// Data files written before a value column was added answer its
     /// default (RFD 023); a rewrite of them writes the column in.
     ColumnDefault,
 }
@@ -285,6 +355,30 @@ impl FindingCode {
             | Self::BloomUndersized
             | Self::DeletesPending
             | Self::ColumnDefault => None,
+        }
+    }
+
+    /// Whether a finding of this code is about one value column, which it
+    /// names (`Finding::column`), rather than about the row or the table
+    /// (RFD 022): the codes `icetray_findings` carries a `column` label for.
+    pub fn per_column(self) -> bool {
+        match self {
+            Self::DictionaryEncodedValue
+            | Self::LargeValuePages
+            | Self::ValuePagesOverCeiling
+            | Self::ColumnDefault => true,
+            Self::LargeKeyPages
+            | Self::NoBucketPartition
+            | Self::OverlappingFiles
+            | Self::BoundsMissing
+            | Self::ColumnIndexTruncated
+            | Self::LongKeys
+            | Self::LargeFile
+            | Self::ManyFilesPerBucket
+            | Self::NoBloomFilter
+            | Self::BloomOversized
+            | Self::BloomUndersized
+            | Self::DeletesPending => false,
         }
     }
 }
@@ -397,14 +491,17 @@ impl fmt::Display for WriterProperty {
 /// constructors: `cost` takes `caps` from the code (`FindingCode::cap`)
 /// with a penalty, `advice` sets neither, and each debug-asserts that its
 /// code is one it builds, so a capping code's finding is a cost and every
-/// other is advice. Serializes with the field names of its getters, `caps`
-/// as null for advice.
+/// other is advice. A finding about one value column names it
+/// (`with_column`). Serializes with the field names of its getters, `caps`
+/// as null for advice and `column` as null for a finding about the row or
+/// the table.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
     caps: Option<Level>,
     code: FindingCode,
     message: String,
     file: Option<String>,
+    column: Option<String>,
     penalty: Option<Penalty>,
     property: Option<WriterProperty>,
 }
@@ -425,6 +522,7 @@ impl Finding {
             code,
             message,
             file: file.map(str::to_string),
+            column: None,
             penalty: Some(penalty),
             property,
         }
@@ -446,8 +544,20 @@ impl Finding {
             code,
             message,
             file: file.map(str::to_string),
+            column: None,
             penalty: None,
             property,
+        }
+    }
+
+    /// The finding about value column `column`; every per-column code's
+    /// finding names its column (`FindingCode::per_column`).
+    #[must_use]
+    pub fn with_column(self, column: &str) -> Self {
+        debug_assert!(self.code.per_column(), "{} names no column", self.code);
+        Self {
+            column: Some(column.to_string()),
+            ..self
         }
     }
 
@@ -470,6 +580,20 @@ impl Finding {
     /// The data file the finding is about; `None` for a table-level one.
     pub fn file(&self) -> Option<&str> {
         self.file.as_deref()
+    }
+
+    /// The value column the finding is about; `None` for one about the row
+    /// or the table.
+    pub fn column(&self) -> Option<&str> {
+        self.column.as_deref()
+    }
+
+    /// The finding as a `below_level` refusal names it.
+    pub(crate) fn capping(&self) -> Capping {
+        Capping {
+            code: self.code,
+            column: self.column.clone(),
+        }
     }
 
     /// The measured penalty; `Some` exactly when `caps` is.
@@ -500,28 +624,14 @@ pub struct FileReport {
     pub row_groups: usize,
     /// Data pages of the key column across every row group.
     pub key_pages: usize,
-    /// Data pages of the value column across every row group.
-    pub value_pages: usize,
     /// Rows in the largest key page, from the key column's offset index: the
     /// keys a lookup in that page decodes.
     pub max_key_page_rows: i64,
     /// The length in bytes of the longest key.
     pub max_key_bytes: usize,
-    /// Mean uncompressed bytes of a value page, the value column's
-    /// uncompressed chunk bytes over its data pages: what a hit
-    /// decompresses. A dictionary page's bytes are counted in: the footer
-    /// gives its compressed extent and no uncompressed size, so taking them
-    /// out would take a read of its header.
-    pub avg_value_page_bytes: u64,
-    /// Mean uncompressed bytes of one value, the value column's
-    /// uncompressed chunk bytes over the file's rows. Against
-    /// `avg_value_page_bytes` it says how many values a hit fetches for the
-    /// one it wanted; reported, never thresholded, since a membership set
-    /// with empty values fetches a page for nothing and is not wrong.
-    pub avg_value_bytes: u64,
-    /// Whether every value page starts on the same row as a key page in
-    /// every row group.
-    pub pages_aligned: bool,
+    /// One report per value column the table serves, in the layout's
+    /// order (RFD 022).
+    pub value_columns: Vec<ValueColumnReport>,
     /// The columns, key or value, that a row group dictionary-encodes: a
     /// dictionary page or a dictionary encoding among the pages' encodings.
     pub dictionary_columns: Vec<String>,
@@ -546,6 +656,47 @@ pub struct FileReport {
     pub resident_bytes: usize,
 }
 
+/// What the doctor measured about one value column of one data file (RFD
+/// 022). A file written before the column was added holds none of it: it
+/// answers the column's default, and every count is zero.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ValueColumnReport {
+    /// The column's configured name.
+    pub column: String,
+    /// Whether the file lacks the column and answers its default (RFD 023).
+    pub answers_default: bool,
+    /// Data pages of the column across every row group.
+    pub value_pages: usize,
+    /// Mean uncompressed bytes of a value page, the column's uncompressed
+    /// chunk bytes over its data pages: what a hit naming it decompresses.
+    /// A dictionary page's bytes are counted in: the footer gives its
+    /// compressed extent and no uncompressed size, so taking them out would
+    /// take a read of its header.
+    pub avg_value_page_bytes: u64,
+    /// Mean uncompressed bytes of one value, the column's uncompressed chunk
+    /// bytes over the file's rows. Against `avg_value_page_bytes` it says
+    /// how many values a hit fetches for the one it wanted; reported, never
+    /// thresholded, since a membership set with empty values fetches a page
+    /// for nothing and is not wrong.
+    pub avg_value_bytes: u64,
+    /// Whether every page of the column starts on the same row as a key
+    /// page in every row group.
+    pub pages_aligned: bool,
+}
+
+/// One value column's verdict in a table's summary (RFD 020, RFD 022).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ColumnSummary {
+    /// The column's configured name.
+    pub column: String,
+    /// The level a lookup naming it achieves in the loaded tier.
+    pub level: Level,
+    /// The GETs a cold hit spends on it alone.
+    pub gets_per_hit: u64,
+    /// Data files that answer its default, written before it was added.
+    pub files_answering_default: usize,
+}
+
 /// The doctor's verdict on one generation and the numbers an owner chooses
 /// a residency by. What the `doctor` and `info` subcommands serialize, so a
 /// new measurement here reaches them without a change there.
@@ -556,7 +707,9 @@ pub struct TableSummary {
     /// The snapshot diagnosed.
     pub snapshot_id: SnapshotId,
     /// The level the snapshot's layout achieves in the loaded tier: the
-    /// dearest cap any finding or the residency sets (RFD 020).
+    /// dearest cap any finding or the residency sets (RFD 020), which is the
+    /// dearest value column's, or that of finding the row for a table of no
+    /// value columns (RFD 022).
     pub level: Level,
     /// The level the table declares (`TableConfig::lookups`).
     pub lookups: Level,
@@ -589,6 +742,8 @@ pub struct TableSummary {
     /// What one cold lookup pays at worst in the loaded tier, from the same
     /// measurement as `level`.
     pub lookup_cost: LookupCost,
+    /// Each value column's level and cost, in the layout's order.
+    pub value_columns: Vec<ColumnSummary>,
     /// What the snapshot's deletes come to (RFD 021), from the delete state
     /// the load applied: what the delete gauges show while it serves.
     pub deletes: DeleteSummary,
@@ -596,6 +751,19 @@ pub struct TableSummary {
     pub capping: usize,
     /// Advice findings, the count of those whose `caps` is `None`.
     pub advice: usize,
+}
+
+impl TableSummary {
+    /// Each value column's level, as `judge` takes them.
+    pub fn column_levels(&self) -> Vec<ColumnLevel> {
+        self.value_columns
+            .iter()
+            .map(|column| ColumnLevel {
+                column: column.column.clone(),
+                level: column.level,
+            })
+            .collect()
+    }
 }
 
 /// The whole report: the summary, the capping findings first, and one
@@ -612,10 +780,10 @@ pub struct TableReport {
 }
 
 impl TableReport {
-    /// The distinct codes of the capping findings, in the report's order:
-    /// what `judge` chooses a `below_level` refusal's codes from.
-    pub fn capping_codes(&self) -> Vec<FindingCode> {
-        capping_codes(&self.findings)
+    /// The distinct capping findings by code and column, in the report's
+    /// order: what `judge` chooses a `below_level` refusal's findings from.
+    pub fn capping(&self) -> Vec<Capping> {
+        capping(&self.findings)
     }
 }
 
@@ -632,6 +800,19 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         .iter()
         .map(|file| measure(file, &g.layout))
         .collect();
+    let value_columns = g
+        .layout
+        .value_columns
+        .iter()
+        .zip(&caps.columns)
+        .enumerate()
+        .map(|(at, (column, cost))| ColumnSummary {
+            column: column.name.clone(),
+            level: cost.level,
+            gets_per_hit: cost.gets_per_hit,
+            files_answering_default: answering_default(g, at),
+        })
+        .collect();
     let buckets = by_bucket(&facts);
     let pending = deletes_pending(g, &caps, deletes);
     let mut findings = caps.findings;
@@ -642,7 +823,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
     );
     findings.extend(many_files_findings(&buckets));
     findings.extend(pending);
-    findings.extend(column_default(g));
+    findings.extend(column_defaults(g));
     sort_findings(&mut findings);
     let predicted = with_deletes(predicted_total(&facts), g.delete_bound());
     let capping = findings
@@ -664,6 +845,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         predicted,
         level_by_residency: level_by_residency(caps.layout, &predicted),
         lookup_cost: caps.cost,
+        value_columns,
         deletes,
         capping,
         advice: findings.len() - capping,
@@ -689,15 +871,19 @@ fn level_by_residency(layout: Level, predicted: &ResidentBytes) -> BTreeMap<Resi
 /// The level gate (RFD 020): `RefusalReason::BelowLevel` under `table`
 /// when `level` does not meet `declared` and `strict` is on; `Ok`
 /// otherwise, since a table below its level that is not strict is flagged
-/// and served. The refusal names those of the capping `codes` whose cap
-/// does not meet `declared`, never one the declared level accepts. The load
-/// decides whether a snapshot is swapped in through it, and the doctor
-/// whether a configured table is reported refused, so the two cannot
-/// disagree.
+/// and served. A table's level is its dearest value column's, so one column
+/// below the declared level refuses the whole snapshot (RFD 022). The
+/// refusal names those of the capping findings `capping` whose cap does not
+/// meet `declared`, never one the declared level accepts, each with the
+/// column it is about, and carries `columns`, each value column's level
+/// from the same measurement as `level`. The load decides whether a
+/// snapshot is swapped in through it, and the doctor whether a configured
+/// table is reported refused, so the two cannot disagree.
 pub fn judge(
     table: &str,
     level: Level,
-    codes: &[FindingCode],
+    columns: &[ColumnLevel],
+    capping: &[Capping],
     declared: Level,
     strict: bool,
 ) -> Result<()> {
@@ -707,10 +893,11 @@ pub fn judge(
             RefusalReason::BelowLevel {
                 declared,
                 achieved: level,
-                findings: codes
+                columns: columns.to_vec(),
+                findings: capping
                     .iter()
-                    .copied()
-                    .filter(|code| code.cap().is_some_and(|cap| !cap.meets(declared)))
+                    .filter(|capping| capping.code.cap().is_some_and(|cap| !cap.meets(declared)))
+                    .cloned()
                     .collect(),
             },
         ))
@@ -719,16 +906,17 @@ pub fn judge(
     }
 }
 
-/// The distinct codes of the capping findings, in the order `findings`
-/// gives them.
-fn capping_codes(findings: &[Finding]) -> Vec<FindingCode> {
-    let mut codes = Vec::new();
+/// The distinct capping findings by code and column, in the order
+/// `findings` gives them.
+fn capping(findings: &[Finding]) -> Vec<Capping> {
+    let mut capping = Vec::new();
     for finding in findings.iter().filter(|finding| finding.caps().is_some()) {
-        if !codes.contains(&finding.code()) {
-            codes.push(finding.code());
+        let named = finding.capping();
+        if !capping.contains(&named) {
+            capping.push(named);
         }
     }
-    codes
+    capping
 }
 
 /// What a snapshot's level for its layout is judged from (RFD 020): the
@@ -745,14 +933,15 @@ pub(crate) struct LayoutView<'a> {
 }
 
 /// One file as a level is judged from it: its manifest entry and footer,
-/// with the key and value columns' leaf positions in the footer's schema;
-/// no value leaf for a file written before the value column was added,
-/// which answers its default and makes no value-column finding (RFD 023).
+/// with the key and value columns' leaf positions in the footer's schema,
+/// the value columns in the layout's order; no value leaf for a column the
+/// file was written before, which answers its default and makes no
+/// finding of that column (RFD 023).
 pub(crate) struct FileView<'a> {
     entry: &'a DataFileEntry,
     metadata: &'a ParquetMetaData,
     key_leaf: usize,
-    value_leaf: Option<usize>,
+    value_leaves: Vec<Option<usize>>,
 }
 
 impl<'a> FileView<'a> {
@@ -762,7 +951,7 @@ impl<'a> FileView<'a> {
             entry: &file.entry,
             metadata: file.index.metadata(),
             key_leaf: file.index.key_leaf(),
-            value_leaf: file.index.value_leaf(),
+            value_leaves: file.index.value_leaves(),
         }
     }
 
@@ -773,7 +962,7 @@ impl<'a> FileView<'a> {
             entry,
             metadata: inspected.metadata(),
             key_leaf: inspected.key_leaf(),
-            value_leaf: inspected.value_leaf(),
+            value_leaves: inspected.value_leaves(),
         }
     }
 }
@@ -794,7 +983,8 @@ impl<'a> LayoutView<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Caps {
     /// The level in the view's residency: the dearest of `layout` and the
-    /// residency's best level.
+    /// residency's best level, which is the dearest column's level, or that
+    /// of finding the row for a table of no value columns (RFD 022).
     pub(crate) level: Level,
     /// The dearest cap the findings set, whatever the residency; `optimal`
     /// for none.
@@ -804,22 +994,30 @@ pub(crate) struct Caps {
     pub(crate) findings: Vec<Finding>,
     /// What one cold lookup pays at worst in the view's residency.
     pub(crate) cost: LookupCost,
+    /// Each value column's level and cost in the view's residency, in the
+    /// layout's order.
+    pub(crate) columns: Vec<ColumnCost>,
 }
 
 impl Caps {
-    /// The distinct codes of the capping findings, in the finding table's
-    /// order: what `judge` chooses a `below_level` refusal's codes from.
-    pub(crate) fn codes(&self) -> Vec<FindingCode> {
-        capping_codes(&self.findings)
+    /// The distinct capping findings by code and column, in the finding
+    /// table's order: what `judge` chooses a `below_level` refusal's
+    /// findings from.
+    pub(crate) fn capping(&self) -> Vec<Capping> {
+        capping(&self.findings)
     }
 }
 
 /// The capping findings `view` raises, the level they and its residency
-/// allow, and the cost of a cold lookup there (RFD 020): the one function
-/// the doctor's report, the load's level gate, and the cost gauges all
-/// measure a layout by, so none can disagree. Per file, a dictionary-encoded
-/// value column and large key pages; per table, files written with no
-/// bucket partition and overlapping files. No `f64` enters.
+/// allow, per value column and for the table, and the cost of a cold
+/// lookup there (RFD 020, RFD 022): the one function the doctor's report,
+/// the load's level gate, and the cost gauges all measure a layout by, so
+/// none can disagree. Per file, a dictionary-encoded value column, named,
+/// and large key pages; per table, files written with no bucket partition
+/// and overlapping files. A column's level is its own findings' caps with
+/// those of finding the row, the findings that name no column, and the
+/// residency's best level; the table's is the dearest of them all. No
+/// `f64` enters.
 pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     let mut findings = Vec::new();
     for file in &view.files {
@@ -827,31 +1025,68 @@ pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     }
     table_capping_findings(view, &mut findings);
     sort_findings(&mut findings);
-    let layout = findings
+    let dearest = |about: &dyn Fn(&Finding) -> bool| {
+        findings
+            .iter()
+            .filter(|finding| about(finding))
+            .filter_map(Finding::caps)
+            .fold(Level::Optimal, Level::max)
+    };
+    let layout = dearest(&|_| true);
+    let row = dearest(&|finding| finding.column().is_none());
+    let best = view.residency.best_level();
+    let row_gets = row_gets(view);
+    let columns = view
+        .layout
+        .value_columns
         .iter()
-        .filter_map(Finding::caps)
-        .fold(Level::Optimal, Level::max);
+        .map(|column| {
+            let about = |finding: &Finding| finding.column() == Some(column.name.as_str());
+            let extra = findings
+                .iter()
+                .filter(|finding| about(finding))
+                .filter_map(|finding| finding.penalty()?.extra_gets_per_hit)
+                .max()
+                .unwrap_or(0);
+            ColumnCost {
+                level: row.max(dearest(&about)).max(best),
+                gets_per_hit: VALUE_PAGE_GETS + extra,
+            }
+        })
+        .collect::<Vec<_>>();
+    let dearest_column = columns
+        .iter()
+        .map(|column| column.gets_per_hit)
+        .max()
+        .unwrap_or(0);
     Caps {
-        level: layout.max(view.residency.best_level()),
+        level: layout.max(best),
         layout,
-        cost: lookup_cost(view, &findings),
+        cost: LookupCost {
+            gets_per_hit: row_gets.key_pages + dearest_column,
+            gets_per_miss: row_gets.key_pages,
+            files_probed: row_gets.files_probed,
+        },
+        columns,
         findings,
     }
 }
 
-/// The cost of one cold lookup on `view`, whose capping findings are
-/// `findings`. A hit reads one file's value, so the dearest
-/// `extra_gets_per_hit` of any finding is what it adds. The files probed
-/// are the most any bucket's lookup probes, the figure `overlapping_files`
+/// What finding a row costs a cold lookup on `view`: the GETs under
+/// `bloom` for the key page of every file probed, each filter answering
+/// yes, with the key column's dictionary page when any file's is
+/// dictionary-encoded, and the files probed.
+struct RowGets {
+    key_pages: u64,
+    files_probed: usize,
+}
+
+/// The cost of finding a row on `view` (`RowGets`). The files probed are
+/// the most any bucket's lookup probes, the figure `overlapping_files`
 /// carries; `no_bucket_partition`'s figure counts every unbucketed file,
 /// while a lookup probes only those whose exact key range covers its key,
 /// which the overlap figure already narrows to.
-fn lookup_cost(view: &LayoutView<'_>, findings: &[Finding]) -> LookupCost {
-    let extra_per_hit = findings
-        .iter()
-        .filter_map(|finding| finding.penalty()?.extra_gets_per_hit)
-        .max()
-        .unwrap_or(0);
+fn row_gets(view: &LayoutView<'_>) -> RowGets {
     let files_probed = view
         .overlapping
         .values()
@@ -861,9 +1096,10 @@ fn lookup_cost(view: &LayoutView<'_>, findings: &[Finding]) -> LookupCost {
     let key_pages = match view.residency {
         Residency::Full | Residency::Disk => 0,
         Residency::Bloom => {
-            let key_dictionary = view.files.iter().any(|file| {
-                chunk_facts(file.metadata, file.key_leaf, file.value_leaf).key_dictionary
-            });
+            let key_dictionary = view
+                .files
+                .iter()
+                .any(|file| column_chunk_facts(file.metadata, file.key_leaf).dictionary);
             let dictionary = if key_dictionary {
                 DICTIONARY_PAGE_GETS
             } else {
@@ -872,9 +1108,8 @@ fn lookup_cost(view: &LayoutView<'_>, findings: &[Finding]) -> LookupCost {
             (KEY_PAGE_GETS + dictionary) * approx::count(files_probed)
         }
     };
-    LookupCost {
-        gets_per_hit: VALUE_PAGE_GETS + extra_per_hit + key_pages,
-        gets_per_miss: key_pages,
+    RowGets {
+        key_pages,
         files_probed,
     }
 }
@@ -948,18 +1183,51 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
     let predicted = FileIndex::predicted_resident_bytes(
         metadata,
         index.key_leaf(),
+        &index.held_value_leaves(),
         index.key_type(),
         index.handle(),
     );
-    let pages = page_facts(metadata, index.key_leaf(), index.value_leaf());
-    let chunks = chunk_facts(metadata, index.key_leaf(), index.value_leaf());
+    let pages = key_page_facts(metadata, index.key_leaf());
     let mut dictionary_columns = Vec::new();
-    if chunks.key_dictionary {
+    if column_chunk_facts(metadata, index.key_leaf()).dictionary {
         dictionary_columns.push(layout.key_column.clone());
     }
-    if chunks.value_dictionary {
-        dictionary_columns.push(layout.value_column.clone());
-    }
+    let value_columns = layout
+        .value_columns
+        .iter()
+        .zip(index.value_leaves())
+        .map(|(column, leaf)| {
+            let Some(leaf) = leaf else {
+                return ValueColumnReport {
+                    column: column.name.clone(),
+                    answers_default: true,
+                    value_pages: 0,
+                    avg_value_page_bytes: 0,
+                    avg_value_bytes: 0,
+                    pages_aligned: true,
+                };
+            };
+            let chunks = column_chunk_facts(metadata, leaf);
+            if chunks.dictionary {
+                dictionary_columns.push(column.name.clone());
+            }
+            let (value_pages, pages_aligned) = value_page_facts(metadata, index.key_leaf(), leaf);
+            ValueColumnReport {
+                column: column.name.clone(),
+                answers_default: false,
+                value_pages,
+                avg_value_page_bytes: chunks
+                    .uncompressed_bytes
+                    .checked_div(approx::count(value_pages))
+                    .unwrap_or(0),
+                avg_value_bytes: chunks
+                    .uncompressed_bytes
+                    .checked_div(rows_of(index))
+                    .unwrap_or(0),
+                pages_aligned,
+            }
+        })
+        .collect();
     FileFacts {
         report: FileReport {
             path: file.entry.path.clone(),
@@ -968,18 +1236,9 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             rows: index.rows(),
             row_groups: metadata.num_row_groups(),
             key_pages: pages.key_pages,
-            value_pages: pages.value_pages,
             max_key_page_rows: pages.max_key_page_rows,
             max_key_bytes: index.max_key_bytes(),
-            avg_value_page_bytes: chunks
-                .value_uncompressed_bytes
-                .checked_div(approx::count(pages.value_pages))
-                .unwrap_or(0),
-            avg_value_bytes: chunks
-                .value_uncompressed_bytes
-                .checked_div(rows_of(index))
-                .unwrap_or(0),
-            pages_aligned: pages.aligned,
+            value_columns,
             dictionary_columns,
             bloom_bytes: predicted.filter_bytes,
             bloom_bits_per_key: predicted.bloom_bits_per_key,
@@ -1001,39 +1260,28 @@ fn rows_of(index: &FileIndex) -> u64 {
         .expect("FileIndex::build refused a negative row count as FileFault::InconsistentRowCounts")
 }
 
-/// What the offset indexes say about a file's pages.
-struct PageFacts {
+/// What the key column's offset index says about a file's key pages.
+struct KeyPageFacts {
     key_pages: usize,
-    value_pages: usize,
     max_key_page_rows: i64,
-    aligned: bool,
 }
 
-/// Counts the key and value pages of every row group, finds the largest key
-/// page in rows (a page's rows run to the next page's first row, or the row
-/// group's end), and checks that the value pages start on the key pages'
-/// rows. A file with no value column has no value pages, and none out of
-/// line.
-fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: Option<usize>) -> PageFacts {
-    let offsets = metadata.offset_index().expect(
+/// The offset index of a file the index admitted.
+fn offset_index(metadata: &ParquetMetaData) -> &ParquetOffsetIndex {
+    metadata.offset_index().expect(
         "FileIndex::build refused a file without an offset index as FileFault::MissingPageIndex",
-    );
-    let mut facts = PageFacts {
+    )
+}
+
+/// Counts the key pages of every row group and finds the largest in rows (a
+/// page's rows run to the next page's first row, or the row group's end).
+fn key_page_facts(metadata: &ParquetMetaData, key_leaf: usize) -> KeyPageFacts {
+    let mut facts = KeyPageFacts {
         key_pages: 0,
-        value_pages: 0,
         max_key_page_rows: 0,
-        aligned: true,
     };
-    for (row_group, columns) in offsets.iter().enumerate() {
+    for (row_group, columns) in offset_index(metadata).iter().enumerate() {
         let key = columns[key_leaf].page_locations();
-        if let Some(value_leaf) = value_leaf {
-            let value = columns[value_leaf].page_locations();
-            facts.value_pages += value.len();
-            facts.aligned &= key.len() == value.len()
-                && key.iter().zip(value).all(|(key_page, value_page)| {
-                    key_page.first_row_index == value_page.first_row_index
-                });
-        }
         facts.key_pages += key.len();
         let group_rows = metadata.row_group(row_group).num_rows();
         for (at, page) in key.iter().enumerate() {
@@ -1046,32 +1294,43 @@ fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: Option<us
     facts
 }
 
-/// What the column chunks say: which columns some row group
-/// dictionary-encodes, and the value column's uncompressed bytes, none for
-/// a file with no value column.
-struct ChunkFacts {
-    key_dictionary: bool,
-    value_dictionary: bool,
-    value_uncompressed_bytes: u64,
-}
-
-fn chunk_facts(
+/// The pages of the value column at `value_leaf` across every row group,
+/// and whether each starts on the same row as a key page.
+fn value_page_facts(
     metadata: &ParquetMetaData,
     key_leaf: usize,
-    value_leaf: Option<usize>,
-) -> ChunkFacts {
-    let mut facts = ChunkFacts {
-        key_dictionary: false,
-        value_dictionary: false,
-        value_uncompressed_bytes: 0,
+    value_leaf: usize,
+) -> (usize, bool) {
+    let mut pages = 0;
+    let mut aligned = true;
+    for columns in offset_index(metadata) {
+        let key = columns[key_leaf].page_locations();
+        let value = columns[value_leaf].page_locations();
+        pages += value.len();
+        aligned &= key.len() == value.len()
+            && key.iter().zip(value).all(|(key_page, value_page)| {
+                key_page.first_row_index == value_page.first_row_index
+            });
+    }
+    (pages, aligned)
+}
+
+/// What one column's chunks say: whether some row group dictionary-encodes
+/// it, and its uncompressed bytes.
+struct ColumnChunkFacts {
+    dictionary: bool,
+    uncompressed_bytes: u64,
+}
+
+fn column_chunk_facts(metadata: &ParquetMetaData, leaf: usize) -> ColumnChunkFacts {
+    let mut facts = ColumnChunkFacts {
+        dictionary: false,
+        uncompressed_bytes: 0,
     };
     for group in metadata.row_groups() {
-        facts.key_dictionary |= dictionary_encoded(group.column(key_leaf));
-        if let Some(value_leaf) = value_leaf {
-            let value = group.column(value_leaf);
-            facts.value_dictionary |= dictionary_encoded(value);
-            facts.value_uncompressed_bytes += approx::measured(value.uncompressed_size());
-        }
+        let chunk = group.column(leaf);
+        facts.dictionary |= dictionary_encoded(chunk);
+        facts.uncompressed_bytes += approx::measured(chunk.uncompressed_size());
     }
     facts
 }
@@ -1156,28 +1415,19 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding>
 }
 
 /// The per-file capping findings, from the file's footer and manifest
-/// entry alone: a dictionary-encoded value column and large key pages.
+/// entry alone: each dictionary-encoded value column, named, and large key
+/// pages.
 fn file_capping_findings(file: &FileView<'_>, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let path = &file.entry.path;
-    let chunks = chunk_facts(file.metadata, file.key_leaf, file.value_leaf);
-    if chunks.value_dictionary {
-        findings.push(Finding::cost(
-            FindingCode::DictionaryEncodedValue,
-            Some(path),
-            format!(
-                "value column {value} is dictionary-encoded; a hit fetches its dictionary page besides the value page, {gets} extra GET ({property}=false)",
-                value = layout.value_column,
-                gets = DICTIONARY_PAGE_GETS,
-                property = WriterProperty::EnableDictionary,
-            ),
-            Penalty {
-                extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
-                ..Penalty::default()
-            },
-            Some(WriterProperty::EnableDictionary),
-        ));
+    for (column, leaf) in layout.value_columns.iter().zip(&file.value_leaves) {
+        let Some(leaf) = *leaf else {
+            continue;
+        };
+        if column_chunk_facts(file.metadata, leaf).dictionary {
+            findings.push(dictionary_finding(path, column));
+        }
     }
-    let rows = page_facts(file.metadata, file.key_leaf, file.value_leaf).max_key_page_rows;
+    let rows = key_page_facts(file.metadata, file.key_leaf).max_key_page_rows;
     if rows > thresholds::KEY_PAGE_ROWS_LARGE {
         findings.push(Finding::cost(
             FindingCode::LargeKeyPages,
@@ -1197,9 +1447,30 @@ fn file_capping_findings(file: &FileView<'_>, layout: &TableLayout, findings: &m
     }
 }
 
+/// `dictionary_encoded_value` on value column `column` of the file at
+/// `path`.
+fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
+    Finding::cost(
+        FindingCode::DictionaryEncodedValue,
+        Some(path),
+        format!(
+            "value column {value} is dictionary-encoded; a hit naming it fetches its dictionary page besides the value page, {gets} extra GET ({property}=false)",
+            value = column.name,
+            gets = DICTIONARY_PAGE_GETS,
+            property = WriterProperty::EnableDictionary,
+        ),
+        Penalty {
+            extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
+            ..Penalty::default()
+        },
+        Some(WriterProperty::EnableDictionary),
+    )
+    .with_column(&column.name)
+}
+
 /// The per-file advice apart from the bloom filter: bounds, column index,
-/// value pages (over the advice line, and over the lookup's ceiling), key
-/// length, file size. The one `f64` comparison is on
+/// each value column's pages (over the advice line, and over the lookup's
+/// ceiling), key length, file size. The one `f64` comparison is on
 /// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
 /// a zero denominator), so a plain comparison is total.
 fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
@@ -1229,34 +1500,8 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
             Some(WriterProperty::ColumnIndexTruncateLength),
         ));
     }
-    if report.avg_value_page_bytes > thresholds::VALUE_PAGE_BYTES_ADVICE {
-        findings.push(Finding::advice(
-            FindingCode::LargeValuePages,
-            Some(&report.path),
-            format!(
-                "value pages decompress to {bytes} bytes each on average, above {limit}; bound them by bytes ({size}={bound}) and shorten the page-size check interval ({check}), which the writer applies between batches",
-                bytes = report.avg_value_page_bytes,
-                limit = thresholds::VALUE_PAGE_BYTES_ADVICE,
-                size = WriterProperty::PageSizeBytes,
-                bound = contract::VALUE_PAGE_BYTES,
-                check = WriterProperty::RowGroupCheckRecordCount,
-            ),
-            Some(WriterProperty::PageSizeBytes),
-        ));
-    }
-    if report.avg_value_page_bytes > thresholds::MOST_VALUE_PAGE_BYTES {
-        findings.push(Finding::advice(
-            FindingCode::ValuePagesOverCeiling,
-            Some(&report.path),
-            format!(
-                "value pages decompress to {bytes} bytes each on average, above the {ceiling}-byte ceiling on a value page a lookup reads; a lookup into a value page above it is refused with a file fault, so its keys are not served. The trigger is the mean of the value column's uncompressed bytes over its data pages, the dictionary page's bytes included: it can miss one oversized page among smaller ones, and a large value dictionary can raise it above the ceiling when no page is ({size}={bound})",
-                bytes = report.avg_value_page_bytes,
-                ceiling = thresholds::MOST_VALUE_PAGE_BYTES,
-                size = WriterProperty::PageSizeBytes,
-                bound = contract::VALUE_PAGE_BYTES,
-            ),
-            Some(WriterProperty::PageSizeBytes),
-        ));
+    for column in &report.value_columns {
+        value_page_advice(&report.path, column, findings);
     }
     if report.max_key_bytes > contract::KEY_BYTES_ADVICE {
         findings.push(Finding::advice(
@@ -1284,6 +1529,47 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
             ),
             Some(WriterProperty::TargetFileSizeBytes),
         ));
+    }
+}
+
+/// The advice on one value column's pages: over the advice line, and over
+/// the lookup's ceiling, each naming the column.
+fn value_page_advice(path: &str, column: &ValueColumnReport, findings: &mut Vec<Finding>) {
+    let name = &column.column;
+    if column.avg_value_page_bytes > thresholds::VALUE_PAGE_BYTES_ADVICE {
+        findings.push(
+            Finding::advice(
+                FindingCode::LargeValuePages,
+                Some(path),
+                format!(
+                    "pages of value column {name} decompress to {bytes} bytes each on average, above {limit}; bound them by bytes ({size}={bound}) and shorten the page-size check interval ({check}), which the writer applies between batches",
+                    bytes = column.avg_value_page_bytes,
+                    limit = thresholds::VALUE_PAGE_BYTES_ADVICE,
+                    size = WriterProperty::PageSizeBytes,
+                    bound = contract::VALUE_PAGE_BYTES,
+                    check = WriterProperty::RowGroupCheckRecordCount,
+                ),
+                Some(WriterProperty::PageSizeBytes),
+            )
+            .with_column(name),
+        );
+    }
+    if column.avg_value_page_bytes > thresholds::MOST_VALUE_PAGE_BYTES {
+        findings.push(
+            Finding::advice(
+                FindingCode::ValuePagesOverCeiling,
+                Some(path),
+                format!(
+                    "pages of value column {name} decompress to {bytes} bytes each on average, above the {ceiling}-byte ceiling on a value page a lookup reads; a lookup into a value page above it is refused with a file fault, so a lookup naming the column is not served. The trigger is the mean of the column's uncompressed bytes over its data pages, the dictionary page's bytes included: it can miss one oversized page among smaller ones, and a large value dictionary can raise it above the ceiling when no page is ({size}={bound})",
+                    bytes = column.avg_value_page_bytes,
+                    ceiling = thresholds::MOST_VALUE_PAGE_BYTES,
+                    size = WriterProperty::PageSizeBytes,
+                    bound = contract::VALUE_PAGE_BYTES,
+                ),
+                Some(WriterProperty::PageSizeBytes),
+            )
+            .with_column(name),
+        );
     }
 }
 
@@ -1453,34 +1739,50 @@ fn compacted_level(g: &Generation, caps: &Caps) -> Option<Level> {
         .filter(|&compacted| compacted < caps.level)
 }
 
-/// `column_default` (RFD 023) when files of `g` were written before its
-/// value column was added and answer its default: how many, of how many,
-/// and the default they answer. Such a file costs no value-page GET for a
-/// hit, so a table mid-evolution costs less than its level and cost gauges
-/// predict, which describe the files that hold the column.
-fn column_default(g: &Generation) -> Option<Finding> {
-    let defaulted = g
-        .files
+/// The files of `g` that answer value column `column`, a position in its
+/// layout, by its default: written before the column was added (RFD 023).
+fn answering_default(g: &Generation, column: usize) -> usize {
+    g.files
         .iter()
-        .filter(|file| file.index.value_leaf().is_none())
-        .count();
-    if defaulted == 0 {
-        return None;
-    }
+        .filter(|file| file.index.value_leaf(column).is_none())
+        .count()
+}
+
+/// `column_default` (RFD 023), one per value column of `g` that files
+/// written before it was added answer by its default, naming it: how many
+/// files, of how many, and the default they answer. Such a file costs no
+/// value-page GET for a hit naming the column, so a table mid-evolution
+/// costs less than its level and cost gauges predict, which describe the
+/// files that hold the column.
+fn column_defaults(g: &Generation) -> Vec<Finding> {
     let total = g.files.len();
-    let column = &g.layout.value_column;
-    let default = g.layout.value_default.as_ref().map_or_else(
-        || "null".to_string(),
-        |bytes| format!("its initial-default of {} bytes", bytes.len()),
-    );
-    Some(Finding::advice(
-        FindingCode::ColumnDefault,
-        None,
-        format!(
-            "{defaulted} of {total} data files were written before value column {column} was added and answer {default} for it, reading no value page; a rewrite of those files, such as a compaction, writes the column into them",
-        ),
-        None,
-    ))
+    g.layout
+        .value_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(at, column)| {
+            let defaulted = answering_default(g, at);
+            if defaulted == 0 {
+                return None;
+            }
+            let name = &column.name;
+            let default = column.default.as_ref().map_or_else(
+                || "null".to_string(),
+                |bytes| format!("its initial-default of {} bytes", bytes.len()),
+            );
+            Some(
+                Finding::advice(
+                    FindingCode::ColumnDefault,
+                    None,
+                    format!(
+                        "{defaulted} of {total} data files were written before value column {name} was added and answer {default} for it, reading no value page; a rewrite of those files, such as a compaction, writes the column into them",
+                    ),
+                    None,
+                )
+                .with_column(name),
+            )
+        })
+        .collect()
 }
 
 /// `predicted` with each tier's memory grown by `delete_bound`, the bound on
@@ -1809,6 +2111,11 @@ mod tests {
         Option<String>,
     );
 
+    /// The codes of `capping`, in order.
+    fn codes(capping: &[Capping]) -> Vec<FindingCode> {
+        capping.iter().map(|capping| capping.code).collect()
+    }
+
     fn shapes_of(findings: &[Finding]) -> Vec<Shape> {
         findings
             .iter()
@@ -1847,6 +2154,8 @@ mod tests {
                 "{:?}",
                 finding.code
             );
+            let named = finding.code().per_column().then_some(VALUE_COLUMN);
+            assert_eq!(finding.column(), named, "{:?}", finding.code);
         }
     }
 
@@ -2030,12 +2339,17 @@ mod tests {
             assert_eq!(file.rows, loaded.index.rows());
             assert_eq!(file.row_groups, 1);
             assert_eq!(file.key_pages, 1);
-            assert_eq!(file.value_pages, 1);
+            let [value] = &file.value_columns[..] else {
+                panic!("one value column");
+            };
+            assert_eq!(value.column, VALUE_COLUMN);
+            assert!(!value.answers_default);
+            assert_eq!(value.value_pages, 1);
             assert_eq!(file.max_key_page_rows, loaded.index.rows());
             assert!(file.max_key_page_rows <= contract::PAGE_ROWS);
             assert_eq!(file.max_key_bytes, size_of::<i64>());
-            assert!(file.avg_value_page_bytes <= VALUE_PAGE_BYTES_ADVICE);
-            assert!(file.pages_aligned);
+            assert!(value.avg_value_page_bytes <= VALUE_PAGE_BYTES_ADVICE);
+            assert!(value.pages_aligned);
             assert!(file.dictionary_columns.is_empty());
             assert!(file.bloom_bytes.is_some());
             assert!(file.bloom_bits_per_key.unwrap() >= BLOOM_BITS_PER_KEY_MIN);
@@ -2422,8 +2736,8 @@ mod tests {
                 Some(table.path_of("f")),
             )],
         );
-        assert_eq!(report.files[0].value_pages, 1);
-        assert!(report.files[0].avg_value_page_bytes > VALUE_PAGE_BYTES_ADVICE);
+        assert_eq!(report.files[0].value_columns[0].value_pages, 1);
+        assert!(report.files[0].value_columns[0].avg_value_page_bytes > VALUE_PAGE_BYTES_ADVICE);
     }
 
     /// A value page just over the lookup ceiling draws `value_pages_over_ceiling`
@@ -2465,10 +2779,10 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(report.files[0].value_pages, 1);
-        assert!(report.files[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
+        assert_eq!(report.files[0].value_columns[0].value_pages, 1);
+        assert!(report.files[0].value_columns[0].avg_value_page_bytes > MOST_VALUE_PAGE_BYTES);
         let error = generation
-            .lookup(&keys[0], &testing::cache().await)
+            .lookup_first(&keys[0], &testing::cache().await)
             .await
             .unwrap_err();
         assert!(
@@ -2722,7 +3036,7 @@ mod tests {
             Level::Optimal,
         );
         assert_eq!(
-            report.capping_codes(),
+            codes(&report.capping()),
             [
                 FindingCode::DictionaryEncodedValue,
                 FindingCode::NoBucketPartition
@@ -2800,19 +3114,49 @@ mod tests {
     async fn test_judge_refuses_below_level_only_under_strict() {
         let (_table, report, _json) = dictionary_value_report().await;
         let summary = &report.summary;
-        let codes = report.capping_codes();
-        judge(TABLE, summary.level, &codes, Level::Optimal, false).unwrap();
-        let reason = testing::refusal_of(judge(TABLE, summary.level, &codes, Level::Optimal, true));
+        let codes = report.capping();
+        judge(
+            TABLE,
+            summary.level,
+            &summary.column_levels(),
+            &codes,
+            Level::Optimal,
+            false,
+        )
+        .unwrap();
+        let reason = testing::refusal_of(judge(
+            TABLE,
+            summary.level,
+            &summary.column_levels(),
+            &codes,
+            Level::Optimal,
+            true,
+        ));
         assert_eq!(
             reason,
             RefusalReason::BelowLevel {
                 declared: Level::Optimal,
                 achieved: Level::Balanced,
-                findings: vec![FindingCode::DictionaryEncodedValue],
+                columns: vec![crate::check::ColumnLevel {
+                    column: VALUE_COLUMN.to_string(),
+                    level: Level::Balanced,
+                }],
+                findings: vec![Capping {
+                    code: FindingCode::DictionaryEncodedValue,
+                    column: Some(VALUE_COLUMN.to_string()),
+                }],
             }
         );
         for declared in [Level::Balanced, Level::Permissive] {
-            judge(TABLE, summary.level, &codes, declared, true).unwrap();
+            judge(
+                TABLE,
+                summary.level,
+                &summary.column_levels(),
+                &codes,
+                declared,
+                true,
+            )
+            .unwrap();
         }
 
         let advice_only = WriterLayout {
@@ -2825,7 +3169,8 @@ mod tests {
         judge(
             TABLE,
             report.summary.level,
-            &report.capping_codes(),
+            &report.summary.column_levels(),
+            &report.capping(),
             Level::Optimal,
             true,
         )
@@ -2852,7 +3197,7 @@ mod tests {
             Level::Balanced,
         );
         assert_eq!(
-            report.capping_codes(),
+            codes(&report.capping()),
             [
                 FindingCode::DictionaryEncodedValue,
                 FindingCode::OverlappingFiles
@@ -2861,7 +3206,8 @@ mod tests {
         let reason = testing::refusal_of(judge(
             TABLE,
             report.summary.level,
-            &report.capping_codes(),
+            &report.summary.column_levels(),
+            &report.capping(),
             Level::Balanced,
             true,
         ));
@@ -2870,7 +3216,14 @@ mod tests {
             RefusalReason::BelowLevel {
                 declared: Level::Balanced,
                 achieved: Level::Permissive,
-                findings: vec![FindingCode::OverlappingFiles],
+                columns: vec![crate::check::ColumnLevel {
+                    column: VALUE_COLUMN.to_string(),
+                    level: Level::Permissive,
+                }],
+                findings: vec![crate::check::Capping {
+                    code: FindingCode::OverlappingFiles,
+                    column: None,
+                }],
             }
         );
     }
@@ -2901,6 +3254,7 @@ mod tests {
                     FileIndex::predicted_resident_bytes(
                         file.index.metadata(),
                         file.index.key_leaf(),
+                        &file.index.held_value_leaves(),
                         file.index.key_type(),
                         file.index.handle(),
                     )
@@ -3105,7 +3459,7 @@ mod tests {
         let (_table, _, after) = deleted_file_table(Residency::Full, true, scratch.path()).await;
         let caps = layout_caps(&LayoutView::of(&after));
         assert_eq!(caps.level, Level::Permissive);
-        assert_eq!(caps.codes(), [FindingCode::OverlappingFiles]);
+        assert_eq!(codes(&caps.capping()), [FindingCode::OverlappingFiles]);
         assert_eq!(compacted_level(&after, &caps), Some(Level::Optimal));
         let report = diagnose(&after, Level::Optimal);
         assert_eq!(pending(&report).len(), 1);
@@ -3154,7 +3508,7 @@ mod tests {
         let caps = layout_caps(&LayoutView::of(&generation));
         assert_eq!(caps.level, Level::Permissive);
         assert_eq!(
-            caps.codes(),
+            codes(&caps.capping()),
             [
                 FindingCode::NoBucketPartition,
                 FindingCode::OverlappingFiles
@@ -3191,10 +3545,21 @@ mod tests {
                 "predicted",
                 "level_by_residency",
                 "lookup_cost",
+                "value_columns",
                 "deletes",
                 "capping",
                 "advice",
             ])
+        );
+        assert_eq!(
+            summary["value_columns"],
+            serde_json::json!([{
+                "column": VALUE_COLUMN,
+                "level": Level::Balanced.to_string(),
+                "gets_per_hit": VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
+                "files_answering_default": 0,
+            }]),
+            "the dictionary-encoded column is balanced at two GETs"
         );
         assert_eq!(
             summary["deletes"],
@@ -3258,9 +3623,16 @@ mod tests {
         );
         assert_eq!(finding["penalty"]["files_probed_per_lookup"], Json::Null);
         assert_eq!(finding["file"], Json::String(table.path_of("f")));
+        assert_eq!(finding["column"], Json::String(VALUE_COLUMN.to_string()));
         assert!(finding["message"].is_string());
         let advice = Finding::advice(FindingCode::LongKeys, None, String::new(), None);
-        assert_eq!(serde_json::to_value(&advice).unwrap()["caps"], Json::Null);
+        let advice = serde_json::to_value(&advice).unwrap();
+        assert_eq!(advice["caps"], Json::Null);
+        assert_eq!(
+            advice["column"],
+            Json::Null,
+            "a finding about the row names no column"
+        );
     }
 
     #[tokio::test]
@@ -3277,12 +3649,9 @@ mod tests {
                 "rows",
                 "row_groups",
                 "key_pages",
-                "value_pages",
                 "max_key_page_rows",
                 "max_key_bytes",
-                "avg_value_page_bytes",
-                "avg_value_bytes",
-                "pages_aligned",
+                "value_columns",
                 "dictionary_columns",
                 "bloom_bytes",
                 "bloom_bits_per_key",
@@ -3298,5 +3667,20 @@ mod tests {
             Json::Array(vec![Json::String(VALUE_COLUMN.to_string())])
         );
         assert_eq!(file["bounds_present"], Json::Bool(true));
+        let column = file["value_columns"][0].as_object().unwrap();
+        let column_names: BTreeSet<&str> = column.keys().map(String::as_str).collect();
+        assert_eq!(
+            column_names,
+            BTreeSet::from([
+                "column",
+                "answers_default",
+                "value_pages",
+                "avg_value_page_bytes",
+                "avg_value_bytes",
+                "pages_aligned",
+            ])
+        );
+        assert_eq!(column["column"], Json::String(VALUE_COLUMN.to_string()));
+        assert_eq!(column["answers_default"], Json::Bool(false));
     }
 }

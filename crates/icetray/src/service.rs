@@ -6,8 +6,9 @@
 //! `MultiGet` run under the server's deadline for the method (RFD 013); a
 //! client's own deadline is tonic's, which drops the call at it. Together
 //! they hold at most `server.max_in_flight` slots, and a call that finds
-//! none is refused at once. A `MultiGet` carries at most
-//! `server.max_multi_get_keys` keys.
+//! none is refused at once. A `MultiGet` asks for at most
+//! `server.max_multi_get_values` values, its keys times the columns it
+//! names (RFD 022).
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,12 +18,14 @@ use arc_swap::Guard;
 use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{CacheError, Error, Key, KeyType, Opened, Table, Tables, Value, approx};
+use icetray_core::{
+    CacheError, Error, Key, KeyType, Opened, Row, Table, TableLayout, Tables, ValueType, approx,
+};
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
-    GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, TableInfoRequest,
-    TableInfoResponse,
+    ColumnValue, GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, NullValue,
+    TableInfoRequest, TableInfoResponse, column_value,
 };
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
@@ -87,8 +90,8 @@ pub struct Service {
     multi_get_deadline: Duration,
     /// `Get` and `MultiGet` together.
     slots: Slots,
-    /// The most keys one `MultiGet` may carry.
-    max_multi_get_keys: usize,
+    /// The most values one `MultiGet` may ask for.
+    max_multi_get_values: usize,
 }
 
 impl Service {
@@ -100,7 +103,7 @@ impl Service {
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
             slots: Slots::new(server.max_in_flight),
-            max_multi_get_keys: server.max_multi_get_keys,
+            max_multi_get_values: server.max_multi_get_values,
         }
     }
 
@@ -204,9 +207,25 @@ impl From<CallFault> for Status {
         match fault {
             CallFault::DeadlineExceeded { .. } => Self::deadline_exceeded(message),
             CallFault::Overloaded { .. } => Self::resource_exhausted(message),
-            CallFault::TooManyKeys { .. } => Self::invalid_argument(message),
+            CallFault::TooManyValues { .. } => Self::invalid_argument(message),
         }
     }
+}
+
+/// The values `request` asks for, its keys times the columns it names, a
+/// presence-only call counting one per key (RFD 022), held to `limit`:
+/// `CallFault::TooManyValues` over it, before any lookup or slot.
+fn check_values(request: &MultiGetRequest, limit: usize) -> Result<(), CallFault> {
+    let keys = request.keys.len();
+    let columns = request.columns.len();
+    if keys.saturating_mul(columns.max(1)) > limit {
+        return Err(CallFault::TooManyValues {
+            keys,
+            columns,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 /// Runs `work` under the server's deadline `after`; past it, `work` is
@@ -222,7 +241,8 @@ async fn within<T>(
         .map_err(|_elapsed| CallFault::DeadlineExceeded { after })?
 }
 
-/// Core's error as a status (RFD 010): a key of the wrong type is
+/// Core's error as a status (RFD 010): a key of the wrong type, and a
+/// column the table does not serve or named twice (RFD 022), is
 /// `INVALID_ARGUMENT`; a page fetch that ran past `server.get_deadline` is
 /// `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a `Get`'s
 /// deadline and its fetch's pass moments apart, and the call answers one
@@ -237,7 +257,7 @@ async fn within<T>(
 pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {
-        Error::KeyType { .. } => Status::invalid_argument(message),
+        Error::KeyType { .. } | Error::ColumnRequest { .. } => Status::invalid_argument(message),
         Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }
         | Error::ObjectStore(_)
@@ -263,15 +283,59 @@ pub fn status_from(error: &Error) -> Status {
     }
 }
 
-/// A lookup's outcome on the wire: the presence and the value bytes, empty
-/// for a null or absent key. A present value's bytes are the lookup's own,
-/// moved into the message, not copied.
-pub fn presence(value: Value) -> (v1::Presence, Bytes) {
-    match value {
-        Value::Present(bytes) => (v1::Presence::Present, bytes),
-        Value::Null => (v1::Presence::Null, Bytes::new()),
-        Value::Absent => (v1::Presence::Absent, Bytes::new()),
+/// A lookup's outcome on the wire: the presence and, for a present key, one
+/// value per column named, in order, each its bytes or `null`; none for an
+/// absent key. A present value's bytes are the lookup's own, moved into the
+/// message, not copied.
+pub fn row_wire(row: Row) -> (v1::Presence, Vec<ColumnValue>) {
+    match row {
+        Row::Present(values) => (
+            v1::Presence::Present,
+            values.into_iter().map(column_value_wire).collect(),
+        ),
+        Row::Absent => (v1::Presence::Absent, Vec::new()),
     }
+}
+
+/// One column's value on the wire: its bytes, or `null` for a null, which
+/// is not a value of zero length.
+fn column_value_wire(value: Option<Bytes>) -> ColumnValue {
+    let kind = match value {
+        Some(bytes) => column_value::Kind::Value(bytes),
+        None => column_value::Kind::NullValue(NullValue {}),
+    };
+    ColumnValue { kind: Some(kind) }
+}
+
+/// The table's value columns on the wire, in the layout's order, which is
+/// by name.
+fn value_columns_wire(layout: &TableLayout) -> Vec<v1::ValueColumn> {
+    layout
+        .value_columns
+        .iter()
+        .map(|column| {
+            let (value_type, width) = match column.value_type {
+                ValueType::Binary => (v1::ValueType::Binary, 0),
+                ValueType::Fixed { width } => (
+                    v1::ValueType::Fixed,
+                    u32::try_from(width).expect(
+                        "a layout admits a fixed column only as wide as a Parquet type length, an i32",
+                    ),
+                ),
+                ValueType::String => (v1::ValueType::String, 0),
+            };
+            v1::ValueColumn {
+                name: column.name.clone(),
+                value_type: i32::from(value_type),
+                width,
+            }
+        })
+        .collect()
+}
+
+/// The column names a request carries, as the core takes them.
+fn names(columns: &[String]) -> Vec<&str> {
+    columns.iter().map(String::as_str).collect()
 }
 
 /// The table's key type on the wire.
@@ -291,11 +355,14 @@ impl Service {
         let table = table(&tables, &request.table)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, key_type)?;
-        let lookup = table.get(&key).await.map_err(|error| status_from(&error))?;
-        let (presence, value) = presence(lookup.value);
+        let lookup = table
+            .get(&key, &names(&request.columns))
+            .await
+            .map_err(|error| status_from(&error))?;
+        let (presence, values) = row_wire(lookup.row);
         Ok(Response::new(GetResponse {
             presence: i32::from(presence),
-            value,
+            values,
             snapshot_id: lookup.snapshot_id.0,
         }))
     }
@@ -314,17 +381,17 @@ impl Service {
             .map(|key| key_from_wire(Some(key), key_type))
             .collect::<Result<Vec<Key>, WireKeyFault>>()?;
         let lookup = table
-            .multi_get(&keys)
+            .multi_get(&keys, &names(&request.columns))
             .await
             .map_err(|error| status_from(&error))?;
         let results = lookup
-            .values
+            .rows
             .into_iter()
-            .map(|value| {
-                let (presence, value) = presence(value);
+            .map(|row| {
+                let (presence, values) = row_wire(row);
                 Hit {
                     presence: i32::from(presence),
-                    value,
+                    values,
                 }
             })
             .collect();
@@ -340,20 +407,13 @@ impl Service {
         within(self.get_deadline, self.lookup(request)).await
     }
 
-    /// `MultiGet`, held to `max_multi_get_keys`, admitted, and inside its
-    /// deadline.
+    /// `MultiGet`, held to `max_multi_get_values` (`check_values`),
+    /// admitted, and inside its deadline.
     async fn answer_multi_get(
         &self,
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        let keys = request.keys.len();
-        if keys > self.max_multi_get_keys {
-            return Err(CallFault::TooManyKeys {
-                keys,
-                limit: self.max_multi_get_keys,
-            }
-            .into());
-        }
+        check_values(&request, self.max_multi_get_values)?;
         let _slot = self.slots.admit()?;
         within(self.multi_get_deadline, self.lookup_batch(request)).await
     }
@@ -377,6 +437,7 @@ impl Service {
             records: generation.records,
             key_type: i32::from(key_type_wire(generation.layout.key_type)),
             index_bytes: approx::count(generation.index_bytes),
+            value_columns: value_columns_wire(&generation.layout),
         }))
     }
 }
@@ -409,7 +470,9 @@ mod tests {
 
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
-    use icetray_core::{FileFault, LocalFault, RefusalReason, Storage, TableFault};
+    use icetray_core::{
+        ColumnRequestFault, FileFault, LocalFault, RefusalReason, Storage, TableFault,
+    };
     use tonic::Code;
 
     use super::*;
@@ -553,8 +616,9 @@ mod tests {
                 Code::ResourceExhausted,
             ),
             (
-                CallFault::TooManyKeys {
+                CallFault::TooManyValues {
                     keys: SAMPLE_LIMIT + 1,
+                    columns: 1,
                     limit: SAMPLE_LIMIT,
                 },
                 Code::InvalidArgument,
@@ -694,8 +758,32 @@ mod tests {
             ),
         ]
         .into_iter()
+        .chain(column_cases())
         .chain(canceled_cases())
         .collect()
+    }
+
+    /// A column a lookup names that the table does not serve, and one it
+    /// names twice, beside their code.
+    fn column_cases() -> [(Error, Code); 2] {
+        [
+            (
+                Error::ColumnRequest {
+                    table: TABLE.to_string(),
+                    column: "absent".to_string(),
+                    fault: ColumnRequestFault::NotServed,
+                },
+                Code::InvalidArgument,
+            ),
+            (
+                Error::ColumnRequest {
+                    table: TABLE.to_string(),
+                    column: "value".to_string(),
+                    fault: ColumnRequestFault::Repeated,
+                },
+                Code::InvalidArgument,
+            ),
+        ]
     }
 
     /// The variants a canceled task ends in, beside their code.
@@ -751,19 +839,105 @@ mod tests {
     }
 
     #[test]
-    fn test_presence_per_value() {
+    fn test_row_wire_carries_each_value_in_order_null_apart_from_zero_length() {
         let bytes = Bytes::from_static(STR_VALUE.as_bytes());
-        let (present, wire) = presence(Value::Present(bytes.clone()));
-        assert_eq!((present, &wire), (v1::Presence::Present, &bytes));
+        let (present, wire) = row_wire(Row::Present(vec![
+            None,
+            Some(bytes.clone()),
+            Some(Bytes::new()),
+        ]));
+        assert_eq!(present, v1::Presence::Present);
         assert_eq!(
-            wire.as_ptr(),
+            wire,
+            [
+                ColumnValue {
+                    kind: Some(column_value::Kind::NullValue(NullValue {})),
+                },
+                ColumnValue {
+                    kind: Some(column_value::Kind::Value(bytes.clone())),
+                },
+                ColumnValue {
+                    kind: Some(column_value::Kind::Value(Bytes::new())),
+                },
+            ]
+        );
+        let Some(column_value::Kind::Value(carried)) = &wire[1].kind else {
+            panic!("the second value is bytes");
+        };
+        assert_eq!(
+            carried.as_ptr(),
             bytes.as_ptr(),
             "the message carries the lookup's bytes, not a copy"
         );
-        assert_eq!(presence(Value::Null), (v1::Presence::Null, Bytes::new()));
         assert_eq!(
-            presence(Value::Absent),
-            (v1::Presence::Absent, Bytes::new())
+            row_wire(Row::Present(Vec::new())),
+            (v1::Presence::Present, Vec::new()),
+            "a presence-only answer carries no value"
+        );
+        assert_eq!(row_wire(Row::Absent), (v1::Presence::Absent, Vec::new()));
+    }
+
+    #[test]
+    fn test_check_values_counts_keys_times_columns_and_a_presence_only_key_as_one() {
+        let request = |keys: usize, columns: usize| MultiGetRequest {
+            table: TABLE.to_string(),
+            keys: vec![wire(v1::key::Key::Long(LONG_VALUE)); keys],
+            columns: (0..columns).map(|at| format!("c{at}")).collect(),
+        };
+        let columns_named = 2;
+        let at_limit = SAMPLE_LIMIT / columns_named;
+        assert!(check_values(&request(at_limit, columns_named), SAMPLE_LIMIT).is_ok());
+        assert!(matches!(
+            check_values(&request(at_limit + 1, columns_named), SAMPLE_LIMIT),
+            Err(CallFault::TooManyValues {
+                keys,
+                columns: 2,
+                limit: SAMPLE_LIMIT,
+            }) if keys == at_limit + 1
+        ));
+        assert!(check_values(&request(SAMPLE_LIMIT, 0), SAMPLE_LIMIT).is_ok());
+        assert!(matches!(
+            check_values(&request(SAMPLE_LIMIT + 1, 0), SAMPLE_LIMIT),
+            Err(CallFault::TooManyValues { columns: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn test_value_columns_wire_names_each_type_and_a_fixed_width() {
+        let fixed_width = 16;
+        let column = |name: &str, value_type| icetray_core::ValueColumnLayout {
+            name: name.to_string(),
+            field_id: 0,
+            value_type,
+            default: None,
+        };
+        let layout = TableLayout {
+            bucketing: None,
+            key_column: "key".to_string(),
+            key_field_id: 0,
+            key_type: KeyType::Long,
+            key_width: None,
+            value_columns: vec![
+                column("a", ValueType::Binary),
+                column("b", ValueType::Fixed { width: fixed_width }),
+                column("c", ValueType::String),
+            ],
+        };
+        let wire: Vec<(String, i32, u32)> = value_columns_wire(&layout)
+            .into_iter()
+            .map(|column| (column.name, column.value_type, column.width))
+            .collect();
+        assert_eq!(
+            wire,
+            [
+                ("a".to_string(), i32::from(v1::ValueType::Binary), 0),
+                (
+                    "b".to_string(),
+                    i32::from(v1::ValueType::Fixed),
+                    u32::try_from(fixed_width).unwrap()
+                ),
+                ("c".to_string(), i32::from(v1::ValueType::String), 0),
+            ]
         );
     }
 

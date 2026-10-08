@@ -5,6 +5,11 @@
 > column can be added to a served table without a rewrite, and a served
 > column is not renamed. See RFD 023.
 
+> Updated 2026-10-07: a table serves one or more value columns, or none
+> for a membership set, each read only when a lookup names it, and one
+> packed column performs best. A null is a value of a present row. See
+> RFD 022.
+
 ## Problem
 
 icetray serves a lookup by reading the Parquet data files a batch pipeline
@@ -18,26 +23,35 @@ comes from and whether the reader may assume it.
 
 ## Decision
 
-Tables will be served from a layout their writer produces, and the doctor
-will check the clauses RFD 016 (Doctor) lists rather than the reader
-assuming any of it. The layout is one key column of type long, string,
-binary, or uuid; one value column of type binary, fixed, or string, with
-nulls allowed; `bucket(N, key)` partitioning; each file sorted by key;
-dictionary encoding off; 1,000-row pages; a full-length column index and
-manifest metrics on the key; a bloom filter on the key; zstd compression;
-data files of 32 to 64 MiB; and value pages bounded by bytes for large
+Tables will be served from a layout their writer produces, and the
+doctor will check the clauses RFD 016 (Doctor) lists rather than the
+reader assuming any of it. The layout is one key column of type long,
+string, binary, or uuid; one or more value columns of type binary,
+fixed, or string, with nulls allowed, one packed column performing best;
+`bucket(N, key)` partitioning; each file sorted by key; dictionary
+encoding off; 1,000-row pages; a full-length column index and manifest
+metrics on the key; a bloom filter on the key; zstd compression; data
+files of 32 to 64 MiB; and value pages bounded by bytes for large
 values.
 
 The clauses and their reasons follow. The table properties that produce
 them are the writer recipe in the
 [prototype findings, method](../analysis/2026-09-10-prototype-findings.md#writer-recipe-for-the-s3-tables).
 
-- One key column and one value column of type binary, fixed, or string,
-  with nulls allowed. icetray serves the value's bytes unchanged and
-  answers a null as present with no value, which is distinct from absent
+- One key column and one or more value columns of type binary, fixed, or
+  string, with nulls allowed (RFD 022 (Value columns)). icetray serves
+  each value's bytes unchanged and answers a null as a null value of a
+  present row, which is distinct from absent and from a zero-length value
   (RFD 010 (Transport and client contract)). What a null means is the
-  table owner's rule, and a table used as a membership set spends no bytes
-  on values at all. The key's rules are in RFD 008 (Keys).
+  table owner's rule, and a table used as a membership set names no value
+  columns at all. The key's rules are in RFD 008 (Keys).
+- One packed column performs best, since each column a lookup names adds
+  a range GET to its cold hit. A row packed into one binary column at
+  write time, as a serialized protobuf whose field addition handles
+  evolution, costs one GET. A table read by several kinds of caller
+  splits its row along how it is read: fields read together share a
+  column, and a large part read on its own, such as an embedding, gets a
+  column of its own.
 - Columns found by name and field id, as Iceberg's writers record them
   (RFD 023 (Column resolution)). A value column added to the schema after
   a file was written answers its default in that file, so a column can be
@@ -55,9 +69,10 @@ them are the writer recipe in the
   second GET per hit
   ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
 - 1,000-row pages, so that a lookup decodes one key page and fetches one
-  value page. The row count sets the CPU a lookup spends decoding a key
-  page, and 1,000 is the count behind the layout's measurements
-  ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
+  value page per column it names. The row count sets the CPU a lookup
+  spends decoding a key page, and 1,000 is the count behind the layout's
+  measurements ([prototype findings, finding
+  1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
 - Value pages bounded by bytes for large values, with the writer's
   page-size check interval shortened so that the bound takes effect. A row
   limit alone leaves pages of many megabytes per cold hit
@@ -109,14 +124,12 @@ Bounding value pages by rows only. Rejected because the writers examined
 both check the byte limit lazily
 ([prototype findings, finding 6](../analysis/2026-09-10-prototype-findings.md#6-a-row-limit-alone-does-not-bound-page-size-for-large-values-and-both-writers-check-the-byte-limit-lazily)).
 
-Several value columns, with the caller choosing which to read. Rejected
-for the first version. A row's columns live in separate column chunks at
-unrelated offsets, so each column asked for adds a range GET to every cold
-hit, and typed per-column values with projection amount to most of a
-query API. Packing the row into one binary column at write time, as a
-serialized protobuf whose field addition handles evolution, costs one GET
-instead. If projection is ever wanted, which tier it belongs to is RFD
-007's call.
+Typed value columns, such as a long or a double read by name. Rejected
+because such a value has no "bytes unchanged" form, and typed per-column
+values with projection amount to most of a query API. Several columns of
+bytes, each read only when a lookup names it, are RFD 022 (Value
+columns). If projection inside a packed column is ever wanted, which
+tier it belongs to is RFD 007's call.
 
 Refusing null values. Rejected because a key with a null value is a
 legitimate row and the wire can say so without ambiguity. Refusing nulls

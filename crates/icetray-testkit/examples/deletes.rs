@@ -26,19 +26,18 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use iceberg::spec::DataFile;
-use icetray_core::config::{LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig};
+use icetray_core::config::{Residency, ServerConfig, SourceConfig, TableConfig};
 use icetray_core::{
-    Generation, Key, KeyType, LocalDir, PER_MILLE, Storage, TableSource, TableSummary, Value,
-    approx, diagnose, time,
+    Generation, Key, KeyType, PER_MILLE, Row, TableSource, TableSummary, approx, diagnose, time,
 };
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
 use icetray_testkit::keys::FIRST_VERSION;
 use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, absent_key_from, write_fixture,
@@ -448,24 +447,11 @@ async fn build(
     source: &SourceConfig,
     local: &Path,
 ) -> HarnessResult<Served> {
-    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = match residency {
-        Residency::Disk => Some(Arc::new(LocalDir::open(
-            &LocalConfig {
-                dir: local.to_path_buf(),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            storage.stats(),
-        )?)),
-        Residency::Full | Residency::Bloom => None,
-    };
     let config = TableConfig {
         source: source.clone(),
         ..fixture.config(residency, false)
     };
-    Ok(verify::build(
-        storage,
+    Ok(verify::build_in(
         config,
         TableSource::from_config(source).await?,
         local,
@@ -554,7 +540,7 @@ struct Layer {
 struct Ask {
     key: Key,
     row: Option<u64>,
-    expected: Value,
+    expected: Row,
 }
 
 impl ProbeTable {
@@ -680,7 +666,7 @@ impl ProbeTable {
 
     /// What a lookup of class-zero row `row` answers: its value where a
     /// file holds the row live, else absent.
-    fn expected(&self, row: u64) -> Value {
+    fn expected(&self, row: u64) -> Row {
         let live = self
             .files
             .iter()
@@ -688,7 +674,7 @@ impl ProbeTable {
         if live {
             self.fixture.expected(&self.key(row))
         } else {
-            Value::Absent
+            Row::Absent
         }
     }
 
@@ -712,12 +698,12 @@ impl ProbeTable {
                 Variant::Control => Ask {
                     key: absent_key_from(&self.key(row)),
                     row: None,
-                    expected: Value::Absent,
+                    expected: Row::Absent,
                 },
                 Variant::Updated | Variant::Shadowed => Ask {
                     key: self.key(row),
                     row: Some(row),
-                    expected: Value::Absent,
+                    expected: Row::Absent,
                 },
             })
             .collect()
@@ -923,14 +909,14 @@ async fn asked(served: &Served, asks: &[Ask]) -> HarnessResult<(Latencies, f64)>
     let mut took = Vec::with_capacity(asks.len());
     for ask in asks {
         let started = Instant::now();
-        let found = served.table.get(&ask.key).await?;
+        let found = served.table.get(&ask.key, &[VALUE_COLUMN]).await?;
         took.push(started.elapsed());
-        if found.value != ask.expected {
+        if found.row != ask.expected {
             return Err(format!(
                 "{:?} answered present {}, expected present {}",
                 ask.key,
-                matches!(found.value, Value::Present(_)),
-                matches!(ask.expected, Value::Present(_)),
+                verify::one_value(&found.row).is_some(),
+                verify::one_value(&ask.expected).is_some(),
             )
             .into());
         }

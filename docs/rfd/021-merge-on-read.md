@@ -10,6 +10,10 @@
 > it sits beside; delete-state memory is stated as measured
 > ([analysis](../analysis/2026-10-07-merge-on-read-costs.md)).
 
+> Updated 2026-10-07: a live row's value pages are those of the columns
+> the lookup names, and deletes are checked once per row, whatever the
+> columns. See RFD 022.
+
 ## Problem
 
 RFD 009 (Writes between builds) refuses every snapshot that carries a
@@ -200,7 +204,9 @@ copies are refused as `duplicate_keys`.
 A lookup finds the key's row in a candidate file exactly as RFD 006
 (Lookup hot path) describes, then checks that file's bitmap before it
 reads anything more. A deleted row is skipped and the lookup moves to the
-next candidate, and only a live row's value page is fetched.
+next candidate, and only a live row's value pages are fetched, those of
+the columns the lookup names (RFD 022 (Value columns)). The bitmap is
+checked once per row, however many columns are named.
 
 Candidates are probed in descending data sequence number across every
 bucketing, with ties broken by the generation's file order, and the cost
@@ -212,10 +218,10 @@ older copies.
 
 What a lookup pays, by residency:
 
-- `full`: the key page is in memory. A hit costs one GET and a miss none,
-  deleted or not.
+- `full`: the key page is in memory. A hit costs one GET per named
+  column and a miss none, deleted or not.
 - `disk`: the key page is read from the local chunk file. A hit costs one
-  GET and a miss none.
+  GET per named column and a miss none.
 - `bloom`: a deleted row is still in its file's bloom filter, so a miss on
   a deleted key costs one key-page GET for each file holding a deleted
   copy, where an absent key costs one only at the false-positive rate. A

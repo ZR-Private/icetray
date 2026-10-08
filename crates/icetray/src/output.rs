@@ -9,9 +9,10 @@ use std::fmt;
 use std::io::Write as _;
 
 use base64::Engine as _;
-use icetray_core::generation::{Lookup, Value};
+use icetray_core::generation::{Lookup, Row};
 use icetray_core::{ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotId, TableSummary};
 use serde::Serialize;
+use serde::ser::SerializeMap as _;
 
 use crate::error::CliError;
 use crate::key_text;
@@ -33,27 +34,63 @@ pub enum Kind {
     Lookup,
 }
 
-/// A lookup's outcome as the `lookup` line carries it; the same three values
-/// as the wire (RFD 010). Serialized as the lowercase name.
+/// A lookup's outcome as the `lookup` line carries it; the same two values
+/// as the wire (RFD 010, RFD 022). Serialized as the lowercase name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Presence {
-    /// The key is in the snapshot with a non-null value.
+    /// The key is in the snapshot.
     Present,
-    /// The key is in the snapshot and its value is null.
-    Null,
     /// The key is not in the snapshot.
     Absent,
 }
 
 impl Presence {
-    /// The outcome of `value`.
-    pub fn of(value: &Value) -> Self {
-        match value {
-            Value::Present(_) => Self::Present,
-            Value::Null => Self::Null,
-            Value::Absent => Self::Absent,
+    /// The outcome of `row`.
+    pub fn of(row: &Row) -> Self {
+        match row {
+            Row::Present(_) => Self::Present,
+            Row::Absent => Self::Absent,
         }
+    }
+}
+
+/// One value as a `lookup` line carries it: standard base64 with padding,
+/// the text when its bytes are UTF-8, and its length.
+#[derive(Debug, Serialize)]
+pub struct ValueText {
+    base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utf8: Option<String>,
+    bytes: usize,
+}
+
+impl ValueText {
+    /// The text of `bytes`.
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            // intentional: a value that is not UTF-8 has no text form, and
+            // the base64 field already carries its bytes.
+            utf8: std::str::from_utf8(bytes).ok().map(str::to_string),
+            bytes: bytes.len(),
+        }
+    }
+}
+
+/// A present key's values by column name, in the order the columns were
+/// named, a null as `None`: serialized as one JSON object whose keys keep
+/// that order, a null value as JSON `null`.
+#[derive(Debug)]
+pub struct Values(Vec<(String, Option<ValueText>)>);
+
+impl Serialize for Values {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (column, value) in &self.0 {
+            map.serialize_entry(column, value)?;
+        }
+        map.end()
     }
 }
 
@@ -143,6 +180,7 @@ impl RefusalCode {
             | ErrorKind::Location
             | ErrorKind::Cache
             | ErrorKind::KeyType
+            | ErrorKind::ColumnRequest
             | ErrorKind::Table
             | ErrorKind::File
             | ErrorKind::NotReady
@@ -202,10 +240,10 @@ impl<'a> RefusalLine<'a> {
 
 /// One lookup of a `get` run, a `lookup` line: the key as the text `get`
 /// takes for it (`key_text::text`), so a `key` passed back to `get` looks
-/// up the same key, the outcome, the value as standard base64 with padding
-/// and, when its bytes are UTF-8, as text, the snapshot answered from, the
-/// GETs the lookup issued, and the time it took. The value fields are
-/// absent for a null or absent key.
+/// up the same key, the outcome, for a present key its `values` by column
+/// name in the order named (`Values`), the snapshot answered from, the GETs
+/// the lookup issued, and the time it took. `values` is absent for an
+/// absent key, and empty for a present one when no column was named.
 #[derive(Debug, Serialize)]
 pub struct LookupLine<'a> {
     kind: Kind,
@@ -213,34 +251,41 @@ pub struct LookupLine<'a> {
     key: String,
     presence: Presence,
     #[serde(skip_serializing_if = "Option::is_none")]
-    value_base64: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value_utf8: Option<String>,
-    value_bytes: usize,
+    values: Option<Values>,
     snapshot_id: SnapshotId,
     gets: u64,
     elapsed_micros: u64,
 }
 
 impl<'a> LookupLine<'a> {
-    /// The line for `lookup` of `key` on `table`, which issued `gets` GETs
-    /// and took `elapsed_micros`.
-    pub fn new(table: &'a str, key: &Key, lookup: &Lookup, gets: u64, elapsed_micros: u64) -> Self {
-        let bytes = match &lookup.value {
-            Value::Present(bytes) => Some(bytes.as_ref()),
-            Value::Null | Value::Absent => None,
+    /// The line for `lookup` of `key` on `table`, which named `columns`,
+    /// issued `gets` GETs, and took `elapsed_micros`.
+    pub fn new(
+        table: &'a str,
+        key: &Key,
+        columns: &[&str],
+        lookup: &Lookup,
+        gets: u64,
+        elapsed_micros: u64,
+    ) -> Self {
+        let values = match &lookup.row {
+            Row::Present(values) => Some(Values(
+                columns
+                    .iter()
+                    .zip(values)
+                    .map(|(&column, value)| {
+                        (column.to_string(), value.as_deref().map(ValueText::of))
+                    })
+                    .collect(),
+            )),
+            Row::Absent => None,
         };
         Self {
             kind: Kind::Lookup,
             table,
             key: key_text::text(key),
-            presence: Presence::of(&lookup.value),
-            value_base64: bytes
-                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
-            // intentional: a value that is not UTF-8 has no text form, and
-            // the base64 field already carries its bytes.
-            value_utf8: bytes.and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_string)),
-            value_bytes: bytes.map_or(0, <[u8]>::len),
+            presence: Presence::of(&lookup.row),
+            values,
             snapshot_id: lookup.snapshot_id,
             gets,
             elapsed_micros,
@@ -301,8 +346,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use icetray_core::{
-        DeleteSummary, FindingCode, KeyType, Level, LookupCost, Residency, ResidentBytes,
-        TableFault,
+        Capping, ColumnSummary, DeleteSummary, FindingCode, KeyType, Level, LookupCost, Residency,
+        ResidentBytes, TableFault, ValueColumnReport,
     };
     use serde_json::Value as Json;
 
@@ -316,6 +361,10 @@ mod tests {
 
     /// The snapshot every sample line names.
     const SNAPSHOT: i64 = 42;
+
+    /// The value column every sample names, and a second one.
+    const COLUMN: &str = "payload";
+    const OTHER_COLUMN: &str = "detail";
 
     /// A value whose bytes are not UTF-8.
     const BINARY_VALUE: [u8; 3] = [0xff, 0xfe, 0x00];
@@ -371,6 +420,12 @@ mod tests {
                 gets_per_miss: 0,
                 files_probed: 1,
             },
+            value_columns: vec![ColumnSummary {
+                column: COLUMN.to_string(),
+                level: Level::Optimal,
+                gets_per_hit: 1,
+                files_answering_default: 0,
+            }],
             deletes: DeleteSummary {
                 rows: 1,
                 files: 1,
@@ -394,12 +449,16 @@ mod tests {
             rows: 1,
             row_groups: 1,
             key_pages: 1,
-            value_pages: 1,
             max_key_page_rows: 1,
             max_key_bytes: 1,
-            avg_value_page_bytes: 1,
-            avg_value_bytes: 1,
-            pages_aligned: true,
+            value_columns: vec![ValueColumnReport {
+                column: COLUMN.to_string(),
+                answers_default: false,
+                value_pages: 1,
+                avg_value_page_bytes: 1,
+                avg_value_bytes: 1,
+                pages_aligned: true,
+            }],
             dictionary_columns: Vec::new(),
             bloom_bytes: None,
             bloom_bits_per_key: None,
@@ -410,11 +469,16 @@ mod tests {
         }
     }
 
-    fn lookup(value: Value) -> Lookup {
+    fn lookup(row: Row) -> Lookup {
         Lookup {
-            value,
+            row,
             snapshot_id: SnapshotId(SNAPSHOT),
         }
+    }
+
+    /// A present key whose one value is `bytes`.
+    fn present(bytes: &'static [u8]) -> Lookup {
+        lookup(Row::Present(vec![Some(Bytes::from_static(bytes))]))
     }
 
     #[test]
@@ -426,7 +490,7 @@ mod tests {
             table: TABLE.to_string(),
             fault: TableFault::MetadataLocationUnknown,
         };
-        let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
+        let present = present(TEXT_VALUE.as_bytes());
         let key = Key::Long(1);
         assert_eq!(leading_keys(&SummaryLine::new(&summary)), ["kind", "table"]);
         assert_eq!(
@@ -445,6 +509,7 @@ mod tests {
             leading_keys(&LookupLine::new(
                 TABLE,
                 &key,
+                &[COLUMN],
                 &present,
                 GETS,
                 ELAPSED_MICROS
@@ -487,10 +552,15 @@ mod tests {
             Json::String(FindingCode::LargeFile.to_string())
         );
         assert_eq!(line["caps"], Json::Null, "advice caps nothing");
+        assert_eq!(line["column"], Json::Null, "a finding about the table");
         let file = file_report();
         let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
         assert_eq!(line["kind"], Json::String("file".to_string()));
         assert_eq!(line["path"], Json::String(file.path.clone()));
+        assert_eq!(
+            line["value_columns"][0]["column"],
+            Json::String(COLUMN.to_string())
+        );
     }
 
     #[test]
@@ -506,7 +576,11 @@ mod tests {
             reason: RefusalReason::BelowLevel {
                 declared: Level::Optimal,
                 achieved: Level::Permissive,
-                findings: vec![FindingCode::NoBucketPartition],
+                columns: Vec::new(),
+                findings: vec![Capping {
+                    code: FindingCode::NoBucketPartition,
+                    column: None,
+                }],
             },
         };
         for (error, code) in [(refused, "equality_deletes"), (below_level, "below_level")] {
@@ -537,21 +611,42 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_lookup_line_present_value_as_base64_and_utf8() {
+    fn test_serialize_lookup_line_present_values_by_column_in_order_as_base64_and_utf8() {
         let key = Key::Long(1);
-        let present = lookup(Value::Present(Bytes::from_static(TEXT_VALUE.as_bytes())));
-        let line =
-            serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
-                .unwrap();
+        let both = lookup(Row::Present(vec![
+            Some(Bytes::from_static(TEXT_VALUE.as_bytes())),
+            None,
+        ]));
+        let text = serde_json::to_string(&LookupLine::new(
+            TABLE,
+            &key,
+            &[OTHER_COLUMN, COLUMN],
+            &both,
+            GETS,
+            ELAPSED_MICROS,
+        ))
+        .unwrap();
+        let line: Json = serde_json::from_str(&text).unwrap();
         assert_eq!(line["kind"], Json::String("lookup".to_string()));
         assert_eq!(line["key"], Json::String("1".to_string()));
         assert_eq!(line["presence"], Json::String("present".to_string()));
         assert_eq!(
-            line["value_base64"],
-            Json::String(TEXT_VALUE_BASE64.to_string())
+            line["values"][OTHER_COLUMN],
+            serde_json::json!({
+                "base64": TEXT_VALUE_BASE64,
+                "utf8": TEXT_VALUE,
+                "bytes": TEXT_VALUE.len(),
+            })
         );
-        assert_eq!(line["value_utf8"], Json::String(TEXT_VALUE.to_string()));
-        assert_eq!(line["value_bytes"], Json::from(TEXT_VALUE.len()));
+        assert_eq!(line["values"][COLUMN], Json::Null, "a null is null");
+        let values = &text[text.find("\"values\"").unwrap()..];
+        let KeyOrder(order) =
+            serde_json::Deserializer::from_str(&values[values.find('{').unwrap()..])
+                .into_iter::<KeyOrder>()
+                .next()
+                .unwrap()
+                .unwrap();
+        assert_eq!(order, [OTHER_COLUMN, COLUMN], "in the order named");
         assert_eq!(line["snapshot_id"], Json::String(SNAPSHOT.to_string()));
         assert_eq!(line["gets"], Json::from(GETS));
         assert_eq!(line["elapsed_micros"], Json::from(ELAPSED_MICROS));
@@ -569,11 +664,17 @@ mod tests {
             Key::Bytes(BINARY_VALUE.to_vec()),
             Key::Uuid(*b"0123456789abcdef"),
         ];
-        let absent = lookup(Value::Absent);
+        let absent = lookup(Row::Absent);
         for key in keys {
-            let line =
-                serde_json::to_string(&LookupLine::new(TABLE, &key, &absent, 0, ELAPSED_MICROS))
-                    .unwrap();
+            let line = serde_json::to_string(&LookupLine::new(
+                TABLE,
+                &key,
+                &[COLUMN],
+                &absent,
+                0,
+                ELAPSED_MICROS,
+            ))
+            .unwrap();
             let line: Json = serde_json::from_str(&line).unwrap();
             let Json::String(printed) = &line["key"] else {
                 panic!("{key}: the key is a JSON string in {line}");
@@ -592,7 +693,8 @@ mod tests {
         let line = serde_json::to_value(LookupLine::new(
             TABLE,
             &key,
-            &lookup(Value::Absent),
+            &[COLUMN],
+            &lookup(Row::Absent),
             0,
             ELAPSED_MICROS,
         ))
@@ -603,41 +705,59 @@ mod tests {
     #[test]
     fn test_serialize_lookup_line_non_utf8_value_has_no_utf8_field() {
         let key = Key::Long(1);
-        let present = lookup(Value::Present(Bytes::from_static(&BINARY_VALUE)));
-        let line =
-            serde_json::to_value(LookupLine::new(TABLE, &key, &present, GETS, ELAPSED_MICROS))
-                .unwrap();
-        assert!(line["value_base64"].is_string());
-        assert!(line.get("value_utf8").is_none());
-        assert_eq!(line["value_bytes"], Json::from(BINARY_VALUE.len()));
+        let present = present(&BINARY_VALUE);
+        let line = serde_json::to_value(LookupLine::new(
+            TABLE,
+            &key,
+            &[COLUMN],
+            &present,
+            GETS,
+            ELAPSED_MICROS,
+        ))
+        .unwrap();
+        let value = &line["values"][COLUMN];
+        assert!(value["base64"].is_string());
+        assert!(value.get("utf8").is_none());
+        assert_eq!(value["bytes"], Json::from(BINARY_VALUE.len()));
     }
 
     #[test]
-    fn test_serialize_lookup_line_null_and_absent_carry_no_value() {
+    fn test_serialize_lookup_line_absent_carries_no_values_and_presence_only_empty_ones() {
         let key = Key::Long(1);
-        for (value, name) in [(Value::Null, "null"), (Value::Absent, "absent")] {
-            let line = serde_json::to_value(LookupLine::new(
-                TABLE,
-                &key,
-                &lookup(value),
-                0,
-                ELAPSED_MICROS,
-            ))
-            .unwrap();
-            assert_eq!(line["presence"], Json::String(name.to_string()));
-            assert!(line.get("value_base64").is_none());
-            assert!(line.get("value_utf8").is_none());
-            assert_eq!(line["value_bytes"], Json::from(0));
-        }
+        let absent = serde_json::to_value(LookupLine::new(
+            TABLE,
+            &key,
+            &[COLUMN],
+            &lookup(Row::Absent),
+            0,
+            ELAPSED_MICROS,
+        ))
+        .unwrap();
+        assert_eq!(absent["presence"], Json::String("absent".to_string()));
+        assert!(absent.get("values").is_none());
+        let presence_only = serde_json::to_value(LookupLine::new(
+            TABLE,
+            &key,
+            &[],
+            &lookup(Row::Present(Vec::new())),
+            0,
+            ELAPSED_MICROS,
+        ))
+        .unwrap();
+        assert_eq!(
+            presence_only["presence"],
+            Json::String("present".to_string())
+        );
+        assert_eq!(presence_only["values"], serde_json::json!({}));
     }
 
     #[test]
-    fn test_of_maps_every_value() {
+    fn test_of_maps_every_row() {
         assert_eq!(
-            Presence::of(&Value::Present(Bytes::new())),
+            Presence::of(&Row::Present(vec![Some(Bytes::new())])),
             Presence::Present
         );
-        assert_eq!(Presence::of(&Value::Null), Presence::Null);
-        assert_eq!(Presence::of(&Value::Absent), Presence::Absent);
+        assert_eq!(Presence::of(&Row::Present(Vec::new())), Presence::Present);
+        assert_eq!(Presence::of(&Row::Absent), Presence::Absent);
     }
 }

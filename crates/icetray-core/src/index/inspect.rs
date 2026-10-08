@@ -9,6 +9,7 @@ use std::sync::Arc;
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::schema::types::ColumnDescriptor;
 
 use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
@@ -53,10 +54,10 @@ impl Inspected {
         self.layout.key_leaf
     }
 
-    /// The value column's leaf in the footer's schema; `None` for a file
-    /// written before the column was added.
-    pub(crate) fn value_leaf(&self) -> Option<usize> {
-        self.layout.value.map(|value| value.leaf)
+    /// Each value column's leaf in the footer's schema, in the layout's
+    /// order; `None` for a column the file was written before.
+    pub(crate) fn value_leaves(&self) -> Vec<Option<usize>> {
+        self.layout.value_leaves()
     }
 
     /// Every tier's resident bytes for the file, from its footer alone.
@@ -90,22 +91,42 @@ impl Inspected {
     }
 }
 
-/// The key leaf of a file, its value column when it holds one, and how
-/// each decodes, from the footer.
+/// The key leaf of a file, each value column it holds, and how each
+/// decodes, from the footer.
 #[derive(Debug)]
 pub(super) struct Layout {
     pub(super) key_leaf: usize,
     pub(super) key_shape: KeyShape,
-    pub(super) value: Option<ValueColumn>,
+    /// Per value column of the table's layout, in its order, the column
+    /// the file holds; `None` for one it was written before.
+    pub(super) values: Vec<Option<ValueColumn>>,
 }
 
 impl Layout {
-    /// The checks `FileIndex::inspect` makes on the footer, in order: both
-    /// columns resolve under `layout`, the snapshot's (`column::resolve`),
-    /// the key's physical type matches the key type, the value's is a byte
-    /// array, the file has rows and its row counts agree, and the key
-    /// column and the value column, when the file holds one, have an
-    /// offset index that describes their pages.
+    /// Each value column's leaf, in the layout's order.
+    pub(super) fn value_leaves(&self) -> Vec<Option<usize>> {
+        self.values
+            .iter()
+            .map(|value| value.map(|value| value.leaf))
+            .collect()
+    }
+
+    /// The leaves of the value columns the file holds, the ones whose
+    /// offset index the footer keeps (`kept_footer`).
+    pub(super) fn held_value_leaves(&self) -> Vec<usize> {
+        self.values
+            .iter()
+            .flatten()
+            .map(|value| value.leaf)
+            .collect()
+    }
+
+    /// The checks `FileIndex::inspect` makes on the footer, in order: every
+    /// column resolves under `layout`, the snapshot's (`column::resolve`),
+    /// the key's physical type matches the key type, each value column's
+    /// is a byte array, the file has rows and its row counts agree, and the
+    /// key column and every value column the file holds have an offset
+    /// index that describes their pages.
     pub(super) fn inspect(
         table: &str,
         handle: &FileHandle,
@@ -118,24 +139,28 @@ impl Layout {
         let columns = column::resolve(table, path, schema, layout)?;
         let key_leaf = columns.key_leaf;
         let key_shape = key_shape(table, path, layout.key_type, &schema.column(key_leaf))?;
-        let value = columns
-            .value_leaf
+        let values = columns
+            .value_leaves
+            .iter()
             .map(|leaf| {
-                value_shape(path, &schema.column(leaf)).map(|shape| ValueColumn { leaf, shape })
+                leaf.map(|leaf| {
+                    value_shape(path, &schema.column(leaf)).map(|shape| ValueColumn { leaf, shape })
+                })
+                .transpose()
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         if metadata.file_metadata().num_rows() == 0 {
             return Err(file_fault(path, FileFault::NoRows));
         }
         check_row_counts(path, metadata)?;
         check_offset_index(path, metadata, key_leaf, size)?;
-        if let Some(value) = value {
+        for value in values.iter().flatten() {
             check_offset_index(path, metadata, value.leaf, size)?;
         }
         Ok(Self {
             key_leaf,
             key_shape,
-            value,
+            values,
         })
     }
 }
@@ -188,7 +213,7 @@ fn key_shape(
     })
 }
 
-/// How the value column decodes, or `FileFault::ValuePhysicalType` when it
+/// How a value column decodes, or `FileFault::ValuePhysicalType` when it
 /// is not a byte array of either width, or `FileFault::ZeroWidthValue` for
 /// a `FIXED_LEN_BYTE_ARRAY` of width 0.
 fn value_shape(path: &str, descr: &ColumnDescriptor) -> Result<ValueShape> {
@@ -277,15 +302,23 @@ fn check_offset_index(
 
 /// The footer as the index keeps it: a copy of `metadata` with the column
 /// index of every column but the key replaced by `NONE` in every row group,
-/// so the page minimums and maximums of the value column, which the reader
+/// so the page minimums and maximums of the value columns, which the reader
 /// never consults and which dominate the index of a large-value table, are
-/// not resident (RFD 017). The key column keeps both indexes and every
-/// column its offset index. Always a copy, never the footer moved: the
-/// bytes `ParquetMetaData::memory_size` reports follow each vector's
-/// capacity, which a copy sets from its contents alone, so the footer as
-/// kept and a copy of the footer as loaded measure the same and
+/// not resident (RFD 017), and the offset index of every column but the key
+/// and `value_leaves`, the value columns the table serves that the file
+/// holds, replaced by an empty one, so a column the table does not serve
+/// costs nothing resident however wide the file (RFD 004, RFD 022). The key
+/// column keeps both indexes. A replaced entry stays in its place, so every
+/// kept one is still found at its leaf. Always a copy, never the footer
+/// moved: the bytes `ParquetMetaData::memory_size` reports follow each
+/// vector's capacity, which a copy sets from its contents alone, so the
+/// footer as kept and a copy of the footer as loaded measure the same and
 /// `predicted_resident_bytes` is exact from either.
-pub(super) fn kept_footer(metadata: &ParquetMetaData, key_leaf: usize) -> ParquetMetaData {
+pub(super) fn kept_footer(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    value_leaves: &[usize],
+) -> ParquetMetaData {
     let mut builder = metadata.clone().into_builder();
     if let Some(mut column_index) = builder.take_column_index() {
         for row_group in &mut column_index {
@@ -296,6 +329,19 @@ pub(super) fn kept_footer(metadata: &ParquetMetaData, key_leaf: usize) -> Parque
             }
         }
         builder = builder.set_column_index(Some(column_index));
+    }
+    if let Some(mut offset_index) = builder.take_offset_index() {
+        for row_group in &mut offset_index {
+            for (leaf, entry) in row_group.iter_mut().enumerate() {
+                if leaf != key_leaf && !value_leaves.contains(&leaf) {
+                    *entry = OffsetIndexMetaData {
+                        page_locations: Vec::new(),
+                        unencoded_byte_array_data_bytes: None,
+                    };
+                }
+            }
+        }
+        builder = builder.set_offset_index(Some(offset_index));
     }
     builder.build()
 }
@@ -402,8 +448,9 @@ pub(super) struct ResidentSet {
 }
 
 impl ResidentSet {
-    /// From `metadata` of the file `handle` opens, keyed by `key_type`, with
-    /// the fences exact when `fences` is given and estimated from the footer
+    /// From `metadata` of the file `handle` opens, keyed by `key_type`, its
+    /// footer as kept with `value_leaves` (`kept_footer`), with the fences
+    /// exact when `fences` is given and estimated from the footer
     /// otherwise. A key chunk `chunk_range` cannot place counts as zero and
     /// is left out of the chunk file, whose verification record is
     /// estimated from the footer (`record::estimated_len`), and the filters
@@ -412,6 +459,7 @@ impl ResidentSet {
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
         fences: Option<&[Vec<Key>]>,
@@ -440,7 +488,7 @@ impl ResidentSet {
                 .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
         );
         Self {
-            footer: approx::count(kept_footer(metadata, key_leaf).memory_size()),
+            footer: approx::count(kept_footer(metadata, key_leaf, value_leaves).memory_size()),
             key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
             chunk_file: chunk_file_bytes(
                 &identity_of(handle),
@@ -605,6 +653,8 @@ mod tests {
 
     /// A column name no fixture has.
     const ABSENT_COLUMN: &str = "absent";
+    /// The value column's leaf in every fixture file: the second column.
+    const VALUE_LEAF: usize = 1;
     /// A footer offset or size no file can mean: before the file's first byte.
     const NEGATIVE_OFFSET: i64 = -1;
     /// Bytes per value where value pages must be bounded by bytes.
@@ -752,7 +802,10 @@ mod tests {
         for (key_column, value_column) in cases {
             let layout = TableLayout {
                 key_column: key_column.to_string(),
-                value_column: value_column.to_string(),
+                value_columns: vec![manifest_testing::binary_column(
+                    value_column,
+                    manifest_testing::VALUE_FIELD_ID,
+                )],
                 ..layout.clone()
             };
             let result = FileIndex::build(
@@ -803,9 +856,9 @@ mod tests {
                 metadata,
                 &manifest_testing::layout(KeyType::Long, None),
             )
-            .map(|layout| (layout.key_leaf, layout.value.map(|value| value.leaf)))
+            .map(|layout| (layout.key_leaf, layout.value_leaves()))
         };
-        assert_eq!(inspect(&loaded).unwrap(), (0, Some(1)));
+        assert_eq!(inspect(&loaded).unwrap(), (0, vec![Some(VALUE_LEAF)]));
         let rows = loaded.file_metadata().num_rows();
         let disagreeing = [
             with_file_rows(&loaded, -1),
@@ -817,8 +870,14 @@ mod tests {
             assert_eq!(fault_of(inspect(patched)), FileFault::InconsistentRowCounts);
         }
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&disagreeing[0], 0, KeyType::Long, &opened.handle)
-                .bloom_bits_per_key,
+            FileIndex::predicted_resident_bytes(
+                &disagreeing[0],
+                0,
+                &[VALUE_LEAF],
+                KeyType::Long,
+                &opened.handle
+            )
+            .bloom_bits_per_key,
             Some(0.0),
             "a negative row count estimates as no rows"
         );
@@ -970,7 +1029,7 @@ mod tests {
         for row_group in 0..ROW_GROUPS {
             let column_index = &kept.column_index().unwrap()[row_group];
             assert_eq!(
-                column_index[index.value_leaf().unwrap()],
+                column_index[index.value_leaf(0).unwrap()],
                 ColumnIndexMetaData::NONE
             );
             assert!(matches!(
@@ -978,10 +1037,10 @@ mod tests {
                 ColumnIndexMetaData::INT64(_)
             ));
             assert!(matches!(
-                loaded.column_index().unwrap()[row_group][index.value_leaf().unwrap()],
+                loaded.column_index().unwrap()[row_group][index.value_leaf(0).unwrap()],
                 ColumnIndexMetaData::BYTE_ARRAY(_)
             ));
-            value_pages += kept.offset_index().unwrap()[row_group][index.value_leaf().unwrap()]
+            value_pages += kept.offset_index().unwrap()[row_group][index.value_leaf(0).unwrap()]
                 .page_locations()
                 .len();
         }
@@ -997,11 +1056,98 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
+            &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
         );
         assert_eq!(from_loaded, predicted_of(&index));
         assert_eq!(from_loaded.full, count(index.resident_bytes()));
+    }
+
+    /// The offset index of every column the layout does not serve is
+    /// dropped at build, as the column index of every column but the key
+    /// is (RFD 004, RFD 022): a file wider than its layout keeps no more
+    /// resident than one that is not, the prediction from the footer as
+    /// loaded is what the index keeps, and a lookup still reads the served
+    /// column. A layout of no value columns keeps the key's alone.
+    #[tokio::test]
+    async fn test_build_drops_the_offset_index_of_every_column_not_served() {
+        let rows = contract_rows();
+        let mut wide = Fixture::contract(KeyType::Long, rows);
+        wide.extra_columns = 2;
+        let opened = store(&wide).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let extra_leaves = [VALUE_LEAF + 1, VALUE_LEAF + 2];
+        let index = opened.index(KeyType::Long).await;
+        let kept = index.metadata();
+        for row_group in 0..ROW_GROUPS {
+            let offsets = &kept.offset_index().unwrap()[row_group];
+            assert!(!offsets[index.key_leaf()].page_locations().is_empty());
+            assert!(!offsets[VALUE_LEAF].page_locations().is_empty());
+            for leaf in extra_leaves {
+                assert!(
+                    offsets[leaf].page_locations().is_empty(),
+                    "row group {row_group} leaf {leaf}"
+                );
+                assert!(
+                    !loaded.offset_index().unwrap()[row_group][leaf]
+                        .page_locations()
+                        .is_empty(),
+                    "the file has the index the build dropped"
+                );
+            }
+        }
+        let from_loaded = FileIndex::predicted_resident_bytes(
+            &loaded,
+            index.key_leaf(),
+            &[VALUE_LEAF],
+            KeyType::Long,
+            &opened.handle,
+        );
+        assert_eq!(from_loaded, predicted_of(&index));
+        assert_eq!(from_loaded.full, count(index.resident_bytes()));
+        let serving_every_column = kept_footer(
+            &loaded,
+            index.key_leaf(),
+            &[VALUE_LEAF, extra_leaves[0], extra_leaves[1]],
+        );
+        assert!(
+            kept.memory_size() < serving_every_column.memory_size(),
+            "the extra columns' offset indexes are not resident"
+        );
+        let row = super::super::RowRef {
+            row_group: 0,
+            row: 0,
+        };
+        let (value, _) = index.read_value(row, None).await.unwrap().unwrap();
+        assert_eq!(
+            value.unwrap(),
+            crate::index::testing::value_for(0).as_slice()
+        );
+
+        let presence_only = TableLayout {
+            value_columns: Vec::new(),
+            ..manifest_testing::layout(KeyType::Long, None)
+        };
+        let keyed = FileIndex::build(
+            TABLE,
+            Arc::clone(&opened.handle),
+            &presence_only,
+            Residency::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        let offsets = &keyed.metadata().offset_index().unwrap()[0];
+        assert!(!offsets[keyed.key_leaf()].page_locations().is_empty());
+        for leaf in [VALUE_LEAF, extra_leaves[0], extra_leaves[1]] {
+            assert!(offsets[leaf].page_locations().is_empty(), "leaf {leaf}");
+        }
+        assert_eq!(
+            predicted_of(&keyed).full,
+            count(keyed.resident_bytes()),
+            "the prediction stays exact with no value column"
+        );
     }
 
     #[tokio::test]
@@ -1011,8 +1157,13 @@ mod tests {
         let index = opened.index(KeyType::Long).await;
         let key_leaf = index.key_leaf();
         let size = opened.handle.size();
-        let intact =
-            FileIndex::predicted_resident_bytes(&loaded, key_leaf, KeyType::Long, &opened.handle);
+        let intact = FileIndex::predicted_resident_bytes(
+            &loaded,
+            key_leaf,
+            &[VALUE_LEAF],
+            KeyType::Long,
+            &opened.handle,
+        );
         let first_chunk = loaded.row_group(0).column(key_leaf).compressed_size();
         let unplaceable = [NEGATIVE_OFFSET, i64::try_from(size).unwrap(), i64::MAX / 2];
         for claimed in unplaceable {
@@ -1022,6 +1173,7 @@ mod tests {
             let estimated = FileIndex::predicted_resident_bytes(
                 &patched,
                 key_leaf,
+                &[VALUE_LEAF],
                 KeyType::Long,
                 &opened.handle,
             );
@@ -1086,8 +1238,14 @@ mod tests {
         assert_eq!(path, location());
         assert_eq!(fault, FileFault::UnplaceableBloomFilter { row_group: 0 });
         assert_eq!(
-            FileIndex::predicted_resident_bytes(&patched, key_leaf, KeyType::Long, &opened.handle)
-                .bloom,
+            FileIndex::predicted_resident_bytes(
+                &patched,
+                key_leaf,
+                &[VALUE_LEAF],
+                KeyType::Long,
+                &opened.handle
+            )
+            .bloom,
             None
         );
         assert!(bloom_ranges(TABLE, &opened.handle, index.metadata(), key_leaf).is_ok());
@@ -1127,6 +1285,7 @@ mod tests {
                 FileIndex::predicted_resident_bytes(
                     &patched,
                     key_leaf,
+                    &[VALUE_LEAF],
                     KeyType::Long,
                     &opened.handle
                 )

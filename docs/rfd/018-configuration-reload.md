@@ -12,6 +12,10 @@
 > refused whole when a strict table's serving snapshot is below its new
 > level. See RFD 020 (Lookup levels).
 
+> Updated 2026-10-07: a change to the set of a table's value columns
+> loads the whole table anew, and a reordered `value_columns` is no
+> change. See RFD 022.
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing
@@ -54,7 +58,10 @@ or log settings differ from the running ones is refused as a whole, with a
 reason that names the setting and says a restart applies it.
 
 Tables are matched by name. A table whose entry is equal in every field
-keeps its generation, its refresh, and its reservations untouched. An
+keeps its generation, its refresh, and its reservations untouched.
+`value_columns` is compared as a set, so a list that only reorders its
+columns is equal (RFD 022 (Value columns)), and a change to the set
+makes the table changed, which loads it whole. An
 added table loads under the load deadline, as at start. A changed table
 loads as a new table beside the one serving under its name, and the old
 one serves until the swap. A removed table stops refreshing at the swap. A

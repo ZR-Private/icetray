@@ -13,6 +13,7 @@ use icetray::cli::ENV_CONFIG;
 use icetray_core::Key;
 use icetray_testkit::Result;
 use icetray_testkit::golden::{self, GoldenTable};
+use icetray_testkit::layout::VALUE_COLUMN;
 use serde_json::Value as Json;
 
 /// The built binary under test.
@@ -22,11 +23,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_icetray");
 /// and the middle.
 const IDS_2M: [u64; 3] = [0, 999_999, 1_999_999];
 
-/// The one `lookup` line of `icetray get --location <table> -- <text>`,
-/// which must exit 0.
+/// The one `lookup` line of `icetray get --location <table> --value-column
+/// value --column value -- <text>`, which must exit 0.
 fn get(warehouse: &str, table: GoldenTable, text: &str) -> Result<Json> {
     let output = Command::new(BIN)
         .args(["get", "--location", &golden::location(warehouse, table)])
+        .args(["--value-column", VALUE_COLUMN, "--column", VALUE_COLUMN])
         .args(["--", text])
         .env_remove(ENV_CONFIG)
         .output()?;
@@ -64,7 +66,11 @@ fn assert_key_field_round_trips(table: GoldenTable, key_of: fn(u64) -> Key) -> R
         assert_eq!(again["presence"], "present", "{again}");
         assert_eq!(again["key"], first["key"], "{again}");
         let expected = STANDARD.encode(golden::value(&text));
-        assert_eq!(again["value_base64"], Json::String(expected), "{again}");
+        assert_eq!(
+            again["values"][VALUE_COLUMN]["base64"],
+            Json::String(expected),
+            "{again}"
+        );
     }
     Ok(())
 }

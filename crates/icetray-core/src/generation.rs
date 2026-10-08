@@ -19,12 +19,14 @@ use std::time::Instant;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{Snapshot, TableMetadata};
+use metrics::Counter;
+use tokio::sync::Semaphore;
 
 use crate::approx;
 use crate::blocking;
-use crate::cache::{PageCache, PageOrigin};
+use crate::cache::{Issue, PageCache};
 use crate::catalog::{Resolved, TableFault};
-use crate::check::{self, Caps, FileView, FindingCode, LayoutView, LookupCost};
+use crate::check::{self, Capping, Caps, ColumnCost, FileView, LayoutView, LookupCost};
 use crate::config::{Residency, TableConfig};
 use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
@@ -124,9 +126,12 @@ pub struct Generation {
     /// `residency`, from the same measurement as `level`; what the cost
     /// gauges show while the generation serves.
     pub lookup_cost: LookupCost,
-    /// The distinct codes of the findings that cap `level`, in the finding
+    /// Each value column's level and cost, from the same measurement, in
+    /// `layout`'s order (RFD 022); `level` is the dearest of them.
+    pub column_costs: Vec<ColumnCost>,
+    /// The distinct capping findings, by code and column, in the finding
     /// table's order.
-    capping: Vec<FindingCode>,
+    capping: Vec<Capping>,
     /// The probe ranks of `files` per bucketing the files carry and per
     /// bucket under it, ascending, which is the order a lookup probes them
     /// (`ranked_routes`); how a key finds its candidates.
@@ -194,14 +199,12 @@ impl Generation {
             &resolved.unread_defaults,
             snapshot,
             &config.key_column,
-            &config.value_column,
+            &config.value_column_names(),
         )?;
         let files =
             manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
-        let (reused, pending) = reuse_or_open(files.data, previous, storage, &hedge).await?;
-        for file in &reused {
-            file.index.check_columns(table, &layout)?;
-        }
+        let (reused, pending) =
+            reuse_or_open(table, &layout, files.data, previous, storage, &hedge).await?;
         let targets: Vec<DataTarget> = reused
             .iter()
             .map(|file| &file.entry)
@@ -363,7 +366,8 @@ impl Generation {
             oldest_delete_committed: None,
             level: caps.level,
             lookup_cost: caps.cost,
-            capping: caps.codes(),
+            capping: caps.capping(),
+            column_costs: caps.columns,
             probe_routes,
             overlapping,
             verified_groups: to_verify.len(),
@@ -376,7 +380,14 @@ impl Generation {
     /// The level gate (`check::judge`) over the generation's measured level
     /// for a table that declares `declared`.
     pub(crate) fn judge(&self, declared: Level, strict: bool) -> Result<()> {
-        check::judge(&self.table, self.level, &self.capping, declared, strict)
+        check::judge(
+            &self.table,
+            self.level,
+            &check::column_levels(&self.layout, &self.column_costs),
+            &self.capping,
+            declared,
+            strict,
+        )
     }
 
     /// What the generation's delete state comes to (RFD 021): the rows its
@@ -497,58 +508,104 @@ impl Generation {
         self.verified_groups
     }
 
-    /// One lookup and the `result` label it earns: the candidates are
-    /// probed in probe order and the first whose `find` answers with a row
-    /// its file's deletes do not remove gives the row, whose value page is
-    /// read through `cache`; a deleted row is passed over with no value
-    /// page read (RFD 021). A row of a file written before the value column
-    /// was added answers the layout's `value_default` and reads no value
-    /// page (RFD 023). `Present` carries the bytes, `Null` is a
-    /// present key with a null value, `Absent` a key no candidate holds.
-    /// The GET cost is the index's: in the Full tier one GET for a cold
-    /// hit, none for a warm hit, a default, or a miss. The label is `Miss`
-    /// for an absent key; for a present one, `ColdHit` when its value page
-    /// came from outside the cache (a fetch this lookup ran or joined) and
-    /// `WarmHit` when the cache served it from memory or its disk level, or
-    /// no value page was read. Only the value page decides it; a key-page
-    /// GET in the Bloom tier does not.
+    /// One lookup reading the value columns at the positions `columns`
+    /// gives in `layout`, in that order, and the `result` label it earns:
+    /// the candidates are probed in probe order and the first whose `find`
+    /// answers with a row its file's deletes do not remove gives the row,
+    /// checked against the deletes once whatever the columns (RFD 021); a
+    /// deleted row is passed over with no value page read. The row's value
+    /// page of each column named is read through `cache`, every column's
+    /// read at once, each a GET of its own, hedged on its own (RFD 013,
+    /// RFD 022); a row of a file written before a column was added answers
+    /// that column's default and reads no page of it (RFD 023). No column
+    /// named answers presence alone and reads no value page. `Present`
+    /// carries one value per column named, each its bytes or `None` for a
+    /// null; `Absent` is a key no candidate holds. The GET cost is the
+    /// index's: in the Full tier one GET per column named for a cold hit,
+    /// two for a dictionary-encoded column, none for a warm hit, a default,
+    /// presence alone, or a miss. Each GET the lookup issues, a Bloom-tier
+    /// key page's included, holds one permit of `fan_out`, the batch's,
+    /// while it runs, and each GET of a value or dictionary page of the
+    /// column at position `c` is counted under `value_gets[c]` as it is
+    /// issued, where `value_gets` has it (`Issue`).
+    /// The label is `Miss` for an absent key; for a present one,
+    /// `ColdHit` when a value or dictionary page of a column named came
+    /// from outside the cache (a fetch this lookup ran or joined) and
+    /// `WarmHit` otherwise, a hit that read no value page included. Only
+    /// the columns' pages decide it; a key-page GET in the Bloom tier does
+    /// not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
+        columns: &[usize],
         cache: &PageCache,
-    ) -> Result<(Value, LookupResult)> {
+        fan_out: Option<&Arc<Semaphore>>,
+        value_gets: &[Counter],
+    ) -> Result<(Row, LookupResult)> {
+        let key_page = Issue {
+            fan_out,
+            counted: None,
+        };
         for (at, file) in self.ranked_candidates(key) {
-            if let Some(row) = file.index.find(key, Some(cache)).await? {
+            if let Some(row) = file.index.find(key, Some(cache), key_page).await? {
                 if self.is_deleted(at, file.index.position(row)) {
                     continue;
                 }
-                let (value, result) = match file.index.read_value(row, Some(cache)).await? {
-                    Some((value, PageOrigin::Fetched)) => (value, LookupResult::ColdHit),
-                    Some((value, PageOrigin::Cached)) => (value, LookupResult::WarmHit),
-                    None => (self.layout.value_default.clone(), LookupResult::WarmHit),
+                let reads = columns.iter().map(|&column| async move {
+                    let issue = Issue {
+                        fan_out,
+                        counted: value_gets.get(column),
+                    };
+                    Ok::<_, Error>(
+                        match file
+                            .index
+                            .read_column(column, row, Some(cache), issue)
+                            .await?
+                        {
+                            Some(read) => (read.value, read.from_store),
+                            None => (self.layout.value_columns[column].default.clone(), false),
+                        },
+                    )
+                });
+                let (values, from_store): (Vec<Option<Bytes>>, Vec<bool>) =
+                    futures::future::try_join_all(reads)
+                        .await?
+                        .into_iter()
+                        .unzip();
+                let result = if from_store.contains(&true) {
+                    LookupResult::ColdHit
+                } else {
+                    LookupResult::WarmHit
                 };
-                let value = match value {
-                    Some(bytes) => Value::Present(bytes),
-                    None => Value::Null,
-                };
-                return Ok((value, result));
+                return Ok((Row::Present(values), result));
             }
         }
-        Ok((Value::Absent, LookupResult::Miss))
+        Ok((Row::Absent, LookupResult::Miss))
+    }
+
+    /// `lookup` naming the layout's first value column, alone and
+    /// uncounted: the shape the single-column tests read.
+    #[cfg(test)]
+    pub(crate) async fn lookup_first(
+        &self,
+        key: &Key,
+        cache: &PageCache,
+    ) -> Result<(Row, LookupResult)> {
+        self.lookup(key, &[0], cache, None, &[]).await
     }
 
     /// Which file and page each key would reach; the oracle for cost tests.
     /// Of the pages the key's candidates name, in the order a lookup probes
     /// them (`probed`), the first that names the key's row where its file's
-    /// deletes do not remove it, with that page: in the Full tier that
-    /// is the file holding the live key, wherever in an overlap group it
-    /// sits, and the page's `value_page_offset` is the one GET a cold hit
-    /// makes, `None` where the file answers the value column's default and
-    /// a hit makes none. When no candidate names such a row (the key is
-    /// absent or deleted from every file whose fences cover it, or the tier
-    /// is Disk or Bloom, where naming one would take a read), the first
-    /// candidate that would decode a key page for it, the first probe.
-    /// `None` for a key no candidate would decode a page for, which
+    /// deletes do not remove it, with that page: in the Full tier that is
+    /// the file holding the live key, wherever in an overlap group it sits.
+    /// Each page's file reports, through `FileIndex::value_page_offset`,
+    /// the value page a hit naming column `c` would GET, `None` where the
+    /// file answers `c` by its default. When no candidate names such a row
+    /// (the key is absent or deleted from every file whose fences cover it,
+    /// or the tier is Disk or Bloom, where naming one would take a read),
+    /// the first candidate that would decode a key page for it, the first
+    /// probe. `None` for a key no candidate would decode a page for, which
     /// `lookup` answers `Absent` with no I/O.
     pub fn plan(&self, keys: &[Key]) -> Vec<Option<(Arc<LoadedFile>, PageRef)>> {
         keys.iter().map(|key| self.plan_one(key)).collect()
@@ -557,7 +614,7 @@ impl Generation {
     fn plan_one(&self, key: &Key) -> Option<(Arc<LoadedFile>, PageRef)> {
         let mut first_probe = None;
         for (at, file, page) in self.probed(key) {
-            if page.position.is_some() && !self.page_deleted(at, &page) {
+            if page.names_row() && !self.page_deleted(at, &page) {
                 return Some((Arc::clone(file), page));
             }
             first_probe.get_or_insert_with(|| (Arc::clone(file), page));
@@ -705,7 +762,8 @@ impl Planned {
         check::judge(
             &self.config.name,
             caps.level,
-            &caps.codes(),
+            &check::column_levels(&self.layout, &caps.columns),
+            &caps.capping(),
             declared,
             strict,
         )
@@ -1190,9 +1248,16 @@ type Pending = (DataFileEntry, Arc<FileHandle>);
 /// size changed is another file and its index would be stale; a path
 /// committed again at another sequence number is another file to the
 /// deletes, which apply by sequence number (RFD 021), so its entry would
-/// be stale. Opening sends nothing to the store; the first S3 location a
-/// storage opens loads the SDK's defaults (`Storage::locate`).
+/// be stale. A file kept is checked against `layout`, the snapshot's
+/// (`FileIndex::check_columns`): a column it no longer holds as `layout`
+/// means it refuses the snapshot under `table`, and one whose index was
+/// built over other leaves than `layout` resolves to is opened afresh, so
+/// no column is answered from another's pages. Opening sends nothing to
+/// the store; the first S3 location a storage opens loads the SDK's
+/// defaults (`Storage::locate`).
 async fn reuse_or_open(
+    table: &str,
+    layout: &TableLayout,
     entries: Vec<DataFileEntry>,
     previous: Option<&Generation>,
     storage: &Arc<Storage>,
@@ -1213,7 +1278,11 @@ async fn reuse_or_open(
         let unchanged = reusable
             .get(entry.path.as_str())
             .filter(|file| file.entry.size == entry.size && file.entry.sequence == entry.sequence);
-        if let Some(file) = unchanged {
+        let kept = match unchanged {
+            Some(file) => file.index.check_columns(table, layout)?.then_some(file),
+            None => None,
+        };
+        if let Some(file) = kept {
             reused.push(Arc::clone(file));
         } else {
             let handle = FileHandle::open(
@@ -1803,13 +1872,15 @@ fn refuse_duplicates(
     Ok(())
 }
 
-/// The three outcomes of a lookup; the wire carries the same three (RFD 010).
+/// What a lookup answers for one key; the wire carries the same answer
+/// (RFD 010, RFD 022).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Value {
-    /// The key is present with this value.
-    Present(Bytes),
-    /// The key is present and its value is null.
-    Null,
+pub enum Row {
+    /// The key is present, with one value per column the lookup named, in
+    /// the order it named them: each the column's bytes unchanged, or
+    /// `None` for a null, which is not a value of zero length. A lookup that
+    /// named no column carries none.
+    Present(Vec<Option<Bytes>>),
     /// No file holds the key.
     Absent,
 }
@@ -1818,18 +1889,18 @@ pub enum Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lookup {
     /// The outcome.
-    pub value: Value,
+    pub row: Row,
     /// The snapshot the answer was read from.
     pub snapshot_id: SnapshotId,
 }
 
 /// Several lookups' answers from one snapshot, in the order of the keys
-/// asked. Fails as a whole if any key's read fails; partial results are a
-/// later, separate call.
+/// asked, each naming the same columns. Fails as a whole if any key's read
+/// fails; partial results are a later, separate call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultiLookup {
     /// One outcome per key, in order.
-    pub values: Vec<Value>,
+    pub rows: Vec<Row>,
     /// The snapshot every answer was read from.
     pub snapshot_id: SnapshotId,
 }
@@ -1851,20 +1922,21 @@ pub(crate) mod testing {
     use bytes::Bytes;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        DataContentType, DataFile, DataFileFormat, ManifestContentType, PrimitiveType, Schema,
-        TableMetadata, TableMetadataBuilder, Type, UnboundPartitionSpec,
+        DataContentType, DataFile, DataFileFormat, ManifestContentType, NestedField, PrimitiveType,
+        Schema, TableMetadata, TableMetadataBuilder, Type, UnboundPartitionSpec,
     };
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
     use parquet::schema::types::ColumnPath;
 
-    use super::{Generation, Planned};
+    use super::{Generation, Planned, Row};
     use crate::approx::count;
     use crate::cache::PageCache;
     use crate::catalog::{TableFault, TableSource, VERSION_HINT, hint_location};
     use crate::config::{
         HedgeConfig, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
+        ValueColumnConfig,
     };
     use crate::contract::PAGE_ROWS;
     use crate::error::{Error, RefusalReason, Result};
@@ -1928,6 +2000,18 @@ pub(crate) mod testing {
     pub(crate) const FIRST_VERSION: u64 = 1;
     pub(crate) const SECOND_VERSION: u64 = 2;
     pub(crate) const THIRD_VERSION: u64 = 3;
+
+    /// What a lookup naming one value column answers for a present key
+    /// whose value is `bytes`.
+    pub(crate) fn one_value(bytes: impl Into<Bytes>) -> Row {
+        Row::Present(vec![Some(bytes.into())])
+    }
+
+    /// What a lookup naming one value column answers for a present key
+    /// whose value is null.
+    pub(crate) fn one_null() -> Row {
+        Row::Present(vec![None])
+    }
 
     /// The contract's page row limit as the writer takes it.
     pub(crate) fn page_rows() -> usize {
@@ -2200,28 +2284,48 @@ pub(crate) mod testing {
         }
     }
 
+    /// The second value column of a table `Table::with_detail` makes.
+    pub(crate) const DETAIL_COLUMN: &str = "detail";
+    /// Its field id, after the key's and the value's.
+    const DETAIL_FIELD_ID: i32 = 3;
+
+    /// What `DETAIL_COLUMN` holds for a row whose value is `value`: its
+    /// bytes reversed, so no lookup of the one reads the other's bytes.
+    pub(crate) fn detail_of(value: &[u8]) -> Vec<u8> {
+        value.iter().rev().copied().collect()
+    }
+
     /// A Parquet file of `keys` with `values` (a `None` is a null) laid out
-    /// as `layout` says, one row group.
+    /// as `layout` says, one row group, with `DETAIL_COLUMN` holding each
+    /// value's `detail_of` when `detail` is set.
     pub(crate) fn parquet(
         key_type: KeyType,
         keys: &[Key],
         values: &[Option<Vec<u8>>],
+        detail: bool,
         layout: &WriterLayout,
     ) -> Bytes {
         let column = column_of(key_type);
-        let schema = Arc::new(ArrowSchema::new(vec![
+        let mut fields = vec![
             Field::new(KEY_COLUMN, key_data_type(column), false),
             Field::new(VALUE_COLUMN, DataType::Binary, true),
-        ]));
+        ];
         let keys: Vec<Option<Key>> = keys.iter().cloned().map(Some).collect();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                key_array(column, &keys),
-                Arc::new(values.iter().cloned().collect::<BinaryArray>()) as ArrayRef,
-            ],
-        )
-        .unwrap();
+        let mut arrays = vec![
+            key_array(column, &keys),
+            Arc::new(values.iter().cloned().collect::<BinaryArray>()) as ArrayRef,
+        ];
+        if detail {
+            fields.push(Field::new(DETAIL_COLUMN, DataType::Binary, true));
+            arrays.push(Arc::new(
+                values
+                    .iter()
+                    .map(|value| value.as_deref().map(detail_of))
+                    .collect::<BinaryArray>(),
+            ));
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
         let mut out = Vec::new();
         let mut writer =
             ArrowWriter::try_new(&mut out, schema, Some(layout.properties(keys.len()))).unwrap();
@@ -2309,6 +2413,8 @@ pub(crate) mod testing {
         /// The table's hedge window, handed to every load.
         pub(crate) hedge: Arc<HedgeWindow>,
         key_type: KeyType,
+        /// Whether the table has `DETAIL_COLUMN` beside the value column.
+        detail: bool,
         md: TableMetadata,
         /// The default spec, which `add_file` writes under.
         spec_id: i32,
@@ -2323,14 +2429,39 @@ pub(crate) mod testing {
     impl Table {
         /// A table keyed by `key_type` under `spec`, with no snapshot yet.
         pub(crate) fn new(key_type: KeyType, spec: UnboundPartitionSpec) -> Self {
+            Self::of(key_type, spec, false)
+        }
+
+        /// `new` with `DETAIL_COLUMN` beside the value column, in the
+        /// schema, in every file `add_file` writes, and in `config`'s
+        /// value columns (RFD 022).
+        pub(crate) fn with_detail(key_type: KeyType, spec: UnboundPartitionSpec) -> Self {
+            Self::of(key_type, spec, true)
+        }
+
+        fn of(key_type: KeyType, spec: UnboundPartitionSpec, detail: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = manifest_testing::file_root(dir.path());
-            let md = manifest_testing::metadata(&root, schema_for(key_type), spec);
+            let mut schema = schema_for(key_type);
+            if detail {
+                let mut fields: Vec<_> = schema.as_struct().fields().to_vec();
+                fields.push(
+                    NestedField::optional(
+                        DETAIL_FIELD_ID,
+                        DETAIL_COLUMN,
+                        Type::Primitive(PrimitiveType::Binary),
+                    )
+                    .into(),
+                );
+                schema = Schema::builder().with_fields(fields).build().unwrap();
+            }
+            let md = manifest_testing::metadata(&root, schema, spec);
             Self {
                 dir,
                 storage: Arc::new(Storage::new(StorageConfig::default())),
                 hedge: Arc::new(HedgeWindow::new(&HedgeConfig::default())),
                 key_type,
+                detail,
                 spec_id: md.default_partition_spec_id(),
                 md,
                 files: Vec::new(),
@@ -2363,7 +2494,14 @@ pub(crate) mod testing {
                 },
                 r#ref: MAIN.to_string(),
                 key_column: KEY_COLUMN.to_string(),
-                value_column: VALUE_COLUMN.to_string(),
+                value_columns: if self.detail {
+                    vec![
+                        ValueColumnConfig::named(VALUE_COLUMN),
+                        ValueColumnConfig::named(DETAIL_COLUMN),
+                    ]
+                } else {
+                    vec![ValueColumnConfig::named(VALUE_COLUMN)]
+                },
                 strict: true,
                 lookups: None,
                 residency,
@@ -2374,7 +2512,13 @@ pub(crate) mod testing {
         /// Writes `spec`'s file and records it for the next snapshot.
         pub(crate) async fn add_file(&mut self, spec: FileSpec<'_>) {
             let path = self.path_of(spec.name);
-            let bytes = parquet(self.key_type, spec.keys, &spec.values, &spec.layout);
+            let bytes = parquet(
+                self.key_type,
+                spec.keys,
+                &spec.values,
+                self.detail,
+                &spec.layout,
+            );
             let size = count(bytes.len());
             manifest_testing::write_file(&FileIO::new_with_fs(), &path, bytes).await;
             let min = spec.keys.iter().min().unwrap();
@@ -2818,7 +2962,13 @@ mod tests {
             (bucketing, bucket): (Option<Bucketing>, u32),
             layout: &WriterLayout,
         ) -> Arc<LoadedFile> {
-            let bytes = testing::parquet(KeyType::Long, &testing::long_keys(keys), values, layout);
+            let bytes = testing::parquet(
+                KeyType::Long,
+                &testing::long_keys(keys),
+                values,
+                false,
+                layout,
+            );
             let handle = self
                 .store
                 .open(&Self::location(name), bytes, Arc::clone(&self.hedge))
@@ -2943,8 +3093,9 @@ mod tests {
             .into_iter()
             .map(|planned| {
                 let (file, page) = planned.expect("a present key has a plan");
-                let offset = page
-                    .value_page_offset
+                let offset = file
+                    .index
+                    .value_page_offset(0, &page)
                     .expect("the Full tier names the value page of a present key");
                 (file.entry.path.clone(), offset)
             })
@@ -2955,8 +3106,8 @@ mod tests {
         let before = storage.stats().gets();
         for (key, raw) in typed.iter().zip(keys) {
             assert_eq!(
-                generation.lookup(key, &cache).await.unwrap().0,
-                Value::Present(Bytes::from(value_for(*raw))),
+                generation.lookup_first(key, &cache).await.unwrap().0,
+                testing::one_value(Bytes::from(value_for(*raw))),
                 "key {key}"
             );
             assert_eq!(
@@ -3001,8 +3152,8 @@ mod tests {
         for key in &all {
             let absent = Key::Long(key + 1);
             assert_eq!(
-                generation.lookup(&absent, &cache).await.unwrap().0,
-                Value::Absent
+                generation.lookup_first(&absent, &cache).await.unwrap().0,
+                Row::Absent
             );
         }
         assert_eq!(mem.gets(), before, "a miss costs nothing");
@@ -3155,8 +3306,12 @@ mod tests {
             ["four_new", "eight", "flat", "four_old"].map(Mem::location)
         );
         assert_eq!(
-            generation.lookup(&key, &cache().await).await.unwrap().0,
-            Value::Absent
+            generation
+                .lookup_first(&key, &cache().await)
+                .await
+                .unwrap()
+                .0,
+            Row::Absent
         );
         check_present(&generation, &mem.store.storage, &held).await;
     }
@@ -3236,8 +3391,12 @@ mod tests {
             ["four_new", "four_old"].map(Mem::location)
         );
         assert_eq!(
-            generation.lookup(&key, &cache().await).await.unwrap().0,
-            Value::Absent
+            generation
+                .lookup_first(&key, &cache().await)
+                .await
+                .unwrap()
+                .0,
+            Row::Absent
         );
         check_present(&generation, &mem.store.storage, &held).await;
     }
@@ -3267,39 +3426,39 @@ mod tests {
         let before = mem.gets();
         assert_eq!(
             generation
-                .lookup(&Key::Long(keys[1]), &cache)
+                .lookup_first(&Key::Long(keys[1]), &cache)
                 .await
                 .unwrap()
                 .0,
-            Value::Present(Bytes::from(value_for(keys[1])))
+            testing::one_value(Bytes::from(value_for(keys[1])))
         );
         assert_eq!(mem.gets(), before + 1, "a cold hit is one GET");
         assert_eq!(
             generation
-                .lookup(&Key::Long(keys[0]), &cache)
+                .lookup_first(&Key::Long(keys[0]), &cache)
                 .await
                 .unwrap()
                 .0,
-            Value::Present(Bytes::from(value_for(keys[0])))
+            testing::one_value(Bytes::from(value_for(keys[0])))
         );
         assert_eq!(mem.gets(), before + 1, "a warm hit is none");
         assert_eq!(
             generation
-                .lookup(&Key::Long(null_key), &cache)
+                .lookup_first(&Key::Long(null_key), &cache)
                 .await
                 .unwrap()
                 .0,
-            Value::Null
+            testing::one_null()
         );
         assert_eq!(mem.gets(), before + 1, "a null on the cached page is none");
         for absent in [keys[1] + 1, keys[0] - 1, keys.last().unwrap() + 1] {
             assert_eq!(
                 generation
-                    .lookup(&Key::Long(absent), &cache)
+                    .lookup_first(&Key::Long(absent), &cache)
                     .await
                     .unwrap()
                     .0,
-                Value::Absent
+                Row::Absent
             );
         }
         assert_eq!(mem.gets(), before + 1, "a miss is none");
@@ -3312,23 +3471,23 @@ mod tests {
         let generation = table.load(&config, None, None).await.unwrap();
         let cache = cache().await;
         let key = Key::Long(all[0]);
-        let present = Value::Present(Bytes::from(value_for(all[0])));
+        let present = testing::one_value(Bytes::from(value_for(all[0])));
         let before = table.gets();
         assert_eq!(
-            generation.lookup(&key, &cache).await.unwrap(),
+            generation.lookup_first(&key, &cache).await.unwrap(),
             (present.clone(), LookupResult::ColdHit)
         );
         assert_eq!(table.gets(), before + 1, "a cold hit is one GET");
         assert_eq!(
-            generation.lookup(&key, &cache).await.unwrap(),
+            generation.lookup_first(&key, &cache).await.unwrap(),
             (present, LookupResult::WarmHit)
         );
         assert_eq!(
             generation
-                .lookup(&Key::Long(all[0] + 1), &cache)
+                .lookup_first(&Key::Long(all[0] + 1), &cache)
                 .await
                 .unwrap(),
-            (Value::Absent, LookupResult::Miss)
+            (Row::Absent, LookupResult::Miss)
         );
         assert_eq!(table.gets(), before + 1, "a warm hit and a miss cost none");
     }
@@ -3342,15 +3501,21 @@ mod tests {
         key: i64,
         hit_gets: u64,
     ) {
-        let present = Value::Present(Bytes::from(value_for(key)));
+        let present = testing::one_value(Bytes::from(value_for(key)));
         let before = table.gets();
         assert_eq!(
-            generation.lookup(&Key::Long(key), cache).await.unwrap(),
+            generation
+                .lookup_first(&Key::Long(key), cache)
+                .await
+                .unwrap(),
             (present.clone(), LookupResult::ColdHit)
         );
         assert_eq!(table.gets(), before + hit_gets, "a cold hit");
         assert_eq!(
-            generation.lookup(&Key::Long(key), cache).await.unwrap(),
+            generation
+                .lookup_first(&Key::Long(key), cache)
+                .await
+                .unwrap(),
             (present, LookupResult::WarmHit)
         );
         assert_eq!(table.gets(), before + hit_gets, "a warm hit costs none");
@@ -3369,10 +3534,10 @@ mod tests {
         assert_cold_then_warm(&table, &disk, &disk_cache, all[0], 1).await;
         let before = table.gets();
         assert_eq!(
-            disk.lookup(&Key::Long(all[0] + 1), &disk_cache)
+            disk.lookup_first(&Key::Long(all[0] + 1), &disk_cache)
                 .await
                 .unwrap(),
-            (Value::Absent, LookupResult::Miss)
+            (Row::Absent, LookupResult::Miss)
         );
         assert_eq!(
             table.gets(),
@@ -3426,8 +3591,8 @@ mod tests {
         let miss_cache = cache().await;
         let before = table.gets();
         assert_eq!(
-            bloom.lookup(&passing, &miss_cache).await.unwrap(),
-            (Value::Absent, LookupResult::Miss)
+            bloom.lookup_first(&passing, &miss_cache).await.unwrap(),
+            (Row::Absent, LookupResult::Miss)
         );
         assert_eq!(
             table.gets(),
@@ -3435,8 +3600,8 @@ mod tests {
             "a filter-positive miss costs the key page and is still a miss"
         );
         assert_eq!(
-            bloom.lookup(&ruled_out, &miss_cache).await.unwrap(),
-            (Value::Absent, LookupResult::Miss)
+            bloom.lookup_first(&ruled_out, &miss_cache).await.unwrap(),
+            (Row::Absent, LookupResult::Miss)
         );
         assert_eq!(
             table.gets(),
@@ -3461,9 +3626,9 @@ mod tests {
         let (planned, page) = plan[0].as_ref().unwrap();
         assert!(Arc::ptr_eq(planned, &file));
         assert_eq!((page.row_group, page.key_page), (0, 0));
-        assert!(page.value_page_offset.is_some());
-        let (_, inside_page) = plan[1].as_ref().unwrap();
-        assert_eq!(inside_page.value_page_offset, None);
+        assert!(planned.index.value_page_offset(0, page).is_some());
+        let (inside_file, inside_page) = plan[1].as_ref().unwrap();
+        assert_eq!(inside_file.index.value_page_offset(0, inside_page), None);
         assert!(plan[2].is_none());
         assert_cold_hit_reads_the_planned_page(&generation, &mem, planned, page, keys[3]).await;
     }
@@ -3471,7 +3636,7 @@ mod tests {
     /// The compressed size of the value page of `file`'s first row group
     /// at `offset`.
     fn value_page_size(file: &LoadedFile, offset: u64) -> u64 {
-        file.index.metadata().offset_index().unwrap()[0][file.index.value_leaf().unwrap()]
+        file.index.metadata().offset_index().unwrap()[0][file.index.value_leaf(0).unwrap()]
             .page_locations()
             .iter()
             .find(|location| u64::try_from(location.offset).unwrap() == offset)
@@ -3488,12 +3653,16 @@ mod tests {
         page: &PageRef,
         key: i64,
     ) {
-        let page_size = value_page_size(planned, page.value_page_offset.unwrap());
+        let page_size = value_page_size(planned, planned.index.value_page_offset(0, page).unwrap());
         let cache = cache().await;
         let (gets, bytes) = (mem.gets(), mem.store.storage.stats().bytes());
         assert_eq!(
-            generation.lookup(&Key::Long(key), &cache).await.unwrap().0,
-            Value::Present(Bytes::from(value_for(key)))
+            generation
+                .lookup_first(&Key::Long(key), &cache)
+                .await
+                .unwrap()
+                .0,
+            testing::one_value(Bytes::from(value_for(key)))
         );
         assert_eq!(mem.gets(), gets + 1);
         assert_eq!(mem.store.storage.stats().bytes(), bytes + page_size);
@@ -3524,13 +3693,13 @@ mod tests {
             Arc::ptr_eq(planned, &b),
             "the plan names the file holding the key"
         );
-        assert!(page.value_page_offset.is_some());
+        assert!(planned.index.value_page_offset(0, page).is_some());
         assert_cold_hit_reads_the_planned_page(&generation, &mem, planned, page, held_by_b).await;
         // A key inside both fences and in neither file: the first probe,
         // with no value page.
         let (first_probe, page) = plan[1].as_ref().unwrap();
         assert!(Arc::ptr_eq(first_probe, &a));
-        assert_eq!(page.value_page_offset, None);
+        assert_eq!(first_probe.index.value_page_offset(0, page), None);
     }
 
     #[tokio::test]
@@ -3820,11 +3989,11 @@ mod tests {
         let cache = cache().await;
         assert_eq!(
             generation
-                .lookup(&Key::Long(first[1] + 2), &cache)
+                .lookup_first(&Key::Long(first[1] + 2), &cache)
                 .await
                 .unwrap()
                 .0,
-            Value::Absent
+            Row::Absent
         );
     }
 
@@ -3986,8 +4155,12 @@ mod tests {
         let cache = cache().await;
         for key in keys {
             assert_eq!(
-                generation.lookup(&Key::Long(*key), &cache).await.unwrap().0,
-                Value::Present(Bytes::from(value_for(*key))),
+                generation
+                    .lookup_first(&Key::Long(*key), &cache)
+                    .await
+                    .unwrap()
+                    .0,
+                testing::one_value(Bytes::from(value_for(*key))),
                 "key {key}"
             );
         }
@@ -3999,11 +4172,11 @@ mod tests {
         for key in keys {
             assert_eq!(
                 generation
-                    .lookup(&Key::Long(key + 1), &cache)
+                    .lookup_first(&Key::Long(key + 1), &cache)
                     .await
                     .unwrap()
                     .0,
-                Value::Absent,
+                Row::Absent,
                 "key {}",
                 key + 1
             );
@@ -4107,6 +4280,81 @@ mod tests {
         assert_present(&second, &appended).await;
         assert_present(&second, &all).await;
         assert_successors_absent(&second, &appended).await;
+    }
+
+    /// A loaded table of one file holding `DETAIL_COLUMN` beside the value
+    /// column, served under `config` with both, its fixture, its first
+    /// generation, and its keys.
+    async fn two_column_generation() -> (Table, TableConfig, Generation, Vec<i64>) {
+        let mut table = Table::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
+        let all = keys_from(0, E2E_KEYS);
+        table.add_long_file("f", &all, 0).await;
+        table
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let config = table.config(Residency::Full, None);
+        let generation = table.load(&config, None, None).await.unwrap();
+        (table, config, generation, all)
+    }
+
+    /// A lookup answers the columns at the positions it names in the order
+    /// it names them, whatever the layout's order (RFD 022).
+    #[tokio::test]
+    async fn test_lookup_answers_the_positions_named_in_their_order() {
+        let (_table, _config, generation, all) = two_column_generation().await;
+        let names: Vec<&str> = generation
+            .layout
+            .value_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [testing::DETAIL_COLUMN, manifest_testing::VALUE_COLUMN]
+        );
+        let value = value_for(all[0]);
+        let (row, _) = generation
+            .lookup(&Key::Long(all[0]), &[1, 0], &cache().await, None, &[])
+            .await
+            .unwrap();
+        assert_ne!(testing::detail_of(&value), value, "the columns differ");
+        assert_eq!(
+            row,
+            Row::Present(vec![
+                Some(Bytes::from(value.clone())),
+                Some(Bytes::from(testing::detail_of(&value))),
+            ])
+        );
+    }
+
+    /// A file the previous generation indexed over other columns than the
+    /// snapshot's layout resolves to is not reused: it is opened and
+    /// indexed afresh, so no column is answered from another's pages.
+    #[tokio::test]
+    async fn test_load_opens_afresh_a_file_indexed_over_other_columns() {
+        let (table, both, _first, all) = two_column_generation().await;
+        let value_only = TableConfig {
+            value_columns: vec![crate::config::ValueColumnConfig::named(
+                manifest_testing::VALUE_COLUMN,
+            )],
+            ..both.clone()
+        };
+        let previous = table.load(&value_only, None, None).await.unwrap();
+        let planned = table.plan_load(&both, Some(&previous)).await.unwrap();
+        assert!(planned.reused.is_empty(), "indexed over [value] alone");
+        let second = planned.build(None).await.unwrap();
+        let value = value_for(all[0]);
+        let (row, _) = second
+            .lookup(&Key::Long(all[0]), &[0, 1], &cache().await, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            row,
+            Row::Present(vec![
+                Some(Bytes::from(testing::detail_of(&value))),
+                Some(Bytes::from(value)),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -4600,12 +4848,15 @@ mod tests {
             let report = check::diagnose(&generation, config.lookups());
             assert_eq!(caps.level, report.summary.level, "{name}");
             assert_eq!(caps.level, generation.level, "{name}");
-            assert_eq!(caps.codes(), report.capping_codes(), "{name}");
-            assert_eq!(caps.codes(), generation.capping, "{name}");
+            assert_eq!(caps.capping(), report.capping(), "{name}");
+            assert_eq!(caps.capping(), generation.capping, "{name}");
             if name == "two bucketings" {
                 assert_eq!(
-                    caps.codes(),
-                    [FindingCode::OverlappingFiles],
+                    caps.capping(),
+                    [Capping {
+                        code: crate::check::FindingCode::OverlappingFiles,
+                        column: None,
+                    }],
                     "the plan stage links files across bucketings"
                 );
             }
@@ -4651,10 +4902,13 @@ mod tests {
     }
 
     /// The GETs one lookup of `key` costs through a fresh cache, so cold.
-    async fn cold_gets(table: &Table, generation: &Generation, key: i64) -> (Value, u64) {
+    async fn cold_gets(table: &Table, generation: &Generation, key: i64) -> (Row, u64) {
         let cache = cache().await;
         let before = table.gets();
-        let (value, _) = generation.lookup(&Key::Long(key), &cache).await.unwrap();
+        let (value, _) = generation
+            .lookup_first(&Key::Long(key), &cache)
+            .await
+            .unwrap();
         (value, table.gets() - before)
     }
 
@@ -4773,10 +5027,10 @@ mod tests {
                     "{name} {residency}: the fixture reaches the worst case"
                 );
                 let (value, gets) = cold_gets(&table, &generation, hits[0]).await;
-                assert_eq!(value, Value::Present(Bytes::from(value_for(hits[0]))));
+                assert_eq!(value, testing::one_value(Bytes::from(value_for(hits[0]))));
                 assert_eq!(gets, expected.gets_per_hit, "{name} {residency}: a hit");
                 let (value, gets) = cold_gets(&table, &generation, misses[0]).await;
-                assert_eq!(value, Value::Absent);
+                assert_eq!(value, Row::Absent);
                 assert_eq!(gets, expected.gets_per_miss, "{name} {residency}: a miss");
             }
         }
@@ -4912,7 +5166,14 @@ mod tests {
             RefusalReason::BelowLevel {
                 declared: Level::Optimal,
                 achieved: Level::Permissive,
-                findings: vec![FindingCode::OverlappingFiles],
+                columns: vec![crate::check::ColumnLevel {
+                    column: crate::manifest::testing::VALUE_COLUMN.to_string(),
+                    level: Level::Permissive,
+                }],
+                findings: vec![Capping {
+                    code: crate::check::FindingCode::OverlappingFiles,
+                    column: None,
+                }],
             }
         );
         assert_eq!(local.index_bytes_in_use().unwrap(), 0, "no chunk file");
@@ -5123,8 +5384,12 @@ mod tests {
         let cache = cache().await;
         for key in &all {
             assert_eq!(
-                loaded.lookup(&Key::Long(*key), &cache).await.unwrap().0,
-                Value::Present(Bytes::from(value_for(*key)))
+                loaded
+                    .lookup_first(&Key::Long(*key), &cache)
+                    .await
+                    .unwrap()
+                    .0,
+                testing::one_value(Bytes::from(value_for(*key)))
             );
         }
 
@@ -5213,11 +5478,11 @@ mod tests {
             );
             assert_eq!(
                 generation
-                    .lookup(&Key::Long(stray), &cache().await)
+                    .lookup_first(&Key::Long(stray), &cache().await)
                     .await
                     .unwrap()
                     .0,
-                Value::Absent,
+                Row::Absent,
                 "{residency}: routed to the bucket it hashes to, which holds no file"
             );
             assert_eq!(
@@ -5267,7 +5532,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Generation>();
         assert_send_sync::<LoadedFile>();
-        assert_send_sync::<Value>();
+        assert_send_sync::<Row>();
         assert_send_sync::<Lookup>();
         assert_send_sync::<MultiLookup>();
     }
@@ -5348,8 +5613,8 @@ mod tests {
         assert_eq!(planned.entry.path, Mem::location(newer));
         let cache = cache().await;
         assert_eq!(
-            generation.lookup(&key, &cache).await.unwrap().0,
-            Value::Present(Bytes::from(updated_value(updated)))
+            generation.lookup_first(&key, &cache).await.unwrap().0,
+            testing::one_value(Bytes::from(updated_value(updated)))
         );
 
         // The newer copy deleted: the older answers, past the first probe,
@@ -5370,15 +5635,15 @@ mod tests {
         let cache = testing::cache().await;
         let before = mem.store.storage.stats().gets();
         assert_eq!(
-            generation.lookup(&key, &cache).await.unwrap().0,
-            Value::Present(Bytes::from(value_for(updated)))
+            generation.lookup_first(&key, &cache).await.unwrap().0,
+            testing::one_value(Bytes::from(value_for(updated)))
         );
         assert_eq!(
             mem.store.storage.stats().gets(),
             before + 1,
             "the live copy's value page alone"
         );
-        assert!(page.value_page_offset.is_some());
+        assert!(planned.index.value_page_offset(0, &page).is_some());
 
         // Both deleted: absent, with no GET in the Full tier.
         let generation = assemble_deleted(
@@ -5392,8 +5657,8 @@ mod tests {
         .unwrap();
         let before = mem.store.storage.stats().gets();
         assert_eq!(
-            generation.lookup(&key, &cache).await.unwrap().0,
-            Value::Absent
+            generation.lookup_first(&key, &cache).await.unwrap().0,
+            Row::Absent
         );
         assert_eq!(mem.store.storage.stats().gets(), before);
         let (first, page) = generation.plan(std::slice::from_ref(&key))[0]

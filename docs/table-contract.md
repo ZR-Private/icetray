@@ -1,9 +1,9 @@
 # The table contract
 
 The contract is what a table must look like on disk for icetray to serve
-it at one GET per cold hit and none per miss. icetray checks it on the
-files as written, never on the properties a writer was given, at every
-load and in `icetray doctor`.
+it at one GET per column a cold hit reads and none per miss. icetray
+checks it on the files as written, never on the properties a writer was
+given, at every load and in `icetray doctor`.
 
 ## The recipe
 
@@ -73,7 +73,7 @@ doctor's output and the metrics spell it.
 | No null keys | Refused: `null_keys` | Filter nulls before the write |
 | A key at most once within a data file, deleted rows included | Refused: `duplicate_keys` | Deduplicate before the write |
 | A live key in at most one data file: a row a delete removes is not live | Refused: `duplicate_keys` | Deduplicate before the write, or upsert with `MERGE`, which rewrites the older row or deletes it |
-| One value column of type `binary`, `fixed`, or `string`; nulls allowed | Refused: `value_type_unsupported` | Pack the columns a caller needs into one binary value at write time, such as a serialized protobuf. A second column would cost a second GET per hit. |
+| Each configured value column of type `binary`, `fixed`, or `string`; nulls allowed | Refused: `value_type_unsupported`, naming the column | Serve a typed field inside a binary column, such as a serialized protobuf. See [Value columns](#value-columns) for when to pack fields into one column and when to split them. |
 | Each configured column held under the name and field id the snapshot's schema gives it, in data files that record a field id on every column, as Iceberg's writers do | Refused: `column_mismatch`, for a column held under another field id (a swap of names, or a name dropped and added again), its field id held under another name (a rename), a file that records no field ids and lacks the column, a file without its key column, a file holding the name as a nested group, a `fixed` key or value column stored at another width, a configured name that is not a top-level field, or a stated default that does not read as its column's type. A file that records field ids and was written before its value column was added is served, its rows answering the column's default: advice, `column_default`, with the count of such files | Write through an Iceberg writer, and change the schema as [Changing the schema](#changing-the-schema) describes; a compaction rewrites the files that predate a column |
 | No equality delete that may apply to a data file | Refused: `equality_deletes`, for an equality delete newer than the snapshot's oldest data file, which may apply to one (RFD 021). An equality delete no data file is older than changes no answer and is ignored. | A table whose writer leaves equality deletes can be served from a tag or branch that a compaction moves after rewriting them into data files. |
 | Only deletes icetray reads: deletion vectors and Parquet position deletes | Served (RFD 021). Refused: `delete_kind_unsupported`, for a position delete file in Avro or ORC that may apply to a data file no deletion vector masks, a Puffin blob other than a deletion vector, or a Puffin footer that is compressed or sets reserved flags. An Avro or ORC position delete file that applies to no data file the snapshot holds changes no answer and is ignored, and so is one whose every data file is masked: a deletion vector that applies to a data file masks its position deletes. | Merge-on-read writers that write deletion vectors or Parquet position deletes |
@@ -81,9 +81,9 @@ doctor's output and the metrics spell it.
 | Every key in the bucket its file's manifest entry records | Refused: `key_outside_bucket` | Let Iceberg's bucket transform assign files; never register files under a partition by hand |
 | `bucket(N, key)` partitioning, and no other partition field | Caps at `permissive`: `no_bucket_partition`, files probed per lookup | `PARTITIONED BY (bucket(N, key))`, then rewrite the files written without it. See [Choosing the bucket count](#choosing-the-bucket-count). |
 | Within a bucket, files whose key ranges do not intersect | Caps at `permissive`: `overlapping_files`, files probed per lookup | `'write.distribution-mode' = 'hash'`; `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=false` on the write session; or a compaction |
-| Dictionary encoding off on the value column | Caps at `balanced`: `dictionary_encoded_value`, one extra GET per hit | `'parquet.enable.dictionary' = 'false'` |
+| Dictionary encoding off on each value column | Caps the column at `balanced`: `dictionary_encoded_value`, naming the column, one extra GET per hit that reads it | `'parquet.enable.dictionary' = 'false'` |
 | Key pages of 1,000 rows | Caps at `balanced` above 2,000 rows: `large_key_pages`, keys decoded per lookup | `'write.parquet.page-row-limit' = '1000'` |
-| Value pages bounded by bytes for large values | Advice when a file's mean value page is over 1 MiB: `large_value_pages`. Over 64 MiB: `value_pages_over_ceiling`, and a lookup into a page that large is refused with an error | `'write.parquet.page-size-bytes' = '65536'` with a short page-size check interval, as the recipe above describes |
+| Value pages bounded by bytes for large values | Advice, per column, when a file's mean value page for that column is over 1 MiB: `large_value_pages`. Over 64 MiB: `value_pages_over_ceiling`, and a lookup into a page that large is refused with an error | `'write.parquet.page-size-bytes' = '65536'` with a short page-size check interval, as the recipe above describes |
 | Full-length manifest metrics on the key | Advice: `bounds_missing` | `'write.metadata.metrics.column.key' = 'full'` |
 | A full-length column index on the key | Advice: `column_index_truncated` | `'parquet.columnindex.truncate.length'` at least the key length, such as `'256'` |
 | A bloom filter on the key | Advice: `no_bloom_filter`. Under `bloom` residency the table is refused with the same name | `'write.parquet.bloom-filter-enabled.column.key' = 'true'` |
@@ -105,6 +105,38 @@ a local directory is a configuration error. `resident_budget_bytes` is in
 A per-column property in a finding's `property` field is printed as its
 prefix up to the column name, such as
 `write.metadata.metrics.column.`; the finding's message names the column.
+
+A finding about one value column names it in its `column` field, and each
+column has a level of its own: the caps of its own findings with those of
+every finding about the row or the table. The table's level is its
+dearest column's, so under `strict` one column below the declared level
+holds the whole table.
+
+## Value columns
+
+A table serves the value columns its configuration lists in
+[`value_columns`](configuration.md#tables), and a lookup reads only the
+columns it names ([RFD 022](rfd/022-value-columns.md)). A table may list
+none, to answer only whether a key is present, and a presence-only lookup
+costs only finding the row. Each column a cold hit names costs a GET of
+its own, issued concurrently with the others, so a hit naming several
+columns waits on the slowest of them.
+
+One packed column performs best. A table read by one kind of caller packs
+the row into one `binary` column at write time, such as a serialized
+protobuf whose field addition handles evolution, and a cold hit costs one
+GET. A table read by several kinds of caller splits its row along how it
+is read:
+
+- Fields read together share a column.
+- A large part read on its own, such as an embedding, gets a column of
+  its own, so a caller that wants only the small fields does not fetch
+  and decode it, and a value page holds more rows of the rest.
+- A caller that needs most of a row is better served by one packed
+  column than by naming several, which costs a GET per column.
+
+Each column is resolved in each data file on its own, so one column may
+answer its default in a file where another is served.
 
 ## Changing the schema
 
@@ -163,14 +195,15 @@ means rewriting every file.
 
 ## The checks
 
-`icetray doctor` runs the check and prints the findings; its command line
-and output are in [Configuration and the command line](configuration.md).
-The decisions behind the contract:
-[RFD 002](rfd/002-serving-layout-contract.md) (the contract),
-[RFD 007](rfd/007-serving-tiers.md) (refusals, costs, and advice, with
-their penalties), [RFD 009](rfd/009-writes-between-builds.md) (writes
-between builds), [RFD 016](rfd/016-doctor.md) (the doctor),
-[RFD 020](rfd/020-lookup-levels.md) (lookup levels),
-[RFD 021](rfd/021-merge-on-read.md) (delete files), and
-[RFD 023](rfd/023-column-resolution.md) (column resolution). Terms such as
+`icetray doctor` runs the check and prints the findings; its command
+line and output are in [Configuration and the command
+line](configuration.md). The decisions behind the contract: [RFD
+002](rfd/002-serving-layout-contract.md) (the contract), [RFD
+007](rfd/007-serving-tiers.md) (refusals, costs, and advice, with their
+penalties), [RFD 009](rfd/009-writes-between-builds.md) (writes between
+builds), [RFD 016](rfd/016-doctor.md) (the doctor), [RFD
+020](rfd/020-lookup-levels.md) (lookup levels), [RFD
+021](rfd/021-merge-on-read.md) (delete files), [RFD
+022](rfd/022-value-columns.md) (value columns), and [RFD
+023](rfd/023-column-resolution.md) (column resolution). Terms such as
 residency, level, and strict are in the [glossary](glossary.md).

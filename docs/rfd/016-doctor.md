@@ -21,6 +21,13 @@
 > default, and such a file draws no value-column finding, since it holds
 > no such column. See RFD 023.
 
+> Updated 2026-10-07: the value-column findings and the advice
+> `column_default` are reported per configured column and name it, every
+> finding line carries a `column` field, and the table and per-file
+> reports list each value column, a change to the doctor's output
+> contract. Each column has a level and the table's is the dearest
+> column's. See RFD 022.
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -54,19 +61,35 @@ manifest bounds, value pages over 1 MiB, value pages over the lookup's 64 MiB va
 128 MiB, a truncated column index, more files per bucket than the table's
 size and file-size target explain, a key bloom filter that is absent,
 oversized, or undersized for its row group's key count, reported as the
-filter's bits per key, and data files written before the value column was
+filter's bits per key, and data files written before a value column was
 added, which answer its default (RFD 023 (Column resolution)). Such a
-file holds no value column, so it draws no value-column finding, and
-its rows cost no value-page GET, which the level and the cost gauges,
+file does not hold that column, so it draws no finding for it, and its
+rows cost no value-page GET for it, which the level and the cost gauges,
 predicting the worst case, leave out.
+
+A table serves the value columns its configuration lists (RFD 022
+(Value columns)), and
+the findings about a value column (dictionary encoding, value-page size,
+the value-page ceiling, and `column_default`) are made per configured
+column and name it: on the finding's line, in a `below_level` refusal,
+and in the `column` label of `icetray_findings`. A finding about the row
+or the table, such as key pages, buckets, overlap, or bloom filters,
+names no column. Each column has a level, its own findings' caps with
+the row's and the residency's best level; the table's level is the
+dearest column's, since any column may be asked for, and a table of no
+value columns has the level of finding the row. The table's report lists
+each configured column with its level and cost, and the per-file report
+lists each column's value pages and whether the file answers it by its
+default.
 
 The value-page line concerns bytes fetched per hit. That cost grows
 linearly with the page's size and has no step anywhere, so the line is
 drawn where the transfer itself reaches the order of a round trip
 instead of at the contract's 64 KiB bound. The bound remains the recipe
 for large values, where a row limit alone leaves pages of megabytes, and
-the doctor reports the mean value size beside the mean page size so an
-owner sees how many values a hit fetches for the one it wanted.
+the doctor reports each column's mean value size beside its mean page
+size so an owner sees how many values a hit fetches for the one it
+wanted.
 
 The ceiling line warns of refusals rather than slowdowns: a lookup into a
 value page over the ceiling is refused with a file fault. It is reported

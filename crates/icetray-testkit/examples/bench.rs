@@ -36,7 +36,7 @@ use icetray_core::config::{
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
     CallsInFlight, FindingLog, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles,
-    TableSource, Value,
+    TableSource,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
@@ -952,7 +952,7 @@ async fn table_over(
         source: source.clone(),
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
-        value_column: VALUE_COLUMN.to_string(),
+        value_columns: vec![icetray_core::ValueColumnConfig::named(VALUE_COLUMN)],
         strict: true,
         lookups: None,
         residency: tier.residency(),
@@ -1024,19 +1024,21 @@ impl Op {
     async fn run(&self, table: &Table, i: usize) -> BenchResult<()> {
         match self {
             Self::Get { keys, present } => {
-                let lookup = table.get(&keys[i % keys.len()]).await?;
-                let found = matches!(lookup.value, Value::Present(_));
+                let lookup = table.get(&keys[i % keys.len()], &[VALUE_COLUMN]).await?;
+                let found = icetray_testkit::verify::one_value(&lookup.row).is_some();
                 if found != *present {
-                    return Err(format!("key {i} answered {:?}", lookup.value).into());
+                    return Err(format!("key {i} answered {:?}", lookup.row).into());
                 }
             }
             Self::MultiGet { keys, batch } => {
                 let start = (i * batch) % (keys.len() - batch);
-                let lookup = table.multi_get(&keys[start..start + batch]).await?;
+                let lookup = table
+                    .multi_get(&keys[start..start + batch], &[VALUE_COLUMN])
+                    .await?;
                 if !lookup
-                    .values
+                    .rows
                     .iter()
-                    .all(|value| matches!(value, Value::Present(_)))
+                    .all(|row| icetray_testkit::verify::one_value(row).is_some())
                 {
                     return Err(format!("batch {i} answered a key absent").into());
                 }
@@ -1281,7 +1283,7 @@ async fn measure(
 /// before a warm run starts.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
     for id in (0..shape.rows).step_by(approx::length(PRIME_STRIDE)) {
-        table.get(&shape.key(id)).await?;
+        table.get(&shape.key(id), &[VALUE_COLUMN]).await?;
     }
     Ok(())
 }

@@ -5,19 +5,23 @@
 //! reader of one series out of a metrics scrape.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use iceberg::Catalog;
 use icetray_core::approx::count;
-use icetray_core::config::{HedgeConfig, ServerConfig, StorageConfig, TableConfig};
+use icetray_core::config::{HedgeConfig, LocalConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
-    CallsInFlight, FindingLog, Generation, Key, LocalDir, PageCache, Residency, Storage, Table,
-    TableHandles, TableSource, Value,
+    CallsInFlight, FindingLog, Generation, Key, LocalDir, PageCache, Residency, Row, Storage,
+    Table, TableHandles, TableSource,
 };
 
 use crate::error::{Precondition, Result};
 use crate::fixture::Fixture;
 use crate::keys::far_key;
+use crate::layout::VALUE_COLUMN;
 
 /// The page cache budget of a served table: large enough that nothing a
 /// test touches is evicted, so a repeat batch is served from memory and a
@@ -114,6 +118,33 @@ pub async fn build(
     })
 }
 
+/// `build` of `config` from `source` over a fresh hedge-free storage
+/// (`storage_config_for_tests`), so every GET counted is one a load or a
+/// lookup planned, with a `cache_bytes` page cache and, when
+/// `config.residency` is Disk, a local directory at `dir` over the
+/// storage's counters, with no index budget and no disk page cache; not
+/// loaded. The opening of a test that serves a fixture in each residency.
+pub async fn build_in(
+    config: TableConfig,
+    source: TableSource,
+    dir: &Path,
+    cache_bytes: usize,
+) -> Result<Served> {
+    let storage = Arc::new(Storage::new(storage_config_for_tests()));
+    let local = match config.residency {
+        Residency::Disk => Some(Arc::new(LocalDir::open(
+            &LocalConfig {
+                dir: dir.to_path_buf(),
+                index_budget_bytes: None,
+                page_cache_disk_bytes: 0,
+            },
+            storage.stats(),
+        )?)),
+        Residency::Full | Residency::Bloom => None,
+    };
+    build(storage, config, source, local, cache_bytes).await
+}
+
 /// `build` with a `TEST_PAGE_CACHE_BYTES` cache, loaded.
 pub async fn serve_over(
     storage: Arc<Storage>,
@@ -186,28 +217,63 @@ pub fn storage_config_for_tests() -> StorageConfig {
     }
 }
 
-/// The GETs a cold batch of hits on `keys` costs in the Full tier: the
-/// distinct `(file, value page offset)` pairs `generation.plan` names. A key
-/// the plan names no value page for costs nothing in the Full tier, where a
-/// resident key page shows it absent; in any other tier the oracle cannot
-/// name value pages without I/O, which is `Precondition::OracleNotFull`.
-pub fn expected_cold_gets(generation: &Generation, keys: &[Key]) -> Result<u64> {
+/// The GETs a cold batch of hits on `keys` naming the value columns
+/// `columns` costs in the Full tier (RFD 022): the distinct `(file, column,
+/// value page offset)` triples `generation.plan` names, one GET per value
+/// page of each column named; a dictionary-encoded column's dictionary page
+/// is not counted. A key the plan names no row for costs nothing in the Full
+/// tier, where a resident key page shows it absent, and neither does a
+/// column a file answers by its default (RFD 023); in any other tier the
+/// oracle cannot name value pages without I/O, which is
+/// `Precondition::OracleNotFull`.
+///
+/// Panics on a column the generation does not serve.
+pub fn expected_cold_gets(generation: &Generation, keys: &[Key], columns: &[&str]) -> Result<u64> {
+    if generation.residency != Residency::Full {
+        return Err(Precondition::OracleNotFull {
+            residency: generation.residency,
+        }
+        .into());
+    }
+    let positions = column_positions(generation, columns);
     let mut pages = HashSet::new();
     for (file, page) in generation.plan(keys).into_iter().flatten() {
-        match page.value_page_offset {
-            Some(offset) => {
-                pages.insert((file.entry.path.clone(), offset));
-            }
-            None if generation.residency == Residency::Full => {}
-            None => {
-                return Err(Precondition::OracleNotFull {
-                    residency: generation.residency,
-                }
-                .into());
+        for &column in &positions {
+            if let Some(offset) = file.index.value_page_offset(column, &page) {
+                pages.insert((file.entry.path.clone(), column, offset));
             }
         }
     }
     Ok(count(pages.len()))
+}
+
+/// The value a lookup naming one column answers for a present key, when it
+/// is not null: `None` for an absent key, a null value, or a row that does
+/// not carry exactly one value.
+pub fn one_value(row: &Row) -> Option<&Bytes> {
+    match row {
+        Row::Present(values) => match values.as_slice() {
+            [value] => value.as_ref(),
+            _ => None,
+        },
+        Row::Absent => None,
+    }
+}
+
+/// The positions in `generation`'s layout of the value columns `columns`
+/// names.
+///
+/// Panics on a column the generation does not serve.
+pub fn column_positions(generation: &Generation, columns: &[&str]) -> Vec<usize> {
+    columns
+        .iter()
+        .map(|&column| {
+            generation
+                .layout
+                .value_column(column)
+                .unwrap_or_else(|| panic!("the generation serves no column {column}"))
+        })
+        .collect()
 }
 
 /// The distinct key pages `generation.plan` names for `keys`: the key-page
@@ -242,16 +308,17 @@ pub struct SeenPages {
 
 /// The GETs a lookup of `key` costs in `generation`'s tier after the
 /// lookups `seen` records, for a key with a live copy when `live` (RFD
-/// 021): the value page the Full tier's generation `full` plans for the
-/// live copy, unless fetched before or its file answers the value column's
-/// default and reads none (RFD 023); and in the Bloom tier every key page a
-/// probe decodes, walking the candidates in probe order up to the file the
-/// plan names, or through every candidate for a key with no live copy,
-/// deleted copies among them. The Full and Disk tiers decode key pages from
-/// memory and from local disk.
+/// 021), naming value column `column`: its value page the Full tier's
+/// generation `full` plans for the live copy, unless fetched before or its
+/// file answers the column's default and reads none (RFD 023); and in the
+/// Bloom tier every key page a probe decodes, walking the candidates in
+/// probe order up to the file the plan names, or through every candidate
+/// for a key with no live copy, deleted copies among them. The Full and
+/// Disk tiers decode key pages from memory and from local disk.
 pub fn expected_lookup_gets(
     full: &Generation,
     generation: &Generation,
+    column: &str,
     key: &Key,
     live: bool,
     seen: &mut SeenPages,
@@ -265,9 +332,13 @@ pub fn expected_lookup_gets(
             .next()
             .flatten()
             .expect("the plan names a live key's file");
-        if file.index.value_leaf().is_some() {
-            let offset = page
-                .value_page_offset
+        let [column] = column_positions(full, &[column])[..] else {
+            unreachable!("one name is one position");
+        };
+        if file.index.value_leaf(column).is_some() {
+            let offset = file
+                .index
+                .value_page_offset(column, &page)
                 .expect("the Full tier names the value page of a file that holds the column");
             gets += u64::from(seen.value_pages.insert((file.entry.path.clone(), offset)));
         }
@@ -290,18 +361,18 @@ pub fn expected_lookup_gets(
     gets
 }
 
-/// Looks up the fixture key at every id, checking each answer against the
-/// fixture's derivation (`Present` bytes compared whole, or `Null`) and its
-/// snapshot against the serving generation's; returns the GETs the batch
-/// cost.
+/// Looks up the fixture key at every id naming `VALUE_COLUMN`, checking
+/// each answer against the fixture's derivation (`Present` bytes compared
+/// whole, or a null) and its snapshot against the serving generation's;
+/// returns the GETs the batch cost.
 pub async fn verify_hits(served: &Served, fixture: &Fixture, ids: &[u64]) -> Result<u64> {
     let stats = served.storage.stats();
     let before = stats.gets();
     let generation = served.current();
     for &id in ids {
         let key = fixture.key(id);
-        let lookup = served.table.get(&key).await?;
-        assert_eq!(lookup.value, fixture.expected(&key), "value for key {key}");
+        let lookup = served.table.get(&key, &[VALUE_COLUMN]).await?;
+        assert_eq!(lookup.row, fixture.expected(&key), "value for key {key}");
         assert_eq!(
             lookup.snapshot_id, generation.snapshot_id,
             "snapshot for key {key}"
@@ -319,7 +390,7 @@ pub async fn verify_hit_cost(served: Served, fixture: &Fixture, ids: &[u64]) -> 
     if hits > 0 || fetches > 0 {
         return Err(Precondition::CacheNotCold { hits, fetches }.into());
     }
-    let expected = expected_cold_gets(&served.current(), &fixture.keys_at(ids))?;
+    let expected = expected_cold_gets(&served.current(), &fixture.keys_at(ids), &[VALUE_COLUMN])?;
     assert!(expected > 0, "the sample names no value page");
     let cold = verify_hits(&served, fixture, ids).await?;
     assert_eq!(
@@ -340,15 +411,15 @@ pub async fn verify_misses(served: &Served, fixture: &Fixture, ids: &[u64]) -> R
     for &id in ids {
         let key = fixture.absent_near(id);
         assert_eq!(
-            served.table.get(&key).await?.value,
-            Value::Absent,
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "key {key}"
         );
     }
     let far = far_key(fixture.spec().key_type);
     assert_eq!(
-        served.table.get(&far).await?.value,
-        Value::Absent,
+        served.table.get(&far, &[VALUE_COLUMN]).await?.row,
+        Row::Absent,
         "key {far}"
     );
     assert_eq!(stats.gets(), before, "misses touch no storage");

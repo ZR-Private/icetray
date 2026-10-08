@@ -37,7 +37,7 @@ use icetray_core::config::{
 };
 use icetray_core::{
     FALL_PER_MILLE, Generation, Key, KeyType, LocalDir, PER_MILLE, RECOVER_PER_MILLE, Storage,
-    TableSource, Value, approx, time,
+    TableSource, approx, time,
 };
 use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
@@ -385,7 +385,7 @@ async fn serve(cli: &Cli) -> SweepResult<Served> {
         source: source.clone(),
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
-        value_column: VALUE_COLUMN.to_string(),
+        value_columns: vec![icetray_core::ValueColumnConfig::named(VALUE_COLUMN)],
         strict: false,
         lookups: None,
         residency: Residency::Disk,
@@ -512,9 +512,9 @@ async fn lookups(
                 let mut took = Vec::with_capacity(part.len());
                 for key in &part {
                     let started = Instant::now();
-                    let found = served.table.get(key).await?;
+                    let found = served.table.get(key, &[VALUE_COLUMN]).await?;
                     took.push(started.elapsed());
-                    if matches!(found.value, Value::Present(_)) != (kind == Kind::Hit) {
+                    if verify::one_value(&found.row).is_some() != (kind == Kind::Hit) {
                         return Err(format!("{key:?} answered as no {kind}").into());
                     }
                 }

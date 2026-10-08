@@ -18,11 +18,12 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Storage, Value,
+    Budget, DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Row, Storage,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
 };
+use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
 
@@ -84,7 +85,11 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
     )
     .await?;
     let oracle = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    let expected = verify::expected_cold_gets(&oracle.current(), &fixture.keys_at(&SAMPLE))?;
+    let expected = verify::expected_cold_gets(
+        &oracle.current(),
+        &fixture.keys_at(&SAMPLE),
+        &[VALUE_COLUMN],
+    )?;
     let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
     let served = served?;
     assert_eq!(served.current().residency, Residency::Disk);
@@ -121,8 +126,8 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
             routed += 1;
         }
         assert_eq!(
-            served.table.get(&key).await?.value,
-            Value::Absent,
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            Row::Absent,
             "key {key}"
         );
     }
@@ -135,7 +140,10 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
 
     let (gets, reads) = counters();
     let far = icetray_testkit::far_key(KeyType::Long);
-    assert_eq!(served.table.get(&far).await?.value, Value::Absent);
+    assert_eq!(
+        served.table.get(&far, &[VALUE_COLUMN]).await?.row,
+        Row::Absent
+    );
     assert_eq!(counters(), (gets, reads), "a far miss touches nothing");
     Ok(())
 }
@@ -173,7 +181,10 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
     for id in SAMPLE {
         let key = fixture.key(id);
         let (gets, reads) = (stats.gets(), stats.local_reads());
-        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            fixture.expected(&key)
+        );
         assert_eq!(
             (stats.gets() - gets, stats.local_reads() - reads),
             (1, 1),
@@ -327,7 +338,10 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     );
     for id in SAMPLE {
         let key = fixture.key(id);
-        assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+        assert_eq!(
+            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            fixture.expected(&key)
+        );
     }
     assert_eq!(
         served.cache.fetches(),
@@ -350,7 +364,10 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     let stats = storage.stats();
     let key = fixture.key(SAMPLE[0]);
     let (gets, reads) = (stats.gets(), stats.local_reads());
-    assert_eq!(served.table.get(&key).await?.value, fixture.expected(&key));
+    assert_eq!(
+        served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+        fixture.expected(&key)
+    );
     assert_eq!(
         (stats.gets() - gets, stats.local_reads() - reads),
         (0, 1),
