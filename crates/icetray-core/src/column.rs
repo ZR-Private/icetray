@@ -137,8 +137,10 @@ pub(crate) enum Found {
 /// records field ids when every top-level column carries one; one where
 /// only some do records none. A column of that name is the one named
 /// `name`, else the one named `avro_compatible(name)`, the name Iceberg's
-/// Java writers give it in the file: a file may hold both, `a-b` beside a
-/// sibling named `a_x2Db`, and the escaped form is the other column.
+/// Java writers give it in the file, when that one carries `field_id`:
+/// those writers always record field ids, and the escaped form can be the
+/// name of another column, `a_x2Db` beside `a-b` in the schema, so a
+/// column under it with another field id or none is not this one.
 pub(crate) fn find(
     schema: &SchemaDescriptor,
     name: &str,
@@ -151,7 +153,12 @@ pub(crate) fn find(
     let named = fields
         .iter()
         .position(|field| field.name() == name)
-        .or_else(|| fields.iter().position(|field| field.name() == compatible));
+        .or_else(|| {
+            fields
+                .iter()
+                .zip(&ids)
+                .position(|(field, &id)| field.name() == compatible && id == Some(field_id))
+        });
     match named {
         Some(at) => match ids[at] {
             Some(found) if found != field_id => Err(ColumnMismatch::OtherFieldId {
@@ -635,10 +642,8 @@ mod tests {
         assert_eq!(found(message, "1key", KEY_FIELD_ID), Ok(Found::Leaf(0)));
         assert_eq!(
             found(message, "user-id", OTHER_FIELD_ID),
-            Err(ColumnMismatch::OtherFieldId {
-                expected: OTHER_FIELD_ID,
-                found: VALUE_FIELD_ID,
-            })
+            Ok(Found::Absent),
+            "the escaped name under another field id is another column"
         );
     }
 
@@ -663,6 +668,29 @@ mod tests {
         assert_eq!(
             found(without_ids, "a_x2Db", ESCAPED_FIELD_ID),
             Ok(Found::Leaf(1))
+        );
+        // A file written before `a-b` was added holds only its sibling:
+        // `a-b` is absent, never the sibling's bytes.
+        let sibling_only = "message m { required int64 key = 1; optional binary a_x2Db = 6; }";
+        assert_eq!(
+            found(sibling_only, "a-b", EXACT_FIELD_ID),
+            Ok(Found::Absent)
+        );
+        let sibling_only_without_ids = "message m { required int64 key; optional binary a_x2Db; }";
+        assert_eq!(
+            found(sibling_only_without_ids, "a-b", EXACT_FIELD_ID),
+            Err(ColumnMismatch::AbsentWithoutFieldIds)
+        );
+        // A key column under the escaped name does not answer for `a-b`.
+        let key_named_sibling = "message m { required binary a_x2Db = 1; }";
+        assert_eq!(
+            found(key_named_sibling, "a-b", EXACT_FIELD_ID),
+            Ok(Found::Absent)
+        );
+        let key_named_sibling_without_ids = "message m { required binary a_x2Db; }";
+        assert_eq!(
+            found(key_named_sibling_without_ids, "a-b", EXACT_FIELD_ID),
+            Err(ColumnMismatch::AbsentWithoutFieldIds)
         );
     }
 

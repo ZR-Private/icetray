@@ -218,7 +218,9 @@ columns as one without them, except that it refuses a column found by
 name whose field id differs from the schema's. Iceberg's Java writers
 store a column whose name is not a valid Avro name under an escaped one,
 `user-id` as `user_x2Did` and `1st` as `_1st`; icetray matches a file
-column under either name to the configured column.
+column under either name to the configured column, under the escaped
+name only when the file column carries the configured column's field
+id, since the escaped name can belong to another column.
 
 - The owner can add a column to a served table without a rewrite. For
   the rows of a file written before the column, icetray returns the
