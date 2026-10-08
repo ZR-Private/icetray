@@ -400,7 +400,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
         report
             .files
             .iter()
-            .filter(|file| file.value_columns[0].answers_default
+            .filter(|file| file.value_columns[0].predates_column
                 && file.value_columns[0].value_pages == 0)
             .count(),
         earlier,

@@ -456,7 +456,7 @@ mod tests {
                 format: icetray_core::ValueFormat::Protobuf,
                 level: Level::Optimal,
                 gets_per_hit: 1,
-                files_answering_default: 0,
+                files_predating_column: 0,
             }],
             deletes: DeleteSummary {
                 rows: 1,
@@ -485,7 +485,7 @@ mod tests {
             max_key_bytes: 1,
             value_columns: vec![ValueColumnReport {
                 column: COLUMN.to_string(),
-                answers_default: false,
+                predates_column: false,
                 value_pages: 1,
                 avg_value_page_bytes: 1,
                 avg_value_bytes: 1,

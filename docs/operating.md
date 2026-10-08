@@ -202,7 +202,7 @@ The label values:
   `icetray_findings{code="column_default",column="..."}` reads 1 however
   many data files predate the column and are read with its default; the
   file count is in the finding's message and in the doctor's
-  `files_answering_default`. The doctor's `malformed_protobuf` has no
+  `files_predating_column`. The doctor's `malformed_protobuf` has no
   series: a load reads no values, so only the `doctor` command raises it.
 - `column`: a configured value column's name.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason

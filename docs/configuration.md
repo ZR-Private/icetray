@@ -614,7 +614,7 @@ Two conventions hold for every line:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_predating_column":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 | Key | Value |
@@ -645,7 +645,7 @@ One per table, from `info` and from `doctor`:
 | `value_columns[].format` | The column's format as configured in the table's entry: `opaque` or `protobuf`. |
 | `value_columns[].level` | The level a lookup requesting the column achieves, as `icetray_table_column_level` reports it. |
 | `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. |
-| `value_columns[].files_answering_default` | Data files written before the column was added, for which a lookup returns the column's default. |
+| `value_columns[].files_predating_column` | Data files written before the column was added, for which a lookup returns the column's default. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
 | `deletes.fraction` | `deletes.rows` over `records`, as `icetray_table_deleted_fraction` reports it. |
@@ -682,9 +682,9 @@ One per data file, from `doctor --files`:
 | `max_key_bytes` | The longest key, in bytes. |
 | `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes. |
 | `value_columns[].column` | The column's name. |
-| `value_columns[].answers_default` | Whether the file was written before the column was added, so a lookup in it returns the column's default; its counts are then zero. |
+| `value_columns[].predates_column` | Whether the file was written before the column was added, so a lookup returns the column's default for its rows; its counts are then zero. |
 | `value_columns[].value_pages` | Data pages of the column across every row group. |
-| `value_columns[].avg_value_page_bytes` | Mean uncompressed bytes of the column's value page: what a cold hit naming it decompresses. |
+| `value_columns[].avg_value_page_bytes` | Mean uncompressed bytes of the column's value page: what a cold hit requesting it decompresses. |
 | `value_columns[].avg_value_bytes` | Mean uncompressed bytes of one of the column's values. |
 | `value_columns[].pages_aligned` | Whether every page of the column starts on the same row as a key page. |
 | `dictionary_columns` | The columns, key or value, that are dictionary-encoded in a row group. |

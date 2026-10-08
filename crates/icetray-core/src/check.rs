@@ -209,8 +209,8 @@ pub struct ColumnCost {
     pub level: Level,
     /// The GETs a cold hit spends on the column alone: its value page, and
     /// its dictionary page when any file's chunk of it is
-    /// dictionary-encoded. A file that answers the column's default spends
-    /// none, which this worst case does not count.
+    /// dictionary-encoded. A hit in a file written before the column was
+    /// added spends none, which this worst case does not count.
     pub gets_per_hit: u64,
 }
 
@@ -704,14 +704,15 @@ pub struct FileReport {
 }
 
 /// What the doctor measured about one value column of one data file (RFD
-/// 022). A file written before the column was added holds none of it: it
-/// answers the column's default, and every count is zero.
+/// 022). A file written before the column was added holds none of it: a
+/// lookup returns the column's default for its rows, and every count is
+/// zero.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ValueColumnReport {
     /// The column's configured name.
     pub column: String,
-    /// Whether the file lacks the column and answers its default (RFD 023).
-    pub answers_default: bool,
+    /// Whether the file was written before the column was added (RFD 023).
+    pub predates_column: bool,
     /// Data pages of the column across every row group.
     pub value_pages: usize,
     /// Mean uncompressed bytes of a value page, the column's uncompressed
@@ -742,8 +743,9 @@ pub struct ColumnSummary {
     pub level: Level,
     /// The GETs a cold hit spends on it alone.
     pub gets_per_hit: u64,
-    /// Data files that answer its default, written before it was added.
-    pub files_answering_default: usize,
+    /// Data files written before the column was added, for whose rows a
+    /// lookup returns the column's default (RFD 023).
+    pub files_predating_column: usize,
 }
 
 /// The doctor's verdict on one generation and the numbers an owner chooses
@@ -865,7 +867,7 @@ pub fn diagnose(
             format: formats(&column.name),
             level: cost.level,
             gets_per_hit: cost.gets_per_hit,
-            files_answering_default: answering_default(g, at),
+            files_predating_column: predating_column(g, at),
         })
         .collect();
     let buckets = by_bucket(&facts);
@@ -1114,8 +1116,8 @@ pub(crate) struct LayoutView<'a> {
 /// One file as a level is judged from it: its manifest entry and footer,
 /// with the key and value columns' leaf positions in the footer's schema,
 /// the value columns in the layout's order; no value leaf for a column the
-/// file was written before, which answers its default and makes no
-/// finding of that column (RFD 023).
+/// file was written before, for whose rows a lookup returns its default,
+/// and which makes no finding of that column (RFD 023).
 pub(crate) struct FileView<'a> {
     entry: &'a DataFileEntry,
     metadata: &'a ParquetMetaData,
@@ -1379,7 +1381,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             let Some(leaf) = leaf else {
                 return ValueColumnReport {
                     column: column.name.clone(),
-                    answers_default: true,
+                    predates_column: true,
                     value_pages: 0,
                     avg_value_page_bytes: 0,
                     avg_value_bytes: 0,
@@ -1393,7 +1395,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             let (value_pages, pages_aligned) = value_page_facts(metadata, index.key_leaf(), leaf);
             ValueColumnReport {
                 column: column.name.clone(),
-                answers_default: false,
+                predates_column: false,
                 value_pages,
                 avg_value_page_bytes: chunks
                     .uncompressed_bytes
@@ -1918,19 +1920,20 @@ fn compacted_level(g: &Generation, caps: &Caps) -> Option<Level> {
         .filter(|&compacted| compacted < caps.level)
 }
 
-/// The files of `g` that answer value column `column`, a position in its
-/// layout, by its default: written before the column was added (RFD 023).
-fn answering_default(g: &Generation, column: usize) -> usize {
+/// The files of `g` written before value column `column`, a position in
+/// its layout, was added, for whose rows a lookup returns the column's
+/// default (RFD 023).
+fn predating_column(g: &Generation, column: usize) -> usize {
     g.files
         .iter()
         .filter(|file| file.index.value_leaf(column).is_none())
         .count()
 }
 
-/// `column_default` (RFD 023), one per value column of `g` that files
-/// written before it was added answer by its default, naming it: how many
-/// files, of how many, and the default they answer. Such a file costs no
-/// value-page GET for a hit naming the column, so a table mid-evolution
+/// `column_default` (RFD 023), one per value column of `g` that has data
+/// files written before it was added, naming it: how many files, of how
+/// many, and the default a lookup returns for their rows. Such a file
+/// costs no value-page GET for a hit requesting the column, so a table mid-evolution
 /// costs less than its level and cost gauges predict, which describe the
 /// files that hold the column.
 fn column_defaults(g: &Generation) -> Vec<Finding> {
@@ -1940,7 +1943,7 @@ fn column_defaults(g: &Generation) -> Vec<Finding> {
         .iter()
         .enumerate()
         .filter_map(|(at, column)| {
-            let defaulted = answering_default(g, at);
+            let defaulted = predating_column(g, at);
             if defaulted == 0 {
                 return None;
             }
@@ -1954,7 +1957,7 @@ fn column_defaults(g: &Generation) -> Vec<Finding> {
                     FindingCode::ColumnDefault,
                     None,
                     format!(
-                        "{defaulted} of {total} data files were written before value column {name} was added and answer {default} for it, reading no value page; a rewrite of those files, such as a compaction, writes the column into them",
+                        "{defaulted} of {total} data files were written before value column {name} was added, so a lookup returns {default} for their rows and reads no value page; a rewrite of those files, such as a compaction, writes the column into them",
                     ),
                     None,
                 )
@@ -2524,7 +2527,7 @@ mod tests {
                 panic!("one value column");
             };
             assert_eq!(value.column, VALUE_COLUMN);
-            assert!(!value.answers_default);
+            assert!(!value.predates_column);
             assert_eq!(value.value_pages, 1);
             assert_eq!(file.max_key_page_rows, loaded.index.rows());
             assert!(file.max_key_page_rows <= contract::PAGE_ROWS);
@@ -3752,7 +3755,7 @@ mod tests {
                 "format": ValueFormat::Opaque.to_string(),
                 "level": Level::Balanced.to_string(),
                 "gets_per_hit": VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
-                "files_answering_default": 0,
+                "files_predating_column": 0,
             }]),
             "the dictionary-encoded column is balanced at two GETs"
         );
@@ -3868,7 +3871,7 @@ mod tests {
             column_names,
             BTreeSet::from([
                 "column",
-                "answers_default",
+                "predates_column",
                 "value_pages",
                 "avg_value_page_bytes",
                 "avg_value_bytes",
@@ -3876,7 +3879,7 @@ mod tests {
             ])
         );
         assert_eq!(column["column"], Json::String(VALUE_COLUMN.to_string()));
-        assert_eq!(column["answers_default"], Json::Bool(false));
+        assert_eq!(column["predates_column"], Json::Bool(false));
     }
 
     /// A one-bucket table of one file per entry of `pages`, `FILE_KEYS`

@@ -302,7 +302,7 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
     for column in &report.summary.value_columns {
         assert_eq!(column.level, Level::Optimal, "{}", column.column);
         assert_eq!(column.gets_per_hit, 1, "{}", column.column);
-        assert_eq!(column.files_answering_default, 0, "{}", column.column);
+        assert_eq!(column.files_predating_column, 0, "{}", column.column);
     }
     assert_eq!(report.files.len(), fixture.file_count());
     for file in &report.files {
@@ -318,7 +318,7 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
             file.path
         );
         for column in &file.value_columns {
-            assert!(!column.answers_default, "{} {}", file.path, column.column);
+            assert!(!column.predates_column, "{} {}", file.path, column.column);
             assert!(column.value_pages > 0, "{} {}", file.path, column.column);
             assert!(column.pages_aligned, "{} {}", file.path, column.column);
         }
