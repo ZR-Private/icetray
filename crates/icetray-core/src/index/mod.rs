@@ -612,13 +612,17 @@ struct GroupRange {
     last: Key,
 }
 
-/// Where a lookup's page bytes come from: the store through the page cache
-/// (the value page in every tier, the key page in the Bloom tier), each GET
-/// answering to the issue given (`Issue`), or the disk tier's chunk file.
+/// Where a read's page bytes come from: for a lookup, the store through
+/// the page cache (the value page in every tier, the key page in the Bloom
+/// tier), each GET answering to the issue given (`Issue`), or the disk
+/// tier's chunk file; for the doctor, the store on the load path, one
+/// unhedged load GET per page that feeds no table's hedge window (RFD 013,
+/// RFD 024).
 #[derive(Clone, Copy)]
 enum PageSource<'a> {
     Store(Option<&'a PageCache>, Issue<'a>),
     Disk(&'a DiskChunks),
+    Load,
 }
 
 /// Where the pages one read took came from: the page it decodes, and the
@@ -1078,8 +1082,9 @@ impl FileIndex {
 
     /// Every value of the first value page of value column `column`, a
     /// position in the table's layout, nulls left out: page 0 of the first
-    /// row group that holds rows and a page, read with one GET past the
-    /// page cache, and its dictionary page's when the chunk has one, its
+    /// row group that holds rows and a page, read with one load GET past
+    /// the page cache, never hedged, and its dictionary page's when the
+    /// chunk has one, its
     /// headers checked as `read_column` checks them. Empty for a file whose
     /// row groups hold no page, and for a page of only nulls. `None` for a
     /// file written before the column was added (RFD 023). What the doctor
@@ -1097,7 +1102,7 @@ impl FileIndex {
             return Ok(Some(Vec::new()));
         };
         let (segments, _) = self
-            .fetch_pages(chunk, FIRST_PAGE, PageSource::Store(None, Issue::default()))
+            .fetch_pages(chunk, FIRST_PAGE, PageSource::Load)
             .await?;
         check_value_page_headers(chunk, value.shape, FIRST_PAGE, &segments)?;
         let rows = chunk.page_rows(FIRST_PAGE);
@@ -1352,8 +1357,8 @@ impl FileIndex {
     }
 
     /// One byte range of the file from `source`: a hedged lookup GET through
-    /// the cache, or one counted local read. A chunk-file read is `Cached`:
-    /// it cost no GET, which is what the origin distinguishes.
+    /// the cache, one counted local read, or one load GET. A chunk-file read
+    /// is `Cached`: it cost no GET, which is what the origin distinguishes.
     async fn read_from(
         &self,
         source: PageSource<'_>,
@@ -1365,6 +1370,11 @@ impl FileIndex {
                 .page(range)
                 .await
                 .map(|bytes| (bytes, PageOrigin::Cached)),
+            PageSource::Load => self
+                .handle
+                .read_range(range)
+                .await
+                .map(|bytes| (bytes, PageOrigin::Fetched)),
         }
     }
 }
@@ -1634,6 +1644,7 @@ mod tests {
 
     use super::*;
     use crate::approx::count;
+    use crate::config::HedgeConfig;
     use crate::contract::PAGE_ROWS;
     use crate::generation::testing::{self, Dictionary, KeyColumn, cache, column_of, page_rows};
     use crate::index::page_header::{MOST_VALUE_PAGE_BYTES, PageBody, PageHeader};
@@ -1641,10 +1652,12 @@ mod tests {
         BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened,
         PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, absent_after,
         contract_rows, fault_of, group_rows, header_at, key_for, location, moved_by_header,
-        pages_of, predicted_of, row_of, stepped, store, store_file, value_for, value_of_len,
-        with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
+        pages_of, predicted_of, row_of, stepped, store, store_file, store_hedged_by, value_for,
+        value_of_len, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
+        with_pages,
     };
-    use crate::storage::IoStats;
+    use crate::storage::{HedgeWindow, IoStats};
+    use std::time::Duration;
 
     use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::{EnabledStatistics, WriterVersion};
@@ -1739,7 +1752,14 @@ mod tests {
                 *value = None;
             }
         }
-        let opened = store(&fixture).await;
+        // One sample short of a full window: a hedged lookup read would
+        // fill it and give the window a delay; a load read records nothing.
+        let hedge = HedgeConfig::default();
+        let window = Arc::new(HedgeWindow::new(&hedge));
+        for _ in 1..hedge.window {
+            window.record(Duration::ZERO, false);
+        }
+        let opened = store_hedged_by(&fixture, Arc::clone(&window)).await;
         let mut index = opened.index(KeyType::Long).await;
         let leaf = index.value_leaf(0).unwrap();
         let page_of = |metadata: &ParquetMetaData, row_group: usize| -> Vec<Bytes> {
@@ -1758,6 +1778,7 @@ mod tests {
             1,
             "one GET past the page cache"
         );
+        assert_eq!(window.delay(), None, "a load GET, kept out of the window");
         let second = page_of(&index.metadata, 1);
         index.metadata = Arc::new(with_pages(
             &with_group_rows(&index.metadata, 0, 0),

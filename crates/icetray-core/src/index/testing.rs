@@ -321,14 +321,17 @@ pub(super) async fn store(fixture: &Fixture) -> Opened {
 }
 
 pub(super) async fn store_file(file: Bytes) -> Opened {
+    store_file_hedged_by(file, Arc::new(HedgeWindow::new(&HedgeConfig::default()))).await
+}
+
+/// `store` with the file's lookup reads hedged against `window`.
+pub(super) async fn store_hedged_by(fixture: &Fixture, window: Arc<HedgeWindow>) -> Opened {
+    store_file_hedged_by(fixture.write(), window).await
+}
+
+async fn store_file_hedged_by(file: Bytes, window: Arc<HedgeWindow>) -> Opened {
     let mem = MemStore::new();
-    let handle = mem
-        .open(
-            &location(),
-            file.clone(),
-            Arc::new(HedgeWindow::new(&HedgeConfig::default())),
-        )
-        .await;
+    let handle = mem.open(&location(), file.clone(), window).await;
     Opened {
         storage: mem.storage,
         handle,
