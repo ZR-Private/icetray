@@ -5,7 +5,8 @@
 //! so a test knows what a projection of any field numbers returns without a
 //! protobuf parser and without the walker it tests.
 
-use icetray_core::{Key, Malformed};
+use icetray_core::varint::{CONTINUES, PAYLOAD, PAYLOAD_BITS};
+use icetray_core::{Key, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 
 use crate::fixture::Fixture;
 use crate::keys::Stream;
@@ -40,30 +41,6 @@ pub const FIELDS: [u32; 7] = [
     FILLER_FIELD,
 ];
 
-/// Protobuf's wire types, as a tag carries them.
-const VARINT: u64 = 0;
-const FIXED64: u64 = 1;
-const LENGTH_DELIMITED: u64 = 2;
-const START_GROUP: u64 = 3;
-const END_GROUP: u64 = 4;
-const FIXED32: u64 = 5;
-
-/// The bits of a tag below its field number.
-const WIRE_TYPE_BITS: u32 = 3;
-
-/// The mask of a tag's wire-type bits, which a tag's first byte carries.
-const WIRE_TYPE_MASK: u8 = (1 << WIRE_TYPE_BITS) - 1;
-
-/// The least wire type protobuf does not define; 6 and 7 are both
-/// undefined.
-const FIRST_UNDEFINED_WIRE_TYPE: u8 = 6;
-
-/// The bits of a varint byte that carry its value, and the bit that says
-/// another byte follows.
-const VARINT_PAYLOAD: u64 = 0x7f;
-const VARINT_PAYLOAD_BITS: u32 = 7;
-const CONTINUATION: u8 = 0x80;
-
 /// The elements of each record of `SCORES_FIELD`.
 const SCORES_PER_RECORD: usize = 3;
 
@@ -85,12 +62,12 @@ pub fn fields(key: &Key, len: usize, version: u64) -> Vec<(u32, Vec<u8>)> {
     let id = stream.next();
     let scores = |stream: &mut Stream| -> Vec<u8> {
         let payload: Vec<u8> = (0..SCORES_PER_RECORD)
-            .flat_map(|_| varint(stream.next() >> VARINT_PAYLOAD_BITS))
+            .flat_map(|_| varint(stream.next() >> PAYLOAD_BITS))
             .collect();
         delimited(SCORES_FIELD, &payload)
     };
     let mut fields = vec![
-        (ID_FIELD, [tag(ID_FIELD, VARINT), varint(id)].concat()),
+        (ID_FIELD, [tag(ID_FIELD, Wire::Varint), varint(id)].concat()),
         (SCORES_FIELD, scores(&mut stream)),
     ];
     let letters = u64::try_from(LETTERS.len()).expect("an alphabet's length fits a u64");
@@ -105,7 +82,7 @@ pub fn fields(key: &Key, len: usize, version: u64) -> Vec<(u32, Vec<u8>)> {
     fields.push((
         CHECKSUM_FIELD,
         [
-            tag(CHECKSUM_FIELD, FIXED64),
+            tag(CHECKSUM_FIELD, Wire::Fixed64),
             stream.next().to_le_bytes().to_vec(),
         ]
         .concat(),
@@ -113,12 +90,12 @@ pub fn fields(key: &Key, len: usize, version: u64) -> Vec<(u32, Vec<u8>)> {
     fields.push((
         GROUP_FIELD,
         [
-            tag(GROUP_FIELD, START_GROUP),
-            tag(ID_FIELD, VARINT),
+            tag(GROUP_FIELD, Wire::StartGroup),
+            tag(ID_FIELD, Wire::Varint),
             varint(stream.next()),
-            tag(GROUP_FIELD, START_GROUP),
-            tag(GROUP_FIELD, END_GROUP),
-            tag(GROUP_FIELD, END_GROUP),
+            tag(GROUP_FIELD, Wire::StartGroup),
+            tag(GROUP_FIELD, Wire::EndGroup),
+            tag(GROUP_FIELD, Wire::EndGroup),
         ]
         .concat(),
     ));
@@ -126,13 +103,17 @@ pub fn fields(key: &Key, len: usize, version: u64) -> Vec<(u32, Vec<u8>)> {
         u32::try_from(stream.next() >> u32::BITS).expect("the high half of a u64 fits a u32");
     fields.push((
         FLAGS_FIELD,
-        [tag(FLAGS_FIELD, FIXED32), flags.to_le_bytes().to_vec()].concat(),
+        [
+            tag(FLAGS_FIELD, Wire::Fixed32),
+            flags.to_le_bytes().to_vec(),
+        ]
+        .concat(),
     ));
     let tail = [
         (SCORES_FIELD, scores(&mut stream)),
         (
             ID_FIELD,
-            [tag(ID_FIELD, VARINT), varint(stream.next())].concat(),
+            [tag(ID_FIELD, Wire::Varint), varint(stream.next())].concat(),
         ),
     ];
     let tail_bytes: usize = tail.iter().map(|(_, bytes)| bytes.len()).sum();
@@ -172,7 +153,9 @@ pub fn projected(key: &Key, len: usize, version: u64, numbers: &[u32]) -> Vec<u8
 /// malformed whatever follows; `None` otherwise.
 pub fn first_byte_fault(value: &[u8]) -> Option<Malformed> {
     let wire_type = value.first()? & WIRE_TYPE_MASK;
-    (wire_type >= FIRST_UNDEFINED_WIRE_TYPE).then_some(Malformed::WireType { at: 0, wire_type })
+    Wire::of(wire_type)
+        .is_none()
+        .then_some(Malformed::WireType { at: 0, wire_type })
 }
 
 /// The first key of `fixture`, in its order, whose value is malformed at
@@ -186,15 +169,15 @@ pub fn malformed_key(fixture: &Fixture) -> Option<(Key, Malformed)> {
 }
 
 /// A tag of field `number` and wire type `wire`.
-fn tag(number: u32, wire: u64) -> Vec<u8> {
-    varint((u64::from(number) << WIRE_TYPE_BITS) | wire)
+fn tag(number: u32, wire: Wire) -> Vec<u8> {
+    varint((u64::from(number) << WIRE_TYPE_BITS) | u64::from(wire as u8))
 }
 
 /// `bytes` as field `number`, length-delimited.
 fn delimited(number: u32, bytes: &[u8]) -> Vec<u8> {
     let length = u64::try_from(bytes.len()).expect("a field's length fits a u64");
     [
-        tag(number, LENGTH_DELIMITED),
+        tag(number, Wire::LengthDelimited),
         varint(length),
         bytes.to_vec(),
     ]
@@ -205,13 +188,13 @@ fn delimited(number: u32, bytes: &[u8]) -> Vec<u8> {
 fn varint(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
-        let low = u8::try_from(value & VARINT_PAYLOAD).expect("seven bits fit a byte");
-        value >>= VARINT_PAYLOAD_BITS;
+        let low = u8::try_from(value & u64::from(PAYLOAD)).expect("seven bits fit a byte");
+        value >>= PAYLOAD_BITS;
         if value == 0 {
             bytes.push(low);
             return bytes;
         }
-        bytes.push(low | CONTINUATION);
+        bytes.push(low | CONTINUES);
     }
 }
 

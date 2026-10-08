@@ -43,6 +43,7 @@ use crate::approx;
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::Result;
 use crate::parquet_io::Segments;
+use crate::varint;
 
 /// Bytes an encoding writes for one key value beyond the key's own bytes:
 /// a `PLAIN` or `DELTA_LENGTH_BYTE_ARRAY` length of 4 bytes, or a
@@ -182,10 +183,6 @@ const STOP: u8 = 0;
 /// A list header whose count nibble is this carries its count in a
 /// varint after it.
 const LIST_COUNT_FOLLOWS: u8 = 0x0f;
-/// The bit of a varint byte that says another byte follows.
-pub(super) const VARINT_CONTINUES: u8 = 0x80;
-/// The payload bits of a varint byte.
-const VARINT_PAYLOAD_BITS: usize = 7;
 
 /// `PageHeader.type`.
 pub(super) const TYPE_FIELD: i16 = 1;
@@ -738,15 +735,15 @@ impl Compact<'_> {
     /// by dropping the bits past 64, so one is refused here.
     fn varint(&mut self) -> Parsed<u64> {
         let mut value = 0;
-        for shift in (0..u64::BITS).step_by(VARINT_PAYLOAD_BITS) {
+        for shift in (0..u64::BITS).step_by(varint::PAYLOAD_BITS as usize) {
             let byte = self.byte()?;
-            let payload = u64::from(byte & !VARINT_CONTINUES);
+            let payload = u64::from(byte & varint::PAYLOAD);
             let shifted = payload << shift;
             if shifted >> shift != payload {
                 return Err(PageHeaderFault::VarintTooLong);
             }
             value |= shifted;
-            if byte & VARINT_CONTINUES == 0 {
+            if byte & varint::CONTINUES == 0 {
                 return Ok(value);
             }
         }
@@ -1634,12 +1631,12 @@ mod tests {
 
         fn varint(&mut self, mut value: u64) -> &mut Self {
             loop {
-                let low = u8::try_from(value & u64::from(!VARINT_CONTINUES)).unwrap();
-                value >>= VARINT_PAYLOAD_BITS;
+                let low = u8::try_from(value & u64::from(varint::PAYLOAD)).unwrap();
+                value >>= varint::PAYLOAD_BITS;
                 if value == 0 {
                     return self.byte(low);
                 }
-                self.byte(low | VARINT_CONTINUES);
+                self.byte(low | varint::CONTINUES);
             }
         }
 
@@ -2038,14 +2035,14 @@ mod tests {
             top.extend_from_slice(bytes);
             PageHeader::read(&header(size, size, &[], &top))
         };
-        let continued = [VARINT_CONTINUES; 9];
+        let continued = [varint::CONTINUES; 9];
         let mut widest = continued.to_vec();
         widest.push(1);
         assert!(top(&widest).is_ok(), "ten bytes carrying 64 bits");
         let mut wider = continued.to_vec();
         wider.push(2);
         assert_eq!(top(&wider), Err(PageHeaderFault::VarintTooLong));
-        let mut longer = [VARINT_CONTINUES; 10].to_vec();
+        let mut longer = [varint::CONTINUES; 10].to_vec();
         longer.push(0);
         assert_eq!(top(&longer), Err(PageHeaderFault::VarintTooLong));
 

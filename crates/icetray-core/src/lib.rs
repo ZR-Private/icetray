@@ -32,6 +32,7 @@ mod snapshot;
 mod storage;
 mod table;
 pub mod time;
+pub mod varint;
 
 pub use aws_catalog::{AwsCatalogError, AwsSource};
 pub use bucket::bucket;
@@ -63,7 +64,7 @@ pub use manifest::{
     ValueType,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
-pub use projection::{MAX_FIELD_NUMBER, Malformed};
+pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, LocationError, LocationFault, Storage};
 pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};

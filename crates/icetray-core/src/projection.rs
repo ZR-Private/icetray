@@ -18,6 +18,7 @@ use std::ops::Range;
 use bytes::Bytes;
 
 use crate::manifest::ColumnRequestFault;
+use crate::varint::{CONTINUES, PAYLOAD, PAYLOAD_BITS};
 
 /// The largest protobuf field number, `2^29 - 1`: a field number is the
 /// tag's value above its three wire-type bits, and the protobuf
@@ -32,20 +33,12 @@ const MAX_VARINT_BYTES: usize = 10;
 /// requires.
 const LAST_VARINT_BYTE_MAX: u8 = 1;
 
-/// The bits of a tag below its field number that hold the wire type.
-const WIRE_TYPE_BITS: u32 = 3;
+/// The bits of a protobuf tag below its field number that hold the wire
+/// type.
+pub const WIRE_TYPE_BITS: u32 = 3;
 
-/// The mask of a tag's wire-type bits.
-const WIRE_TYPE_MASK: u32 = (1 << WIRE_TYPE_BITS) - 1;
-
-/// The bit of a varint byte that says another byte follows.
-const CONTINUATION: u8 = 0x80;
-
-/// The bits of a varint byte that carry its value.
-const VARINT_PAYLOAD: u8 = 0x7f;
-
-/// The value bits each varint byte carries.
-const VARINT_PAYLOAD_BITS: u32 = 7;
+/// The mask of a tag's wire-type bits, which its first byte carries.
+pub const WIRE_TYPE_MASK: u8 = (1 << WIRE_TYPE_BITS) - 1;
 
 /// The bytes of a `fixed64`, `sfixed64`, or `double` field's payload.
 const FIXED64_BYTES: usize = 8;
@@ -53,36 +46,41 @@ const FIXED64_BYTES: usize = 8;
 /// The bytes of a `fixed32`, `sfixed32`, or `float` field's payload.
 const FIXED32_BYTES: usize = 4;
 
-/// A protobuf wire type a tag may carry; 6 and 7 are not defined and make
-/// a value malformed.
+/// A protobuf wire type, by the number a tag's low `WIRE_TYPE_BITS`
+/// carry; the two numbers left (6 and 7) are not defined and make a value
+/// malformed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Wire {
-    /// 0: a varint.
-    Varint,
-    /// 1: eight bytes.
-    Fixed64,
-    /// 2: a varint length, then that many bytes.
-    LengthDelimited,
-    /// 3: the start of a group, ended by an end tag of the same number.
-    StartGroup,
-    /// 4: the end of a group.
-    EndGroup,
-    /// 5: four bytes.
-    Fixed32,
+#[repr(u8)]
+pub enum Wire {
+    /// A varint.
+    Varint = 0,
+    /// Eight bytes.
+    Fixed64 = 1,
+    /// A varint length, then that many bytes.
+    LengthDelimited = 2,
+    /// The start of a group, ended by an end tag of the same number.
+    StartGroup = 3,
+    /// The end of a group.
+    EndGroup = 4,
+    /// Four bytes.
+    Fixed32 = 5,
 }
 
 impl Wire {
-    /// The wire type of a tag's low bits; `None` for 6 and 7.
-    fn of(bits: u32) -> Option<Self> {
-        match bits {
-            0 => Some(Self::Varint),
-            1 => Some(Self::Fixed64),
-            2 => Some(Self::LengthDelimited),
-            3 => Some(Self::StartGroup),
-            4 => Some(Self::EndGroup),
-            5 => Some(Self::Fixed32),
-            _ => None,
-        }
+    /// Every wire type protobuf defines.
+    const ALL: [Self; 6] = [
+        Self::Varint,
+        Self::Fixed64,
+        Self::LengthDelimited,
+        Self::StartGroup,
+        Self::EndGroup,
+        Self::Fixed32,
+    ];
+
+    /// The wire type numbered `bits`, a tag's low `WIRE_TYPE_BITS`; `None`
+    /// for a number protobuf does not define.
+    pub fn of(bits: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|wire| *wire as u8 == bits)
     }
 }
 
@@ -343,10 +341,10 @@ fn tag(value: &[u8], at: &mut usize) -> Result<(u32, Wire), Malformed> {
         number: bits >> WIRE_TYPE_BITS,
     };
     let bits = u32::try_from(bits).map_err(|_| out_of_range)?;
-    let wire_bits = bits & WIRE_TYPE_MASK;
-    let wire = Wire::of(wire_bits).ok_or(Malformed::WireType {
+    let wire_type = u8::try_from(bits & u32::from(WIRE_TYPE_MASK)).expect("three bits fit a byte");
+    let wire = Wire::of(wire_type).ok_or(Malformed::WireType {
         at: start,
-        wire_type: u8::try_from(wire_bits).expect("three bits fit a byte"),
+        wire_type,
     })?;
     match bits >> WIRE_TYPE_BITS {
         0 => Err(out_of_range),
@@ -401,9 +399,9 @@ fn read_varint(value: &[u8], at: &mut usize) -> Result<u64, VarintFault> {
         let Some(&byte) = value.get(*at + index) else {
             return Err(VarintFault::Truncated);
         };
-        let shift = VARINT_PAYLOAD_BITS * u32::try_from(index).expect("a varint index fits a u32");
-        result |= u64::from(byte & VARINT_PAYLOAD) << shift;
-        if byte & CONTINUATION == 0 {
+        let shift = PAYLOAD_BITS * u32::try_from(index).expect("a varint index fits a u32");
+        result |= u64::from(byte & PAYLOAD) << shift;
+        if byte & CONTINUES == 0 {
             if index + 1 == MAX_VARINT_BYTES && byte > LAST_VARINT_BYTE_MAX {
                 return Err(VarintFault::Overflow);
             }
@@ -435,46 +433,50 @@ mod tests {
     }
 
     /// A tag of `number` and `wire`.
-    fn tag_of(number: u32, wire: u8) -> Vec<u8> {
-        varint_of((u64::from(number) << WIRE_TYPE_BITS) | u64::from(wire))
+    fn tag_of(number: u32, wire: Wire) -> Vec<u8> {
+        raw_tag(number, wire as u8)
     }
 
-    /// `value` as a varint.
-    fn varint_of(mut value: u64) -> Vec<u8> {
+    /// A tag of `number` and wire type number `bits`, which may be one
+    /// protobuf does not define, and `number` one outside the range:
+    /// prost's `encode_key` refuses to write either.
+    fn raw_tag(number: u32, bits: u8) -> Vec<u8> {
+        varint_of((u64::from(number) << WIRE_TYPE_BITS) | u64::from(bits))
+    }
+
+    /// `value` as a varint, as prost writes one.
+    fn varint_of(value: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
-        loop {
-            let low = u8::try_from(value & u64::from(VARINT_PAYLOAD)).unwrap();
-            value >>= VARINT_PAYLOAD_BITS;
-            if value == 0 {
-                bytes.push(low);
-                return bytes;
-            }
-            bytes.push(low | CONTINUATION);
-        }
+        prost::encoding::encode_varint(value, &mut bytes);
+        bytes
     }
 
-    /// Wire type numbers, as a tag carries them.
-    const VARINT: u8 = 0;
-    const FIXED64: u8 = 1;
-    const LEN: u8 = 2;
-    const START_GROUP: u8 = 3;
-    const END_GROUP: u8 = 4;
-    const FIXED32: u8 = 5;
+    /// The wire type numbers protobuf does not define.
+    fn undefined_wire_types() -> Vec<u8> {
+        (0..=WIRE_TYPE_MASK)
+            .filter(|bits| Wire::of(*bits).is_none())
+            .collect()
+    }
 
     /// One field of every wire type, by number: 1 varint, 2 fixed64, 3
     /// length-delimited, 4 a group holding a varint, 5 fixed32.
     fn every_wire_type() -> Vec<Vec<u8>> {
-        let varint = [tag_of(1, VARINT), varint_of(300)].concat();
-        let fixed64 = [tag_of(2, FIXED64), vec![0xAB; FIXED64_BYTES]].concat();
-        let delimited = [tag_of(3, LEN), varint_of(3), b"abc".to_vec()].concat();
-        let group = [
-            tag_of(4, START_GROUP),
-            tag_of(1, VARINT),
-            varint_of(7),
-            tag_of(4, END_GROUP),
+        let varint = [tag_of(1, Wire::Varint), varint_of(300)].concat();
+        let fixed64 = [tag_of(2, Wire::Fixed64), vec![0xAB; FIXED64_BYTES]].concat();
+        let delimited = [
+            tag_of(3, Wire::LengthDelimited),
+            varint_of(3),
+            b"abc".to_vec(),
         ]
         .concat();
-        let fixed32 = [tag_of(5, FIXED32), vec![0xCD; FIXED32_BYTES]].concat();
+        let group = [
+            tag_of(4, Wire::StartGroup),
+            tag_of(1, Wire::Varint),
+            varint_of(7),
+            tag_of(4, Wire::EndGroup),
+        ]
+        .concat();
+        let fixed32 = [tag_of(5, Wire::Fixed32), vec![0xCD; FIXED32_BYTES]].concat();
         vec![varint, fixed64, delimited, group, fixed32]
     }
 
@@ -499,9 +501,9 @@ mod tests {
 
     #[test]
     fn test_project_keeps_every_occurrence_in_the_value_s_order() {
-        let first = [tag_of(2, VARINT), varint_of(1)].concat();
-        let between = [tag_of(1, VARINT), varint_of(9)].concat();
-        let second = [tag_of(2, VARINT), varint_of(2)].concat();
+        let first = [tag_of(2, Wire::Varint), varint_of(1)].concat();
+        let between = [tag_of(1, Wire::Varint), varint_of(9)].concat();
+        let second = [tag_of(2, Wire::Varint), varint_of(2)].concat();
         let value = [first.clone(), between, second.clone()].concat();
         assert_eq!(projected(&value, &[2]).unwrap(), [first, second].concat());
     }
@@ -535,9 +537,9 @@ mod tests {
 
     #[test]
     fn test_project_does_not_look_inside_a_length_delimited_field() {
-        let inner = [tag_of(5, END_GROUP), tag_of(1, 7), vec![0xFF]].concat();
+        let inner = [tag_of(5, Wire::EndGroup), raw_tag(1, 7), vec![0xFF]].concat();
         let value = [
-            tag_of(3, LEN),
+            tag_of(3, Wire::LengthDelimited),
             varint_of(u64::try_from(inner.len()).unwrap()),
             inner,
         ]
@@ -549,19 +551,19 @@ mod tests {
     #[test]
     fn test_project_keeps_a_group_with_its_nested_groups_through_its_end_tag() {
         let group = [
-            tag_of(6, START_GROUP),
-            tag_of(7, START_GROUP),
-            tag_of(6, START_GROUP),
-            tag_of(1, FIXED32),
+            tag_of(6, Wire::StartGroup),
+            tag_of(7, Wire::StartGroup),
+            tag_of(6, Wire::StartGroup),
+            tag_of(1, Wire::Fixed32),
             vec![0; FIXED32_BYTES],
-            tag_of(6, END_GROUP),
-            tag_of(7, END_GROUP),
-            tag_of(2, LEN),
+            tag_of(6, Wire::EndGroup),
+            tag_of(7, Wire::EndGroup),
+            tag_of(2, Wire::LengthDelimited),
             varint_of(0),
-            tag_of(6, END_GROUP),
+            tag_of(6, Wire::EndGroup),
         ]
         .concat();
-        let after = [tag_of(1, VARINT), varint_of(5)].concat();
+        let after = [tag_of(1, Wire::Varint), varint_of(5)].concat();
         let value = [group.clone(), after.clone()].concat();
         assert_eq!(projected(&value, &[6]).unwrap(), group);
         assert_eq!(
@@ -584,8 +586,8 @@ mod tests {
     #[test]
     fn test_project_walks_deep_nesting_without_recursing() {
         let value = [
-            tag_of(1, START_GROUP).repeat(DEEP_NESTING),
-            tag_of(1, END_GROUP).repeat(DEEP_NESTING),
+            tag_of(1, Wire::StartGroup).repeat(DEEP_NESTING),
+            tag_of(1, Wire::EndGroup).repeat(DEEP_NESTING),
         ]
         .concat();
         assert_eq!(projected(&value, &[1]).unwrap(), value);
@@ -593,8 +595,14 @@ mod tests {
 
     #[test]
     fn test_project_refuses_wire_types_six_and_seven() {
-        for wire_type in [6, 7] {
-            let value = [tag_of(1, VARINT), varint_of(1), tag_of(2, wire_type)].concat();
+        let undefined = undefined_wire_types();
+        assert_eq!(
+            undefined,
+            [6, 7],
+            "the two numbers protobuf leaves undefined"
+        );
+        for wire_type in undefined {
+            let value = [tag_of(1, Wire::Varint), varint_of(1), raw_tag(2, wire_type)].concat();
             assert_eq!(
                 projected(&value, &[1]),
                 Err(Malformed::WireType { at: 2, wire_type }),
@@ -605,13 +613,13 @@ mod tests {
 
     #[test]
     fn test_project_refuses_field_number_zero_and_above_the_range() {
-        let zero = tag_of(0, VARINT);
+        let zero = tag_of(0, Wire::Varint);
         assert_eq!(
             projected(&[zero, varint_of(1)].concat(), &[1]),
             Err(Malformed::FieldNumber { at: 0, number: 0 })
         );
         let above = MAX_FIELD_NUMBER + 1;
-        let tag = tag_of(above, VARINT);
+        let tag = tag_of(above, Wire::Varint);
         assert!(
             u32::try_from((u64::from(above)) << WIRE_TYPE_BITS).is_err(),
             "the tag does not fit 32 bits"
@@ -623,7 +631,7 @@ mod tests {
                 number: u64::from(above)
             })
         );
-        let highest = [tag_of(MAX_FIELD_NUMBER, VARINT), varint_of(1)].concat();
+        let highest = [tag_of(MAX_FIELD_NUMBER, Wire::Varint), varint_of(1)].concat();
         assert_eq!(projected(&highest, &[MAX_FIELD_NUMBER]).unwrap(), highest);
     }
 
@@ -636,17 +644,17 @@ mod tests {
             "a tag padded past five bytes is field 1"
         );
         assert_eq!(Inner::decode(&padded_tag[..]).unwrap().number, 1);
-        let mut ten = tag_of(1, VARINT);
+        let mut ten = tag_of(1, Wire::Varint);
         ten.extend([0xFF; MAX_VARINT_BYTES - 1]);
         ten.push(LAST_VARINT_BYTE_MAX);
         assert_eq!(projected(&ten, &[1]).unwrap(), ten, "ten bytes is a varint");
         let past_64_bits = [
             0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,
         ];
-        let mut eleven = tag_of(1, VARINT);
+        let mut eleven = tag_of(1, Wire::Varint);
         eleven.extend([0xFF; MAX_VARINT_BYTES]);
         eleven.push(0x01);
-        let mut long_length = tag_of(3, LEN);
+        let mut long_length = tag_of(3, Wire::LengthDelimited);
         long_length.extend([0x80; MAX_VARINT_BYTES]);
         long_length.push(0x00);
         let mut long_tag = vec![0x88; MAX_VARINT_BYTES];
@@ -676,31 +684,39 @@ mod tests {
 
     #[test]
     fn test_project_refuses_every_field_that_runs_past_the_end() {
-        let prefix = [tag_of(1, VARINT), varint_of(1)].concat();
+        let prefix = [tag_of(1, Wire::Varint), varint_of(1)].concat();
         let at = prefix.len();
         let cases = [
             ("a tag cut short", vec![0x80]),
             (
                 "a varint cut short",
-                [tag_of(2, VARINT), vec![0x80]].concat(),
+                [tag_of(2, Wire::Varint), vec![0x80]].concat(),
             ),
-            ("a varint missing", tag_of(2, VARINT)),
+            ("a varint missing", tag_of(2, Wire::Varint)),
             (
                 "fixed64 short",
-                [tag_of(2, FIXED64), vec![0; FIXED64_BYTES - 1]].concat(),
+                [tag_of(2, Wire::Fixed64), vec![0; FIXED64_BYTES - 1]].concat(),
             ),
             (
                 "fixed32 short",
-                [tag_of(2, FIXED32), vec![0; FIXED32_BYTES - 1]].concat(),
+                [tag_of(2, Wire::Fixed32), vec![0; FIXED32_BYTES - 1]].concat(),
             ),
             (
                 "a length past the end",
-                [tag_of(2, LEN), varint_of(4), b"abc".to_vec()].concat(),
+                [
+                    tag_of(2, Wire::LengthDelimited),
+                    varint_of(4),
+                    b"abc".to_vec(),
+                ]
+                .concat(),
             ),
-            ("a length cut short", [tag_of(2, LEN), vec![0x80]].concat()),
+            (
+                "a length cut short",
+                [tag_of(2, Wire::LengthDelimited), vec![0x80]].concat(),
+            ),
             (
                 "a length of u64::MAX",
-                [tag_of(2, LEN), varint_of(u64::MAX)].concat(),
+                [tag_of(2, Wire::LengthDelimited), varint_of(u64::MAX)].concat(),
             ),
         ];
         for (case, tail) in cases {
@@ -717,10 +733,10 @@ mod tests {
     #[test]
     fn test_project_refuses_unclosed_mismatched_and_unmatched_groups() {
         let unclosed = [
-            tag_of(1, START_GROUP),
-            tag_of(2, START_GROUP),
-            tag_of(2, END_GROUP),
-            tag_of(3, START_GROUP),
+            tag_of(1, Wire::StartGroup),
+            tag_of(2, Wire::StartGroup),
+            tag_of(2, Wire::EndGroup),
+            tag_of(3, Wire::StartGroup),
         ]
         .concat();
         assert_eq!(
@@ -728,7 +744,7 @@ mod tests {
             Err(Malformed::GroupUnclosed { at: 0, number: 1 }),
             "the top-level group left open"
         );
-        let mismatched = [tag_of(1, START_GROUP), tag_of(2, END_GROUP)].concat();
+        let mismatched = [tag_of(1, Wire::StartGroup), tag_of(2, Wire::EndGroup)].concat();
         assert_eq!(
             projected(&mismatched, &[1]),
             Err(Malformed::GroupMismatch {
@@ -737,12 +753,22 @@ mod tests {
                 closed: 2
             })
         );
-        let unmatched = [tag_of(1, VARINT), varint_of(0), tag_of(1, END_GROUP)].concat();
+        let unmatched = [
+            tag_of(1, Wire::Varint),
+            varint_of(0),
+            tag_of(1, Wire::EndGroup),
+        ]
+        .concat();
         assert_eq!(
             projected(&unmatched, &[1]),
             Err(Malformed::UnmatchedEndGroup { at: 2, number: 1 })
         );
-        let inside = [tag_of(1, START_GROUP), tag_of(2, 6), tag_of(1, END_GROUP)].concat();
+        let inside = [
+            tag_of(1, Wire::StartGroup),
+            raw_tag(2, 6),
+            tag_of(1, Wire::EndGroup),
+        ]
+        .concat();
         assert_eq!(
             projected(&inside, &[2]),
             Err(Malformed::WireType {
@@ -755,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_project_refuses_a_malformed_value_whichever_fields_are_named() {
-        let value = [tag_of(1, VARINT), varint_of(1), tag_of(2, 7)].concat();
+        let value = [tag_of(1, Wire::Varint), varint_of(1), raw_tag(2, 7)].concat();
         for fields in [&[1][..], &[2], &[3]] {
             assert!(projected(&value, fields).is_err(), "{fields:?}");
         }
@@ -977,7 +1003,7 @@ mod tests {
             .flat_map(|value| varint_of(value.cast_unsigned()))
             .collect();
         [
-            tag_of(PACKED_FIELD, LEN),
+            tag_of(PACKED_FIELD, Wire::LengthDelimited),
             varint_of(u64::try_from(payload.len()).unwrap()),
             payload,
         ]
@@ -1056,17 +1082,17 @@ mod tests {
     /// length-delimited field.
     fn unknown_fields(rng: &mut StdRng) -> Vec<u8> {
         [
-            tag_of(UNKNOWN_FIELD, VARINT),
+            tag_of(UNKNOWN_FIELD, Wire::Varint),
             varint_of(rng.random()),
-            tag_of(UNKNOWN_FIELD, START_GROUP),
-            tag_of(UNKNOWN_NESTED_GROUP, START_GROUP),
-            tag_of(1, FIXED32),
+            tag_of(UNKNOWN_FIELD, Wire::StartGroup),
+            tag_of(UNKNOWN_NESTED_GROUP, Wire::StartGroup),
+            tag_of(1, Wire::Fixed32),
             rng.random::<u32>().to_le_bytes().to_vec(),
-            tag_of(UNKNOWN_NESTED_GROUP, END_GROUP),
-            tag_of(2, LEN),
+            tag_of(UNKNOWN_NESTED_GROUP, Wire::EndGroup),
+            tag_of(2, Wire::LengthDelimited),
             varint_of(1),
             vec![rng.random()],
-            tag_of(UNKNOWN_FIELD, END_GROUP),
+            tag_of(UNKNOWN_FIELD, Wire::EndGroup),
         ]
         .concat()
     }

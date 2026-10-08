@@ -31,7 +31,7 @@ use crate::index::page_header::{
     COMPRESSED_PAGE_SIZE_FIELD, DATA_PAGE_HEADER_FIELD, DATA_PAGE_HEADER_V2_FIELD,
     DEFINITION_LEVELS_BYTE_LENGTH_FIELD, DICTIONARY_PAGE_HEADER_FIELD, NIBBLE_BITS, NIBBLE_MASK,
     NUM_VALUES_FIELD, PageBody, PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD,
-    UNCOMPRESSED_PAGE_SIZE_FIELD, VARINT_CONTINUES,
+    UNCOMPRESSED_PAGE_SIZE_FIELD,
 };
 use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, RowRef, WireType};
 use crate::key::testing::UUID_HALF_BYTES;
@@ -41,6 +41,7 @@ use crate::manifest::testing::{self as manifest_testing, KEY_COLUMN, VALUE_COLUM
 use crate::parquet_io::FileHandle;
 use crate::storage::testing::{MEM_PREFIX, MemStore};
 use crate::storage::{HedgeWindow, IoStats, Storage};
+use crate::varint::{CONTINUES, PAYLOAD, PAYLOAD_BITS};
 
 /// The fixture file's key under the prefix.
 const FILE_KEY: &str = "db/kv/data/f0.parquet";
@@ -497,7 +498,7 @@ fn header_varint(header: &[u8], field: HeaderField) -> Range<usize> {
     let varint_end = |from: usize| {
         from + header[from..]
             .iter()
-            .position(|byte| byte & VARINT_CONTINUES == 0)
+            .position(|byte| byte & CONTINUES == 0)
             .unwrap()
             + 1
     };
@@ -577,12 +578,12 @@ fn zigzag_varint(value: i32, width: usize) -> Vec<u8> {
     let mut rest = ((value << 1) ^ (value >> (i32::BITS - 1))).cast_unsigned();
     let varint = (0..width)
         .map(|at| {
-            let low = u8::try_from(rest & u32::from(!VARINT_CONTINUES)).unwrap();
-            rest >>= u8::BITS - 1;
+            let low = u8::try_from(rest & u32::from(PAYLOAD)).unwrap();
+            rest >>= PAYLOAD_BITS;
             if at + 1 == width {
                 low
             } else {
-                low | VARINT_CONTINUES
+                low | CONTINUES
             }
         })
         .collect();
