@@ -26,7 +26,9 @@ use crate::approx;
 use crate::blocking;
 use crate::cache::{Issue, PageCache};
 use crate::catalog::{Resolved, TableFault};
-use crate::check::{self, Capping, Caps, ColumnCost, FileView, LayoutView, LookupCost};
+use crate::check::{
+    self, Capping, Caps, ColumnCost, ColumnLevel, FileView, LayoutView, LookupCost,
+};
 use crate::config::{Residency, TableConfig};
 use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
@@ -193,15 +195,7 @@ impl Generation {
         let table = config.name.as_str();
         config.check_reachable()?;
         let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
-        let layout = TableLayout::derive(
-            table,
-            &resolved.metadata,
-            &resolved.unread_defaults,
-            snapshot,
-            &config.key_column,
-            &config.value_column_names(),
-        )?;
-        layout.check_formats(config)?;
+        let layout = TableLayout::for_entry(config, resolved, snapshot)?;
         let files =
             manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
         let (reused, pending) =
@@ -384,11 +378,17 @@ impl Generation {
         check::judge(
             &self.table,
             self.level,
-            &check::column_levels(&self.layout, &self.column_costs),
+            &self.column_levels(),
             &self.capping,
             declared,
             strict,
         )
+    }
+
+    /// Each value column's level, as `judge` and the level gauges take
+    /// them.
+    pub(crate) fn column_levels(&self) -> Vec<ColumnLevel> {
+        check::column_levels(&self.layout, &self.column_costs)
     }
 
     /// What the generation's delete state comes to (RFD 021): the rows its

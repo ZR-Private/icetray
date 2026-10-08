@@ -629,9 +629,11 @@ async fn test_a_projected_default_is_trimmed_with_no_value_get_in_the_disk_and_b
             key_pages,
             "{residency}: no value page"
         );
-        let report = examine(&generation, Level::Optimal, &|name| {
-            served.table.config().format_of(name).unwrap_or_default()
-        })
+        let report = examine(
+            &generation,
+            Level::Optimal,
+            &served.table.config().formats(),
+        )
         .await
         .report;
         assert!(
@@ -675,9 +677,11 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
     let generation = served.current();
     let stats = served.storage.stats();
     let before = stats.gets();
-    let examined = examine(&generation, Level::Optimal, &|name| {
-        served.table.config().format_of(name).unwrap_or_default()
-    })
+    let examined = examine(
+        &generation,
+        Level::Optimal,
+        &served.table.config().formats(),
+    )
     .await;
     assert_eq!(
         stats.gets(),
@@ -732,9 +736,11 @@ async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
             .all(|file| file.index.value_leaf(0).is_some()),
         "every file holds the column"
     );
-    let examined = examine(&generation, Level::Optimal, &|name| {
-        served.table.config().format_of(name).unwrap_or_default()
-    })
+    let examined = examine(
+        &generation,
+        Level::Optimal,
+        &served.table.config().formats(),
+    )
     .await;
     assert!(
         !examined.report.findings.iter().any(|finding| {

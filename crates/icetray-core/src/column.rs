@@ -273,27 +273,23 @@ pub(crate) fn resolve(
             },
         )
     };
-    let key_leaf = match find(schema, &layout.key_column, layout.key_field_id) {
-        Ok(Found::Leaf(leaf)) => {
-            check_width(&schema.column(leaf), layout.key_width)
-                .map_err(|mismatch| refuse(&layout.key_column, mismatch))?;
-            leaf
-        }
-        Ok(Found::Absent) => return Err(refuse(&layout.key_column, ColumnMismatch::KeyAbsent)),
-        Err(mismatch) => return Err(refuse(&layout.key_column, mismatch)),
-    };
-    let value_leaves = layout
-        .value_columns
-        .iter()
-        .map(|column| match find(schema, &column.name, column.field_id) {
+    let locate = |name: &str, field_id: i32, width: Option<u64>| -> Result<Option<usize>> {
+        match find(schema, name, field_id) {
             Ok(Found::Leaf(leaf)) => {
-                check_width(&schema.column(leaf), column.width())
-                    .map_err(|mismatch| refuse(&column.name, mismatch))?;
+                check_width(&schema.column(leaf), width)
+                    .map_err(|mismatch| refuse(name, mismatch))?;
                 Ok(Some(leaf))
             }
             Ok(Found::Absent) => Ok(None),
-            Err(mismatch) => Err(refuse(&column.name, mismatch)),
-        })
+            Err(mismatch) => Err(refuse(name, mismatch)),
+        }
+    };
+    let key_leaf = locate(&layout.key_column, layout.key_field_id, layout.key_width)?
+        .ok_or_else(|| refuse(&layout.key_column, ColumnMismatch::KeyAbsent))?;
+    let value_leaves = layout
+        .value_columns
+        .iter()
+        .map(|column| locate(&column.name, column.field_id, column.width()))
         .collect::<Result<Vec<_>>>()?;
     Ok(FileColumns {
         key_leaf,

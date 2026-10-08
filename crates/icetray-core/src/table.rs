@@ -28,7 +28,7 @@ use crate::approx;
 use crate::blocking::on_blocking_pool;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
-use crate::check::{self, ColumnCost, ColumnLevel, Finding, FindingCode, LookupCost};
+use crate::check::{self, Capping, ColumnCost, ColumnLevel, Finding, FindingCode, LookupCost};
 use crate::config::{Residency, TableConfig};
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
@@ -429,7 +429,7 @@ struct GenerationGauges {
 
 /// An admitted generation's findings counted by code and, for a code about
 /// one value column, by that column (`FindingCode::per_column`).
-type FindingCounts = BTreeMap<(FindingCode, Option<String>), u64>;
+type FindingCounts = BTreeMap<Capping, u64>;
 
 /// What a lookup needs beside its generation: the table's page cache
 /// handle, its lookup metrics, and the calls in flight it counts among.
@@ -1076,16 +1076,7 @@ impl Table {
             let resolved = self.source.resolve(&self.storage).await?;
             let snapshot = self.ref_snapshot(&resolved)?;
             let config = self.config.load();
-            let layout = TableLayout::derive(
-                self.name(),
-                &resolved.metadata,
-                &resolved.unread_defaults,
-                &snapshot,
-                &config.key_column,
-                &config.value_column_names(),
-            )?;
-            layout.check_formats(&config)?;
-            Ok(layout.key_type)
+            Ok(TableLayout::for_entry(&config, &resolved, &snapshot)?.key_type)
         })
         .await
         .map_err(|failed| *failed.error)
@@ -1460,10 +1451,7 @@ impl Table {
     /// snapshot's level still measured). A `Degraded` or `Held` state an
     /// earlier poll left ends, since the last refresh succeeded.
     fn in_step(&self, current: &Generation) {
-        self.measured(
-            current.level,
-            check::column_levels(&current.layout, &current.column_costs),
-        );
+        self.measured(current.level, current.column_levels());
         if matches!(
             self.state(),
             TableState::Degraded { .. } | TableState::Held { .. }
@@ -1494,14 +1482,10 @@ impl Table {
     /// generation.
     fn gate(&self, generation: &Generation, config: &TableConfig) -> Result<FindingCounts> {
         let declared = config.lookups();
-        let report = check::diagnose(generation, declared, &|name| {
-            config.format_of(name).unwrap_or_default()
-        });
+        let report = check::diagnose(generation, declared, &config.formats());
         let mut counts = FindingCounts::new();
         for finding in &report.findings {
-            *counts
-                .entry((finding.code(), finding.column().map(str::to_string)))
-                .or_default() += 1;
+            *counts.entry(finding.capping()).or_default() += 1;
             log_finding(self.name(), finding, self.findings, declared);
         }
         generation.judge(declared, config.strict)?;
@@ -1560,7 +1544,7 @@ impl Table {
             let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
             let level = LevelGauges {
                 measured: generation.level,
-                columns: check::column_levels(&generation.layout, &generation.column_costs),
+                columns: generation.column_levels(),
                 declared,
                 page_cache: gauges.level.as_ref().and_then(|level| level.page_cache),
             };
@@ -1769,13 +1753,11 @@ impl Table {
         )
         .set(approx::gauge_len(generation.index_bytes));
         let count = |code: FindingCode, column: Option<&str>| {
-            approx::gauge(
-                generation
-                    .findings
-                    .get(&(code, column.map(str::to_string)))
-                    .copied()
-                    .unwrap_or(0),
-            )
+            let capping = Capping {
+                code,
+                column: column.map(str::to_string),
+            };
+            approx::gauge(generation.findings.get(&capping).copied().unwrap_or(0))
         };
         for code in FindingCode::ALL
             .into_iter()
@@ -2017,7 +1999,6 @@ mod tests {
 
     use super::*;
     use crate::catalog::TableFault;
-    use crate::check::Capping;
     use crate::config::{Residency, ServerConfig, ValueColumnConfig, ValueFormat};
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
@@ -2668,8 +2649,9 @@ mod tests {
             for _ in 0..table.storage.hedge_config().window {
                 table.hedge.record(FAST_SAMPLE, false);
             }
-            let pairs = 2;
-            gauged.fill_to(2 * pairs);
+            let hedged_columns = 2;
+            let gets_per_hedged_column = 2;
+            gauged.fill_to(hedged_columns * gets_per_hedged_column);
             let stats = fixture.storage.stats();
             let before = (stats.gets(), stats.hedges());
             assert_eq!(

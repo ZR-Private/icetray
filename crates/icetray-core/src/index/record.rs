@@ -354,7 +354,7 @@ mod tests {
             let bytes = encode(&verified);
             let column = index.key_column();
             assert_eq!(
-                decode(&bytes, &column, index.key_shape),
+                decode(&bytes, &column, index.layout.key_shape),
                 Ok(verified),
                 "{key_type}"
             );
@@ -372,7 +372,11 @@ mod tests {
         verified.fences[1].clear();
         verified.groups.pop();
         assert_eq!(
-            decode(&encode(&verified), &index.key_column(), index.key_shape),
+            decode(
+                &encode(&verified),
+                &index.key_column(),
+                index.layout.key_shape
+            ),
             Err(RecordFault::Fences {
                 row_group: 1,
                 stored: 0
@@ -448,7 +452,7 @@ mod tests {
             let bytes = encode(&verified_of(&index));
             let widened = with_fences(&bytes, |fences| fences[0][0].push(0));
             assert_eq!(
-                decode(&widened, &index.key_column(), index.key_shape).map(|_| ()),
+                decode(&widened, &index.key_column(), index.layout.key_shape).map(|_| ()),
                 Err(RecordFault::Key { row_group: 0 }),
                 "{key_type}"
             );
@@ -467,7 +471,7 @@ mod tests {
             fences[0][0].pop();
         });
         assert_eq!(
-            decode(&shortened, &index.key_column(), index.key_shape).map(|_| ()),
+            decode(&shortened, &index.key_column(), index.layout.key_shape).map(|_| ()),
             Err(RecordFault::Key { row_group: 0 })
         );
     }

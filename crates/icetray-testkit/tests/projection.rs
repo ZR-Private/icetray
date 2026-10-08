@@ -474,10 +474,7 @@ async fn test_doctor_walks_one_value_page_per_protobuf_column() -> Result<()> {
             let generation = served.current();
             let stats = served.storage.stats();
             let before = stats.gets();
-            let examined = examine(&generation, Level::Optimal, &|name| {
-                config.format_of(name).unwrap_or_default()
-            })
-            .await;
+            let examined = examine(&generation, Level::Optimal, &config.formats()).await;
             assert!(examined.unwalked.is_empty(), "{:?}", examined.unwalked);
             let report = examined.report;
             let walked = format == ValueFormat::Protobuf;
@@ -568,7 +565,7 @@ async fn test_doctor_reports_a_failed_walk_beside_a_whole_report() -> Result<()>
     let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
     let served = serve(&fixture, config.clone(), scratch.path()).await?;
     let generation = served.current();
-    let formats = |name: &str| config.format_of(name).unwrap_or_default();
+    let formats = config.formats();
     let whole = icetray_core::diagnose(&generation, Level::Optimal, &formats);
     assert!(remove_data_files(dir.path())? > 0);
     let examined = examine(&generation, Level::Optimal, &formats).await;

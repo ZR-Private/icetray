@@ -888,14 +888,38 @@ mod tests {
         flag: bool,
     }
 
-    /// Every field number of `Typed`.
-    const TYPED_FIELDS: [u32; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
-
-    /// The members of `Typed`'s oneof.
-    const ONEOF_MEMBERS: [u32; 2] = [7, 8];
-
+    /// The fields of `Typed`, by its prost tags: what `masked` clears.
+    const ID_FIELD: u32 = 1;
+    const NAME_FIELD: u32 = 2;
+    const UNPACKED_FIELD: u32 = 3;
     /// The field of `Typed` that is packed.
     const PACKED_FIELD: u32 = 4;
+    const MAP_FIELD: u32 = 5;
+    const NESTED_FIELD: u32 = 6;
+    /// The members of `Typed`'s oneof.
+    const ONEOF_MEMBERS: [u32; 2] = [7, 8];
+    const GROUP_FIELD: u32 = 9;
+    const FIXED32_FIELD: u32 = 10;
+    const FIXED64_FIELD: u32 = 11;
+    const BLOBS_FIELD: u32 = 12;
+    const FLAG_FIELD: u32 = 13;
+
+    /// Every field number of `Typed`.
+    const TYPED_FIELDS: [u32; 13] = [
+        ID_FIELD,
+        NAME_FIELD,
+        UNPACKED_FIELD,
+        PACKED_FIELD,
+        MAP_FIELD,
+        NESTED_FIELD,
+        ONEOF_MEMBERS[0],
+        ONEOF_MEMBERS[1],
+        GROUP_FIELD,
+        FIXED32_FIELD,
+        FIXED64_FIELD,
+        BLOBS_FIELD,
+        FLAG_FIELD,
+    ];
 
     /// A field number `Typed` does not have: the oracle's values carry it as
     /// unknown fields, and its field sets name it at times.
@@ -1015,22 +1039,22 @@ mod tests {
     fn masked(typed: &Typed, fields: &[u32]) -> Typed {
         let named = |number: u32| fields.contains(&number);
         let mut out = typed.clone();
-        if !named(1) {
+        if !named(ID_FIELD) {
             out.id = 0;
         }
-        if !named(2) {
+        if !named(NAME_FIELD) {
             out.name.clear();
         }
-        if !named(3) {
+        if !named(UNPACKED_FIELD) {
             out.unpacked.clear();
         }
         if !named(PACKED_FIELD) {
             out.packed.clear();
         }
-        if !named(5) {
+        if !named(MAP_FIELD) {
             out.map.clear();
         }
-        if !named(6) {
+        if !named(NESTED_FIELD) {
             out.nested = None;
         }
         out.choice = match &typed.choice {
@@ -1038,19 +1062,19 @@ mod tests {
             Some(Choice::Message(_)) if !named(ONEOF_MEMBERS[1]) => None,
             other => other.clone(),
         };
-        if !named(9) {
+        if !named(GROUP_FIELD) {
             out.group = None;
         }
-        if !named(10) {
+        if !named(FIXED32_FIELD) {
             out.fixed32 = 0;
         }
-        if !named(11) {
+        if !named(FIXED64_FIELD) {
             out.fixed64 = 0;
         }
-        if !named(12) {
+        if !named(BLOBS_FIELD) {
             out.blobs.clear();
         }
-        if !named(13) {
+        if !named(FLAG_FIELD) {
             out.flag = false;
         }
         out

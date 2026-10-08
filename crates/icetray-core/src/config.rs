@@ -18,7 +18,7 @@ use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
-use crate::manifest::{self, ColumnRead};
+use crate::manifest::{self, ColumnRead, ValueType};
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -1581,6 +1581,17 @@ impl ValueFormat {
         Self::Opaque
     }
 
+    /// Whether a column of `value_type` may be declared in this format: an
+    /// opaque column takes every type a layout admits, and a protobuf
+    /// column must be `binary`, since a trimmed value has no fixed width
+    /// and a protobuf is not text (RFD 024).
+    pub fn admits(self, value_type: ValueType) -> bool {
+        match (self, value_type) {
+            (Self::Opaque, _) | (Self::Protobuf, ValueType::Binary) => true,
+            (Self::Protobuf, ValueType::Fixed { .. } | ValueType::String) => false,
+        }
+    }
+
     /// The format's lowercase name, as the file spells it.
     pub const fn name(self) -> &'static str {
         match self {
@@ -1642,6 +1653,13 @@ impl TableConfig {
             .iter()
             .find(|column| column.name == name)
             .map(|column| column.format)
+    }
+
+    /// The declared format of each column by name, opaque for a name the
+    /// table does not serve: what the doctor and the wire read a column's
+    /// format through.
+    pub fn formats(&self) -> impl Fn(&str) -> ValueFormat + '_ {
+        |name| self.format_of(name).unwrap_or_default()
     }
 
     /// Each value column's format, in `value_column_names`' order, which is

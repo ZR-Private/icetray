@@ -664,12 +664,10 @@ pub struct FileIndex {
     /// of every value column the table serves; every other column index and
     /// offset index is dropped at build (`kept_footer`).
     metadata: Arc<ParquetMetaData>,
-    key_leaf: usize,
-    key_shape: KeyShape,
-    /// Per value column of the table's layout, in its order, the column the
-    /// file holds; `None` for one the file was written before, whose rows
-    /// answer that column's default.
-    values: Vec<Option<ValueColumn>>,
+    /// The key leaf, how the keys decode, and the value column the file
+    /// holds per column of the table's layout; `None` for one the file
+    /// was written before, whose rows answer that column's default.
+    layout: Layout,
     keys: KeyResidency,
     /// Per row group, the first key of every key page.
     fences: Vec<Vec<Key>>,
@@ -867,37 +865,30 @@ impl FileIndex {
 
     /// The key type the file's keys were verified as.
     pub(crate) fn key_type(&self) -> KeyType {
-        self.key_shape.key_type()
+        self.layout.key_shape.key_type()
     }
 
     /// The leaf column index of the key.
     pub fn key_leaf(&self) -> usize {
-        self.key_leaf
+        self.layout.key_leaf
     }
 
     /// The leaf column index of value column `column`, a position in the
     /// table's layout; `None` for a file written before that column was
     /// added, which holds no such column.
     pub fn value_leaf(&self, column: usize) -> Option<usize> {
-        self.values[column].map(|value| value.leaf)
+        self.layout.values[column].map(|value| value.leaf)
     }
 
     /// Every value column's leaf, in the layout's order.
     pub fn value_leaves(&self) -> Vec<Option<usize>> {
-        self.values
-            .iter()
-            .map(|value| value.map(|value| value.leaf))
-            .collect()
+        self.layout.value_leaves()
     }
 
     /// The leaves of the value columns the file holds: those whose offset
     /// index the footer keeps.
     pub(crate) fn held_value_leaves(&self) -> Vec<usize> {
-        self.values
-            .iter()
-            .flatten()
-            .map(|value| value.leaf)
-            .collect()
+        self.layout.held_value_leaves()
     }
 
     /// Checks that the file still holds its columns as `layout`, a later
@@ -927,11 +918,8 @@ impl FileIndex {
                 },
             ));
         }
-        let built = self
-            .values
-            .iter()
-            .map(|value| value.map(|value| value.leaf));
-        Ok(columns.key_leaf == self.key_leaf && columns.value_leaves.into_iter().eq(built))
+        Ok(columns.key_leaf == self.layout.key_leaf
+            && columns.value_leaves == self.layout.value_leaves())
     }
 
     /// The first key of every key page, per row group; a row group without
@@ -970,7 +958,7 @@ impl FileIndex {
     pub(crate) fn resident_bytes(&self) -> usize {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
-            self.key_leaf,
+            self.layout.key_leaf,
             &self.held_value_leaves(),
             self.key_type(),
             &self.handle,
@@ -1054,7 +1042,7 @@ impl FileIndex {
         cache: Option<&PageCache>,
         issue: Issue<'_>,
     ) -> Result<Option<ValueRead>> {
-        let Some(value) = self.values[column] else {
+        let Some(value) = self.layout.values[column] else {
             return Ok(None);
         };
         let page = self.value_page(value, row)?;
@@ -1091,7 +1079,7 @@ impl FileIndex {
     /// walks a protobuf column's values on (RFD 024).
     pub(crate) async fn first_page_values(&self, column: usize) -> Result<Option<Vec<Bytes>>> {
         const FIRST_PAGE: usize = 0;
-        let Some(value) = self.values[column] else {
+        let Some(value) = self.layout.values[column] else {
             return Ok(None);
         };
         let column = self.value_column(value);
@@ -1142,7 +1130,7 @@ impl FileIndex {
     /// `None` for a file written before the column was added, which fetches no
     /// value page (RFD 023).
     pub fn value_page_offset(&self, column: usize, page: &PageRef) -> Option<u64> {
-        let value = self.values[column]?;
+        let value = self.layout.values[column]?;
         let row = page.row?;
         self.value_page_index(value, row).map(|at| {
             self.value_column(value)
@@ -1210,7 +1198,7 @@ impl FileIndex {
             Some(page) => chunk.page_rows(page),
             None => 0..chunk.rows(),
         };
-        let keys = decode_run(chunk, self.key_shape, rows, Arc::new(chunks.clone()))?;
+        let keys = decode_run(chunk, self.layout.key_shape, rows, Arc::new(chunks.clone()))?;
         check_utf8(chunk, &keys)?;
         Ok(keys)
     }
@@ -1224,11 +1212,13 @@ impl FileIndex {
         match &self.keys {
             KeyResidency::Chunks(chunks) => Ok(Arc::clone(chunks)),
             KeyResidency::Disk(disk) => {
-                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf, self.handle.size());
+                let ranges =
+                    key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
                 chunks_from_disk(disk, &ranges, self.handle.size()).await
             }
             KeyResidency::Filters(_) => {
-                let ranges = key_chunk_ranges(&self.metadata, self.key_leaf, self.handle.size());
+                let ranges =
+                    key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
                 let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
                 Ok(Arc::new(Segments::new(parts, self.handle.size())))
             }
@@ -1238,7 +1228,7 @@ impl FileIndex {
     fn key_column(&self) -> Column<'_> {
         Column {
             metadata: &self.metadata,
-            leaf: self.key_leaf,
+            leaf: self.layout.key_leaf,
             path: &self.handle.location,
         }
     }
@@ -1284,7 +1274,7 @@ impl FileIndex {
     ) -> Result<Option<RowRef>> {
         let chunk = self.key_column().group(row_group);
         let rows = chunk.page_rows(page);
-        let keys = decode_run(chunk, self.key_shape, rows.clone(), segments)?;
+        let keys = decode_run(chunk, self.layout.key_shape, rows.clone(), segments)?;
         Ok(keys.binary_search(key).ok().map(|at| RowRef {
             row_group,
             row: rows.start + row_offset(at),
@@ -1812,7 +1802,7 @@ mod tests {
             let (value, _) = index.read_value(row, Some(&cache)).await.unwrap().unwrap();
             let value = value.unwrap();
             assert_eq!(value, value_for(at).as_slice());
-            let value_column = index.values[0].unwrap();
+            let value_column = index.layout.values[0].unwrap();
             let chunk = index.value_column(value_column).group(row.row_group);
             let page = index.value_page(value_column, row).unwrap();
             let (cached, origins) = index

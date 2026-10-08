@@ -94,9 +94,7 @@ impl Inspected {
         Ok(FileIndex {
             handle,
             metadata,
-            key_leaf: layout.key_leaf,
-            key_shape: layout.key_shape,
-            values: layout.values,
+            layout,
             keys,
             fences: verified.fences,
             groups: verified.groups,

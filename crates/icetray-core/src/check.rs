@@ -243,7 +243,7 @@ pub(crate) fn column_levels(layout: &TableLayout, costs: &[ColumnCost]) -> Vec<C
 /// value column it is about, `None` for a finding about the row or the
 /// table (RFD 022). Display gives the code, then the column in
 /// parentheses when there is one.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct Capping {
     /// The finding's code.
     pub code: FindingCode,
@@ -956,10 +956,7 @@ pub async fn examine(
     for (at, column) in g.layout.value_columns.iter().enumerate() {
         match formats(&column.name) {
             ValueFormat::Protobuf => {
-                if g.files
-                    .iter()
-                    .any(|file| file.index.value_leaf(at).is_none())
-                {
+                if predating_column(g, at) > 0 {
                     report.findings.extend(walk_default(column));
                 }
                 match walk_protobuf_page(g, at, &column.name).await {

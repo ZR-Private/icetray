@@ -316,21 +316,22 @@ fn column_value_wire(value: Option<Bytes>) -> ColumnValue {
 /// by name, each with the format `entry`, the table's entry as it stands,
 /// declares it in.
 fn value_columns_wire(layout: &TableLayout, entry: &TableConfig) -> Vec<v1::ValueColumn> {
+    let formats = entry.formats();
     layout
         .value_columns
         .iter()
         .map(|column| {
-            let (value_type, width) = match column.value_type {
-                ValueType::Binary => (v1::ValueType::Binary, 0),
-                ValueType::Fixed { width } => (
-                    v1::ValueType::Fixed,
-                    u32::try_from(width).expect(
-                        "a layout admits a fixed column only as wide as a Parquet type length, an i32",
-                    ),
-                ),
-                ValueType::String => (v1::ValueType::String, 0),
+            let value_type = match column.value_type {
+                ValueType::Binary => v1::ValueType::Binary,
+                ValueType::Fixed { .. } => v1::ValueType::Fixed,
+                ValueType::String => v1::ValueType::String,
             };
-            let format = match entry.format_of(&column.name).unwrap_or_default() {
+            let width = column.value_type.width().map_or(0, |width| {
+                u32::try_from(width).expect(
+                    "a layout admits a fixed column only as wide as a Parquet type length, an i32",
+                )
+            });
+            let format = match formats(&column.name) {
                 ValueFormat::Opaque => v1::ValueFormat::Opaque,
                 ValueFormat::Protobuf => v1::ValueFormat::Protobuf,
             };

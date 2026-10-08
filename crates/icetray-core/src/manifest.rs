@@ -20,7 +20,7 @@ use iceberg::spec::{
 };
 
 use crate::bucket;
-use crate::catalog::TableFault;
+use crate::catalog::{Resolved, TableFault};
 use crate::column::{self, ColumnMismatch, UnreadDefaults};
 use crate::config::{TableConfig, ValueFormat};
 use crate::deletes::{Sorted, oldest_by_partition};
@@ -111,10 +111,7 @@ impl ValueColumnLayout {
     /// The width of every value of a `fixed` column; `None` for binary and
     /// string, whose values have any length.
     pub fn width(&self) -> Option<u64> {
-        match self.value_type {
-            ValueType::Fixed { width } => Some(width),
-            ValueType::Binary | ValueType::String => None,
-        }
+        self.value_type.width()
     }
 }
 
@@ -132,6 +129,17 @@ pub enum ValueType {
     },
     /// `string`.
     String,
+}
+
+impl ValueType {
+    /// The width of every value of a `fixed` column; `None` for binary and
+    /// string, whose values have any length.
+    pub fn width(self) -> Option<u64> {
+        match self {
+            Self::Fixed { width } => Some(width),
+            Self::Binary | Self::String => None,
+        }
+    }
 }
 
 impl fmt::Display for ValueType {
@@ -288,13 +296,9 @@ impl TableLayout {
             .map(|&name| {
                 let field = column(name)?;
                 let value_type = value_type(table, name, &field.field_type)?;
-                let width = match value_type {
-                    ValueType::Fixed { width } => Some(width),
-                    ValueType::Binary | ValueType::String => None,
-                };
                 let default = column::value_default(
                     field,
-                    width,
+                    value_type.width(),
                     unread.contains(schema.schema_id(), field.id),
                 )
                 .map_err(|cause| mismatch(name, cause))?;
@@ -316,6 +320,28 @@ impl TableLayout {
             key_width: fixed_width(&key_field.field_type),
             value_columns,
         })
+    }
+
+    /// The layout of `snapshot` for the table `config` describes, derived
+    /// (`derive`) from `resolved`, its metadata and unread defaults, over
+    /// the configured key and value columns, with each column's declared
+    /// format checked against its type (`check_formats`): what a load and
+    /// a key-type resolution both build.
+    pub(crate) fn for_entry(
+        config: &TableConfig,
+        resolved: &Resolved,
+        snapshot: &Snapshot,
+    ) -> Result<Self> {
+        let layout = Self::derive(
+            &config.name,
+            &resolved.metadata,
+            &resolved.unread_defaults,
+            snapshot,
+            &config.key_column,
+            &config.value_column_names(),
+        )?;
+        layout.check_formats(config)?;
+        Ok(layout)
     }
 
     /// The position in `value_columns` of the column named `name`; `None`
@@ -340,12 +366,11 @@ impl TableLayout {
     ) -> Result<Selection> {
         select_columns(&entry.name, reads, |name| {
             let at = self.value_column(name)?;
-            let format = match (entry.format_of(name)?, self.value_columns[at].value_type) {
-                (ValueFormat::Protobuf, ValueType::Binary) => ValueFormat::Protobuf,
-                (ValueFormat::Opaque, _)
-                | (ValueFormat::Protobuf, ValueType::Fixed { .. } | ValueType::String) => {
-                    ValueFormat::Opaque
-                }
+            let declared = entry.format_of(name)?;
+            let format = if declared.admits(self.value_columns[at].value_type) {
+                declared
+            } else {
+                ValueFormat::Opaque
             };
             Some((at, format))
         })
@@ -356,37 +381,38 @@ impl TableLayout {
     /// a load refuses the snapshot for, and a retune of formats the entry
     /// for.
     pub(crate) fn check_formats(&self, entry: &TableConfig) -> Result<()> {
+        let formats = entry.formats();
         self.value_columns.iter().try_for_each(|column| {
-            let format = entry.format_of(&column.name).unwrap_or_default();
-            check_format(&entry.name, &column.name, column.value_type, format)
+            check_format(
+                &entry.name,
+                &column.name,
+                column.value_type,
+                formats(&column.name),
+            )
         })
     }
 }
 
 /// `RefusalReason::ValueTypeUnsupported` for `column` of `table`, of type
-/// `value_type`, declared `format` when the format does not take the type:
-/// a protobuf column must be `binary`, since a trimmed value has no fixed
-/// width and a protobuf is not text (RFD 024). An opaque column takes
-/// every type a layout admits.
+/// `value_type`, declared `format` when the format does not take the type
+/// (`ValueFormat::admits`).
 fn check_format(
     table: &str,
     column: &str,
     value_type: ValueType,
     format: ValueFormat,
 ) -> Result<()> {
-    match (format, value_type) {
-        (ValueFormat::Opaque, _) | (ValueFormat::Protobuf, ValueType::Binary) => Ok(()),
-        (ValueFormat::Protobuf, ValueType::Fixed { .. } | ValueType::String) => {
-            Err(Error::refused(
-                table,
-                RefusalReason::ValueTypeUnsupported {
-                    column: column.to_string(),
-                    got: value_type.to_string(),
-                    format,
-                },
-            ))
-        }
+    if format.admits(value_type) {
+        return Ok(());
     }
+    Err(Error::refused(
+        table,
+        RefusalReason::ValueTypeUnsupported {
+            column: column.to_string(),
+            got: value_type.to_string(),
+            format,
+        },
+    ))
 }
 
 /// The column reads `reads` names, checked in its order for a lookup of
