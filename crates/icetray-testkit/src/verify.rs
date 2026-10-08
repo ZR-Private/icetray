@@ -5,7 +5,7 @@
 //! reader of one series out of a metrics scrape.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -146,6 +146,16 @@ pub async fn build_in(
     build(storage, config, source, local, cache_bytes).await
 }
 
+/// `build_in` with a `TEST_PAGE_CACHE_BYTES` cache over the source
+/// `config` names, loaded: a table served over nothing a test shares.
+pub async fn serve_in(config: TableConfig, dir: &Path) -> Result<Served> {
+    let source = TableSource::from_config(&config.source).await?;
+    build_in(config, source, dir, TEST_PAGE_CACHE_BYTES)
+        .await?
+        .load()
+        .await
+}
+
 /// `build` with a `TEST_PAGE_CACHE_BYTES` cache, loaded.
 pub async fn serve_over(
     storage: Arc<Storage>,
@@ -202,6 +212,84 @@ pub async fn serve_catalog_with(
         storage,
     )
     .await
+}
+
+/// What a cold pass over some keys costs, measured on a Full-tier serving
+/// of the table as the oracle (`expected_cold_gets`, `expected_key_pages`),
+/// which knows nothing of projection: a pass in another tier, or trimmed
+/// to fields, must cost the same value-page GETs.
+#[derive(Clone, Copy, Debug)]
+pub struct ColdCosts {
+    /// The value-page GETs the pass costs naming its columns.
+    pub value_gets: u64,
+    /// The key pages a Bloom-tier pass reads besides.
+    pub key_pages: u64,
+}
+
+impl ColdCosts {
+    /// The costs of a cold pass over `keys` naming `columns`, from `config`
+    /// served in the Full tier over a fresh storage. Above zero: an oracle
+    /// of no GETs would let every cost assertion pass without proving
+    /// anything.
+    pub async fn of(config: TableConfig, keys: &[Key], columns: &[&str]) -> Result<Self> {
+        let config = TableConfig {
+            residency: Residency::Full,
+            ..config
+        };
+        let source = TableSource::from_config(&config.source).await?;
+        let full = serve(config, source, storage_config_for_tests()).await?;
+        let oracle = full.current();
+        let value_gets = expected_cold_gets(&oracle, keys, columns)?;
+        assert!(value_gets > 0, "the oracle counts a value page per key");
+        Ok(Self {
+            value_gets,
+            key_pages: expected_key_pages(&oracle, keys),
+        })
+    }
+
+    /// The key-page GETs the pass adds in `residency`: none in the Full
+    /// and Disk tiers, which hold or read every key page locally.
+    pub fn key_page_gets(self, residency: Residency) -> u64 {
+        match residency {
+            Residency::Full | Residency::Disk => 0,
+            Residency::Bloom => self.key_pages,
+        }
+    }
+
+    /// Every GET the pass costs in `residency`.
+    pub fn gets_in(self, residency: Residency) -> u64 {
+        self.value_gets + self.key_page_gets(residency)
+    }
+}
+
+/// Every Parquet data file under `dir`, recursively.
+pub fn data_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        for entry in std::fs::read_dir(&at)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+            {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Removes every Parquet data file under `dir`, so a load of a table there
+/// fails while its metadata still reads; returns how many it removed.
+pub fn remove_data_files(dir: &Path) -> Result<usize> {
+    let files = data_files(dir)?;
+    for path in &files {
+        std::fs::remove_file(path)?;
+    }
+    Ok(files.len())
 }
 
 /// Overwrites with zeros every column chunk of `column` in the Parquet

@@ -47,7 +47,7 @@ use iceberg::{
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use icetray_core::approx::count;
 use icetray_core::catalog::{TableSource, hint_location, version_file};
-use icetray_core::config::{Residency, SourceConfig, TableConfig, ValueColumnConfig};
+use icetray_core::config::{Residency, SourceConfig, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
@@ -778,8 +778,9 @@ impl Fixture {
     }
 
     /// A configuration serving this fixture's main branch in `residency`
-    /// from the pinned source; a caller that follows the root or a catalog
-    /// overrides `source`. No resident-bytes budget.
+    /// from the pinned source, every value column the spec wrote opaque; a
+    /// caller that follows the root or a catalog overrides `source`. No
+    /// resident-bytes budget.
     pub fn config(&self, residency: Residency, strict: bool) -> TableConfig {
         self.config_with_budget(residency, strict, None)
     }
@@ -791,17 +792,51 @@ impl Fixture {
         strict: bool,
         budget: Option<u64>,
     ) -> TableConfig {
+        let mut value_columns = vec![ValueColumnConfig::named(VALUE_COLUMN)];
+        if self.spec.second_value {
+            value_columns.push(ValueColumnConfig::named(SECOND_VALUE_COLUMN));
+        }
         TableConfig {
             name: self.spec.name.clone(),
             source: self.pinned_source(),
             r#ref: MAIN_BRANCH.to_string(),
             key_column: KEY_COLUMN.to_string(),
-            value_columns: vec![ValueColumnConfig::named(VALUE_COLUMN)],
+            value_columns,
             strict,
             lookups: None,
             residency,
             resident_budget_bytes: budget,
         }
+    }
+
+    /// `config`, not strict, serving `columns` instead, each opaque: fewer
+    /// than the spec wrote, or ones a later schema added.
+    pub fn config_serving(&self, residency: Residency, columns: &[&str]) -> TableConfig {
+        TableConfig {
+            value_columns: columns
+                .iter()
+                .map(|&column| ValueColumnConfig::named(column))
+                .collect(),
+            ..self.config(residency, false)
+        }
+    }
+
+    /// `config`, not strict, with the column named `column`, one the spec
+    /// wrote, declared `format`.
+    pub fn config_declaring(
+        &self,
+        residency: Residency,
+        column: &str,
+        format: ValueFormat,
+    ) -> TableConfig {
+        let mut config = self.config(residency, false);
+        config
+            .value_columns
+            .iter_mut()
+            .find(|declared| declared.name == column)
+            .expect("the column declared is one the spec wrote")
+            .format = format;
+        config
     }
 
     /// Writes `ids` in the given order as new data files and commits them

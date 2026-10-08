@@ -18,8 +18,7 @@ use icetray::telemetry::{self, Call, CodeLabel};
 use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{
-    Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueColumnConfig,
-    ValueFormat,
+    Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat,
 };
 use icetray_core::key::UUID_BYTES;
 use icetray_core::metric::{self, Kind, LookupResult};
@@ -1891,19 +1890,17 @@ async fn test_unknown_or_repeated_column_is_invalid_argument_and_presence_only_r
     Ok(())
 }
 
-/// A table serving two value columns: the fixture's entry naming
-/// `SECOND_VALUE_COLUMN` beside the value column, listed out of name
-/// order, which carries no meaning.
-async fn two_column_stack() -> Result<Stack, BoxError> {
+/// A table serving two value columns, `VALUE_COLUMN` holding values of
+/// `kind` and declared `format`, beside `SECOND_VALUE_COLUMN`, opaque.
+async fn two_column_stack(kind: ValueKind, format: ValueFormat) -> Result<Stack, BoxError> {
     let spec = FixtureSpec {
         second_value: true,
+        value_kind: kind,
         ..FixtureSpec::small(TABLE, KeyType::Long)
     };
     let mut stack = Stack::start_with(vec![spec], async |setup| {
-        setup.config.tables[0].value_columns = vec![
-            ValueColumnConfig::named(VALUE_COLUMN),
-            ValueColumnConfig::named(SECOND_VALUE_COLUMN),
-        ];
+        setup.config.tables[0] =
+            setup.fixtures[0].config_declaring(Residency::Full, VALUE_COLUMN, format);
         Ok(())
     })
     .await?;
@@ -1916,7 +1913,7 @@ async fn two_column_stack() -> Result<Stack, BoxError> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_table_info_lists_the_value_columns() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = two_column_stack().await?;
+    let mut stack = two_column_stack(ValueKind::Random, ValueFormat::Opaque).await?;
     let info = stack.table_info(TABLE).await?;
     let binary = |name: &str| v1::ValueColumn {
         name: name.to_string(),
@@ -1937,7 +1934,7 @@ async fn test_table_info_lists_the_value_columns() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_and_multi_get_carry_two_columns_in_request_order() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = two_column_stack().await?;
+    let mut stack = two_column_stack(ValueKind::Random, ValueFormat::Opaque).await?;
     let fixture = &stack.fixtures[0];
     let keys = fixture.keys_at(&SAMPLE);
     let expected = |key: &Key, columns: &[&str]| -> Vec<Option<Vec<u8>>> {
@@ -1980,26 +1977,6 @@ async fn test_get_and_multi_get_carry_two_columns_in_request_order() -> TestResu
     Ok(())
 }
 
-/// A table whose `VALUE_COLUMN` holds values of `kind` and is declared
-/// protobuf, beside `SECOND_VALUE_COLUMN`, opaque.
-async fn protobuf_stack(kind: ValueKind) -> Result<Stack, BoxError> {
-    let spec = FixtureSpec {
-        second_value: true,
-        value_kind: kind,
-        ..FixtureSpec::small(TABLE, KeyType::Long)
-    };
-    let mut stack = Stack::start_with(vec![spec], async |setup| {
-        setup.config.tables[0].value_columns = vec![
-            ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf),
-            ValueColumnConfig::named(SECOND_VALUE_COLUMN),
-        ];
-        Ok(())
-    })
-    .await?;
-    stack.serving.ready().await;
-    Ok(stack)
-}
-
 /// The column read of `name` keeping `fields`.
 fn wire_read(name: &str, fields: &[u32]) -> v1::ColumnRead {
     v1::ColumnRead {
@@ -2032,7 +2009,7 @@ fn length_of(values: &[Option<Vec<u8>>]) -> f64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_and_multi_get_trim_a_protobuf_column_and_count_its_bytes() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = protobuf_stack(ValueKind::Protobuf).await?;
+    let mut stack = two_column_stack(ValueKind::Protobuf, ValueFormat::Protobuf).await?;
     let info = stack.table_info(TABLE).await?;
     let formats: Vec<(String, i32)> = info
         .value_columns
@@ -2132,7 +2109,7 @@ async fn test_get_and_multi_get_trim_a_protobuf_column_and_count_its_bytes() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_field_list_the_column_does_not_take_is_invalid_argument() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = protobuf_stack(ValueKind::Protobuf).await?;
+    let mut stack = two_column_stack(ValueKind::Protobuf, ValueFormat::Protobuf).await?;
     let key = stack.fixtures[0].key(SAMPLE[0]);
     let before = stack.stats.gets();
     let cases = [
@@ -2177,7 +2154,7 @@ async fn test_a_field_list_the_column_does_not_take_is_invalid_argument() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_malformed_value_is_failed_precondition_and_counted() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = protobuf_stack(ValueKind::Random).await?;
+    let mut stack = two_column_stack(ValueKind::Random, ValueFormat::Protobuf).await?;
     let fixture = &stack.fixtures[0];
     let (malformed, _) = protobuf::malformed_key(fixture)
         .expect("some random value starts with an undefined wire type");

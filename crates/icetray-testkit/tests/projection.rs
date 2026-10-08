@@ -9,9 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use icetray_core::config::{
-    Config, Residency, ServerConfig, TableConfig, ValueColumnConfig, ValueFormat,
-};
+use icetray_core::config::{Config, Residency, ServerConfig, TableConfig, ValueFormat};
 use icetray_core::open::open_with;
 use icetray_core::{
     ColumnRead, ColumnRequestFault, Error, FindingCode, FindingLog, Key, KeyType, Level, Row,
@@ -23,7 +21,7 @@ use icetray_testkit::protobuf::{
     ABSENT_FIELD, CHECKSUM_FIELD, FIELDS, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
     malformed_key,
 };
-use icetray_testkit::verify::{self, Served};
+use icetray_testkit::verify::{self, ColdCosts};
 use icetray_testkit::{
     Fixture, FixtureSpec, Nulls, Result, ValueKind, memory_catalog_local, write_fixture,
 };
@@ -59,23 +57,7 @@ async fn fixture_of(dir: &Path, name: &str, kind: ValueKind, nulls: Nulls) -> Re
 /// The fixture's entry in `residency` serving `VALUE_COLUMN` declared
 /// `format` and `SECOND_VALUE_COLUMN` opaque.
 fn entry(fixture: &Fixture, residency: Residency, format: ValueFormat) -> TableConfig {
-    TableConfig {
-        value_columns: vec![
-            ValueColumnConfig::of(VALUE_COLUMN, format),
-            ValueColumnConfig::named(SECOND_VALUE_COLUMN),
-        ],
-        ..fixture.config(residency, false)
-    }
-}
-
-/// `config` served over a fresh storage and cache, a local directory under
-/// `scratch` in the Disk tier.
-async fn serve(fixture: &Fixture, config: TableConfig, scratch: &Path) -> Result<Served> {
-    let source = icetray_core::TableSource::from_config(&fixture.pinned_source()).await?;
-    verify::build_in(config, source, scratch, verify::TEST_PAGE_CACHE_BYTES)
-        .await?
-        .load()
-        .await
+    fixture.config_declaring(residency, VALUE_COLUMN, format)
 }
 
 /// The reads of a lookup trimming `VALUE_COLUMN` to `fields` and reading
@@ -90,21 +72,14 @@ fn reads(fields: &[u32]) -> [ColumnRead<'_>; 2] {
     ]
 }
 
-/// The value-page GETs a cold pass over `keys` naming both columns costs,
-/// from the Full tier's oracle, which knows nothing of projection, and the
-/// key pages a Bloom-tier pass adds.
-async fn cold_costs(fixture: &Fixture, keys: &[Key]) -> Result<(u64, u64)> {
-    let scratch = tempfile::tempdir()?;
-    let full = serve(
-        fixture,
+/// What a cold pass over `keys` naming both columns costs.
+async fn cold_costs(fixture: &Fixture, keys: &[Key]) -> Result<ColdCosts> {
+    ColdCosts::of(
         entry(fixture, Residency::Full, ValueFormat::Protobuf),
-        scratch.path(),
+        keys,
+        &[VALUE_COLUMN, SECOND_VALUE_COLUMN],
     )
-    .await?;
-    let oracle = full.current();
-    let values = verify::expected_cold_gets(&oracle, keys, &[VALUE_COLUMN, SECOND_VALUE_COLUMN])?;
-    assert!(values > 0);
-    Ok((values, verify::expected_key_pages(&oracle, keys)))
+    .await
 }
 
 #[tokio::test]
@@ -112,12 +87,12 @@ async fn test_projected_reads_answer_the_named_fields_at_a_whole_read_s_gets() -
     let dir = tempfile::tempdir()?;
     let fixture = fixture_of(dir.path(), "kv_project", ValueKind::Protobuf, Nulls::None).await?;
     let keys = fixture.keys_at(&SAMPLE);
-    let (value_gets, key_pages) = cold_costs(&fixture, &keys).await?;
+    let costs = cold_costs(&fixture, &keys).await?;
     for residency in RESIDENCIES {
         for fields in FIELD_LISTS {
             let scratch = tempfile::tempdir()?;
             let config = entry(&fixture, residency, ValueFormat::Protobuf);
-            let served = serve(&fixture, config, scratch.path()).await?;
+            let served = verify::serve_in(config, scratch.path()).await?;
             let stats = served.storage.stats();
             let before = stats.gets();
             for key in &keys {
@@ -134,13 +109,9 @@ async fn test_projected_reads_answer_the_named_fields_at_a_whole_read_s_gets() -
                     );
                 }
             }
-            let key_page_gets = match residency {
-                Residency::Full | Residency::Disk => 0,
-                Residency::Bloom => key_pages,
-            };
             assert_eq!(
                 stats.gets() - before,
-                value_gets + key_page_gets,
+                costs.gets_in(residency),
                 "{residency} {fields:?}: a projected cold pass costs a whole one's GETs"
             );
         }
@@ -159,14 +130,14 @@ async fn test_projected_multi_get_answers_every_key_from_one_generation() -> Res
     )
     .await?;
     let present = fixture.keys_at(&SAMPLE);
-    let (value_gets, key_pages) = cold_costs(&fixture, &present).await?;
+    let costs = cold_costs(&fixture, &present).await?;
     let mut keys = present.clone();
     keys.push(fixture.absent_near(SAMPLE[0]));
     let fields = [SCORES_FIELD, GROUP_FIELD];
     for residency in RESIDENCIES {
         let scratch = tempfile::tempdir()?;
         let config = entry(&fixture, residency, ValueFormat::Protobuf);
-        let served = serve(&fixture, config, scratch.path()).await?;
+        let served = verify::serve_in(config, scratch.path()).await?;
         let stats = served.storage.stats();
         let before = stats.gets();
         let batch = served.table.multi_get(&present, &reads(&fields)).await?;
@@ -176,13 +147,9 @@ async fn test_projected_multi_get_answers_every_key_from_one_generation() -> Res
             .collect();
         assert_eq!(batch.rows, expected, "{residency}");
         assert_eq!(batch.snapshot_id, served.current().snapshot_id);
-        let key_page_gets = match residency {
-            Residency::Full | Residency::Disk => 0,
-            Residency::Bloom => key_pages,
-        };
         assert_eq!(
             stats.gets() - before,
-            value_gets + key_page_gets,
+            costs.gets_in(residency),
             "{residency}: a projected batch costs a whole one's GETs"
         );
         let with_absent = served.table.multi_get(&keys, &reads(&fields)).await?;
@@ -209,7 +176,7 @@ async fn test_a_null_stays_null_and_a_value_of_none_of_the_fields_is_empty() -> 
     .await?;
     let scratch = tempfile::tempdir()?;
     let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = serve(&fixture, config, scratch.path()).await?;
+    let served = verify::serve_in(config, scratch.path()).await?;
     let null = fixture.key(0);
     let present = fixture.key(1);
     assert_eq!(fixture.value(&null), None);
@@ -243,7 +210,7 @@ async fn test_a_field_list_the_format_does_not_take_is_refused_before_any_read()
     .await?;
     let scratch = tempfile::tempdir()?;
     let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = serve(&fixture, config, scratch.path()).await?;
+    let served = verify::serve_in(config, scratch.path()).await?;
     let key = fixture.key(SAMPLE[1]);
     let one = [ID_FIELD];
     let cases = [
@@ -321,7 +288,7 @@ async fn test_a_malformed_value_fails_get_and_its_multi_get_naming_the_key() -> 
     .await?;
     let scratch = tempfile::tempdir()?;
     let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = serve(&fixture, config, scratch.path()).await?;
+    let served = verify::serve_in(config, scratch.path()).await?;
     let (malformed, expected) =
         malformed_key(&fixture).expect("some random value starts with an undefined wire type");
     let fields = [ID_FIELD];
@@ -470,7 +437,7 @@ async fn test_doctor_walks_one_value_page_per_protobuf_column() -> Result<()> {
         for format in [ValueFormat::Opaque, ValueFormat::Protobuf] {
             let scratch = tempfile::tempdir()?;
             let config = entry(&fixture, Residency::Full, format);
-            let served = serve(&fixture, config.clone(), scratch.path()).await?;
+            let served = verify::serve_in(config.clone(), scratch.path()).await?;
             let generation = served.current();
             let stats = served.storage.stats();
             let before = stats.gets();
@@ -527,28 +494,6 @@ async fn test_doctor_walks_one_value_page_per_protobuf_column() -> Result<()> {
     Ok(())
 }
 
-/// Removes every data file under `dir`, the fixture's warehouse, and
-/// returns how many it removed.
-fn remove_data_files(dir: &Path) -> Result<usize> {
-    let mut removed = 0;
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(at) = pending.pop() {
-        for entry in std::fs::read_dir(&at)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|extension| extension == "parquet")
-            {
-                std::fs::remove_file(&path)?;
-                removed += 1;
-            }
-        }
-    }
-    Ok(removed)
-}
-
 /// A walk whose page read fails leaves its column unwalked and the rest of
 /// the report whole: the summary, the load's findings, and the level.
 #[tokio::test]
@@ -563,11 +508,11 @@ async fn test_doctor_reports_a_failed_walk_beside_a_whole_report() -> Result<()>
     .await?;
     let scratch = tempfile::tempdir()?;
     let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = serve(&fixture, config.clone(), scratch.path()).await?;
+    let served = verify::serve_in(config.clone(), scratch.path()).await?;
     let generation = served.current();
     let formats = config.formats();
     let whole = icetray_core::diagnose(&generation, Level::Optimal, &formats);
-    assert!(remove_data_files(dir.path())? > 0);
+    assert!(verify::remove_data_files(dir.path())? > 0);
     let examined = examine(&generation, Level::Optimal, &formats).await;
     let columns: Vec<&str> = examined
         .unwalked

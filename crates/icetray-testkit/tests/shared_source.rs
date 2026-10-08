@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use icetray_core::ColumnRead;
 use icetray_core::config::{
-    Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig, ValueColumnConfig,
+    Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
 };
 use icetray_core::open::open_with;
 use icetray_core::{FindingLog, KeyType, Row, Storage};
@@ -38,15 +38,13 @@ async fn test_two_entries_over_one_table_serve_their_own_value_columns() -> Resu
             ..FixtureSpec::small("jobs", KeyType::Long)
         };
         let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-        let value = fixture.config(residency, false);
         let detail = TableConfig {
             name: DETAIL_TABLE.to_string(),
-            value_columns: vec![ValueColumnConfig::named(SECOND_VALUE_COLUMN)],
-            ..value.clone()
+            ..fixture.config_serving(residency, &[SECOND_VALUE_COLUMN])
         };
         let value = TableConfig {
             name: VALUE_TABLE.to_string(),
-            ..value
+            ..fixture.config_serving(residency, &[VALUE_COLUMN])
         };
         let config = Config {
             server: ServerConfig::default(),

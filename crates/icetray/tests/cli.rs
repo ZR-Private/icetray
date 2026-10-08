@@ -33,7 +33,7 @@ use icetray_testkit::fixture::{
 };
 use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::protobuf;
-use icetray_testkit::verify::series_value;
+use icetray_testkit::verify::{data_files, remove_data_files, series_value, zero_column_chunks};
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, Nulls, Order, ValueKind, memory_catalog_local, write_fixture,
 };
@@ -836,42 +836,6 @@ async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
     Ok(())
 }
 
-/// Every Parquet data file under `dir`, recursively.
-fn data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, BoxError> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            found.extend(data_files(&path)?);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "parquet")
-        {
-            found.push(path);
-        }
-    }
-    Ok(found)
-}
-
-/// Removes every Parquet data file under `dir`, so a load of a table there
-/// fails while its metadata still reads; returns how many it removed.
-fn remove_data_files(dir: &Path) -> Result<usize, BoxError> {
-    let mut removed = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            removed += remove_data_files(&path)?;
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "parquet")
-        {
-            std::fs::remove_file(&path)?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
 /// A key that does not parse under the table's key type is a usage error
 /// found from the metadata alone, before the load: with every data file
 /// gone, so a load fails with exit 1, a bad key still exits 64.
@@ -1049,7 +1013,7 @@ async fn test_doctor_reports_an_unreadable_walk_as_unwalked_and_the_report_whole
     let fixture = local_fixture(dir.path(), spec).await?;
     let mut zeroed = 0;
     for path in data_files(dir.path())? {
-        zeroed += icetray_testkit::verify::zero_column_chunks(&path, VALUE_COLUMN)?;
+        zeroed += zero_column_chunks(&path, VALUE_COLUMN)?;
     }
     assert!(zeroed > 0, "the value chunks are zeroed");
     let located = protobuf_location(&fixture);

@@ -7,7 +7,6 @@
 //! another width, a file without its key column, and files that record no
 //! field ids or only some.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch};
@@ -97,42 +96,18 @@ async fn two_bucket_fixture(
 }
 
 /// `fixture`'s table entry in `residency` serving `columns`, from its root
-/// followed through the version hint, and the source it names.
-async fn root_entry(
-    fixture: &Fixture,
-    columns: &[&str],
-    residency: Residency,
-) -> Result<(TableConfig, TableSource)> {
-    let source = fixture.root_source();
-    let config = TableConfig {
-        source: source.clone(),
-        value_columns: columns
-            .iter()
-            .map(|&column| ValueColumnConfig::named(column))
-            .collect(),
-        ..fixture.config(residency, false)
-    };
-    Ok((config, TableSource::from_config(&source).await?))
-}
-
-/// `fixture` served from its root in `residency` serving `columns`, over a
-/// fresh storage, with a local directory under `scratch` in the Disk tier.
-async fn serve_root_in(
-    fixture: &Fixture,
-    columns: &[&str],
-    residency: Residency,
-    scratch: &Path,
-) -> Result<Served> {
-    let (config, source) = root_entry(fixture, columns, residency).await?;
-    verify::build_in(config, source, scratch, verify::TEST_PAGE_CACHE_BYTES)
-        .await?
-        .load()
-        .await
+/// followed through the version hint.
+fn root_entry(fixture: &Fixture, columns: &[&str], residency: Residency) -> TableConfig {
+    TableConfig {
+        source: fixture.root_source(),
+        ..fixture.config_serving(residency, columns)
+    }
 }
 
 /// `fixture` served from its root in the Full tier serving `columns`.
 async fn serve_root(fixture: &Fixture, columns: &[&str]) -> Result<Served> {
-    let (config, source) = root_entry(fixture, columns, Residency::Full).await?;
+    let config = root_entry(fixture, columns, Residency::Full);
+    let source = TableSource::from_config(&config.source).await?;
     verify::serve(config, source, verify::storage_config_for_tests()).await
 }
 
@@ -161,7 +136,8 @@ async fn load_error(config: TableConfig, source: TableSource) -> Result<Error> {
 /// The error the first load of `fixture` from its root serving
 /// `value_column` alone fails with.
 async fn first_load_error(fixture: &Fixture, value_column: &str) -> Result<Error> {
-    let (config, source) = root_entry(fixture, &[value_column], Residency::Full).await?;
+    let config = root_entry(fixture, &[value_column], Residency::Full);
+    let source = TableSource::from_config(&config.source).await?;
     load_error(config, source).await
 }
 
@@ -426,8 +402,11 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
         .map(|&id| fixture.key(id))
         .collect();
     for residency in [Residency::Bloom, Residency::Disk] {
-        let served =
-            serve_root_in(&fixture, &[SECOND_VALUE_COLUMN], residency, scratch.path()).await?;
+        let served = verify::serve_in(
+            root_entry(&fixture, &[SECOND_VALUE_COLUMN], residency),
+            scratch.path(),
+        )
+        .await?;
         let generation = served.current();
         let mut seen = SeenPages::default();
         let expected: u64 = earlier
@@ -561,25 +540,16 @@ fn protobuf_default(seed: &Key, fields: &[u32]) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-/// `fixture` served from its root in `residency` with `SECOND_VALUE_COLUMN`
-/// declared protobuf, a local directory under `scratch` in the Disk tier.
-async fn serve_protobuf_default(
-    fixture: &Fixture,
-    residency: Residency,
-    scratch: &Path,
-) -> Result<Served> {
-    let (config, source) = root_entry(fixture, &[SECOND_VALUE_COLUMN], residency).await?;
-    let config = TableConfig {
+/// `fixture`'s entry from its root in `residency` with `SECOND_VALUE_COLUMN`,
+/// which a schema change added, declared protobuf.
+fn protobuf_default_entry(fixture: &Fixture, residency: Residency) -> TableConfig {
+    TableConfig {
         value_columns: vec![ValueColumnConfig::of(
             SECOND_VALUE_COLUMN,
             ValueFormat::Protobuf,
         )],
-        ..config
-    };
-    verify::build_in(config, source, scratch, verify::TEST_PAGE_CACHE_BYTES)
-        .await?
-        .load()
-        .await
+        ..root_entry(fixture, &[SECOND_VALUE_COLUMN], residency)
+    }
 }
 
 /// A default answered for a protobuf column is projected as a value (RFD
@@ -608,7 +578,8 @@ async fn test_a_projected_default_is_trimmed_with_no_value_get_in_the_disk_and_b
     }];
     let scratch = tempfile::tempdir()?;
     for residency in [Residency::Bloom, Residency::Disk] {
-        let served = serve_protobuf_default(&fixture, residency, scratch.path()).await?;
+        let served =
+            verify::serve_in(protobuf_default_entry(&fixture, residency), scratch.path()).await?;
         let generation = served.current();
         let stats = served.storage.stats();
         let before = stats.gets();
@@ -673,7 +644,11 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
         })
         .await?;
     let scratch = tempfile::tempdir()?;
-    let served = serve_protobuf_default(&fixture, Residency::Full, scratch.path()).await?;
+    let served = verify::serve_in(
+        protobuf_default_entry(&fixture, Residency::Full),
+        scratch.path(),
+    )
+    .await?;
     let generation = served.current();
     let stats = served.storage.stats();
     let before = stats.gets();
@@ -727,7 +702,11 @@ async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
         })
         .await?;
     let scratch = tempfile::tempdir()?;
-    let served = serve_protobuf_default(&fixture, Residency::Full, scratch.path()).await?;
+    let served = verify::serve_in(
+        protobuf_default_entry(&fixture, Residency::Full),
+        scratch.path(),
+    )
+    .await?;
     let generation = served.current();
     assert!(
         generation
@@ -801,10 +780,7 @@ async fn test_a_default_that_does_not_read_is_refused_through_a_catalog() -> Res
     catalog
         .register_table(&ident, fixture.metadata_location().to_string())
         .await?;
-    let config = TableConfig {
-        value_columns: vec![ValueColumnConfig::named(SECOND_VALUE_COLUMN)],
-        ..fixture.config(Residency::Full, false)
-    };
+    let config = fixture.config_serving(Residency::Full, &[SECOND_VALUE_COLUMN]);
     let error = load_error(config, TableSource::Catalog { catalog, ident }).await?;
     assert_eq!(
         mismatch_of(&error),

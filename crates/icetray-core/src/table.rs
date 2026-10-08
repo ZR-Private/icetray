@@ -2537,16 +2537,25 @@ mod tests {
     async fn two_columns_one_row_per_page(
         key_count: usize,
     ) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
-        two_columns_one_row_per_page_in(key_count, Dictionary::Off).await
+        two_column_table_of(
+            i64::try_from(key_count).unwrap(),
+            WriterLayout {
+                page_rows: 1,
+                ..WriterLayout::contract()
+            },
+        )
+        .await
     }
 
-    /// `two_columns_one_row_per_page` with the columns `dictionary` names
-    /// dictionary-encoded.
-    async fn two_columns_one_row_per_page_in(
-        key_count: usize,
-        dictionary: Dictionary,
+    /// A loaded table of one file holding `DETAIL_COLUMN` beside the value
+    /// column, `key_count` keys written under `layout`, its file read
+    /// through a `Gauged` store, which passes every GET until a test gates
+    /// it.
+    async fn two_column_table_of(
+        key_count: i64,
+        layout: WriterLayout,
     ) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
-        let all = keys_from(0, i64::try_from(key_count).unwrap());
+        let all = keys_from(0, key_count);
         let keys = long_keys(&all);
         let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
         fixture
@@ -2556,11 +2565,7 @@ mod tests {
                 values: values_of(&all),
                 partition: Partition::Bucket(0),
                 bounds: Bounds::Exact,
-                layout: WriterLayout {
-                    page_rows: 1,
-                    dictionary,
-                    ..WriterLayout::contract()
-                },
+                layout,
             })
             .await;
         fixture
@@ -2726,8 +2731,15 @@ mod tests {
     async fn test_run_counts_a_dictionary_page_as_a_get_against_the_fan_out() {
         let pages = 2;
         for permits in [1, pages] {
-            let (table, fixture, all, gauged) =
-                two_columns_one_row_per_page_in(1, Dictionary::Value).await;
+            let (table, fixture, all, gauged) = two_column_table_of(
+                1,
+                WriterLayout {
+                    page_rows: 1,
+                    dictionary: Dictionary::Value,
+                    ..WriterLayout::contract()
+                },
+            )
+            .await;
             gauged.fill_to(permits);
             let before = fixture.gets();
             assert_eq!(
@@ -2839,10 +2851,13 @@ mod tests {
     #[test]
     fn test_get_counts_each_value_page_get_once_where_it_is_issued() {
         let (gets, series) = recorded(async {
-            let (table, fixture, all) = two_column_table(WriterLayout {
-                dictionary: Dictionary::Value,
-                ..WriterLayout::contract()
-            })
+            let (table, fixture, all, _gauged) = two_column_table_of(
+                FILE_KEYS,
+                WriterLayout {
+                    dictionary: Dictionary::Value,
+                    ..WriterLayout::contract()
+                },
+            )
             .await;
             let before = fixture.gets();
             let both_reads = [
@@ -2882,30 +2897,6 @@ mod tests {
         );
     }
 
-    /// A loaded lenient table of one file of `FILE_KEYS` keys in `layout`
-    /// with `DETAIL_COLUMN` beside the value column, its fixture, and its
-    /// keys.
-    async fn two_column_table(layout: WriterLayout) -> (Table, Fixture, Vec<i64>) {
-        let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
-        let all = keys_from(0, FILE_KEYS);
-        fixture
-            .add_file(FileSpec {
-                name: "f",
-                keys: &long_keys(&all),
-                values: values_of(&all),
-                partition: Partition::Bucket(0),
-                bounds: Bounds::Exact,
-                layout,
-            })
-            .await;
-        fixture
-            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
-            .await;
-        let table = table_over(&fixture, lenient(&fixture)).await;
-        table.load().await.unwrap();
-        (table, fixture, all)
-    }
-
     /// A lookup reads the columns it names in the order it names them, one
     /// GET per column cold and none warm; naming none answers presence
     /// alone with no read; and each column's GETs are counted under its
@@ -2913,7 +2904,8 @@ mod tests {
     #[test]
     fn test_get_reads_the_columns_named_in_order_and_counts_their_gets() {
         let ((), series) = recorded(async {
-            let (table, fixture, all) = two_column_table(WriterLayout::contract()).await;
+            let (table, fixture, all, _gauged) =
+                two_column_table_of(FILE_KEYS, WriterLayout::contract()).await;
             let key = Key::Long(all[0]);
             let before = fixture.gets();
             let read = table
@@ -2992,7 +2984,8 @@ mod tests {
     /// refused before any read, on `get` and `multi_get` alike (RFD 022).
     #[tokio::test]
     async fn test_get_and_multi_get_refuse_an_unserved_or_repeated_column_before_any_read() {
-        let (table, fixture, all) = two_column_table(WriterLayout::contract()).await;
+        let (table, fixture, all, _gauged) =
+            two_column_table_of(FILE_KEYS, WriterLayout::contract()).await;
         let key = Key::Long(all[0]);
         let before = fixture.gets();
         for (names, column, fault) in [
@@ -3031,10 +3024,13 @@ mod tests {
     /// column below the level refuses the table (RFD 020, RFD 022).
     #[tokio::test]
     async fn test_levels_and_findings_are_per_column() {
-        let (table, _fixture, _all) = two_column_table(WriterLayout {
-            dictionary: Dictionary::Value,
-            ..WriterLayout::contract()
-        })
+        let (table, _fixture, _all, _gauged) = two_column_table_of(
+            FILE_KEYS,
+            WriterLayout {
+                dictionary: Dictionary::Value,
+                ..WriterLayout::contract()
+            },
+        )
         .await;
         let generation = table.current().unwrap();
         assert_eq!(
@@ -3103,10 +3099,13 @@ mod tests {
     #[test]
     fn test_metrics_levels_findings_and_costs_are_per_column() {
         let ((), series) = recorded(async {
-            let (table, _fixture, _all) = two_column_table(WriterLayout {
-                dictionary: Dictionary::Value,
-                ..WriterLayout::contract()
-            })
+            let (table, _fixture, _all, _gauged) = two_column_table_of(
+                FILE_KEYS,
+                WriterLayout {
+                    dictionary: Dictionary::Value,
+                    ..WriterLayout::contract()
+                },
+            )
             .await;
             table.publish_gauges();
         });

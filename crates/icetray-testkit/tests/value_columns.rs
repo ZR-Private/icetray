@@ -8,11 +8,11 @@
 use std::path::Path;
 
 use icetray_core::ColumnRead;
-use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
+use icetray_core::config::{Residency, ValueFormat};
 use icetray_core::{KeyType, Level, Row, diagnose};
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, local_catalog};
 use icetray_testkit::layout::VALUE_COLUMN;
-use icetray_testkit::verify::{self, Served};
+use icetray_testkit::verify::{self, ColdCosts};
 use icetray_testkit::{Fixture, FixtureSpec, Result, write_fixture};
 
 /// Both value columns of the fixture, in one order a lookup names them.
@@ -20,33 +20,6 @@ const BOTH: [&str; 2] = [VALUE_COLUMN, SECOND_VALUE_COLUMN];
 
 /// The same columns in the other order.
 const BOTH_REVERSED: [&str; 2] = [SECOND_VALUE_COLUMN, VALUE_COLUMN];
-
-/// The fixture's entry in `residency` serving both value columns, listed
-/// in the reversed order, which carries no meaning.
-fn both_columns(fixture: &Fixture, residency: Residency) -> TableConfig {
-    TableConfig {
-        value_columns: BOTH_REVERSED
-            .iter()
-            .map(|&column| ValueColumnConfig::named(column))
-            .collect(),
-        ..fixture.config(residency, false)
-    }
-}
-
-/// `fixture` served in `residency` with both value columns over a fresh
-/// storage, a local directory under `scratch` in the Disk tier.
-async fn serve_both(fixture: &Fixture, residency: Residency, scratch: &Path) -> Result<Served> {
-    let source = icetray_core::TableSource::from_config(&fixture.pinned_source()).await?;
-    verify::build_in(
-        both_columns(fixture, residency),
-        source,
-        scratch,
-        verify::TEST_PAGE_CACHE_BYTES,
-    )
-    .await?
-    .load()
-    .await
-}
 
 /// A small long-keyed fixture with both value columns.
 async fn two_column_fixture(dir: &Path, name: &str) -> Result<Fixture> {
@@ -81,41 +54,21 @@ fn sampled(fixture: &Fixture) -> Vec<icetray_core::Key> {
     keys
 }
 
-/// What a cold pass over `keys` costs, from the Full tier's oracle: the
-/// value-page GETs naming `VALUE_COLUMN` alone and naming both columns,
-/// and the key pages a Bloom-tier lookup adds.
-struct ColdCosts {
-    one_column: u64,
-    both: u64,
-    key_pages: u64,
-}
-
-impl ColdCosts {
-    async fn of(fixture: &Fixture, keys: &[icetray_core::Key]) -> Result<Self> {
-        let scratch = tempfile::tempdir()?;
-        let full = serve_both(fixture, Residency::Full, scratch.path()).await?;
-        let oracle = full.current();
-        let costs = Self {
-            one_column: verify::expected_cold_gets(&oracle, keys, &[VALUE_COLUMN])?,
-            both: verify::expected_cold_gets(&oracle, keys, &BOTH)?,
-            key_pages: verify::expected_key_pages(&oracle, keys),
-        };
-        assert!(costs.one_column > 0);
-        assert_eq!(
-            costs.both,
-            2 * costs.one_column,
-            "the two columns' pages are pages of their own"
-        );
-        Ok(costs)
-    }
-
-    /// The key-page GETs a cold pass adds in `residency`.
-    fn key_page_gets(&self, residency: Residency) -> u64 {
-        match residency {
-            Residency::Full | Residency::Disk => 0,
-            Residency::Bloom => self.key_pages,
-        }
-    }
+/// What a cold pass over `keys` costs naming `VALUE_COLUMN` alone and
+/// naming both columns, whose pages are pages of their own.
+async fn cold_costs(
+    fixture: &Fixture,
+    keys: &[icetray_core::Key],
+) -> Result<(ColdCosts, ColdCosts)> {
+    let config = fixture.config(Residency::Full, false);
+    let one_column = ColdCosts::of(config.clone(), keys, &[VALUE_COLUMN]).await?;
+    let both = ColdCosts::of(config, keys, &BOTH).await?;
+    assert_eq!(
+        both.value_gets,
+        2 * one_column.value_gets,
+        "the two columns' pages are pages of their own"
+    );
+    Ok((one_column, both))
 }
 
 #[tokio::test]
@@ -123,10 +76,10 @@ async fn test_both_columns_answer_in_request_order_at_one_get_per_column_cold() 
     let dir = tempfile::tempdir()?;
     let fixture = two_column_fixture(dir.path(), "kv_columns").await?;
     let keys = sampled(&fixture);
-    let costs = ColdCosts::of(&fixture, &keys).await?;
+    let (_, both) = cold_costs(&fixture, &keys).await?;
     for residency in RESIDENCIES {
         let scratch = tempfile::tempdir()?;
-        let served = serve_both(&fixture, residency, scratch.path()).await?;
+        let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();
         let before = stats.gets();
         for key in &keys {
@@ -138,7 +91,7 @@ async fn test_both_columns_answer_in_request_order_at_one_get_per_column_cold() 
         }
         assert_eq!(
             stats.gets() - before,
-            costs.both + costs.key_page_gets(residency),
+            both.gets_in(residency),
             "{residency}: one value-page GET per column named, cold"
         );
     }
@@ -152,7 +105,7 @@ async fn test_the_other_order_answers_the_other_order_and_warm_pages_cost_nothin
     let keys = sampled(&fixture);
     for residency in RESIDENCIES {
         let scratch = tempfile::tempdir()?;
-        let served = serve_both(&fixture, residency, scratch.path()).await?;
+        let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         for key in &keys {
             served.table.get(key, &verify::whole(&BOTH)).await?;
         }
@@ -192,12 +145,12 @@ async fn test_presence_alone_reads_no_value_page_on_get_and_multi_get() -> Resul
     let dir = tempfile::tempdir()?;
     let fixture = two_column_fixture(dir.path(), "kv_columns_presence").await?;
     let keys = sampled(&fixture);
-    let costs = ColdCosts::of(&fixture, &keys).await?;
+    let (one_column, _) = cold_costs(&fixture, &keys).await?;
     let mut batch = keys.clone();
     batch.push(fixture.absent_near(SAMPLE[0]));
     for residency in RESIDENCIES {
         let scratch = tempfile::tempdir()?;
-        let served = serve_both(&fixture, residency, scratch.path()).await?;
+        let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();
         let before = stats.gets();
         for key in &keys {
@@ -216,7 +169,7 @@ async fn test_presence_alone_reads_no_value_page_on_get_and_multi_get() -> Resul
         assert_eq!(presence.rows, expected, "{residency}");
         assert_eq!(
             stats.gets() - before,
-            costs.key_page_gets(residency),
+            one_column.key_page_gets(residency),
             "{residency}: presence alone reads no value page, the key pages once"
         );
     }
@@ -228,10 +181,10 @@ async fn test_one_column_named_reads_that_columns_pages_alone() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let fixture = two_column_fixture(dir.path(), "kv_columns_one").await?;
     let keys = sampled(&fixture);
-    let costs = ColdCosts::of(&fixture, &keys).await?;
+    let (one_column, _) = cold_costs(&fixture, &keys).await?;
     for residency in RESIDENCIES {
         let scratch = tempfile::tempdir()?;
-        let served = serve_both(&fixture, residency, scratch.path()).await?;
+        let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();
         let before = stats.gets();
         for key in &keys {
@@ -247,7 +200,7 @@ async fn test_one_column_named_reads_that_columns_pages_alone() -> Result<()> {
         }
         assert_eq!(
             stats.gets() - before,
-            costs.one_column + costs.key_page_gets(residency),
+            one_column.gets_in(residency),
             "{residency}: one column named, one column's pages"
         );
     }
@@ -259,7 +212,7 @@ async fn test_multi_get_across_columns_answers_from_one_generation() -> Result<(
     let dir = tempfile::tempdir()?;
     let fixture = two_column_fixture(dir.path(), "kv_columns_batch").await?;
     let scratch = tempfile::tempdir()?;
-    let served = serve_both(&fixture, Residency::Full, scratch.path()).await?;
+    let served = verify::serve_in(fixture.config(Residency::Full, false), scratch.path()).await?;
     let mut keys = sampled(&fixture);
     keys.push(fixture.absent_near(SAMPLE[0]));
     let expected_gets = verify::expected_cold_gets(&served.current(), &keys, &BOTH_REVERSED)?;
@@ -289,7 +242,7 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let scratch = tempfile::tempdir()?;
-    let served = serve_both(&fixture, Residency::Full, scratch.path()).await?;
+    let served = verify::serve_in(fixture.config(Residency::Full, false), scratch.path()).await?;
     let generation = served.current();
     let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     let names: Vec<&str> = report
