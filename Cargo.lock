@@ -2648,6 +2648,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "crc32fast",
+ "flate2",
  "foyer",
  "futures",
  "iceberg",

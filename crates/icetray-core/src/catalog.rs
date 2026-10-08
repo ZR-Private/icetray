@@ -7,7 +7,9 @@
 //! catalog client speaks to its catalog over HTTP and never to object
 //! storage.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,6 +165,14 @@ pub enum TableFault {
         /// The Puffin file's location.
         path: String,
     },
+    /// The metadata file starts with the gzip magic bytes, as a file
+    /// Iceberg's writers compress (`write.metadata.compression-codec`)
+    /// does, but its bytes do not decompress.
+    #[error("metadata file {location} starts as gzip but does not decompress")]
+    MetadataGzipMalformed {
+        /// The metadata file's location.
+        location: String,
+    },
     /// The snapshot's timestamp is outside the range a `jiff::Timestamp`
     /// represents, so its age cannot be measured.
     #[error("snapshot {snapshot_id} has a timestamp outside the representable range")]
@@ -189,6 +199,7 @@ impl Recurs for TableFault {
             | Self::BucketValueOutOfRange { .. }
             | Self::SequenceNumberMissing { .. }
             | Self::VectorUnplaced { .. }
+            | Self::MetadataGzipMalformed { .. }
             | Self::SnapshotTimestampOutOfRange { .. } => Recurrence::Deterministic,
             // The version hint is rewritten in place by every commit, and the
             // catalog's record is the catalog's to change: neither is part of
@@ -380,14 +391,43 @@ async fn current_metadata_file(storage: &Storage, location: &str) -> Result<Stri
     Ok(parse_hint(root, &bytes)?.metadata_file(root))
 }
 
-/// Reads and parses the metadata file at `file`: one read.
+/// Reads and parses the metadata file at `file`, gzip-compressed or not
+/// (`metadata_json`): one read.
 async fn read_metadata(storage: &Storage, file: String) -> Result<Resolved> {
     let bytes = storage.read_all(&file).await?;
-    let metadata: TableMetadata = serde_json::from_slice(&bytes)?;
+    let metadata: TableMetadata = serde_json::from_slice(&metadata_json(&file, &bytes)?)?;
     Ok(Resolved {
         metadata: Arc::new(metadata),
         location: file,
     })
+}
+
+/// The first two bytes of a gzip stream (RFC 1952).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// The JSON of the metadata file at `location`, whose bytes are `bytes`.
+/// Iceberg lets a writer gzip its metadata files
+/// (`write.metadata.compression-codec=gzip`, named `*.gz.metadata.json`),
+/// and a file is told apart by its content, as the iceberg crate's own
+/// reader does, since JSON never starts with the gzip magic bytes. Bytes
+/// that start with it but do not decompress are
+/// `TableFault::MetadataGzipMalformed`.
+fn metadata_json<'a>(location: &str, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    if !bytes.starts_with(&GZIP_MAGIC) {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let mut json = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut json)
+        .map_err(|_malformed| {
+            Error::table_fault(
+                location,
+                TableFault::MetadataGzipMalformed {
+                    location: location.to_string(),
+                },
+            )
+        })?;
+    Ok(Cow::Owned(json))
 }
 
 /// The table as the catalog holds it now. A record without a metadata
@@ -873,6 +913,42 @@ mod tests {
             .unwrap();
         assert!(unchanged.is_none());
         assert_eq!(store.gets(), 1, "nothing is read for a pinned file");
+    }
+
+    /// `bytes` gzip-compressed, as a writer under
+    /// `write.metadata.compression-codec=gzip` writes a metadata file.
+    fn gzipped(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_resolve_reads_gzip_compressed_metadata() {
+        let store = Store::new();
+        let file = format!(
+            "{}/{METADATA_DIR}/v{SECOND_VERSION}.gz{METADATA_SUFFIX}",
+            root()
+        );
+        let json = serde_json::to_vec(&second_metadata()).unwrap();
+        store.put(&file, gzipped(&json)).await;
+        store.put_hint(file.clone()).await;
+        let resolved = static_root().resolve(&store.mem.storage).await.unwrap();
+        assert_eq!(resolved.location, file);
+        assert_eq!(
+            resolved.metadata.current_snapshot_id(),
+            Some(SECOND_SNAPSHOT)
+        );
+
+        let mut truncated = gzipped(&json);
+        truncated.truncate(truncated.len() / 2);
+        store.put(&file, truncated).await;
+        assert_eq!(
+            table_fault_of(static_root().resolve(&store.mem.storage).await, &file),
+            TableFault::MetadataGzipMalformed {
+                location: file.clone()
+            }
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ aws-sdk-s3tables = { version = "1.71.0", default-features = false, features = ["
 bytes = { workspace = true }
 crc32c = { workspace = true }
 crc32fast = { workspace = true }
+flate2 = "1.1.10"
 foyer = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
