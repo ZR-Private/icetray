@@ -166,8 +166,11 @@ impl Generation {
     /// (`deletes::bound`), reuses from `previous` every file the snapshot
     /// still names by the same path at the same size and data sequence
     /// number (the same `Arc`, RFD 005; `reuse_or_open`) with the rows its
-    /// deletes removed there, opens a `FileHandle` for every other file
-    /// with the manifest's size and `hedge`, and inspects their footers
+    /// deletes removed there, checks every reused file's columns against
+    /// the snapshot's schema from the footer it keeps
+    /// (`FileIndex::check_columns`, RFD 023), opens a `FileHandle` for
+    /// every other file with the manifest's size and `hedge`, and inspects
+    /// their footers, which resolves their columns the same way,
     /// `load_concurrency()` at a time. No key chunk or delete is read and
     /// nothing is written; `Planned::build` does both. Raised before any
     /// read: a `lookups` level the residency cannot reach, as
@@ -188,6 +191,7 @@ impl Generation {
         let layout = TableLayout::derive(
             table,
             &resolved.metadata,
+            &resolved.unread_defaults,
             snapshot,
             &config.key_column,
             &config.value_column,
@@ -195,6 +199,9 @@ impl Generation {
         let files =
             manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
         let (reused, pending) = reuse_or_open(files.data, previous, storage, &hedge).await?;
+        for file in &reused {
+            file.index.check_columns(table, &layout)?;
+        }
         let targets: Vec<DataTarget> = reused
             .iter()
             .map(|file| &file.entry)
@@ -494,15 +501,17 @@ impl Generation {
     /// probed in probe order and the first whose `find` answers with a row
     /// its file's deletes do not remove gives the row, whose value page is
     /// read through `cache`; a deleted row is passed over with no value
-    /// page read (RFD 021). `Present` carries the bytes, `Null` is a
+    /// page read (RFD 021). A row of a file written before the value column
+    /// was added answers the layout's `value_default` and reads no value
+    /// page (RFD 023). `Present` carries the bytes, `Null` is a
     /// present key with a null value, `Absent` a key no candidate holds.
     /// The GET cost is the index's: in the Full tier one GET for a cold
-    /// hit, none for a warm hit or a miss. The label is `Miss` for an
-    /// absent key; for a present one, `ColdHit` when its value page came
-    /// from outside the cache (a fetch this lookup ran or joined) and
-    /// `WarmHit` when the cache served it from memory or its disk level.
-    /// Only the value page decides it; a key-page GET in the Bloom tier
-    /// does not.
+    /// hit, none for a warm hit, a default, or a miss. The label is `Miss`
+    /// for an absent key; for a present one, `ColdHit` when its value page
+    /// came from outside the cache (a fetch this lookup ran or joined) and
+    /// `WarmHit` when the cache served it from memory or its disk level, or
+    /// no value page was read. Only the value page decides it; a key-page
+    /// GET in the Bloom tier does not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
@@ -513,14 +522,14 @@ impl Generation {
                 if self.is_deleted(at, file.index.position(row)) {
                     continue;
                 }
-                let (value, origin) = file.index.read_value(row, Some(cache)).await?;
+                let (value, result) = match file.index.read_value(row, Some(cache)).await? {
+                    Some((value, PageOrigin::Fetched)) => (value, LookupResult::ColdHit),
+                    Some((value, PageOrigin::Cached)) => (value, LookupResult::WarmHit),
+                    None => (self.layout.value_default.clone(), LookupResult::WarmHit),
+                };
                 let value = match value {
                     Some(bytes) => Value::Present(bytes),
                     None => Value::Null,
-                };
-                let result = match origin {
-                    PageOrigin::Fetched => LookupResult::ColdHit,
-                    PageOrigin::Cached => LookupResult::WarmHit,
                 };
                 return Ok((value, result));
             }
@@ -530,16 +539,17 @@ impl Generation {
 
     /// Which file and page each key would reach; the oracle for cost tests.
     /// Of the pages the key's candidates name, in the order a lookup probes
-    /// them (`probed`), the first that names a value page for a row its
-    /// file's deletes do not remove, with that page: in the Full tier that
+    /// them (`probed`), the first that names the key's row where its file's
+    /// deletes do not remove it, with that page: in the Full tier that
     /// is the file holding the live key, wherever in an overlap group it
     /// sits, and the page's `value_page_offset` is the one GET a cold hit
-    /// makes. When no candidate names such a page (the key is absent or
-    /// deleted from every file whose fences cover it, or the tier is Disk
-    /// or Bloom, where naming one would take a read), the first candidate
-    /// that would decode a key page for it, the first probe. `None` for a
-    /// key no candidate would decode a page for, which `lookup` answers
-    /// `Absent` with no I/O.
+    /// makes, `None` where the file answers the value column's default and
+    /// a hit makes none. When no candidate names such a row (the key is
+    /// absent or deleted from every file whose fences cover it, or the tier
+    /// is Disk or Bloom, where naming one would take a read), the first
+    /// candidate that would decode a key page for it, the first probe.
+    /// `None` for a key no candidate would decode a page for, which
+    /// `lookup` answers `Absent` with no I/O.
     pub fn plan(&self, keys: &[Key]) -> Vec<Option<(Arc<LoadedFile>, PageRef)>> {
         keys.iter().map(|key| self.plan_one(key)).collect()
     }
@@ -547,7 +557,7 @@ impl Generation {
     fn plan_one(&self, key: &Key) -> Option<(Arc<LoadedFile>, PageRef)> {
         let mut first_probe = None;
         for (at, file, page) in self.probed(key) {
-            if page.value_page_offset.is_some() && !self.page_deleted(at, &page) {
+            if page.position.is_some() && !self.page_deleted(at, &page) {
                 return Some((Arc::clone(file), page));
             }
             first_probe.get_or_insert_with(|| (Arc::clone(file), page));
@@ -1228,14 +1238,7 @@ async fn inspect_all(
 ) -> Result<Vec<(DataFileEntry, Inspected)>> {
     stream::iter(pending)
         .map(|(entry, handle)| async move {
-            let inspected = FileIndex::inspect(
-                table,
-                handle,
-                &layout.key_column,
-                &layout.value_column,
-                layout.key_type,
-            )
-            .await?;
+            let inspected = FileIndex::inspect(table, handle, layout).await?;
             Ok::<_, Error>((entry, inspected))
         })
         .buffered(load_concurrency())
@@ -2689,9 +2692,7 @@ mod tests {
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
     use crate::manifest::UNBUCKETED;
-    use crate::manifest::testing::{
-        DATA_DIR, KEY_COLUMN, KEY_FIELD_ID, Partition, VALUE_COLUMN, VALUE_FIELD_ID, unpartitioned,
-    };
+    use crate::manifest::testing::{self as manifest_testing, DATA_DIR, Partition, unpartitioned};
     use crate::storage::testing::{MEM_PREFIX, MemStore};
 
     /// Snapshot `id` at `sequence` committed at `millis`, for
@@ -2766,14 +2767,7 @@ mod tests {
     const BLOOM_HIT_GETS: u64 = 2;
 
     fn layout(bucketing: Option<Bucketing>) -> TableLayout {
-        TableLayout {
-            bucketing,
-            key_column: KEY_COLUMN.to_string(),
-            key_field_id: KEY_FIELD_ID,
-            key_type: KeyType::Long,
-            value_column: VALUE_COLUMN.to_string(),
-            value_field_id: VALUE_FIELD_ID,
-        }
+        manifest_testing::layout(KeyType::Long, bucketing)
     }
 
     /// The snapshot the assembled generations are said to serve; nothing
@@ -2833,9 +2827,7 @@ mod tests {
             let index = FileIndex::build(
                 TABLE,
                 handle,
-                KEY_COLUMN,
-                VALUE_COLUMN,
-                KeyType::Long,
+                &manifest_testing::layout(KeyType::Long, None),
                 Residency::Full,
                 None,
             )
@@ -3479,7 +3471,7 @@ mod tests {
     /// The compressed size of the value page of `file`'s first row group
     /// at `offset`.
     fn value_page_size(file: &LoadedFile, offset: u64) -> u64 {
-        file.index.metadata().offset_index().unwrap()[0][file.index.value_leaf()]
+        file.index.metadata().offset_index().unwrap()[0][file.index.value_leaf().unwrap()]
             .page_locations()
             .iter()
             .find(|location| u64::try_from(location.offset).unwrap() == offset)
@@ -4985,7 +4977,7 @@ mod tests {
                     .await
                     .unwrap(),
                 );
-                total += FileIndex::inspect(TABLE, handle, KEY_COLUMN, VALUE_COLUMN, KeyType::Long)
+                total += FileIndex::inspect(TABLE, handle, &layout(None))
                     .await
                     .unwrap()
                     .predicted()

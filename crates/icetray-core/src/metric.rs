@@ -414,7 +414,9 @@ impl fmt::Display for ReadKind {
 pub enum LookupResult {
     /// The key was present and its value page was fetched.
     ColdHit,
-    /// The key was present and its value page was already cached.
+    /// The key was present and its value page was already cached, or its
+    /// file predates the value column and answered the column's default
+    /// with no page read (RFD 023).
     WarmHit,
     /// The key was absent.
     Miss,

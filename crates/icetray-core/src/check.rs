@@ -236,6 +236,9 @@ pub enum FindingCode {
     /// compaction would remove them and their delete files, and the state
     /// they hold.
     DeletesPending,
+    /// Data files written before the value column was added answer its
+    /// default (RFD 023); a rewrite of them writes the column in.
+    ColumnDefault,
 }
 
 impl FindingCode {
@@ -244,7 +247,7 @@ impl FindingCode {
     /// admitted generation, so a code the generation does not raise reads
     /// zero. Complete: a successor match over every variant, which a new
     /// variant fails to compile, is compared to this list in tests.
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
@@ -260,6 +263,7 @@ impl FindingCode {
         Self::BloomOversized,
         Self::BloomUndersized,
         Self::DeletesPending,
+        Self::ColumnDefault,
     ];
 
     /// The level a finding of this code caps a table at (RFD 020), `None`
@@ -279,7 +283,8 @@ impl FindingCode {
             | Self::NoBloomFilter
             | Self::BloomOversized
             | Self::BloomUndersized
-            | Self::DeletesPending => None,
+            | Self::DeletesPending
+            | Self::ColumnDefault => None,
         }
     }
 }
@@ -302,6 +307,7 @@ impl fmt::Display for FindingCode {
             Self::BloomOversized => "bloom_oversized",
             Self::BloomUndersized => "bloom_undersized",
             Self::DeletesPending => "deletes_pending",
+            Self::ColumnDefault => "column_default",
         };
         f.write_str(code)
     }
@@ -636,6 +642,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
     );
     findings.extend(many_files_findings(&buckets));
     findings.extend(pending);
+    findings.extend(column_default(g));
     sort_findings(&mut findings);
     let predicted = with_deletes(predicted_total(&facts), g.delete_bound());
     let capping = findings
@@ -738,12 +745,14 @@ pub(crate) struct LayoutView<'a> {
 }
 
 /// One file as a level is judged from it: its manifest entry and footer,
-/// with the key and value columns' leaf positions in the footer's schema.
+/// with the key and value columns' leaf positions in the footer's schema;
+/// no value leaf for a file written before the value column was added,
+/// which answers its default and makes no value-column finding (RFD 023).
 pub(crate) struct FileView<'a> {
     entry: &'a DataFileEntry,
     metadata: &'a ParquetMetaData,
     key_leaf: usize,
-    value_leaf: usize,
+    value_leaf: Option<usize>,
 }
 
 impl<'a> FileView<'a> {
@@ -1003,8 +1012,9 @@ struct PageFacts {
 /// Counts the key and value pages of every row group, finds the largest key
 /// page in rows (a page's rows run to the next page's first row, or the row
 /// group's end), and checks that the value pages start on the key pages'
-/// rows.
-fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: usize) -> PageFacts {
+/// rows. A file with no value column has no value pages, and none out of
+/// line.
+fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: Option<usize>) -> PageFacts {
     let offsets = metadata.offset_index().expect(
         "FileIndex::build refused a file without an offset index as FileFault::MissingPageIndex",
     );
@@ -1016,13 +1026,15 @@ fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: usize) ->
     };
     for (row_group, columns) in offsets.iter().enumerate() {
         let key = columns[key_leaf].page_locations();
-        let value = columns[value_leaf].page_locations();
+        if let Some(value_leaf) = value_leaf {
+            let value = columns[value_leaf].page_locations();
+            facts.value_pages += value.len();
+            facts.aligned &= key.len() == value.len()
+                && key.iter().zip(value).all(|(key_page, value_page)| {
+                    key_page.first_row_index == value_page.first_row_index
+                });
+        }
         facts.key_pages += key.len();
-        facts.value_pages += value.len();
-        facts.aligned &= key.len() == value.len()
-            && key.iter().zip(value).all(|(key_page, value_page)| {
-                key_page.first_row_index == value_page.first_row_index
-            });
         let group_rows = metadata.row_group(row_group).num_rows();
         for (at, page) in key.iter().enumerate() {
             let end = key
@@ -1035,24 +1047,31 @@ fn page_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: usize) ->
 }
 
 /// What the column chunks say: which columns some row group
-/// dictionary-encodes, and the value column's uncompressed bytes.
+/// dictionary-encodes, and the value column's uncompressed bytes, none for
+/// a file with no value column.
 struct ChunkFacts {
     key_dictionary: bool,
     value_dictionary: bool,
     value_uncompressed_bytes: u64,
 }
 
-fn chunk_facts(metadata: &ParquetMetaData, key_leaf: usize, value_leaf: usize) -> ChunkFacts {
+fn chunk_facts(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    value_leaf: Option<usize>,
+) -> ChunkFacts {
     let mut facts = ChunkFacts {
         key_dictionary: false,
         value_dictionary: false,
         value_uncompressed_bytes: 0,
     };
     for group in metadata.row_groups() {
-        let value = group.column(value_leaf);
         facts.key_dictionary |= dictionary_encoded(group.column(key_leaf));
-        facts.value_dictionary |= dictionary_encoded(value);
-        facts.value_uncompressed_bytes += approx::measured(value.uncompressed_size());
+        if let Some(value_leaf) = value_leaf {
+            let value = group.column(value_leaf);
+            facts.value_dictionary |= dictionary_encoded(value);
+            facts.value_uncompressed_bytes += approx::measured(value.uncompressed_size());
+        }
     }
     facts
 }
@@ -1434,6 +1453,36 @@ fn compacted_level(g: &Generation, caps: &Caps) -> Option<Level> {
         .filter(|&compacted| compacted < caps.level)
 }
 
+/// `column_default` (RFD 023) when files of `g` were written before its
+/// value column was added and answer its default: how many, of how many,
+/// and the default they answer. Such a file costs no value-page GET for a
+/// hit, so a table mid-evolution costs less than its level and cost gauges
+/// predict, which describe the files that hold the column.
+fn column_default(g: &Generation) -> Option<Finding> {
+    let defaulted = g
+        .files
+        .iter()
+        .filter(|file| file.index.value_leaf().is_none())
+        .count();
+    if defaulted == 0 {
+        return None;
+    }
+    let total = g.files.len();
+    let column = &g.layout.value_column;
+    let default = g.layout.value_default.as_ref().map_or_else(
+        || "null".to_string(),
+        |bytes| format!("its initial-default of {} bytes", bytes.len()),
+    );
+    Some(Finding::advice(
+        FindingCode::ColumnDefault,
+        None,
+        format!(
+            "{defaulted} of {total} data files were written before value column {column} was added and answer {default} for it, reading no value page; a rewrite of those files, such as a compaction, writes the column into them",
+        ),
+        None,
+    ))
+}
+
 /// `predicted` with each tier's memory grown by `delete_bound`, the bound on
 /// the delete state's bytes, which every tier holds in memory beside its
 /// index (RFD 021): a `full` table is budgeted for it, and `disk` and
@@ -1622,6 +1671,7 @@ mod tests {
         (FindingCode::BloomOversized, "bloom_oversized"),
         (FindingCode::BloomUndersized, "bloom_undersized"),
         (FindingCode::DeletesPending, "deletes_pending"),
+        (FindingCode::ColumnDefault, "column_default"),
     ];
 
     /// `rows` values of `len` bytes each, none null.
@@ -1876,7 +1926,8 @@ mod tests {
             FindingCode::NoBloomFilter => Some(FindingCode::BloomOversized),
             FindingCode::BloomOversized => Some(FindingCode::BloomUndersized),
             FindingCode::BloomUndersized => Some(FindingCode::DeletesPending),
-            FindingCode::DeletesPending => None,
+            FindingCode::DeletesPending => Some(FindingCode::ColumnDefault),
+            FindingCode::ColumnDefault => None,
         }
     }
 

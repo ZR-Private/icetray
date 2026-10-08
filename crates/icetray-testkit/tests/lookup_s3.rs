@@ -9,7 +9,7 @@ use icetray_core::KeyType;
 use icetray_core::approx::count;
 use icetray_core::config::Residency;
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE};
-use icetray_testkit::verify::{self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS};
+use icetray_testkit::verify::{self, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS};
 use icetray_testkit::{FixtureSpec, Result, S3Fixture, memory_catalog_s3, write_fixture};
 
 /// The fixture server's bucket and the warehouse prefix inside it.
@@ -42,8 +42,8 @@ async fn test_get_over_s3() -> Result<()> {
     let files = count(served.current().files.len());
     assert_eq!(
         served.storage.stats().gets(),
-        LOAD_METADATA_GETS + LOAD_GETS_PER_FILE * files,
-        "manifest list and manifest, then a footer and a key chunk per file"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + LOAD_GETS_PER_FILE * files,
+        "metadata file, manifest list, and manifest, then a footer and a key chunk per file"
     );
     let served = verify::verify_hit_cost(served, &fixture, &SAMPLE).await?;
     verify::verify_misses(&served, &fixture, &SAMPLE).await

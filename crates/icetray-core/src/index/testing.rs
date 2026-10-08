@@ -37,7 +37,7 @@ use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, 
 use crate::key::testing::UUID_HALF_BYTES;
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::LocalDir;
-use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
+use crate::manifest::testing::{self as manifest_testing, KEY_COLUMN, VALUE_COLUMN};
 use crate::parquet_io::FileHandle;
 use crate::storage::testing::{MEM_PREFIX, MemStore};
 use crate::storage::{HedgeWindow, IoStats, Storage};
@@ -336,9 +336,7 @@ impl Opened {
         FileIndex::build(
             TABLE,
             Arc::clone(&self.handle),
-            KEY_COLUMN,
-            VALUE_COLUMN,
-            key_type,
+            &manifest_testing::layout(key_type, None),
             residency,
             local,
         )

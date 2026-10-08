@@ -16,6 +16,11 @@
 > serviceability, and its exit codes follow the declared level. See RFD
 > 020 (Lookup levels).
 
+> Updated 2026-10-07: the advice `column_default` reports how many data
+> files were written before the value column was added and answer its
+> default, and such a file draws no value-column finding, since it holds
+> no such column. See RFD 023.
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -47,9 +52,13 @@ penalty RFD 007 assigns it. The advice covers missing or truncated
 manifest bounds, value pages over 1 MiB, value pages over the lookup's 64 MiB value page ceiling
 (RFD 004 (Resident key-chunk index)), keys over 128 bytes, data files over
 128 MiB, a truncated column index, more files per bucket than the table's
-size and file-size target explain, and a key bloom filter that is absent,
+size and file-size target explain, a key bloom filter that is absent,
 oversized, or undersized for its row group's key count, reported as the
-filter's bits per key.
+filter's bits per key, and data files written before the value column was
+added, which answer its default (RFD 023 (Column resolution)). Such a
+file holds no value column, so it draws no value-column finding, and
+its rows cost no value-page GET, which the level and the cost gauges,
+predicting the worst case, leave out.
 
 The value-page line concerns bytes fetched per hit. That cost grows
 linearly with the page's size and has no step anywhere, so the line is

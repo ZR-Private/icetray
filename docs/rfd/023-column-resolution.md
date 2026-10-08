@@ -28,8 +28,9 @@ default and every other mismatch refused.
 
 A file records field ids when every top-level column of its Parquet
 schema carries one, as Iceberg's writers write them. A file where only
-some do is treated as recording none. What each file holds for a
-configured column decides the answer:
+some do is treated as recording none, except that a column found by
+name that carries a field id other than the schema's is refused. What
+each file holds for a configured column decides the answer:
 
 | The file holds | The answer |
 |---|---|
@@ -37,7 +38,7 @@ configured column decides the answer:
 | A column of that name, with another field id | Refused |
 | No column of that name, but the schema's field id under another name | Refused |
 | Neither the name nor the field id, and records field ids | The column's default |
-| No field ids, and a column of that name | Served, unchecked |
+| No field ids, and a column of that name with no field id but the schema's | Served, unchecked |
 | No field ids, and no column of that name | Refused |
 
 - **Names are top-level.** Names and field ids are matched among the

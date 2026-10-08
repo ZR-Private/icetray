@@ -220,8 +220,8 @@ The disk level holds one open file descriptor per 4 MiB block, so
 |---|---|---|---|
 | `name` | string | required | The name clients use. Unique and not empty. |
 | `ref` | string | required | The Iceberg branch or tag to serve, such as `"main"`. |
-| `key_column` | string | required | The key column. |
-| `value_column` | string | required | The value column. |
+| `key_column` | string | required | The key column: a top-level field of the snapshot's schema, found in each data file by its name and field id ([Changing the schema](table-contract.md#changing-the-schema)). |
+| `value_column` | string | required | The value column, a top-level field found the same way. |
 | `source` | table | required | Where the table's metadata comes from, below. |
 | `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
@@ -237,7 +237,7 @@ new [generation](glossary.md) when the ref names a new snapshot.
 | `type` | Keys | What a poll follows |
 |---|---|---|
 | `"static"` | `location`, required: a table root or a metadata file | A table root is followed through its `metadata/version-hint.text`, as the Hadoop catalog writes it; an unchanged hint costs that one read. A location ending in `.metadata.json` names one metadata file, which never changes, so the table never advances. |
-| `"rest"` | `uri`, required: the catalog's base URI; `warehouse`, optional; `namespace`, required, its levels separated by dots (`"db.schema"`); `table`, required | Each poll loads the table from the catalog, one call within `storage.catalog_timeout`, and follows the metadata location the catalog returns. |
+| `"rest"` | `uri`, required: the catalog's base URI; `warehouse`, optional; `namespace`, required, its levels separated by dots (`"db.schema"`); `table`, required | Each poll loads the table from the catalog, one call within `storage.catalog_timeout`, and follows the metadata location the catalog returns. An unchanged location costs that call and no read; a new one costs one read of its metadata file, for the column defaults the catalog's client does not report ([Changing the schema](table-contract.md#changing-the-schema)). |
 | `"glue"` | `database` and `table`, required; `catalog_id`, `region`, and `endpoint`, optional; [below](#glue) | Each poll calls Glue's `GetTable`, one call within `storage.catalog_timeout`, and follows the table's `metadata_location` parameter. An unchanged location costs that call and no read. |
 | `"s3tables"` | `table_bucket_arn`, `namespace`, and `table`, required; `region` and `endpoint`, optional; [below](#s3tables) | Each poll calls S3 Tables' `GetTableMetadataLocation`, one call within `storage.catalog_timeout`, and follows the location it returns. An unchanged location costs that call and no read. |
 
@@ -655,7 +655,7 @@ for it:
 
 | Key | Value |
 |---|---|
-| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`; or `load_failed` when an error rather than a rule stopped the load. |
+| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`; or `load_failed` when an error rather than a rule stopped the load. |
 | `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 

@@ -451,7 +451,10 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
                 .expect("the contract layout writes a column index");
             for row_group in column_index {
                 assert_eq!(
-                    row_group[file.index.value_leaf()],
+                    row_group[file
+                        .index
+                        .value_leaf()
+                        .expect("every file holds the value column")],
                     ColumnIndexMetaData::NONE,
                     "{}: the value column's column index is dropped on load",
                     file.entry.path

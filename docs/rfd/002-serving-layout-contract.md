@@ -1,5 +1,10 @@
 # Serving layout contract
 
+> Updated 2026-10-07: a configured column is found in each data file by
+> its name and the field id the snapshot's schema gives it, so a value
+> column can be added to a served table without a rewrite, and a served
+> column is not renamed. See RFD 023.
+
 ## Problem
 
 icetray serves a lookup by reading the Parquet data files a batch pipeline
@@ -33,6 +38,12 @@ them are the writer recipe in the
   (RFD 010 (Transport and client contract)). What a null means is the
   table owner's rule, and a table used as a membership set spends no bytes
   on values at all. The key's rules are in RFD 008 (Keys).
+- Columns found by name and field id, as Iceberg's writers record them
+  (RFD 023 (Column resolution)). A value column added to the schema after
+  a file was written answers its default in that file, so a column can be
+  added without a rewrite. A served column is not renamed: a new column is
+  added beside it, written, and moved to by the callers, and the old one
+  is dropped from the clients, then the configuration, then the schema.
 - `bucket(N, key)` partitioning with hash distribution, so that a lookup
   routes to one bucket. N is chosen once, at write time. Choosing a
   multiple of the node counts a table might later be sharded across

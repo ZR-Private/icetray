@@ -25,6 +25,13 @@
 > deletes shrank, and a delete file no longer stops the table advancing
 > unless it is one RFD 021 (Merge-on-read) refuses.
 
+> Updated 2026-10-07: a generation resolves its key and value columns in
+> every data file against the snapshot's own schema, a reused file
+> included, from the footer the file keeps, so a schema that drops a
+> column and adds another under its name refuses the snapshot rather than
+> serving an unchanged file's old column; a file that lacks the column
+> is no longer a file fault. See RFD 023.
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -59,10 +66,17 @@ the snapshot's own schema and from each manifest's partition spec, so a
 schema or spec change between snapshots cannot misroute a key. The
 table's current schema and default spec play no part
 ([prototype findings, finding 15](../analysis/2026-09-10-prototype-findings.md#15-what-reviews-found-that-tests-did-not)).
+Each column is then found in every data file by its name and checked
+against the field id that schema gives it, as RFD 023 (Column
+resolution) decides.
 
 A data file that the new snapshot still references by the same path, at
 the same size and data sequence number, keeps its resident index from the
-previous generation, and only new files are loaded. Because load work is
+previous generation, and only new files are loaded. A kept file's columns
+are resolved again against the new snapshot's schema from the footer the
+index keeps, which reads nothing, since a schema that drops a column and
+adds another under its name changes what the unchanged file means (RFD
+023). Because load work is
 per file and unchanged files are reused, a refresh costs its delta
 ([prototype findings, finding 3](../analysis/2026-09-10-prototype-findings.md#3-load-time)).
 In simulation a small build takes well under one dependent round trip per

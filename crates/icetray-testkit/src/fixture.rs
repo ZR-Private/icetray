@@ -16,18 +16,19 @@ use std::time::Duration;
 
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    new_null_array,
 };
 use arrow::buffer::Buffer;
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use iceberg::io::{FileIO, LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
-    MAIN_BRANCH, ManifestFile, ManifestListWriter, ManifestWriterBuilder, NestedField, NullOrder,
-    Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema, Snapshot, SnapshotReference,
-    SnapshotRetention, SortDirection, SortField, SortOrder, Struct, Summary, TableMetadata,
-    Transform, Type, UnboundPartitionSpec,
+    MAIN_BRANCH, ManifestFile, ManifestListWriter, ManifestWriterBuilder, NestedField,
+    NestedFieldRef, NullOrder, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema,
+    Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct,
+    Summary, TableMetadata, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
@@ -40,7 +41,9 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter as _;
 use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
-use iceberg::{Catalog, CatalogBuilder as _, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, CatalogBuilder as _, ErrorKind, NamespaceIdent, Runtime, TableCreation, TableIdent,
+};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use icetray_core::approx::count;
 use icetray_core::catalog::{TableSource, hint_location, version_file};
@@ -49,7 +52,7 @@ use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
 use icetray_core::{Key, KeyType, Value};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
 
@@ -197,17 +200,19 @@ pub const INTERLEAVED_SAMPLE: [u64; 6] = [0, 2, 1_234, 2_998, 4_002, 7_998];
 pub const NEWEST_SAMPLE: [u64; 4] = [1, 4_001, 7_997, 8_500];
 
 /// The field id of the key column in every fixture schema.
-const KEY_FIELD_ID: i32 = 1;
+pub const KEY_FIELD_ID: i32 = 1;
 
 /// The field id of the value column in every fixture schema.
-const VALUE_FIELD_ID: i32 = 2;
+pub const VALUE_FIELD_ID: i32 = 2;
 
-/// The field id of `SECOND_VALUE_COLUMN` in a schema that holds it.
-const SECOND_VALUE_FIELD_ID: i32 = 3;
+/// The field id of `SECOND_VALUE_COLUMN` in a schema created with it.
+pub const SECOND_VALUE_FIELD_ID: i32 = 3;
 
-/// A second binary value column, written when `FixtureSpec::second_value`
-/// is set: each row's `value` bytes reversed, null where `value` is, so a
-/// table entry naming it reads bytes no entry naming `value` returns.
+/// A second binary value column, written into every file whose schema
+/// holds it: from the first build when `FixtureSpec::second_value` is set,
+/// or from the `write_rows` after `Fixture::evolve` adds it. Each row's
+/// `value` bytes reversed, null where `value` is, so a table entry naming
+/// it reads bytes no entry naming `value` returns.
 pub const SECOND_VALUE_COLUMN: &str = "detail";
 
 /// The schema id every fixture table is created with.
@@ -436,6 +441,59 @@ impl RawFile {
     }
 }
 
+/// An arrow field that a Parquet writer records under `field_id`, as
+/// Iceberg's writers record every column (RFD 023): a raw file built from
+/// fields like this records field ids, one built from plain fields records
+/// none.
+pub fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
+    Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        field_id.to_string(),
+    )]))
+}
+
+/// One change `Fixture::evolve` makes to the current schema's top-level
+/// columns, as a writer's schema evolution does: every column keeps its
+/// field id across a rename, and an added column takes one above every id
+/// the table has assigned.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchemaChange {
+    /// Adds an optional column `name` of `ty` stating `default`.
+    Add {
+        /// The new column's name.
+        name: String,
+        /// Its type.
+        ty: PrimitiveType,
+        /// The `initial-default` the schema states for it.
+        default: StatedDefault,
+    },
+    /// Renames the column `from` to `to`.
+    Rename {
+        /// The column's name before.
+        from: String,
+        /// Its name after.
+        to: String,
+    },
+    /// Drops the column `name`.
+    Drop {
+        /// The column's name.
+        name: String,
+    },
+}
+
+/// The `initial-default` an added column states.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatedDefault {
+    /// None: rows written before the column read null.
+    None,
+    /// This literal, which the iceberg crate writes in the spec's JSON form.
+    Literal(Literal),
+    /// This JSON, written into every metadata file from then on as it is,
+    /// past the iceberg crate, which cannot write a default it cannot read:
+    /// how a test states a default that does not read as its column's type.
+    Raw(serde_json::Value),
+}
+
 /// A snapshot to commit by hand: the data files it lists and the delete
 /// files it lists (`Fixture::commit_by_hand`).
 #[derive(Clone, Debug, Default)]
@@ -504,6 +562,9 @@ pub struct Fixture {
     by_hand: bool,
     /// By-hand commits so far; the next writes metadata version one above.
     hand_commits: u64,
+    /// The `StatedDefault::Raw` defaults `evolve` added, by field id, which
+    /// every metadata file written from then on states.
+    raw_defaults: Vec<(i32, serde_json::Value)>,
 }
 
 /// What one snapshot lists, as a `Fixture` follows it.
@@ -535,6 +596,7 @@ impl Fixture {
             history: HashMap::new(),
             by_hand: false,
             hand_commits: 0,
+            raw_defaults: Vec::new(),
         })
     }
 
@@ -941,20 +1003,111 @@ impl Fixture {
             .map(|current| current.snapshot_id())
     }
 
-    /// Writes `metadata` as the next by-hand version and takes it as the
-    /// table's; the version hint is the caller's to write.
+    /// Writes `metadata` as the next by-hand version, every raw default
+    /// `evolve` added stated in it (`stated_json`), and takes it as the
+    /// table's for every by-hand write after, `commit_by_hand` and
+    /// `move_ref` alike: the writers of `write_rows` write under its
+    /// schema. The version hint is the caller's to write.
     async fn write_metadata(&mut self, metadata: TableMetadata) -> Result<()> {
         self.hand_commits += 1;
         let location = version_file(self.root(), self.hand_commits);
         self.table
             .file_io()
             .new_output(&location)?
-            .write(Bytes::from(serde_json::to_vec(&metadata)?))
+            .write(Bytes::from(self.stated_json(&metadata)?))
             .await?;
+        self.table = Table::builder()
+            .metadata(metadata.clone())
+            .metadata_location(location.clone())
+            .identifier(self.ident.clone())
+            .file_io(self.table.file_io().clone())
+            .runtime(Runtime::try_current()?)
+            .build()?;
         self.metadata = metadata;
         self.metadata_location = location;
         self.by_hand = true;
         Ok(())
+    }
+
+    /// `metadata` as JSON, with every raw default of `raw_defaults` stated
+    /// on its field in every schema that holds the field.
+    fn stated_json(&self, metadata: &TableMetadata) -> Result<Vec<u8>> {
+        let mut json = serde_json::to_value(metadata)?;
+        if let Some(schemas) = json
+            .get_mut(SCHEMAS_KEY)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for field in schemas
+                .iter_mut()
+                .filter_map(|schema| schema.get_mut(FIELDS_KEY))
+                .filter_map(serde_json::Value::as_array_mut)
+                .flatten()
+            {
+                let id = field.get(FIELD_ID_KEY).and_then(serde_json::Value::as_i64);
+                if let Some((_, default)) = self
+                    .raw_defaults
+                    .iter()
+                    .find(|(field_id, _)| Some(i64::from(*field_id)) == id)
+                {
+                    field[INITIAL_DEFAULT_KEY] = default.clone();
+                }
+            }
+        }
+        Ok(serde_json::to_vec(&json)?)
+    }
+
+    /// Changes the current schema by `changes`, in order, and commits by
+    /// hand a snapshot under the new schema listing every data and delete
+    /// file the current one does (`commit_by_hand`): the files stay as they
+    /// were written while what the schema means by their columns changes.
+    /// A rename or drop of a column the schema lacks is
+    /// `SpecFault::ColumnNotInSchema`. Rows written after (`write_rows`)
+    /// carry the new schema's columns and field ids.
+    pub async fn evolve(&mut self, changes: &[SchemaChange]) -> Result<()> {
+        let mut fields: Vec<NestedFieldRef> =
+            self.metadata.current_schema().as_struct().fields().to_vec();
+        let mut next_id = self.metadata.last_column_id() + 1;
+        for change in changes {
+            match change {
+                SchemaChange::Add { name, ty, default } => {
+                    let field = NestedField::optional(next_id, name, Type::Primitive(ty.clone()));
+                    let field = match default {
+                        StatedDefault::None => field,
+                        StatedDefault::Literal(literal) => {
+                            field.with_initial_default(literal.clone())
+                        }
+                        StatedDefault::Raw(json) => {
+                            self.raw_defaults.push((next_id, json.clone()));
+                            field
+                        }
+                    };
+                    fields.push(field.into());
+                    next_id += 1;
+                }
+                SchemaChange::Rename { from, to } => {
+                    let at = column_at(&fields, from)?;
+                    let mut renamed = NestedField::clone(&fields[at]);
+                    renamed.name.clone_from(to);
+                    fields[at] = renamed.into();
+                }
+                SchemaChange::Drop { name } => {
+                    fields.remove(column_at(&fields, name)?);
+                }
+            }
+        }
+        let schema = Schema::builder().with_fields(fields).build()?;
+        self.metadata = self
+            .metadata
+            .clone()
+            .into_builder(Some(self.metadata_location.clone()))
+            .add_current_schema(schema)?
+            .build()?
+            .metadata;
+        self.commit_by_hand(HandSnapshot {
+            data: self.files.clone(),
+            deletes: self.deletes.clone(),
+        })
+        .await
     }
 
     /// Records what the current snapshot lists, for `move_ref`.
@@ -1216,6 +1369,27 @@ impl Fixture {
     }
 }
 
+/// The keys of a metadata file's JSON that `Fixture::stated_json` walks to
+/// a field's default, as the Iceberg spec names them.
+const SCHEMAS_KEY: &str = "schemas";
+const FIELDS_KEY: &str = "fields";
+const FIELD_ID_KEY: &str = "id";
+const INITIAL_DEFAULT_KEY: &str = "initial-default";
+
+/// The position of the top-level column `name` among `fields`, or
+/// `SpecFault::ColumnNotInSchema`.
+fn column_at(fields: &[NestedFieldRef], name: &str) -> Result<usize> {
+    fields
+        .iter()
+        .position(|field| field.name == name)
+        .ok_or_else(|| {
+            SpecFault::ColumnNotInSchema {
+                name: name.to_string(),
+            }
+            .into()
+        })
+}
+
 /// The position delete files that delete `targets`' positions under spec
 /// `spec_id`: one per data file naming it as its referenced data file when
 /// `scoped`, else one per partition naming none.
@@ -1262,9 +1436,9 @@ pub async fn local_catalog() -> Result<(TempDir, Arc<dyn Catalog>)> {
 }
 
 /// A memory catalog whose files live under `dir` on local disk, through the
-/// library's own filesystem storage. It resolves a table with no
-/// object-storage read through icetray's `Storage`, which makes it the
-/// in-process stand-in for a catalog record.
+/// library's own filesystem storage, where icetray's `Storage` reads the
+/// metadata file it names too: the in-process stand-in for a catalog
+/// record.
 pub async fn memory_catalog_local(dir: &Path) -> Result<Arc<MemoryCatalog>> {
     std::fs::create_dir_all(dir)?;
     let warehouse = format!("file://{}", dir.display());
@@ -1548,8 +1722,14 @@ fn group_by_bucket(
 }
 
 /// One batch of `keys` with their values at `version_of` each id, a null
-/// for every id `spec.nulls` names, cast to the arrow types the library's
-/// schema conversion gives the two columns.
+/// for every id `spec.nulls` names, one column per field of `arrow_schema`
+/// cast to its arrow type: `KEY_COLUMN` the keys, `VALUE_COLUMN` the
+/// values, `SECOND_VALUE_COLUMN` the values reversed, and a column the
+/// fixture derives nothing for, which `Fixture::evolve` may add, all nulls.
+/// A column `arrow_schema` lacks is not written, so after `evolve` drops
+/// or renames the key or value column the batch omits it rather than
+/// failing: a file written then lacks that column, as a writer under that
+/// schema would write it.
 fn batch(
     arrow_schema: &Arc<ArrowSchema>,
     spec: &FixtureSpec,
@@ -1566,30 +1746,26 @@ fn batch(
                 .then(|| value_of_version(key, spec.value_bytes, spec.value_kind, version_of(id)))
         })
         .collect();
-    let second: Option<ArrayRef> = spec.second_value.then(|| {
-        Arc::new(
-            values
-                .iter()
-                .map(|value| value.map(|bytes| reversed(bytes.to_vec())))
-                .collect::<BinaryArray>(),
-        ) as ArrayRef
-    });
+    let second: ArrayRef = Arc::new(
+        values
+            .iter()
+            .map(|value| value.map(|bytes| reversed(bytes.to_vec())))
+            .collect::<BinaryArray>(),
+    );
     let value: ArrayRef = Arc::new(values);
-    let mut columns = vec![
-        arrow::compute::cast(&key, arrow_schema.field_with_name(KEY_COLUMN)?.data_type())?,
-        arrow::compute::cast(
-            &value,
-            arrow_schema.field_with_name(VALUE_COLUMN)?.data_type(),
-        )?,
-    ];
-    if let Some(second) = second {
-        columns.push(arrow::compute::cast(
-            &second,
-            arrow_schema
-                .field_with_name(SECOND_VALUE_COLUMN)?
-                .data_type(),
-        )?);
-    }
+    let columns = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = match field.name().as_str() {
+                KEY_COLUMN => Arc::clone(&key),
+                VALUE_COLUMN => Arc::clone(&value),
+                SECOND_VALUE_COLUMN => Arc::clone(&second),
+                _ => new_null_array(field.data_type(), ids.len()),
+            };
+            Ok(arrow::compute::cast(&column, field.data_type())?)
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
     Ok(RecordBatch::try_new(Arc::clone(arrow_schema), columns)?)
 }
 

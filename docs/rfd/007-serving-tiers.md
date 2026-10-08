@@ -18,6 +18,12 @@
 > deletes and unreadable deletes that may apply. See RFD 021
 > (Merge-on-read).
 
+> Updated 2026-10-07: a configured column that a data file does not hold
+> as the snapshot's schema means it is refused as `column_mismatch`,
+> which replaces the file fault `MissingColumn`, and a file written
+> before its value column was added answers the column's default. See
+> RFD 023.
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -37,7 +43,8 @@ deviation costs, and the two must agree on one classification.
 
 A table icetray cannot serve correctly (unsorted files, null or duplicate
 keys, keys outside their file's recorded bucket, a key column whose
-physical type does not match the schema, a value column that is not
+physical type does not match the schema, a configured column a data file
+does not hold as the schema means it, a value column that is not
 binary, fixed, or string, equality deletes and unreadable deletes that
 may apply, keys over 4,096 bytes, and the residency refusals of RFD 017
 (Residency tiers)) will be refused at load with a named reason; a table it
@@ -96,6 +103,17 @@ Placements settled elsewhere:
   the wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)). A typed column has no defined encoding there, and any answer
   would be a guess. RFD 002 (Serving layout contract) states the clause.
+- A configured column a data file does not hold as the snapshot's schema
+  means it is refused as `column_mismatch`: a column of its name under
+  another field id, its field id under another name, a file that records
+  no field ids and lacks the name, a file without its key column, a file
+  holding the name as a nested group, a `fixed` column at another width,
+  a name that is not a top-level field, and a default that does not
+  read. A swap of two names would otherwise
+  serve one column's bytes under the other's name. A file that records
+  field ids and lacks the value column was written before the column was
+  added and answers its default, which is no deviation. RFD 023 (Column
+  resolution) gives the rule.
 - Equality deletes and unreadable deletes that may apply are refused;
   RFD 021 (Merge-on-read) serves deletion vectors and Parquet position
   deletes and says why the rest stay refused.

@@ -74,6 +74,7 @@ doctor's output and the metrics spell it.
 | A key at most once within a data file, deleted rows included | Refused: `duplicate_keys` | Deduplicate before the write |
 | A live key in at most one data file: a row a delete removes is not live | Refused: `duplicate_keys` | Deduplicate before the write, or upsert with `MERGE`, which rewrites the older row or deletes it |
 | One value column of type `binary`, `fixed`, or `string`; nulls allowed | Refused: `value_type_unsupported` | Pack the columns a caller needs into one binary value at write time, such as a serialized protobuf. A second column would cost a second GET per hit. |
+| Each configured column held under the name and field id the snapshot's schema gives it, in data files that record a field id on every column, as Iceberg's writers do | Refused: `column_mismatch`, for a column held under another field id (a swap of names, or a name dropped and added again), its field id held under another name (a rename), a file that records no field ids and lacks the column, a file without its key column, a file holding the name as a nested group, a `fixed` key or value column stored at another width, a configured name that is not a top-level field, or a stated default that does not read as its column's type. A file that records field ids and was written before its value column was added is served, its rows answering the column's default: advice, `column_default`, with the count of such files | Write through an Iceberg writer, and change the schema as [Changing the schema](#changing-the-schema) describes; a compaction rewrites the files that predate a column |
 | No equality delete that may apply to a data file | Refused: `equality_deletes`, for an equality delete newer than the snapshot's oldest data file, which may apply to one (RFD 021). An equality delete no data file is older than changes no answer and is ignored. | A table whose writer leaves equality deletes can be served from a tag or branch that a compaction moves after rewriting them into data files. |
 | Only deletes icetray reads: deletion vectors and Parquet position deletes | Served (RFD 021). Refused: `delete_kind_unsupported`, for a position delete file in Avro or ORC that may apply to a data file no deletion vector masks, a Puffin blob other than a deletion vector, or a Puffin footer that is compressed or sets reserved flags. An Avro or ORC position delete file that applies to no data file the snapshot holds changes no answer and is ignored, and so is one whose every data file is masked: a deletion vector that applies to a data file masks its position deletes. | Merge-on-read writers that write deletion vectors or Parquet position deletes |
 | Each data file sorted by key | Refused: `unsorted` | `ALTER TABLE ... WRITE LOCALLY ORDERED BY key`. A global sort is not needed. |
@@ -104,6 +105,37 @@ a local directory is a configuration error. `resident_budget_bytes` is in
 A per-column property in a finding's `property` field is printed as its
 prefix up to the column name, such as
 `write.metadata.metrics.column.`; the finding's message names the column.
+
+## Changing the schema
+
+icetray finds each configured column in a data file by its top-level name
+and checks it against the field id the snapshot's schema gives that name
+([RFD 023](rfd/023-column-resolution.md)). Iceberg's writers record a
+field id on every column of every file they write; a file written without
+them is served for the columns it holds by name, unchecked, and refused
+for one it lacks, since nothing in it says whether that column was added
+after it or renamed. A file with field ids on only some columns is read
+as one without them, except that a column found by name that carries a
+field id other than the schema's is refused. Iceberg's Java writers store a column whose name is
+not a valid Avro name under an escaped one, `user-id` as `user_x2Did`
+and `1st` as `_1st`; a file column under either name is the configured
+column.
+
+- A column can be added to a served table without a rewrite. A file
+  written before the column answers the column's `initial-default` for
+  it, or null when the schema states none, and reads no value page for
+  it. The doctor reports such files as `column_default` until a
+  compaction rewrites them with the column.
+- A served column is not renamed. To serve a column under a new name,
+  add a new column beside it, write it, and move the callers to it; then
+  drop the old one from the clients, then from the configuration, then
+  from the schema. A rename is refused: under the old name as a column
+  the schema lacks (a table fault), under the new name as
+  `column_mismatch`. A swap of two names is refused as
+  `column_mismatch`. Either way the last snapshot served keeps serving.
+- Dropping a column and adding another under the same name is refused
+  the same way: the files written before hold the old column under that
+  name, under another field id.
 
 ## Choosing the bucket count
 
@@ -138,6 +170,7 @@ The decisions behind the contract:
 [RFD 007](rfd/007-serving-tiers.md) (refusals, costs, and advice, with
 their penalties), [RFD 009](rfd/009-writes-between-builds.md) (writes
 between builds), [RFD 016](rfd/016-doctor.md) (the doctor),
-[RFD 020](rfd/020-lookup-levels.md) (lookup levels), and
-[RFD 021](rfd/021-merge-on-read.md) (delete files). Terms such as
+[RFD 020](rfd/020-lookup-levels.md) (lookup levels),
+[RFD 021](rfd/021-merge-on-read.md) (delete files), and
+[RFD 023](rfd/023-column-resolution.md) (column resolution). Terms such as
 residency, level, and strict are in the [glossary](glossary.md).

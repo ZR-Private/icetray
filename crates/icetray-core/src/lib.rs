@@ -10,6 +10,7 @@ mod bucket;
 mod cache;
 pub mod catalog;
 pub mod check;
+mod column;
 pub mod config;
 pub mod contract;
 pub mod deletes;
@@ -39,6 +40,7 @@ pub use check::{
     FileReport, Finding, FindingCode, LookupCost, Penalty, TableReport, TableSummary,
     WriterProperty, diagnose, judge,
 };
+pub use column::ColumnMismatch;
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,

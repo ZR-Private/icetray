@@ -32,7 +32,7 @@ use icetray_testkit::fixture::{
     WIDE_VALUE_BYTES, local_catalog, residue_class,
 };
 use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
-use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{
     Bloom, Dictionary, Fixture, FixtureSpec, Layout, Result, Statistics, TestkitError,
     write_fixture,
@@ -632,8 +632,8 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
     assert!(row_groups > files, "several row groups per file");
     assert_eq!(
         served.storage.stats().gets(),
-        LOAD_METADATA_GETS + files + row_groups,
-        "a footer per file and a chunk per row group"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + files + row_groups,
+        "the metadata, a footer per file, and a chunk per row group"
     );
     assert!(
         generation

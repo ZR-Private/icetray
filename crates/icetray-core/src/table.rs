@@ -916,6 +916,7 @@ impl Table {
             let layout = TableLayout::derive(
                 self.name(),
                 &resolved.metadata,
+                &resolved.unread_defaults,
                 &snapshot,
                 &config.key_column,
                 &config.value_column,

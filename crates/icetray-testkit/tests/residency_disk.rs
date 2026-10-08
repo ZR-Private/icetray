@@ -23,7 +23,7 @@ use icetray_core::{
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
 };
-use icetray_testkit::verify::{self, LOAD_METADATA_GETS, Served};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
 
 /// The two tables sharing one local directory in the retain test.
@@ -166,8 +166,8 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
     let served = served?;
     assert_eq!(
         storage.stats().gets(),
-        LOAD_METADATA_GETS + files,
-        "footers only: every chunk file is reused"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + files,
+        "metadata and footers only: every chunk file is reused"
     );
     let stats = storage.stats();
     for id in SAMPLE {
@@ -212,8 +212,8 @@ async fn test_disk_over_budget_is_refused_before_any_chunk_is_written() -> Resul
     assert_eq!(local.index_bytes_in_use()?, 0, "no chunk file was written");
     assert_eq!(
         storage.stats().gets(),
-        LOAD_METADATA_GETS + count(fixture.file_count()),
-        "every footer and no chunk"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + count(fixture.file_count()),
+        "the metadata, every footer, and no chunk"
     );
     Ok(())
 }

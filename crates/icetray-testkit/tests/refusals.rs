@@ -25,7 +25,7 @@ use icetray_testkit::fixture::{
     residue_class, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
-use icetray_testkit::verify::{self, LOAD_METADATA_GETS};
+use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS};
 use icetray_testkit::{
     Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, Order,
     RawFile, Result, TestkitError, value_for, write_fixture,
@@ -263,8 +263,8 @@ async fn test_unsupported_key_type_is_refused() -> Result<()> {
     assert_eq!(refused.reason, RefusalReason::KeyTypeUnsupported);
     assert_eq!(
         refused.storage.stats().gets(),
-        0,
-        "refused from the schema alone"
+        METADATA_FILE_GETS,
+        "refused from the metadata file alone"
     );
     Ok(())
 }
@@ -299,8 +299,8 @@ async fn test_unsupported_value_type_is_refused() -> Result<()> {
     );
     assert_eq!(
         refused.storage.stats().gets(),
-        0,
-        "refused from the schema alone"
+        METADATA_FILE_GETS,
+        "refused from the metadata file alone"
     );
     Ok(())
 }
@@ -599,8 +599,8 @@ async fn test_full_tier_over_budget_is_refused_at_the_footer_stage() -> Result<(
     assert!(needed > budget);
     assert_eq!(
         refused.storage.stats().gets(),
-        LOAD_METADATA_GETS + count(fixture.file_count()),
-        "every footer and no chunk"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + count(fixture.file_count()),
+        "the metadata, every footer, and no chunk"
     );
     Ok(())
 }
@@ -708,8 +708,8 @@ async fn test_strict_table_below_its_level_is_refused_before_any_chunk() -> Resu
     );
     assert_eq!(
         refused.storage.stats().gets(),
-        LOAD_METADATA_GETS + count(fixture.file_count()),
-        "every footer and no chunk"
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + count(fixture.file_count()),
+        "the metadata, every footer, and no chunk"
     );
     Ok(())
 }
@@ -806,8 +806,8 @@ async fn test_lookups_its_residency_cannot_reach_is_a_config_violation() -> Resu
     );
     assert_eq!(
         served.storage.stats().gets(),
-        0,
-        "no manifest and no footer"
+        METADATA_FILE_GETS,
+        "the metadata file, and no manifest and no footer"
     );
     assert!(served.table.current().is_none());
     assert!(

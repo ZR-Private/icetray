@@ -31,8 +31,8 @@ const APPENDED_8K_12K: Range<u64> = 8_000..12_000;
 const FUTURE_ID: u64 = 9_000;
 
 /// Refresh GETs beyond the per-file ones after one append through the
-/// catalog: the manifest list and two manifests.
-const REFRESH_METADATA_GETS: u64 = 3;
+/// catalog: the new metadata file, the manifest list, and two manifests.
+const REFRESH_METADATA_GETS: u64 = 4;
 
 /// Files of the interleaved fixture after the second class: two per bucket.
 const INTERLEAVED_FILES: usize = 8;
@@ -94,7 +94,7 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
     assert_eq!(
         stats.gets() - before,
         REFRESH_METADATA_GETS + LOAD_GETS_PER_FILE * new_files,
-        "manifest list, two manifests, then a footer and a chunk per new file"
+        "metadata file, manifest list, two manifests, then a footer and a chunk per new file"
     );
 
     let lookup = served.table.get(&new_key).await?;

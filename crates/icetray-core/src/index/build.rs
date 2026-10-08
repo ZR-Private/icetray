@@ -95,9 +95,8 @@ impl Inspected {
             handle,
             metadata,
             key_leaf: layout.key_leaf,
-            value_leaf: layout.value_leaf,
             key_shape: layout.key_shape,
-            value_shape: layout.value_shape,
+            value: layout.value,
             keys,
             fences: verified.fences,
             groups: verified.groups,
@@ -1190,7 +1189,6 @@ mod tests {
     };
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
-    use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
     use parquet::basic::PageType;
     use parquet::file::properties::WriterVersion;
 
@@ -2455,9 +2453,7 @@ mod tests {
             let inspected = FileIndex::inspect(
                 TABLE,
                 Arc::clone(&restarted.handle),
-                KEY_COLUMN,
-                VALUE_COLUMN,
-                key_type,
+                &crate::manifest::testing::layout(key_type, None),
             )
             .await
             .unwrap();

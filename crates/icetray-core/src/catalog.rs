@@ -5,7 +5,9 @@
 //! the version hint, one table load from the catalog, or one AWS catalog
 //! call. Every byte of object storage goes through `Storage` (RFD 003); a
 //! catalog client speaks to its catalog over HTTP and never to object
-//! storage.
+//! storage, and the metadata file a catalog names is read through `Storage`
+//! once per new location, for the defaults the client's parse drops (RFD
+//! 023).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -21,6 +23,7 @@ use iceberg_catalog_rest::{
 };
 
 use crate::aws_catalog::AwsSource;
+use crate::column::UnreadDefaults;
 use crate::config::SourceConfig;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::snapshot::SnapshotId;
@@ -76,7 +79,9 @@ pub enum TableFault {
         /// The spec id the manifest list records for the manifest.
         spec_id: i32,
     },
-    /// A configured column is not in the snapshot's schema.
+    /// A configured column is not in the snapshot's schema at any level; a
+    /// name that is a nested field's is refused as
+    /// `RefusalReason::ColumnMismatch` instead (RFD 023).
     #[error("column {column} is not in the snapshot's schema")]
     ColumnMissing {
         /// The column as configured.
@@ -220,6 +225,10 @@ pub(crate) struct Resolved {
     pub metadata: Arc<TableMetadata>,
     /// The metadata file's location.
     pub location: String,
+    /// The fields whose stated `initial-default` the parse dropped (RFD
+    /// 023), found from the metadata file's own bytes, which a catalog
+    /// source reads beside the client's parse.
+    pub unread_defaults: UnreadDefaults,
 }
 
 impl Resolved {
@@ -331,8 +340,8 @@ impl TableSource {
 
     /// The current metadata. A static root costs two reads, the version
     /// hint and the metadata file; a static metadata file one; a catalog
-    /// source one table load from the catalog and no object-storage read;
-    /// an AWS source one catalog call and the metadata file.
+    /// source one table load from the catalog and one read of the metadata
+    /// file it names; an AWS source one catalog call and the metadata file.
     pub(crate) async fn resolve(&self, storage: &Storage) -> Result<Resolved> {
         Ok(self
             .resolve_if_changed(storage, None)
@@ -344,7 +353,8 @@ impl TableSource {
     /// with no `known`, the metadata. When nothing moved this costs one
     /// small read: a static root reads its version hint and parses no
     /// metadata; a catalog source costs one table load, whose metadata the
-    /// client parses either way, within `Storage::catalog_timeout`; an AWS
+    /// client parses either way, within `Storage::catalog_timeout`, and
+    /// reads the metadata file only at a location not `known`; an AWS
     /// source costs one catalog call within the same bound and reads no
     /// object. A static source that names a metadata file directly reads
     /// nothing and never advances.
@@ -362,8 +372,23 @@ impl TableSource {
                 read_metadata(storage, file).await.map(Some)
             }
             Self::Catalog { catalog, ident } => {
-                let resolved = load_from_catalog(catalog, ident, storage.catalog_timeout()).await?;
-                Ok((known != Some(resolved.location.as_str())).then_some(resolved))
+                let (metadata, location) =
+                    load_from_catalog(catalog, ident, storage.catalog_timeout()).await?;
+                if known == Some(location.as_str()) {
+                    return Ok(None);
+                }
+                // The client hands over the metadata it parsed and not its
+                // bytes, and only the bytes tell a default the parse
+                // dropped from none (`UnreadDefaults`), so a new location
+                // costs one read of its file.
+                let bytes = storage.read_all(&location).await?;
+                let unread_defaults =
+                    UnreadDefaults::of(&metadata_json(&location, &bytes)?, &metadata)?;
+                Ok(Some(Resolved {
+                    metadata,
+                    location,
+                    unread_defaults,
+                }))
             }
             Self::Aws(source) => {
                 // Boxed: the SDK's call future is large and deeply nested,
@@ -392,13 +417,17 @@ async fn current_metadata_file(storage: &Storage, location: &str) -> Result<Stri
 }
 
 /// Reads and parses the metadata file at `file`, gzip-compressed or not
-/// (`metadata_json`): one read.
+/// (`metadata_json`), with the defaults it states that the parse dropped
+/// (`UnreadDefaults::of`): one read.
 async fn read_metadata(storage: &Storage, file: String) -> Result<Resolved> {
     let bytes = storage.read_all(&file).await?;
-    let metadata: TableMetadata = serde_json::from_slice(&metadata_json(&file, &bytes)?)?;
+    let json = metadata_json(&file, &bytes)?;
+    let metadata: TableMetadata = serde_json::from_slice(&json)?;
+    let unread_defaults = UnreadDefaults::of(&json, &metadata)?;
     Ok(Resolved {
         metadata: Arc::new(metadata),
         location: file,
+        unread_defaults,
     })
 }
 
@@ -430,7 +459,8 @@ fn metadata_json<'a>(location: &str, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
     Ok(Cow::Owned(json))
 }
 
-/// The table as the catalog holds it now. A record without a metadata
+/// The table's metadata as the catalog holds it now, as the client parsed
+/// it, and the location of its file. A record without a metadata
 /// location is `TableFault::MetadataLocationUnknown` under the identifier.
 /// The call runs within `timeout`, and one that runs longer is dropped as
 /// `Error::CatalogTimeout`. The bound is on the call rather than on an HTTP
@@ -441,7 +471,7 @@ async fn load_from_catalog(
     catalog: &Arc<dyn Catalog>,
     ident: &TableIdent,
     timeout: Duration,
-) -> Result<Resolved> {
+) -> Result<(Arc<TableMetadata>, String)> {
     let table = tokio::time::timeout(timeout, catalog.load_table(ident))
         .await
         .map_err(|_elapsed| Error::CatalogTimeout {
@@ -452,10 +482,7 @@ async fn load_from_catalog(
         .metadata_location()
         .ok_or_else(|| Error::table_fault(&ident.to_string(), TableFault::MetadataLocationUnknown))?
         .to_string();
-    Ok(Resolved {
-        metadata: table.metadata_ref(),
-        location,
-    })
+    Ok((table.metadata_ref(), location))
 }
 
 /// `rest` under `root`, which carries no trailing separator.
@@ -613,10 +640,11 @@ mod tests {
 
     use bytes::Bytes;
     use iceberg::TableCreation;
+    use iceberg::io::LocalFsStorageFactory;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
-        MAIN_BRANCH, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-        TableMetadata,
+        FormatVersion, MAIN_BRANCH, Operation, Snapshot, SnapshotReference, SnapshotRetention,
+        Summary, TableMetadata,
     };
 
     use super::*;
@@ -639,8 +667,6 @@ mod tests {
     /// The catalog name and namespace of the memory-catalog test.
     const CATALOG_NAME: &str = "test";
     const NAMESPACE: &str = "db";
-    /// The warehouse of the memory catalog, in its own in-memory storage.
-    const WAREHOUSE: &str = "memory://warehouse";
     /// The catalog timeout of the test that waits on a catalog that never
     /// answers: short, so the test is quick.
     const TEST_CATALOG_TIMEOUT: Duration = Duration::from_millis(200);
@@ -956,6 +982,7 @@ mod tests {
         let resolved = Resolved {
             metadata: Arc::new(second_metadata()),
             location: metadata_location(SECOND_VERSION),
+            unread_defaults: UnreadDefaults::default(),
         };
         assert_eq!(
             resolved
@@ -1078,12 +1105,18 @@ mod tests {
         assert!(catalog.requests() > 0, "the call reached the catalog");
     }
 
-    #[tokio::test]
-    async fn test_resolve_through_a_catalog_reads_nothing_from_object_storage() {
+    /// A memory catalog whose files live under `dir` on local disk, where
+    /// `Storage` reads them too, holding a v3 `long_schema` table it
+    /// created, with the table's metadata location.
+    async fn local_catalog_table(dir: &std::path::Path) -> (Arc<dyn Catalog>, TableIdent, String) {
         let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
             .load(
                 CATALOG_NAME,
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), WAREHOUSE.to_string())]),
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    format!("{FILE_SCHEME}{}", dir.display()),
+                )]),
             )
             .await
             .unwrap();
@@ -1098,32 +1131,74 @@ mod tests {
                 TableCreation::builder()
                     .name(TABLE.to_string())
                     .schema(testing::long_schema())
+                    .format_version(FormatVersion::V3)
                     .build(),
             )
             .await
             .unwrap();
-        let source = TableSource::Catalog {
-            catalog: Arc::new(catalog),
-            ident: created.identifier().clone(),
-        };
-        let store = Store::new();
-        let resolved = source.resolve(&store.mem.storage).await.unwrap();
-        assert_eq!(resolved.location, created.metadata_location().unwrap());
-        assert_eq!(resolved.metadata.uuid(), created.metadata().uuid());
+        let location = created.metadata_location().unwrap().to_string();
+        (Arc::new(catalog), created.identifier().clone(), location)
+    }
+
+    #[tokio::test]
+    async fn test_resolve_through_a_catalog_reads_the_metadata_file_once_per_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, ident, location) = local_catalog_table(dir.path()).await;
+        let source = TableSource::Catalog { catalog, ident };
+        let storage = Storage::new(StorageConfig::default());
+        let stats = storage.stats();
+        let resolved = source.resolve(&storage).await.unwrap();
+        assert_eq!(resolved.location, location);
+        assert_eq!(resolved.unread_defaults, UnreadDefaults::default());
+        assert_eq!(stats.gets(), 1, "the metadata file the catalog names");
         let unchanged = source
-            .resolve_if_changed(&store.mem.storage, Some(&resolved.location))
+            .resolve_if_changed(&storage, Some(&resolved.location))
             .await
             .unwrap();
         assert!(unchanged.is_none());
+        assert_eq!(stats.gets(), 1, "an unchanged location reads nothing");
         let moved = source
-            .resolve_if_changed(&store.mem.storage, Some(MISSING_REF))
+            .resolve_if_changed(&storage, Some(MISSING_REF))
             .await
             .unwrap();
         assert!(moved.is_some());
+        assert_eq!(stats.gets(), 2, "a new location reads its file once");
+    }
+
+    /// The catalog's client parses an `initial-default` it cannot read as
+    /// no default; the metadata file's own bytes still name it.
+    #[tokio::test]
+    async fn test_resolve_through_a_catalog_names_a_default_the_client_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (catalog, ident, location) = local_catalog_table(dir.path()).await;
+        let path = location.strip_prefix(FILE_SCHEME).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for schema in json["schemas"].as_array_mut().unwrap() {
+            for field in schema["fields"].as_array_mut().unwrap() {
+                if field["id"] == testing::VALUE_FIELD_ID {
+                    field["initial-default"] = serde_json::json!("not hex");
+                }
+            }
+        }
+        std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let source = TableSource::Catalog { catalog, ident };
+        let resolved = source
+            .resolve(&Storage::new(StorageConfig::default()))
+            .await
+            .unwrap();
+        let schema = resolved.metadata.current_schema();
+        assert!(
+            schema
+                .field_by_id(testing::VALUE_FIELD_ID)
+                .unwrap()
+                .initial_default
+                .is_none(),
+            "the client dropped the default"
+        );
         assert_eq!(
-            store.gets(),
-            0,
-            "a catalog source never reads object storage"
+            resolved.unread_defaults,
+            UnreadDefaults::naming(schema.schema_id(), testing::VALUE_FIELD_ID)
         );
     }
 

@@ -110,6 +110,13 @@ pub enum SpecFault {
         /// The file's location.
         path: String,
     },
+    /// `Fixture::evolve` renamed or dropped a column the current schema
+    /// does not hold.
+    #[error("column {name} is not in the current schema")]
+    ColumnNotInSchema {
+        /// The column's name.
+        name: String,
+    },
     /// `move_ref` named a snapshot this fixture did not commit.
     #[error("snapshot {snapshot_id} was not committed by this fixture")]
     UnknownSnapshot {

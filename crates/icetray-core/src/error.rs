@@ -11,6 +11,7 @@ use crate::aws_catalog::AwsCatalogError;
 use crate::cache::CacheError;
 use crate::catalog::TableFault;
 use crate::check::FindingCode;
+use crate::column::ColumnMismatch;
 use crate::config::ConfigError;
 use crate::index::FileFault;
 use crate::key::{Key, KeyType};
@@ -430,9 +431,10 @@ fn location_detail(table: Option<&str>, source: &LocationError) -> String {
 }
 
 /// A refusal for a log line: the name, then the fields a reader needs to
-/// act on: the file and row group, the types found and expected, the length
-/// over the cap, the bytes needed and the budget, the levels declared and
-/// achieved and the findings that cap it (RFD 007, RFD 017, RFD 020).
+/// act on: the file and row group, the types found and expected, the column
+/// and how it mismatches, the length over the cap, the bytes needed and the
+/// budget, the levels declared and achieved and the findings that cap it
+/// (RFD 007, RFD 017, RFD 020, RFD 023).
 fn refusal_detail(reason: &RefusalReason) -> String {
     match reason {
         RefusalReason::Unsorted { path, row_group }
@@ -446,6 +448,16 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             got,
         } => format!("{reason} (file {path}, expected {expected}, got {got})"),
         RefusalReason::ValueTypeUnsupported { got } => format!("{reason} (got {got})"),
+        RefusalReason::ColumnMismatch {
+            column,
+            path: Some(path),
+            mismatch,
+        } => format!("{reason} (column {column}, file {path}: {mismatch})"),
+        RefusalReason::ColumnMismatch {
+            column,
+            path: None,
+            mismatch,
+        } => format!("{reason} (column {column}: {mismatch})"),
         RefusalReason::KeyTooLong { path, bytes } => {
             format!("{reason} (file {path}, {bytes} bytes)")
         }
@@ -552,6 +564,22 @@ pub enum RefusalReason {
     },
     /// The key column's Iceberg type is not long, string, binary, fixed, or uuid.
     KeyTypeUnsupported,
+    /// A configured column is not found in the snapshot as its schema means
+    /// it (RFD 023): the configured name is not a top-level field of the
+    /// schema or states a default that does not read, or a data file holds
+    /// the column under another field id or name, lacks it with no field ids
+    /// to say it was added after the file, lacks the key column, holds the
+    /// name as a nested group, or stores a `fixed` key or value column at
+    /// another width. Checked against every file of
+    /// the snapshot, a reused file included, from the footer it keeps.
+    ColumnMismatch {
+        /// The column as configured.
+        column: String,
+        /// The data file at fault; `None` when the snapshot's schema is.
+        path: Option<String>,
+        /// Which case it is.
+        mismatch: ColumnMismatch,
+    },
     /// The value column's Iceberg type in the snapshot's schema is none of
     /// binary, fixed, or string, so its bytes have no defined encoding on the
     /// wire (RFD 002, RFD 010). Raised by `TableLayout::derive`; a data file
@@ -632,6 +660,7 @@ impl Recurs for RefusalReason {
             | Self::KeyOutsideBucket { .. }
             | Self::KeyTypeMismatch { .. }
             | Self::KeyTypeUnsupported
+            | Self::ColumnMismatch { .. }
             | Self::ValueTypeUnsupported { .. }
             | Self::EqualityDeletes { .. }
             | Self::DeleteKindUnsupported { .. }
@@ -721,6 +750,7 @@ impl fmt::Display for RefusalReason {
             Self::KeyOutsideBucket { .. } => "key_outside_bucket",
             Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
+            Self::ColumnMismatch { .. } => "column_mismatch",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
             Self::EqualityDeletes { .. } => "equality_deletes",
             Self::DeleteKindUnsupported { .. } => "delete_kind_unsupported",
@@ -795,6 +825,25 @@ mod tests {
                 "key_type_mismatch",
             ),
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
+            (
+                RefusalReason::ColumnMismatch {
+                    column: "value".to_string(),
+                    path: Some(FILE_PATH.to_string()),
+                    mismatch: ColumnMismatch::OtherFieldId {
+                        expected: 2,
+                        found: 3,
+                    },
+                },
+                "column_mismatch",
+            ),
+            (
+                RefusalReason::ColumnMismatch {
+                    column: "value".to_string(),
+                    path: None,
+                    mismatch: ColumnMismatch::UnreadableDefault,
+                },
+                "column_mismatch",
+            ),
             (
                 RefusalReason::ValueTypeUnsupported {
                     got: iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long)
@@ -1029,10 +1078,6 @@ mod tests {
         use Recurrence::{Deterministic, Transient};
         let row_group = 0;
         vec![
-            (
-                file(FileFault::MissingColumn("k".to_string())),
-                Deterministic,
-            ),
             (file(FileFault::MissingPageIndex), Deterministic),
             (file(FileFault::NoRows), Deterministic),
             (file(FileFault::InconsistentRowCounts), Deterministic),

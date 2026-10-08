@@ -198,7 +198,8 @@ The label values:
   `bloom` residency).
 - `result` of `icetray_lookups_total` and `icetray_lookup_seconds`:
   `cold_hit` (the value page was fetched), `warm_hit` (the page cache
-  served it), `miss`.
+  served it, or the row's file was written before its value column was
+  added and answered the column's default with no page read), `miss`.
 - `result` of `icetray_config_reloads_total`: `applied`, `refused`.
 - `state`: `loading`, `serving`, `degraded`, `held` ([Refresh and
   reload](#refresh-and-reload)).
@@ -207,12 +208,16 @@ The label values:
   `bounds_missing`, `column_index_truncated`, `large_value_pages`,
   `value_pages_over_ceiling`, `long_keys`, `large_file`,
   `many_files_per_bucket`, `no_bloom_filter`, `bloom_oversized`,
-  `bloom_undersized`, `deletes_pending`.
+  `bloom_undersized`, `deletes_pending`, `column_default`.
+  `column_default` is one finding per column, so
+  `icetray_findings{code="column_default"}` reads 1 however many files
+  answer the value column by its default; the file count is in the
+  finding's message.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
-  `key_type_mismatch`, `key_type_unsupported`, `value_type_unsupported`,
-  `equality_deletes`, `delete_kind_unsupported`, `key_too_long`,
-  `over_budget`, `no_bloom_filter`, `below_level`), or an
+  `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`,
+  `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`,
+  `key_too_long`, `over_budget`, `no_bloom_filter`, `below_level`), or an
   error kind (`iceberg`, `parquet`, `object_store`, `object_store_path`,
   `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`,
   `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`,
@@ -356,7 +361,10 @@ reads depends on the table's source
   call.
 - A poll that finds a new snapshot builds the generation beside the
   current one, loading only the data files the previous generation did
-  not hold, then swaps it in. `icetray_generation_swaps_total` counts it.
+  not hold and checking the columns of every file it keeps against the
+  new snapshot's schema, which reads nothing
+  ([RFD 023](rfd/023-column-resolution.md)), then swaps it in.
+  `icetray_generation_swaps_total` counts it.
 - A refresh that fails leaves the last good generation serving, counts
   `icetray_refresh_errors_total`, logs `refresh failed` at `warn`, and
   moves the table to degraded, or to held for a `below_level` refusal.

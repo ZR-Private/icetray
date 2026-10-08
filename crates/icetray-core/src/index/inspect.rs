@@ -9,17 +9,19 @@ use std::sync::Arc;
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
+use parquet::schema::types::ColumnDescriptor;
 
 use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
 use super::{
-    FileFault, KeyShape, ResidentBytes, ValueShape, bits_per_key, file_fault, identity_of, record,
-    saturating_sum, saturating_sum_all,
+    FileFault, KeyShape, ResidentBytes, ValueColumn, ValueShape, bits_per_key, file_fault,
+    identity_of, record, saturating_sum, saturating_sum_all,
 };
 use crate::approx;
+use crate::column;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{LocalDir, chunk_file_bytes};
+use crate::manifest::TableLayout;
 use crate::parquet_io::FileHandle;
 
 /// A data file past the footer stage of `FileIndex::build`: its footer
@@ -51,9 +53,10 @@ impl Inspected {
         self.layout.key_leaf
     }
 
-    /// The value column's leaf in the footer's schema.
-    pub(crate) fn value_leaf(&self) -> usize {
-        self.layout.value_leaf
+    /// The value column's leaf in the footer's schema; `None` for a file
+    /// written before the column was added.
+    pub(crate) fn value_leaf(&self) -> Option<usize> {
+        self.layout.value.map(|value| value.leaf)
     }
 
     /// Every tier's resident bytes for the file, from its footer alone.
@@ -87,58 +90,54 @@ impl Inspected {
     }
 }
 
-/// The key and value leaves of a file and how each decodes, from the footer.
+/// The key leaf of a file, its value column when it holds one, and how
+/// each decodes, from the footer.
 #[derive(Debug)]
 pub(super) struct Layout {
     pub(super) key_leaf: usize,
-    pub(super) value_leaf: usize,
     pub(super) key_shape: KeyShape,
-    pub(super) value_shape: ValueShape,
+    pub(super) value: Option<ValueColumn>,
 }
 
 impl Layout {
     /// The checks `FileIndex::inspect` makes on the footer, in order: both
-    /// columns exist, the key's physical type matches the key type, the
-    /// value's is a byte array, the file has rows and its row counts agree,
-    /// both columns have an offset index that describes their pages.
+    /// columns resolve under `layout`, the snapshot's (`column::resolve`),
+    /// the key's physical type matches the key type, the value's is a byte
+    /// array, the file has rows and its row counts agree, and the key
+    /// column and the value column, when the file holds one, have an
+    /// offset index that describes their pages.
     pub(super) fn inspect(
         table: &str,
         handle: &FileHandle,
         metadata: &ParquetMetaData,
-        key_column: &str,
-        value_column: &str,
-        key_type: KeyType,
+        layout: &TableLayout,
     ) -> Result<Self> {
         let path = handle.location.as_str();
         let size = handle.size();
         let schema = metadata.file_metadata().schema_descr();
-        let key_leaf = leaf(path, schema, key_column)?;
-        let value_leaf = leaf(path, schema, value_column)?;
-        let key_shape = key_shape(table, path, key_type, &schema.column(key_leaf))?;
-        let value_shape = value_shape(path, &schema.column(value_leaf))?;
+        let columns = column::resolve(table, path, schema, layout)?;
+        let key_leaf = columns.key_leaf;
+        let key_shape = key_shape(table, path, layout.key_type, &schema.column(key_leaf))?;
+        let value = columns
+            .value_leaf
+            .map(|leaf| {
+                value_shape(path, &schema.column(leaf)).map(|shape| ValueColumn { leaf, shape })
+            })
+            .transpose()?;
         if metadata.file_metadata().num_rows() == 0 {
             return Err(file_fault(path, FileFault::NoRows));
         }
         check_row_counts(path, metadata)?;
         check_offset_index(path, metadata, key_leaf, size)?;
-        check_offset_index(path, metadata, value_leaf, size)?;
+        if let Some(value) = value {
+            check_offset_index(path, metadata, value.leaf, size)?;
+        }
         Ok(Self {
             key_leaf,
-            value_leaf,
             key_shape,
-            value_shape,
+            value,
         })
     }
-}
-
-/// The leaf index of the top-level column `name`, which must itself be a
-/// leaf.
-fn leaf(path: &str, schema: &SchemaDescriptor, name: &str) -> Result<usize> {
-    schema
-        .columns()
-        .iter()
-        .position(|column| matches!(column.path().parts(), [part] if part == name))
-        .ok_or_else(|| file_fault(path, FileFault::MissingColumn(name.to_string())))
 }
 
 /// How the key column decodes, or `RefusalReason::KeyTypeMismatch` when its
@@ -592,6 +591,7 @@ mod tests {
 
     use super::*;
     use crate::approx::count;
+    use crate::column::ColumnMismatch;
     use crate::config::Residency;
     use crate::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
     use crate::generation::testing::{self, Bloom, KeyColumn, TABLE, page_rows, refusal_of};
@@ -601,7 +601,7 @@ mod tests {
         stepped, store, value_of_len, with_column_chunk, with_group_rows, with_pages,
     };
     use crate::index::{FileFault, FileIndex};
-    use crate::manifest::testing::{KEY_COLUMN, VALUE_COLUMN};
+    use crate::manifest::testing::{self as manifest_testing, KEY_COLUMN, VALUE_COLUMN};
 
     /// A column name no fixture has.
     const ABSENT_COLUMN: &str = "absent";
@@ -740,27 +740,43 @@ mod tests {
         );
     }
 
+    /// The fixture's file records no field ids, so a configured column it
+    /// lacks may have been renamed rather than added, and is refused at the
+    /// footer whichever column it is (RFD 023).
     #[tokio::test]
-    async fn test_build_missing_column_is_a_file_fault() {
+    async fn test_build_a_column_absent_from_a_file_without_field_ids_is_refused() {
         let opened = store(&Fixture::contract(KeyType::Long, FEW_ROWS)).await;
-        for (key_column, value_column) in
-            [(ABSENT_COLUMN, VALUE_COLUMN), (KEY_COLUMN, ABSENT_COLUMN)]
-        {
+        let layout = manifest_testing::layout(KeyType::Long, None);
+        let cases = [(ABSENT_COLUMN, VALUE_COLUMN), (KEY_COLUMN, ABSENT_COLUMN)];
+        let footers_read = count(cases.len());
+        for (key_column, value_column) in cases {
+            let layout = TableLayout {
+                key_column: key_column.to_string(),
+                value_column: value_column.to_string(),
+                ..layout.clone()
+            };
             let result = FileIndex::build(
                 TABLE,
                 Arc::clone(&opened.handle),
-                key_column,
-                value_column,
-                KeyType::Long,
+                &layout,
                 Residency::Full,
                 None,
             )
             .await;
             assert_eq!(
-                fault_of(result),
-                FileFault::MissingColumn(ABSENT_COLUMN.to_string())
+                refusal_of(result),
+                RefusalReason::ColumnMismatch {
+                    column: ABSENT_COLUMN.to_string(),
+                    path: Some(opened.handle.location.clone()),
+                    mismatch: ColumnMismatch::AbsentWithoutFieldIds,
+                }
             );
         }
+        assert_eq!(
+            opened.stats().gets(),
+            footers_read,
+            "each build is refused at its footer, one GET"
+        );
     }
 
     #[tokio::test]
@@ -785,13 +801,11 @@ mod tests {
                 TABLE,
                 &opened.handle,
                 metadata,
-                KEY_COLUMN,
-                VALUE_COLUMN,
-                KeyType::Long,
+                &manifest_testing::layout(KeyType::Long, None),
             )
-            .map(|layout| (layout.key_leaf, layout.value_leaf))
+            .map(|layout| (layout.key_leaf, layout.value.map(|value| value.leaf)))
         };
-        assert_eq!(inspect(&loaded).unwrap(), (0, 1));
+        assert_eq!(inspect(&loaded).unwrap(), (0, Some(1)));
         let rows = loaded.file_metadata().num_rows();
         let disagreeing = [
             with_file_rows(&loaded, -1),
@@ -901,9 +915,7 @@ mod tests {
                 TABLE,
                 &opened.handle,
                 metadata,
-                KEY_COLUMN,
-                VALUE_COLUMN,
-                KeyType::Long,
+                &manifest_testing::layout(KeyType::Long, None),
             )
             .map(|layout| layout.key_leaf)
         };
@@ -957,16 +969,19 @@ mod tests {
         let mut value_pages = 0;
         for row_group in 0..ROW_GROUPS {
             let column_index = &kept.column_index().unwrap()[row_group];
-            assert_eq!(column_index[index.value_leaf()], ColumnIndexMetaData::NONE);
+            assert_eq!(
+                column_index[index.value_leaf().unwrap()],
+                ColumnIndexMetaData::NONE
+            );
             assert!(matches!(
                 column_index[index.key_leaf()],
                 ColumnIndexMetaData::INT64(_)
             ));
             assert!(matches!(
-                loaded.column_index().unwrap()[row_group][index.value_leaf()],
+                loaded.column_index().unwrap()[row_group][index.value_leaf().unwrap()],
                 ColumnIndexMetaData::BYTE_ARRAY(_)
             ));
-            value_pages += kept.offset_index().unwrap()[row_group][index.value_leaf()]
+            value_pages += kept.offset_index().unwrap()[row_group][index.value_leaf().unwrap()]
                 .page_locations()
                 .len();
         }
@@ -1126,9 +1141,7 @@ mod tests {
         FileIndex::inspect(
             TABLE,
             Arc::clone(&opened.handle),
-            KEY_COLUMN,
-            VALUE_COLUMN,
-            key_type,
+            &manifest_testing::layout(key_type, None),
         )
         .await
         .unwrap()

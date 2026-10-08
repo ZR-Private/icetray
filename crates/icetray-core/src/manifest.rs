@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestEntry,
@@ -19,6 +20,7 @@ use iceberg::spec::{
 
 use crate::bucket;
 use crate::catalog::TableFault;
+use crate::column::{self, ColumnMismatch, UnreadDefaults};
 use crate::deletes::{Sorted, oldest_by_partition};
 use crate::error::{Error, RefusalReason, Result, UnsupportedDelete};
 use crate::key::{Key, KeyType};
@@ -75,10 +77,20 @@ pub struct TableLayout {
     pub key_field_id: i32,
     /// The key column's type.
     pub key_type: KeyType,
+    /// The width of every key of a `fixed` key column; `None` for every
+    /// other key type.
+    pub key_width: Option<u64>,
     /// The value column's name.
     pub value_column: String,
     /// The value column's field id in the snapshot's schema.
     pub value_field_id: i32,
+    /// The width of every value of a `fixed` value column; `None` for
+    /// binary and string, whose values have any length.
+    pub value_width: Option<u64>,
+    /// What a data file written before the value column was added answers
+    /// for it (RFD 023): the column's `initial-default` in the snapshot's
+    /// schema as bytes, or `None`, a null, when the schema gives none.
+    pub value_default: Option<Bytes>,
 }
 
 impl TableLayout {
@@ -90,14 +102,20 @@ impl TableLayout {
     /// whose type `KeyType::from_iceberg` does not admit as
     /// `RefusalReason::KeyTypeUnsupported` and a value column that is not
     /// binary, fixed, or string as `RefusalReason::ValueTypeUnsupported`
-    /// (RFD 002). A column absent from the schema is
-    /// `TableFault::ColumnMissing`, a schema id the metadata lacks
-    /// `TableFault::SchemaMissing`. Bucketing comes from `md`'s default
-    /// partition spec, since a snapshot records no spec of its own; a
-    /// bucket count of zero there is `TableFault::ZeroBuckets`.
+    /// (RFD 002). Each column is a top-level field of the schema (RFD 023):
+    /// a name the schema holds only nested, such as a dotted name, is
+    /// `RefusalReason::ColumnMismatch` with `ColumnMismatch::NotTopLevel`,
+    /// and a name it lacks altogether `TableFault::ColumnMissing`. The value
+    /// column's default is its `initial-default` (`column::value_default`);
+    /// one `unread` names, which the metadata states but the parse dropped,
+    /// is `ColumnMismatch::UnreadableDefault`. A schema id the metadata
+    /// lacks is `TableFault::SchemaMissing`. Bucketing comes from `md`'s
+    /// default partition spec, since a snapshot records no spec of its own;
+    /// a bucket count of zero there is `TableFault::ZeroBuckets`.
     pub(crate) fn derive(
         table: &str,
         md: &TableMetadata,
+        unread: &UnreadDefaults,
         snapshot: &Snapshot,
         key_column: &str,
         value_column: &str,
@@ -108,21 +126,40 @@ impl TableLayout {
             })?,
             None => md.current_schema(),
         };
-        let column = |name: &str| {
-            schema.field_by_name(name).ok_or_else(|| {
-                Error::table_fault(
-                    table,
-                    TableFault::ColumnMissing {
-                        column: name.to_string(),
-                    },
-                )
-            })
+        let mismatch = |name: &str, mismatch: ColumnMismatch| {
+            Error::refused(
+                table,
+                RefusalReason::ColumnMismatch {
+                    column: name.to_string(),
+                    path: None,
+                    mismatch,
+                },
+            )
+        };
+        let column = |name: &str| match schema.as_struct().field_by_name(name) {
+            Some(field) => Ok(field),
+            None if schema.field_by_name(name).is_some() => {
+                Err(mismatch(name, ColumnMismatch::NotTopLevel))
+            }
+            None => Err(Error::table_fault(
+                table,
+                TableFault::ColumnMissing {
+                    column: name.to_string(),
+                },
+            )),
         };
         let key_field = column(key_column)?;
         let value_field = column(value_column)?;
         let key_type = KeyType::from_iceberg(&key_field.field_type)
             .ok_or_else(|| Error::refused(table, RefusalReason::KeyTypeUnsupported))?;
         check_value_type(table, &value_field.field_type)?;
+        let value_width = fixed_width(&value_field.field_type);
+        let value_default = column::value_default(
+            value_field,
+            value_width,
+            unread.contains(schema.schema_id(), value_field.id),
+        )
+        .map_err(|cause| mismatch(value_column, cause))?;
         let bucketing = bucket_field(table, md.default_partition_spec(), key_field.id)?
             .map(|field| field.bucketing);
         Ok(Self {
@@ -130,9 +167,20 @@ impl TableLayout {
             key_column: key_column.to_string(),
             key_field_id: key_field.id,
             key_type,
+            key_width: fixed_width(&key_field.field_type),
             value_column: value_column.to_string(),
             value_field_id: value_field.id,
+            value_width,
+            value_default,
         })
+    }
+}
+
+/// The width of a `fixed` type; `None` for every other type.
+fn fixed_width(ty: &Type) -> Option<u64> {
+    match *ty {
+        Type::Primitive(PrimitiveType::Fixed(width)) => Some(width),
+        Type::Primitive(_) | Type::Struct(_) | Type::List(_) | Type::Map(_) => None,
     }
 }
 
@@ -746,8 +794,9 @@ pub(crate) mod testing {
         TableMetadata, TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
     };
 
+    use super::{Bucketing, TableLayout};
     use crate::catalog::{METADATA_DIR, hint_location, version_file};
-    use crate::key::Key;
+    use crate::key::{Key, KeyType};
     use crate::time;
 
     /// The key column of every fixture table.
@@ -791,6 +840,23 @@ pub(crate) mod testing {
             ])
             .build()
             .unwrap()
+    }
+
+    /// The layout of a table of `KEY_COLUMN` of `key_type` and a binary
+    /// `VALUE_COLUMN` with no default, under `bucketing`: what a fixture
+    /// whose data files are written without field ids is resolved against.
+    pub(crate) fn layout(key_type: KeyType, bucketing: Option<Bucketing>) -> TableLayout {
+        TableLayout {
+            bucketing,
+            key_column: KEY_COLUMN.to_string(),
+            key_field_id: KEY_FIELD_ID,
+            key_type,
+            key_width: None,
+            value_column: VALUE_COLUMN.to_string(),
+            value_field_id: VALUE_FIELD_ID,
+            value_width: None,
+            value_default: None,
+        }
     }
 
     /// The long-keyed, binary-valued schema most fixtures use.
@@ -1222,7 +1288,14 @@ mod tests {
     }
 
     fn derive(md: &TableMetadata, snapshot: &Snapshot) -> Result<TableLayout> {
-        TableLayout::derive(TABLE, md, snapshot, KEY_COLUMN, VALUE_COLUMN)
+        TableLayout::derive(
+            TABLE,
+            md,
+            &UnreadDefaults::default(),
+            snapshot,
+            KEY_COLUMN,
+            VALUE_COLUMN,
+        )
     }
 
     /// The table fault `result` ended in, under `TABLE`.
@@ -1282,17 +1355,19 @@ mod tests {
     #[test]
     fn test_derive_admits_every_key_type_including_uuid_and_fixed() {
         let dir = tempfile::tempdir().unwrap();
+        let fixed_width = crate::approx::count(UUID_BYTES);
         let cases = [
-            (PrimitiveType::Long, KeyType::Long),
-            (PrimitiveType::String, KeyType::String),
-            (PrimitiveType::Binary, KeyType::Binary),
+            (PrimitiveType::Long, KeyType::Long, None),
+            (PrimitiveType::String, KeyType::String, None),
+            (PrimitiveType::Binary, KeyType::Binary, None),
             (
-                PrimitiveType::Fixed(crate::approx::count(UUID_BYTES)),
+                PrimitiveType::Fixed(fixed_width),
                 KeyType::Binary,
+                Some(fixed_width),
             ),
-            (PrimitiveType::Uuid, KeyType::Uuid),
+            (PrimitiveType::Uuid, KeyType::Uuid, None),
         ];
-        for (primitive, expected) in cases {
+        for (primitive, expected, key_width) in cases {
             let md = testing::metadata(
                 &testing::file_root(dir.path()),
                 testing::schema(
@@ -1309,8 +1384,11 @@ mod tests {
                     key_column: KEY_COLUMN.to_string(),
                     key_field_id: KEY_FIELD_ID,
                     key_type: expected,
+                    key_width,
                     value_column: VALUE_COLUMN.to_string(),
                     value_field_id: VALUE_FIELD_ID,
+                    value_width: None,
+                    value_default: None,
                 }
             );
         }
@@ -1387,6 +1465,7 @@ mod tests {
                 fault_of(TableLayout::derive(
                     TABLE,
                     &md,
+                    &UnreadDefaults::default(),
                     &snapshot,
                     key_column,
                     value_column
@@ -1454,6 +1533,7 @@ mod tests {
         let renamed = TableLayout::derive(
             TABLE,
             &md,
+            &UnreadDefaults::default(),
             &snapshot_with_schema(Some(current_schema_id)),
             KEY_COLUMN,
             RENAMED_VALUE_COLUMN,
@@ -1464,6 +1544,7 @@ mod tests {
         let by_default = TableLayout::derive(
             TABLE,
             &md,
+            &UnreadDefaults::default(),
             &snapshot_with_schema(None),
             KEY_COLUMN,
             RENAMED_VALUE_COLUMN,
@@ -1474,6 +1555,122 @@ mod tests {
             fault_of(derive(&md, &snapshot_with_schema(Some(ABSENT_SCHEMA_ID)))),
             TableFault::SchemaMissing {
                 schema_id: ABSENT_SCHEMA_ID,
+            }
+        );
+    }
+
+    /// The schema of the nested-name test: the key, and a struct `outer`
+    /// holding the binary `inner`, at field ids one, two, and three.
+    fn nested_schema() -> Schema {
+        let inner = NestedField::optional(
+            RENAMED_VALUE_FIELD_ID,
+            NESTED_INNER,
+            Type::Primitive(PrimitiveType::Binary),
+        );
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    KEY_FIELD_ID,
+                    KEY_COLUMN,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::optional(
+                    VALUE_FIELD_ID,
+                    NESTED_OUTER,
+                    Type::Struct(iceberg::spec::StructType::new(vec![inner.into()])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    /// The struct field of `nested_schema` and the field inside it.
+    const NESTED_OUTER: &str = "outer";
+    const NESTED_INNER: &str = "inner";
+
+    #[test]
+    fn test_derive_a_nested_name_is_a_column_mismatch_and_an_absent_one_a_table_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = testing::metadata(
+            &testing::file_root(dir.path()),
+            nested_schema(),
+            testing::unpartitioned(),
+        );
+        let snapshot = snapshot_with_schema(None);
+        let derive_value = |value_column: &str| {
+            TableLayout::derive(
+                TABLE,
+                &md,
+                &UnreadDefaults::default(),
+                &snapshot,
+                KEY_COLUMN,
+                value_column,
+            )
+        };
+        let dotted = format!("{NESTED_OUTER}.{NESTED_INNER}");
+        assert_eq!(
+            refusal_of(derive_value(&dotted)),
+            RefusalReason::ColumnMismatch {
+                column: dotted.clone(),
+                path: None,
+                mismatch: ColumnMismatch::NotTopLevel,
+            }
+        );
+        let absent = format!("{NESTED_OUTER}.{ABSENT_COLUMN}");
+        assert_eq!(
+            fault_of(derive_value(&absent)),
+            TableFault::ColumnMissing { column: absent }
+        );
+    }
+
+    #[test]
+    fn test_derive_takes_a_fixed_width_and_the_initial_default_and_refuses_an_unread_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = vec![7_u8; crate::approx::length(FIXED_VALUE_BYTES)];
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    KEY_FIELD_ID,
+                    KEY_COLUMN,
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::optional(
+                    VALUE_FIELD_ID,
+                    VALUE_COLUMN,
+                    Type::Primitive(PrimitiveType::Fixed(FIXED_VALUE_BYTES)),
+                )
+                .with_initial_default(Literal::fixed(default.clone()))
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let md = testing::metadata_of_version(
+            &testing::file_root(dir.path()),
+            schema,
+            testing::unpartitioned(),
+            iceberg::spec::FormatVersion::V3,
+        );
+        let snapshot = snapshot_with_schema(None);
+        let layout = derive(&md, &snapshot).unwrap();
+        assert_eq!(layout.value_width, Some(FIXED_VALUE_BYTES));
+        assert_eq!(layout.value_default, Some(Bytes::from(default)));
+        let unread = UnreadDefaults::naming(md.current_schema_id(), VALUE_FIELD_ID);
+        assert_eq!(
+            refusal_of(TableLayout::derive(
+                TABLE,
+                &md,
+                &unread,
+                &snapshot,
+                KEY_COLUMN,
+                VALUE_COLUMN,
+            )),
+            RefusalReason::ColumnMismatch {
+                column: VALUE_COLUMN.to_string(),
+                path: None,
+                mismatch: ColumnMismatch::UnreadableDefault,
             }
         );
     }

@@ -24,13 +24,15 @@ use crate::keys::far_key;
 /// cold count is exactly the distinct pages a batch fetches.
 pub const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Load GETs past the per-file ones over a catalog source: the manifest
-/// list and the one manifest a fixture's first snapshot has. The metadata
-/// itself came from the catalog record.
+/// Load GETs past the per-file ones and the metadata file
+/// (`METADATA_FILE_GETS`): the manifest list and the one manifest a
+/// fixture's first snapshot has.
 pub const LOAD_METADATA_GETS: u64 = 2;
 
-/// The GET a static source spends on the metadata file before
-/// `LOAD_METADATA_GETS`, which a catalog source takes from its record.
+/// The GET every source spends on the metadata file at a location it has
+/// not read before `LOAD_METADATA_GETS`: a static source parses it, and a
+/// catalog source, whose client hands over its own parse, reads it for
+/// the column defaults that parse drops (RFD 023).
 pub const METADATA_FILE_GETS: u64 = 1;
 
 /// Load GETs per single-row-group file in every tier: the footer and the
@@ -241,7 +243,8 @@ pub struct SeenPages {
 /// The GETs a lookup of `key` costs in `generation`'s tier after the
 /// lookups `seen` records, for a key with a live copy when `live` (RFD
 /// 021): the value page the Full tier's generation `full` plans for the
-/// live copy, unless fetched before; and in the Bloom tier every key page a
+/// live copy, unless fetched before or its file answers the value column's
+/// default and reads none (RFD 023); and in the Bloom tier every key page a
 /// probe decodes, walking the candidates in probe order up to the file the
 /// plan names, or through every candidate for a key with no live copy,
 /// deleted copies among them. The Full and Disk tiers decode key pages from
@@ -262,10 +265,12 @@ pub fn expected_lookup_gets(
             .next()
             .flatten()
             .expect("the plan names a live key's file");
-        let offset = page
-            .value_page_offset
-            .expect("the Full tier names the value page");
-        gets += u64::from(seen.value_pages.insert((file.entry.path.clone(), offset)));
+        if file.index.value_leaf().is_some() {
+            let offset = page
+                .value_page_offset
+                .expect("the Full tier names the value page of a file that holds the column");
+            gets += u64::from(seen.value_pages.insert((file.entry.path.clone(), offset)));
+        }
         live_path = Some(file.entry.path.clone());
     }
     if generation.residency == Residency::Bloom {
