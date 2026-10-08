@@ -836,6 +836,23 @@ async fn test_get_key_field_passed_back_looks_up_the_same_key() -> TestResult {
     Ok(())
 }
 
+/// Every Parquet data file under `dir`, recursively.
+fn data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, BoxError> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            found.extend(data_files(&path)?);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "parquet")
+        {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
 /// Removes every Parquet data file under `dir`, so a load of a table there
 /// fails while its metadata still reads; returns how many it removed.
 fn remove_data_files(dir: &Path) -> Result<usize, BoxError> {
@@ -1016,6 +1033,40 @@ async fn test_doctor_reports_each_column_s_format_and_malformed_protobuf() -> Te
                 .all(|line| line["kind"] != "refusal" && line["kind"] != "unwalked")
         );
     }
+    Ok(())
+}
+
+/// `doctor` reports a protobuf column whose walked page it cannot read as
+/// an `unwalked` line naming the column, and still emits the table's
+/// report: the walk is advice, so the run exits 0 and nothing is refused.
+#[tokio::test]
+async fn test_doctor_reports_an_unreadable_walk_as_unwalked_and_the_report_whole() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let spec = FixtureSpec {
+        value_kind: ValueKind::Protobuf,
+        ..FixtureSpec::small("kv_doctor_unwalked", KeyType::Long)
+    };
+    let fixture = local_fixture(dir.path(), spec).await?;
+    let mut zeroed = 0;
+    for path in data_files(dir.path())? {
+        zeroed += icetray_testkit::verify::zero_column_chunks(&path, VALUE_COLUMN)?;
+    }
+    assert!(zeroed > 0, "the value chunks are zeroed");
+    let located = protobuf_location(&fixture);
+    let located: Vec<&str> = located.iter().map(String::as_str).collect();
+    let output = run(&[&["doctor"][..], &located].concat(), &[]);
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    assert_eq!(report[0]["kind"], "table", "{report:?}");
+    let unwalked: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "unwalked")
+        .collect();
+    let [line] = unwalked[..] else {
+        panic!("one unwalked line, got {report:?}");
+    };
+    assert_eq!(line["column"], VALUE_COLUMN);
+    assert!(report.iter().all(|line| line["kind"] != "refusal"));
     Ok(())
 }
 

@@ -204,6 +204,39 @@ pub async fn serve_catalog_with(
     .await
 }
 
+/// Overwrites with zeros every column chunk of `column` in the Parquet
+/// file at `path`, leaving its length and footer as written, and returns
+/// how many chunks it zeroed. A load reads the footer and the key chunks
+/// only, so it still succeeds; a read of one of the column's pages then
+/// fails to decode, as a page the store corrupted would.
+pub fn zero_column_chunks(path: &Path, column: &str) -> Result<usize> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let ranges: Vec<(u64, u64)> = {
+        let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
+        reader
+            .metadata()
+            .row_groups()
+            .iter()
+            .flat_map(RowGroupMetaData::columns)
+            .filter(|chunk| chunk.column_path().parts() == [column])
+            .map(ColumnChunkMetaData::byte_range)
+            .collect()
+    };
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    for &(start, len) in &ranges {
+        file.seek(SeekFrom::Start(start))?;
+        file.write_all(&vec![
+            0;
+            usize::try_from(len).expect("a chunk fits in memory")
+        ])?;
+    }
+    Ok(ranges.len())
+}
+
 /// The default storage configuration with hedging disabled, so a batch
 /// larger than the hedge window can never add a hedge GET to a count the
 /// oracle predicts. Every in-process cost test serves under it or under

@@ -701,6 +701,51 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
     Ok(())
 }
 
+/// A default no file answers is never served, since a file written after
+/// the column was added holds it, so the doctor does not report it.
+#[tokio::test]
+async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
+    let (_dir, mut fixture) =
+        two_bucket_fixture("kv_default_unanswered", FormatVersion::V3, false).await?;
+    fixture
+        .evolve(&[SchemaChange::Add {
+            name: SECOND_VALUE_COLUMN.to_string(),
+            ty: PrimitiveType::Binary,
+            default: StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
+        }])
+        .await?;
+    let ids: Vec<u64> = fixture.ids().collect();
+    let rewritten = fixture.write_rows(&ids, FIRST_VERSION, "rewritten").await?;
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data: rewritten,
+            deletes: Vec::new(),
+        })
+        .await?;
+    let scratch = tempfile::tempdir()?;
+    let served = serve_protobuf_default(&fixture, Residency::Full, scratch.path()).await?;
+    let generation = served.current();
+    assert!(
+        generation
+            .files
+            .iter()
+            .all(|file| file.index.value_leaf(0).is_some()),
+        "every file holds the column"
+    );
+    let examined = examine(&generation, Level::Optimal, &|name| {
+        served.table.config().format_of(name).unwrap_or_default()
+    })
+    .await;
+    assert!(
+        !examined.report.findings.iter().any(|finding| {
+            finding.code() == FindingCode::MalformedProtobuf && finding.file().is_none()
+        }),
+        "a default no file answers is not reported: {:?}",
+        examined.report.findings
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_a_default_that_does_not_read_is_refused() -> Result<()> {
     let (_dir, mut fixture) = two_bucket_fixture("kv_unread", FormatVersion::V3, false).await?;

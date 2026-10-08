@@ -104,7 +104,8 @@ Keys, errors, and limits:
   or the caller stops naming fields of that column; a read naming no
   fields serves the value whole. `icetray_projection_errors_total` counts
   them, and `icetray doctor` looks for them on one value page per protobuf
-  column and in its default; a malformed value on another page is found
+  column and in its default when a file answers by it; a malformed value
+  on another page is found
   when a lookup first names fields of it.
 - A `Get` or `MultiGet` still running at `server.get_deadline` or
   `server.multi_get_deadline` is `DEADLINE_EXCEEDED`. A client-sent

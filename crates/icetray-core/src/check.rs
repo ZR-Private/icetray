@@ -935,7 +935,9 @@ pub struct Unwalked {
 /// The `doctor` command's report on `g` (RFD 016, RFD 024): `diagnose`'s,
 /// with the walk no load makes of each column `formats` declares protobuf.
 /// The walk checks the column's stated default (RFD 023), with no GET,
-/// and every value on the first value page of the first file in
+/// when a file of `g` answers the column by it (a file written after the
+/// column was added holds the column, so a default no file answers is
+/// never served), and every value on the first value page of the first file in
 /// generation order that holds the column, read with one GET (two for a
 /// dictionary-encoded chunk) past the page cache; a page of only nulls
 /// passes the walk to the next such file, up to `MOST_WALKED_FILES`. A
@@ -952,7 +954,12 @@ pub async fn examine(
     for (at, column) in g.layout.value_columns.iter().enumerate() {
         match formats(&column.name) {
             ValueFormat::Protobuf => {
-                report.findings.extend(walk_default(column));
+                if g.files
+                    .iter()
+                    .any(|file| file.index.value_leaf(at).is_none())
+                {
+                    report.findings.extend(walk_default(column));
+                }
                 match walk_protobuf_page(g, at, &column.name).await {
                     Ok(finding) => report.findings.extend(finding),
                     Err(error) => unwalked.push(Unwalked {

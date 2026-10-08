@@ -103,7 +103,10 @@ with the whole value returned when the request names none.
   `icetray_lookups_total` does. `icetray_projection_errors_total` counts
   malformed values by table and column.
 - **Checked by the doctor.** The `doctor` command walks the default
-  each protobuf column states (RFD 023), with no GET, and the values of
+  each protobuf column states (RFD 023), with no GET, when a file
+  answers the column by it (a file written after the column was added
+  holds the column, so a default no file answers is never served), and
+  the values of
   one value page of the column, one GET, two when the column's chunk is
   dictionary-encoded, and reports a malformed value or default as the
   advice `malformed_protobuf`, which catches a column declared protobuf

@@ -157,7 +157,8 @@ The writer's part is that every value of the column parses as protobuf,
 and so does the default the column states, if any. A value that does not
 is served whole to a lookup that names no fields and fails one that
 names some as `FAILED_PRECONDITION`, every time, until it is rewritten;
-`icetray doctor` walks the column's default and one value page of each
+`icetray doctor` walks the column's default, when a file written before
+the column answers by it, and one value page of each
 protobuf column and reports such a value as `malformed_protobuf`. The
 page is the first one of the first file holding the column, or of the
 next of up to three files when it holds only nulls, so a malformed value
