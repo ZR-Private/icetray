@@ -371,9 +371,10 @@ impl PageCache {
     /// cached. The disk level's read is not bounded by it.
     /// The origin is what the `result` label of a lookup is decided by, per
     /// call rather than by differencing the process-wide counters, which
-    /// concurrent lookups would confuse. A fetch the cache runs answers to
-    /// `issue` (`Issue`); a page served without one, or a fetch joined,
-    /// takes nothing of it.
+    /// concurrent lookups would confuse. A page in memory is served on the
+    /// caller's task with nothing taken of `issue`; any other waits here
+    /// for `issue`'s permit (`Issue`) before the cache is asked for it, so
+    /// a caller dropped while it waits leaves nothing queued in the cache.
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: (Arc<str>, u64),
@@ -385,29 +386,37 @@ impl PageCache {
         Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
         let key = PageKey(key.0, key.1);
-        // Built only once foyer decides to fetch, so a hit clones nothing.
-        let run = || Run {
+        if let Some(page) = self.in_memory(&key) {
+            self.record_hit();
+            return Ok((page, PageOrigin::Cached));
+        }
+        // foyer calls `fetch` on every call, so the run, and the permit in
+        // it, is built as well for a page that reached memory while the
+        // permit was awaited, a page on the disk level, and a fetch joined,
+        // none of which runs it (`Issue` says when each frees the permit).
+        let run = Run {
             page: key.clone(),
             fetches: Arc::clone(&self.fetches),
             deadline: self.fetch_deadline,
-            admission: issue.admission(),
+            permit: issue.permit().await,
+            counted: issue.counted.cloned(),
         };
-        // One call to foyer and not a `get` first: foyer's `get` reports a
-        // disk level that fails to read as an error while its `get_or_fetch`
-        // moves on to the fetch, which is what a disposable directory calls
-        // for (RFD 017). The levels' entries differ in type, so each arm
-        // reduces its own to the source and the page.
+        // foyer's `get_or_fetch` and not its `get` past memory: `get`
+        // reports a disk level that fails to read as an error while
+        // `get_or_fetch` moves on to the fetch, which is what a disposable
+        // directory calls for (RFD 017). The levels' entries differ in
+        // type, so each arm reduces its own to the source and the page.
         let (served, stats) = match self.level.as_ref() {
             Level::Memory(cache) => (
                 cache
-                    .get_or_fetch(&key, || run().fetch(fetch()))
+                    .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 None,
             ),
             Level::Hybrid { cache, stats } => (
                 cache
-                    .get_or_fetch(&key, || run().fetch(fetch()))
+                    .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
                     .map(|entry| (entry.source(), entry.value().0.clone())),
                 Some(stats.as_ref()),
@@ -488,6 +497,17 @@ impl PageCache {
                 if let Some(stats) = stats {
                     stats.record_local_read(approx::count(page.len()));
                 }
+            }
+        }
+    }
+
+    /// The page at `key` when memory holds it, counted by foyer as a hit
+    /// of its eviction policy as `get_or_fetch` would count it.
+    fn in_memory(&self, key: &PageKey) -> Option<Bytes> {
+        match self.level.as_ref() {
+            Level::Memory(cache) => cache.get(key).map(|entry| entry.value().0.clone()),
+            Level::Hybrid { cache, .. } => {
+                cache.memory().get(key).map(|entry| entry.value().0.clone())
             }
         }
     }
@@ -653,17 +673,26 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
 }
 
 /// What a lookup's GET answers to beside the fetch deadline of the handle
-/// it goes through (RFD 013, RFD 022). It applies where the GET is issued:
-/// a page served from memory or from the disk level, or a fetch another
-/// lookup ran and this one joined, issues none and takes nothing of it.
+/// it goes through (RFD 013, RFD 022). A page served from memory takes
+/// nothing of it; any other page takes the permit on the lookup's own task
+/// before the page cache is asked for it, and the GET counts as it is
+/// issued.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Issue<'a> {
     /// The fan-out of the `multi_get` the lookup is one of
-    /// (`MULTI_GET_FAN_OUT`): the GET takes one of its permits before it
-    /// starts, so the wait for one is not charged against the deadline,
-    /// and holds it until it ends, on the task the GET runs on, so a lookup
-    /// dropped first frees nothing while its GET runs on. Its hedge runs
-    /// under the same permit. `None` for a `get`, one call of its own.
+    /// (`MULTI_GET_FAN_OUT`): one of its permits is taken before the page
+    /// cache is asked, so a lookup still waiting for one has nothing queued
+    /// there for another call to join, and the wait is not charged against
+    /// the deadline. The permit moves into the fetch and is held until the
+    /// GET ends, on the task the GET runs on, so a lookup dropped first
+    /// frees nothing while its GET runs on; its hedge runs under the same
+    /// permit. A page the disk level serves, or one another caller fetched
+    /// meanwhile, drops it unused, and so does a lookup that joins a fetch
+    /// in flight, save the first to join: foyer keeps that one's fetch
+    /// beside the running one until it ends, and the permit with it. That
+    /// permit narrows the batch's GETs in flight and cannot stall them,
+    /// since the fetch it waits on took its own before it started. `None`
+    /// for a `get`, one call of its own.
     pub(crate) fan_out: Option<&'a Arc<Semaphore>>,
     /// Counted once as the GET is issued, its hedge not: a value column's
     /// `value_page_gets_total` for the column's value or dictionary page,
@@ -672,38 +701,24 @@ pub(crate) struct Issue<'a> {
 }
 
 impl Issue<'_> {
-    /// What the GET's task holds of this issue, owned.
-    fn admission(self) -> Admission {
-        Admission {
-            fan_out: self.fan_out.map(Arc::clone),
-            counted: self.counted.cloned(),
-        }
-    }
-
-    /// Waits for the GET's permit when it has a fan-out, then counts the
-    /// GET; the GET holds the returned permit while it runs.
-    pub(crate) async fn admit(self) -> Option<OwnedSemaphorePermit> {
-        self.admission().admit().await
-    }
-}
-
-/// An `Issue` owned by the task a GET runs on.
-struct Admission {
-    fan_out: Option<Arc<Semaphore>>,
-    counted: Option<Counter>,
-}
-
-impl Admission {
-    async fn admit(self) -> Option<OwnedSemaphorePermit> {
-        let permit = match self.fan_out {
+    /// Waits for one permit of the fan-out when there is one.
+    async fn permit(self) -> Option<OwnedSemaphorePermit> {
+        match self.fan_out {
             Some(fan_out) => Some(
-                fan_out
+                Arc::clone(fan_out)
                     .acquire_owned()
                     .await
                     .expect("a batch's fan-out semaphore is never closed"),
             ),
             None => None,
-        };
+        }
+    }
+
+    /// Waits for the GET's permit when it has a fan-out, then counts the
+    /// GET: a GET issued without the page cache. The GET holds the
+    /// returned permit while it runs.
+    pub(crate) async fn admit(self) -> Option<OwnedSemaphorePermit> {
+        let permit = self.permit().await;
         if let Some(counted) = self.counted {
             counted.increment(1);
         }
@@ -713,35 +728,42 @@ impl Admission {
 
 /// What one caller's fetch runs with, should foyer run it: the page it is
 /// for, the counter it counts in, the deadline of the handle it came
-/// through, and the issue it answers to.
+/// through, the permit its issue took, and the counter its GET counts in.
 struct Run {
     page: PageKey,
     fetches: Arc<Fetches>,
     deadline: Option<Duration>,
-    admission: Admission,
+    permit: Option<OwnedSemaphorePermit>,
+    counted: Option<Counter>,
 }
 
 impl Run {
     /// Runs a caller's fetch once foyer has decided the page must come from
-    /// outside: admitted under its issue first (`Issue`), then counted as
-    /// it starts so that a fetch that fails still counts. With a deadline,
-    /// `fut` is dropped when it passes, measured from admission, and the
+    /// outside: counted as it starts, in `fetches` and in its issue's
+    /// counter, so that a fetch that fails still counts. With a deadline,
+    /// `fut` is dropped when it passes, measured from the start, and the
     /// run fails as `FetchFailed::Deadline`. The permit is held until the
     /// run ends either way.
     async fn fetch<Fut>(self, fut: Fut) -> std::result::Result<PageValue, FetchFailed>
     where
         Fut: Future<Output = Result<Bytes>>,
     {
-        let _permit = self.admission.admit().await;
-        self.fetches.record();
-        let fetched = match self.deadline {
+        let Self {
+            page,
+            fetches,
+            deadline,
+            permit: _permit,
+            counted,
+        } = self;
+        fetches.record();
+        if let Some(counted) = counted {
+            counted.increment(1);
+        }
+        let fetched = match deadline {
             None => fut.await,
-            Some(after) => tokio::time::timeout(after, fut).await.map_err(|_elapsed| {
-                FetchFailed::Deadline {
-                    page: self.page,
-                    after,
-                }
-            })?,
+            Some(after) => tokio::time::timeout(after, fut)
+                .await
+                .map_err(|_elapsed| FetchFailed::Deadline { page, after })?,
         };
         // Copied into an allocation of its own: the store can hand back a
         // slice of a larger buffer, such as the HTTP connection's read

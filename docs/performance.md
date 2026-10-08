@@ -42,7 +42,10 @@ lookup's `gets`, so an owner can measure a residency's GET count on a
 real table before configuring it.
 
 icetray holds at most 32 GETs in flight for one `MultiGet`, and each GET
-a lookup issues holds one slot until it ends. A batch whose keys are all
+a lookup issues holds one slot until it ends. A lookup takes its slot
+before it asks the page cache for a page not in memory, so a page in
+memory costs no slot, and a `Get` of a page a batch is still waiting to
+fetch issues its own GET rather than waiting behind the batch. A batch whose keys are all
 cold therefore waits about one GET's latency for every 32 GETs. Under
 `full` or `disk` that is every 32 keys when it requests one column, every
 16 when it requests two, and fewer when a column is dictionary-encoded,
