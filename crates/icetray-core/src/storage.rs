@@ -488,7 +488,9 @@ impl Storage {
     /// identical second request is issued, counted as a hedge, and the first
     /// answer wins. Every attempt, hedged or not, is recorded into the
     /// window with its elapsed time, so the ceiling counts every hedge
-    /// spent. One lookup GET, plus one more when a hedge is issued.
+    /// spent; that includes a read dropped after its delay passed
+    /// (`WindowSample`).
+    /// One lookup GET, plus one more when a hedge is issued.
     pub(crate) async fn read_range_hedged(
         &self,
         l: &Located,
@@ -497,10 +499,16 @@ impl Storage {
     ) -> Result<Bytes> {
         let len = range_len(&range);
         self.stats.record_get(ReadKind::Lookup, len);
-        let started = Instant::now();
-        let (answer, hedged) = self.race(l, range, len, window.delay()).await;
-        let elapsed = started.elapsed();
-        window.record(elapsed, hedged);
+        let delay = window.delay();
+        let mut sample = WindowSample {
+            window,
+            started: Instant::now(),
+            delay,
+            hedged: false,
+            recorded: false,
+        };
+        let answer = self.race(l, range, len, delay, &mut sample.hedged).await;
+        let elapsed = sample.record();
         self.stats.record_latency(ReadKind::Lookup, elapsed);
         answer.map_err(Error::from)
     }
@@ -718,27 +726,30 @@ impl Storage {
     /// The lookup read with its hedge. The first request races a timer of
     /// `delay`; when the timer wins, an identical second request is issued
     /// and counted, and whichever answers first wins. An answer that is an
-    /// error does not win: the other request finishes and decides. Returns
-    /// the answer and whether a hedge was issued.
+    /// error does not win: the other request finishes and decides. Sets
+    /// `hedged` before it issues a hedge, so a caller dropped while the
+    /// pair is in flight still knows one was spent.
     async fn race(
         &self,
         l: &Located,
         range: Range<u64>,
         len: u64,
         delay: Option<Duration>,
-    ) -> (object_store::Result<Bytes>, bool) {
+        hedged: &mut bool,
+    ) -> object_store::Result<Bytes> {
         let first = pin!(l.store.get_range(&l.path, range.clone()));
         let Some(delay) = delay else {
-            return (first.await, false);
+            return first.await;
         };
         let timer = pin!(tokio::time::sleep(delay));
         let first = match select(first, timer).await {
-            Either::Left((answer, _timer)) => return (answer, false),
+            Either::Left((answer, _timer)) => return answer,
             Either::Right(((), first)) => first,
         };
         self.stats.record_hedge(len);
+        *hedged = true;
         let second = pin!(l.store.get_range(&l.path, range));
-        let answer = match select(first, second).await {
+        match select(first, second).await {
             Either::Left((Ok(bytes), _)) | Either::Right((Ok(bytes), _)) => Ok(bytes),
             Either::Left((Err(error), second)) => {
                 tracing::debug!(%error, "first lookup request failed; waiting for its hedge");
@@ -748,8 +759,50 @@ impl Storage {
                 tracing::debug!(%error, "hedge failed; waiting for the first lookup request");
                 first.await
             }
-        };
-        (answer, true)
+        }
+    }
+}
+
+/// One lookup GET's sample for its table's hedge window (RFD 013). A read
+/// that answers records its elapsed time. A read dropped before it answers
+/// (the page cache drops a fetch at its deadline, a canceled lookup drops
+/// its reads) records only once its delay has passed or its hedge was
+/// issued: such a sample is the slow one the delay most needs, and its
+/// hedge would otherwise never count against the ceiling. A read dropped
+/// sooner records nothing, since its elapsed time only bounds its latency
+/// from below and would pull the percentile down.
+struct WindowSample<'w> {
+    /// The table's window.
+    window: &'w HedgeWindow,
+    /// When the first request was issued.
+    started: Instant,
+    /// The delay the read raced, `None` when it could not hedge.
+    delay: Option<Duration>,
+    /// Whether a hedge was issued; set by `race` before it issues one.
+    hedged: bool,
+    /// Whether the sample is in the window.
+    recorded: bool,
+}
+
+impl WindowSample<'_> {
+    /// Records the answered read and returns its elapsed time.
+    fn record(&mut self) -> Duration {
+        let elapsed = self.started.elapsed();
+        self.window.record(elapsed, self.hedged);
+        self.recorded = true;
+        elapsed
+    }
+}
+
+impl Drop for WindowSample<'_> {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        if self.hedged || self.delay.is_some_and(|delay| elapsed >= delay) {
+            self.window.record(elapsed, self.hedged);
+        }
     }
 }
 
@@ -2603,6 +2656,50 @@ mod tests {
         assert!(
             window.delay().is_some_and(|delay| delay < HUGE),
             "the unhedged attempt entered the window and displaced a HUGE sample"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_range_hedged_dropped_after_its_hedge_counts_against_the_ceiling() {
+        let (storage, located) = storage_with(Arc::new(Scripted::new(&[STALL, STALL]))).await;
+        let window = eager_window();
+        assert!(window.delay().is_some(), "the window would hedge a lookup");
+        tokio::time::timeout(HUGE, async {
+            let mut read = pin!(storage.read_range_hedged(&located, INNER_RANGE, &window));
+            while storage.stats().hedges() == 0 {
+                tokio::select! {
+                    biased;
+                    _ = &mut read => panic!("neither request of the pair answers"),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("the hedge is issued once the window's delay passes");
+        assert_eq!(storage.stats().hedges(), 1);
+        assert!(
+            window.delay().is_none(),
+            "the dropped read entered the window as hedged, which reaches the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_range_hedged_dropped_before_its_delay_records_nothing() {
+        let (storage, located) = storage_with(Arc::new(Scripted::new(&[STALL]))).await;
+        let window = window_with(
+            &hedge_config(MEDIAN, TWO, HALF),
+            &[(HUGE, false), (HUGE, false)],
+        );
+        assert_eq!(window.delay(), Some(HUGE));
+        let read = storage.read_range_hedged(&located, INNER_RANGE, &window);
+        assert!(
+            futures::poll!(pin!(read)).is_pending(),
+            "the first request stalls"
+        );
+        assert_eq!(
+            window.delay(),
+            Some(HUGE),
+            "a read dropped long before its delay left the window as it was"
         );
     }
 
