@@ -6,7 +6,7 @@
 
 ## Problem
 
-RFD 002 (Serving layout contract) gives a table one value column and
+RFD 002 (Serving layout) gives a table one value column and
 recommends packing a row into it, as a serialized protobuf, so that a
 cold hit costs one GET. That serves a table read by one kind of caller.
 It serves a wide row read by several kinds of caller badly. A row that
@@ -169,7 +169,7 @@ column, a change to the doctor's output contract); RFD 018 (a change of
 columns reloads the table); RFD 020 (`optimal` and the cost gauges
 describe one column read, and the level is the dearest column's); and
 RFD 021 (a live row's value pages are those of the columns named). The
-table contract, the configuration reference, and the performance guide
+optimal layout, the configuration reference, and the performance guide
 carry the guidance on when to split a row and when to pack it.
 
 A multi-column cold hit waits on the slowest of its GETs, so its tail is

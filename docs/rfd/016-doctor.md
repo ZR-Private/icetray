@@ -36,7 +36,7 @@
 
 ## Problem
 
-RFD 002 (Serving layout contract) leaves to this RFD what the doctor
+RFD 002 (Serving layout) leaves to this RFD what the doctor
 checks and how it reports, and RFD 007 (Serving tiers) leaves it the exit
 code a build pipeline can gate on. The check is necessary because a
 writer's output cannot be inferred from its properties. The prototype
@@ -107,11 +107,11 @@ for that code.
 The value-page line concerns bytes fetched per hit. That cost grows
 linearly with the page's size and has no step anywhere, so the line is
 drawn where the transfer itself reaches the order of a round trip
-instead of at the contract's 64 KiB bound. The bound remains the recipe
-for large values, where a row limit alone leaves pages of megabytes, and
-the doctor reports each column's mean value size beside its mean page
-size so an owner sees how many values a hit fetches for the one it
-wanted.
+instead of at the optimal layout's 64 KiB bound. The bound remains the
+recipe for large values, where a row limit alone leaves pages of
+megabytes, and the doctor reports each column's mean value size beside
+its mean page size so an owner sees how many values a hit fetches for
+the one it wanted.
 
 The ceiling line warns of refusals rather than slowdowns: a lookup into a
 value page over the ceiling is refused with a file fault. It is reported
@@ -173,8 +173,8 @@ Checks only in the subcommand. Rejected: the server must know the tier at
 load to honor `strict`, and only the check at load sees the snapshot
 actually served.
 
-A pass/fail checker. Rejected by RFD 007: off-contract layouts serve
-correctly at the same GET count
+A pass/fail checker. Rejected by RFD 007: layouts other than the optimal
+one serve correctly at the same GET count
 ([finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)),
 so a single bit would either refuse tables that work or hide the penalty
 of tables that are inefficient.
@@ -189,9 +189,9 @@ site.
 Table builders get a verdict and a fix before a table ships, and a
 pipeline gets a loud failure from the exit code before the table reaches a
 server, where `strict` would refuse it at load. Key pages between the
-contract's 1,000 rows and the 2,000-row inefficient threshold draw no
-finding. The slack is a chosen margin, so a writer whose page rounding
-overshoots the contract does not trip the doctor.
+optimal layout's 1,000 rows and the 2,000-row inefficient threshold draw
+no finding. The slack is a chosen margin, so a writer whose page rounding
+overshoots the optimal layout does not trip the doctor.
 
 The thresholds rest on a few measurements from limited vantage points
 ([range-GET latency, what this does and does not establish](../analysis/2026-09-10-s3-range-get-latency.md#what-this-does-and-does-not-establish)).

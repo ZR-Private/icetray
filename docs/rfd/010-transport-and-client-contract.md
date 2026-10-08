@@ -67,7 +67,7 @@ proto3 list of bytes cannot hold a null. A null value, a zero-length
 value, and an absent key are distinct on the wire. An absent result
 carries no values, and neither does a present result of a presence-only
 request. A miss is a normal answer rather than an error, and what a null
-value means is the table owner's rule (RFD 002 (Serving layout contract)).
+value means is the table owner's rule (RFD 002 (Serving layout)).
 
 Get returns the outcome, the values, and the snapshot id. MultiGet answers
 every key in the batch from one generation, so a batch is consistent with

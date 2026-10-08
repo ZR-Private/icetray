@@ -137,7 +137,7 @@ as booleans or initial values, and a `Vec::with_capacity` argument whose
 meaning is obvious from the line it is on. A constant has one home: when two
 crates need the same value, it is declared once in the lowest crate both
 depend on and imported from there, never redeclared. A test fixture that
-needs the page row limit imports the contract's constant; it does not write
+needs the page row limit imports `contract::PAGE_ROWS`; it does not write
 `1_000` again. Beyond that, a test may use a literal when the test itself
 says what it is: an expected outcome the assertion names ("no more than 7
 GETs"), or input that is plainly made up (`[3, 4, 7, 3]`). A literal that
@@ -170,6 +170,33 @@ where the helper goes.
 - Every crate root starts with a `//!` header saying what the crate is.
 - Every public item has a `///` comment. `missing_docs` warns, and CI turns
   the warning into a failure.
+
+## User documentation
+
+A change a user can see is documented in the same change, in three places:
+
+- **The guide for its reader.** What the feature does, when to use it, and
+  what to watch for, in the document for the person it serves:
+  [Calling icetray](docs/calling.md) for a service that sends requests,
+  [The optimal layout](docs/table-layout.md) for whoever writes the table,
+  and [Operating icetray](docs/operating.md) for whoever runs the server.
+- **The reference.** Every configuration key in
+  [Configuration and the command line](docs/configuration.md), every metric
+  and log field in the operating guide, and every protobuf field in its
+  comment in `icetray.proto`. The TOML examples in the README and `docs/`
+  are parsed by a test, so an example that no longer matches the schema
+  fails the build.
+- **The decision.** The RFD that records why, or an update note on the RFD
+  it changes.
+
+The README describes a feature only when it changes how a reader thinks
+about icetray, such as value columns or projection, in a short paragraph
+with an example and a link to the guide.
+
+The docs are written for engineers who know data lakes, object storage,
+and gRPC. Use the term such an engineer uses, and name the actor that does
+the thing: the owner configures a table, a caller requests columns, the
+server responds, the page cache serves a page.
 
 ## Comments
 

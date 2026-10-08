@@ -110,17 +110,19 @@ pub const TABLE_BELOW_LEVEL: &str = "icetray_table_below_level";
 pub const TABLE_LEVEL: &str = "icetray_table_level";
 /// The level the table declares, by `table`, in `TABLE_LEVEL`'s numbers.
 pub const TABLE_DECLARED_LEVEL: &str = "icetray_table_declared_level";
-/// The level a lookup naming one value column achieves on the serving
-/// generation, by `table` and `column` (RFD 022, `ColumnCost::level`),
-/// capped by the page cache as `TABLE_LEVEL` is, in its numbers; the
-/// table's level is the dearest column's.
+/// The level a lookup requesting one value column achieves, by `table`
+/// and `column` (RFD 022, `ColumnCost::level`), on the snapshot
+/// `TABLE_LEVEL` measures: the serving generation, or while the table is
+/// held, the snapshot it refused. Capped by the page cache as
+/// `TABLE_LEVEL` is, in its numbers; the table's level is the most
+/// expensive column's.
 pub const TABLE_COLUMN_LEVEL: &str = "icetray_table_column_level";
 /// The fraction of the serving generation's chunk-file pages the kernel's
 /// page cache held at the last sample, by `table`, present only while that
 /// residency is observed (RFD 020, `Generation::chunk_residency`).
 pub const TABLE_CHUNK_RESIDENT_FRACTION: &str = "icetray_table_chunk_resident_fraction";
 /// GETs one cold hit makes at worst on the serving generation's layout and
-/// residency finding its row and reading the dearest value column, by
+/// residency finding its row and reading the most expensive value column, by
 /// `table` (RFD 020, RFD 022, `LookupCost::gets_per_hit`).
 pub const TABLE_GETS_PER_HIT: &str = "icetray_table_gets_per_hit";
 /// GETs one cold hit spends at worst on one value column, by `table` and
@@ -357,7 +359,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
     (
         TABLE_GETS_PER_HIT,
         Kind::Gauge,
-        "GETs one cold hit makes at worst finding its row and reading the dearest value column on the serving generation, by table.",
+        "GETs one cold hit makes at worst finding its row and reading the most expensive value column on the serving generation, by table.",
     ),
     (
         TABLE_COLUMN_GETS_PER_HIT,

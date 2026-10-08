@@ -85,8 +85,8 @@ finding the row. Under `strict`, one column below the declared level
 refuses the snapshot for the whole table.
 
 Advice findings cap nothing. A key page counts as large where the doctor's
-`large_key_pages` finding says so, not at the contract's recommended size,
-so the table and the finding cannot disagree. RFD 021 decides where
+`large_key_pages` finding says so, not at the optimal layout's recommended
+size, so the table and the finding cannot disagree. RFD 021 decides where
 merge-on-read snapshots fall; a deletion vector may cost no extra file.
 
 Refusals stay outside the levels. A snapshot that could answer wrongly, or

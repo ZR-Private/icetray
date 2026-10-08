@@ -75,7 +75,7 @@ each file holds for a configured column decides the answer:
   remembered against the metadata location (RFD 009 (Writes between
   builds)), and at boot RFD 005's start-or-fail rule applies.
 
-The table contract follows. A column can be added to a served table
+The optimal layout follows. A column can be added to a served table
 without a rewrite. A served column is not renamed: a new column is
 added beside it, written, and moved to by the callers, and the old one
 is dropped, first from the clients, then from the configuration, then
@@ -120,8 +120,8 @@ The check runs against every file at every refresh, reused files
 included. It compares field ids the resident footer already holds, so
 it reads nothing.
 
-Earlier RFDs and documents are revised to match: RFD 002 and the table
-contract (columns may be added, served columns are not renamed); RFD
+Earlier RFDs and documents are revised to match: RFD 002 and the optimal
+layout (columns may be added, served columns are not renamed); RFD
 005 (resolution and the check on reused files); RFD 007 (the reason
 `column_mismatch`, which replaces the file fault `MissingColumn`); RFD 016 (the advice `column_default`); and the
 operating guide's list of refresh-error reasons.

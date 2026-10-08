@@ -2,7 +2,7 @@
 
 ## Problem
 
-RFD 002 (Serving layout contract) recommends packing a row into one
+RFD 002 (Serving layout) recommends packing a row into one
 binary column as a serialized protobuf, and RFD 022 (Value columns) lets
 a table split a row into columns along how it is read. A column is cut
 once, at write time, for every caller. Within one column, a caller that
@@ -169,7 +169,7 @@ projection saves is the bytes on the wire and the caller's decode.
 
 The oneof rule is the caller's to keep, and breaking it returns a
 cleared member as set, with no error. Callers project oneofs with care,
-and the table contract says so.
+and `docs/table-layout.md` says so.
 
 A malformed value that the doctor's page did not hold is found when a
 caller first projects it, and fails every projected batch that holds it
@@ -188,7 +188,7 @@ failure not retried); RFD 011 (a column's `format`); RFD 016 (Doctor)
 (the walk of one page per protobuf column); RFD 018 (Configuration
 reload) (a format change applies in place); RFD 022 (a column entry
 carries its format, and its projection alternative points here); the
-table contract (the declaration, the oneof rule, and the partial-parse
+optimal layout (the declaration, the oneof rule, and the partial-parse
 rule); and the performance guide (when to split a row into columns and
 when to project one).
 

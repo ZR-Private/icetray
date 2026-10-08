@@ -14,7 +14,7 @@
 A cold hit costs one GET per value column it names, and the latency of
 those GETs belongs to the object store. First-byte time for a range read
 varies with the size of the data file and carries a tail even at the
-file sizes RFD 002 (Serving layout contract) targets ([range-GET latency
+file sizes RFD 002 (Serving layout) targets ([range-GET latency
 analysis, what the evidence
 implies](../analysis/2026-09-10-s3-range-get-latency.md#what-the-evidence-implies)).
 It varies more with how recently the file was read: in-region, a file

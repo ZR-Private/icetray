@@ -54,8 +54,8 @@ round trips
 ([prototype findings, finding 12](../analysis/2026-09-10-prototype-findings.md#12-deterministic-simulation)).
 
 Golden tables come from a real batch writer, written both locally and on
-S3. They cover the contract of RFD 002 (Serving layout contract) and the
-off-contract layouts that RFD 007 (Serving tiers) finds inefficient
+S3. They cover the optimal layout of RFD 002 (Serving layout) and the
+other layouts that RFD 007 (Serving tiers) finds inefficient
 ([prototype findings, method](../analysis/2026-09-10-prototype-findings.md#fixtures)).
 The tests find them through an explicit setting, and the test output shows
 when they are absent.

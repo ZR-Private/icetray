@@ -147,7 +147,7 @@ pub enum Command {
         )]
         config: Option<PathBuf>,
     },
-    /// Check tables against the table contract.
+    /// Check tables against the optimal layout.
     ///
     /// Loads each table and prints a JSON table line with its summary and
     /// the lookup level its layout achieves, a finding line for each
@@ -290,9 +290,9 @@ pub struct Target {
     /// repeatable.
     ///
     /// FORMAT is opaque, the default, or protobuf, which lets --column
-    /// trim the column's values to some of their fields; a name holding a
-    /// : takes its format after it, as a:b:opaque. With none, the table
-    /// answers only whether a key is present.
+    /// project the column's values to some of their fields; a name holding
+    /// a : takes its format after it, as a:b:opaque. With none, a lookup
+    /// returns only the key's presence.
     #[arg(
         long = "value-column",
         value_name = "NAME[:FORMAT]",
@@ -312,10 +312,10 @@ pub struct Target {
         help_heading = HEADING_LOCATED
     )]
     pub r#ref: String,
-    /// Where the located table keeps its key chunks.
+    /// Where icetray stores the located table's key chunks.
     ///
-    /// Disk residency needs a local directory and is available through a
-    /// configuration file.
+    /// Disk residency requires a local directory, which only a
+    /// configuration file sets.
     #[arg(
         long,
         value_name = "RESIDENCY",

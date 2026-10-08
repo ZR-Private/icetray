@@ -95,7 +95,7 @@ const DEFAULT_HEDGE_PERCENTILE: f64 = 0.95;
 /// stall episode (RFD 013).
 const DEFAULT_HEDGE_WINDOW: usize = 256;
 
-/// The share of requests that may hedge when the file says nothing: five
+/// The share of lookup GETs that may be hedged when the file says nothing: five
 /// percent, so the GET overhead stays small where reads are billed per GET
 /// (RFD 013).
 const DEFAULT_HEDGE_MAX_RATE: f64 = 0.05;
@@ -445,8 +445,8 @@ pub enum ConfigViolation {
         /// The configured percentile.
         percentile: f64,
     },
-    /// The hedge ceiling is outside `[0, 1]`; it is the share of requests
-    /// that may hedge (RFD 013).
+    /// The hedge ceiling is outside `[0, 1]`; it is the share of lookup GETs
+    /// that may be hedged (RFD 013).
     #[error("storage.hedge.max_rate {max_rate} is not in [0, 1]")]
     HedgeMaxRateOutOfRange {
         /// The configured ceiling.
@@ -1253,7 +1253,8 @@ pub struct HedgeConfig {
     pub percentile: f64,
     /// Lookup GETs in the per-table latency window; at least one.
     pub window: usize,
-    /// The share of requests that may hedge, in `[0, 1]`.
+    /// The largest share of the lookup GETs in the window that may be
+    /// hedged, in `[0, 1]`.
     pub max_rate: f64,
 }
 

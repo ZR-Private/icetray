@@ -44,8 +44,8 @@ cold hit. RFD 006
 
 Load issues one GET per file for the footer, with a tail prefetch that
 carries the page indexes, and then one per row group for its key chunk. A
-contract-shaped file has one row group, so it costs two GETs. Memory per
-key is a small multiple of the compressed key bytes
+file in the optimal layout has one row group, so it costs two GETs.
+Memory per key is a small multiple of the compressed key bytes
 ([prototype findings, finding 2](../analysis/2026-09-10-prototype-findings.md#2-resident-index-size)).
 
 The resident set leaves out every value column's column index and keeps
@@ -70,9 +70,9 @@ Rejected, though they may return as an opt-in under a budget, which is an
 open question below.
 
 Page indexes plus a bloom filter, without key chunks, for every table. A
-bloom filter's "maybe" costs a GET on a miss, and on off-contract layouts
-the column index cannot say which page holds a key. Resident chunks answer
-that exactly on every layout the findings cover
+bloom filter's "maybe" costs a GET on a miss, and on layouts other than
+the optimal one the column index cannot say which page holds a key.
+Resident chunks answer that exactly on every layout the findings cover
 ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).
 As a per-table choice rather than the design, it is one of RFD 017's
 tiers.
@@ -126,17 +126,17 @@ fault:
   two lengths near the maximum overflow.
 
 Those bounds rest on the footer's row counts, so a footer claiming
-billions of rows widens them. For key pages, a ceiling that does not rest
-on the footer closes that gap. No key page, data or dictionary, may
-declare more than 64 MiB uncompressed. That is sixteen times the
-contract's largest key page of 1,000 keys at the cap (about 4 MiB) and far
+billions of rows widens them. For key pages, a ceiling that does not
+rest on the footer closes that gap. No key page, data or dictionary, may
+declare more than 64 MiB uncompressed. That is sixteen times the optimal
+layout's largest key page of 1,000 keys at the cap (about 4 MiB) and far
 above the 1 MiB pages writers aim for. No key dictionary may count more
-entries than 64 MiB holds at the larger of two sizes: the fewest bytes an
-entry of its type encodes to (8 for a long, the 4-byte length of a byte
-array, a fixed-width column's width) and the bytes parquet holds a decoded
-entry in (8 for a long, 32 for a byte array or fixed-width handle in
-parquet 58). A key dictionary therefore fits the ceiling in memory as well
-as on the wire.
+entries than 64 MiB holds at the larger of two sizes: the fewest bytes
+an entry of its type encodes to (8 for a long, the 4-byte length of a
+byte array, a fixed-width column's width) and the bytes parquet holds a
+decoded entry in (8 for a long, 32 for a byte array or fixed-width
+handle in parquet 58). A key dictionary therefore fits the ceiling in
+memory as well as on the wire.
 
 A key stored as a fixed-width column of width 0 holds one distinct value,
 so it cannot key a table of more than one row, and parquet's fixed-width
@@ -156,10 +156,10 @@ a header parquet would read to different numbers, an uncompressed size
 above the ceiling, a dictionary of more values than its row group has rows
 or than the ceiling holds at the larger of an entry's encoded and
 in-memory size, a compressed size past the page's place, and v2 level
-lengths past the page's size. The contract caps no value's length, so a
-value page's rows imply no bound. The ceiling is sixteen times the 4 MiB
-message a gRPC client on tonic's defaults accepts, and far above the
-64 KiB value pages of the contract (RFD 002 (Serving layout contract)). A
+lengths past the page's size. The optimal layout caps no value's length,
+so a value page's rows imply no bound. The ceiling is sixteen times the
+4 MiB message a gRPC client on tonic's defaults accepts, and far above
+the 64 KiB value pages of the optimal layout (RFD 002 (Serving layout)). A
 page of large values bounded by rows alone, which the doctor advises
 against, can exceed it (a thousand values of 128 KiB is 125 MiB), and a
 lookup into such a page is refused even though each value would fit in a

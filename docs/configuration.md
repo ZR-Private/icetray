@@ -4,28 +4,28 @@
 
 The configuration is one file, TOML or JSON, read by `serve` and by the
 [one-shots](glossary.md) (`doctor`, `get`, and `info`). A document whose
-first non-whitespace character is `{` is JSON; anything else is TOML. Both
-read into the same schema.
+first non-whitespace character is `{` is JSON; anything else is TOML.
+icetray parses both into the same schema.
 
-- Every section may be left out, and then takes its defaults. Within a
-  section, a key marked required below must be present.
+- Every section is optional, and a section left out takes its defaults.
+  Within a section, a key marked required below must be present.
 - At least one table is required. A file that lists none is invalid.
-- A key the schema does not know is an error, and the message lists the
-  keys that section accepts.
-- The whole file is validated before anything is opened. An error names
+- A key outside the schema is an error, and the message lists the keys
+  that section accepts.
+- icetray validates the whole file before it opens anything. An error names
   the file, where its path came from, and the setting by its full path,
   such as `invalid configuration file icetray.toml (from --config):
   server.poll_interval 0s is below the minimum of 1s`, and the run exits 1.
-  A file that is not valid TOML is reported in one line with the line and
-  column, such as
+  icetray reports a file that is not valid TOML in one line, with the line
+  and column, such as
   `` is not valid toml: line 1, column 10: unclosed array table, expected `]` ``.
 
 ### An example
 
-This example serves one table from a table root and one from a REST
-catalog. Its values are chosen for a container, not copied from the
+This example configures one table read from a table root and one read
+through a REST catalog. Its values suit a container and differ from the
 defaults: the default listeners are loopback, and `storage.local` has no
-default at all.
+default.
 
 ```toml
 [server]
@@ -79,16 +79,18 @@ table = "profiles"
   or absolute local paths. A `file:` URI is `file:///data/kv`,
   `file://localhost/data/kv`, or `file:/data/kv`; one with a relative path
   (`file:data/kv`) or another host (`file://otherhost/data/kv`) is
-  refused. A `static` table's location is checked when the file is
-  validated, after the file's own rewrite rules: an empty location, a
-  relative path, and a location no store serves, such as `gs://` with no
-  rule rewriting it, are refused there as `tables[0].source.location`,
-  with exit 1. A `--rewrite` on the command line does not rescue such a
-  location. The file's locations are never resolved against a working
-  directory. (A relative `--location` on the command line is; see
-  [One table without a file](#one-table-without-a-file).) The locations a
-  table's metadata or catalog names are known only as it loads, and one
-  that no store serves fails the load with the error kind `location`.
+  refused. icetray checks a `static` table's location when it validates
+  the file, after applying the file's own rewrite rules: it refuses an
+  empty location, a relative path, and a location no store serves, such as
+  `gs://` with no rule rewriting it, as `tables[0].source.location`, with
+  exit 1. Validation applies only the file's rules, so a `--rewrite` on the
+  command line cannot make such a location valid. icetray never resolves
+  the file's locations against a working directory. (It does resolve a
+  relative `--location` on the command line; see
+  [One table without a file](#one-table-without-a-file).) The locations
+  that a table's metadata records or its catalog returns are known only at
+  load, and one that no store serves fails the load with the error kind
+  `location`.
 
 ### `[server]`
 
@@ -98,25 +100,26 @@ table = "profiles"
 | `metrics_listen` | address | `"127.0.0.1:9433"` | The HTTP listener for `/metrics` and `/ready`. |
 | `poll_interval` | duration | `"10s"` | How often each table's ref is re-resolved and the configuration file re-read. At least `"1s"` and at most `"24h"`. |
 | `page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the value-page cache. See the note below. |
-| `get_deadline` | duration | `"5s"` | The longest a `Get` may run, and the longest each page fetch of any lookup may run, in a `MultiGet` too. Past it the call is `DEADLINE_EXCEEDED`. |
+| `get_deadline` | duration | `"5s"` | The longest a `Get` may run, and the longest each page fetch of any lookup may run, in a `MultiGet` too. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
-| `max_in_flight` | count | `1024` | `Get` and `MultiGet` calls in flight at once. One more is refused at once as `RESOURCE_EXHAUSTED`, never queued. |
-| `max_multi_get_values` | count | `1000` | Values one `MultiGet` may ask for: its keys times the columns it names, a presence-only call counting one per key. More is `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
-| `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table serves: a first load, or a retry after one failed. |
+| `max_in_flight` | count | `1024` | The most `Get` and `MultiGet` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
+| `max_multi_get_values` | count | `1000` | The most values one `MultiGet` may request: its keys times the columns it requests, a presence-only request counting one per key. icetray rejects a larger request with `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
+| `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table is serving: a first load, or a retry after one failed. |
 | `refresh_deadline` | duration | `"5m"` | The longest one refresh over a serving generation may run. Past it the table is [degraded](glossary.md) and the next poll retries. |
-| `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls before it stops waiting. |
+| `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls to finish. |
 
-Every duration and both counts must be above zero. A client's own
-deadline is enforced by the gRPC layer and is the client's to report.
+Every duration and both counts must be above zero. The gRPC layer
+enforces a client's own deadline, and its expiry is reported as the
+client's.
 
 The page cache has one shard per tokio worker thread, rounded up to a
 power of two, and each shard must hold one 64 KiB value page plus its
-64-byte entry: 65,600 bytes. Parsing refuses a `page_cache_bytes` under
-one shard's minimum, and opening the cache refuses one under the total
-for the machine's shards (1,049,600 bytes for the 16 shards of an
-11-core machine), with exit 1, before any table loads. The worker count
-is the number of cores the process sees, unless `TOKIO_WORKER_THREADS`
-sets it.
+64-byte entry: 65,600 bytes. icetray refuses a `page_cache_bytes` under
+one shard's minimum when it parses the file, and one under the total for
+the machine's shards (1,049,600 bytes for the 16 shards of an 11-core
+machine) when it opens the cache, with exit 1, before any table loads.
+The worker count is the number of cores the process sees, unless
+`TOKIO_WORKER_THREADS` sets it.
 
 ### `[server.log]`
 
@@ -167,17 +170,17 @@ which is resolved once for both.
 |---|---|---|---|
 | `endpoint` | string | AWS | The endpoint URL, for S3-compatible stores. |
 | `region` | string | the SDK's | The region. A `glue` or `s3tables` source that names no region of its own uses it too. |
-| `access_key_id` | string | none | A static access key id. Set with `secret_access_key` or not at all. Static keys win over the chain. |
-| `secret_access_key` | string | none | The static secret key. It is never printed. |
+| `access_key_id` | string | none | A static access key id. Set with `secret_access_key` or not at all. Static keys take precedence over the chain. |
+| `secret_access_key` | string | none | The static secret key. icetray never prints it. |
 | `allow_http` | boolean | `false` | Permit a plain HTTP endpoint. |
 | `path_style` | boolean | `false` | Address buckets as `host/bucket/key` rather than by virtual host. |
 
 ### `[[storage.rewrite]]`
 
 Each rule replaces a location prefix before any read, for tables whose
-metadata records paths from another host or bucket. Rules apply in file
-order to every location the metadata yields, and the first rule whose
-`from` matches wins.
+metadata records paths from another host or bucket. icetray tries the
+rules in file order on every location the metadata records, and applies
+the first rule whose `from` matches.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -186,29 +189,30 @@ order to every location the metadata yields, and the first rule whose
 
 ### `[storage.hedge]`
 
-A lookup GET still unanswered after the delay is sent a second time, and
-the first answer wins. Load reads are never hedged.
+When a lookup GET has no response after the delay, icetray sends it a
+second time and uses whichever response arrives first. Load reads are
+never hedged.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Whether lookup GETs are hedged. |
 | `percentile` | number | `0.95` | The delay is this percentile of the table's recent lookup GET latencies. In (0, 1]. |
 | `window` | count | `256` | Lookup GETs in each table's latency window. At least 1. |
-| `max_rate` | number | `0.05` | The share of requests that may hedge. In [0, 1]. |
+| `max_rate` | number | `0.05` | The largest share of the lookup GETs in the window that may be hedged. In [0, 1]. |
 
 The ranges are checked even when `enabled` is `false`.
 
 ### `[storage.local]`
 
 The optional local directory: the chunk files of `disk` tables and the
-page cache's disk level. Everything in it is rebuilt from object storage
-([Operating icetray](operating.md#the-local-directory)).
+page cache's disk level. icetray rebuilds everything in it from object
+storage ([Operating icetray](operating.md#the-local-directory)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | path | required | The directory. A relative path is taken from the working directory. |
 | `page_cache_disk_bytes` | bytes | required | The size bound of the page cache's disk level. `0` turns the level off; any other value is at least one 4 MiB block, 4194304. |
-| `index_budget_bytes` | bytes | unbounded | The bytes chunk files may occupy across every table, checked when a load begins. A load that would pass it is refused as `over_budget`. |
+| `index_budget_bytes` | bytes | unbounded | The bytes chunk files may occupy across every table. icetray checks it when a load begins and refuses a load that would exceed it as `over_budget`. |
 
 The disk level holds one open file descriptor per 4 MiB block, so
 `page_cache_disk_bytes` sets part of the descriptor limit a replica needs
@@ -218,51 +222,52 @@ The disk level holds one open file descriptor per 4 MiB block, so
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | required | The name clients use. Unique and not empty. |
+| `name` | string | required | The name clients request the table by. Unique and not empty. |
 | `ref` | string | required | The Iceberg branch or tag to serve, such as `"main"`. |
-| `key_column` | string | required | The key column: a top-level field of the snapshot's schema, found in each data file by its name and field id ([Changing the schema](table-contract.md#changing-the-schema)). |
-| `value_columns` | list of strings or tables | required | The value columns the table serves, each a top-level field found the same way and each read only when a lookup names it ([Value columns](table-contract.md#value-columns)). An entry is the column's name, `"payload"`, or a table of its `name` and its `format`, `{ name = "detail", format = "protobuf" }`; in JSON, `"payload"` or `{"name": "detail", "format": "protobuf"}`. `format` is `"opaque"`, the default, bytes icetray never looks into, or `"protobuf"`, a serialized protobuf message a lookup may trim to the top-level fields it names ([Protobuf columns](table-contract.md#protobuf-columns)). A key the table form does not know is a schema error placed at it, as ``tables[0].value_columns[1].fromat: unknown field `fromat`, expected `name` or `format` ``, and so is a format of another name, as ``tables[0].value_columns[1].format: unknown variant `json`, expected `opaque` or `protobuf` ``. The list may be empty, `value_columns = []`, for a table that answers only whether a key is present. Each column must be of Iceberg type `binary`, `fixed`, or `string`, and a protobuf one `binary`, or the snapshot is refused as `value_type_unsupported`, naming the column. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. Order carries no meaning: a reload that only reorders the list changes nothing, one that changes only formats applies to the serving snapshot in place, and one that changes the set loads the table anew. |
-| `source` | table | required | Where the table's metadata comes from, below. |
-| `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
-| `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
-| `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` needs `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
-| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: a load whose resident bytes would pass it, its delete state counted at a bound taken from the manifests, is refused as `over_budget` once the footers are read, before any key chunk or delete is fetched. Set on a `disk` or `bloom` table, it makes the file invalid. |
+| `key_column` | string | required | The key column: a top-level field of the snapshot's schema, which icetray matches in each data file by its name and field id ([Changing the schema](table-layout.md#changing-the-schema)). |
+| `value_columns` | list of strings or tables | required | The value columns icetray serves for the table. Each is a top-level field matched the same way, and icetray reads it only when a request lists it ([Value columns](table-layout.md#value-columns)). An entry is the column's name, `"payload"`, or a table of its `name` and its `format`, `{ name = "detail", format = "protobuf" }`; in JSON, `"payload"` or `{"name": "detail", "format": "protobuf"}`. `format` is `"opaque"`, the default, for bytes icetray returns as stored, or `"protobuf"`, for a serialized protobuf message that icetray can trim to the top-level fields a request lists ([Protobuf columns](table-layout.md#protobuf-columns)). An unknown key in the table form is a schema error reported at its path, as ``tables[0].value_columns[1].fromat: unknown field `fromat`, expected `name` or `format` ``, and so is an unknown format, as ``tables[0].value_columns[1].format: unknown variant `json`, expected `opaque` or `protobuf` ``. The list may be empty, `value_columns = []`, for a table served for key presence only. Each column must be of Iceberg type `binary`, `fixed`, or `string`, and a protobuf column of type `binary`; icetray refuses a snapshot that breaks this as `value_type_unsupported`, naming the column. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. The order of the list is not significant: a reload that only reorders it changes nothing, one that changes only formats applies to the serving snapshot in place, and one that changes the set of columns loads the table anew. |
+| `source` | table | required | Where icetray reads the table's metadata from, below. |
+| `lookups` | string | the best level `residency` reaches | The lookup cost the owner accepts for the table: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
+| `strict` | boolean | `false` | Whether icetray refuses a snapshot whose layout falls below the table's `lookups` level. When a strict table's first snapshot is below its level, the start fails; icetray refuses a later one and [holds](glossary.md) the table, and the last snapshot that met the level keeps serving. With `strict` off, icetray serves the snapshot and flags the table below its level. |
+| `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` requires `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
+| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: the most resident bytes a load may hold, its delete state counted at a bound taken from the manifests. icetray refuses a load that would exceed it as `over_budget` once the footers are read, before it fetches any key chunk or delete. Set on a `disk` or `bloom` table, it makes the file invalid. |
 
 ### `[tables.source]`
 
-The `type` key picks the source kind. On every poll, icetray finds the
+The `type` key selects the source kind. On every poll, icetray finds the
 table's current metadata, resolves the configured ref in it, and builds a
-new [generation](glossary.md) when the ref names a new snapshot.
+new [generation](glossary.md) when the ref points to a new snapshot.
 
 | `type` | Keys | What a poll follows |
 |---|---|---|
-| `"static"` | `location`, required: a table root or a metadata file | A table root is followed through its `metadata/version-hint.text`, as the Hadoop catalog writes it; an unchanged hint costs that one read. A location ending in `.metadata.json` names one metadata file, which never changes, so the table never advances. |
-| `"rest"` | `uri`, required: the catalog's base URI; `warehouse`, optional; `namespace`, required, its levels separated by dots (`"db.schema"`); `table`, required | Each poll loads the table from the catalog, one call within `storage.catalog_timeout`, and follows the metadata location the catalog returns. An unchanged location costs that call and no read; a new one costs one read of its metadata file, for the column defaults the catalog's client does not report ([Changing the schema](table-contract.md#changing-the-schema)). |
+| `"static"` | `location`, required: a table root or a metadata file | For a table root, icetray reads its `metadata/version-hint.text`, as the Hadoop catalog writes it; an unchanged hint costs that one read. A location ending in `.metadata.json` is a single metadata file, which never changes, so the table never advances to a new snapshot. |
+| `"rest"` | `uri`, required: the catalog's base URI; `warehouse`, optional; `namespace`, required, its levels separated by dots (`"db.schema"`); `table`, required | Each poll loads the table from the catalog, one call within `storage.catalog_timeout`, and follows the metadata location the catalog returns. An unchanged location costs that call and no read; a new one costs one read of its metadata file, for the column defaults the catalog's client does not report ([Changing the schema](table-layout.md#changing-the-schema)). |
 | `"glue"` | `database` and `table`, required; `catalog_id`, `region`, and `endpoint`, optional; [below](#glue) | Each poll calls Glue's `GetTable`, one call within `storage.catalog_timeout`, and follows the table's `metadata_location` parameter. An unchanged location costs that call and no read. |
 | `"s3tables"` | `table_bucket_arn`, `namespace`, and `table`, required; `region` and `endpoint`, optional; [below](#s3tables) | Each poll calls S3 Tables' `GetTableMetadataLocation`, one call within `storage.catalog_timeout`, and follows the location it returns. An unchanged location costs that call and no read. |
 
 The `rest` source sends no credentials. Its requests carry no
 `Authorization` header, so a catalog that requires a bearer token, OAuth2
-client credentials, or SigV4 signing cannot be used directly. It serves
-REST catalogs that need no credentials, and catalogs behind a proxy that
-adds them. A catalog that answers an unauthenticated request with 401
-fails the table's first load, and the server exits 1. Credentials a
-catalog vends for storage are not used either: every object read goes
-through `[storage]` and its credentials.
+client credentials, or SigV4 signing cannot be used directly. The source
+works with REST catalogs that require no credentials, and with catalogs
+behind a proxy that adds them. A catalog that responds to an
+unauthenticated request with 401 fails the table's first load, and the
+server exits 1. icetray also ignores storage credentials a catalog vends:
+every object read goes through `[storage]` and its credentials.
 
-The `glue` and `s3tables` sources ask their catalog for the location of
-the table's current metadata file and nothing else. The metadata file and
-every file it names are read through `[storage]`, its rewrite rules
-included, as a `static` table's are. Their calls are signed with the
-credentials `[storage.s3]` describes, and a call the catalog refuses or
-that fails fails the load or poll with the error kind `catalog`; one that
-runs past `storage.catalog_timeout` fails it with `catalog_timeout`.
+For a `glue` or `s3tables` source, icetray requests only the location of
+the table's current metadata file from the catalog. It reads the metadata
+file and every file it lists through `[storage]`, its rewrite rules
+included, as it does for a `static` table. The catalog calls are signed
+with the credentials `[storage.s3]` describes. A call that the catalog
+rejects, or that fails, fails the load or poll with the error kind
+`catalog`; one that runs past `storage.catalog_timeout` fails it with
+`catalog_timeout`.
 
 The region of either source is its own `region` when set, else
-`storage.s3.region`, else, for `s3tables`, the region the table bucket's
-ARN names. A `glue` source that none of these names follows the SDK's own
-region resolution: `AWS_REGION`, the profile, or the instance metadata
-service.
+`storage.s3.region`, else, for `s3tables`, the region in the table
+bucket's ARN. For a `glue` source with none of these, icetray falls back
+to the SDK's own region resolution: `AWS_REGION`, the profile, or the
+instance metadata service.
 
 #### `glue`
 
@@ -275,9 +280,10 @@ service.
 | `endpoint` | string | AWS | An `http://` or `https://` endpoint URL, for a Glue-compatible service or a VPC endpoint. |
 
 The table must be an Iceberg table: its `table_type` parameter is
-`ICEBERG`, in any case, and its `metadata_location` parameter names the
-current metadata file. A table of another type is refused with the error
-kind `table`, as is one without a `metadata_location`.
+`ICEBERG`, in any letter case, and its `metadata_location` parameter holds
+the location of the current metadata file. icetray refuses a table of
+another type with the error kind `table`, and one without a
+`metadata_location` too.
 
 ```toml
 [tables.source]
@@ -296,8 +302,8 @@ table = "kv"
 | `region` | string | as above | The region of the S3 Tables endpoint. Not empty when set. |
 | `endpoint` | string | AWS | An `http://` or `https://` endpoint URL, for an S3 Tables-compatible service or a VPC endpoint. |
 
-A table the service holds no metadata location for, such as one created
-and never written, is refused with the error kind `table`.
+icetray refuses a table that has no metadata location in the service,
+such as one created and never written, with the error kind `table`.
 
 ```toml
 [tables.source]
@@ -307,17 +313,18 @@ namespace = "db"
 table = "kv"
 ```
 
-A required key left out, or a key the source kind does not take, is
-refused at `tables[0].source`; an empty value is refused by the setting's
-full path, as `tables[0].source.database is empty`.
+A required key left out, or a key outside the source kind's schema, is
+reported at `tables[0].source`; an empty value is reported at the
+setting's full path, as `tables[0].source.database is empty`.
 
 ## Choosing a residency
 
-A table's [residency](glossary.md) decides where its key chunks live, and
-with it the table's memory, its disk use, and its GETs per lookup. Every
-residency gives the same answers. `icetray info` and `icetray doctor`
-print each residency's resident bytes under `predicted`, computed from the
-footers alone, so the choice can be made with the numbers in hand.
+A table's [residency](glossary.md) sets where icetray stores its key
+chunks, and with it the table's memory, its disk use, and its GETs per
+lookup. Every residency returns the same results. `icetray info` and
+`icetray doctor` print each residency's resident bytes under `predicted`,
+computed from the footers alone, so the owner can choose with the numbers
+in hand.
 
 | | `full` | `disk` | `bloom` |
 |---|---|---|---|
@@ -325,29 +332,29 @@ footers alone, so the choice can be made with the numbers in hand.
 | Local disk | none | `predicted.disk_bytes` of chunk files | none |
 | Cold hit | 1 GET | 1 local read and 1 GET | 2 GETs: the key page, then the value page |
 | Warm hit | none | 1 local read | none |
-| Miss | none | 1 local read | none, or 1 GET when the filter passes a key that is absent |
+| Miss | none | 1 local read | none, or 1 GET when an absent key passes the filter |
 | Needs | memory for the key chunks | `[storage.local]` on a mounted volume | a bloom filter on the key in every file |
 
 - **`full`**, the default, is the fastest on a hit. Use it whenever
   `predicted.full` fits in the replica's memory beside the page cache.
-  `resident_budget_bytes` turns a table that outgrows its share into a
-  refusal before its key chunks are fetched.
-- **`disk`** holds a fraction of a byte per key in memory and keeps the
-  rest in a local file. Use it for tables whose key chunks do not fit in
-  memory, on a replica with a local volume. A local read is a memory copy
-  while the operating system's page cache holds the chunk file, so size
-  the memory limit with room for `predicted.disk_bytes`
+  With `resident_budget_bytes` set, icetray refuses a table that outgrows
+  its share before it fetches the key chunks.
+- **`disk`** holds a fraction of a byte per key in memory and stores the
+  key chunks in a local file. Use it for tables whose key chunks do not
+  fit in memory, on a replica with a local volume. A local read is a
+  memory copy while the operating system's page cache holds the chunk
+  file, so size the memory limit with room for `predicted.disk_bytes`
   ([Operating icetray](operating.md#memory)).
-- **`bloom`** needs no disk, at the price of a second GET on every cold
-  hit and a GET for each false positive. The miss rate follows the
-  writer's filter size, which `predicted.bloom_bits_per_key` reports: at
-  8 bits per key or more, few misses cost a GET. Writers often size the
-  filter per row group rather than per key, which can make
-  `predicted.bloom` larger than `predicted.full`; compare the two before
-  choosing it. A `bloom` load fetches the key chunks to verify them and
-  holds them while it does, so its memory at load is above what it keeps.
-  Use it when the keys do not fit in memory and no local volume can be
-  mounted.
+- **`bloom`** requires no local disk and costs a second GET on every cold
+  hit and a GET for each false positive. The share of misses that cost a
+  GET depends on the writer's filter size, which
+  `predicted.bloom_bits_per_key` reports: at 8 bits per key or more, few
+  do. Writers often size the filter per row group rather than per key,
+  which can make `predicted.bloom` larger than `predicted.full`; compare
+  the two before choosing `bloom`. A `bloom` load fetches the key chunks
+  to verify them and holds them until verification ends, so its memory during
+  the load exceeds what it retains. Use it when the keys do not fit in
+  memory and no local volume can be mounted.
 
 The decision is recorded in [RFD 017](rfd/017-residency-tiers.md).
 
@@ -360,53 +367,56 @@ stated in what a lookup costs, so it means the same on every table:
   none, and a lookup probes one file and decodes one key page of ordinary
   size.
 - `balanced`: a lookup still probes one file, with a fixed extra cost: an
-  extra GET per hit, a GET for a miss the bloom filter passes, larger key
-  pages, or key pages read from the device instead of the page cache.
+  extra GET per hit, a GET for a miss that passes the bloom filter, larger
+  key pages, or key pages read from the device instead of the page cache.
 - `permissive`: any snapshot icetray serves correctly, including one where
   a lookup probes more than one file.
 
 The level a snapshot achieves is the costliest level that its residency
 or any of its findings caps it at. `bloom` residency caps it at
 `balanced`; the findings that cap it, and at which level, are in [the
-table contract](table-contract.md#requirements). Advice caps nothing.
-Each value column has a level of its own: the caps of its own findings,
-such as `dictionary_encoded_value` on that column, with those of every
-finding about the row or the table. The table's level is its dearest
-column's, and a table of no value columns has the level of finding the
-row. Under `strict`, one column below the declared level refuses the
-snapshot for the whole table. The doctor prints the level as `level`,
-each column's under `value_columns`, and under `level_by_residency` the
-level each residency would reach with the same files, beside what each
-costs under `predicted`. A serving `disk` table also falls to `balanced`
-while the kernel's page cache holds too little of its chunk files
-([Metrics](operating.md#metrics)). That depends on the server's memory,
-not on the snapshot, so the doctor does not report it and `strict` never
-acts on it.
+optimal layout's requirements](table-layout.md#requirements). Advice
+caps nothing. Each value column has a level of its own, which combines
+the caps of its own findings, such as `dictionary_encoded_value` on that
+column, with those of every finding about the row or the table. The
+table's level is its costliest column's, and a table with no value
+columns has the level of locating the row. Under `strict`, icetray
+refuses the snapshot for the whole table when one column is below the
+declared level. The doctor prints the level as `level`, each column's
+under `value_columns`, and under `level_by_residency` the level each
+residency would reach with the same files, beside what each costs under
+`predicted`. A serving `disk` table also falls to `balanced` while the
+kernel's page cache holds too little of its chunk files
+([Metrics](operating.md#metrics)). That state follows from the server's
+memory and is independent of the snapshot, so the doctor does not report
+it and `strict` never acts on it.
 
 The line between `balanced` and `permissive` is the one that matters for
 operations. A cost within one file follows from how the files are written
-and stays put. Extra files probed come from how the table is committed
-to, and they grow with every append until a compaction removes them.
+and stays constant. Extra files probed follow from how writers commit to
+the table, and their number grows with every append until a compaction
+merges the files.
 
-Choose the level by what the table's readers and its writer can live
-with:
+Choose the level from the latency the table's readers need and the
+layout its writer can produce:
 
 - Keep the default, the best level the residency reaches, when the
-  table's lookups sit on a latency-sensitive path and a table that gets
-  slower should alert its owner.
-- Declare `balanced` for a table whose writer cannot drop the value
-  dictionary or shrink its key pages. Left at the default, such a table
-  reads below its level from its first load
+  table's lookups are on a latency-sensitive path and its owner should be
+  alerted when they get slower.
+- Declare `balanced` for a table whose writer cannot turn off dictionary
+  encoding on the value column or shrink its key pages. Left at the
+  default, such a table is below its level from its first load
   ([What to alert on](operating.md#what-to-alert-on)).
-- Declare `permissive` for a table that takes appends with no compaction
-  schedule, accepting lookups that slow down until a compaction runs.
+- Declare `permissive` for a table that receives appends with no
+  compaction schedule, whose lookups slow down until a compaction runs.
 
-`strict` decides what falling below the level does. Off, the default, the
-snapshot serves and the table is flagged. On, a snapshot whose layout is
-below the level is refused as `below_level`: at start `serve` exits 1, and
-on a refresh the last snapshot that met the level keeps serving and the
-table is held ([Refresh and reload](operating.md#refresh-and-reload)). A
-strict table's level is judged before any key chunk is fetched, from the
+`strict` sets what icetray does when a snapshot falls below the level.
+With `strict` off, the default, icetray serves the snapshot and flags the
+table. With it on, icetray refuses a snapshot whose layout is below the
+level as `below_level`: at start `serve` exits 1, and on a refresh
+icetray holds the table and the last snapshot that met the level keeps
+serving ([Refresh and reload](operating.md#refresh-and-reload)). icetray
+judges a strict table's level before it fetches any key chunk, from the
 manifests, the footers, and the first and last key page of each new file
 that shares a bucket with another, with the key's dictionary page when it
 has one, so a refused snapshot writes nothing to the local directory.
@@ -420,7 +430,7 @@ icetray <COMMAND>
 
 Commands:
   serve   Run the gRPC server
-  doctor  Check tables against the table contract
+  doctor  Check tables against the optimal layout
   get     Look up keys in one table
   info    Describe each table's current snapshot
 ```
@@ -440,33 +450,34 @@ icetray get --location s3://warehouse/db/kv --value-column payload --column payl
 - `serve` takes `-c, --config <PATH>` and nothing else. It is described
   in [Operating icetray](operating.md).
 - `doctor` loads each table, checks it against the
-  [table contract](table-contract.md), and prints a `table` line, a
-  `finding` line per finding, and a `refusal` line for a table that cannot
-  be served. `--files` adds a `file` line per data file. The doctor
-  decodes and hashes every key to check that it sits in its file's bucket,
-  which a load does not, so it takes longer than `info` on the same table.
-  For each column declared protobuf it also walks the default the
-  column states, with no GET, and every value on the first value page of
-  the first file holding the column, one GET, two for a
-  dictionary-encoded chunk, passing to the next file holding the column
-  when that page holds only nulls, up to three files. A value or default
-  that is not protobuf is `malformed_protobuf` advice; a page it cannot
-  read is an `unwalked` line, and the rest of the table's report stands.
+  [optimal layout](table-layout.md), and prints a `table` line, a
+  `finding` line per finding, and a `refusal` line for a table that
+  icetray refuses. `--files` adds a `file` line per data file. The doctor
+  decodes and hashes every key to check that it belongs in its file's
+  bucket, a check a load skips, so the doctor takes longer than `info` on
+  the same table. For each column declared protobuf it also walks the
+  column's default, which costs no GET, and every value on the first
+  value page of the first file holding the column, which costs one GET,
+  or two for a dictionary-encoded chunk. When that page holds only nulls,
+  it moves to the next file holding the column, up to three files. The
+  doctor reports a value or default that does not parse as protobuf as
+  `malformed_protobuf` advice, and a page it cannot read as an `unwalked`
+  line; the rest of the table's report is unaffected.
 - `info` loads each table and prints its `table` line.
 - `get` loads one table and prints a `lookup` line per key, in the order
   given. It takes a repeatable `--column <NAME[=FIELDS]>`, the value
-  columns to read for every key, in the order given, with no default:
-  with none, each line says only whether its key is present and no value
-  page is read. `FIELDS` is a comma-separated list of top-level field
-  numbers, such as `--column detail=1,4,9`, for a column declared
-  protobuf: each value is trimmed to those fields, and its line carries
-  the trimmed bytes in the usual shape. `NAME` alone reads the whole
-  value, and so does `NAME=`, the form for a name that holds an `=`. A
-  column the table does not serve, one named twice, a field list for a
-  column not declared protobuf, a number outside 1 to 536870911, or one
-  given twice exits 64 before the table loads, and so does a field list
-  that is not numbers. A value that is not protobuf fails the run with
-  exit 1, naming the table, column, and key.
+  columns to read for every key, in the order given. The flag has no
+  default: with none, each line reports only whether its key is present,
+  and `get` reads no value page. `FIELDS` is a comma-separated list of
+  top-level field numbers, such as `--column detail=1,4,9`, for a column
+  declared protobuf: `get` trims each value to those fields and prints the
+  trimmed bytes in the usual shape. `NAME` alone reads the whole value,
+  and so does `NAME=`, the form for a name that contains an `=`. A column
+  the table does not serve, one listed twice, a field list for a column
+  not declared protobuf, a number outside 1 to 536870911, or one given
+  twice exits 64 before the table loads, and so does a field list that is
+  not numbers. A value that does not parse as protobuf fails the run with
+  exit 1, and the error names the table, column, and key.
 
 ### Choosing the tables
 
@@ -479,16 +490,16 @@ The one-shots share one set of flags, grouped in their help as follows.
 | `-c, --config <PATH>` | The configuration file. |
 | `--location <URI>` | One table opened without a file; see below. Cannot be combined with `--config`. |
 | `--rewrite <FROM=TO>` | A location prefix rewrite, repeatable, under either target. |
-| `-t, --table <NAME>` | Selects a configured table, so it needs a configuration file. On `doctor` and `info` it limits the run to that table; on `get` it is required when the file lists more than one. |
+| `-t, --table <NAME>` | Selects a configured table, so it requires a configuration file. On `doctor` and `info` it limits the run to that table; on `get` it is required when the file lists more than one. |
 
 **Located table (with --location)**
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--key-column <COLUMN>` | `key` | The key column. |
-| `--value-column <NAME[:FORMAT]>` | none | A value column the table serves, with its format, `opaque` by default or `protobuf`; repeatable. A name holding a `:` takes its format after it, as `a:b:opaque`. An unknown format exits 64. With none, the table answers only whether a key is present. |
+| `--value-column <NAME[:FORMAT]>` | none | A value column the table serves, with its format, `opaque` by default or `protobuf`; repeatable. A name holding a `:` takes its format after it, as `a:b:opaque`. An unknown format exits 64. With none, the table is served for key presence only. |
 | `--ref <REF>` | `main` | The branch or tag to read. |
-| `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` needs a local directory and is available through a configuration file. |
+| `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` requires a local directory, so it is available only through a configuration file. |
 
 **Output** (`doctor` only)
 
@@ -496,17 +507,16 @@ The one-shots share one set of flags, grouped in their help as follows.
 |---|---|
 | `--files` | Also print one `file` line per data file. |
 
-The configuration file comes from `--config`, or, with neither `--config`
-nor `--location`, from the `ICETRAY_CONFIG` environment variable. An empty
-`ICETRAY_CONFIG` counts as unset. A `--location` run reads no
-configuration file, not even one the variable names. With no flag and no
-variable, the run exits 64 with
+icetray reads the configuration file named by `--config`, or, with
+neither `--config` nor `--location`, by the `ICETRAY_CONFIG` environment
+variable. An empty `ICETRAY_CONFIG` counts as unset. A `--location` run
+reads no configuration file and ignores `ICETRAY_CONFIG`. With no flag and
+no variable, the run exits 64 with
 `no configuration: pass --config or --location, or set ICETRAY_CONFIG`.
-A file that cannot be read, or that does not parse or validate, is named
-in the error with where its path came from, `--config` or
-`ICETRAY_CONFIG`.
+When a file cannot be read, or does not parse or validate, the error
+names it with where its path came from, `--config` or `ICETRAY_CONFIG`.
 
-A `--table` name that no configured table has exits 64, and so does
+A `--table` name that matches no configured table exits 64, and so does
 `--table` given with `--location`. Both errors print a hint: the first
 lists the configured names, and the second says to drop `--table` or to
 pass `--config` instead of `--location`.
@@ -521,11 +531,12 @@ path is resolved against the working directory, so
 root. The table is named after the table root's last directory: `kv` for
 `s3://warehouse/db/kv` and for
 `s3://warehouse/db/kv/metadata/v3.metadata.json`. A location with no
-directory to name it after, such as a bare bucket, opens as `table`.
+directory to name the table after, such as a bare bucket, opens as a
+table named `table`.
 
 A located table runs with every `[server]` and `[storage]` default. Its
-value columns are the ones its `--value-column` flags name, none when
-there are none, so the doctor checks only those columns' layout. Its
+value columns are the ones the `--value-column` flags list, or none, so
+the doctor checks only those columns' layout. Its
 `lookups` is the best level its `--residency` reaches, `optimal` for
 `full` and `balanced` for `bloom`, and it is never strict, so the doctor
 reports a located table below that level with exit 2 rather than refusing
@@ -539,12 +550,12 @@ icetray info --location target/golden-warehouse/db/long_2m --value-column value
 
 ### Rewrite rules on the command line
 
-`--rewrite FROM=TO` splits at the first `=`, and both halves must be non
-empty: `--rewrite =x` or `--rewrite x` exits 64, naming the flag and the
-value. A `TO` that is a relative local path is resolved against the working
-directory. Under `--config`, the command line's rules go ahead of the
-file's, so they win for the same prefix. `serve` takes no `--rewrite`;
-its rules come from the file.
+`--rewrite FROM=TO` splits at the first `=`, and both halves must be
+non-empty: `--rewrite =x` or `--rewrite x` exits 64, and the error names
+the flag and the value. A `TO` that is a relative local path is resolved
+against the working directory. Under `--config`, icetray puts the command
+line's rules ahead of the file's, so they take precedence for the same
+prefix. `serve` takes no `--rewrite`; it reads its rules from the file.
 
 ### Keys
 
@@ -561,9 +572,9 @@ A [`lookup` line](#lookup)'s `key` is in this form, so passed back to
 
 A key that starts with `-` and is not a number goes after `--`:
 `icetray get --location ... -- -abc`. `get` reads the key type from the
-table's metadata and checks every key against it before it loads any data
-file, so a key that does not parse exits 64 at once, with a hint giving
-the form.
+table's metadata and parses every key as that type before it loads any
+data file, so a key that does not parse exits 64 at once, with a hint
+giving the form.
 
 ## Output
 
@@ -577,9 +588,9 @@ error: no table named nope is configured
   hint: pass --table with one of: long_2m, str_2m
 ```
 
-The `hint` line appears when the fix is plain from the failure. When a
-reader closes stdout early, as `head` does, the run stops printing and
-exits 0.
+icetray prints the `hint` line when the failure points to a clear fix.
+When a reader closes stdout early, as `head` does, the run stops printing
+and exits 0.
 
 ### The output contract, version 1
 
@@ -609,8 +620,8 @@ One per table, from `info` and from `doctor`:
 | Key | Value |
 |---|---|
 | `snapshot_id` | The snapshot loaded. |
-| `level` | The [level](#choosing-a-level) the snapshot achieves in the loaded residency: `optimal`, `balanced`, or `permissive`, the costliest level that the residency or any finding caps it at, which is its dearest value column's. |
-| `lookups` | The level the table declares: its configured `lookups`, or for a located table the best level its residency reaches. |
+| `level` | The [level](#choosing-a-level) the snapshot achieves in the loaded residency: `optimal`, `balanced`, or `permissive`, the costliest level that the residency or any finding caps it at, which is its costliest value column's. |
+| `lookups` | The table's declared level: its configured `lookups`, or for a located table the best level its residency reaches. |
 | `residency` | The residency the table was loaded in. |
 | `file_count` | Live data files in the snapshot. |
 | `buckets` | The bucket count of the key's bucket transform, `null` for a table without one. |
@@ -626,15 +637,15 @@ One per table, from `info` and from `doctor`:
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
 | `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
 | `level_by_residency` | For each residency that can load the table, the level its files would reach there. A residency that cannot load the table is left out, as `bloom` is when `predicted.bloom` is `null`. |
-| `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, finding the row and reading the dearest value column, as `icetray_table_gets_per_hit` reports it while the snapshot serves. For a table of no value columns, finding the row alone. |
+| `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, locating the row and reading the costliest value column, as `icetray_table_gets_per_hit` reports it while the snapshot serves. For a table with no value columns, locating the row alone. |
 | `lookup_cost.gets_per_miss` | GETs one miss makes at worst, as `icetray_table_gets_per_miss` reports it. |
 | `lookup_cost.files_probed` | Files one lookup probes at worst, as `icetray_table_files_probed_per_lookup` reports it. |
-| `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes; empty for a table of none. |
+| `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes; empty for a table with none. |
 | `value_columns[].column` | The column's name. |
-| `value_columns[].format` | The column's format as the table's entry declares it: `opaque` or `protobuf`. |
-| `value_columns[].level` | The level a lookup naming the column achieves, as `icetray_table_column_level` reports it. |
-| `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it names. |
-| `value_columns[].files_answering_default` | Data files written before the column was added, which answer its default. |
+| `value_columns[].format` | The column's format as configured in the table's entry: `opaque` or `protobuf`. |
+| `value_columns[].level` | The level a lookup requesting the column achieves, as `icetray_table_column_level` reports it. |
+| `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. |
+| `value_columns[].files_answering_default` | Data files written before the column was added, for which a lookup returns the column's default. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
 | `deletes.fraction` | `deletes.rows` over `records`, as `icetray_table_deleted_fraction` reports it. |
@@ -649,12 +660,12 @@ One per finding, from `doctor`, capping findings first:
 | Key | Value |
 |---|---|
 | `caps` | The level the finding caps the table at, `balanced` or `permissive`; `null` for advice. |
-| `code` | The finding's code, such as `large_key_pages`; the codes are in [the table contract](table-contract.md#requirements). |
+| `code` | The finding's code, such as `large_key_pages`; the codes are in [the optimal layout's requirements](table-layout.md#requirements). |
 | `message` | What was measured, for a person. |
 | `file` | The data file's location, or `null` for a table-level finding. |
 | `column` | The value column the finding is about, for `dictionary_encoded_value`, `large_value_pages`, `value_pages_over_ceiling`, `column_default`, and `malformed_protobuf`; `null` for a finding about the row or the table. |
 | `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
-| `property` | The writer property that fixes it, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
+| `property` | The writer property that corrects the layout, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
 
 #### `file`
 
@@ -663,7 +674,7 @@ One per data file, from `doctor --files`:
 | Key | Value |
 |---|---|
 | `path` | The file's location as the manifest records it. |
-| `bucket` | The bucket the file holds. |
+| `bucket` | The bucket the file belongs to. |
 | `key_type` | `long`, `string`, `binary`, or `uuid`. |
 | `rows`, `row_groups` | Rows and row groups in the file. |
 | `key_pages` | Data pages of the key column across every row group. |
@@ -671,12 +682,12 @@ One per data file, from `doctor --files`:
 | `max_key_bytes` | The longest key, in bytes. |
 | `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes. |
 | `value_columns[].column` | The column's name. |
-| `value_columns[].answers_default` | Whether the file was written before the column was added and answers its default; its counts are then zero. |
+| `value_columns[].answers_default` | Whether the file was written before the column was added, so a lookup in it returns the column's default; its counts are then zero. |
 | `value_columns[].value_pages` | Data pages of the column across every row group. |
 | `value_columns[].avg_value_page_bytes` | Mean uncompressed bytes of the column's value page: what a cold hit naming it decompresses. |
 | `value_columns[].avg_value_bytes` | Mean uncompressed bytes of one of the column's values. |
 | `value_columns[].pages_aligned` | Whether every page of the column starts on the same row as a key page. |
-| `dictionary_columns` | The columns, key or value, that a row group dictionary-encodes. |
+| `dictionary_columns` | The columns, key or value, that are dictionary-encoded in a row group. |
 | `bloom_bytes`, `bloom_bits_per_key` | The key's bloom filter size and bits per row; `null` when a row group has none. |
 | `key_chunk_bytes` | The key column's compressed bytes. |
 | `distinct_page_mins_ratio` | The share of key pages whose column-index minimum is distinct; low when the column index is truncated. |
@@ -694,7 +705,7 @@ for it:
 
 | Key | Value |
 |---|---|
-| `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
+| `reason` | A refusal reason from [the optimal layout's requirements](table-layout.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
 | `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
@@ -704,9 +715,9 @@ for it:
 #### `unwalked`
 
 One per column declared protobuf whose value page the doctor could not
-read, after the table's `finding` lines. The column's values went
-unchecked; the table is not refused for it, and the exit code is what the
-table's other lines make it:
+read, after the table's `finding` lines. The doctor leaves the column's
+values unchecked and does not refuse the table for it; the table's other
+lines set the exit code:
 
 ```json
 {"kind":"unwalked","table":"kv","column":"detail","error_kind":"object_store","message":"object store: Object at location db/kv/data/00000-0.parquet not found"}
@@ -735,7 +746,7 @@ One per key, from `get`:
 | `values.<column>.base64` | The value in standard base64 with padding. |
 | `values.<column>.utf8` | The value as text. Present only when its bytes are UTF-8. |
 | `values.<column>.bytes` | The value's length in bytes; `0` for a zero-length value, which is distinct from `null`. |
-| `snapshot_id` | The snapshot the answer came from. |
+| `snapshot_id` | The snapshot the lookup read. |
 | `gets` | The GETs this lookup issued. |
 | `elapsed_micros` | The lookup's time, in microseconds. |
 
@@ -743,10 +754,10 @@ One per key, from `get`:
 
 The same codes apply to every command; the root help's footer lists them.
 
-- **0**: the run did what was asked. An absent key is an answer, so a
-  `get` of absent keys exits 0. The doctor exits 0 when every table meets
-  its `lookups` level; advice does not change the code, and neither does
-  a capping finding the level accepts. `serve` exits 0 after a drain that
+- **0**: the run completed what was requested. An absent key is a valid
+  result, so a `get` of absent keys exits 0. The doctor exits 0 when every
+  table meets its `lookups` level; advice does not change the code, and
+  neither does a capping finding within the declared level. `serve` exits 0 after a drain that
   finished within `server.drain_deadline`.
 - **1**: the run failed. A configuration file that cannot be read, is not
   TOML or JSON, does not fit the schema (a key missing, unknown, or of the
@@ -756,7 +767,7 @@ The same codes apply to every command; the root help's footer lists them.
   path on the command line with no readable working directory; a load or
   read error; a table refused, which for the doctor is a `refusal` line,
   `below_level` under `strict` among them, and takes precedence over 2;
-  and for `serve`, a first load that failed, a listener that would not
+  and for `serve`, a first load that failed, a listener that failed to
   bind, or a drain that passed its deadline.
 - **2**: the doctor found a table below its `lookups` level that it did
   not refuse: a configured table with `strict` off, the default, or a

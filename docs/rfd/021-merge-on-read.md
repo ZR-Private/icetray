@@ -295,10 +295,11 @@ the delete files, and the delete state's bytes a compaction would remove
 and, where files overlap, the level the table would reach with none
 overlapping.
 
-Before release, three measurements are made on the testkit's contract
-tables, and their results go into `docs/performance.md` and the doctor's
-explanations: hit and miss latency at 1, 2, 4, 8, and 16 files per bucket
-under each residency, with deleted rows first in the probe order;
+Before release, three measurements are made on the testkit's tables in
+the optimal layout, and their results go into `docs/performance.md` and
+the doctor's explanations: hit and miss latency at 1, 2, 4, 8, and 16
+files per bucket under each residency, with deleted rows first in the
+probe order;
 delete-state memory at deleted fractions from 0.1% to 50%; and load and
 refresh time with up to 1,000 live delete files. If the bitmap check
 adds more than a tenth of a key-page decode to a lookup, the uncapped
@@ -354,7 +355,7 @@ wrong answer refusals exist to prevent.
 
 RFD 009's refusal of every delete file is replaced: its recommended
 serving ref stays the pattern for `optimal`, and its deferred native reads
-are this RFD. The table contract replaces `delete_files` with
+are this RFD. The optimal layout replaces `delete_files` with
 `equality_deletes` and `delete_kind_unsupported`, and its rule that every
 key appears once becomes two: a key appears at most once within a data
 file, and a live key appears in at most one file. RFD 020's

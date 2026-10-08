@@ -7,7 +7,7 @@ an RFD and implies nothing about order.
 | RFD | Title | Decision |
 |---|---|---|
 | [001](001-how-to-rfd.md) | How to RFD | Decisions are recorded as short files here, each stating its decision in one affirmative sentence and updated in place when it changes. |
-| [002](002-serving-layout-contract.md) | Serving layout contract | Tables are served from a layout their writer produces (bucketed, sorted, 1,000-row pages, no value dictionary, a key bloom filter), checked on the written files. |
+| [002](002-serving-layout-contract.md) | Serving layout | Tables are served from a layout their writer produces, the optimal layout (bucketed, sorted, 1,000-row pages, no value dictionary, a key bloom filter), checked on the written files. |
 | [003](003-one-storage-stack.md) | One storage stack | Every byte read from object storage passes through one layer that owns location rewriting, request counting, and credentials. |
 | [004](004-resident-key-chunk-index.md) | Resident key-chunk index | Each data file's footer, page indexes, key chunks, exact key range, and fence array stay in memory, so a hit fetches at most one value page per column it names and a miss fetches nothing. |
 | [005](005-generations-and-refresh.md) | Generations and refresh | A table follows one ref, builds each new snapshot beside the current one while reusing unchanged files, and swaps it in atomically. |

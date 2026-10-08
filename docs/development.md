@@ -50,10 +50,10 @@ Two suites need fixtures and show as ignored under a plain `cargo test`.
   then `dev/rest-fixture.sh up` starts `apache/iceberg-rest-fixture:1.10.1`
   in a container.
 - `dev/test-golden.sh` runs the layout tests against the golden tables
-  `dev/golden-tables.py` writes: one contract-shaped table per key type,
-  one in table format version 3 (the rest are version 2, the writer's
-  default), and the off-contract layouts whose capping and advice findings
-  the doctor reports.
+  `dev/golden-tables.py` writes: one table per key type in the optimal
+  layout, one in table format version 3 (the rest are version 2, the
+  writer's default), and the other layouts whose capping and advice
+  findings the doctor reports.
 
 ```sh
 dev/golden-tables.sh
@@ -63,8 +63,9 @@ ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 `dev/golden-tables.sh` runs the recipe with Spark 4.1.3 and Iceberg 1.11.0
 (`iceberg-spark-runtime-4.1_2.13`) in the `apache/spark:4.1.3-python3`
 image, which carries Java 21, so the host needs a container runtime
-(`dev/runtime.sh up`) and `python3`. `--only contract` or `--only
-off-contract` writes one group, and `--only` with a table's name writes
+(`dev/runtime.sh up`) and `python3`. `--only contract` (the tables in the
+optimal layout) or `--only off-contract` (the other layouts) writes one
+group, and `--only` with a table's name writes
 that table alone: `--only long_2m` writes about 80 MB. The recipe also
 runs on the host with PySpark 4.1 and Java 17 or later, and writes to any
 object store or local directory:

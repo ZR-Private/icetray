@@ -100,7 +100,7 @@ time goes to decoding those two pages, and little to the lookup itself;
 which page dominates depends on whether the values compress ([prototype
 findings, finding
 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)). That is
-why RFD 002 (Serving layout contract) bounds value pages by bytes for large
+why RFD 002 (Serving layout) bounds value pages by bytes for large
 values, and why large key pages are an inefficient finding measured in RFD
 007.
 

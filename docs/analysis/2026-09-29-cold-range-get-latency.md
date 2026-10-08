@@ -67,7 +67,7 @@ once. Fifty samples a size put the p99 on one or two observations.
 - Cold-hit budgets in-region are about 90 to 175 ms of S3 time at the
   median and 190 to 320 ms at p99, not the 25 to 30 ms the earlier analysis
   gave; that figure is the warm case, a file read within seconds.
-- The file-size clause of RFD 002 (Serving layout contract) keeps its
+- The file-size clause of RFD 002 (Serving layout) keeps its
   reason cold, and the cold boundary is lower: files of 64 MiB answer a
   cold read like files of 256 MiB. Whether to lower the target below 64
   MiB, against more files and more load round trips, is the open call.

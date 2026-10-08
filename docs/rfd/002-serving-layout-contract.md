@@ -1,4 +1,4 @@
-# Serving layout contract
+# Serving layout
 
 > Updated 2026-10-07: a configured column is found in each data file by
 > its name and the field id the snapshot's schema gives it, so a value
@@ -14,6 +14,11 @@
 > lookup may trim its value to the top-level fields it names after the
 > page cache; projection is decided there, not as a serving tier. See
 > RFD 024.
+
+> Updated 2026-10-08: the layout this RFD decides is called the optimal
+> layout in the documentation; a table written to it reaches the
+> `optimal` level under `full` and `disk` residency. See
+> docs/table-layout.md.
 
 ## Problem
 
@@ -143,8 +148,8 @@ Refusing null values. Rejected because a key with a null value is a
 legitimate row and the wire can say so without ambiguity. Refusing nulls
 would rule out the membership-set use and gain nothing in correctness.
 
-Requiring the contract and refusing every other table. Rejected because
-off-contract tables serve correctly, if inefficiently
+Requiring the optimal layout and refusing every other table. Rejected
+because tables in other layouts serve correctly, if inefficiently
 ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)),
 and measuring that inefficiency is RFD 007's domain.
 
@@ -157,11 +162,12 @@ it will undo the layout
 The doctor (RFD 016) reports each deviation with the property that fixes
 it.
 
-The contract is verified on the files as written and never inferred from
-the properties that were set. Two bloom-filter sizing properties are
-no-ops in the Iceberg release behind the findings
+The optimal layout is verified on the files as written and never
+inferred from the properties that were set. Two bloom-filter sizing
+properties are no-ops in the Iceberg release behind the findings
 ([prototype findings, finding 7](../analysis/2026-09-10-prototype-findings.md#7-two-iceberg-1101-writer-properties-are-no-ops)),
-so the filter's presence is contract and its sizing is guidance.
+so the filter's presence is part of the optimal layout and its sizing is
+guidance.
 
 Two calls are open.
 
@@ -175,9 +181,9 @@ more files, more GETs at load, and more index bytes per key. Larger files
 cut the file count, but the slow mode may begin anywhere in the band above
 the target, which the evidence does not cover.
 
-The other is whether the contract requires the writer's adaptive skew
-splitting to be off. With it off, each bucket gets sorted files that do
-not overlap, however many the file-size target rolls. On is the writer's
+The other is whether the optimal layout requires the writer's adaptive
+skew splitting to be off. With it off, each bucket gets sorted files that
+do not overlap, however many the file-size target rolls. On is the writer's
 default and balances a skewed bucket across tasks, at the price that a
 bucket may hold overlapping sorted files
 ([prototype findings, finding 9](../analysis/2026-09-10-prototype-findings.md#9-spark-writes-several-sorted-files-per-bucket-sometimes-overlapping)),

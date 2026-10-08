@@ -7,8 +7,8 @@ ordering was the same and the ratio about two, because fixed network latency
 dilutes the gap. Multipart objects were a few milliseconds slower than
 single-part objects of the same size, small against the size effect, so the
 upload method is not what separates the size classes. What file size a
-serving table should target will be decided in RFD 002 (Serving layout
-contract), which will cite this document as its evidence.
+serving table should target will be decided in RFD 002 (Serving
+layout), which will cite this document as its evidence.
 
 > Updated 2026-09-29: these are warm reads. The run visited eleven objects
 > round-robin, so every read came about eleven requests after the last read

@@ -1,8 +1,8 @@
 // The client contract of icetray: read-only get-by-key lookups over Apache
-// Iceberg tables, spoken over gRPC. Clients in any language are generated
-// from this file; icetray ships no hand-written client. JSON exists only as
-// the output of the operator subcommands (`doctor`, `get`, `info`) and is
-// never a transport.
+// Iceberg tables, served over gRPC. Clients in any language are generated
+// from this file; icetray ships no hand-written client. icetray emits JSON
+// only as the output of the operator subcommands (`doctor`, `get`, `info`);
+// the transport is protobuf over gRPC.
 //
 // Every comment states what a caller may rely on, never how the server
 // produces it. From 1.0.0, field numbers are never reused (Stability in
@@ -11,32 +11,33 @@ syntax = "proto3";
 
 package icetray.v1;
 
-// Lookups over the tables the server is configured to serve. Naming a table
-// the server does not serve is a NOT_FOUND error. Sending a key whose
-// variant does not match the table's key type, or a key with no variant
-// set, is an INVALID_ARGUMENT error, and so is naming a value column the
-// table does not serve, naming one twice, or naming fields of a column in a
-// way ColumnRead does not allow. A key that is not in the table is a normal
-// answer, never an error. A lookup that names fields of a value that is not
-// the protobuf its column declares is a FAILED_PRECONDITION error, the same
-// on every attempt until the table's data changes, so it is not retried.
+// Lookups in the tables the server is configured to serve. A request for a
+// table the server does not serve is a NOT_FOUND error. A request is an
+// INVALID_ARGUMENT error when it omits the key or sets no variant in it,
+// sets a variant that does not match the table's key type, lists a value
+// column the table does not serve or lists one twice, or lists fields of a
+// column in a way ColumnRead does not allow. A key that is not in the table
+// is a successful response, never an error. A request that lists fields of
+// a value that is not the protobuf its column declares is a
+// FAILED_PRECONDITION error, the same on every attempt until the table's
+// data changes, so a caller does not retry it.
 service Icetray {
-  // Look up one key in one table. The answer carries the snapshot id it was
-  // read from.
+  // Look up one key in one table. The response carries the id of the
+  // snapshot the server read it from.
   rpc Get(GetRequest) returns (GetResponse);
-  // Look up many keys in one table. The results are in request order and
-  // all come from one snapshot. When any key cannot be answered the whole
-  // call fails and the caller retries the batch it built, unless the
-  // failure is FAILED_PRECONDITION, which a retry meets again; a response
-  // never answers only some of the keys.
+  // Look up many keys in one table. The response returns the results in
+  // request order, all read from one snapshot. When the lookup of any key
+  // fails, the whole call fails, so a response always covers every key of
+  // the request. A caller that retries resends the whole batch; a
+  // FAILED_PRECONDITION error recurs on every retry.
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   // Describe the snapshot the server currently serves for a table.
   rpc TableInfo(TableInfoRequest) returns (TableInfoResponse);
 }
 
 // A lookup key. The variant must match the table's key type, which
-// TableInfoResponse.key_type reports; sending another variant is an
-// INVALID_ARGUMENT error.
+// TableInfoResponse.key_type reports; a request that sets another variant
+// is an INVALID_ARGUMENT error.
 message Key {
   // Exactly one variant is set.
   oneof key {
@@ -48,10 +49,11 @@ message Key {
     string str = 2;
     // The key of a table whose key type is KEY_TYPE_BINARY or KEY_TYPE_UUID.
     // `bin` carries binary, fixed, and uuid keys, and the table's key type
-    // says how its bytes are read: a binary or fixed key is the column's
-    // bytes, matched bytewise; a uuid key is the sixteen bytes of the UUID.
-    // The bytes pass through unchanged, so a composite key is the caller's
-    // encoding into them.
+    // determines how the server reads its bytes: a binary or fixed key is
+    // the column's bytes, matched bytewise; a uuid key is the sixteen bytes
+    // of the UUID, and a uuid key of any other length is an
+    // INVALID_ARGUMENT error. The server matches the bytes unchanged, so the
+    // caller encodes a composite key into them.
     bytes bin = 3;
   }
 }
@@ -65,51 +67,55 @@ message GetRequest {
   // request that omits it is an INVALID_ARGUMENT error.
   Key key = 2;
   // The value columns to read, among those TableInfoResponse lists. The
-  // answer carries one value per column read, in this order. An empty list
-  // asks whether the key is present and reads no value; there is no default
-  // column. A ColumnRead with no fields reads its column whole; only an
-  // empty list of columns reads no value. A name the table does not serve,
-  // or a name given twice, is an INVALID_ARGUMENT error.
+  // response carries one value per column listed, in this order. The
+  // server has no default column: an empty list requests the key's
+  // presence alone and reads no value. A ColumnRead with no fields reads its
+  // column whole. A name the table does not serve, or a name listed twice,
+  // is an INVALID_ARGUMENT error.
   repeated ColumnRead columns = 3;
 }
 
-// One value column a lookup reads, whole or trimmed to some of its
+// One value column a request reads, whole or projected to some of its
 // top-level protobuf fields.
 message ColumnRead {
   // The column's name, as TableInfoResponse lists it.
   string name = 1;
-  // The top-level field numbers to keep, for a column TableInfoResponse
-  // lists as VALUE_FORMAT_PROTOBUF; empty for the whole value, unchanged.
-  // Unlike an empty GetRequest.columns, which reads no value, an empty list
-  // here reads the whole value. A list for a column of another format, a number outside 1 to
-  // 536870911, or a number given twice is an INVALID_ARGUMENT error. The
-  // value returned holds every occurrence of each named top-level field, in
-  // the value's order, each whole, and nothing else, so it parses as the
-  // caller's message type whenever the whole value does, each named field
-  // reading as in the whole value and every other field unset. A value
-  // holding none of them is present with zero bytes, and a null stays null.
-  // A caller naming a member of a oneof names every member of it: the
-  // server knows no schema, and a member that a later member of the whole
-  // value cleared would otherwise come back set. A message with required
-  // fields may come back without them, so the caller parses it partially
-  // (Go's UnmarshalOptions{AllowPartial: true}, Java's parsePartialFrom). A
+  // The top-level field numbers to project the value to, for a column
+  // TableInfoResponse lists as VALUE_FORMAT_PROTOBUF. An empty list returns
+  // the whole value, unchanged, where an empty GetRequest.columns reads no
+  // value. A list for a column of another format, a number outside 1 to
+  // 536870911, or a number listed twice is an INVALID_ARGUMENT error. The
+  // projected value holds every occurrence of each listed top-level field,
+  // each whole and in the value's order, and nothing else, so it parses as
+  // the caller's message type whenever the whole value does: each listed
+  // field reads as in the whole value and every other field reads as
+  // unset. A value holding none of the listed fields is returned as `value`
+  // with zero bytes, and a null is returned as `null_value`. The server
+  // holds no schema, so two rules are the caller's. A caller that lists a
+  // member of a oneof lists every member of it, since a member that a later
+  // member of the whole value cleared is otherwise returned set. A caller
+  // parses a projected message that has required fields partially (Go's
+  // UnmarshalOptions{AllowPartial: true}, Java's parsePartialFrom), since
+  // the projected value lacks every field the request does not list. A
   // value that is not protobuf fails the call as FAILED_PRECONDITION,
-  // whichever fields are named; the server does not check that a named
-  // number is a field of the caller's type.
+  // whichever fields are listed. The server accepts a number that is not a
+  // field of the caller's type and returns whatever the value carries under
+  // it.
   repeated uint32 fields = 2;
 }
 
-// Whether a key is in the snapshot. The two answered outcomes are distinct
-// on the wire, and a present key's values may each be null apart from it.
+// Whether a key is in the snapshot. The server returns PRESENCE_PRESENT or
+// PRESENCE_ABSENT, distinct on the wire, and each value of a present key
+// may separately be null (ColumnValue.null_value).
 enum Presence {
-  // Never sent by the server. It is the proto3 default, so a message that
-  // reads as unspecified was not answered.
+  // Never sent by the server. It is the proto3 default, so a field that
+  // reads as unspecified was not set by a server response.
   PRESENCE_UNSPECIFIED = 0;
   // The key is in the snapshot; `values` carries one value per requested
   // column.
   PRESENCE_PRESENT = 1;
-  // The key is not in the snapshot; `values` is empty. A miss is a normal
-  // answer, not an error.
+  // The key is not in the snapshot; `values` is empty. A miss is a
+  // successful response.
   PRESENCE_ABSENT = 2;
 }
 
@@ -118,33 +124,36 @@ message NullValue {}
 
 // One column's value for a present key. Exactly one variant is set. A null
 // value is `null_value`; a value of zero length is `value` holding no
-// bytes; the two are distinct. What a null value means is the table owner's rule.
+// bytes; the two are distinct. The table's owner defines what a null value
+// means.
 message ColumnValue {
   // Exactly one variant is set.
   oneof kind {
     // The value's bytes, unchanged from the table: a binary or fixed
-    // column's bytes, a string column's UTF-8; or, for a read that named
-    // fields, the value trimmed to them as ColumnRead.fields says.
+    // column's bytes, a string column's UTF-8; or, for a request that
+    // listed fields, the value projected to them as ColumnRead.fields
+    // describes.
     bytes value = 1;
     // The value is null.
     NullValue null_value = 2;
   }
 }
 
-// The answer to one lookup.
+// The response to one Get.
 message GetResponse {
   // Whether the key is in the snapshot.
   Presence presence = 1;
   // When presence is PRESENCE_PRESENT, one value per column the request
-  // named, in the request's order: values[i] answers columns[i]. Empty
-  // otherwise, and empty for a request that named no column.
+  // listed, in the request's order: values[i] is the value of columns[i].
+  // Empty otherwise, and empty for a request that listed no column.
   repeated ColumnValue values = 2;
-  // The Iceberg snapshot id the answer was read from. Two answers carrying
-  // different ids came from different snapshots of the table.
+  // The id of the Iceberg snapshot the server read the response from. Two
+  // responses carrying different ids were read from different snapshots of
+  // the table.
   int64 snapshot_id = 3;
 }
 
-// Several lookups in one table, all answered from one snapshot.
+// Several lookups in one table, all read from one snapshot.
 message MultiGetRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error.
@@ -153,38 +162,38 @@ message MultiGetRequest {
   // The response carries one result per key, in this order.
   repeated Key keys = 2;
   // The value columns to read for every key, as GetRequest.columns reads
-  // them: one list for the whole call, each column's fields applied to
-  // every key, empty for presence alone, a ColumnRead with no fields
-  // reading its column whole, and a name not served or given twice an
-  // INVALID_ARGUMENT error. A call asking for more values than the
-  // server's limit, its keys times its columns with a presence-only call
-  // counting one per key, whatever fields each names, is an
-  // INVALID_ARGUMENT error before any key is looked up. A value of any key
-  // that is not the protobuf its column declares, when its read names
-  // fields, fails the whole call as FAILED_PRECONDITION.
+  // them: one list for the whole call, with each column's fields applied
+  // to every key. An empty list returns presence alone, a ColumnRead with
+  // no fields reads its column whole, and a name the table does not serve
+  // or a name listed twice is an INVALID_ARGUMENT error. A call that
+  // requests more values than the server's limit is an INVALID_ARGUMENT
+  // error before the server looks up any key; the count is its keys times
+  // its columns, a presence-only call counting one per key, whatever fields
+  // each column lists. When a ColumnRead lists fields, a value of any key
+  // that is not the protobuf its column declares fails the whole call as
+  // FAILED_PRECONDITION.
   repeated ColumnRead columns = 3;
 }
 
-// The answer to one key of a MultiGet. It carries no snapshot id of its
-// own: every result of a batch came from the one snapshot named on the
-// MultiGetResponse.
+// The result for one key of a MultiGet. Its snapshot is the one
+// MultiGetResponse.snapshot_id names, which the server read every result
+// of the batch from.
 message Hit {
   // Whether the key is in the snapshot.
   Presence presence = 1;
   // When presence is PRESENCE_PRESENT, one value per column the request
-  // named, in the request's order; empty otherwise.
+  // listed, in the request's order; empty otherwise.
   repeated ColumnValue values = 2;
 }
 
-// The answers to a MultiGet. The call fails as a whole when any key cannot
-// be answered, so a response answers every key of the request.
+// The response to a MultiGet. The call fails as a whole when the lookup of
+// any key fails, so a response covers every key of the request.
 message MultiGetResponse {
-  // One result per requested key, in request order: results[i] answers
-  // keys[i].
+  // One result per requested key, in request order: results[i] is the
+  // result for keys[i].
   repeated Hit results = 1;
-  // The Iceberg snapshot id every result was read from. A batch is
-  // consistent with itself: no two of its results come from different
-  // snapshots.
+  // The id of the Iceberg snapshot the server read every result from, so
+  // the results of a batch are consistent with each other.
   int64 snapshot_id = 2;
 }
 
@@ -195,27 +204,28 @@ message TableInfoRequest {
   string table = 1;
 }
 
-// The Iceberg type of a table's key column. It decides which Key variant a
-// lookup sends and how a `bin` key's bytes are read; clients switch on it.
+// The Iceberg type of a table's key column. It determines which Key
+// variant a request sets and how the server reads a `bin` key's bytes;
+// clients switch on it.
 enum KeyType {
-  // Never sent by the server. It is the proto3 default, so a message that
-  // reads as unspecified was not answered.
+  // Never sent by the server. It is the proto3 default, so a field that
+  // reads as unspecified was not set by a server response.
   KEY_TYPE_UNSPECIFIED = 0;
-  // Iceberg `long`. Lookups send Key.long.
+  // Iceberg `long`. Requests set Key.long.
   KEY_TYPE_LONG = 1;
-  // Iceberg `string`. Lookups send Key.str.
+  // Iceberg `string`. Requests set Key.str.
   KEY_TYPE_STRING = 2;
-  // Iceberg `binary` or `fixed`. Lookups send Key.bin with the key's bytes.
+  // Iceberg `binary` or `fixed`. Requests set Key.bin to the key's bytes.
   KEY_TYPE_BINARY = 3;
-  // Iceberg `uuid`. Lookups send Key.bin with the sixteen bytes of the UUID.
+  // Iceberg `uuid`. Requests set Key.bin to the sixteen bytes of the UUID.
   KEY_TYPE_UUID = 4;
 }
 
 // The Iceberg type of a value column. Every type is served as its bytes
 // unchanged: a string as its UTF-8.
 enum ValueType {
-  // Never sent by the server. It is the proto3 default, so a message that
-  // reads as unspecified was not answered.
+  // Never sent by the server. It is the proto3 default, so a field that
+  // reads as unspecified was not set by a server response.
   VALUE_TYPE_UNSPECIFIED = 0;
   // Iceberg `binary`.
   VALUE_TYPE_BINARY = 1;
@@ -225,22 +235,22 @@ enum ValueType {
   VALUE_TYPE_STRING = 3;
 }
 
-// What a value column's values are, as the table's configuration declares
-// them.
+// The format of a value column's values, as the table's configuration
+// declares it.
 enum ValueFormat {
-  // Never sent by the server. It is the proto3 default, so a message that
-  // reads as unspecified was not answered.
+  // Never sent by the server. It is the proto3 default, so a field that
+  // reads as unspecified was not set by a server response.
   VALUE_FORMAT_UNSPECIFIED = 0;
-  // Bytes the server never looks into; a read takes the whole value.
+  // Bytes the server returns as stored; a request reads the whole value.
   VALUE_FORMAT_OPAQUE = 1;
-  // A serialized protobuf message, of a VALUE_TYPE_BINARY column; a read
-  // may name top-level fields to keep (ColumnRead.fields).
+  // A serialized protobuf message, of a VALUE_TYPE_BINARY column; a request
+  // may project it to some of its top-level fields (ColumnRead.fields).
   VALUE_FORMAT_PROTOBUF = 2;
 }
 
-// One value column the table serves, which a lookup may name.
+// One value column the table serves, which a request may list.
 message ValueColumn {
-  // The name a lookup names the column by.
+  // The name a request lists the column by.
   string name = 1;
   // The column's type.
   ValueType value_type = 2;
@@ -248,7 +258,8 @@ message ValueColumn {
   // other type.
   uint32 width = 3;
   // The column's format. It can change while the snapshot stays the same,
-  // and a read naming fields is checked against the format at the time.
+  // and the server checks a request that lists fields against the format
+  // current when the request arrives.
   ValueFormat format = 4;
 }
 
@@ -256,8 +267,8 @@ message ValueColumn {
 message TableInfoResponse {
   // The name the table was requested under.
   string table = 1;
-  // The Iceberg snapshot id being served. Get and MultiGet answers for the
-  // table carry this id until the table advances to another snapshot.
+  // The Iceberg snapshot id being served. Get and MultiGet responses for
+  // the table carry this id until the table advances to another snapshot.
   int64 snapshot_id = 2;
   // The bucket count of the key column's bucket partition; 0 when the
   // table is not bucket-partitioned.
@@ -266,14 +277,13 @@ message TableInfoResponse {
   uint64 data_files = 4;
   // The number of rows in the served snapshot.
   uint64 records = 5;
-  // The key column's type. It says which Key variant a lookup must send
-  // and how a `bin` key's bytes are read.
+  // The key column's type. It determines which Key variant a request must
+  // set and how the server reads a `bin` key's bytes.
   KeyType key_type = 6;
   // The bytes resident in memory for this table's lookup index, as one
   // total with no breakdown.
   uint64 index_bytes = 7;
-  // The value columns a lookup may name, in name order, names compared as
-  // their UTF-8 bytes; empty for a table that answers only whether a key
-  // is present.
+  // The value columns a request may list, in name order, names compared as
+  // their UTF-8 bytes; empty for a table that serves only key presence.
   repeated ValueColumn value_columns = 8;
 }

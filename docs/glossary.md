@@ -2,89 +2,110 @@
 
 The terms the other pages use, each defined once.
 
-**Advice.** A finding that names a writer property worth changing for
-memory, load time, or tuning. Advice never changes whether a table serves.
-See [the table contract](table-contract.md).
+**Advice.** A doctor finding that names a writer property worth changing
+for memory, load time, or tuning. Advice caps no level and never affects
+whether icetray serves a table. See [the optimal layout](table-layout.md).
 
-**Degraded.** The state of a table whose last refresh failed. The last
-good generation keeps serving, `icetray_table_state{state="degraded"}`
-reads 1, and the next poll tries again, except after a failure of the
-snapshot itself, a refusal or a fault of its metadata or data files, which
-is tried again once the table's metadata location moves. Readiness does
-not change. A strict table refused for its level is held instead. See
+**Degraded.** The state of a table whose last refresh failed. icetray
+keeps serving the last good generation,
+`icetray_table_state{state="degraded"}` reads 1, and the next poll tries
+the refresh again. A failure of the snapshot itself, a refusal or a fault
+of its metadata or data files, is tried again only once the table's
+source names another metadata location or a reload changes the table's
+entry. Readiness does not change. A strict table whose snapshot is
+refused for its level is held instead. See
 [Refresh and reload](operating.md#refresh-and-reload).
 
-**Delete state.** The rows a generation's deletion vectors and position
-delete files remove from each data file it holds, kept in memory for
-every residency and checked before a lookup reads a value page. Its bytes
-count toward `icetray_index_bytes`, and a `full` table's resident budget
-counts it at a bound taken from the manifests. See
+**Delete state.** The in-memory record of the rows that a generation's
+deletion vectors and position delete files remove from each of its data
+files. icetray keeps it resident under every residency, and a lookup
+checks it before reading a value page. Its bytes count toward
+`icetray_index_bytes`, and a `full` table's resident budget counts it at
+a bound taken from the manifests. See
 [RFD 021](rfd/021-merge-on-read.md).
 
-**Deletion vector.** A bitmap of the deleted row positions of one data
-file, stored as a blob in a Puffin file, which Iceberg format v3 writers
-use in place of position delete files. icetray serves them.
+**Deletion vector.** A roaring bitmap of the deleted row positions of one
+data file, stored as a blob in a Puffin file, which Iceberg format v3
+writers use in place of position delete files. icetray applies them to
+every lookup.
 
-**Fence array.** The first key of every key page of a data file, held in
-memory for every residency. A lookup binary-searches it to pick the one key
-page that can hold its key.
+**Fence array.** The array of the first key of every key page in a data
+file, resident under every residency. A lookup binary-searches it to find
+the one key page that can hold its key.
 
 **Generation.** One snapshot of a table as icetray serves it: the
-snapshot's data files with their resident index. A new snapshot is built
-as a new generation beside the serving one and swapped in whole, so every
-answer comes from exactly one snapshot, whose id it carries.
+snapshot's data files with their resident index. icetray builds a new
+snapshot's generation beside the serving one and swaps it in whole, so
+every response comes from exactly one snapshot and carries its id.
 
-**Held.** The state of a strict table that refused its newest snapshot
-for its level while the last snapshot that met the level keeps serving.
-`icetray_table_state{state="held"}` reads 1, and the table is not
-degraded, since a writer's layout put it there and no fault did. It
-ends when a snapshot that meets the level swaps in, when the ref returns
-to the serving snapshot, or when a reload relaxes `lookups` to a level the
-refused snapshot meets or turns `strict` off. See
+**Held.** The state of a strict table whose newest snapshot icetray
+refused as `below_level`, while it keeps serving the last snapshot that
+met the level. `icetray_table_state{state="held"}` reads 1. Held is
+distinct from degraded, which follows a failed refresh: a writer's layout
+causes it. It ends at the next swap, as when a compaction commits a
+snapshot that meets the level, when the ref returns to the serving
+snapshot, or when a reload relaxes `lookups` to a level the refused
+snapshot meets or turns `strict` off. See
 [Refresh and reload](operating.md#refresh-and-reload).
 
 **Key chunk.** The compressed bytes of a data file's key column in one row
-group. A load reads every key chunk once to verify the keys, and the
-`full` residency keeps them in memory.
+group. A load reads every key chunk once to verify the keys; `full`
+residency keeps them in memory and `disk` residency in a chunk file.
 
-**Level.** The lookup cost a table declares it accepts, its `lookups`,
-and the cost its snapshot's layout achieves, each one of `optimal`,
-`balanced`, or `permissive`. `optimal` is one GET per column a hit reads
-and none per miss, probing one file; `balanced` probes one file at a
-fixed extra cost; `permissive` is any snapshot icetray serves correctly,
-including one where a lookup probes several files. Residency and the
-doctor's capping findings set the level achieved. Each value column has a
-level, the table's is its dearest column's, and a table below its
-declared level is flagged.
+**Level.** A class of lookup cost, one of `optimal`, `balanced`, or
+`permissive`. The owner configures the level a table must meet as its
+`lookups`, and icetray measures the level each snapshot reaches.
+`optimal` means one GET per column a hit reads and none per miss, with a
+lookup probing one file and decoding one key page of ordinary size;
+`balanced` means one file probed at a fixed extra cost; `permissive`
+covers any snapshot icetray serves correctly, including one where a
+lookup probes several files. Residency, the doctor's capping findings,
+and, for a serving `disk` table, the kernel's page cache set the level
+reached. Each value column has a level, the table's is its dearest
+column's, and `icetray_table_below_level` reads 1 while a table is below
+its configured level.
 See [Choosing a level](configuration.md#choosing-a-level).
 
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
 `doctor`, `get`, and `info`. Each loads its tables the way `serve` does.
 See [the command line](configuration.md#the-command-line).
 
-**Projection.** Trimming a value of a column declared protobuf to the
-top-level fields a lookup names, by field number, after the page cache;
-it saves the bytes on the wire and the caller's decode, not a GET. See
-[Protobuf columns](table-contract.md#protobuf-columns).
+**Optimal layout.** The Iceberg and Parquet layout at which icetray
+serves a table at one GET per column a cold hit reads and none per miss:
+`bucket(N, key)` partitioning, files sorted by key, 1,000-row key pages,
+dictionary encoding off on each value column, and a bloom filter on the
+key, among other requirements. A table in the optimal layout reaches the
+`optimal` level under `full` and `disk` residency. icetray serves other
+layouts at a cost the doctor reports, and refuses a layout it would serve
+incorrectly. See [the optimal layout](table-layout.md).
 
-**Refused.** A snapshot icetray will not serve, for a named reason: an
-answer could be wrong (unsorted files, duplicate keys, equality deletes,
-and the like), the table cannot be held the way its residency requires,
-or, under `strict`, its layout is below the table's level
-(`below_level`).
+**Projection.** The trimming of a value in a column declared protobuf to
+the top-level field numbers a request lists, which icetray performs after
+the page cache. It saves the bytes on the wire and the caller's decode,
+and makes the same GETs as reading the whole value. See
+[Protobuf columns](table-layout.md#protobuf-columns).
 
-**Residency.** Where a table keeps its key chunks: `full` (in memory),
-`disk` (in a file in the local directory, with footers, page indexes,
-and the fence array in memory), or `bloom` (bloom filters in memory instead). See
+**Refused.** The outcome for a snapshot icetray will not serve, for a
+named reason: a lookup could return a wrong result (unsorted files,
+duplicate keys, equality deletes, and the like), icetray cannot hold the
+table as its residency requires, or, under `strict`, the snapshot's
+layout is below the table's level (`below_level`).
+
+**Residency.** The configured storage of a table's key chunks: `full` (in
+memory), `disk` (in a chunk file in the local directory, with footers,
+page indexes, and the fence array in memory), or `bloom` (the key
+column's bloom filters in memory in place of the key chunks). See
 [Choosing a residency](configuration.md#choosing-a-residency).
 
-**Strict.** A per-table setting, off by default, that refuses a snapshot
-whose layout puts the table below its level instead of serving it
-flagged. A strict table holds its last snapshot that met the level, and
-fails to start when its first snapshot is below it.
+**Strict.** A per-table setting, off by default, under which icetray
+refuses a snapshot whose layout is below the table's level; without it,
+icetray serves such a snapshot and flags the table. icetray keeps serving
+a strict table's last snapshot that met the level, and a strict table
+whose first snapshot is below it fails to start.
 
-**Value column.** A column a table serves as bytes, listed in its
-`value_columns` and read only when a lookup names it; a table may list
-none, to answer only whether a key is present. Each column a cold hit
-names costs a GET of its own, so one packed column performs best. See
-[Value columns](table-contract.md#value-columns).
+**Value column.** A Parquet column that icetray returns as bytes, listed
+in the table's `value_columns` and read only when a request lists it. A
+table configured with no value columns returns only whether a key is
+present. Each column a cold hit requests costs a GET of its own, so one
+packed column performs best. See
+[Value columns](table-layout.md#value-columns).

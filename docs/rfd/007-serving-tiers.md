@@ -32,7 +32,7 @@
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
-the contract in RFD 002 (Serving layout contract) miss it in different
+the optimal layout in RFD 002 (Serving layout) miss it in different
 ways. An unsorted file cannot be searched, and a duplicate key has two
 answers, so a lookup into either may be wrong. A dictionary-encoded value
 column
@@ -109,7 +109,7 @@ Placements settled elsewhere:
   refused as `value_type_unsupported`, naming the column, because the
   wire carries a value as opaque bytes (RFD 010 (Transport and client
   contract)). A typed column has no defined encoding there, and any answer
-  would be a guess. RFD 002 (Serving layout contract) states the clause.
+  would be a guess. RFD 002 (Serving layout) states the clause.
 - A configured column a data file does not hold as the snapshot's schema
   means it is refused as `column_mismatch`: a column of its name under
   another field id, its field id under another name, a file that records
@@ -147,9 +147,9 @@ answers with slow ones. A warning worth one extra GET per hit looked the
 same to the server as one about truncated manifest bounds, when only the
 first should bear on whether to serve.
 
-Refuse everything off-contract. Rejected because those tables serve
-correctly (finding 1), and a contract that gates serving would turn every
-writer default into an outage.
+Refuse everything outside the optimal layout. Rejected because those
+tables serve correctly (finding 1), and an optimal layout that gates
+serving would turn every writer default into an outage.
 
 Refuse overlapping files. Rejected because overlap without duplicates is
 inefficient, not wrong, and a batch writer at its default settings can produce it
