@@ -12,12 +12,13 @@ use crate::cache::CacheError;
 use crate::catalog::TableFault;
 use crate::check::{Capping, ColumnLevel};
 use crate::column::ColumnMismatch;
-use crate::config::ConfigError;
+use crate::config::{ConfigError, ValueFormat};
 use crate::index::FileFault;
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::local::LocalFault;
 use crate::manifest::ColumnRequestFault;
+use crate::projection::Malformed;
 use crate::storage::LocationError;
 
 /// Every failure a caller of this crate can observe. A caller decides what
@@ -77,8 +78,10 @@ pub enum Error {
         /// The key type the caller sent.
         got: KeyType,
     },
-    /// A lookup named a column the table does not serve, or named one twice
-    /// (RFD 022); checked against the serving generation before any read.
+    /// A lookup named a column the table does not serve, or named one
+    /// twice (RFD 022), or named fields it cannot trim the column to (RFD
+    /// 024); checked against the serving generation and the table's entry
+    /// before any read.
     #[error("table {table}: column {column} {fault}")]
     ColumnRequest {
         /// The table's configured name.
@@ -87,6 +90,21 @@ pub enum Error {
         column: String,
         /// What is wrong with naming it.
         fault: ColumnRequestFault,
+    },
+    /// A value a lookup trims to the fields it names is not protobuf as the
+    /// column declares (RFD 024): the bytes are the writer's, so every
+    /// attempt fails the same way until they are rewritten or the caller
+    /// stops trimming them.
+    #[error("table {table}: column {column} of key {key} is not protobuf: {fault}")]
+    MalformedValue {
+        /// The table's configured name.
+        table: String,
+        /// The column whose value it is.
+        column: String,
+        /// The key whose row holds it.
+        key: Key,
+        /// Where the walk stopped.
+        fault: Malformed,
     },
     /// The table's metadata makes it unusable before any data file is read;
     /// the fault set is closed.
@@ -234,6 +252,7 @@ impl Error {
             | Self::Refused { .. }
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
+            | Self::MalformedValue { .. }
             | Self::Table { .. }
             | Self::File { .. }
             | Self::NotReady { .. }
@@ -270,6 +289,7 @@ impl Error {
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
             Self::KeyType { .. } => ErrorKind::KeyType,
             Self::ColumnRequest { .. } => ErrorKind::ColumnRequest,
+            Self::MalformedValue { .. } => ErrorKind::MalformedValue,
             Self::Table { .. } => ErrorKind::Table,
             Self::File { .. } => ErrorKind::File,
             Self::NotReady { .. } => ErrorKind::NotReady,
@@ -313,6 +333,8 @@ pub enum ErrorKind {
     KeyType,
     /// `Error::ColumnRequest`.
     ColumnRequest,
+    /// `Error::MalformedValue`.
+    MalformedValue,
     /// `Error::Table`.
     Table,
     /// `Error::File`.
@@ -373,6 +395,9 @@ impl Recurs for Error {
             Self::File { fault, .. } => fault.recurrence(),
             Self::Local { fault, .. } => fault.recurrence(),
             Self::Cache(error) => error.recurrence(),
+            // A data file's bytes, which are immutable, walked under the
+            // column's declared format: the same value fails the same way.
+            Self::MalformedValue { .. } => Recurrence::Deterministic,
             // A library's error does not say whether it met malformed
             // bytes or a read that failed under it.
             Self::Iceberg(_)
@@ -415,6 +440,7 @@ impl fmt::Display for ErrorKind {
             Self::Cache => "cache",
             Self::KeyType => "key_type",
             Self::ColumnRequest => "column_request",
+            Self::MalformedValue => "malformed_value",
             Self::Table => "table",
             Self::File => "file",
             Self::NotReady => "not_ready",
@@ -465,9 +491,16 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             expected,
             got,
         } => format!("{reason} (file {path}, expected {expected}, got {got})"),
-        RefusalReason::ValueTypeUnsupported { column, got } => {
-            format!("{reason} (column {column}, got {got})")
-        }
+        RefusalReason::ValueTypeUnsupported {
+            column,
+            got,
+            format: ValueFormat::Opaque,
+        } => format!("{reason} (column {column}, got {got})"),
+        RefusalReason::ValueTypeUnsupported {
+            column,
+            got,
+            format: format @ ValueFormat::Protobuf,
+        } => format!("{reason} (column {column}, got {got}; format {format} needs binary)"),
         RefusalReason::ColumnMismatch {
             column,
             path: Some(path),
@@ -604,15 +637,22 @@ pub enum RefusalReason {
     },
     /// A value column's Iceberg type in the snapshot's schema is none of
     /// binary, fixed, or string, so its bytes have no defined encoding on the
-    /// wire (RFD 002, RFD 010, RFD 022). Raised by `TableLayout::derive`; a
-    /// data file whose physical type contradicts an admitted schema type is
-    /// `FileFault::ValuePhysicalType`, a malformed file rather than a refusal.
+    /// wire (RFD 002, RFD 010, RFD 022), or is not `binary` for a column
+    /// declared protobuf (RFD 024). Raised as the snapshot's layout is
+    /// derived and checked, and against the serving layout by a retune
+    /// that declares a format; a data file whose physical type contradicts
+    /// an admitted schema type is `FileFault::ValuePhysicalType`, a
+    /// malformed file rather than a refusal.
     ValueTypeUnsupported {
         /// The value column as configured.
         column: String,
         /// The Iceberg type's `Display`, held as text because
         /// `iceberg::spec::Type` does not implement `Hash`.
         got: String,
+        /// The format that does not take the type: `Opaque` for a type no
+        /// format serves, since every format takes a subset of opaque's
+        /// types, and `Protobuf` for one only that declaration excludes.
+        format: ValueFormat,
     },
     /// An equality delete applies to a data file the snapshot holds: its
     /// data sequence number is above that of the snapshot's oldest data
@@ -924,6 +964,15 @@ mod tests {
                     column: "value".to_string(),
                     got: iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long)
                         .to_string(),
+                    format: ValueFormat::Opaque,
+                },
+                "value_type_unsupported",
+            ),
+            (
+                RefusalReason::ValueTypeUnsupported {
+                    column: "value".to_string(),
+                    got: "string".to_string(),
+                    format: ValueFormat::Protobuf,
                 },
                 "value_type_unsupported",
             ),
@@ -1392,12 +1441,22 @@ mod tests {
         cases.extend(file_fault_recurrence_cases());
         cases.extend(local_fault_recurrence_cases());
         cases.extend(cache_recurrence_cases());
+        cases.push((
+            Error::MalformedValue {
+                table: TABLE.to_string(),
+                column: "value".to_string(),
+                key: Key::Long(1),
+                fault: crate::projection::Malformed::PastEnd { at: 0 },
+            },
+            Recurrence::Deterministic,
+        ));
         let classified_above = |error: &Error| match error {
             Error::Refused { .. }
             | Error::Table { .. }
             | Error::File { .. }
             | Error::Local { .. }
-            | Error::Cache(_) => true,
+            | Error::Cache(_)
+            | Error::MalformedValue { .. } => true,
             Error::Iceberg(_)
             | Error::Parquet(_)
             | Error::ObjectStore(_)
@@ -1612,6 +1671,15 @@ mod tests {
                     fault: ColumnRequestFault::NotServed,
                 },
                 "column_request",
+            ),
+            (
+                Error::MalformedValue {
+                    table: TABLE.to_string(),
+                    column: "value".to_string(),
+                    key: Key::Long(1),
+                    fault: crate::projection::Malformed::PastEnd { at: 0 },
+                },
+                "malformed_value",
             ),
         ]
     }

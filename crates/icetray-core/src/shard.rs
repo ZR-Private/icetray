@@ -51,16 +51,25 @@ pub(crate) struct Sharded<T> {
 
 /// A shard's value, aligned to 128 bytes: the cache line of the Apple
 /// M-series cores and twice that of x86, so two shards share no line on
-/// either.
+/// either. A shard whose state is allocated apart from its line holds each
+/// part a thread writes in a `Line` too, so no part shares a line with
+/// another shard's.
 #[repr(align(128))]
 #[derive(Default)]
-struct Line<T>(T);
+pub(crate) struct Line<T>(pub(crate) T);
 
 impl<T: Default> Sharded<T> {
     /// `count()` shards, each `T::default()`.
     pub(crate) fn new() -> Self {
+        Self::from_fn(T::default)
+    }
+}
+
+impl<T> Sharded<T> {
+    /// `count()` shards, each what `make` returns.
+    pub(crate) fn from_fn(mut make: impl FnMut() -> T) -> Self {
         Self {
-            shards: (0..count()).map(|_| Line::default()).collect(),
+            shards: (0..count()).map(|_| Line(make())).collect(),
         }
     }
 }

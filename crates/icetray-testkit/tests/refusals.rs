@@ -12,12 +12,17 @@ use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, S
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
 use iceberg::spec::{DataFile, DataFileFormat, PrimitiveType, Struct};
+use icetray_core::ColumnRead;
 use icetray_core::approx::count;
-use icetray_core::config::{ConfigError, ConfigViolation, LocalConfig, Residency, TableConfig};
+use icetray_core::config::{
+    Config, ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, TableConfig,
+    ValueColumnConfig, ValueFormat,
+};
 use icetray_core::contract::MAX_KEY_BYTES;
+use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, Capping, Error, ErrorKind, FindingCode, Key, KeyType, Level, LocalDir, RefusalReason,
-    Row, Storage, TableSource, TableState, UnsupportedDelete, bucket,
+    Budget, Capping, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType, Level, LocalDir,
+    RefusalReason, Row, Storage, TableSource, TableState, UnsupportedDelete, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -305,6 +310,97 @@ async fn test_unsupported_value_type_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// A `string` value column declared protobuf is refused from the metadata
+/// file alone, naming the column and the format (RFD 024); declared opaque,
+/// the same table loads, and a reload declaring it protobuf is refused
+/// against the serving layout and changes nothing.
+#[tokio::test]
+async fn test_protobuf_on_a_string_value_column_is_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let key: ArrayRef = Arc::new(Int64Array::from(RAW_KEYS.to_vec()));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(KEY_COLUMN, DataType::Int64, false),
+        Field::new(VALUE_COLUMN, DataType::Utf8, true),
+    ]));
+    let value: ArrayRef = Arc::new(StringArray::from(RAW_STRING_KEYS.to_vec()));
+    let batch = RecordBatch::try_new(schema, vec![key, value])?;
+    let raw = RawFile::from_batch(RAW_FILE, &batch, &Layout::contract(), Struct::empty(), None)?;
+    let fixture = write_table_of_types(
+        catalog.as_ref(),
+        NAMESPACE,
+        "kv_stringvalue",
+        PrimitiveType::Long,
+        PrimitiveType::String,
+        0,
+        raw,
+    )
+    .await?;
+    let protobuf = TableConfig {
+        value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
+        ..fixture.config(Residency::Full, false)
+    };
+    let refused = refused_through_catalog(&fixture, &catalog, protobuf).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::ValueTypeUnsupported {
+            column: VALUE_COLUMN.to_string(),
+            got: PrimitiveType::String.to_string(),
+            format: ValueFormat::Protobuf,
+        }
+    );
+    assert_eq!(
+        refused.storage.stats().gets(),
+        METADATA_FILE_GETS,
+        "refused from the metadata file alone"
+    );
+    let opaque = fixture.config(Residency::Full, false);
+    let config = Config {
+        server: ServerConfig::default(),
+        storage: verify::storage_config_for_tests(),
+        tables: vec![opaque],
+    };
+    let storage = Arc::new(Storage::new(config.storage.clone()));
+    let opened = open_with(&config, None, storage, FindingLog::Events).await?;
+    opened.tables()[0].load().await?;
+    let serving = opened.tables()[0].current();
+    let retune = TableConfig {
+        value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
+        ..config.tables[0].clone()
+    };
+    let Err(refusal) = opened.apply(&[retune]).await else {
+        panic!("a retune to protobuf on a string column is refused");
+    };
+    let [(table, error)] = &refusal.failures[..] else {
+        panic!("one failure, got {:?}", refusal.failures);
+    };
+    assert_eq!(table, &config.tables[0].name);
+    assert!(
+        matches!(
+            error,
+            Error::Refused {
+                reason: RefusalReason::ValueTypeUnsupported {
+                    format: ValueFormat::Protobuf,
+                    ..
+                },
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        opened.tables()[0].config().format_of(VALUE_COLUMN),
+        Some(ValueFormat::Opaque)
+    );
+    assert!(
+        opened.tables()[0]
+            .current()
+            .zip(serving)
+            .is_some_and(|(now, before)| Arc::ptr_eq(&now, &before)),
+        "the serving generation is untouched"
+    );
+    Ok(())
+}
+
 /// An unpartitioned `IDS_2K` fixture, as the delete fixtures start from.
 async fn unpartitioned_fixture(catalog: &Arc<dyn Catalog>, name: &str) -> Result<Fixture> {
     let spec = FixtureSpec {
@@ -441,14 +537,22 @@ async fn test_avro_position_deletes_a_vector_masks_are_ignored() -> Result<()> {
     for id in fixture.ids() {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             fixture.expected(&key)
         );
     }
     for id in one_per_file {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "id {id}"
         );
@@ -516,7 +620,11 @@ async fn test_equality_delete_is_refused_while_live_and_served_once_dangling() -
     for id in SAMPLE_4K.into_iter().filter(|id| IDS_2K.contains(id)) {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             fixture.expected(&key)
         );
     }

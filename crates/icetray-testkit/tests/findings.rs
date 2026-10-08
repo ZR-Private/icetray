@@ -16,12 +16,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use icetray_core::ColumnRead;
 use icetray_core::approx;
 use icetray_core::check::thresholds::{
     BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
 };
-use icetray_core::config::Residency;
+use icetray_core::config::{Residency, ValueFormat};
 use icetray_core::{
     Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, RefusalReason, Row,
     TableReport, WriterProperty, diagnose,
@@ -188,7 +189,7 @@ async fn test_contract_fixture_is_optimal_with_no_findings() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let (_fixture, served) =
         write_and_serve(&catalog, FixtureSpec::small("kv_contract", KeyType::Long)).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_eq!(report.summary.level, Level::Optimal);
     assert!(report.findings.is_empty(), "{:?}", report.findings);
     assert_eq!((report.summary.capping, report.summary.advice), (0, 0));
@@ -209,7 +210,7 @@ async fn test_dictionary_encoded_value_caps_balanced_by_one_extra_get() -> Resul
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[FindingCode::DictionaryEncodedValue], &[]);
     assert_eq!(
         finding(&report, FindingCode::DictionaryEncodedValue)
@@ -251,7 +252,7 @@ async fn test_large_key_pages_penalty_is_the_rows_decoded() -> Result<()> {
         ..FixtureSpec::small("kv_bigpages", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[FindingCode::LargeKeyPages], &[]);
     assert_eq!(
         finding(&report, FindingCode::LargeKeyPages)
@@ -278,7 +279,7 @@ async fn test_no_bucket_partition_caps_permissive() -> Result<()> {
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
     assert!(generation.files.len() >= TWO_FILES);
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     assert_codes(
         &report,
         &[FindingCode::NoBucketPartition],
@@ -310,7 +311,7 @@ async fn test_overlapping_files_caps_permissive() -> Result<()> {
         .append(catalog.as_ref(), residue_class(SECOND_CLASS), "half")
         .await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[FindingCode::OverlappingFiles], &[]);
     assert_eq!(
         finding(&report, FindingCode::OverlappingFiles)
@@ -341,7 +342,7 @@ async fn test_bounds_missing_is_advice() -> Result<()> {
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::BoundsMissing]);
     assert!(BOUNDS_TRUNCATE < fixture.key(0).as_bytes().len());
     for file in &generation.files {
@@ -367,7 +368,7 @@ async fn test_column_index_truncated_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_cutindex", KeyType::String)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::ColumnIndexTruncated]);
     for file in &report.files {
         assert!(
@@ -390,7 +391,7 @@ async fn test_large_value_pages_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_widepages", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::LargeValuePages]);
     Ok(())
 }
@@ -414,7 +415,7 @@ async fn test_value_pages_over_ceiling_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_ceilingpages", KeyType::Long)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(
         &report,
         &[],
@@ -432,7 +433,7 @@ async fn test_value_pages_over_ceiling_is_advice() -> Result<()> {
     );
     let error = served
         .table
-        .get(&fixture.key(0), &[VALUE_COLUMN])
+        .get(&fixture.key(0), &[ColumnRead::whole(VALUE_COLUMN)])
         .await
         .expect_err("the value page is over the ceiling");
     assert!(
@@ -466,7 +467,7 @@ async fn test_long_keys_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_longkeys", KeyType::String)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::LongKeys]);
     assert!(
         report
@@ -501,7 +502,7 @@ async fn test_large_file_is_advice() -> Result<()> {
     let generation = served.current();
     assert_eq!(generation.files.len(), 1);
     assert!(generation.files[0].entry.size > FILE_BYTES_ADVICE);
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     assert_codes(
         &report,
         &[],
@@ -526,7 +527,7 @@ async fn test_many_files_per_bucket_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_manyfiles", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::ManyFilesPerBucket]);
     assert!(
         approx::count(report.summary.max_files_per_bucket) > FILES_PER_BUCKET_FACTOR,
@@ -549,7 +550,7 @@ async fn test_no_bloom_filter_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_nobloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::NoBloomFilter]);
     assert_eq!(report.summary.predicted.bloom, None);
     Ok(())
@@ -568,7 +569,7 @@ async fn test_bloom_oversized_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_bigbloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::BloomOversized]);
     for file in &report.files {
         let rows = u64::try_from(file.rows).unwrap();
@@ -595,7 +596,7 @@ async fn test_bloom_undersized_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_smallbloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
     assert_codes(&report, &[], &[FindingCode::BloomUndersized]);
     for file in &report.files {
         assert!(
@@ -652,7 +653,14 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
     {
         let key = fixture.key(id);
         assert!(
-            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
+            verify::one_value(
+                &served
+                    .table
+                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?
+                    .row
+            )
+            .is_some(),
             "key {key}"
         );
     }
@@ -660,7 +668,11 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
     let before = stats.gets();
     let inside = fixture.absent_near(INSIDE_ID);
     assert_eq!(
-        served.table.get(&inside, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&inside, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Absent
     );
     assert_eq!(

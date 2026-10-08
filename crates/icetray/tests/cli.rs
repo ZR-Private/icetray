@@ -23,16 +23,19 @@ use icetray_core::metric::{
     ALLOCATOR_ALLOCATED_BYTES, ALLOCATOR_RESIDENT_BYTES, CONFIG_PENDING, CONFIG_RELOADS_TOTAL,
     LABEL_RESULT, LABEL_STATE, LABEL_TABLE, PROCESS_RSS_BYTES, TABLE_STATE,
 };
-use icetray_core::{Key, KeyType, SnapshotId, TableState, bucket};
+use icetray_core::{
+    ColumnRead, Key, KeyType, MAX_FIELD_NUMBER, Row, SnapshotId, TableState, bucket,
+};
 use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{
     IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS,
     TWO_BUCKETS, UNPARTITIONED_FILE_BYTES,
 };
 use icetray_testkit::layout::{Layout, VALUE_COLUMN};
+use icetray_testkit::protobuf;
 use icetray_testkit::verify::series_value;
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, Nulls, Order, memory_catalog_local, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, Nulls, Order, ValueKind, memory_catalog_local, write_fixture,
 };
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -897,6 +900,178 @@ async fn test_get_rejects_an_unserved_or_repeated_column_before_the_load() -> Te
         assert!(output.stdout.is_empty());
         assert_plain_error(&output);
     }
+    Ok(())
+}
+
+/// `--location` with `VALUE_COLUMN` declared protobuf.
+fn protobuf_location(fixture: &Fixture) -> [String; 4] {
+    [
+        "--location".to_string(),
+        fixture.metadata_location().to_string(),
+        "--value-column".to_string(),
+        format!("{VALUE_COLUMN}:protobuf"),
+    ]
+}
+
+/// `get --column NAME=FIELDS` on a column declared protobuf prints the
+/// value trimmed to those fields, in the line's usual shape, at the GET a
+/// whole read costs; `NAME=` and `NAME` read it whole.
+#[tokio::test]
+async fn test_get_trims_a_protobuf_column_to_the_fields_named() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let spec = FixtureSpec {
+        value_kind: ValueKind::Protobuf,
+        ..FixtureSpec::small("kv_project_cli", KeyType::Long)
+    };
+    let fixture = local_fixture(dir.path(), spec).await?;
+    let key = fixture.key(SAMPLE[0]);
+    let fields = [protobuf::ID_FIELD, protobuf::SCORES_FIELD];
+    let encoded =
+        |bytes: &[u8]| Json::String(base64::engine::general_purpose::STANDARD.encode(bytes));
+    let trimmed = fixture.expected_reads(
+        &key,
+        &[ColumnRead {
+            name: VALUE_COLUMN,
+            fields: &fields,
+        }],
+    );
+    let Row::Present(values) = trimmed else {
+        unreachable!("a sampled key is present");
+    };
+    let trimmed = values[0].clone().expect("a present value");
+    let whole = fixture.value(&key).expect("a present value");
+    assert!(trimmed.len() < whole.len());
+    let located = protobuf_location(&fixture);
+    let located: Vec<&str> = located.iter().map(String::as_str).collect();
+    let named = format!(
+        "{VALUE_COLUMN}={}",
+        fields.map(|field| field.to_string()).join(",")
+    );
+    let empty_list = format!("{VALUE_COLUMN}=");
+    for (column, expected) in [
+        (named.as_str(), &trimmed[..]),
+        (empty_list.as_str(), &whole[..]),
+        (VALUE_COLUMN, &whole[..]),
+    ] {
+        let output = run(
+            &[
+                &["get"][..],
+                &located,
+                &["--column", column],
+                &[&key.to_string()],
+            ]
+            .concat(),
+            &[],
+        );
+        assert_exit(&output, EXIT_OK);
+        let got = lines(&output.stdout);
+        assert_eq!(
+            got[0]["values"][VALUE_COLUMN]["base64"],
+            encoded(expected),
+            "{column}"
+        );
+        assert_eq!(
+            got[0]["values"][VALUE_COLUMN]["bytes"],
+            Json::from(expected.len())
+        );
+        assert_eq!(got[0]["gets"], Json::from(1), "{column}: one value page");
+    }
+    Ok(())
+}
+
+/// `doctor` on a table declaring a protobuf column reports the column's
+/// format, and for values that are not protobuf a `malformed_protobuf`
+/// finding naming the column, which is advice: the run exits 0. A column
+/// of protobuf values draws none.
+#[tokio::test]
+async fn test_doctor_reports_each_column_s_format_and_malformed_protobuf() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for (kind, malformed) in [(ValueKind::Random, 1), (ValueKind::Protobuf, 0)] {
+        let spec = FixtureSpec {
+            value_kind: kind,
+            ..FixtureSpec::small(&format!("kv_doctor_{kind:?}"), KeyType::Long)
+        };
+        let fixture = local_fixture(dir.path(), spec).await?;
+        let located = protobuf_location(&fixture);
+        let located: Vec<&str> = located.iter().map(String::as_str).collect();
+        let output = run(&[&["doctor"][..], &located].concat(), &[]);
+        assert_exit(&output, EXIT_OK);
+        let report = lines(&output.stdout);
+        assert_eq!(report[0]["kind"], "table");
+        assert_eq!(report[0]["value_columns"][0]["column"], VALUE_COLUMN);
+        assert_eq!(report[0]["value_columns"][0]["format"], "protobuf");
+        assert_eq!(report[0]["advice"], Json::from(malformed), "{kind:?}");
+        let found: Vec<&Json> = report
+            .iter()
+            .filter(|line| line["kind"] == "finding" && line["code"] == "malformed_protobuf")
+            .collect();
+        assert_eq!(found.len(), malformed, "{kind:?}: {report:?}");
+        for finding in found {
+            assert_eq!(finding["column"], VALUE_COLUMN);
+            assert!(finding["caps"].is_null(), "advice");
+        }
+        assert!(
+            report
+                .iter()
+                .all(|line| line["kind"] != "refusal" && line["kind"] != "unwalked")
+        );
+    }
+    Ok(())
+}
+
+/// A field list the table's configured format does not take, a field
+/// number out of range or given twice, and text that is no field list or
+/// no format are usage errors before the load: with every data file gone,
+/// so a load fails with exit 1, each still exits 64.
+#[tokio::test]
+async fn test_get_rejects_a_bad_field_list_or_format_before_the_load() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(
+        dir.path(),
+        FixtureSpec::small("kv_badfields", KeyType::Long),
+    )
+    .await?;
+    assert!(remove_data_files(dir.path())? > 0);
+    let key = fixture.key(SAMPLE[0]).to_string();
+    let opaque = location(&fixture);
+    let protobuf = protobuf_location(&fixture);
+    let protobuf: Vec<&str> = protobuf.iter().map(String::as_str).collect();
+    let fields_of = |list: &str| format!("{VALUE_COLUMN}={list}");
+    let cases = [
+        (&opaque[..], fields_of("1")),
+        (&protobuf[..], fields_of("0")),
+        (
+            &protobuf[..],
+            fields_of(&(MAX_FIELD_NUMBER + 1).to_string()),
+        ),
+        (&protobuf[..], fields_of("1,2,1")),
+        (&protobuf[..], fields_of("1,x")),
+        (
+            &protobuf[..],
+            fields_of(&(u64::from(u32::MAX) + 1).to_string()),
+        ),
+    ];
+    for (located, column) in cases {
+        let output = run(
+            &[&["get"][..], located, &["--column", &column], &[&key]].concat(),
+            &[],
+        );
+        assert_exit(&output, EXIT_USAGE);
+        assert!(output.stdout.is_empty(), "{column}");
+    }
+    let unknown_format = format!("{VALUE_COLUMN}:json");
+    let output = run(
+        &[
+            "get",
+            "--location",
+            fixture.metadata_location(),
+            "--value-column",
+            &unknown_format,
+            &key,
+        ],
+        &[],
+    );
+    assert_exit(&output, EXIT_USAGE);
     Ok(())
 }
 

@@ -112,17 +112,17 @@ pub struct Applied {
     pub started: Vec<Arc<Table>>,
     /// The tables swapped out, whose gauges are withdrawn.
     pub stopped: Vec<Arc<Table>>,
-    /// The tables whose configuration changed in `lookups` or `strict`
-    /// alone, which serve on in place under the new entry
-    /// (`Table::retune`), their generation and refresh untouched.
+    /// The tables whose configuration changed in `lookups`, `strict`, or
+    /// value column formats alone, which serve on in place under the new
+    /// entry (`Table::retune`), their generation and refresh untouched.
     pub retuned: Vec<Arc<Table>>,
     /// The tables kept, whose configuration is unchanged.
     pub kept: usize,
 }
 
 /// Why `Opened::apply` changed nothing: every table it could not open or
-/// load, or whose new `lookups` or `strict` its serving generation does not
-/// meet, by name, in configuration order.
+/// load, or whose new `lookups`, `strict`, or column formats its serving
+/// generation does not meet, by name, in configuration order.
 #[derive(Debug)]
 pub struct Refused {
     /// Each table that failed, with its failure.
@@ -196,8 +196,9 @@ impl Opened {
     /// Replaces the tables served with `configs`, all or nothing (RFD
     /// 018). Tables are matched by name: one whose configuration is equal
     /// in every field is kept as it is, generation and refresh untouched;
-    /// one whose configuration differs in `lookups` or `strict` alone is
-    /// retuned in place at the swap, with no load (RFD 020); every other is
+    /// one whose configuration differs in `lookups`, `strict`, or value
+    /// column formats alone is retuned in place at the swap, with no load
+    /// (RFD 020, RFD 024); every other is
     /// built and loaded beside the set serving, the serving table of its
     /// name included, and neither is touched until every one has loaded.
     /// Each retuned table's serving generation is judged against its new
@@ -240,7 +241,7 @@ impl Opened {
                     next.push(Arc::clone(same));
                     continue;
                 }
-                if entry.same_but_levels(config) {
+                if entry.same_but_tuning(config) {
                     if let Err(error) = same.judge_retune(config) {
                         failures.push((config.name.clone(), error));
                     }
@@ -515,6 +516,7 @@ mod tests {
         refusal_of, two_bucket_table,
     };
     use crate::level::Level;
+    use crate::manifest::testing::whole;
     use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::STALL;
@@ -1015,7 +1017,11 @@ mod tests {
         let (_fixture, opened, both, key) = two_column_table(&[value, detail]).await;
         let before = table_named(&opened, FIRST_TABLE).unwrap();
         let serving = before.current().unwrap();
-        let expected = before.get(&key, &[detail, value]).await.unwrap().row;
+        let expected = before
+            .get(&key, &whole(&[detail, value]))
+            .await
+            .unwrap()
+            .row;
 
         let reordered = TableConfig {
             value_columns: listing(&[detail, value]),
@@ -1038,7 +1044,7 @@ mod tests {
         let applied = opened.apply(std::slice::from_ref(&retuned)).await.unwrap();
         assert_eq!(applied.retuned.len(), 1, "a retune beside the reorder");
         assert_eq!(
-            after.get(&key, &[detail, value]).await.unwrap().row,
+            after.get(&key, &whole(&[detail, value])).await.unwrap().row,
             expected,
             "the columns still answer by name"
         );
@@ -1055,7 +1061,7 @@ mod tests {
         let (_fixture, opened, value_only, key) = two_column_table(&[value]).await;
         let before = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(matches!(
-            before.get(&key, &[detail]).await,
+            before.get(&key, &whole(&[detail])).await,
             Err(crate::error::Error::ColumnRequest { .. })
         ));
 
@@ -1072,7 +1078,7 @@ mod tests {
         let added = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(!Arc::ptr_eq(&added, &before));
         let crate::generation::Row::Present(values) =
-            added.get(&key, &[detail, value]).await.unwrap().row
+            added.get(&key, &whole(&[detail, value])).await.unwrap().row
         else {
             panic!("the key is present");
         };
@@ -1100,7 +1106,7 @@ mod tests {
         let removed = table_named(&opened, FIRST_TABLE).unwrap();
         assert!(!Arc::ptr_eq(&removed, &added));
         assert!(matches!(
-            removed.get(&key, &[detail]).await,
+            removed.get(&key, &whole(&[detail])).await,
             Err(crate::error::Error::ColumnRequest { .. })
         ));
     }

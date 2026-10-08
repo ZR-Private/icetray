@@ -26,6 +26,7 @@ pub mod memory;
 pub mod metric;
 pub mod open;
 mod parquet_io;
+mod projection;
 mod shard;
 mod snapshot;
 mod storage;
@@ -37,14 +38,15 @@ pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
-    Capping, ColumnCost, ColumnLevel, ColumnSummary, FileReport, Finding, FindingCode, LookupCost,
-    Penalty, TableReport, TableSummary, ValueColumnReport, WriterProperty, diagnose, judge,
+    Capping, ColumnCost, ColumnLevel, ColumnSummary, Examined, FileReport, Finding, FindingCode,
+    LookupCost, Penalty, TableReport, TableSummary, Unwalked, ValueColumnReport, WriterProperty,
+    diagnose, examine, judge,
 };
 pub use column::ColumnMismatch;
 pub use config::{
     Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
     Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
-    StandardField, StorageConfig, TableConfig, ValueColumnConfig,
+    StandardField, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete};
@@ -57,9 +59,11 @@ pub use key::{Key, KeyBytes, KeyType};
 pub use level::{FALL_PER_MILLE, Level, PAGE_CACHE_SAMPLE_INTERVAL, PER_MILLE, RECOVER_PER_MILLE};
 pub use local::{DataFileIdentity, DiskChunks, DiskLevel, LocalDir, LocalFault};
 pub use manifest::{
-    Bucketing, ColumnRequestFault, DataFileEntry, TableLayout, ValueColumnLayout, ValueType,
+    Bucketing, ColumnRead, ColumnRequestFault, DataFileEntry, TableLayout, ValueColumnLayout,
+    ValueType,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
+pub use projection::{MAX_FIELD_NUMBER, Malformed};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, LocationError, LocationFault, Storage};
 pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};

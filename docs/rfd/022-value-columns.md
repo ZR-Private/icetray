@@ -1,5 +1,9 @@
 # Value columns
 
+> Updated 2026-10-07: a `value_columns` entry carries its column's
+> format, and a format change applies in place; projection inside a
+> packed protobuf column is decided on its own. See RFD 024.
+
 ## Problem
 
 RFD 002 (Serving layout contract) gives a table one value column and
@@ -34,14 +38,16 @@ name several value columns, or none, each read only when a lookup names
 it, all from one key index and one generation.
 
 - **Configuration.** `value_columns` lists the columns a table serves
-  and replaces `value_column`. The list may be empty, for a table that
-  answers only whether a key is present. A name listed twice, or the
-  key column listed as a value, is a configuration error, and so is an
-  empty name. Order carries no meaning: a generation holds the columns
-  in name order, names compared as their bytes, so a reordered list is
-  not a change and keeps the generation and its indexes. A change to the
-  set reloads the whole table under RFD 018 (Configuration reload),
-  accepted because a table's columns change rarely.
+  and replaces `value_column`, each entry a name or a table of a name
+  and the column's format (RFD 024 (Field projection)). The list may be
+  empty, for a table that answers only whether a key is present. A name
+  listed twice, or the key column listed as a value, is a configuration
+  error, and so is an empty name. Order carries no meaning: a generation
+  holds the columns in name order, names compared as their bytes, so a
+  reordered list is not a change and keeps the generation and its
+  indexes. A change to the set reloads the whole table under RFD 018
+  (Configuration reload), accepted because a table's columns change
+  rarely; a change of formats alone applies in place.
 - **Types.** Each column is `binary`, `fixed`, or `string`, served as
   bytes unchanged. A column of any other type refuses the table as
   `value_type_unsupported`, naming the column. How a column is found in
@@ -138,9 +144,10 @@ such a value has no "bytes unchanged" form, so the wire would need typed
 values, which is the query API RFD 002 declined.
 
 Projection inside one packed column, trimming a serialized protobuf to
-the field numbers a caller asks for, which RFD 002 left to RFD 007
-(Serving tiers). Not chosen here: it saves bytes on the wire and in the
-caller's decode, but not the GET, and can be decided on its own.
+the field numbers a caller asks for. Not chosen here: it saves bytes on
+the wire and in the caller's decode, but not the GET, and is decided on
+its own by RFD 024 (Field projection), which declares the format per
+column and complements a split into columns rather than replacing it.
 
 Several requested columns fetched as one range read. Rejected because a
 row's columns lie in column chunks at unrelated offsets, so one read

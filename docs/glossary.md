@@ -62,6 +62,11 @@ See [Choosing a level](configuration.md#choosing-a-level).
 `doctor`, `get`, and `info`. Each loads its tables the way `serve` does.
 See [the command line](configuration.md#the-command-line).
 
+**Projection.** Trimming a value of a column declared protobuf to the
+top-level fields a lookup names, by field number, after the page cache;
+it saves the bytes on the wire and the caller's decode, not a GET. See
+[Protobuf columns](table-contract.md#protobuf-columns).
+
 **Refused.** A snapshot icetray will not serve, for a named reason: an
 answer could be wrong (unsorted files, duplicate keys, equality deletes,
 and the like), the table cannot be held the way its residency requires,

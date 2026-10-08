@@ -31,6 +31,19 @@ pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// succeeds; a fetch another lookup joins is not counted again, and hedges
 /// are `HEDGES_TOTAL`'s.
 pub const VALUE_PAGE_GETS_TOTAL: &str = "icetray_value_page_gets_total";
+/// Bytes of the values each lookup the core answered read, by `table` and
+/// `column` (RFD 024): a present value's bytes as the page held them, a
+/// default (RFD 023) as its bytes, a null and a miss as none. A lookup that
+/// fails counts nothing, and a failed `MultiGet` counts the keys it answered
+/// before the failure, as `LOOKUPS_TOTAL` does.
+pub const VALUE_BYTES_READ_TOTAL: &str = "icetray_value_bytes_read_total";
+/// Bytes of the values each lookup the core answered returned, by `table`
+/// and `column` (RFD 024), counted as `VALUE_BYTES_READ_TOTAL` is: a value
+/// read whole as it was read, a projected one as its trimmed bytes.
+pub const VALUE_BYTES_RETURNED_TOTAL: &str = "icetray_value_bytes_returned_total";
+/// Malformed values projected lookups met, by `table` and `column` (RFD
+/// 024): each failed its lookup as `FAILED_PRECONDITION`.
+pub const PROJECTION_ERRORS_TOTAL: &str = "icetray_projection_errors_total";
 /// Refreshes that failed and left the previous generation serving, by
 /// `table` and `reason`.
 pub const REFRESH_ERRORS_TOTAL: &str = "icetray_refresh_errors_total";
@@ -160,7 +173,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 45] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -210,6 +223,21 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 45] = [
         VALUE_PAGE_GETS_TOTAL,
         Kind::Counter,
         "Value-page and dictionary-page GETs issued, hedges excluded, by table and column.",
+    ),
+    (
+        VALUE_BYTES_READ_TOTAL,
+        Kind::Counter,
+        "Bytes of the values answered lookups read, by table and column.",
+    ),
+    (
+        VALUE_BYTES_RETURNED_TOTAL,
+        Kind::Counter,
+        "Bytes of the values answered lookups returned, after projection, by table and column.",
+    ),
+    (
+        PROJECTION_ERRORS_TOTAL,
+        Kind::Counter,
+        "Malformed values projected lookups met, by table and column.",
     ),
     (
         REFRESH_ERRORS_TOTAL,

@@ -9,11 +9,14 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use icetray_core::config::{Config, TableConfig};
-use icetray_core::{FindingLog, Opened, Table, diagnose, judge, open, time};
+use icetray_core::{ColumnRead, FindingLog, Opened, Table, diagnose, examine, judge, open, time};
 
+use crate::cli::ColumnArg;
 use crate::error::{CliError, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK};
 use crate::key_text;
-use crate::output::{FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, emit};
+use crate::output::{
+    FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, UnwalkedLine, emit,
+};
 
 /// Opens every table of `config`, or the one named by `only`, logging the
 /// doctor's findings as `findings` says; a name no
@@ -51,7 +54,11 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// (`Generation::verify_buckets`, which decodes and hashes every key and
 /// which no load or refresh runs) finds a key outside its file's recorded
 /// bucket or cannot finish: that table would answer a present key absent,
-/// so it is a refusal, not a cap or advice (RFD 007). Every table is
+/// so it is a refusal, not a cap or advice (RFD 007). The report is
+/// `examine`'s, which walks each protobuf column's default and a value
+/// page of it (RFD 024); a column whose page could not be read is an
+/// `unwalked` line after the findings, and the table's report and
+/// judgement stand without it. Every table is
 /// loaded with `strict` off, so its findings are reported whatever its
 /// setting, diagnosed against its configured `lookups`, and then judged by
 /// `judge` under its configured `strict`: a table below its level that
@@ -83,10 +90,17 @@ pub async fn doctor(
                     continue;
                 }
                 let configured = configured(config, table.name());
-                let report = diagnose(&generation, configured.lookups());
+                let examined = examine(&generation, configured.lookups(), &|name| {
+                    configured.format_of(name).unwrap_or_default()
+                })
+                .await;
+                let report = &examined.report;
                 emit(&SummaryLine::new(&report.summary))?;
                 for finding in &report.findings {
                     emit(&FindingLine::new(table.name(), finding))?;
+                }
+                for unwalked in &examined.unwalked {
+                    emit(&UnwalkedLine::new(table.name(), unwalked))?;
                 }
                 if files {
                     for file in &report.files {
@@ -145,7 +159,10 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     }
     for table in loaded {
         let generation = table.serving()?;
-        let report = diagnose(&generation, table.config().lookups());
+        let entry = table.config();
+        let report = diagnose(&generation, entry.lookups(), &|name| {
+            entry.format_of(name).unwrap_or_default()
+        });
         emit(&SummaryLine::new(&report.summary))?;
     }
     Ok(())
@@ -153,18 +170,20 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
 
 /// `get`: one `lookup` line per key from the table named by `only`, or the
 /// only configured table, each reading the value columns `columns` names,
-/// none for presence alone (RFD 022); several tables and no name is
+/// whole or trimmed to the fields each names (RFD 024), none for presence
+/// alone (RFD 022); several tables and no name is
 /// `CliError::TableNameRequired`. The columns are checked against the
-/// table's configured ones, and every key is parsed under the key type of
-/// the snapshot the ref names, read from the table's metadata before any
-/// data file (`Table::resolve_key_type`), so a column the table does not
-/// serve or names twice, and a key that does not parse, are usage errors
-/// before the load, which on a large table takes minutes.
+/// table's configured ones and their formats, and every key is parsed
+/// under the key type of the snapshot the ref names, read from the table's
+/// metadata before any data file (`Table::resolve_key_type`), so a column
+/// the table does not serve, names twice, or reads with fields its format
+/// does not take, and a key that does not parse, are usage errors before
+/// the load, which on a large table takes minutes.
 /// Each line carries the GETs the lookup issued and its elapsed time.
 pub async fn get(
     config: &Config,
     only: Option<&str>,
-    columns: &[String],
+    columns: &[ColumnArg],
     keys: &[String],
 ) -> Result<(), CliError> {
     let opened = open_tables(config, only, FindingLog::Events).await?;
@@ -180,10 +199,17 @@ pub async fn get(
             });
         }
     };
-    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let reads: Vec<ColumnRead<'_>> = columns
+        .iter()
+        .map(|column| ColumnRead {
+            name: &column.name,
+            fields: &column.fields,
+        })
+        .collect();
+    let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
     table
         .config()
-        .check_column_request(&names)
+        .check_column_request(&reads)
         .map_err(CliError::Column)?;
     let key_type = table.resolve_key_type().await?;
     let parsed = keys
@@ -195,7 +221,7 @@ pub async fn get(
     for key in &parsed {
         let before = stats.gets();
         let started = Instant::now();
-        let lookup = table.get(key, &names).await?;
+        let lookup = table.get(key, &reads).await?;
         let elapsed = time::micros(started.elapsed());
         emit(&LookupLine::new(
             table.name(),

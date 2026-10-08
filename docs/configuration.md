@@ -51,7 +51,7 @@ location = "s3://warehouse/db/kv"
 name = "profiles"
 ref = "serving"
 key_column = "user_id"
-value_columns = ["properties", "embedding"]
+value_columns = [{ name = "properties", format = "protobuf" }, "embedding"]
 residency = "disk"
 
 [tables.source]
@@ -221,7 +221,7 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `name` | string | required | The name clients use. Unique and not empty. |
 | `ref` | string | required | The Iceberg branch or tag to serve, such as `"main"`. |
 | `key_column` | string | required | The key column: a top-level field of the snapshot's schema, found in each data file by its name and field id ([Changing the schema](table-contract.md#changing-the-schema)). |
-| `value_columns` | list of strings | required | The value columns the table serves, each a top-level field found the same way and each read only when a lookup names it ([Value columns](table-contract.md#value-columns)). The list may be empty, `value_columns = []`, for a table that answers only whether a key is present. Each column must be of Iceberg type `binary`, `fixed`, or `string`, or the snapshot is refused as `value_type_unsupported`, naming the column. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. Order carries no meaning: a reload that only reorders the list changes nothing, and one that changes the set loads the table anew. |
+| `value_columns` | list of strings or tables | required | The value columns the table serves, each a top-level field found the same way and each read only when a lookup names it ([Value columns](table-contract.md#value-columns)). An entry is the column's name, `"payload"`, or a table of its `name` and its `format`, `{ name = "detail", format = "protobuf" }`; in JSON, `"payload"` or `{"name": "detail", "format": "protobuf"}`. `format` is `"opaque"`, the default, bytes icetray never looks into, or `"protobuf"`, a serialized protobuf message a lookup may trim to the top-level fields it names ([Protobuf columns](table-contract.md#protobuf-columns)). A key the table form does not know is a schema error placed at it, as ``tables[0].value_columns[1].fromat: unknown field `fromat`, expected `name` or `format` ``, and so is a format of another name, as ``tables[0].value_columns[1].format: unknown variant `json`, expected `opaque` or `protobuf` ``. The list may be empty, `value_columns = []`, for a table that answers only whether a key is present. Each column must be of Iceberg type `binary`, `fixed`, or `string`, and a protobuf one `binary`, or the snapshot is refused as `value_type_unsupported`, naming the column. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. Order carries no meaning: a reload that only reorders the list changes nothing, one that changes only formats applies to the serving snapshot in place, and one that changes the set loads the table anew. |
 | `source` | table | required | Where the table's metadata comes from, below. |
 | `lookups` | string | the best level `residency` reaches | The lookup cost the table accepts: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Refuse a snapshot whose layout puts the table below its `lookups` level. A strict table whose first snapshot is below its level fails the start; a later one is refused, and the table is [held](glossary.md): the last snapshot that met the level keeps serving. Off, the snapshot serves and the table is flagged below its level. |
@@ -445,13 +445,28 @@ icetray get --location s3://warehouse/db/kv --value-column payload --column payl
   be served. `--files` adds a `file` line per data file. The doctor
   decodes and hashes every key to check that it sits in its file's bucket,
   which a load does not, so it takes longer than `info` on the same table.
+  For each column declared protobuf it also walks the default the
+  column states, with no GET, and every value on the first value page of
+  the first file holding the column, one GET, two for a
+  dictionary-encoded chunk, passing to the next file holding the column
+  when that page holds only nulls, up to three files. A value or default
+  that is not protobuf is `malformed_protobuf` advice; a page it cannot
+  read is an `unwalked` line, and the rest of the table's report stands.
 - `info` loads each table and prints its `table` line.
 - `get` loads one table and prints a `lookup` line per key, in the order
-  given. It takes a repeatable `--column <COLUMN>`, the value columns to
-  read for every key, in the order given, with no default: with none,
-  each line says only whether its key is present and no value page is
-  read. A column the table does not serve, or one named twice, fails the
-  run.
+  given. It takes a repeatable `--column <NAME[=FIELDS]>`, the value
+  columns to read for every key, in the order given, with no default:
+  with none, each line says only whether its key is present and no value
+  page is read. `FIELDS` is a comma-separated list of top-level field
+  numbers, such as `--column detail=1,4,9`, for a column declared
+  protobuf: each value is trimmed to those fields, and its line carries
+  the trimmed bytes in the usual shape. `NAME` alone reads the whole
+  value, and so does `NAME=`, the form for a name that holds an `=`. A
+  column the table does not serve, one named twice, a field list for a
+  column not declared protobuf, a number outside 1 to 536870911, or one
+  given twice exits 64 before the table loads, and so does a field list
+  that is not numbers. A value that is not protobuf fails the run with
+  exit 1, naming the table, column, and key.
 
 ### Choosing the tables
 
@@ -471,7 +486,7 @@ The one-shots share one set of flags, grouped in their help as follows.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--key-column <COLUMN>` | `key` | The key column. |
-| `--value-column <COLUMN>` | none | A value column the table serves; repeatable. With none, the table answers only whether a key is present. |
+| `--value-column <NAME[:FORMAT]>` | none | A value column the table serves, with its format, `opaque` by default or `protobuf`; repeatable. A name holding a `:` takes its format after it, as `a:b:opaque`. An unknown format exits 64. With none, the table answers only whether a key is present. |
 | `--ref <REF>` | `main` | The branch or tag to read. |
 | `--residency <RESIDENCY>` | `full` | `full` or `bloom`. `disk` needs a local directory and is available through a configuration file. |
 
@@ -588,7 +603,7 @@ Two conventions hold for every line:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 | Key | Value |
@@ -616,6 +631,7 @@ One per table, from `info` and from `doctor`:
 | `lookup_cost.files_probed` | Files one lookup probes at worst, as `icetray_table_files_probed_per_lookup` reports it. |
 | `value_columns` | One object per configured value column, in name order, names compared as their UTF-8 bytes; empty for a table of none. |
 | `value_columns[].column` | The column's name. |
+| `value_columns[].format` | The column's format as the table's entry declares it: `opaque` or `protobuf`. |
 | `value_columns[].level` | The level a lookup naming the column achieves, as `icetray_table_column_level` reports it. |
 | `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it names. |
 | `value_columns[].files_answering_default` | Data files written before the column was added, which answer its default. |
@@ -636,7 +652,7 @@ One per finding, from `doctor`, capping findings first:
 | `code` | The finding's code, such as `large_key_pages`; the codes are in [the table contract](table-contract.md#requirements). |
 | `message` | What was measured, for a person. |
 | `file` | The data file's location, or `null` for a table-level finding. |
-| `column` | The value column the finding is about, for `dictionary_encoded_value`, `large_value_pages`, `value_pages_over_ceiling`, and `column_default`; `null` for a finding about the row or the table. |
+| `column` | The value column the finding is about, for `dictionary_encoded_value`, `large_value_pages`, `value_pages_over_ceiling`, `column_default`, and `malformed_protobuf`; `null` for a finding about the row or the table. |
 | `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
 | `property` | The writer property that fixes it, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
 
@@ -679,11 +695,28 @@ for it:
 | Key | Value |
 |---|---|
 | `reason` | A refusal reason from [the table contract](table-contract.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
-| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
+| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
 `reason` and `error_kind` use the same names as the `reason` label of
 `icetray_refresh_errors_total`.
+
+#### `unwalked`
+
+One per column declared protobuf whose value page the doctor could not
+read, after the table's `finding` lines. The column's values went
+unchecked; the table is not refused for it, and the exit code is what the
+table's other lines make it:
+
+```json
+{"kind":"unwalked","table":"kv","column":"detail","error_kind":"object_store","message":"object store: Object at location db/kv/data/00000-0.parquet not found"}
+```
+
+| Key | Value |
+|---|---|
+| `column` | The column whose page was not read. |
+| `error_kind` | What failed, one of the `error_kind` values of `refusal`. |
+| `message` | The error, for a person. |
 
 #### `lookup`
 

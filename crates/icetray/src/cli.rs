@@ -12,12 +12,13 @@ use clap::builder::{NonEmptyStringValueParser, PossibleValuesParser, Styles, Typ
 use clap::{Args, Parser, Subcommand};
 use icetray_core::catalog::{is_relative_path, table_root_name};
 use icetray_core::config::{
-    Config, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig, SourceConfig,
-    StorageConfig, TableConfig, ValueColumnConfig,
+    Config, ConfigViolation, DEFAULT_RESIDENCY, Residency, RewriteFault, RewriteRule, ServerConfig,
+    SourceConfig, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
 };
 
 use crate::error::{
-    CliError, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, RewriteTextFault,
+    CliError, ColumnTextFault, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE,
+    RewriteTextFault,
 };
 use crate::reload::{ConfigFile, ConfigSource as _, Reading};
 
@@ -51,6 +52,18 @@ const LOCATED_RESIDENCIES: [Residency; 2] = [Residency::Full, Residency::Bloom];
 /// What separates the two halves of a `--rewrite FROM=TO` rule; the first
 /// occurrence, since a location may itself carry one.
 const REWRITE_SEPARATOR: char = '=';
+
+/// What separates a `--column` name from its field list, `NAME=FIELDS`; the
+/// last occurrence, so a name holding one is still named, as `NAME=` for
+/// the whole value.
+const FIELDS_SEPARATOR: char = '=';
+
+/// What separates two field numbers of a `--column` field list.
+const FIELD_LIST_SEPARATOR: char = ',';
+
+/// What separates a `--value-column` name from its format, `NAME:FORMAT`;
+/// the last occurrence, so a name holding one takes its format after it.
+const FORMAT_SEPARATOR: char = ':';
 
 /// The help heading of the flags that choose the tables, on every command.
 const HEADING_TABLES: &str = "Table selection";
@@ -95,6 +108,7 @@ fn footer() -> String {
 
 {heading}Examples:{heading:#}
   icetray get --location s3://warehouse/db/kv --value-column payload --column payload 42 43
+  icetray get --location s3://warehouse/db/kv --value-column detail:protobuf --column detail=1,4 42
   icetray doctor --config icetray.toml
   icetray serve --config icetray.toml"
     )
@@ -170,14 +184,20 @@ pub enum Command {
         /// The table to read; needed when more than one is configured.
         #[arg(long, short, value_name = "NAME", help_heading = HEADING_TABLES)]
         table: Option<String>,
-        /// A value column to read for every key; repeatable, read in the
-        /// order given.
+        /// A value column to read for every key, whole or trimmed to some
+        /// fields; repeatable, read in the order given.
         ///
-        /// With none, each lookup line says only whether its key is
-        /// present, and no value page is read. A column the table does not
-        /// serve, or one named twice, fails the run.
-        #[arg(long = "column", value_name = "COLUMN")]
-        columns: Vec<String>,
+        /// FIELDS is a comma-separated list of top-level protobuf field
+        /// numbers, such as detail=1,4,9, for a column declared protobuf:
+        /// each value is trimmed to every occurrence of those fields. NAME
+        /// alone, or NAME= for a name that holds an =, reads the whole
+        /// value. With no --column, each lookup line says only whether its
+        /// key is present, and no value page is read. A column the table
+        /// does not serve, one named twice, a field list for a column not
+        /// declared protobuf, a number outside 1 to 536870911, or one given
+        /// twice fails the run before the table loads.
+        #[arg(long = "column", value_name = "NAME[=FIELDS]", value_parser = parse_column)]
+        columns: Vec<ColumnArg>,
         /// Keys to look up, each as text of the table's key type.
         ///
         /// A long is its digits, with a leading - when negative. A string
@@ -266,17 +286,22 @@ pub struct Target {
         help_heading = HEADING_LOCATED
     )]
     pub key_column: String,
-    /// A value column the located table serves; repeatable.
+    /// A value column the located table serves, with its format;
+    /// repeatable.
     ///
-    /// With none, the table answers only whether a key is present.
+    /// FORMAT is opaque, the default, or protobuf, which lets --column
+    /// trim the column's values to some of their fields; a name holding a
+    /// : takes its format after it, as a:b:opaque. With none, the table
+    /// answers only whether a key is present.
     #[arg(
         long = "value-column",
-        value_name = "COLUMN",
+        value_name = "NAME[:FORMAT]",
+        value_parser = parse_value_column,
         requires = "location",
         conflicts_with = "config",
         help_heading = HEADING_LOCATED
     )]
-    pub value_columns: Vec<String>,
+    pub value_columns: Vec<ValueColumnConfig>,
     /// The branch or tag of the located table to read.
     #[arg(
         long,
@@ -400,6 +425,58 @@ fn parse_rewrite(text: &str) -> Result<RewriteRule, RewriteTextFault> {
     }
 }
 
+/// One `get --column`: the column's name and the field numbers to trim its
+/// values to, empty for the whole value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnArg {
+    /// The column's name.
+    pub name: String,
+    /// The field numbers; empty reads the value whole.
+    pub fields: Vec<u32>,
+}
+
+/// A `--column` from `NAME` or `NAME=FIELDS`, split at the last `=`, FIELDS
+/// a comma-separated list of numbers, each a `u32`; an empty FIELDS reads
+/// the whole value. Whether the table serves the name and takes the
+/// numbers is checked against its configuration once it is known
+/// (`TableConfig::check_column_request`); text that is not a number is a
+/// usage error here.
+fn parse_column(text: &str) -> Result<ColumnArg, ColumnTextFault> {
+    let Some((name, list)) = text.rsplit_once(FIELDS_SEPARATOR) else {
+        return Ok(ColumnArg {
+            name: text.to_string(),
+            fields: Vec::new(),
+        });
+    };
+    let fields = if list.is_empty() {
+        Vec::new()
+    } else {
+        list.split(FIELD_LIST_SEPARATOR)
+            .map(|number| {
+                number
+                    .parse()
+                    .map_err(|_| ColumnTextFault::NotAFieldNumber {
+                        text: number.to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?
+    };
+    Ok(ColumnArg {
+        name: name.to_string(),
+        fields,
+    })
+}
+
+/// A `--value-column` from `NAME` or `NAME:FORMAT`, split at the last `:`,
+/// FORMAT read through `ValueFormat`'s `FromStr`; a FORMAT it does not know
+/// is a usage error.
+fn parse_value_column(text: &str) -> Result<ValueColumnConfig, ConfigViolation> {
+    match text.rsplit_once(FORMAT_SEPARATOR) {
+        None => Ok(ValueColumnConfig::named(text)),
+        Some((name, format)) => Ok(ValueColumnConfig::of(name, format.parse::<ValueFormat>()?)),
+    }
+}
+
 /// `location` made absolute against the working directory when it is a
 /// relative local path (`catalog::is_relative_path`), with its `.` and `..`
 /// components resolved by name, since storage refuses either in a path, and
@@ -518,11 +595,7 @@ impl Target {
                 source: SourceConfig::Static { location },
                 r#ref: self.r#ref.clone(),
                 key_column: self.key_column.clone(),
-                value_columns: self
-                    .value_columns
-                    .iter()
-                    .map(|name| ValueColumnConfig::named(name))
-                    .collect(),
+                value_columns: self.value_columns.clone(),
                 strict: false,
                 lookups: None,
                 residency: self.residency,
@@ -940,6 +1013,96 @@ value_columns = ["value"]
         let error =
             parse(&["serve", "--config", "icetray.toml", "--location", LOCATION]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{error}");
+    }
+
+    #[test]
+    fn test_parse_column_reads_a_name_and_a_field_list_split_at_the_last_separator() {
+        let column = |name: &str, fields: &[u32]| ColumnArg {
+            name: name.to_string(),
+            fields: fields.to_vec(),
+        };
+        let cases = [
+            ("detail", column("detail", &[])),
+            ("detail=", column("detail", &[])),
+            ("detail=1,4,9", column("detail", &[1, 4, 9])),
+            ("a=b=", column("a=b", &[])),
+            ("a=b=7", column("a=b", &[7])),
+            ("detail=0", column("detail", &[0])),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_column(text), Ok(expected), "{text:?}");
+        }
+        for (text, entry) in [
+            ("detail=1,x", "x"),
+            ("detail=1,,2", ""),
+            ("detail=-1", "-1"),
+        ] {
+            assert_eq!(
+                parse_column(text),
+                Err(ColumnTextFault::NotAFieldNumber {
+                    text: entry.to_string()
+                }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_value_column_reads_a_name_and_a_format_split_at_the_last_separator() {
+        assert_eq!(
+            parse_value_column("detail"),
+            Ok(ValueColumnConfig::named("detail"))
+        );
+        assert_eq!(
+            parse_value_column("detail:protobuf"),
+            Ok(ValueColumnConfig::of("detail", ValueFormat::Protobuf))
+        );
+        assert_eq!(
+            parse_value_column("a:b:opaque"),
+            Ok(ValueColumnConfig::named("a:b"))
+        );
+        assert_eq!(
+            parse_value_column("detail:json"),
+            Err(ConfigViolation::UnknownValueFormat {
+                text: "json".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_config_location_value_column_carries_its_format() {
+        let cli = parse(&[
+            "get",
+            "--location",
+            LOCATION,
+            "--value-column",
+            "detail:protobuf",
+            "--value-column",
+            "payload",
+            "--column",
+            "detail=1,2",
+            "1",
+        ])
+        .unwrap();
+        let Command::Get {
+            target, columns, ..
+        } = cli.command
+        else {
+            panic!("a get");
+        };
+        assert_eq!(
+            columns,
+            [ColumnArg {
+                name: "detail".to_string(),
+                fields: vec![1, 2],
+            }]
+        );
+        let config = target.config(None).unwrap();
+        assert_eq!(
+            config.tables[0].value_formats(),
+            [ValueFormat::Protobuf, ValueFormat::Opaque],
+            "detail, then payload"
+        );
     }
 
     #[test]

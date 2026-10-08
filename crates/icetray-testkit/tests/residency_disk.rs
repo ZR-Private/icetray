@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig,
@@ -126,7 +127,11 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
             routed += 1;
         }
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "key {key}"
         );
@@ -141,7 +146,11 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
     let (gets, reads) = counters();
     let far = icetray_testkit::far_key(KeyType::Long);
     assert_eq!(
-        served.table.get(&far, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&far, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Absent
     );
     assert_eq!(counters(), (gets, reads), "a far miss touches nothing");
@@ -182,7 +191,11 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
         let key = fixture.key(id);
         let (gets, reads) = (stats.gets(), stats.local_reads());
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             fixture.expected(&key)
         );
         assert_eq!(
@@ -339,7 +352,11 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     for id in SAMPLE {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             fixture.expected(&key)
         );
     }
@@ -365,7 +382,11 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     let key = fixture.key(SAMPLE[0]);
     let (gets, reads) = (stats.gets(), stats.local_reads());
     assert_eq!(
-        served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&key)
     );
     assert_eq!(

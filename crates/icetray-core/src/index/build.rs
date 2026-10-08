@@ -1158,6 +1158,23 @@ pub(super) fn read_one<T: ParquetDataType>(
     Ok(values.pop())
 }
 
+/// The rows `rows` of the value column chunk `chunk` from `segments`, its
+/// nulls left out: the values of one value page, which the caller has
+/// fetched with its dictionary page and whose headers it has checked, as
+/// for `read_one`.
+pub(super) fn read_rows<T: ParquetDataType>(
+    chunk: ColumnChunk<'_>,
+    rows: Range<i64>,
+    segments: Arc<Segments>,
+) -> Result<Vec<T::T>> {
+    read_column::<T>(
+        chunk,
+        segments,
+        row_index(rows.start),
+        row_index(rows.end - rows.start),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use parquet::basic::{Compression, Encoding};

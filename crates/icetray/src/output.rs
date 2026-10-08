@@ -10,7 +10,9 @@ use std::io::Write as _;
 
 use base64::Engine as _;
 use icetray_core::generation::{Lookup, Row};
-use icetray_core::{ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotId, TableSummary};
+use icetray_core::{
+    ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotId, TableSummary, Unwalked,
+};
 use serde::Serialize;
 use serde::ser::SerializeMap as _;
 
@@ -30,6 +32,9 @@ pub enum Kind {
     File,
     /// A table the doctor refused.
     Refusal,
+    /// A protobuf column whose value page the doctor could not read, so
+    /// its values went unchecked (RFD 024).
+    Unwalked,
     /// One lookup of a `get` run, as `icetray_lookups_total` counts it.
     Lookup,
 }
@@ -181,6 +186,7 @@ impl RefusalCode {
             | ErrorKind::Cache
             | ErrorKind::KeyType
             | ErrorKind::ColumnRequest
+            | ErrorKind::MalformedValue
             | ErrorKind::Table
             | ErrorKind::File
             | ErrorKind::NotReady
@@ -234,6 +240,31 @@ impl<'a> RefusalLine<'a> {
             reason,
             error_kind,
             message: error.to_string(),
+        }
+    }
+}
+
+/// A protobuf column the doctor's walk could not read (`Unwalked`), an
+/// `unwalked` line: the column, the error's kind, and its message for a
+/// person. It refuses nothing: the table's other lines stand.
+#[derive(Debug, Serialize)]
+pub struct UnwalkedLine<'a> {
+    kind: Kind,
+    table: &'a str,
+    column: &'a str,
+    error_kind: ErrorKind,
+    message: String,
+}
+
+impl<'a> UnwalkedLine<'a> {
+    /// The line for `unwalked`, a column of `table`.
+    pub fn new(table: &'a str, unwalked: &'a Unwalked) -> Self {
+        Self {
+            kind: Kind::Unwalked,
+            table,
+            column: &unwalked.column,
+            error_kind: unwalked.error.kind(),
+            message: unwalked.error.to_string(),
         }
     }
 }
@@ -422,6 +453,7 @@ mod tests {
             },
             value_columns: vec![ColumnSummary {
                 column: COLUMN.to_string(),
+                format: icetray_core::ValueFormat::Protobuf,
                 level: Level::Optimal,
                 gets_per_hit: 1,
                 files_answering_default: 0,
@@ -505,6 +537,14 @@ mod tests {
             leading_keys(&RefusalLine::new(TABLE, &error)),
             ["kind", "table"]
         );
+        let unwalked = icetray_core::Unwalked {
+            column: COLUMN.to_string(),
+            error,
+        };
+        assert_eq!(
+            leading_keys(&UnwalkedLine::new(TABLE, &unwalked)),
+            ["kind", "table"]
+        );
         assert_eq!(
             leading_keys(&LookupLine::new(
                 TABLE,
@@ -532,6 +572,11 @@ mod tests {
             Json::String("balanced".to_string())
         );
         assert_eq!(line["capping"], Json::from(0));
+        assert_eq!(
+            line["value_columns"][0]["format"],
+            Json::String("protobuf".to_string()),
+            "each column's format, as the file spells it"
+        );
         assert_eq!(
             line["lookup_cost"],
             serde_json::json!({"gets_per_hit": 1, "gets_per_miss": 0, "files_probed": 1})
@@ -608,6 +653,22 @@ mod tests {
             assert_eq!(line["error_kind"], Json::String(kind.to_string()));
             assert!(line["message"].is_string());
         }
+    }
+
+    #[test]
+    fn test_serialize_unwalked_line_names_the_column_and_the_error_s_kind() {
+        let unwalked = icetray_core::Unwalked {
+            column: COLUMN.to_string(),
+            error: icetray_core::Error::Table {
+                table: TABLE.to_string(),
+                fault: TableFault::MetadataLocationUnknown,
+            },
+        };
+        let line = serde_json::to_value(UnwalkedLine::new(TABLE, &unwalked)).unwrap();
+        assert_eq!(line["kind"], Json::String("unwalked".to_string()));
+        assert_eq!(line["column"], Json::String(COLUMN.to_string()));
+        assert_eq!(line["error_kind"], Json::String("table".to_string()));
+        assert!(line["message"].is_string());
     }
 
     #[test]

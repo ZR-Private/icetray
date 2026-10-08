@@ -9,6 +9,12 @@
 > table's value columns, and the MultiGet limit is
 > `server.max_multi_get_values`, counting keys times columns. See RFD 022.
 
+> Updated 2026-10-07: each column a Get or MultiGet reads carries a list
+> of protobuf field numbers to trim its value to, empty for the whole
+> value; TableInfo reports each column's format; a value that is not the
+> protobuf its column declares fails the call as `FAILED_PRECONDITION`,
+> a deterministic failure the caller does not retry. See RFD 024.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -44,10 +50,15 @@ type says how its bytes are read. The variant must match the table's key
 type, and a key sent in the wrong one is an invalid-argument error. Naming
 a table the server does not serve is a not-found error.
 
-Get and MultiGet each carry one list of value columns (RFD 022 (Value
+Get and MultiGet each carry one list of column reads (RFD 022 (Value
 columns)), applied to every key of the call, with no default: an empty
 list asks whether the key is present and nothing more. A name the table
 does not serve, or a name given twice, is an invalid-argument error.
+Each read names a column and a list of top-level protobuf field numbers
+to trim its value to, empty for the whole value (RFD 024 (Field
+projection)); a list for a column not declared protobuf, a number
+outside protobuf's range, or a number given twice is an
+invalid-argument error.
 
 Every result says whether the key is present or absent. A present result
 carries one value per requested column, in the order requested, and each
@@ -63,12 +74,17 @@ every key in the batch from one generation, so a batch is consistent with
 itself. It carries one snapshot id for the whole batch, and its results
 come back in the order the keys were sent, each with only the outcome and
 the values. When any key in a MultiGet cannot be answered, the whole call
-fails and the caller retries it.
+fails and the caller retries it, unless the failure is
+`FAILED_PRECONDITION`: a value a read trims that is not the protobuf its
+column declares fails the same way on every attempt, so the caller stops
+naming fields of that column or waits for the table to be rewritten
+rather than retrying.
 
 TableInfo reports the snapshot id, bucket count, file count, row count, key
 type, resident index bytes, and the table's value columns in name order,
-each with its type and a `fixed` column's width. The key type and each
-column's type are enums, so clients switch on them.
+each with its type, a `fixed` column's width, and its format. The key
+type, each column's type, and its format are enums, so clients switch on
+them.
 
 Field comments in the proto describe what a caller can rely on and leave
 the server's internal structures out.
@@ -90,7 +106,11 @@ and they would have to be kept equal.
 Answering the rest of a MultiGet and marking the failed entry. Rejected for
 the first version. It puts an error check on every result of every call, a
 cost every caller pays for a failure expected to be rare, while a retry
-only resends the batch the caller already built.
+only resends the batch the caller already built. A value that is not the
+protobuf its column declares is the exception: its failure is
+deterministic, so a retry fails again, and the caller drops the key or
+the field list; the doctor and `icetray_projection_errors_total` surface
+the value (RFD 024).
 
 Streaming MultiGet. Deferred. The fan-out pattern in archetype A merges the
 tier's results with the online store's, and request-order results in one

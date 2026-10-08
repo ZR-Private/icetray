@@ -136,7 +136,7 @@ pub enum ReloadRefusal {
     /// Settings outside the tables changed, by their names in the file.
     Restart(Vec<&'static str>),
     /// A table failed to open or load, or its serving generation does not
-    /// meet its retuned `lookups` or `strict`.
+    /// meet its retuned `lookups`, `strict`, or column formats.
     Tables(Refused),
 }
 

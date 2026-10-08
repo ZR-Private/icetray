@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use iceberg::puffin::DELETION_VECTOR_V1;
 use iceberg::spec::{DataFile, FormatVersion, Struct};
+use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
@@ -192,7 +193,11 @@ async fn check(tiers: &mut Tiers, fixture: &Fixture) -> Result<MergeOracle> {
         for key in &keys {
             let expected = expected_gets(&full, &generation, &oracle, key, seen);
             let before = stats.gets();
-            let answer = served.table.get(key, &[VALUE_COLUMN]).await?.row;
+            let answer = served
+                .table
+                .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row;
             assert_eq!(answer, oracle.expected(key), "{residency} key {key}");
             assert_eq!(
                 stats.gets() - before,
@@ -572,7 +577,11 @@ async fn test_a_deleted_keys_bloom_miss_costs_a_key_page_per_deleted_copy() -> R
         copies.is_subset(&positives),
         "a deleted row stays in its filter"
     );
-    let (answer, gets) = gets_during(&bloom, bloom.table.get(&key, &[VALUE_COLUMN])).await;
+    let (answer, gets) = gets_during(
+        &bloom,
+        bloom.table.get(&key, &[ColumnRead::whole(VALUE_COLUMN)]),
+    )
+    .await;
     assert_eq!(answer?.row, Row::Absent);
     assert_eq!(
         gets,
@@ -581,7 +590,11 @@ async fn test_a_deleted_keys_bloom_miss_costs_a_key_page_per_deleted_copy() -> R
     );
     for (residency, extra) in [(Residency::Full, 0), (Residency::Disk, 0)] {
         let served = serve_in(&fixture, residency, scratch.path(), None).await?;
-        let (answer, gets) = gets_during(&served, served.table.get(&key, &[VALUE_COLUMN])).await;
+        let (answer, gets) = gets_during(
+            &served,
+            served.table.get(&key, &[ColumnRead::whole(VALUE_COLUMN)]),
+        )
+        .await;
         assert_eq!(answer?.row, Row::Absent);
         assert_eq!(gets, extra, "{residency}: a deleted key's miss");
     }
@@ -684,7 +697,7 @@ async fn test_a_ref_moved_back_past_a_vector_refuses_two_live_copies() -> Result
         assert_eq!(
             table
                 .table
-                .get(&fixture.key(id), &[VALUE_COLUMN])
+                .get(&fixture.key(id), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await?
                 .row,
             served,

@@ -22,9 +22,11 @@ use iceberg::spec::{
 use crate::bucket;
 use crate::catalog::TableFault;
 use crate::column::{self, ColumnMismatch, UnreadDefaults};
+use crate::config::{TableConfig, ValueFormat};
 use crate::deletes::{Sorted, oldest_by_partition};
 use crate::error::{Error, RefusalReason, Result, UnsupportedDelete};
 use crate::key::{Key, KeyType};
+use crate::projection::{FieldSet, MAX_FIELD_NUMBER};
 use crate::snapshot::SequenceNumber;
 use crate::storage::Storage;
 
@@ -117,7 +119,8 @@ impl ValueColumnLayout {
 }
 
 /// The Iceberg types a value column may have, each served as its bytes
-/// unchanged (RFD 002, RFD 022): a string as its UTF-8.
+/// unchanged (RFD 002, RFD 022): a string as its UTF-8. Display gives the
+/// type as Iceberg's `Type` displays it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueType {
     /// `binary`.
@@ -131,22 +134,90 @@ pub enum ValueType {
     String,
 }
 
-/// What is wrong with a column a lookup names (RFD 022). Display gives the
-/// fault for `Error::ColumnRequest`'s message.
+impl fmt::Display for ValueType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Binary => f.write_str("binary"),
+            Self::Fixed { width } => write!(f, "fixed({width})"),
+            Self::String => f.write_str("string"),
+        }
+    }
+}
+
+/// One column a lookup reads (RFD 022, RFD 024): the column's name, and
+/// the top-level field numbers its protobuf value is trimmed to, empty for
+/// the whole value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnRead<'a> {
+    /// The column's configured name.
+    pub name: &'a str,
+    /// The field numbers to keep; empty reads the value whole.
+    pub fields: &'a [u32],
+}
+
+impl<'a> ColumnRead<'a> {
+    /// The whole value of the column named `name`.
+    pub const fn whole(name: &'a str) -> Self {
+        Self { name, fields: &[] }
+    }
+}
+
+/// The column reads of one lookup checked against its table
+/// (`select_columns`): per read, in the order the lookup named them, the
+/// column's position in the layout and the fields its value is trimmed to,
+/// `None` for the whole value. A read holds fields only when its column was
+/// protobuf as the lookup was checked, so the lookup trims under the
+/// format it was validated under whatever a retune declares meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Selection {
+    /// The columns' positions in the layout.
+    pub(crate) positions: Vec<usize>,
+    /// The fields each read keeps, by the same index as `positions`.
+    pub(crate) fields: Vec<Option<FieldSet>>,
+}
+
+impl Selection {
+    /// Whether any read trims its value.
+    pub(crate) fn projects(&self) -> bool {
+        self.fields.iter().any(Option::is_some)
+    }
+}
+
+/// What is wrong with a column a lookup names (RFD 022, RFD 024). Display
+/// gives the fault for `Error::ColumnRequest`'s message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColumnRequestFault {
     /// The table serves no column of that name.
     NotServed,
     /// The lookup names the column more than once.
     Repeated,
+    /// The lookup names fields of a column not declared protobuf.
+    NotProtobuf,
+    /// The lookup names a field number outside 1 to `MAX_FIELD_NUMBER`.
+    FieldOutOfRange {
+        /// The number.
+        field: u32,
+    },
+    /// The lookup names one field number twice for the column.
+    RepeatedField {
+        /// The number.
+        field: u32,
+    },
 }
 
 impl fmt::Display for ColumnRequestFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NotServed => "is not served",
-            Self::Repeated => "is named more than once",
-        })
+        match self {
+            Self::NotServed => f.write_str("is not served"),
+            Self::Repeated => f.write_str("is named more than once"),
+            Self::NotProtobuf => {
+                f.write_str("takes no field list, since it is not declared protobuf")
+            }
+            Self::FieldOutOfRange { field } => {
+                write!(f, "names field {field}, outside 1 to {MAX_FIELD_NUMBER}")
+            }
+            Self::RepeatedField { field } => write!(f, "names field {field} more than once"),
+        }
     }
 }
 
@@ -255,40 +326,108 @@ impl TableLayout {
             .position(|column| column.name == name)
     }
 
-    /// The positions of the columns `names` names, in its order, for a
-    /// lookup of `table` (`select_columns`).
-    pub(crate) fn select(&self, table: &str, names: &[&str]) -> Result<Vec<usize>> {
-        select_columns(table, names, |name| self.value_column(name))
+    /// The column reads `reads` names checked for a lookup under `entry`,
+    /// the table's entry as it stands (`select_columns`): each column's
+    /// position here, and its format from `entry`, so a retune of formats
+    /// applies to the next lookup. A column `entry` declares protobuf whose
+    /// type here is not `binary` is taken as opaque: an entry retuned to
+    /// protobuf after this layout was checked takes no field list for a
+    /// column it cannot trim.
+    pub(crate) fn select(
+        &self,
+        entry: &TableConfig,
+        reads: &[ColumnRead<'_>],
+    ) -> Result<Selection> {
+        select_columns(&entry.name, reads, |name| {
+            let at = self.value_column(name)?;
+            let format = match (entry.format_of(name)?, self.value_columns[at].value_type) {
+                (ValueFormat::Protobuf, ValueType::Binary) => ValueFormat::Protobuf,
+                (ValueFormat::Opaque, _)
+                | (ValueFormat::Protobuf, ValueType::Fixed { .. } | ValueType::String) => {
+                    ValueFormat::Opaque
+                }
+            };
+            Some((at, format))
+        })
+    }
+
+    /// `ValueTypeUnsupported` for the first column `entry` declares in a
+    /// format its type in this layout does not take (`check_format`): what
+    /// a load refuses the snapshot for, and a retune of formats the entry
+    /// for.
+    pub(crate) fn check_formats(&self, entry: &TableConfig) -> Result<()> {
+        self.value_columns.iter().try_for_each(|column| {
+            let format = entry.format_of(&column.name).unwrap_or_default();
+            check_format(&entry.name, &column.name, column.value_type, format)
+        })
     }
 }
 
-/// The positions `position` gives the columns `names` names, in its order,
-/// for a lookup of `table`: a name `position` places nowhere, one the table
-/// does not serve, is `Error::ColumnRequest` with
-/// `ColumnRequestFault::NotServed`, a name given twice the same with
-/// `ColumnRequestFault::Repeated`, the first such name in `names` reported.
+/// `RefusalReason::ValueTypeUnsupported` for `column` of `table`, of type
+/// `value_type`, declared `format` when the format does not take the type:
+/// a protobuf column must be `binary`, since a trimmed value has no fixed
+/// width and a protobuf is not text (RFD 024). An opaque column takes
+/// every type a layout admits.
+fn check_format(
+    table: &str,
+    column: &str,
+    value_type: ValueType,
+    format: ValueFormat,
+) -> Result<()> {
+    match (format, value_type) {
+        (ValueFormat::Opaque, _) | (ValueFormat::Protobuf, ValueType::Binary) => Ok(()),
+        (ValueFormat::Protobuf, ValueType::Fixed { .. } | ValueType::String) => {
+            Err(Error::refused(
+                table,
+                RefusalReason::ValueTypeUnsupported {
+                    column: column.to_string(),
+                    got: value_type.to_string(),
+                    format,
+                },
+            ))
+        }
+    }
+}
+
+/// The column reads `reads` names, checked in its order for a lookup of
+/// `table`, where `served` gives a served column's position and format: a
+/// name `served` places nowhere, one the table does not serve, is
+/// `Error::ColumnRequest` with `ColumnRequestFault::NotServed`, and a name
+/// given twice the same with `ColumnRequestFault::Repeated`; a field list on
+/// a column not declared protobuf is `ColumnRequestFault::NotProtobuf`, and
+/// on a protobuf column a field number out of range or given twice is
+/// `ColumnRequestFault::FieldOutOfRange` or
+/// `ColumnRequestFault::RepeatedField` (`FieldSet::new`). The first fault in
+/// `reads` is reported.
 pub(crate) fn select_columns(
     table: &str,
-    names: &[&str],
-    position: impl Fn(&str) -> Option<usize>,
-) -> Result<Vec<usize>> {
-    let mut seen = HashSet::with_capacity(names.len());
-    names
-        .iter()
-        .map(|&name| {
-            let fault = |fault| Error::ColumnRequest {
-                table: table.to_string(),
-                column: name.to_string(),
-                fault,
-            };
-            let at = position(name).ok_or_else(|| fault(ColumnRequestFault::NotServed))?;
-            if seen.insert(at) {
-                Ok(at)
-            } else {
-                Err(fault(ColumnRequestFault::Repeated))
-            }
-        })
-        .collect()
+    reads: &[ColumnRead<'_>],
+    served: impl Fn(&str) -> Option<(usize, ValueFormat)>,
+) -> Result<Selection> {
+    let mut seen = HashSet::with_capacity(reads.len());
+    let mut selection = Selection {
+        positions: Vec::with_capacity(reads.len()),
+        fields: Vec::with_capacity(reads.len()),
+    };
+    for read in reads {
+        let fault = |fault| Error::ColumnRequest {
+            table: table.to_string(),
+            column: read.name.to_string(),
+            fault,
+        };
+        let (at, format) = served(read.name).ok_or_else(|| fault(ColumnRequestFault::NotServed))?;
+        if !seen.insert(at) {
+            return Err(fault(ColumnRequestFault::Repeated));
+        }
+        let fields = match format {
+            ValueFormat::Opaque if read.fields.is_empty() => None,
+            ValueFormat::Opaque => return Err(fault(ColumnRequestFault::NotProtobuf)),
+            ValueFormat::Protobuf => FieldSet::new(read.fields).map_err(fault)?,
+        };
+        selection.positions.push(at);
+        selection.fields.push(fields);
+    }
+    Ok(selection)
 }
 
 /// The width of a `fixed` type; `None` for every other type.
@@ -335,6 +474,7 @@ fn value_type(table: &str, name: &str, ty: &Type) -> Result<ValueType> {
             RefusalReason::ValueTypeUnsupported {
                 column: name.to_string(),
                 got: ty.to_string(),
+                format: ValueFormat::Opaque,
             },
         )),
     }
@@ -915,10 +1055,15 @@ pub(crate) mod testing {
         TableMetadata, TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
     };
 
-    use super::{Bucketing, TableLayout, ValueColumnLayout, ValueType};
+    use super::{Bucketing, ColumnRead, TableLayout, ValueColumnLayout, ValueType};
     use crate::catalog::{METADATA_DIR, hint_location, version_file};
     use crate::key::{Key, KeyType};
     use crate::time;
+
+    /// Each column `names` names read whole.
+    pub(crate) fn whole<'a>(names: &[&'a str]) -> Vec<ColumnRead<'a>> {
+        names.iter().map(|&name| ColumnRead::whole(name)).collect()
+    }
 
     /// The key column of every fixture table.
     pub(crate) const KEY_COLUMN: &str = "key";
@@ -1348,7 +1493,7 @@ mod tests {
     };
     use super::*;
     use crate::bucket;
-    use crate::config::StorageConfig;
+    use crate::config::{StorageConfig, ValueColumnConfig};
     use crate::generation::testing::{TABLE, refusal_of, table_fault_of};
     use crate::key::UUID_BYTES;
 
@@ -1572,6 +1717,7 @@ mod tests {
                 RefusalReason::ValueTypeUnsupported {
                     column: VALUE_COLUMN.to_string(),
                     got: refused.to_string(),
+                    format: ValueFormat::Opaque,
                 }
             );
         }
@@ -1654,12 +1800,33 @@ mod tests {
             RefusalReason::ValueTypeUnsupported {
                 column: RENAMED_VALUE_COLUMN.to_string(),
                 got: Type::Primitive(PrimitiveType::Long).to_string(),
+                format: ValueFormat::Opaque,
             }
         );
     }
 
-    #[test]
-    fn test_select_names_columns_by_position_and_refuses_an_unserved_or_repeated_name() {
+    /// The entry of `TABLE` serving `columns`, the rest of it as a test
+    /// leaves it.
+    fn entry(columns: Vec<ValueColumnConfig>) -> TableConfig {
+        TableConfig {
+            name: TABLE.to_string(),
+            source: crate::config::SourceConfig::Static {
+                location: "mem://w/db/kv".to_string(),
+            },
+            r#ref: iceberg::spec::MAIN_BRANCH.to_string(),
+            key_column: KEY_COLUMN.to_string(),
+            value_columns: columns,
+            strict: false,
+            lookups: None,
+            residency: crate::config::Residency::Full,
+            resident_budget_bytes: None,
+        }
+    }
+
+    /// The layout of `select`'s tests: `RENAMED_VALUE_COLUMN` and
+    /// `VALUE_COLUMN`, both binary, at positions 0 and 1, and the entry
+    /// declaring the first protobuf.
+    fn select_fixture() -> (TableLayout, TableConfig) {
         let layout = TableLayout {
             value_columns: vec![
                 testing::binary_column(RENAMED_VALUE_COLUMN, RENAMED_VALUE_FIELD_ID),
@@ -1667,39 +1834,190 @@ mod tests {
             ],
             ..testing::layout(KeyType::Long, None)
         };
+        let config = entry(vec![
+            ValueColumnConfig::named(VALUE_COLUMN),
+            ValueColumnConfig::of(RENAMED_VALUE_COLUMN, ValueFormat::Protobuf),
+        ]);
+        (layout, config)
+    }
+
+    #[test]
+    fn test_select_names_columns_by_position_with_the_fields_each_keeps() {
+        let (layout, config) = select_fixture();
+        let fields = [9, 2];
+        let selection = layout
+            .select(
+                &config,
+                &[
+                    ColumnRead::whole(VALUE_COLUMN),
+                    ColumnRead {
+                        name: RENAMED_VALUE_COLUMN,
+                        fields: &fields,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(selection.positions, [1, 0]);
         assert_eq!(
-            layout
-                .select(TABLE, &[VALUE_COLUMN, RENAMED_VALUE_COLUMN])
-                .unwrap(),
-            [1, 0]
+            selection.fields,
+            [None, FieldSet::new(&fields).unwrap()],
+            "a protobuf column keeps the fields named, an empty list none"
         );
-        assert_eq!(layout.select(TABLE, &[]).unwrap(), Vec::<usize>::new());
+        assert!(selection.projects());
+        let whole = layout
+            .select(&config, &[ColumnRead::whole(RENAMED_VALUE_COLUMN)])
+            .unwrap();
+        assert_eq!(whole.fields, [None]);
+        assert!(!whole.projects());
+        assert_eq!(
+            layout.select(&config, &[]).unwrap().positions,
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn test_select_refuses_each_column_request_fault_naming_the_column() {
+        let (layout, config) = select_fixture();
+        let one = [1];
+        let field = |name, fields| ColumnRead { name, fields };
         let cases = [
             (
-                &[VALUE_COLUMN, ABSENT_COLUMN][..],
+                vec![
+                    ColumnRead::whole(VALUE_COLUMN),
+                    ColumnRead::whole(ABSENT_COLUMN),
+                ],
                 ABSENT_COLUMN,
                 ColumnRequestFault::NotServed,
             ),
             (
-                &[VALUE_COLUMN, RENAMED_VALUE_COLUMN, VALUE_COLUMN][..],
+                vec![
+                    ColumnRead::whole(VALUE_COLUMN),
+                    field(RENAMED_VALUE_COLUMN, &one[..]),
+                    field(VALUE_COLUMN, &[][..]),
+                ],
                 VALUE_COLUMN,
                 ColumnRequestFault::Repeated,
             ),
+            (
+                vec![field(VALUE_COLUMN, &one[..])],
+                VALUE_COLUMN,
+                ColumnRequestFault::NotProtobuf,
+            ),
+            (
+                vec![field(VALUE_COLUMN, &[0][..])],
+                VALUE_COLUMN,
+                ColumnRequestFault::NotProtobuf,
+            ),
+            (
+                vec![field(RENAMED_VALUE_COLUMN, &[1, 0][..])],
+                RENAMED_VALUE_COLUMN,
+                ColumnRequestFault::FieldOutOfRange { field: 0 },
+            ),
+            (
+                vec![field(RENAMED_VALUE_COLUMN, &[MAX_FIELD_NUMBER + 1][..])],
+                RENAMED_VALUE_COLUMN,
+                ColumnRequestFault::FieldOutOfRange {
+                    field: MAX_FIELD_NUMBER + 1,
+                },
+            ),
+            (
+                vec![field(RENAMED_VALUE_COLUMN, &[3, 1, 3][..])],
+                RENAMED_VALUE_COLUMN,
+                ColumnRequestFault::RepeatedField { field: 3 },
+            ),
         ];
-        for (names, named, expected) in cases {
-            let Err(Error::ColumnRequest {
-                table,
-                column,
-                fault,
-            }) = layout.select(TABLE, names)
-            else {
-                panic!("{names:?} is refused");
-            };
+        for (reads, named, expected) in cases {
+            for result in [
+                layout.select(&config, &reads).map(drop),
+                config.check_column_request(&reads),
+            ] {
+                let Err(Error::ColumnRequest {
+                    table,
+                    column,
+                    fault,
+                }) = result
+                else {
+                    panic!("{reads:?} is refused");
+                };
+                assert_eq!(
+                    (table.as_str(), column.as_str(), fault),
+                    (TABLE, named, expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_takes_a_protobuf_entry_on_a_column_not_binary_as_opaque() {
+        let (layout, config) = select_fixture();
+        let layout = TableLayout {
+            value_columns: layout
+                .value_columns
+                .into_iter()
+                .map(|column| ValueColumnLayout {
+                    value_type: ValueType::String,
+                    ..column
+                })
+                .collect(),
+            ..layout
+        };
+        let fields = [1];
+        let Err(Error::ColumnRequest { column, fault, .. }) = layout.select(
+            &config,
+            &[ColumnRead {
+                name: RENAMED_VALUE_COLUMN,
+                fields: &fields,
+            }],
+        ) else {
+            panic!("a field list on a string column is refused");
+        };
+        assert_eq!(
+            (column.as_str(), fault),
+            (RENAMED_VALUE_COLUMN, ColumnRequestFault::NotProtobuf)
+        );
+        let whole = layout
+            .select(&config, &[ColumnRead::whole(RENAMED_VALUE_COLUMN)])
+            .unwrap();
+        assert_eq!(whole.fields, [None], "and read whole as opaque");
+    }
+
+    #[test]
+    fn test_check_formats_refuses_protobuf_on_a_string_or_fixed_column() {
+        let fixed_width = 16;
+        let layout = |value_type| TableLayout {
+            value_columns: vec![ValueColumnLayout {
+                value_type,
+                ..testing::binary_column(VALUE_COLUMN, VALUE_FIELD_ID)
+            }],
+            ..testing::layout(KeyType::Long, None)
+        };
+        let protobuf = entry(vec![ValueColumnConfig::of(
+            VALUE_COLUMN,
+            ValueFormat::Protobuf,
+        )]);
+        let opaque = entry(vec![ValueColumnConfig::named(VALUE_COLUMN)]);
+        assert!(layout(ValueType::Binary).check_formats(&protobuf).is_ok());
+        for value_type in [ValueType::String, ValueType::Fixed { width: fixed_width }] {
+            assert!(layout(value_type).check_formats(&opaque).is_ok());
             assert_eq!(
-                (table.as_str(), column.as_str(), fault),
-                (TABLE, named, expected)
+                refusal_of(layout(value_type).check_formats(&protobuf)),
+                RefusalReason::ValueTypeUnsupported {
+                    column: VALUE_COLUMN.to_string(),
+                    got: value_type.to_string(),
+                    format: ValueFormat::Protobuf,
+                },
+                "{value_type}"
             );
         }
+        assert_eq!(
+            ValueType::Fixed { width: fixed_width }.to_string(),
+            "fixed(16)"
+        );
+        assert_eq!(
+            ValueType::Fixed { width: fixed_width }.to_string(),
+            Type::Primitive(PrimitiveType::Fixed(fixed_width)).to_string(),
+            "as Iceberg displays the type"
+        );
     }
 
     #[test]

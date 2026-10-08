@@ -31,7 +31,9 @@ use icetray::listen::METRICS_PATH;
 use icetray_core::config::ServerConfig;
 use icetray_core::{approx, metric};
 use icetray_proto::v1::icetray_client::IcetrayClient;
-use icetray_proto::v1::{self, GetRequest, KeyType, MultiGetRequest, Presence, TableInfoRequest};
+use icetray_proto::v1::{
+    self, ColumnRead, GetRequest, KeyType, MultiGetRequest, Presence, TableInfoRequest,
+};
 use icetray_testkit::TestkitError;
 use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::truth::{self, Entry, Outcome};
@@ -378,7 +380,10 @@ async fn get(
         .get(GetRequest {
             table: table.to_string(),
             key: Some(wire_key(entry)),
-            columns: vec![column.to_string()],
+            columns: vec![ColumnRead {
+                name: column.to_string(),
+                fields: Vec::new(),
+            }],
         })
         .await
         .map_err(Failure::Status)?
@@ -395,7 +400,10 @@ async fn multi_get(
         .multi_get(MultiGetRequest {
             table: table.to_string(),
             keys: asked.iter().map(wire_key).collect(),
-            columns: vec![column.to_string()],
+            columns: vec![ColumnRead {
+                name: column.to_string(),
+                fields: Vec::new(),
+            }],
         })
         .await
         .map_err(Failure::Status)?

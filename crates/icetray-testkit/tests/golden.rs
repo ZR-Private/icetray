@@ -10,8 +10,9 @@ use std::sync::Arc;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestList, TableMetadata,
 };
+use icetray_core::ColumnRead;
 use icetray_core::approx::count;
-use icetray_core::config::{Config, LocalConfig, StorageConfig};
+use icetray_core::config::{Config, LocalConfig, StorageConfig, ValueFormat};
 use icetray_core::{
     Error, Finding, FindingCode, FindingLog, Generation, Key, Level, LookupCost, RefusalReason,
     Residency, Row, Storage, Table, TableReport, diagnose, open,
@@ -62,7 +63,11 @@ impl Golden {
     /// The doctor's report on the serving generation, at the table's
     /// declared level.
     fn report(&self) -> TableReport {
-        diagnose(&self.current(), self.table.config().lookups())
+        diagnose(
+            &self.current(),
+            self.table.config().lookups(),
+            &ValueFormat::opaque,
+        )
     }
 }
 
@@ -113,7 +118,10 @@ async fn hits(golden: &Golden, keys: &[Key], expected: impl Fn(&Key) -> Vec<u8>)
     let stats = golden.storage.stats();
     let before = stats.gets();
     for key in keys {
-        let lookup = golden.table.get(key, &[VALUE_COLUMN]).await?;
+        let lookup = golden
+            .table
+            .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?;
         let Some(bytes) = verify::one_value(&lookup.row) else {
             panic!("key {key} is {:?}", lookup.row);
         };
@@ -128,7 +136,11 @@ async fn misses(golden: &Golden, keys: &[Key]) -> Result<()> {
     let before = stats.gets();
     for key in keys {
         assert_eq!(
-            golden.table.get(key, &[VALUE_COLUMN]).await?.row,
+            golden
+                .table
+                .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "key {key}"
         );
@@ -269,7 +281,11 @@ async fn test_golden_bin16_contract_serves() -> Result<()> {
     assert!(!keys.is_empty());
     let stats = golden.storage.stats();
     for key in &keys {
-        let row = golden.table.get(key, &[VALUE_COLUMN]).await?.row;
+        let row = golden
+            .table
+            .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row;
         let Some(bytes) = verify::one_value(&row) else {
             panic!("key {key} is absent");
         };
@@ -291,7 +307,11 @@ async fn test_golden_bin16_contract_serves() -> Result<()> {
     let before = stats.gets();
     for key in &flipped {
         assert_eq!(
-            golden.table.get(key, &[VALUE_COLUMN]).await?.row,
+            golden
+                .table
+                .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "key {key}"
         );
@@ -512,7 +532,11 @@ async fn assert_merge_on_read_serves(table: GoldenTable) -> Result<()> {
                 &mut seen,
             );
             let before = stats.gets();
-            let answer = served.table.get(&key, &[VALUE_COLUMN]).await?.row;
+            let answer = served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row;
             match &expected {
                 Some(value) => {
                     let Some(bytes) = verify::one_value(&answer) else {

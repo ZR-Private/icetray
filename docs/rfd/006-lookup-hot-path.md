@@ -4,6 +4,10 @@
 > names, concurrently, and none for a presence-only lookup; a column a
 > file answers by its default costs no read. See RFD 022.
 
+> Updated 2026-10-07: a lookup that names fields of a protobuf column
+> walks each such value's top-level fields after decoding it, linear in
+> the value's bytes, and returns the fields named. See RFD 024.
+
 ## Problem
 
 RFD 004 (Resident key-chunk index) settles what stays in memory for each
@@ -49,6 +53,11 @@ The path is the same for every table whose key chunks are resident:
    (Column resolution)) reads nothing.
 4. The column reader decodes one row from each page and returns the
    values in the order the lookup named their columns.
+5. A value whose read names fields of a column declared protobuf (RFD
+   024 (Field projection)) is walked over its top-level fields and
+   trimmed to the ones named, after the page cache, so the cached page
+   stays whole for every caller. The walk is linear in the value's bytes
+   and costs no read; a value it cannot walk fails the lookup.
 
 Two more segments are intended reads, counted as reads rather than raised
 as errors. One is a value column's dictionary page when one exists, which
@@ -84,15 +93,16 @@ cheaper than another.
 
 ## Consequences
 
-Per-lookup CPU is one key page decoded and one value page decompressed
-per named column. On a warm hit of one column nearly all of the time
-goes to decoding those two pages, and little to the lookup itself; which
-page dominates depends on whether the values compress ([prototype
+Per-lookup CPU is one key page decoded and one value page decompressed per
+named column, and, for a projected read, a walk of the one value, small
+beside the page it came from. On a warm hit of one column nearly all of the
+time goes to decoding those two pages, and little to the lookup itself;
+which page dominates depends on whether the values compress ([prototype
 findings, finding
-4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)). That
-is why RFD 002 (Serving layout contract) bounds value pages by bytes for
-large values, and why large key pages are an inefficient finding
-measured in RFD 007.
+4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)). That is
+why RFD 002 (Serving layout contract) bounds value pages by bytes for large
+values, and why large key pages are an inefficient finding measured in RFD
+007.
 
 A layout the resident index does not cover fails loudly, as an error in
 the counting tests of RFD 014 (Test layering), instead of showing up as an

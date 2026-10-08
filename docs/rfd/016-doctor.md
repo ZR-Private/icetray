@@ -28,6 +28,12 @@
 > contract. Each column has a level and the table's is the dearest
 > column's. See RFD 022.
 
+> Updated 2026-10-07: the `doctor` command, and not the check at every
+> load, walks the default and the values of one value page of each
+> column declared protobuf and reports one that is not protobuf as the
+> advice `malformed_protobuf`, naming the column; the table's report
+> gives each column's format. See RFD 024.
+
 ## Problem
 
 RFD 002 (Serving layout contract) leaves to this RFD what the doctor
@@ -80,7 +86,23 @@ dearest column's, since any column may be asked for, and a table of no
 value columns has the level of finding the row. The table's report lists
 each configured column with its level and cost, and the per-file report
 lists each column's value pages and whether the file answers it by its
-default.
+default. The table's report gives each column's format as its entry
+declares it (RFD 024 (Field projection)).
+
+Only the command walks values. For each column declared protobuf it
+walks the default the column states (RFD 023), with no GET, and every
+value on the first value page of the first file that holds the column,
+one GET past the page cache (two for a dictionary-encoded chunk), as a
+projection would, passing to the next file that holds the column when
+that page holds only nulls, up to three files. A value or default that
+does not walk is the advice `malformed_protobuf`, naming the column and,
+for a page, the file, which catches a column declared protobuf that
+holds another format. A page the command cannot read is reported for
+its column, and the table's report and judgement stand without it. A
+malformed value on a page the walk does not read is found by the first
+lookup that names fields of it. The check at every load reads no value
+page, so it does not walk, and the `findings` gauge carries no series
+for that code.
 
 The value-page line concerns bytes fetched per hit. That cost grows
 linearly with the page's size and has no step anywhere, so the line is

@@ -14,12 +14,13 @@ use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, Reco
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::TableIdent;
 use iceberg::spec::{FormatVersion, Literal, PrimitiveType, Struct};
+use icetray_core::ColumnRead;
 use icetray_core::approx::{self, count};
-use icetray_core::config::{Residency, TableConfig, ValueColumnConfig};
+use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::metric::{self, LookupResult};
 use icetray_core::{
     ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
-    TableFault, TableSource, TableState, diagnose,
+    TableFault, TableSource, TableState, diagnose, examine,
 };
 use icetray_testkit::error::SpecFault;
 use icetray_testkit::fixture::{
@@ -29,6 +30,7 @@ use icetray_testkit::fixture::{
 };
 use icetray_testkit::keys::FIRST_VERSION;
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
+use icetray_testkit::protobuf;
 use icetray_testkit::verify::{
     self, HINT_POLL_GETS, LOAD_METADATA_GETS, METADATA_FILE_GETS, SeenPages, Served,
 };
@@ -62,6 +64,10 @@ const EVOLVED_TABLE: &str = "kv_unread_catalog_evolved";
 
 /// The bytes a v3 table states as an added column's `initial-default`.
 const DEFAULT_BYTES: &[u8] = b"written before the column";
+
+/// The bytes the protobuf message a v3 table states as an added column's
+/// `initial-default` is padded to, in the projection tests.
+const PROTOBUF_DEFAULT_BYTES: usize = 64;
 
 /// Ids sampled from the first build of an `IDS_2K` fixture: both ends and
 /// the middle, in both buckets.
@@ -300,7 +306,7 @@ async fn gets_answering(
     for &id in ids {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, columns).await?.row,
+            served.table.get(&key, &verify::whole(columns)).await?.row,
             expected(&key),
             "{id}"
         );
@@ -332,7 +338,10 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     assert_eq!(
         served
             .table
-            .get(&fixture.key(DELETED_ID), &[SECOND_VALUE_COLUMN])
+            .get(
+                &fixture.key(DELETED_ID),
+                &[ColumnRead::whole(SECOND_VALUE_COLUMN)]
+            )
             .await?
             .row,
         Row::Absent,
@@ -373,7 +382,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     .await?;
 
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     let defaults: Vec<_> = report
         .findings
         .iter()
@@ -470,7 +479,7 @@ async fn test_a_default_costs_no_value_get_in_the_disk_and_bloom_tiers() -> Resu
         .collect();
     assert_eq!(
         full.table
-            .multi_get(&mixed, &[SECOND_VALUE_COLUMN])
+            .multi_get(&mixed, &[ColumnRead::whole(SECOND_VALUE_COLUMN)])
             .await?
             .rows,
         expected
@@ -538,6 +547,156 @@ async fn test_a_column_added_with_a_v3_initial_default_answers_its_bytes() -> Re
         .await?,
         0,
         "a row answered by its default reads no value page"
+    );
+    Ok(())
+}
+
+/// The protobuf message the projection tests state as a default: the
+/// testkit's message drawn from the stream of `seed`, and what a read of
+/// `fields` trims it to.
+fn protobuf_default(seed: &Key, fields: &[u32]) -> (Vec<u8>, Vec<u8>) {
+    (
+        protobuf::value(seed, PROTOBUF_DEFAULT_BYTES, FIRST_VERSION),
+        protobuf::projected(seed, PROTOBUF_DEFAULT_BYTES, FIRST_VERSION, fields),
+    )
+}
+
+/// `fixture` served from its root in `residency` with `SECOND_VALUE_COLUMN`
+/// declared protobuf, a local directory under `scratch` in the Disk tier.
+async fn serve_protobuf_default(
+    fixture: &Fixture,
+    residency: Residency,
+    scratch: &Path,
+) -> Result<Served> {
+    let (config, source) = root_entry(fixture, &[SECOND_VALUE_COLUMN], residency).await?;
+    let config = TableConfig {
+        value_columns: vec![ValueColumnConfig::of(
+            SECOND_VALUE_COLUMN,
+            ValueFormat::Protobuf,
+        )],
+        ..config
+    };
+    verify::build_in(config, source, scratch, verify::TEST_PAGE_CACHE_BYTES)
+        .await?
+        .load()
+        .await
+}
+
+/// A default answered for a protobuf column is projected as a value (RFD
+/// 024), still with no value-page GET: in the Disk tier no GET, in the
+/// Bloom tier the key pages alone.
+#[tokio::test]
+async fn test_a_projected_default_is_trimmed_with_no_value_get_in_the_disk_and_bloom_tiers()
+-> Result<()> {
+    let (_dir, mut fixture) =
+        two_bucket_fixture("kv_default_projected", FormatVersion::V3, false).await?;
+    let fields = [protobuf::NAME_FIELD, protobuf::ID_FIELD];
+    let (default, trimmed) = protobuf_default(&fixture.key(0), &fields);
+    assert!(!trimmed.is_empty() && trimmed.len() < default.len());
+    add_column_then_rows(
+        &mut fixture,
+        StatedDefault::Literal(Literal::binary(default)),
+    )
+    .await?;
+    let earlier: Vec<Key> = FIRST_BUILD_SAMPLE
+        .iter()
+        .map(|&id| fixture.key(id))
+        .collect();
+    let reads = [ColumnRead {
+        name: SECOND_VALUE_COLUMN,
+        fields: &fields,
+    }];
+    let scratch = tempfile::tempdir()?;
+    for residency in [Residency::Bloom, Residency::Disk] {
+        let served = serve_protobuf_default(&fixture, residency, scratch.path()).await?;
+        let generation = served.current();
+        let stats = served.storage.stats();
+        let before = stats.gets();
+        for key in &earlier {
+            assert_eq!(
+                served.table.get(key, &reads).await?.row,
+                Row::Present(vec![Some(trimmed.clone().into())]),
+                "{residency} {key}"
+            );
+        }
+        let key_pages = match residency {
+            Residency::Bloom => verify::expected_key_pages(&generation, &earlier),
+            Residency::Disk => 0,
+            Residency::Full => unreachable!("the loop serves the Bloom and Disk tiers"),
+        };
+        assert_eq!(
+            stats.gets() - before,
+            key_pages,
+            "{residency}: no value page"
+        );
+        let report = examine(&generation, Level::Optimal, &|name| {
+            served.table.config().format_of(name).unwrap_or_default()
+        })
+        .await
+        .report;
+        assert!(
+            !report.findings.iter().any(|finding| {
+                finding.code() == FindingCode::MalformedProtobuf && finding.file().is_none()
+            }),
+            "a protobuf default walks: {:?}",
+            report.findings
+        );
+    }
+    Ok(())
+}
+
+/// The doctor walks a protobuf column's stated default with no GET, and a
+/// default that is not protobuf is `malformed_protobuf` naming the column
+/// and no file.
+#[tokio::test]
+async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
+    let (_dir, mut fixture) =
+        two_bucket_fixture("kv_default_malformed", FormatVersion::V3, false).await?;
+    assert!(
+        protobuf::first_byte_fault(DEFAULT_BYTES).is_some(),
+        "the text default is not protobuf"
+    );
+    fixture
+        .evolve(&[SchemaChange::Add {
+            name: SECOND_VALUE_COLUMN.to_string(),
+            ty: PrimitiveType::Binary,
+            default: StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
+        }])
+        .await?;
+    let data = fixture.files().to_vec();
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data,
+            deletes: Vec::new(),
+        })
+        .await?;
+    let scratch = tempfile::tempdir()?;
+    let served = serve_protobuf_default(&fixture, Residency::Full, scratch.path()).await?;
+    let generation = served.current();
+    let stats = served.storage.stats();
+    let before = stats.gets();
+    let examined = examine(&generation, Level::Optimal, &|name| {
+        served.table.config().format_of(name).unwrap_or_default()
+    })
+    .await;
+    assert_eq!(
+        stats.gets(),
+        before,
+        "every file answers the default, so no page is read"
+    );
+    assert!(examined.unwalked.is_empty());
+    let found: Vec<_> = examined
+        .report
+        .findings
+        .iter()
+        .filter(|finding| finding.code() == FindingCode::MalformedProtobuf)
+        .collect();
+    let [finding] = found[..] else {
+        panic!("one finding, got {found:?}");
+    };
+    assert_eq!(
+        (finding.column(), finding.file(), finding.caps()),
+        (Some(SECOND_VALUE_COLUMN), None, None)
     );
     Ok(())
 }
@@ -656,7 +815,11 @@ async fn test_a_reused_file_under_a_dropped_and_readded_name_is_refused_on_refre
     );
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&old_key)
     );
     assert!(
@@ -778,7 +941,11 @@ async fn test_a_file_without_field_ids_holding_the_name_is_served() -> Result<()
     for key in RAW_KEYS {
         let key = Key::Long(key);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Present(vec![Some(value_for(&key).into())])
         );
     }

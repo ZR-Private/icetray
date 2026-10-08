@@ -51,7 +51,7 @@ use icetray_core::config::{Residency, SourceConfig, TableConfig, ValueColumnConf
 use icetray_core::contract::KEY_BYTES_ADVICE;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
-use icetray_core::{Key, KeyType, Row};
+use icetray_core::{ColumnRead, Key, KeyType, Row};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
@@ -64,6 +64,7 @@ use crate::keys::{
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::merge_oracle::MergeOracle;
+use crate::protobuf;
 use crate::s3::S3Fixture;
 
 /// Ids of the small fixture: twenty thousand rows, about 1,250 per bucket
@@ -682,6 +683,41 @@ impl Fixture {
                 })
                 .collect(),
         )
+    }
+
+    /// What a lookup reading `reads` answers for a key this fixture holds:
+    /// `expected_of` its columns, with each read that names fields trimmed
+    /// to them as a projection trims the value (RFD 024), from the fields
+    /// the value was written from (`protobuf::projected`), a null staying
+    /// null.
+    ///
+    /// Panics on fields of a column other than a `VALUE_COLUMN` of
+    /// `ValueKind::Protobuf`.
+    pub fn expected_reads(&self, key: &Key, reads: &[ColumnRead<'_>]) -> Row {
+        let names: Vec<&str> = reads.iter().map(|read| read.name).collect();
+        let Row::Present(mut values) = self.expected_of(key, &names) else {
+            unreachable!("expected_of answers present");
+        };
+        for (value, read) in values.iter_mut().zip(reads) {
+            if read.fields.is_empty() {
+                continue;
+            }
+            assert!(
+                read.name == VALUE_COLUMN && self.spec.value_kind == ValueKind::Protobuf,
+                "the fixture writes protobuf into a protobuf VALUE_COLUMN alone"
+            );
+            if value.is_some() {
+                let id = id_of(key, self.spec.key_pad, self.spec.key_shape);
+                let version = id.map_or(FIRST_VERSION, |id| self.version_of(id));
+                *value = Some(Bytes::from(protobuf::projected(
+                    key,
+                    self.spec.value_bytes,
+                    version,
+                    read.fields,
+                )));
+            }
+        }
+        Row::Present(values)
     }
 
     /// Every key written, ascending by id.

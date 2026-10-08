@@ -16,7 +16,7 @@ use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetOffse
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 
 use crate::approx;
-use crate::config::Residency;
+use crate::config::{Residency, ValueFormat};
 use crate::contract;
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, RefusalReason, Result};
@@ -27,6 +27,7 @@ use crate::index::{
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::manifest::{DataFileEntry, TableLayout, ValueColumnLayout};
+use crate::projection;
 use crate::snapshot::SnapshotId;
 
 /// The thresholds, in one place (RFD 016): each derives from `contract`
@@ -116,6 +117,15 @@ pub mod thresholds {
 /// `dictionary_encoded_value` (RFD 007); for the key column under `bloom`,
 /// on each file whose filter answers yes (RFD 017).
 const DICTIONARY_PAGE_GETS: u64 = 1;
+
+/// The most data files the doctor's walk of a protobuf column reads a value
+/// page of (RFD 024): the first files in generation order that hold the
+/// column, until one's first value page holds a value that is not null.
+/// Three bounds the walk of a sparse column to three GETs (six for
+/// dictionary-encoded chunks) while letting it pass a file or two whose
+/// first page is all nulls; a column null on the first page of every file
+/// walked is not checked.
+const MOST_WALKED_FILES: usize = 3;
 
 /// The GETs a cold hit spends on the value page of each column it names
 /// (RFD 006, RFD 022).
@@ -309,15 +319,22 @@ pub enum FindingCode {
     /// Data files written before a value column was added answer its
     /// default (RFD 023); a rewrite of them writes the column in.
     ColumnDefault,
+    /// A value of a column declared protobuf, or the default it states, is
+    /// not protobuf as a projection walks it (RFD 024); a lookup naming
+    /// fields of it fails. Raised by the `doctor` command's walk of each
+    /// protobuf column (`examine`), never at a load, which reads no value
+    /// page.
+    MalformedProtobuf,
 }
 
 impl FindingCode {
     /// Every code, in finding-table order, for a caller that keeps a series
-    /// per code: the `findings` gauge is set for each of these on every
-    /// admitted generation, so a code the generation does not raise reads
-    /// zero. Complete: a successor match over every variant, which a new
-    /// variant fails to compile, is compared to this list in tests.
-    pub(crate) const ALL: [Self; 16] = [
+    /// per code: the `findings` gauge is set for each of these a load raises
+    /// (`raised_at_load`) on every admitted generation, so a code the
+    /// generation does not raise reads zero. Complete: a successor match
+    /// over every variant, which a new variant fails to compile, is
+    /// compared to this list in tests.
+    pub(crate) const ALL: [Self; 17] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
@@ -334,6 +351,7 @@ impl FindingCode {
         Self::BloomUndersized,
         Self::DeletesPending,
         Self::ColumnDefault,
+        Self::MalformedProtobuf,
     ];
 
     /// The level a finding of this code caps a table at (RFD 020), `None`
@@ -354,7 +372,34 @@ impl FindingCode {
             | Self::BloomOversized
             | Self::BloomUndersized
             | Self::DeletesPending
-            | Self::ColumnDefault => None,
+            | Self::ColumnDefault
+            | Self::MalformedProtobuf => None,
+        }
+    }
+
+    /// Whether a load can raise a finding of this code: every code but
+    /// `MalformedProtobuf`, which only the `doctor` command's walk raises.
+    /// The `findings` gauge describes what a load found, so it carries the
+    /// codes a load raises alone.
+    pub fn raised_at_load(self) -> bool {
+        match self {
+            Self::MalformedProtobuf => false,
+            Self::DictionaryEncodedValue
+            | Self::LargeKeyPages
+            | Self::NoBucketPartition
+            | Self::OverlappingFiles
+            | Self::BoundsMissing
+            | Self::ColumnIndexTruncated
+            | Self::LargeValuePages
+            | Self::ValuePagesOverCeiling
+            | Self::LongKeys
+            | Self::LargeFile
+            | Self::ManyFilesPerBucket
+            | Self::NoBloomFilter
+            | Self::BloomOversized
+            | Self::BloomUndersized
+            | Self::DeletesPending
+            | Self::ColumnDefault => true,
         }
     }
 
@@ -366,7 +411,8 @@ impl FindingCode {
             Self::DictionaryEncodedValue
             | Self::LargeValuePages
             | Self::ValuePagesOverCeiling
-            | Self::ColumnDefault => true,
+            | Self::ColumnDefault
+            | Self::MalformedProtobuf => true,
             Self::LargeKeyPages
             | Self::NoBucketPartition
             | Self::OverlappingFiles
@@ -402,6 +448,7 @@ impl fmt::Display for FindingCode {
             Self::BloomUndersized => "bloom_undersized",
             Self::DeletesPending => "deletes_pending",
             Self::ColumnDefault => "column_default",
+            Self::MalformedProtobuf => "malformed_protobuf",
         };
         f.write_str(code)
     }
@@ -689,6 +736,8 @@ pub struct ValueColumnReport {
 pub struct ColumnSummary {
     /// The column's configured name.
     pub column: String,
+    /// The format the table's entry declares it in (RFD 024).
+    pub format: ValueFormat,
     /// The level a lookup naming it achieves in the loaded tier.
     pub level: Level,
     /// The GETs a cold hit spends on it alone.
@@ -787,12 +836,17 @@ impl TableReport {
     }
 }
 
-/// Diagnoses `g` (RFD 016) for a table that declares `lookups`: measures
-/// every file from what the generation holds, raises each finding of the
-/// finding table whose trigger the measurements meet, the capping ones
-/// through `layout_caps`, and sums every tier's predicted resident bytes
-/// from the footers. No I/O and no metrics.
-pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
+/// Diagnoses `g` (RFD 016) for a table that declares `lookups` and each
+/// value column in the format `formats` gives for its name: measures every
+/// file from what the generation holds, raises each finding of the finding
+/// table whose trigger the measurements meet, the capping ones through
+/// `layout_caps`, and sums every tier's predicted resident bytes from the
+/// footers. No I/O and no metrics.
+pub fn diagnose(
+    g: &Generation,
+    lookups: Level,
+    formats: &dyn Fn(&str) -> ValueFormat,
+) -> TableReport {
     let caps = layout_caps(&LayoutView::of(g));
     let deletes = g.delete_summary();
     let facts: Vec<FileFacts> = g
@@ -808,6 +862,7 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         .enumerate()
         .map(|(at, (column, cost))| ColumnSummary {
             column: column.name.clone(),
+            format: formats(&column.name),
             level: cost.level,
             gets_per_hit: cost.gets_per_hit,
             files_answering_default: answering_default(g, at),
@@ -855,6 +910,123 @@ pub fn diagnose(g: &Generation, lookups: Level) -> TableReport {
         findings,
         files: facts.into_iter().map(|file| file.report).collect(),
     }
+}
+
+/// What the `doctor` command reports of a table (`examine`): the report,
+/// and each protobuf column whose walk could not read its page.
+#[derive(Debug)]
+pub struct Examined {
+    /// `diagnose`'s report with the walk's findings.
+    pub report: TableReport,
+    /// Each protobuf column whose walk failed, in layout order.
+    pub unwalked: Vec<Unwalked>,
+}
+
+/// A protobuf column whose value page the doctor's walk could not read, so
+/// its values went unchecked.
+#[derive(Debug)]
+pub struct Unwalked {
+    /// The column's configured name.
+    pub column: String,
+    /// The error the read ended in.
+    pub error: Error,
+}
+
+/// The `doctor` command's report on `g` (RFD 016, RFD 024): `diagnose`'s,
+/// with the walk no load makes of each column `formats` declares protobuf.
+/// The walk checks the column's stated default (RFD 023), with no GET,
+/// and every value on the first value page of the first file in
+/// generation order that holds the column, read with one GET (two for a
+/// dictionary-encoded chunk) past the page cache; a page of only nulls
+/// passes the walk to the next such file, up to `MOST_WALKED_FILES`. A
+/// default or a page holding a value that is not protobuf is
+/// `malformed_protobuf` advice naming the column, and the page's file. A
+/// read that fails leaves that column `Unwalked` and the report whole.
+pub async fn examine(
+    g: &Generation,
+    lookups: Level,
+    formats: &dyn Fn(&str) -> ValueFormat,
+) -> Examined {
+    let mut report = diagnose(g, lookups, formats);
+    let mut unwalked = Vec::new();
+    for (at, column) in g.layout.value_columns.iter().enumerate() {
+        match formats(&column.name) {
+            ValueFormat::Protobuf => {
+                report.findings.extend(walk_default(column));
+                match walk_protobuf_page(g, at, &column.name).await {
+                    Ok(finding) => report.findings.extend(finding),
+                    Err(error) => unwalked.push(Unwalked {
+                        column: column.name.clone(),
+                        error,
+                    }),
+                }
+            }
+            ValueFormat::Opaque => {}
+        }
+    }
+    sort_findings(&mut report.findings);
+    report.summary.advice = report.findings.len() - report.summary.capping;
+    Examined { report, unwalked }
+}
+
+/// `malformed_protobuf` for `column` when the default it states (RFD 023)
+/// is not protobuf; `None` when it walks, and when it states none.
+fn walk_default(column: &ValueColumnLayout) -> Option<Finding> {
+    let default = column.default.as_ref()?;
+    let fault = projection::check(default).err()?;
+    let name = &column.name;
+    Some(
+        Finding::advice(
+            FindingCode::MalformedProtobuf,
+            None,
+            format!(
+                "the initial-default of value column {name} is not protobuf, at {fault}; a lookup that names fields of the column fails for a row of a file written before the column was added, so declare the column opaque or state a protobuf default"
+            ),
+            None,
+        )
+        .with_column(name),
+    )
+}
+
+/// `malformed_protobuf` for value column `at`, named `name`, when a value
+/// on the first value page of a file of `g` that holds the column is not
+/// protobuf, the page of the first such file that holds a value, of at
+/// most `MOST_WALKED_FILES`; `None` when every value walks, and when no
+/// page walked holds one.
+async fn walk_protobuf_page(g: &Generation, at: usize, name: &str) -> Result<Option<Finding>> {
+    let mut walked_files = 0;
+    for file in &g.files {
+        if walked_files == MOST_WALKED_FILES {
+            break;
+        }
+        let Some(values) = file.index.first_page_values(at).await? else {
+            continue;
+        };
+        walked_files += 1;
+        if values.is_empty() {
+            continue;
+        }
+        let mut faults = values
+            .iter()
+            .filter_map(|value| projection::check(value).err());
+        let Some(first) = faults.next() else {
+            return Ok(None);
+        };
+        let malformed = 1 + faults.count();
+        let walked = values.len();
+        return Ok(Some(
+            Finding::advice(
+                FindingCode::MalformedProtobuf,
+                Some(&file.entry.path),
+                format!(
+                    "{malformed} of the {walked} values not null on the first value page of value column {name} are not protobuf, the first at {first}; a lookup that names fields of such a value fails, so declare the column opaque or rewrite its values"
+                ),
+                None,
+            )
+            .with_column(name),
+        ));
+    }
+    Ok(None)
 }
 
 /// The level `layout` achieves in each tier that can load the table, with
@@ -1974,6 +2146,7 @@ mod tests {
         (FindingCode::BloomUndersized, "bloom_undersized"),
         (FindingCode::DeletesPending, "deletes_pending"),
         (FindingCode::ColumnDefault, "column_default"),
+        (FindingCode::MalformedProtobuf, "malformed_protobuf"),
     ];
 
     /// `rows` values of `len` bytes each, none null.
@@ -2236,7 +2409,8 @@ mod tests {
             FindingCode::BloomOversized => Some(FindingCode::BloomUndersized),
             FindingCode::BloomUndersized => Some(FindingCode::DeletesPending),
             FindingCode::DeletesPending => Some(FindingCode::ColumnDefault),
-            FindingCode::ColumnDefault => None,
+            FindingCode::ColumnDefault => Some(FindingCode::MalformedProtobuf),
+            FindingCode::MalformedProtobuf => None,
         }
     }
 
@@ -2318,7 +2492,7 @@ mod tests {
     async fn test_diagnose_contract_fixture_is_optimal_with_no_findings() {
         let mut table = contract_table().await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(&report, &[]);
         let summary = &report.summary;
         assert_eq!(summary.level, Level::Optimal);
@@ -2370,7 +2544,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2394,7 +2568,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].dictionary_columns, [KEY_COLUMN]);
     }
@@ -2413,6 +2587,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_findings(
             &report,
@@ -2438,6 +2613,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_findings(
             &report,
@@ -2470,6 +2646,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_findings(
             &report,
@@ -2591,7 +2768,7 @@ mod tests {
         table.add_long_file("b", &interleaved, 0).await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 1);
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2616,7 +2793,7 @@ mod tests {
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.files[0].entry.key_min, None);
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2642,7 +2819,7 @@ mod tests {
         let entry = &generation.files[0].entry;
         assert!(entry.key_min.is_some() && entry.key_max.is_some());
         assert_eq!(generation.layout.key_type, KeyType::String);
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2665,7 +2842,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, whole) = one_string_file(&keys, Bounds::Exact, small_pages).await;
-        let report = diagnose(&whole, Level::Optimal);
+        let report = diagnose(&whole, Level::Optimal, &ValueFormat::opaque);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].key_pages, pages);
         assert_eq!(
@@ -2678,7 +2855,7 @@ mod tests {
             ..small_pages
         };
         let (table, generation) = one_string_file(&keys, Bounds::Exact, truncated).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2725,6 +2902,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_findings(
             &report,
@@ -2758,7 +2936,7 @@ mod tests {
             })
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         let path = Some(table.path_of("f"));
         assert_findings(
             &report,
@@ -2808,7 +2986,7 @@ mod tests {
             .collect();
         let (table, generation) =
             one_string_file(&keys, Bounds::Exact, WriterLayout::contract()).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2856,7 +3034,7 @@ mod tests {
         }
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 0);
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(FindingCode::ManyFilesPerBucket, None, None, None, None)],
@@ -2875,7 +3053,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2899,7 +3077,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_findings(
             &report,
             &[(
@@ -2929,6 +3107,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_findings(
             &report,
@@ -2962,7 +3141,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [a.clone(), b.clone()]
         );
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         let dictionary = Some(Penalty {
             extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
             ..Penalty::default()
@@ -3016,7 +3195,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(report.summary.level, Level::Optimal, "advice caps nothing");
         assert_eq!((report.summary.capping, report.summary.advice), (0, 1));
 
@@ -3025,7 +3204,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(dictionary).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(report.summary.level, Level::Balanced);
         assert_eq!((report.summary.capping, report.summary.advice), (1, 0));
 
@@ -3034,6 +3213,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
+            &ValueFormat::opaque,
         );
         assert_eq!(
             codes(&report.capping()),
@@ -3055,6 +3235,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Bloom, None).await,
             Level::Balanced,
+            &ValueFormat::opaque,
         );
         assert_findings(&report, &[]);
         assert_eq!(report.summary.level, Level::Balanced);
@@ -3083,7 +3264,8 @@ mod tests {
         assert_eq!(
             diagnose(
                 &one_file(WriterLayout::contract()).await.1,
-                Level::Permissive
+                Level::Permissive,
+                &ValueFormat::opaque
             )
             .summary
             .lookups,
@@ -3099,7 +3281,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(no_filter).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(report.summary.predicted.bloom, None);
         assert_eq!(
             report.summary.level_by_residency,
@@ -3164,7 +3346,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(report.summary.advice, 1);
         judge(
             TABLE,
@@ -3195,6 +3377,7 @@ mod tests {
         let report = diagnose(
             &load(&mut table, Residency::Full, None).await,
             Level::Balanced,
+            &ValueFormat::opaque,
         );
         assert_eq!(
             codes(&report.capping()),
@@ -3236,7 +3419,7 @@ mod tests {
             let local = testing::local_dir(scratch.path(), table.storage.stats(), None);
             let local = (residency == Residency::Disk).then_some(&local);
             let generation = load(&mut table, residency, local).await;
-            let report = diagnose(&generation, Level::Optimal);
+            let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
             assert_eq!(report.summary.residency, residency);
             assert_eq!(report.summary.index_bytes, generation.index_bytes);
             let predicted = report.summary.predicted;
@@ -3310,7 +3493,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         let json = serde_json::to_value(&report).unwrap();
         (table, report, json)
     }
@@ -3398,11 +3581,11 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let (_table, before, after) =
             deleted_file_table(Residency::Full, false, scratch.path()).await;
-        let clean = diagnose(&before, Level::Optimal);
+        let clean = diagnose(&before, Level::Optimal, &ValueFormat::opaque);
         assert!(pending(&clean).is_empty());
         assert_eq!(clean.summary.deletes, DeleteSummary::default());
 
-        let report = diagnose(&after, Level::Optimal);
+        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque);
         let findings = pending(&report);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].caps(), None);
@@ -3437,8 +3620,12 @@ mod tests {
             let bound = after.delete_bound();
             assert!(bound >= approx::count(after.delete_summary().state_bytes));
             assert_eq!(before.delete_bound(), 0);
-            let without = diagnose(&before, Level::Optimal).summary.predicted;
-            let with = diagnose(&after, Level::Optimal).summary.predicted;
+            let without = diagnose(&before, Level::Optimal, &ValueFormat::opaque)
+                .summary
+                .predicted;
+            let with = diagnose(&after, Level::Optimal, &ValueFormat::opaque)
+                .summary
+                .predicted;
             assert_eq!(with.full, without.full + bound, "{residency}");
             assert_eq!(with.disk_memory, without.disk_memory + bound, "{residency}");
             assert_eq!(
@@ -3461,7 +3648,7 @@ mod tests {
         assert_eq!(caps.level, Level::Permissive);
         assert_eq!(codes(&caps.capping()), [FindingCode::OverlappingFiles]);
         assert_eq!(compacted_level(&after, &caps), Some(Level::Optimal));
-        let report = diagnose(&after, Level::Optimal);
+        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(pending(&report).len(), 1);
         assert_eq!(
             report.summary.deletes.rows,
@@ -3515,7 +3702,7 @@ mod tests {
             ]
         );
         assert_eq!(compacted_level(&generation, &caps), None);
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert_eq!(pending(&report).len(), 1);
         assert_eq!(
             report.summary.deletes.rows,
@@ -3555,6 +3742,7 @@ mod tests {
             summary["value_columns"],
             serde_json::json!([{
                 "column": VALUE_COLUMN,
+                "format": ValueFormat::Opaque.to_string(),
                 "level": Level::Balanced.to_string(),
                 "gets_per_hit": VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
                 "files_answering_default": 0,
@@ -3682,5 +3870,94 @@ mod tests {
         );
         assert_eq!(column["column"], Json::String(VALUE_COLUMN.to_string()));
         assert_eq!(column["answers_default"], Json::Bool(false));
+    }
+
+    /// A one-bucket table of one file per entry of `pages`, `FILE_KEYS`
+    /// keys each in disjoint ascending runs, named `f0`, `f1`, ...: every
+    /// value of a file null when its entry is `None`, else that entry's
+    /// bytes. Loaded in the Full tier.
+    async fn files_of_values(pages: &[Option<&[u8]>]) -> (Table, Generation) {
+        let mut table = Table::bucketed(ONE);
+        let mut from = 0;
+        for (at, page) in pages.iter().enumerate() {
+            let keys = testing::keys_from(from, FILE_KEYS);
+            from = keys.last().unwrap() + KEY_STEP;
+            let typed = testing::long_keys(&keys);
+            table
+                .add_file(FileSpec {
+                    values: keys.iter().map(|_| page.map(<[u8]>::to_vec)).collect(),
+                    ..file(
+                        &format!("f{at}"),
+                        &typed,
+                        Partition::Bucket(0),
+                        WriterLayout::contract(),
+                    )
+                })
+                .await;
+        }
+        let generation = load(&mut table, Residency::Full, None).await;
+        (table, generation)
+    }
+
+    /// The `malformed_protobuf` findings of `report`, each its file.
+    fn malformed_files(report: &TableReport) -> Vec<Option<&str>> {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.code() == FindingCode::MalformedProtobuf)
+            .map(Finding::file)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_examine_passes_a_page_of_only_nulls_to_the_next_file_up_to_the_bound() {
+        let malformed: &[u8] = &[0x07; testing::VALUE_BYTES];
+        let protobuf = |_: &str| ValueFormat::Protobuf;
+
+        let (table, generation) = files_of_values(&[None, Some(malformed)]).await;
+        let before = table.gets();
+        let examined = examine(&generation, Level::Optimal, &protobuf).await;
+        assert!(examined.unwalked.is_empty());
+        let second = table.path_of("f1");
+        assert_eq!(
+            malformed_files(&examined.report),
+            [Some(second.as_str())],
+            "the next file's page is walked"
+        );
+        assert_eq!(table.gets() - before, 2, "one GET per page walked");
+
+        let mut pages = vec![None; MOST_WALKED_FILES];
+        pages.push(Some(malformed));
+        let (table, generation) = files_of_values(&pages).await;
+        let before = table.gets();
+        let examined = examine(&generation, Level::Optimal, &protobuf).await;
+        assert!(malformed_files(&examined.report).is_empty());
+        assert_eq!(
+            table.gets() - before,
+            approx::count(MOST_WALKED_FILES),
+            "no file past the bound is read"
+        );
+
+        let (table, generation) = files_of_values(&[Some(malformed)]).await;
+        let before = table.gets();
+        let opaque = examine(&generation, Level::Optimal, &ValueFormat::opaque).await;
+        assert!(malformed_files(&opaque.report).is_empty());
+        assert_eq!(table.gets(), before, "an opaque column is not walked");
+    }
+
+    #[tokio::test]
+    async fn test_examine_leaves_a_column_unwalked_when_its_page_read_fails() {
+        let (table, generation) = files_of_values(&[Some(b"\x08\x01")]).await;
+        let path = table.path_of("f0");
+        std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+        let examined = examine(&generation, Level::Optimal, &|_| ValueFormat::Protobuf).await;
+        let [unwalked] = &examined.unwalked[..] else {
+            panic!("one column unwalked, got {:?}", examined.unwalked);
+        };
+        assert_eq!(unwalked.column, VALUE_COLUMN);
+        assert_eq!(unwalked.error.kind(), crate::error::ErrorKind::ObjectStore);
+        let whole = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        assert_eq!(examined.report.summary.level, whole.summary.level);
+        assert_eq!(examined.report.findings.len(), whole.findings.len());
     }
 }

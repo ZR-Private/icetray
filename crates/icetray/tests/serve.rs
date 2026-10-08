@@ -19,10 +19,14 @@ use icetray::{ServeError, ServeOptions, Serving};
 use icetray_core::approx;
 use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueColumnConfig,
+    ValueFormat,
 };
 use icetray_core::key::UUID_BYTES;
 use icetray_core::metric::{self, Kind, LookupResult};
-use icetray_core::{ErrorKind, Generation, IoStats, Key, KeyType, Storage, TableState};
+use icetray_core::{
+    ColumnRead, ErrorKind, Generation, IoStats, Key, KeyType, MAX_FIELD_NUMBER, Row, Storage,
+    TableState,
+};
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
@@ -30,10 +34,11 @@ use icetray_proto::v1::{
     TableInfoResponse,
 };
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS};
+use icetray_testkit::protobuf;
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture,
-    memory_catalog_s3, write_fixture,
+    ValueKind, memory_catalog_s3, write_fixture,
 };
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -338,18 +343,28 @@ impl Stack {
         self.get_naming(table, key, &[VALUE_COLUMN]).await
     }
 
-    /// One `Get` of `key` on `table` naming `columns`.
+    /// One `Get` of `key` on `table` naming `columns`, each read whole.
     async fn get_naming(
         &mut self,
         table: &str,
         key: Option<v1::Key>,
         columns: &[&str],
     ) -> Result<GetResponse, Status> {
+        self.get_reading(table, key, wire_columns(columns)).await
+    }
+
+    /// One `Get` of `key` on `table` with the column reads `columns`.
+    async fn get_reading(
+        &mut self,
+        table: &str,
+        key: Option<v1::Key>,
+        columns: Vec<v1::ColumnRead>,
+    ) -> Result<GetResponse, Status> {
         self.client
             .get(GetRequest {
                 table: table.to_string(),
                 key,
-                columns: wire_columns(columns),
+                columns,
             })
             .await
             .map(tonic::Response::into_inner)
@@ -360,18 +375,30 @@ impl Stack {
         self.multi_get_naming(table, keys, &[VALUE_COLUMN]).await
     }
 
-    /// One `MultiGet` of `keys` on `table` naming `columns`.
+    /// One `MultiGet` of `keys` on `table` naming `columns`, each read
+    /// whole.
     async fn multi_get_naming(
         &mut self,
         table: &str,
         keys: &[Key],
         columns: &[&str],
     ) -> Result<MultiGetResponse, Status> {
+        self.multi_get_reading(table, keys, wire_columns(columns))
+            .await
+    }
+
+    /// One `MultiGet` of `keys` on `table` with the column reads `columns`.
+    async fn multi_get_reading(
+        &mut self,
+        table: &str,
+        keys: &[Key],
+        columns: Vec<v1::ColumnRead>,
+    ) -> Result<MultiGetResponse, Status> {
         self.client
             .multi_get(MultiGetRequest {
                 table: table.to_string(),
                 keys: keys.iter().map(wire_key).collect(),
-                columns: wire_columns(columns),
+                columns,
             })
             .await
             .map(tonic::Response::into_inner)
@@ -408,8 +435,14 @@ impl Stack {
 }
 
 /// `columns` as a request carries them.
-fn wire_columns(columns: &[&str]) -> Vec<String> {
-    columns.iter().map(|&column| column.to_string()).collect()
+fn wire_columns(columns: &[&str]) -> Vec<v1::ColumnRead> {
+    columns
+        .iter()
+        .map(|&column| v1::ColumnRead {
+            name: column.to_string(),
+            fields: Vec::new(),
+        })
+        .collect()
 }
 
 /// The bytes of the one value `values` carries, `None` for a null.
@@ -1889,6 +1922,7 @@ async fn test_table_info_lists_the_value_columns() -> TestResult {
         name: name.to_string(),
         value_type: i32::from(v1::ValueType::Binary),
         width: 0,
+        format: i32::from(v1::ValueFormat::Opaque),
     };
     assert_eq!(
         info.value_columns,
@@ -1943,6 +1977,265 @@ async fn test_get_and_multi_get_carry_two_columns_in_request_order() -> TestResu
             .collect();
         assert_eq!(&values, batch, "{order:?}");
     }
+    Ok(())
+}
+
+/// A table whose `VALUE_COLUMN` holds values of `kind` and is declared
+/// protobuf, beside `SECOND_VALUE_COLUMN`, opaque.
+async fn protobuf_stack(kind: ValueKind) -> Result<Stack, BoxError> {
+    let spec = FixtureSpec {
+        second_value: true,
+        value_kind: kind,
+        ..FixtureSpec::small(TABLE, KeyType::Long)
+    };
+    let mut stack = Stack::start_with(vec![spec], async |setup| {
+        setup.config.tables[0].value_columns = vec![
+            ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf),
+            ValueColumnConfig::named(SECOND_VALUE_COLUMN),
+        ];
+        Ok(())
+    })
+    .await?;
+    stack.serving.ready().await;
+    Ok(stack)
+}
+
+/// The column read of `name` keeping `fields`.
+fn wire_read(name: &str, fields: &[u32]) -> v1::ColumnRead {
+    v1::ColumnRead {
+        name: name.to_string(),
+        fields: fields.to_vec(),
+    }
+}
+
+/// The value-bytes counters of `column` of `TABLE` in `exposition`: read,
+/// then returned.
+fn value_bytes(exposition: &str, column: &str) -> (f64, f64) {
+    let labels = [(metric::LABEL_TABLE, TABLE), (metric::LABEL_COLUMN, column)];
+    (
+        series_sum(exposition, metric::VALUE_BYTES_READ_TOTAL, &labels),
+        series_sum(exposition, metric::VALUE_BYTES_RETURNED_TOTAL, &labels),
+    )
+}
+
+/// The bytes of `values`, nulls as none, as the value-bytes counters count
+/// them.
+fn length_of(values: &[Option<Vec<u8>>]) -> f64 {
+    let bytes: usize = values.iter().flatten().map(Vec::len).sum();
+    approx::gauge_len(bytes)
+}
+
+/// `TableInfo` reports each column's format, and `Get` and `MultiGet`
+/// trim a protobuf column to the fields a read names while an opaque one
+/// beside it is read whole; the value-bytes counters count what each
+/// column read and returned (RFD 024).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_and_multi_get_trim_a_protobuf_column_and_count_its_bytes() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = protobuf_stack(ValueKind::Protobuf).await?;
+    let info = stack.table_info(TABLE).await?;
+    let formats: Vec<(String, i32)> = info
+        .value_columns
+        .iter()
+        .map(|column| (column.name.clone(), column.format))
+        .collect();
+    assert_eq!(
+        formats,
+        [
+            (
+                SECOND_VALUE_COLUMN.to_string(),
+                i32::from(v1::ValueFormat::Opaque)
+            ),
+            (
+                VALUE_COLUMN.to_string(),
+                i32::from(v1::ValueFormat::Protobuf)
+            ),
+        ]
+    );
+    let fixture = &stack.fixtures[0];
+    let keys = fixture.keys_at(&SAMPLE);
+    let fields = [protobuf::ID_FIELD, protobuf::SCORES_FIELD];
+    let reads = [
+        ColumnRead {
+            name: VALUE_COLUMN,
+            fields: &fields,
+        },
+        ColumnRead::whole(SECOND_VALUE_COLUMN),
+    ];
+    let wire_reads = || {
+        vec![
+            wire_read(VALUE_COLUMN, &fields),
+            wire_read(SECOND_VALUE_COLUMN, &[]),
+        ]
+    };
+    let wanted: Vec<Vec<Option<Vec<u8>>>> = keys
+        .iter()
+        .map(|key| {
+            let Row::Present(values) = fixture.expected_reads(key, &reads) else {
+                unreachable!("a sampled key is present");
+            };
+            values
+                .into_iter()
+                .map(|value| value.map(|bytes| bytes.to_vec()))
+                .collect()
+        })
+        .collect();
+    let whole: Vec<Option<Vec<u8>>> = keys.iter().map(|key| fixture.value(key)).collect();
+    let before = stack.scrape().await?;
+    for (key, expected) in keys.iter().zip(&wanted) {
+        let got = stack
+            .get_reading(TABLE, Some(wire_key(key)), wire_reads())
+            .await?;
+        let values: Vec<_> = got.values.iter().map(wire_value).collect();
+        assert_eq!(&values, expected, "{key}");
+    }
+    let answered = stack.multi_get_reading(TABLE, &keys, wire_reads()).await?;
+    let batch: Vec<Vec<_>> = answered
+        .results
+        .iter()
+        .map(|hit| hit.values.iter().map(wire_value).collect())
+        .collect();
+    assert_eq!(batch, wanted);
+    let after = stack.scrape().await?;
+    let looked_up_twice = 2.0;
+    let trimmed: Vec<Option<Vec<u8>>> = wanted.iter().map(|values| values[0].clone()).collect();
+    let detail: Vec<Option<Vec<u8>>> = wanted.iter().map(|values| values[1].clone()).collect();
+    assert!(
+        length_of(&trimmed) < length_of(&whole),
+        "the projection saves bytes"
+    );
+    let delta = |column| {
+        let (read_after, returned_after) = value_bytes(&after, column);
+        let (read_before, returned_before) = value_bytes(&before, column);
+        (read_after - read_before, returned_after - returned_before)
+    };
+    assert_eq!(
+        delta(VALUE_COLUMN),
+        (
+            looked_up_twice * length_of(&whole),
+            looked_up_twice * length_of(&trimmed)
+        )
+    );
+    assert_eq!(
+        delta(SECOND_VALUE_COLUMN),
+        (
+            looked_up_twice * length_of(&detail),
+            looked_up_twice * length_of(&detail)
+        ),
+        "a whole read counts the same in both"
+    );
+    Ok(())
+}
+
+/// Every field list the column's format or the protobuf range does not
+/// take is `INVALID_ARGUMENT` on `Get` and `MultiGet`, before any read.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_field_list_the_column_does_not_take_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = protobuf_stack(ValueKind::Protobuf).await?;
+    let key = stack.fixtures[0].key(SAMPLE[0]);
+    let before = stack.stats.gets();
+    let cases = [
+        wire_read(SECOND_VALUE_COLUMN, &[protobuf::ID_FIELD]),
+        wire_read(VALUE_COLUMN, &[0]),
+        wire_read(VALUE_COLUMN, &[MAX_FIELD_NUMBER + 1]),
+        wire_read(VALUE_COLUMN, &[protobuf::ID_FIELD, protobuf::ID_FIELD]),
+    ];
+    for read in cases {
+        assert_eq!(
+            code_of(
+                stack
+                    .get_reading(TABLE, Some(wire_key(&key)), vec![read.clone()])
+                    .await
+            ),
+            Code::InvalidArgument,
+            "{read:?}"
+        );
+        assert_eq!(
+            code_of(
+                stack
+                    .multi_get_reading(TABLE, std::slice::from_ref(&key), vec![read.clone()])
+                    .await
+            ),
+            Code::InvalidArgument,
+            "{read:?}"
+        );
+    }
+    assert_eq!(
+        stack.stats.gets(),
+        before,
+        "a refused request reads nothing"
+    );
+    Ok(())
+}
+
+/// A value of a protobuf column that is not protobuf fails a `Get` and a
+/// `MultiGet` holding its key as `FAILED_PRECONDITION`, a `MultiGet`
+/// whole beside a key that answers, counted under `projection_errors_total`
+/// and under no value-bytes counter, and is served whole to a read naming
+/// no fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_malformed_value_is_failed_precondition_and_counted() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = protobuf_stack(ValueKind::Random).await?;
+    let fixture = &stack.fixtures[0];
+    let (malformed, _) = protobuf::malformed_key(fixture)
+        .expect("some random value starts with an undefined wire type");
+    let malformed_value = fixture.value(&malformed);
+    let absent = fixture.absent_near(SAMPLE[0]);
+    let errors = |exposition: &str| {
+        series_sum(
+            exposition,
+            metric::PROJECTION_ERRORS_TOTAL,
+            &[
+                (metric::LABEL_TABLE, TABLE),
+                (metric::LABEL_COLUMN, VALUE_COLUMN),
+            ],
+        )
+    };
+    let before = stack.scrape().await?;
+    let trimmed = || vec![wire_read(VALUE_COLUMN, &[protobuf::ID_FIELD])];
+    assert_eq!(
+        code_of(
+            stack
+                .get_reading(TABLE, Some(wire_key(&malformed)), trimmed())
+                .await
+        ),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        code_of(
+            stack
+                .multi_get_reading(TABLE, std::slice::from_ref(&malformed), trimmed())
+                .await
+        ),
+        Code::FailedPrecondition
+    );
+    let failed = stack.scrape().await?;
+    assert_eq!(
+        value_bytes(&failed, VALUE_COLUMN),
+        value_bytes(&before, VALUE_COLUMN),
+        "a failed lookup counts no bytes"
+    );
+    assert_eq!(
+        code_of(
+            stack
+                .multi_get_reading(TABLE, &[absent, malformed.clone()], trimmed())
+                .await
+        ),
+        Code::FailedPrecondition,
+        "a batch fails whole beside a key that answers"
+    );
+    let whole = stack
+        .get_naming(TABLE, Some(wire_key(&malformed)), &[VALUE_COLUMN])
+        .await?;
+    assert_eq!(one_wire_value(&whole.values), malformed_value);
+    let after = stack.scrape().await?;
+    let failed_lookups: usize = 3;
+    assert_eq!(
+        (errors(&after) - errors(&before)).to_bits(),
+        approx::gauge_len(failed_lookups).to_bits()
+    );
     Ok(())
 }
 

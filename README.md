@@ -28,7 +28,10 @@ costs one range GET.
   key range, and its page by binary search.
 - A hit reads one value page for each value column it names, from the
   page cache or with one range GET, the columns concurrently. A lookup
-  that names none answers only whether the key is present.
+  that names none answers only whether the key is present. A column
+  declared protobuf can be trimmed per request to the top-level fields a
+  caller names, after the page cache, so a caller receives and decodes
+  only what it reads.
 - When the ref moves, icetray loads the new snapshot beside the current one,
   reuses the index of every unchanged file, verifies it, and swaps it in
   atomically. Each answer carries the id of the snapshot it came from.
@@ -128,7 +131,7 @@ icetray doctor --location target/golden-warehouse/db/long_2m --value-column valu
 ```
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_answering_default":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 It exits 0, with no finding: the table reaches the `optimal`
@@ -163,7 +166,7 @@ and the snapshot id is your table's):
 
 ```sh
 grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
-  -d '{"table": "long_2m", "key": {"long": "42"}, "columns": ["value"]}' \
+  -d '{"table": "long_2m", "key": {"long": "42"}, "columns": [{"name": "value"}]}' \
   127.0.0.1:7433 icetray.v1.Icetray/Get
 ```
 
@@ -258,7 +261,9 @@ icetray get --location s3://warehouse/db/kv --value-column value --column value 
   after rewriting the deletes into data files.
 - **Callers need typed values.** icetray serves each value column as
   bytes, of Iceberg type `binary`, `fixed`, or `string`; a number or a
-  struct is packed into a binary value at write time.
+  struct is packed into a binary value at write time. A protobuf value
+  can be trimmed to top-level fields by number, but not to a field of a
+  nested message, and icetray never parses one into types.
 - **You need writes, scans, or range queries.** icetray is read-only and
   answers lookups by exact key.
 - **The server itself must speak TLS or authenticate callers.** The gRPC

@@ -41,7 +41,7 @@ use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
 use crate::parquet_io::{FileHandle, Segments};
-use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one};
+use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one, read_rows};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
 pub(crate) use page_header::check_chunk_page_headers;
@@ -1076,6 +1076,46 @@ impl FileIndex {
         }))
     }
 
+    /// Every value of the first value page of value column `column`, a
+    /// position in the table's layout, nulls left out: page 0 of the first
+    /// row group that holds rows and a page, read with one GET past the
+    /// page cache, and its dictionary page's when the chunk has one, its
+    /// headers checked as `read_column` checks them. Empty for a file whose
+    /// row groups hold no page, and for a page of only nulls. `None` for a
+    /// file that answers the column's default (RFD 023). What the doctor
+    /// walks a protobuf column's values on (RFD 024).
+    pub(crate) async fn first_page_values(&self, column: usize) -> Result<Option<Vec<Bytes>>> {
+        const FIRST_PAGE: usize = 0;
+        let Some(value) = self.values[column] else {
+            return Ok(None);
+        };
+        let column = self.value_column(value);
+        let Some(chunk) = (0..self.metadata.num_row_groups())
+            .map(|row_group| column.group(row_group))
+            .find(|chunk| chunk.rows() > 0 && !chunk.page_locations().is_empty())
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let (segments, _) = self
+            .fetch_pages(chunk, FIRST_PAGE, PageSource::Store(None, Issue::default()))
+            .await?;
+        check_value_page_headers(chunk, value.shape, FIRST_PAGE, &segments)?;
+        let rows = chunk.page_rows(FIRST_PAGE);
+        let values = match value.shape {
+            ValueShape::Variable => read_rows::<ByteArrayType>(chunk, rows, Arc::clone(&segments))?
+                .iter()
+                .map(|value| value_bytes(&segments, value.data()))
+                .collect(),
+            ValueShape::Fixed => {
+                read_rows::<FixedLenByteArrayType>(chunk, rows, Arc::clone(&segments))?
+                    .iter()
+                    .map(|value| value_bytes(&segments, value.data()))
+                    .collect()
+            }
+        };
+        Ok(Some(values))
+    }
+
     /// `read_column` of the layout's first value column, as the value and
     /// its page's origin: the shape the single-column tests read.
     #[cfg(test)]
@@ -1679,6 +1719,58 @@ mod tests {
     /// the cache holds, not a copy; one read from a zstd page, the
     /// contract's codec, is a copy out of the buffer the page was
     /// decompressed into, and shares no fetched page.
+    /// The rows the first page of value leaf `leaf` holds in `row_group`,
+    /// from the offset index.
+    fn first_page_rows(metadata: &ParquetMetaData, row_group: usize, leaf: usize) -> usize {
+        let locations = metadata.offset_index().unwrap()[row_group][leaf].page_locations();
+        let end = locations.get(1).map_or_else(
+            || metadata.row_group(row_group).num_rows(),
+            |next| next.first_row_index,
+        );
+        row_index(end - locations[0].first_row_index)
+    }
+
+    #[tokio::test]
+    async fn test_first_page_values_reads_the_first_row_group_holding_rows_nulls_left_out() {
+        let every_other = 2;
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        for (row, value) in fixture.values.iter_mut().enumerate() {
+            if row % every_other == 1 {
+                *value = None;
+            }
+        }
+        let opened = store(&fixture).await;
+        let mut index = opened.index(KeyType::Long).await;
+        let leaf = index.value_leaf(0).unwrap();
+        let page_of = |metadata: &ParquetMetaData, row_group: usize| -> Vec<Bytes> {
+            let first = row_group * group_rows();
+            (first..first + first_page_rows(metadata, row_group, leaf))
+                .filter(|row| row % every_other == 0)
+                .map(|row| Bytes::from(value_for(row)))
+                .collect()
+        };
+        let expected = page_of(&index.metadata, 0);
+        assert!(!expected.is_empty());
+        let before = opened.stats().gets();
+        assert_eq!(index.first_page_values(0).await.unwrap(), Some(expected));
+        assert_eq!(
+            opened.stats().gets() - before,
+            1,
+            "one GET past the page cache"
+        );
+        let second = page_of(&index.metadata, 1);
+        index.metadata = Arc::new(with_pages(
+            &with_group_rows(&index.metadata, 0, 0),
+            leaf,
+            Vec::new(),
+        ));
+        assert_eq!(
+            index.first_page_values(0).await.unwrap(),
+            Some(second),
+            "a first row group of no rows is passed over"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_value_shares_the_buffer_of_an_uncompressed_page() {
         for (compression, shared) in [

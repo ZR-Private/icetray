@@ -36,9 +36,10 @@ use crate::generation::{Generation, Lookup, MultiLookup, Row};
 use crate::key::{Key, KeyType};
 use crate::level::{Level, PageCacheCondition};
 use crate::local::{LocalDir, ResidentPages, Unobserved};
-use crate::manifest::TableLayout;
+use crate::manifest::{ColumnRead, Selection, TableLayout};
 use crate::metric::{self, LookupResult};
-use crate::shard::{self, Sharded};
+use crate::projection;
+use crate::shard::{self, Line, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
@@ -276,11 +277,11 @@ pub struct Table {
     /// the source names another location. A transient failure does not
     /// advance it: the next poll reads the metadata again and retries.
     /// `None` until the first successful build. A reload that changes the
-    /// table's entry forgets every refusal: one that changes only `lookups`
-    /// or `strict` resets this to the serving generation's location
-    /// (`retune`), and one that changes another field builds a new `Table`,
-    /// which remembers nothing, so a refusal that depended on the old entry
-    /// is tried again under the new one (RFD 005, RFD 018).
+    /// table's entry forgets every refusal: one that changes only `lookups`,
+    /// `strict`, or column formats resets this to the serving generation's
+    /// location (`retune`), and one that changes another field builds a new
+    /// `Table`, which remembers nothing, so a refusal that depended on the
+    /// old entry is tried again under the new one (RFD 005, RFD 018).
     known: Mutex<Option<Known>>,
     /// Serializes `load`, `refresh`, and `retune`; `Opened::retain` takes
     /// every table's in turn and `Opened::apply` every retuned table's, each
@@ -474,37 +475,86 @@ impl Lookups {
         }
     }
 
-    /// One lookup through `generation` reading the value columns at the
-    /// positions `columns` gives, timed and counted under its result, each
-    /// value or dictionary page GET it issues counted under its column's
+    /// One lookup through `generation` reading the value columns
+    /// `selection` names, timed and counted under its result, each value or
+    /// dictionary page GET it issues counted under its column's
     /// `value_page_gets_total` and, in a batch, holding a permit of
-    /// `fan_out` while it runs (`Generation::lookup`); the one path `get`
+    /// `fan_out` while it runs (`Generation::lookup`), then each value a
+    /// read names fields of trimmed to them (`trim`); the one path `get`
     /// and `multi_get` share.
     async fn one(
         &self,
         generation: &Generation,
         key: &Key,
-        columns: &[usize],
+        selection: &Selection,
         fan_out: Option<&Arc<Semaphore>>,
     ) -> Result<Row> {
         let started = Instant::now();
         let (row, result) = generation
             .lookup(
                 key,
-                columns,
+                &selection.positions,
                 &self.cache,
                 fan_out,
                 &self.metrics.value_page_gets,
             )
             .await?;
+        let row = self.trim(generation, key, selection, row)?;
         self.metrics.record(result, started.elapsed());
         Ok(row)
     }
 
+    /// `row` with each value a read of `selection` names fields of trimmed
+    /// to them (RFD 024), after the page cache, so the pages stay whole for
+    /// every caller; a null stays null and a value holding none of the
+    /// fields is empty. The bytes each column read and returned are counted
+    /// for an answered lookup alone, a null as none. A malformed value
+    /// fails the lookup as `Error::MalformedValue` and counts one
+    /// `projection_errors_total` for its column.
+    fn trim(
+        &self,
+        generation: &Generation,
+        key: &Key,
+        selection: &Selection,
+        mut row: Row,
+    ) -> Result<Row> {
+        let Row::Present(values) = &mut row else {
+            return Ok(row);
+        };
+        let length = |value: &Option<bytes::Bytes>| value.as_ref().map_or(0, bytes::Bytes::len);
+        let read: Option<Vec<usize>> = selection
+            .projects()
+            .then(|| values.iter().map(length).collect());
+        for ((value, &column), fields) in values
+            .iter_mut()
+            .zip(&selection.positions)
+            .zip(&selection.fields)
+        {
+            if let (Some(bytes), Some(fields)) = (value.as_mut(), fields) {
+                *bytes = projection::project(bytes, fields).map_err(|fault| {
+                    self.metrics.projection_errors[column].increment(1);
+                    Error::MalformedValue {
+                        table: generation.table.clone(),
+                        column: generation.layout.value_columns[column].name.clone(),
+                        key: key.clone(),
+                        fault,
+                    }
+                })?;
+            }
+        }
+        let counts = self.metrics.counts.mine();
+        for (at, (value, &column)) in values.iter().zip(&selection.positions).enumerate() {
+            let returned = length(value);
+            let read = read.as_ref().map_or(returned, |read| read[at]);
+            counts.columns[column].0.add(read, returned);
+        }
+        Ok(row)
+    }
+
     /// `keys` looked up through `generation`, each reading the value
-    /// columns at the positions `columns` gives, and answered in their
-    /// order. Every GET a lookup issues holds one permit of `fan_out`, the
-    /// batch's bound (`MULTI_GET_FAN_OUT`), while it runs, so the batch's
+    /// columns `selection` names, and answered in their order. Every GET a
+    /// lookup issues holds one permit of `fan_out`, the batch's bound
+    /// (`MULTI_GET_FAN_OUT`), while it runs, so the batch's
     /// tasks together hold at most that many GETs in flight; this task
     /// waits on at most that many lookups itself. The first failure ends
     /// the run.
@@ -512,7 +562,7 @@ impl Lookups {
         &self,
         generation: &Generation,
         keys: &[Key],
-        columns: &[usize],
+        selection: &Selection,
         fan_out: &Arc<Semaphore>,
     ) -> Result<Vec<Row>> {
         // The lookups are built before the stream, unpolled, so no closure
@@ -520,7 +570,7 @@ impl Lookups {
         // make it unprovably `Send`, and the gRPC service needs it `Send`.
         let lookups: Vec<_> = keys
             .iter()
-            .map(|key| self.one(generation, key, columns, Some(fan_out)))
+            .map(|key| self.one(generation, key, selection, Some(fan_out)))
             .collect();
         stream::iter(lookups)
             .buffered(MULTI_GET_FAN_OUT)
@@ -530,14 +580,16 @@ impl Lookups {
 }
 
 /// A table's lookup metric handles, one pair per `LookupResult` under the
-/// table's name and one `value_page_gets_total` per value column,
+/// table's name and per value column its `value_page_gets_total`, its
+/// value bytes read and returned, and its `projection_errors_total`,
 /// registered once when the table is built, with the recorder current
 /// then, so a lookup clones no name, formats no label, and looks up no
-/// series. A lookup's count goes to its thread's shard of `counts` and
-/// reaches `lookups_total` at `publish`, which a scrape runs first and a
-/// dropped table runs last, so a scrape reads every lookup counted before
-/// it. The latency histogram is recorded per lookup, as it happens, and so
-/// is a value-page GET, far rarer than a lookup.
+/// series. A lookup's count and the bytes it answered go to its thread's
+/// shard of `counts` and reach their counters at `publish`, which a scrape
+/// runs first and a dropped table runs last, so a scrape reads every
+/// lookup counted before it. The latency histogram is recorded per lookup,
+/// as it happens, and so are a value-page GET and a malformed value, far
+/// rarer than a lookup.
 struct LookupMetrics {
     cold_hit: ResultMetrics,
     warm_hit: ResultMetrics,
@@ -549,6 +601,15 @@ struct LookupMetrics {
     /// `TableConfig::value_column_names`' order, the column's
     /// `value_page_gets_total`.
     value_page_gets: Vec<Counter>,
+    /// Per value column, as `value_page_gets`, its
+    /// `value_bytes_read_total`, which `publish` moves `counts` into.
+    value_bytes_read: Vec<Counter>,
+    /// Per value column, as `value_page_gets`, its
+    /// `value_bytes_returned_total`, which `publish` moves `counts` into.
+    value_bytes_returned: Vec<Counter>,
+    /// Per value column, as `value_page_gets`, its
+    /// `projection_errors_total`, counted as each malformed value is met.
+    projection_errors: Vec<Counter>,
 }
 
 /// `lookups_total` and `lookup_seconds` of one table and result.
@@ -557,15 +618,44 @@ struct ResultMetrics {
     seconds: Histogram,
 }
 
-/// One shard of a table's lookup counts, not yet published, per result.
-#[derive(Default)]
+/// One shard of a table's lookup counts, not yet published, per result,
+/// and per value column the bytes it answered.
 struct Counts {
     cold_hit: AtomicU64,
     warm_hit: AtomicU64,
     miss: AtomicU64,
+    /// By the column's position in the layout, each on a line of its own,
+    /// since the slice is allocated apart from the shard's line.
+    columns: Box<[Line<ColumnBytes>]>,
+}
+
+/// One value column's bytes in one shard, not yet published.
+#[derive(Default)]
+struct ColumnBytes {
+    read: AtomicU64,
+    returned: AtomicU64,
+}
+
+impl ColumnBytes {
+    /// One value answered: `read` bytes read, `returned` bytes returned.
+    fn add(&self, read: usize, returned: usize) {
+        self.read.fetch_add(approx::count(read), Ordering::Relaxed);
+        self.returned
+            .fetch_add(approx::count(returned), Ordering::Relaxed);
+    }
 }
 
 impl Counts {
+    /// A shard of counts for a table of `columns` value columns.
+    fn new(columns: usize) -> Self {
+        Self {
+            cold_hit: AtomicU64::new(0),
+            warm_hit: AtomicU64::new(0),
+            miss: AtomicU64::new(0),
+            columns: (0..columns).map(|_| Line::default()).collect(),
+        }
+    }
+
     fn of(&self, result: LookupResult) -> &AtomicU64 {
         match result {
             LookupResult::ColdHit => &self.cold_hit,
@@ -591,21 +681,27 @@ impl LookupMetrics {
                 metric::LABEL_RESULT => result.to_string()
             ),
         };
-        Self {
-            cold_hit: of(LookupResult::ColdHit),
-            warm_hit: of(LookupResult::WarmHit),
-            miss: of(LookupResult::Miss),
-            counts: Sharded::new(),
-            value_page_gets: columns
+        let per_column = |name: &'static str| -> Vec<Counter> {
+            columns
                 .iter()
                 .map(|&column| {
                     metrics::counter!(
-                        metric::VALUE_PAGE_GETS_TOTAL,
+                        name,
                         metric::LABEL_TABLE => table.to_string(),
                         metric::LABEL_COLUMN => column.to_string()
                     )
                 })
-                .collect(),
+                .collect()
+        };
+        Self {
+            cold_hit: of(LookupResult::ColdHit),
+            warm_hit: of(LookupResult::WarmHit),
+            miss: of(LookupResult::Miss),
+            counts: Sharded::from_fn(|| Counts::new(columns.len())),
+            value_page_gets: per_column(metric::VALUE_PAGE_GETS_TOTAL),
+            value_bytes_read: per_column(metric::VALUE_BYTES_READ_TOTAL),
+            value_bytes_returned: per_column(metric::VALUE_BYTES_RETURNED_TOTAL),
+            projection_errors: per_column(metric::PROJECTION_ERRORS_TOTAL),
         }
     }
 
@@ -626,19 +722,34 @@ impl LookupMetrics {
         self.of(result).seconds.record(time::seconds(elapsed));
     }
 
-    /// Moves the counts every shard holds into `lookups_total`. Each shard's
-    /// count is taken with a swap to zero, so a lookup counted meanwhile is
-    /// published by this call or the next, and never twice.
+    /// Moves the counts every shard holds into `lookups_total` and the
+    /// value bytes counters. Each shard's count is taken with a swap to
+    /// zero, so a lookup counted meanwhile is published by this call or the
+    /// next, and never twice.
     fn publish(&self) {
+        let taken = |count: &AtomicU64| count.swap(0, Ordering::Relaxed);
+        let publish = |counter: &Counter, counted: u64| {
+            if counted > 0 {
+                counter.increment(counted);
+            }
+        };
         for result in LookupResult::ALL {
-            let counted: u64 = self
+            let counted = self
                 .counts
                 .iter()
-                .map(|shard| shard.of(result).swap(0, Ordering::Relaxed))
+                .map(|shard| taken(shard.of(result)))
                 .sum();
-            if counted > 0 {
-                self.of(result).total.increment(counted);
-            }
+            publish(&self.of(result).total, counted);
+        }
+        for (column, (read, returned)) in self
+            .value_bytes_read
+            .iter()
+            .zip(&self.value_bytes_returned)
+            .enumerate()
+        {
+            let shards = || self.counts.iter().map(|shard| &shard.columns[column].0);
+            publish(read, shards().map(|bytes| taken(&bytes.read)).sum());
+            publish(returned, shards().map(|bytes| taken(&bytes.returned)).sum());
         }
     }
 }
@@ -969,6 +1080,7 @@ impl Table {
                 &config.key_column,
                 &config.value_column_names(),
             )?;
+            layout.check_formats(&config)?;
             Ok(layout.key_type)
         })
         .await
@@ -976,12 +1088,15 @@ impl Table {
     }
 
     /// One lookup against the serving generation, reading the value
-    /// columns `columns` names, answered in that order; none answers
-    /// presence alone (RFD 022). `Error::NotReady` with no generation;
-    /// `Error::KeyType` for a key of another type than the table's and
-    /// `Error::ColumnRequest` for a column the generation does not serve or
-    /// one named twice, each before any read.
-    pub async fn get(&self, key: &Key, columns: &[&str]) -> Result<Lookup> {
+    /// columns `columns` names, answered in that order, each value trimmed
+    /// to the fields its read names (RFD 024); none answers presence alone
+    /// (RFD 022). `Error::NotReady` with no generation; `Error::KeyType` for
+    /// a key of another type than the table's and `Error::ColumnRequest` for
+    /// a column the generation does not serve, one named twice, or a field
+    /// list the entry's format for it does not take, each before any read
+    /// (`TableLayout::select`); `Error::MalformedValue` for a value that is
+    /// not the protobuf its column declares, when its read names fields.
+    pub async fn get(&self, key: &Key, columns: &[ColumnRead<'_>]) -> Result<Lookup> {
         let _in_flight = self.lookups.enter();
         // A guard held across the lookup's awaits stays correct wherever
         // the task resumes. While held it occupies one of the loading
@@ -991,8 +1106,8 @@ impl Table {
         let current = self.current.load();
         let generation = current.as_deref().ok_or_else(|| self.not_ready())?;
         self.check_key_type(generation, key)?;
-        let columns = generation.layout.select(&self.name, columns)?;
-        let row = self.lookups.one(generation, key, &columns, None).await?;
+        let selection = generation.layout.select(&self.config.load(), columns)?;
+        let row = self.lookups.one(generation, key, &selection, None).await?;
         Ok(Lookup {
             row,
             snapshot_id: generation.snapshot_id,
@@ -1015,40 +1130,41 @@ impl Table {
     }
 
     /// Several lookups against one generation, each reading the value
-    /// columns `columns` names, answered in key order (RFD 022). Every
-    /// key's type and the columns are checked before any read, as `get`
-    /// checks them, so a mismatch anywhere fails the whole call and issues
-    /// nothing; any failure fails the whole call (RFD 010). While fewer
-    /// `get` and `multi_get` calls than worker threads are in flight on the
-    /// tables sharing this one's `TableHandles::calls`, this one included,
-    /// the keys are split, in order, into up to one run per worker thread
-    /// (`shard::workers`) of at least `MULTI_GET_TASK_KEYS_MIN` keys, each
-    /// spawned as a task so a batch's decodes run on several cores
-    /// (`Lookups::runs`). A batch that makes one run, as a batch does once
-    /// that many calls are in flight, is looked up here, unspawned.
-    /// `open_with` gives every table of a process one count, so calls to
-    /// any of them count toward holding a batch back from splitting. The
-    /// runs share one bound of `MULTI_GET_FAN_OUT` GETs in flight, each GET
-    /// holding a permit while it runs (`Lookups::run`). Dropping the
-    /// returned future, as a deadline does, aborts the runs still going; a
-    /// GET already issued runs on, holding its permit. A run's panic is
-    /// resumed here; a run canceled under a runtime shutdown is
-    /// `Error::LookupCanceled`.
-    pub async fn multi_get(&self, keys: &[Key], columns: &[&str]) -> Result<MultiLookup> {
+    /// columns `columns` names, trimmed as `get` trims them, answered in
+    /// key order (RFD 022). Every key's type and the columns are checked
+    /// before any read, as `get` checks them, so a mismatch anywhere fails
+    /// the whole call and issues nothing; any failure fails the whole call
+    /// (RFD 010), a malformed value of any key included (RFD 024). While
+    /// fewer `get` and `multi_get` calls than worker threads are in flight
+    /// on the tables sharing this one's `TableHandles::calls`, this one
+    /// included, the keys are split, in order, into up to one run per
+    /// worker thread (`shard::workers`) of at least
+    /// `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a batch's
+    /// decodes run on several cores (`Lookups::runs`). A batch that makes
+    /// one run, as a batch does once that many calls are in flight, is
+    /// looked up here, unspawned. `open_with` gives every table of a
+    /// process one count, so calls to any of them count toward holding a
+    /// batch back from splitting. The runs share one bound of
+    /// `MULTI_GET_FAN_OUT` GETs in flight, each GET holding a permit while
+    /// it runs (`Lookups::run`). Dropping the returned future, as a
+    /// deadline does, aborts the runs still going; a GET already issued
+    /// runs on, holding its permit. A run's panic is resumed here; a run
+    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
+    pub async fn multi_get(&self, keys: &[Key], columns: &[ColumnRead<'_>]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
-        let columns = generation.layout.select(&self.name, columns)?;
+        let selection = generation.layout.select(&self.config.load(), columns)?;
         let fan_out = Arc::new(Semaphore::new(MULTI_GET_FAN_OUT));
         let runs = self.lookups.runs(keys.len());
         let rows = if runs <= 1 {
             self.lookups
-                .run(&generation, keys, &columns, &fan_out)
+                .run(&generation, keys, &selection, &fan_out)
                 .await?
         } else {
-            self.run_spawned(&generation, keys, &columns, runs, &fan_out)
+            self.run_spawned(&generation, keys, selection, runs, &fan_out)
                 .await?
         };
         Ok(MultiLookup {
@@ -1065,23 +1181,23 @@ impl Table {
         &self,
         generation: &Arc<Generation>,
         keys: &[Key],
-        columns: &[usize],
+        selection: Selection,
         runs: usize,
         fan_out: &Arc<Semaphore>,
     ) -> Result<Vec<Row>> {
         let per_run = keys.len().div_ceil(runs);
-        let columns: Arc<[usize]> = Arc::from(columns);
+        let selection = Arc::new(selection);
         let mut tasks = JoinSet::new();
         for (index, part) in keys.chunks(per_run).enumerate() {
             let lookups = Arc::clone(&self.lookups);
             let generation = Arc::clone(generation);
-            let columns = Arc::clone(&columns);
+            let selection = Arc::clone(&selection);
             let fan_out = Arc::clone(fan_out);
             let part = part.to_vec();
             tasks.spawn(async move {
                 (
                     index,
-                    lookups.run(&generation, &part, &columns, &fan_out).await,
+                    lookups.run(&generation, &part, &selection, &fan_out).await,
                 )
             });
         }
@@ -1108,36 +1224,44 @@ impl Table {
     }
 
     /// Whether `config`, an entry that differs from the table's in
-    /// `lookups` and `strict` alone (`TableConfig::same_but_levels`), can be
-    /// applied in place: a `lookups` the residency cannot reach is refused
-    /// as a load refuses it (`TableConfig::check_reachable`), and the
-    /// serving generation is judged against the entry (`Generation::judge`),
-    /// so a strict entry whose level the serving snapshot does not meet is
-    /// refused as `RefusalReason::BelowLevel`, as a load under it would
-    /// refuse that snapshot. With no generation serving there is nothing to
+    /// `lookups`, `strict`, and value column formats alone
+    /// (`TableConfig::same_but_tuning`), can be applied in place: a
+    /// `lookups` the residency cannot reach is refused as a load refuses it
+    /// (`TableConfig::check_reachable`), a format the serving layout's type
+    /// for its column does not take as `RefusalReason::ValueTypeUnsupported`
+    /// (`TableLayout::check_formats`), and the serving generation is judged
+    /// against the entry (`Generation::judge`), so a strict entry whose
+    /// level the serving snapshot does not meet is refused as
+    /// `RefusalReason::BelowLevel`, each as a load under it would refuse
+    /// that snapshot. With no generation serving there is nothing to
     /// judge. Only a judgement made while holding `serial` (`serialized`)
     /// through `retune` decides: without it a build may swap another
     /// generation in after the judgement.
     pub(crate) fn judge_retune(&self, config: &TableConfig) -> Result<()> {
         config.check_reachable()?;
         match self.current() {
-            Some(current) => current.judge(config.lookups(), config.strict),
+            Some(current) => {
+                current.layout.check_formats(config)?;
+                current.judge(config.lookups(), config.strict)
+            }
             None => Ok(()),
         }
     }
 
     /// Applies `config`, which `judge_retune` admitted under the same held
-    /// `serial`, in place (RFD 020): the serving generation keeps serving
-    /// and nothing is read. The level gauges declare the new `lookups` at
-    /// once, against the newest measured snapshot's level, which a retune
-    /// does not change. Every remembered refusal is forgotten, and logged
-    /// as forgotten: the known location becomes the serving generation's,
-    /// so the next poll builds the snapshot the ref names under the new
-    /// entry (RFD 005). A `Held` state ends in `Serving` when the new entry
-    /// would admit the held snapshot's level, which the next poll then
-    /// swaps in, and stays `Held` until that poll refuses it again
-    /// otherwise. A `Degraded` state stays until the next poll ends it,
-    /// since the last load or refresh failed whatever the entry.
+    /// `serial`, in place (RFD 020, RFD 024): the serving generation keeps
+    /// serving and nothing is read, and the next lookup checks its field
+    /// lists against the new formats. The level gauges declare the new
+    /// `lookups` at once, against the newest measured snapshot's level,
+    /// which a retune does not change. Every remembered refusal is
+    /// forgotten, and logged as forgotten: the known location becomes the
+    /// serving generation's, so the next poll builds the snapshot the ref
+    /// names under the new entry (RFD 005). A `Held` state ends in
+    /// `Serving` when the new entry would admit the held snapshot's level,
+    /// which the next poll then swaps in, and stays `Held` until that poll
+    /// refuses it again otherwise. A `Degraded` state stays until the next
+    /// poll ends it, since the last load or refresh failed whatever the
+    /// entry.
     pub(crate) fn retune(&self, config: TableConfig, _serialized: &MutexGuard<'_, ()>) {
         let (declared, strict) = (config.lookups(), config.strict);
         self.config.store(Arc::new(config));
@@ -1365,7 +1489,9 @@ impl Table {
     /// generation.
     fn gate(&self, generation: &Generation, config: &TableConfig) -> Result<FindingCounts> {
         let declared = config.lookups();
-        let report = check::diagnose(generation, declared);
+        let report = check::diagnose(generation, declared, &|name| {
+            config.format_of(name).unwrap_or_default()
+        });
         let mut counts = FindingCounts::new();
         for finding in &report.findings {
             *counts
@@ -1625,8 +1751,9 @@ impl Table {
     }
 
     /// Writes the generation gauges from `generation`; called with the
-    /// gauges' lock held. The `findings` gauge is set for every code, zero
-    /// for the absent ones, so a code that cleared on the swap reads zero:
+    /// gauges' lock held. The `findings` gauge is set for every code a load
+    /// raises (`FindingCode::raised_at_load`), zero for the absent ones, so
+    /// a code that cleared on the swap reads zero:
     /// a code about the row or the table under `{table, code}`, and a code
     /// about one value column (`FindingCode::per_column`) under `{table,
     /// code, column}` for every column the table serves (RFD 022).
@@ -1645,7 +1772,10 @@ impl Table {
                     .unwrap_or(0),
             )
         };
-        for code in FindingCode::ALL {
+        for code in FindingCode::ALL
+            .into_iter()
+            .filter(|code| code.raised_at_load())
+        {
             if code.per_column() {
                 for (column, _) in &generation.columns {
                     metrics::gauge!(
@@ -1883,7 +2013,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::check::Capping;
-    use crate::config::{Residency, ServerConfig};
+    use crate::config::{Residency, ServerConfig, ValueColumnConfig, ValueFormat};
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
     use crate::generation::testing::{
@@ -1902,7 +2032,7 @@ mod tests {
     use crate::local::testing::evict;
     use crate::local::testing::{chunks_offset, overwrite};
     use crate::manifest::ColumnRequestFault;
-    use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN};
+    use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN, whole};
     use crate::metric::LookupResult;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
@@ -2185,7 +2315,7 @@ mod tests {
         assert!(matches!(table.state(), TableState::Loading));
         assert!(table.current().is_none());
         let error = table
-            .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+            .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotReady { table: ref name } if name == TABLE));
@@ -2228,7 +2358,7 @@ mod tests {
         assert_eq!(table.current().unwrap().snapshot_id, snapshot_id);
         assert_eq!(
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap(),
             Lookup {
@@ -2238,7 +2368,7 @@ mod tests {
         );
         assert_eq!(
             table
-                .get(&Key::Long(all[0] + 1), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0] + 1), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap(),
             Lookup {
@@ -2269,11 +2399,16 @@ mod tests {
         let batch = tokio::spawn({
             let table = Arc::clone(&table);
             let keys = vec![Key::Long(all[0])];
-            async move { table.multi_get(&keys, &[VALUE_COLUMN]).await }
+            async move {
+                table
+                    .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await
+            }
         });
         assert_eq!(batch.await.unwrap().unwrap().rows, [present(all[0])]);
         let key = Key::Long(all[0]);
-        let looked_up = tokio::spawn(async move { table.get(&key, &[VALUE_COLUMN]).await });
+        let looked_up =
+            tokio::spawn(async move { table.get(&key, &[ColumnRead::whole(VALUE_COLUMN)]).await });
         assert_eq!(looked_up.await.unwrap().unwrap().row, present(all[0]));
     }
 
@@ -2284,7 +2419,10 @@ mod tests {
         table.load().await.unwrap();
         let before = fixture.gets();
         let error = table
-            .get(&Key::Str("k".to_string()), &[VALUE_COLUMN])
+            .get(
+                &Key::Str("k".to_string()),
+                &[ColumnRead::whole(VALUE_COLUMN)],
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2305,7 +2443,10 @@ mod tests {
         table.load().await.unwrap();
         let keys = [Key::Long(all[0]), Key::Long(all[0] + 1), Key::Long(all[1])];
         assert_eq!(
-            table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap(),
+            table
+                .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await
+                .unwrap(),
             MultiLookup {
                 rows: vec![present(all[0]), Row::Absent, present(all[1])],
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
@@ -2392,7 +2533,10 @@ mod tests {
         // never passes the gate: its page fetches end at the get deadline
         // and the call fails.
         gauged.fill_to(MULTI_GET_FAN_OUT);
-        let answered = table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap();
+        let answered = table
+            .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await
+            .unwrap();
         let expected: Vec<Row> = all.iter().map(|key| present(*key)).collect();
         assert_eq!(answered.rows, expected);
         assert_eq!(
@@ -2466,7 +2610,13 @@ mod tests {
         let keys = long_keys(&all);
         gauged.fill_to(MULTI_GET_FAN_OUT);
         let answered = table
-            .multi_get(&keys, &[DETAIL_COLUMN, VALUE_COLUMN])
+            .multi_get(
+                &keys,
+                &[
+                    ColumnRead::whole(DETAIL_COLUMN),
+                    ColumnRead::whole(VALUE_COLUMN),
+                ],
+            )
             .await
             .unwrap();
         let expected: Vec<Row> = all.iter().map(|key| both(*key)).collect();
@@ -2519,7 +2669,13 @@ mod tests {
             let before = (stats.gets(), stats.hedges());
             assert_eq!(
                 table
-                    .get(&Key::Long(all[0]), &[DETAIL_COLUMN, VALUE_COLUMN])
+                    .get(
+                        &Key::Long(all[0]),
+                        &[
+                            ColumnRead::whole(DETAIL_COLUMN),
+                            ColumnRead::whole(VALUE_COLUMN)
+                        ]
+                    )
                     .await
                     .unwrap()
                     .row,
@@ -2546,7 +2702,10 @@ mod tests {
     /// fan-out of `permits`, the bound `multi_get` gives a batch.
     async fn run_under(table: &Table, keys: &[Key], columns: &[&str], permits: usize) -> Vec<Row> {
         let generation = table.current().unwrap();
-        let columns = generation.layout.select(&table.name, columns).unwrap();
+        let columns = generation
+            .layout
+            .select(&table.config(), &whole(columns))
+            .unwrap();
         let fan_out = Arc::new(Semaphore::new(permits));
         table
             .lookups
@@ -2605,14 +2764,16 @@ mod tests {
             })
             .await;
             let before = fixture.gets();
+            let both_reads = [
+                ColumnRead::whole(DETAIL_COLUMN),
+                ColumnRead::whole(VALUE_COLUMN),
+            ];
             let key = Key::Long(all[0]);
             // On the current-thread runtime the second lookup reaches the
             // page cache while the first one's fetch is still in flight, so
             // it joins that fetch.
-            let (first, second) = futures::join!(
-                table.get(&key, &[DETAIL_COLUMN, VALUE_COLUMN]),
-                table.get(&key, &[DETAIL_COLUMN, VALUE_COLUMN])
-            );
+            let (first, second) =
+                futures::join!(table.get(&key, &both_reads), table.get(&key, &both_reads));
             assert_eq!(first.unwrap().row, both(all[0]));
             assert_eq!(second.unwrap().row, both(all[0]));
             table.publish_lookup_counts();
@@ -2675,7 +2836,13 @@ mod tests {
             let key = Key::Long(all[0]);
             let before = fixture.gets();
             let read = table
-                .get(&key, &[DETAIL_COLUMN, VALUE_COLUMN])
+                .get(
+                    &key,
+                    &[
+                        ColumnRead::whole(DETAIL_COLUMN),
+                        ColumnRead::whole(VALUE_COLUMN),
+                    ],
+                )
                 .await
                 .unwrap();
             assert_eq!(read.row, both(all[0]));
@@ -2686,7 +2853,13 @@ mod tests {
             reversed.reverse();
             assert_eq!(
                 table
-                    .get(&key, &[VALUE_COLUMN, DETAIL_COLUMN])
+                    .get(
+                        &key,
+                        &[
+                            ColumnRead::whole(VALUE_COLUMN),
+                            ColumnRead::whole(DETAIL_COLUMN)
+                        ]
+                    )
                     .await
                     .unwrap()
                     .row,
@@ -2750,9 +2923,9 @@ mod tests {
             ),
         ] {
             let refused = [
-                table.get(&key, names).await.unwrap_err(),
+                table.get(&key, &whole(names)).await.unwrap_err(),
                 table
-                    .multi_get(std::slice::from_ref(&key), names)
+                    .multi_get(std::slice::from_ref(&key), &whole(names))
                     .await
                     .unwrap_err(),
             ];
@@ -2808,7 +2981,7 @@ mod tests {
         );
         assert_eq!(generation.level, Level::Balanced, "the dearest column's");
         assert_eq!(generation.lookup_cost.gets_per_hit, 2);
-        let report = check::diagnose(&generation, Level::Optimal);
+        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         let dictionary: Vec<Option<&str>> = report
             .findings
             .iter()
@@ -2911,6 +3084,19 @@ mod tests {
                 "{name} {labels:?}"
             );
         }
+        let walked_only = FindingCode::MalformedProtobuf.to_string();
+        let doctor_only = series
+            .0
+            .iter()
+            .filter(|(key, ..)| {
+                key.key().name() == metric::FINDINGS
+                    && key.key().labels().any(|label| {
+                        label.key() == metric::LABEL_CODE && label.value() == walked_only
+                    })
+            })
+            .count();
+        assert_eq!(doctor_only, 0, "no load raises the doctor's walk's code");
+        assert!(series.named(metric::FINDINGS) > 0);
     }
 
     /// A table that serves no value column answers whether a key is
@@ -2940,13 +3126,15 @@ mod tests {
         );
         assert_eq!(fixture.gets(), before, "no value page is read");
         assert!(matches!(
-            table.get(&keys[0], &[VALUE_COLUMN]).await,
+            table
+                .get(&keys[0], &[ColumnRead::whole(VALUE_COLUMN)])
+                .await,
             Err(Error::ColumnRequest {
                 fault: ColumnRequestFault::NotServed,
                 ..
             })
         ));
-        let report = check::diagnose(&generation, Level::Optimal);
+        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         assert!(report.summary.value_columns.is_empty());
         assert!(
             report
@@ -3046,7 +3234,7 @@ mod tests {
         let mut held = JoinSet::new();
         for key in long_keys(beside) {
             let other = Arc::clone(&other);
-            held.spawn(async move { other.get(&key, &[VALUE_COLUMN]).await });
+            held.spawn(async move { other.get(&key, &[ColumnRead::whole(VALUE_COLUMN)]).await });
         }
         // Before the fetches end at the get deadline, which would end the
         // calls.
@@ -3067,8 +3255,9 @@ mod tests {
                 .expect("every lookup of the batch reaches the store");
             Arc::strong_count(&batch_table.current().unwrap()) - holders_of_an_inline_batch
         };
+        let value = [ColumnRead::whole(VALUE_COLUMN)];
         tokio::select! {
-            answered = batch_table.multi_get(&keys, &[VALUE_COLUMN]) => panic!("the store holds every GET: {answered:?}"),
+            answered = batch_table.multi_get(&keys, &value) => panic!("the store holds every GET: {answered:?}"),
             spawned = every_get_held => spawned,
         }
     }
@@ -3101,8 +3290,9 @@ mod tests {
             .expect("every lookup of the batch reaches the store");
             Arc::strong_count(&table.current().unwrap()) - holders_of_an_inline_batch
         };
+        let value = [ColumnRead::whole(VALUE_COLUMN)];
         tokio::select! {
-            answered = table.multi_get(&keys, &[VALUE_COLUMN]) => panic!("the store holds every GET: {answered:?}"),
+            answered = table.multi_get(&keys, &value) => panic!("the store holds every GET: {answered:?}"),
             spawned = every_get_held => spawned,
         }
     }
@@ -3114,7 +3304,10 @@ mod tests {
         table.load().await.unwrap();
         let before = fixture.gets();
         let keys = [Key::Long(all[2]), Key::Str("k".to_string())];
-        let error = table.multi_get(&keys, &[VALUE_COLUMN]).await.unwrap_err();
+        let error = table
+            .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             Error::KeyType {
@@ -3143,7 +3336,7 @@ mod tests {
         assert_eq!(kept, ErrorKind::Refused(reason));
         assert!(table.current().is_none());
         let error = table
-            .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+            .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotReady { .. }));
@@ -3232,7 +3425,7 @@ mod tests {
         assert_eq!(degraded(&table), (serving, ErrorKind::RefreshDeadline));
         assert_eq!(
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap()
                 .row,
@@ -3284,7 +3477,7 @@ mod tests {
         assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
         assert_eq!(
             table
-                .get(&Key::Long(appended[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(appended[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap(),
             Lookup {
@@ -3316,7 +3509,7 @@ mod tests {
         );
         assert_eq!(
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap(),
             Lookup {
@@ -3566,7 +3759,10 @@ mod tests {
         assert_eq!(kept, ErrorKind::File);
         let first = served[0].clone();
         assert_eq!(
-            table.get(&first, &[VALUE_COLUMN]).await.unwrap(),
+            table
+                .get(&first, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await
+                .unwrap(),
             Lookup {
                 row: present(0),
                 snapshot_id: SnapshotId(FIRST_SNAPSHOT),
@@ -3742,7 +3938,7 @@ mod tests {
         );
         assert_eq!(
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap()
                 .row,
@@ -3884,7 +4080,7 @@ mod tests {
         assert_eq!(kept, ErrorKind::Refused(expected));
         assert_eq!(
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap()
                 .row,
@@ -3987,15 +4183,15 @@ mod tests {
             let table = table_over(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap();
             table
-                .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap();
             table
-                .get(&Key::Long(all[0] + 1), &[VALUE_COLUMN])
+                .get(&Key::Long(all[0] + 1), &[ColumnRead::whole(VALUE_COLUMN)])
                 .await
                 .unwrap();
             append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
@@ -4070,10 +4266,85 @@ mod tests {
         );
     }
 
+    /// The field a protobuf fixture value holds its key in, as a varint.
+    const KEY_FIELD: u32 = 1;
+    /// The field a protobuf fixture value holds its filler in.
+    const FILLER_FIELD: u32 = 2;
+    /// The filler bytes of a protobuf fixture value.
+    const FILLER_BYTES: usize = 40;
+
+    /// A protobuf message for `key`: `KEY_FIELD` holding the key, then
+    /// `FILLER_FIELD` holding `FILLER_BYTES` bytes, and the length of the
+    /// first field's record.
+    fn protobuf_value(key: i64) -> (Vec<u8>, usize) {
+        let mut value = Vec::new();
+        prost::encoding::encode_key(KEY_FIELD, prost::encoding::WireType::Varint, &mut value);
+        prost::encoding::encode_varint(key.cast_unsigned(), &mut value);
+        let key_record = value.len();
+        prost::encoding::bytes::encode(FILLER_FIELD, &vec![0xAB; FILLER_BYTES], &mut value);
+        (value, key_record)
+    }
+
+    /// A one-bucket fixture of one file of `FILE_KEYS` keys whose values
+    /// are `protobuf_value`'s, committed as `FIRST_SNAPSHOT`, and its keys.
+    async fn protobuf_fixture() -> (Fixture, Vec<i64>) {
+        let mut fixture = Fixture::bucketed(1);
+        let all = keys_from(0, FILE_KEYS);
+        fixture
+            .add_file(FileSpec {
+                name: "f",
+                keys: &long_keys(&all),
+                values: all.iter().map(|&key| Some(protobuf_value(key).0)).collect(),
+                partition: Partition::Bucket(0),
+                bounds: Bounds::Exact,
+                layout: WriterLayout::contract(),
+            })
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        (fixture, all)
+    }
+
+    /// `misses` lookups of `absent`, then one of `present` trimmed to
+    /// `KEY_FIELD`: the length of the value it answers.
+    async fn misses_then_a_projected_hit(
+        table: &Table,
+        absent: &Key,
+        misses: usize,
+        present: i64,
+    ) -> Option<usize> {
+        for _ in 0..misses {
+            let row = table
+                .get(absent, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await
+                .unwrap()
+                .row;
+            assert_eq!(row, Row::Absent);
+        }
+        let projected = table
+            .get(
+                &Key::Long(present),
+                &[ColumnRead {
+                    name: VALUE_COLUMN,
+                    fields: &[KEY_FIELD],
+                }],
+            )
+            .await
+            .unwrap()
+            .row;
+        let Row::Present(values) = projected else {
+            panic!("the key is present");
+        };
+        values[0].as_ref().map(Bytes::len)
+    }
+
     /// Lookups spread over a multi-thread runtime's workers reach
-    /// `lookups_total` at `publish_lookup_counts`, each once: a snapshot of
-    /// the debugging recorder takes the counter's value and resets it, so
-    /// each snapshot reads what was published since the one before.
+    /// `lookups_total` at `publish_lookup_counts`, each once, and the bytes
+    /// each read and returned reach the value bytes counters the same way:
+    /// a snapshot of the debugging recorder takes the counters' values and
+    /// resets them, so each snapshot reads what was published since the one
+    /// before.
     #[test]
     fn test_publish_lookup_counts_moves_every_task_count_once() {
         let workers = 4;
@@ -4085,44 +4356,78 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let labels = [
+        let result =
+            |result: LookupResult| [table_label(), (metric::LABEL_RESULT, result.to_string())];
+        let column = [
             table_label(),
-            (metric::LABEL_RESULT, LookupResult::Miss.to_string()),
+            (metric::LABEL_COLUMN, VALUE_COLUMN.to_string()),
         ];
-        let published =
-            || Series(snapshotter.snapshot().into_vec()).counter(metric::LOOKUPS_TOTAL, &labels);
+        let published = || {
+            let series = Series(snapshotter.snapshot().into_vec());
+            let counter = |name, labels: &[(&str, String)]| series.counter(name, labels);
+            (
+                counter(metric::LOOKUPS_TOTAL, &result(LookupResult::Miss)),
+                counter(metric::LOOKUPS_TOTAL, &result(LookupResult::ColdHit))
+                    + counter(metric::LOOKUPS_TOTAL, &result(LookupResult::WarmHit)),
+                counter(metric::VALUE_BYTES_READ_TOTAL, &column),
+                counter(metric::VALUE_BYTES_RETURNED_TOTAL, &column),
+            )
+        };
         metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
-                let (fixture, all) = two_bucket_table().await;
-                let table =
-                    Arc::new(table_over(&fixture, fixture.config(Residency::Full, None)).await);
+                let (fixture, all) = protobuf_fixture().await;
+                let config = TableConfig {
+                    value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
+                    ..fixture.config(Residency::Full, None)
+                };
+                let table = Arc::new(table_over(&fixture, config).await);
                 table.load().await.unwrap();
-                let absent = Key::Long(all[0] + 1);
+                let absent = Key::Long(all.iter().max().unwrap() + 1);
+                let present = all[0];
+                let (value, key_record) = protobuf_value(present);
                 let tasks: Vec<_> = (0..workers)
                     .map(|_| {
                         let table = Arc::clone(&table);
                         let absent = absent.clone();
                         tokio::spawn(async move {
-                            for _ in 0..lookups_per_task {
-                                assert_eq!(
-                                    table.get(&absent, &[VALUE_COLUMN]).await.unwrap().row,
-                                    Row::Absent
-                                );
-                            }
+                            misses_then_a_projected_hit(&table, &absent, lookups_per_task, present)
+                                .await
                         })
                     })
                     .collect();
                 for task in tasks {
-                    task.await.unwrap();
+                    assert_eq!(task.await.unwrap(), Some(key_record));
                 }
-                assert_eq!(published(), 0, "counted on the shards until published");
+                assert_eq!(
+                    published(),
+                    (0, 0, 0, 0),
+                    "counted on the shards until published"
+                );
                 table.publish_lookup_counts();
-                assert_eq!(published(), approx::count(workers * lookups_per_task));
+                let workers_count = approx::count(workers);
+                assert_eq!(
+                    published(),
+                    (
+                        approx::count(workers * lookups_per_task),
+                        workers_count,
+                        workers_count * approx::count(value.len()),
+                        workers_count * approx::count(key_record),
+                    ),
+                    "a miss reads no bytes; a projected hit reads its value and returns the field"
+                );
                 table.publish_lookup_counts();
-                assert_eq!(published(), 0, "nothing is published twice");
-                table.get(&absent, &[VALUE_COLUMN]).await.unwrap();
+                assert_eq!(published(), (0, 0, 0, 0), "nothing is published twice");
+                table
+                    .get(&Key::Long(present), &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await
+                    .unwrap();
                 drop(table);
-                assert_eq!(published(), 1, "a dropped table publishes what it counted");
+                let whole = approx::count(value.len());
+                assert_eq!(
+                    published(),
+                    (0, 1, whole, whole),
+                    "a dropped table publishes what it counted, a whole read as read"
+                );
             });
         });
     }
@@ -5019,7 +5324,7 @@ mod tests {
             assert_eq!(kept, ErrorKind::ObjectStore);
             assert_eq!(
                 table
-                    .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                    .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                     .await
                     .unwrap()
                     .row,
@@ -5106,7 +5411,7 @@ mod tests {
             assert_eq!(degraded(&table), (serving, refused.clone()));
             assert_eq!(
                 table
-                    .get(&Key::Long(all[0]), &[VALUE_COLUMN])
+                    .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
                     .await
                     .unwrap(),
                 Lookup {
@@ -5343,18 +5648,28 @@ mod tests {
         let key = Key::Long(all[0]);
         gate.fill_to(2);
         assert!(
-            table.get(&key, &[VALUE_COLUMN]).now_or_never().is_none(),
+            table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .now_or_never()
+                .is_none(),
             "a cold hit waits on its page's read"
         );
         gate.fill_to(0);
-        table.get(&key, &[VALUE_COLUMN]).await.unwrap();
-        let warm = table.get(&key, &[VALUE_COLUMN]).now_or_never();
+        table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await
+            .unwrap();
+        let warm = table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .now_or_never();
         assert_eq!(
             warm.expect("a warm hit is ready").unwrap().row,
             present(all[0])
         );
         let absent = Key::Long(all.iter().max().unwrap() + 1);
-        let miss = table.get(&absent, &[VALUE_COLUMN]).now_or_never();
+        let miss = table
+            .get(&absent, &[ColumnRead::whole(VALUE_COLUMN)])
+            .now_or_never();
         assert_eq!(miss.expect("a miss is ready").unwrap().row, Row::Absent);
     }
 

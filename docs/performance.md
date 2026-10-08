@@ -71,6 +71,33 @@ Columns share the page cache, which is keyed by file and offset.
 caller can add up what a request will spend
 ([Metrics](operating.md#metrics)).
 
+## Splitting a row or projecting it
+
+A column declared protobuf can be trimmed per request to the top-level
+fields a caller names ([RFD 024](rfd/024-field-projection.md)), which is
+the finer tool and the cheaper change, since it needs no rewrite of the
+table. The two save different things:
+
+- A split into columns saves the bytes a GET fetches and page-cache
+  space: a caller that names one column fetches and caches only that
+  column's pages. It
+  is fixed at write time, for every caller, and a hit naming several
+  columns costs a GET for each.
+- Projection saves the bytes on the wire and the caller's decode, which
+  a protobuf runtime spends on every field it is handed. It costs no GET
+  and no page-cache space of its own, since the walk runs after the page
+  cache on the value it already holds, and it is chosen per request.
+  The server's walk is linear in the value's bytes, small beside the
+  page decompression every lookup pays.
+
+So split a row where a large part is read on its own, such as an
+embedding beside a few hundred properties, and project within a column
+where callers read different few fields of one message. The two combine:
+a protobuf column of properties beside a column of its own for the
+embedding. `icetray_value_bytes_read_total` and
+`icetray_value_bytes_returned_total` show per column what projection
+saves.
+
 ## Choosing a residency
 
 A table's residency decides where its key chunks live, and so trades
@@ -319,3 +346,5 @@ blocking, so every local read there moves to another thread
   contract asks writers for.
 - [RFD 022](rfd/022-value-columns.md): value columns, and when to split a
   row across them.
+- [RFD 024](rfd/024-field-projection.md): field projection, and when to
+  project within a column rather than split.

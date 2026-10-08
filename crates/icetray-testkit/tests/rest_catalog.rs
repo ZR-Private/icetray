@@ -10,6 +10,7 @@ use std::sync::Arc;
 use iceberg::CatalogBuilder as _;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
+use icetray_core::ColumnRead;
 use icetray_core::KeyType;
 use icetray_core::TableSource;
 use icetray_core::approx;
@@ -65,7 +66,11 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
     assert_eq!(generation.records, approx::count(fixture.ids().count()));
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&old_key)
     );
 
@@ -80,9 +85,22 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
     assert!(served.table.refresh().await?);
     let new_key = fixture.key(NEW_ID);
     assert_eq!(
-        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&new_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&new_key)
     );
-    assert!(verify::one_value(&served.table.get(&old_key, &[VALUE_COLUMN]).await?.row).is_some());
+    assert!(
+        verify::one_value(
+            &served
+                .table
+                .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row
+        )
+        .is_some()
+    );
     Ok(())
 }

@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use iceberg::spec::DataFile;
-use icetray_core::config::{Residency, ServerConfig, SourceConfig, TableConfig};
+use icetray_core::ColumnRead;
+use icetray_core::config::{Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat};
 use icetray_core::{
     Generation, Key, KeyType, PER_MILLE, Row, TableSource, TableSummary, approx, diagnose, time,
 };
@@ -464,7 +465,7 @@ async fn build(
 /// state's bytes and the predicted memory that counts their bound.
 fn summary_of(served: &Served, fixture: &Fixture) -> TableSummary {
     let lookups = fixture.config(Residency::Full, false).lookups();
-    diagnose(&served.current(), lookups).summary
+    diagnose(&served.current(), lookups, &ValueFormat::opaque).summary
 }
 
 /// `rows` as a generation holds a data file's deleted rows (icetray-core's
@@ -909,7 +910,10 @@ async fn asked(served: &Served, asks: &[Ask]) -> HarnessResult<(Latencies, f64)>
     let mut took = Vec::with_capacity(asks.len());
     for ask in asks {
         let started = Instant::now();
-        let found = served.table.get(&ask.key, &[VALUE_COLUMN]).await?;
+        let found = served
+            .table
+            .get(&ask.key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?;
         took.push(started.elapsed());
         if found.row != ask.expected {
             return Err(format!(

@@ -9,8 +9,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use icetray_core::ColumnRead;
 use icetray_core::approx::{self, count};
-use icetray_core::config::Residency;
+use icetray_core::config::{Residency, ValueFormat};
 use icetray_core::{Error, Generation, Key, KeyType, Level, LoadedFile, RefusalReason, diagnose};
 use icetray_testkit::error::Precondition;
 use icetray_testkit::fixture::{
@@ -173,7 +174,11 @@ async fn test_bloom_misses_cost_exactly_what_the_plan_predicts() -> Result<()> {
     let before = stats.gets();
     for key in &probes {
         assert_eq!(
-            served.table.get(key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             icetray_core::Row::Absent,
             "key {key}"
         );
@@ -214,7 +219,9 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         bloom.index_bytes,
         full.index_bytes
     );
-    let predicted = diagnose(&full, Level::Optimal).summary.predicted;
+    let predicted = diagnose(&full, Level::Optimal, &ValueFormat::opaque)
+        .summary
+        .predicted;
     assert_eq!(
         predicted.in_tier(Residency::Full),
         Some(count(full.index_bytes)),
@@ -225,7 +232,7 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         Some(count(bloom.index_bytes)),
         "and the Bloom tier's: footers, indexes, filters, and fences, no chunk"
     );
-    let bloom_summary = diagnose(&bloom, Level::Balanced).summary;
+    let bloom_summary = diagnose(&bloom, Level::Balanced, &ValueFormat::opaque).summary;
     assert_eq!(bloom_summary.residency, Residency::Bloom);
     assert_eq!(
         bloom_summary.level,
@@ -381,7 +388,11 @@ async fn test_bloom_refuses_duplicate_keys_on_refresh() -> Result<()> {
     );
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&old_key)
     );
     Ok(())

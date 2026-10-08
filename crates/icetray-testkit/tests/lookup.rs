@@ -5,8 +5,9 @@
 //! doctor caps a level by or advises on; `findings.rs` holds the doctor's
 //! verdicts on them.
 
+use icetray_core::ColumnRead;
 use icetray_core::approx::{count, length};
-use icetray_core::config::Residency;
+use icetray_core::config::{Residency, ValueFormat};
 use icetray_core::contract::{PAGE_ROWS, VALUE_PAGE_BYTES};
 use icetray_core::{Error, FindingCode, Generation, Key, KeyType, Level, Row, diagnose};
 use icetray_testkit::error::{Precondition, SpecFault};
@@ -100,7 +101,14 @@ async fn round_trip(spec: FixtureSpec) -> Result<()> {
     for id in fixture.id_range().step_by(SWEEP_STRIDE) {
         let key = fixture.key(id);
         assert!(
-            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
+            verify::one_value(
+                &served
+                    .table
+                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?
+                    .row
+            )
+            .is_some(),
             "key {key}"
         );
     }
@@ -189,7 +197,10 @@ async fn test_multi_get_coalesces_one_page_and_answers_from_one_snapshot() -> Re
     let stats = served.storage.stats();
 
     let before = stats.gets();
-    let multi = served.table.multi_get(&same_page, &[VALUE_COLUMN]).await?;
+    let multi = served
+        .table
+        .multi_get(&same_page, &[ColumnRead::whole(VALUE_COLUMN)])
+        .await?;
     assert_eq!(stats.gets() - before, 1, "one page, one GET, ten lookups");
     assert_eq!(multi.snapshot_id, generation.snapshot_id);
     for (key, value) in same_page.iter().zip(&multi.rows) {
@@ -199,7 +210,10 @@ async fn test_multi_get_coalesces_one_page_and_answers_from_one_snapshot() -> Re
     let keys = fixture.keys_at(&SAMPLE);
     let expected = verify::expected_cold_gets(&generation, &keys, &[VALUE_COLUMN])?;
     let before = stats.gets();
-    let multi = served.table.multi_get(&keys, &[VALUE_COLUMN]).await?;
+    let multi = served
+        .table
+        .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
+        .await?;
     assert_eq!(
         stats.gets() - before,
         expected - 1,
@@ -224,7 +238,10 @@ async fn test_get_refuses_a_key_of_another_type() -> Result<()> {
     let before = served.storage.stats().gets();
     let error = served
         .table
-        .get(&Key::Str(OTHER_TYPE_KEY.to_string()), &[VALUE_COLUMN])
+        .get(
+            &Key::Str(OTHER_TYPE_KEY.to_string()),
+            &[ColumnRead::whole(VALUE_COLUMN)],
+        )
         .await
         .unwrap_err();
     assert!(
@@ -259,7 +276,10 @@ async fn test_verify_hit_cost_refuses_a_warm_cache() -> Result<()> {
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     served
         .table
-        .get(&fixture.key(SAMPLE_4K[0]), &[VALUE_COLUMN])
+        .get(
+            &fixture.key(SAMPLE_4K[0]),
+            &[ColumnRead::whole(VALUE_COLUMN)],
+        )
         .await?;
     let error = verify::verify_hit_cost(served, &fixture, &SAMPLE_4K)
         .await
@@ -391,22 +411,42 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
     assert_eq!(fixture.expected(&null_key), Row::Present(vec![None]));
     let before = stats.gets();
     assert_eq!(
-        served.table.get(&null_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&null_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Present(vec![None])
     );
     assert_eq!(stats.gets() - before, 1, "a null costs its value page cold");
     let before = stats.gets();
     assert_eq!(
-        served.table.get(&null_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&null_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Present(vec![None])
     );
     assert_eq!(stats.gets(), before, "and nothing warm");
     let present = fixture.key(PRESENT_ID);
-    assert!(verify::one_value(&served.table.get(&present, &[VALUE_COLUMN]).await?.row).is_some());
+    assert!(
+        verify::one_value(
+            &served
+                .table
+                .get(&present, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row
+        )
+        .is_some()
+    );
     assert_eq!(
         served
             .table
-            .get(&fixture.absent_near(PRESENT_ID), &[VALUE_COLUMN])
+            .get(
+                &fixture.absent_near(PRESENT_ID),
+                &[ColumnRead::whole(VALUE_COLUMN)]
+            )
             .await?
             .row,
         Row::Absent
@@ -444,7 +484,11 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
             let key = fixture.key(id);
             let before = stats.gets();
             assert_eq!(
-                served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+                served
+                    .table
+                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?
+                    .row,
                 fixture.expected(&key)
             );
             assert!(stats.gets() - before <= 1, "a hit is at most one GET");
@@ -453,7 +497,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         assert!(gets >= 1);
         let bytes_per_get = (stats.bytes() - bytes_before) / gets;
         let generation = served.current();
-        let report = diagnose(&generation, Level::Optimal);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
         let flagged = report
             .findings
             .iter()

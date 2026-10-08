@@ -69,21 +69,24 @@ Clients are generated from it; the server offers no reflection, so a tool
 such as grpcurl is given the file with `-proto`. Three calls:
 
 - `Get` looks one key up in one table, reading the value columns its
-  `columns` names, and returns a presence (`PRESENCE_PRESENT` or
-  `PRESENCE_ABSENT`), the values, and the snapshot id it was read from. A
-  present result carries one `ColumnValue` per requested column in
-  request order, each its bytes as `value` or a null as `null_value`; a
-  zero-length value is a `value` of length zero, distinct from
-  `null_value`. An absent result carries
-  none, and so does a present one when `columns` is empty, which asks
-  only whether the key is present.
+  `columns` names, each a `ColumnRead` of a column's `name` and, for a
+  column declared protobuf, the top-level field numbers in `fields` to
+  trim its value to, empty for the whole value, and returns a presence
+  (`PRESENCE_PRESENT` or `PRESENCE_ABSENT`), the values, and the snapshot
+  id it was read from. A present result carries one `ColumnValue` per
+  requested column in request order, each its bytes as `value` or a null
+  as `null_value`; a zero-length value is a `value` of length zero,
+  distinct from `null_value`. An absent result carries none, and so does a
+  present one when `columns` is empty, which asks only whether the key is
+  present.
 - `MultiGet` answers many keys in request order from one snapshot, named
   once on the response, reading the same `columns` for every key. If any
   key cannot be answered the whole call fails.
 - `TableInfo` reports the served snapshot id, bucket count, data file
   count, row count, key type, resident index bytes, and the table's value
   columns in name order, names compared as their UTF-8 bytes, each with
-  its `value_type` and a `fixed` column's `width`.
+  its `value_type`, a `fixed` column's `width`, and its `format`
+  (`VALUE_FORMAT_OPAQUE` or `VALUE_FORMAT_PROTOBUF`).
 
 Keys, errors, and limits:
 
@@ -91,7 +94,18 @@ Keys, errors, and limits:
   fixed, and uuid keys. The wrong variant is `INVALID_ARGUMENT`.
 - An unserved table is `NOT_FOUND`. A miss is a normal answer.
 - A column the table does not serve, or a column named twice, is
-  `INVALID_ARGUMENT`. There is no default column.
+  `INVALID_ARGUMENT`. There is no default column. So is a field list for a
+  column not declared protobuf, a field number outside 1 to 536870911, or
+  one given twice.
+- A value a field list trims that is not protobuf is
+  `FAILED_PRECONDITION`, naming the table, column, and key, and fails a
+  `MultiGet` whole. It is the writer's bytes against the column's
+  declaration, so a retry fails the same way until the value is rewritten
+  or the caller stops naming fields of that column; a read naming no
+  fields serves the value whole. `icetray_projection_errors_total` counts
+  them, and `icetray doctor` looks for them on one value page per protobuf
+  column and in its default; a malformed value on another page is found
+  when a lookup first names fields of it.
 - A `Get` or `MultiGet` still running at `server.get_deadline` or
   `server.multi_get_deadline` is `DEADLINE_EXCEEDED`. A client-sent
   deadline is enforced by the gRPC layer (a tonic client reports
@@ -133,6 +147,9 @@ Counters and histograms:
 | `icetray_page_cache_fetches_total` | | yes | Value-page fetches the cache ran, after coalescing. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups answered. |
 | `icetray_value_page_gets_total` | `table`, `column` | every table and value column | Value-page and dictionary-page GETs issued for the column, hedges excluded: each GET counts once, when it is issued, whether or not its lookup succeeds. Hedges are `icetray_hedges_total`. What a caller budgets a column by. |
+| `icetray_value_bytes_read_total` | `table`, `column` | every table and value column | Bytes of the column's values that each lookup the core answered read, as the page holds them, a default as its bytes, a null and a miss as none. A lookup that fails counts nothing; a failed `MultiGet` counts the keys it answered before the failure, as `icetray_lookups_total` does. |
+| `icetray_value_bytes_returned_total` | `table`, `column` | every table and value column | Bytes of those values the same lookups returned: a whole read counts as it was read, a projected one its trimmed bytes. Its ratio to `icetray_value_bytes_read_total` is what projection saves. |
+| `icetray_projection_errors_total` | `table`, `column` | every table and value column | Values that were not protobuf when a lookup named fields of their column, each failing its call `FAILED_PRECONDITION`. A rise means the column's declaration and its data disagree. |
 | `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. A failure the table remembers is counted once, when met ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
@@ -205,9 +222,9 @@ The label values:
 - `call`: `get`, `multi_get`, `table_info`.
 - `code`: the gRPC status in lower snake case, every one of the 17 gRPC
   codes. icetray's handlers answer `ok`, `invalid_argument`,
-  `deadline_exceeded`, `not_found`, `resource_exhausted`, `unavailable`,
-  and `internal`; the gRPC layer adds `cancelled`, `out_of_range`,
-  `unimplemented`, and `unknown`, as above.
+  `failed_precondition`, `deadline_exceeded`, `not_found`,
+  `resource_exhausted`, `unavailable`, and `internal`; the gRPC layer adds
+  `cancelled`, `out_of_range`, `unimplemented`, and `unknown`, as above.
 - `kind`: `load` (footers, key chunks, and metadata read while a
   generation is built) and `lookup` (value pages, and key pages under
   `bloom` residency).
@@ -232,7 +249,9 @@ The label values:
   `column_default` is one finding per column, so
   `icetray_findings{code="column_default",column="..."}` reads 1 however
   many files answer that column by its default; the file count is in the
-  finding's message and in the doctor's `files_answering_default`.
+  finding's message and in the doctor's `files_answering_default`. The
+  doctor's `malformed_protobuf` has no series, since no load raises it:
+  only the `doctor` command reads values.
 - `column`: a configured value column's name.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
@@ -412,39 +431,39 @@ reads depends on the table's source
   to inherit, a deletion vector entry that does not place its blob in its
   Puffin file, or a snapshot timestamp outside the range icetray can
   represent. It is a `file` fault that a data file's footer or bloom
-  filters show, or that a delete file shows against the manifests
-  ([RFD 021](rfd/021-merge-on-read.md)): a deletion vector its Puffin
-  footer does not list where its entry places it, that the footer places
-  before the end of the file's opening magic or past the footer's start,
-  that is compressed, that names another data file or another row count
-  than its entry, or that passes its checksum but is not a portable
-  64-bit roaring bitmap filling its blob; two manifest entries of one
-  Puffin file that record different file sizes; two deletion vectors that
-  apply to one data file; a position delete file without the `file_path`
-  and `pos` columns, with a null in either, with a row naming another
-  data file than its entry, or with another row count than its entry; a
-  negative position, or one at or past its data file's row count; or a
-  data file with deletes whose manifest entry records another row count
-  than its footer. These depend only on the snapshot and the table's
-  entry, so trying again cannot help. The failure is counted and logged once,
-  when it is met, and the table does not build that snapshot again while
-  its source names the same metadata location: each poll costs only the
-  one read or catalog call above, counts nothing, logs nothing, and the
-  table stays degraded, or held. When the source names another metadata
-  location, its snapshot is built. Once the table serves it, or refuses it
-  in turn, `source moved past a refused snapshot` is logged at `info` with
-  the `reason` and, when the ref named one, the refused `snapshot_id`. A
-  reload that changes a setting of the table's entry other than `lookups`
-  and `strict` loads the table anew under the new entry, the refused
-  snapshot included, so fixing `ref` or a column name or raising
+  filters show, or that a delete file shows against the manifests ([RFD
+  021](rfd/021-merge-on-read.md)): a deletion vector its Puffin footer
+  does not list where its entry places it, that the footer places before
+  the end of the file's opening magic or past the footer's start, that is
+  compressed, that names another data file or another row count than its
+  entry, or that passes its checksum but is not a portable 64-bit roaring
+  bitmap filling its blob; two manifest entries of one Puffin file that
+  record different file sizes; two deletion vectors that apply to one data
+  file; a position delete file without the `file_path` and `pos` columns,
+  with a null in either, with a row naming another data file than its
+  entry, or with another row count than its entry; a negative position, or
+  one at or past its data file's row count; or a data file with deletes
+  whose manifest entry records another row count than its footer. These
+  depend only on the snapshot and the table's entry, so trying again
+  cannot help. The failure is counted and logged once, when it is met, and
+  the table does not build that snapshot again while its source names the
+  same metadata location: each poll costs only the one read or catalog
+  call above, counts nothing, logs nothing, and the table stays degraded,
+  or held. When the source names another metadata location, its snapshot
+  is built. Once the table serves it, or refuses it in turn, `source moved
+  past a refused snapshot` is logged at `info` with the `reason` and, when
+  the ref named one, the refused `snapshot_id`. A reload that changes a
+  setting of the table's entry other than `lookups`, `strict`, and column
+  formats loads the table anew under the new entry, the refused snapshot
+  included, so fixing `ref` or a column name or raising
   `resident_budget_bytes` takes effect without waiting for a new snapshot;
   if the snapshot is still refused, the reload is refused. A reload that
-  changes only `lookups` or `strict` retunes the table in place and loads
-  nothing. It forgets every remembered refusal, whatever its reason, and
-  logs `retune forgot a refused snapshot` at `info`, so the next poll
-  builds the snapshot the ref names under the new entry. A snapshot
-  refused for another reason than its level is then refused once more,
-  and remembered again.
+  changes only `lookups`, `strict`, or the formats of its value columns
+  retunes the table in place and loads nothing. It forgets every
+  remembered refusal, whatever its reason, and logs `retune forgot a
+  refused snapshot` at `info`, so the next poll builds the snapshot the
+  ref names under the new entry. A snapshot refused for another reason
+  than its level is then refused once more, and remembered again.
 - Every other failure is tried again on every poll and is counted and
   logged each time: a store, catalog, cache, or local-directory error, a
   timeout or deadline, `over_budget` against the shared
@@ -484,11 +503,14 @@ SIGHUP. A change to its tables applies without a restart
   it out, and one whose `value_columns` lists the same columns in another
   order is unchanged too. A change to the set of value columns is a
   changed entry, which loads the table anew.
-- A table whose entry changed only in `lookups` or `strict` is retuned in
-  place: its generation keeps serving and nothing is loaded, since the
-  level is judged from the layout the generation already holds. A strict
-  table whose serving snapshot is below its new level refuses the reload,
-  as starting with that file would.
+- A table whose entry changed only in `lookups`, `strict`, or the formats
+  of its value columns is retuned in place: its generation keeps serving
+  and nothing is loaded, since the level is judged from the layout the
+  generation already holds and a lookup reads each column's format from
+  the entry, so a field list is taken, or refused, from the next call on.
+  A strict table whose serving snapshot is below its new level refuses
+  the reload, as starting with that file would, and so does a protobuf
+  format on a column the serving snapshot types other than `binary`.
 - Added and changed tables load beside the tables serving. Once every one
   of them serves, the whole set swaps at once, and the retuned tables take
   their new entries with it. A removed table then answers `NOT_FOUND`.

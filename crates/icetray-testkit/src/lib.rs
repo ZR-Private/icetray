@@ -13,6 +13,7 @@ pub mod keys;
 pub mod latency;
 pub mod layout;
 pub mod merge_oracle;
+pub mod protobuf;
 pub mod s3;
 pub mod sim;
 pub mod truth;

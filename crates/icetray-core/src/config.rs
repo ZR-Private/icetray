@@ -18,7 +18,7 @@ use crate::cache::min_memory_bytes;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
-use crate::manifest;
+use crate::manifest::{self, ColumnRead};
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -591,6 +591,26 @@ pub enum ConfigViolation {
         /// The text as given.
         text: String,
     },
+    /// Text that names no value format; raised by `ValueFormat`'s
+    /// `FromStr`, which the command line reads a column's format through.
+    #[error(
+        "unknown value format {text}; expected one of {}",
+        value_format_names()
+    )]
+    UnknownValueFormat {
+        /// The text as given.
+        text: String,
+    },
+}
+
+/// Every value format's name, comma-separated, for the message that refuses
+/// a name; rendered from `ValueFormat::ALL` so the list cannot lag the enum.
+fn value_format_names() -> String {
+    ValueFormat::ALL
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `ConfigViolation::DiskResidencyWithoutLocalDir`'s message: the setting
@@ -1413,7 +1433,8 @@ impl Default for StorageConfig {
 /// One served table. Two entries are equal when every setting is, `lookups`
 /// compared as `TableConfig::lookups` resolves it, so an entry that spells
 /// out the default equals one that leaves it out, and `value_columns`
-/// compared as the set of names it lists, so a reordered list is no change.
+/// compared as the set of columns it lists, each a name and a format, so a
+/// reordered list is no change.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableConfig {
@@ -1426,10 +1447,11 @@ pub struct TableConfig {
     /// The key column; its Iceberg type is one of `KeyType`.
     pub key_column: String,
     /// The columns the table serves, each Iceberg binary, fixed, or string
-    /// and read only when a lookup names it (RFD 022); empty for a table
-    /// that answers only whether a key is present. A name listed twice, or
-    /// the key column listed, is a violation. Order carries no meaning: two
-    /// entries that list the same columns in another order are equal.
+    /// and read only when a lookup names it (RFD 022), with the format its
+    /// values are declared in (RFD 024); empty for a table that answers
+    /// only whether a key is present. A name listed twice, or the key column
+    /// listed, is a violation. Order carries no meaning: two entries that
+    /// list the same columns in another order are equal.
     pub value_columns: Vec<ValueColumnConfig>,
     /// Whether falling below `lookups` for a reason in the snapshot's
     /// layout is an error rather than a warning (RFD 020): a strict table
@@ -1450,20 +1472,142 @@ pub struct TableConfig {
     pub resident_budget_bytes: Option<u64>,
 }
 
-/// One column a table serves (RFD 022), written in the file as its name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-#[serde(transparent)]
+/// One column a table serves (RFD 022), written in the file as its name
+/// alone, which declares it opaque, or as a table of `name` and `format`
+/// (RFD 024): `{ name = "detail", format = "protobuf" }`. A key the table
+/// form does not know is a schema fault. The derived order is by name, then
+/// format.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValueColumnConfig {
     /// The column's top-level name in the table's schema.
     pub name: String,
+    /// What the column's values are, which says whether a lookup may trim
+    /// them.
+    pub format: ValueFormat,
 }
 
 impl ValueColumnConfig {
-    /// The column named `name`.
+    /// The opaque column named `name`.
     pub fn named(name: &str) -> Self {
+        Self::of(name, ValueFormat::Opaque)
+    }
+
+    /// The column named `name`, declared `format`.
+    pub fn of(name: &str, format: ValueFormat) -> Self {
         Self {
             name: name.to_string(),
+            format,
         }
+    }
+}
+
+/// A value column's table form in the file, `name` and an optional
+/// `format`, read by the derived deserializer so a key it does not know is
+/// refused where serde finds it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueColumnTable {
+    name: String,
+    #[serde(default)]
+    format: ValueFormat,
+}
+
+impl<'de> Deserialize<'de> for ValueColumnConfig {
+    /// A string is the column's name, opaque; a map is its table form
+    /// (`ValueColumnTable`), read from the deserializer in place, so a
+    /// fault inside it is reported at the key at fault.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_any(ValueColumnVisitor)
+    }
+}
+
+/// `ValueColumnConfig`'s visitor: a string, or a map.
+struct ValueColumnVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ValueColumnVisitor {
+    type Value = ValueColumnConfig;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a column name, or a table with name and format")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, name: &str) -> std::result::Result<Self::Value, E> {
+        Ok(ValueColumnConfig::named(name))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let table =
+            ValueColumnTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        Ok(ValueColumnConfig {
+            name: table.name,
+            format: table.format,
+        })
+    }
+}
+
+/// What a value column's values are (RFD 024). Display and serde give the
+/// lowercase name the file spells, which the doctor's output and `TableInfo`
+/// carry.
+// The serde names and Display are the same strings;
+// `test_serialize_value_format_matches_display` holds them together.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ValueFormat {
+    /// Bytes icetray never looks into, served whole.
+    #[default]
+    Opaque,
+    /// A serialized protobuf message, which a lookup may trim to the
+    /// top-level fields it names; only a `binary` column may be declared
+    /// so.
+    Protobuf,
+}
+
+impl ValueFormat {
+    /// Every format, for the parser and its refusal message.
+    pub const ALL: [Self; 2] = [Self::Opaque, Self::Protobuf];
+
+    /// `Opaque` whatever column `_column` names: the formats of a table
+    /// that declares no column protobuf, as `diagnose` and `examine` take
+    /// them.
+    pub fn opaque(_column: &str) -> Self {
+        Self::Opaque
+    }
+
+    /// The format's lowercase name, as the file spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::Protobuf => "protobuf",
+        }
+    }
+}
+
+impl fmt::Display for ValueFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ValueFormat {
+    type Err = ConfigViolation;
+
+    /// Exactly the lowercase names `Display` prints; the one boundary parser
+    /// for a format given on the command line, where the file's are read by
+    /// serde under the same names.
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.name() == text)
+            .ok_or_else(|| ConfigViolation::UnknownValueFormat {
+                text: text.to_string(),
+            })
     }
 }
 
@@ -1482,14 +1626,43 @@ impl TableConfig {
         names
     }
 
-    /// Checks the columns `names` names for a lookup of this table against
-    /// the configured value columns, as a lookup is checked against the
-    /// serving generation's (`Error::ColumnRequest`), so a caller can refuse
-    /// a request before a load.
-    pub fn check_column_request(&self, names: &[&str]) -> Result<()> {
+    /// The value columns, ascending by name, each with its format: what
+    /// two entries compare (`PartialEq`).
+    fn sorted_value_columns(&self) -> Vec<&ValueColumnConfig> {
+        let mut columns: Vec<&ValueColumnConfig> = self.value_columns.iter().collect();
+        columns.sort_unstable();
+        columns
+    }
+
+    /// The format the column named `name` is declared in; `None` for a
+    /// name the table does not serve.
+    pub fn format_of(&self, name: &str) -> Option<ValueFormat> {
+        self.value_columns
+            .iter()
+            .find(|column| column.name == name)
+            .map(|column| column.format)
+    }
+
+    /// Each value column's format, in `value_column_names`' order, which is
+    /// a generation's layout's: what the doctor reports beside each column.
+    pub fn value_formats(&self) -> Vec<ValueFormat> {
+        self.sorted_value_columns()
+            .into_iter()
+            .map(|column| column.format)
+            .collect()
+    }
+
+    /// Checks the column reads `reads` names for a lookup of this table
+    /// against the configured value columns and their formats, as a lookup
+    /// is checked against the serving generation's (`Error::ColumnRequest`),
+    /// so a caller can refuse a request before a load.
+    pub fn check_column_request(&self, reads: &[ColumnRead<'_>]) -> Result<()> {
         let served = self.value_column_names();
-        manifest::select_columns(&self.name, names, |name| {
-            served.iter().position(|&column| column == name)
+        manifest::select_columns(&self.name, reads, |name| {
+            served
+                .iter()
+                .position(|&column| column == name)
+                .zip(self.format_of(name))
         })
         .map(drop)
     }
@@ -1526,18 +1699,21 @@ impl TableConfig {
         self.lookups.unwrap_or_else(|| self.residency.best_level())
     }
 
-    /// Whether `other` differs from this entry in `lookups` and `strict`
-    /// alone, `lookups` compared as resolved: a reload applies such a change
-    /// to the serving generation in place, since the level is judged from
-    /// the layout the generation already holds (RFD 020). True for equal
-    /// entries too.
-    pub(crate) fn same_but_levels(&self, other: &Self) -> bool {
-        *self
-            == Self {
-                lookups: self.lookups,
-                strict: self.strict,
-                ..other.clone()
-            }
+    /// Whether `other` differs from this entry in `lookups`, `strict`, and
+    /// the formats of the same value columns alone, `lookups` compared as
+    /// resolved: a reload applies such a change to the serving generation
+    /// in place, since the level is judged from the layout the generation
+    /// already holds (RFD 020) and a format is read by each lookup from the
+    /// entry (RFD 024). True for equal entries too.
+    pub(crate) fn same_but_tuning(&self, other: &Self) -> bool {
+        self.value_column_names() == other.value_column_names()
+            && *self
+                == Self {
+                    lookups: self.lookups,
+                    strict: self.strict,
+                    value_columns: self.value_columns.clone(),
+                    ..other.clone()
+                }
     }
 
     /// `check_lookups` where the entry is used rather than validated, by a
@@ -1587,7 +1763,7 @@ impl PartialEq for TableConfig {
             && *source == other.source
             && *r#ref == other.r#ref
             && *key_column == other.key_column
-            && self.value_column_names() == other.value_column_names()
+            && self.sorted_value_columns() == other.sorted_value_columns()
             && *strict == other.strict
             && self.lookups() == other.lookups()
             && *residency == other.residency
@@ -2557,6 +2733,146 @@ locaton = "typo"
     }
 
     #[test]
+    fn test_parse_value_column_is_a_name_or_a_table_of_name_and_format() {
+        let mixed = with_value_columns(
+            r#"["value", { name = "detail", format = "protobuf" }, { name = "blob" }, { name = "raw", format = "opaque" }]"#,
+        );
+        let toml = Config::parse(&mixed).unwrap().tables[0].clone();
+        assert_eq!(
+            toml.value_columns,
+            [
+                ValueColumnConfig::named("value"),
+                ValueColumnConfig::of("detail", ValueFormat::Protobuf),
+                ValueColumnConfig::named("blob"),
+                ValueColumnConfig::named("raw"),
+            ]
+        );
+        assert_eq!(
+            toml.value_formats(),
+            [
+                ValueFormat::Opaque,
+                ValueFormat::Protobuf,
+                ValueFormat::Opaque,
+                ValueFormat::Opaque
+            ],
+            "by name: blob, detail, raw, value"
+        );
+        assert_eq!(toml.format_of("detail"), Some(ValueFormat::Protobuf));
+        assert_eq!(toml.format_of("absent"), None);
+        let json = r#"{"tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "ref": "main", "key_column": "key", "value_columns": ["value", {"name": "detail", "format": "protobuf"}, {"name": "blob"}, {"name": "raw", "format": "opaque"}]}]}"#;
+        assert_eq!(Config::parse(json).unwrap().tables[0], toml);
+    }
+
+    #[test]
+    fn test_parse_value_column_table_refuses_an_unknown_key_or_format_where_it_is() {
+        let unknown = with_value_columns(r#"["value", { name = "detail", fromat = "protobuf" }]"#);
+        assert_eq!(
+            schema_fault_at(&unknown),
+            [
+                key("tables"),
+                At::Index(0),
+                key("value_columns"),
+                At::Index(1),
+                key("fromat")
+            ]
+        );
+        let format = with_value_columns(r#"[{ name = "detail", format = "json" }]"#);
+        assert_eq!(
+            schema_fault_at(&format),
+            [
+                key("tables"),
+                At::Index(0),
+                key("value_columns"),
+                At::Index(0),
+                key("format")
+            ]
+        );
+        let nameless = with_value_columns(r#"[{ format = "protobuf" }]"#);
+        assert_eq!(
+            schema_fault_at(&nameless),
+            [
+                key("tables"),
+                At::Index(0),
+                key("value_columns"),
+                At::Index(0)
+            ]
+        );
+        let json = r#"{"tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "ref": "main", "key_column": "key", "value_columns": [{"name": "detail", "fromat": "protobuf"}]}]}"#;
+        assert_eq!(
+            schema_fault_at(json),
+            [
+                key("tables"),
+                At::Index(0),
+                key("value_columns"),
+                At::Index(0),
+                key("fromat")
+            ]
+        );
+        let number = with_value_columns("[7]");
+        assert_eq!(
+            schema_fault_at(&number),
+            [
+                key("tables"),
+                At::Index(0),
+                key("value_columns"),
+                At::Index(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_from_str_value_format_reads_display_and_refuses_other_text() {
+        for format in ValueFormat::ALL {
+            assert_eq!(format.to_string().parse::<ValueFormat>(), Ok(format));
+        }
+        assert_eq!(
+            "Protobuf".parse::<ValueFormat>(),
+            Err(ConfigViolation::UnknownValueFormat {
+                text: "Protobuf".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_serialize_value_format_matches_display() {
+        for format in ValueFormat::ALL {
+            assert_eq!(
+                serde_json::to_value(format).unwrap(),
+                serde_json::Value::String(format.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_eq_and_same_but_tuning_see_a_format_change_apart_from_a_column_change() {
+        let entry =
+            |columns: &str| Config::parse(&with_value_columns(columns)).unwrap().tables[0].clone();
+        let opaque = entry(r#"["value", "detail"]"#);
+        let protobuf = entry(r#"[{ name = "detail", format = "protobuf" }, "value"]"#);
+        assert_ne!(opaque, protobuf, "a format change is a change");
+        assert!(opaque.same_but_tuning(&protobuf), "and is applied in place");
+        assert!(protobuf.same_but_tuning(&opaque));
+        let retuned = TableConfig {
+            lookups: Some(Level::Permissive),
+            strict: !protobuf.strict,
+            ..protobuf.clone()
+        };
+        assert!(opaque.same_but_tuning(&retuned), "with lookups and strict");
+        let fewer = entry(r#"[{ name = "detail", format = "protobuf" }]"#);
+        assert!(!opaque.same_but_tuning(&fewer), "a column removed reloads");
+        let renamed = entry(r#"["value", { name = "details", format = "protobuf" }]"#);
+        assert!(
+            !opaque.same_but_tuning(&renamed),
+            "a column renamed reloads"
+        );
+        assert_eq!(
+            protobuf,
+            entry(r#"["value", { name = "detail", format = "protobuf" }]"#),
+            "order carries no meaning"
+        );
+    }
+
+    #[test]
     fn test_parse_value_columns_may_be_empty_and_refuse_an_empty_name_a_repeat_or_the_key() {
         let presence_only = Config::parse(&with_value_columns("[]")).unwrap();
         assert!(presence_only.tables[0].value_columns.is_empty());
@@ -2587,12 +2903,12 @@ locaton = "typo"
         let two = entry(r#"["value", "detail"]"#);
         let reordered = entry(r#"["detail", "value"]"#);
         assert_eq!(two, reordered, "order carries no meaning");
-        assert!(two.same_but_levels(&reordered));
+        assert!(two.same_but_tuning(&reordered));
         assert_eq!(two.value_column_names(), ["detail", "value"]);
         assert_eq!(reordered.value_column_names(), ["detail", "value"]);
         let one = entry(r#"["value"]"#);
         assert_ne!(two, one, "a column added is a change");
-        assert!(!two.same_but_levels(&one));
+        assert!(!two.same_but_tuning(&one));
         assert_ne!(one, entry("[]"));
     }
 
@@ -2686,7 +3002,7 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_same_but_levels_is_true_for_lookups_and_strict_alone() {
+    fn test_same_but_tuning_is_true_for_lookups_and_strict_alone() {
         let config = Config::parse(TOML_MINIMAL).unwrap();
         let entry = config.tables[0].clone();
         let retuned = TableConfig {
@@ -2694,18 +3010,18 @@ locaton = "typo"
             strict: !entry.strict,
             ..entry.clone()
         };
-        assert!(entry.same_but_levels(&retuned));
-        assert!(entry.same_but_levels(&entry));
+        assert!(entry.same_but_tuning(&retuned));
+        assert!(entry.same_but_tuning(&entry));
         let moved = TableConfig {
             r#ref: format!("{}-next", entry.r#ref),
             ..retuned.clone()
         };
-        assert!(!entry.same_but_levels(&moved));
+        assert!(!entry.same_but_tuning(&moved));
         let budgeted = TableConfig {
             resident_budget_bytes: Some(1),
             ..retuned
         };
-        assert!(!entry.same_but_levels(&budgeted));
+        assert!(!entry.same_but_tuning(&budgeted));
     }
 
     #[test]

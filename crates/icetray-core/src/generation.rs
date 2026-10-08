@@ -201,6 +201,7 @@ impl Generation {
             &config.key_column,
             &config.value_column_names(),
         )?;
+        layout.check_formats(config)?;
         let files =
             manifest::list_files(table, &resolved.metadata, snapshot, &layout, storage).await?;
         let (reused, pending) =
@@ -2831,7 +2832,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableSource;
     use crate::check::thresholds::KEY_PAGE_ROWS_LARGE;
-    use crate::config::{ConfigError, ConfigViolation, HedgeConfig};
+    use crate::config::{ConfigError, ConfigViolation, HedgeConfig, ValueFormat};
     use crate::index::{FileFault, testing as index_testing};
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
@@ -4845,7 +4846,7 @@ mod tests {
             let local = local_dir(scratch.path(), table.storage.stats(), None);
             let config = table.config(residency, None);
             let (caps, generation) = plan_stage_caps(&table, &config, Some(&local)).await;
-            let report = check::diagnose(&generation, config.lookups());
+            let report = check::diagnose(&generation, config.lookups(), &ValueFormat::opaque);
             assert_eq!(caps.level, report.summary.level, "{name}");
             assert_eq!(caps.level, generation.level, "{name}");
             assert_eq!(caps.capping(), report.capping(), "{name}");
@@ -5010,7 +5011,7 @@ mod tests {
                 let generation = table.load(&config, Some(&local), None).await.unwrap();
                 assert_eq!(generation.lookup_cost, expected, "{name} {residency}");
                 assert_eq!(
-                    check::diagnose(&generation, config.lookups())
+                    check::diagnose(&generation, config.lookups(), &ValueFormat::opaque)
                         .summary
                         .lookup_cost,
                     expected,

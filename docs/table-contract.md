@@ -74,6 +74,7 @@ doctor's output and the metrics spell it.
 | A key at most once within a data file, deleted rows included | Refused: `duplicate_keys` | Deduplicate before the write |
 | A live key in at most one data file: a row a delete removes is not live | Refused: `duplicate_keys` | Deduplicate before the write, or upsert with `MERGE`, which rewrites the older row or deletes it |
 | Each configured value column of type `binary`, `fixed`, or `string`; nulls allowed | Refused: `value_type_unsupported`, naming the column | Serve a typed field inside a binary column, such as a serialized protobuf. See [Value columns](#value-columns) for when to pack fields into one column and when to split them. |
+| Each column declared protobuf of type `binary`, every value of it a protobuf message | A `fixed` or `string` column declared protobuf is refused: `value_type_unsupported`, naming the column and the format. A value that is not protobuf draws advice from `icetray doctor`, `malformed_protobuf`, naming the column, and fails every lookup that names fields of it | Declare protobuf only on a `binary` column whose writer serializes protobuf messages into it. See [Protobuf columns](#protobuf-columns). |
 | Each configured column held under the name and field id the snapshot's schema gives it, in data files that record a field id on every column, as Iceberg's writers do | Refused: `column_mismatch`, for a column held under another field id (a swap of names, or a name dropped and added again), its field id held under another name (a rename), a file that records no field ids and lacks the column, a file without its key column, a file holding the name as a nested group, a `fixed` key or value column stored at another width, a configured name that is not a top-level field, or a stated default that does not read as its column's type. A file that records field ids and was written before its value column was added is served, its rows answering the column's default: advice, `column_default`, with the count of such files | Write through an Iceberg writer, and change the schema as [Changing the schema](#changing-the-schema) describes; a compaction rewrites the files that predate a column |
 | No equality delete that may apply to a data file | Refused: `equality_deletes`, for an equality delete newer than the snapshot's oldest data file, which may apply to one (RFD 021). An equality delete no data file is older than changes no answer and is ignored. | A table whose writer leaves equality deletes can be served from a tag or branch that a compaction moves after rewriting them into data files. |
 | Only deletes icetray reads: deletion vectors and Parquet position deletes | Served (RFD 021). Refused: `delete_kind_unsupported`, for a position delete file in Avro or ORC that may apply to a data file no deletion vector masks, a Puffin blob other than a deletion vector, or a Puffin footer that is compressed or sets reserved flags. An Avro or ORC position delete file that applies to no data file the snapshot holds changes no answer and is ignored, and so is one whose every data file is masked: a deletion vector that applies to a data file masks its position deletes. | Merge-on-read writers that write deletion vectors or Parquet position deletes |
@@ -137,6 +138,50 @@ is read:
 
 Each column is resolved in each data file on its own, so one column may
 answer its default in a file where another is served.
+
+## Protobuf columns
+
+A `binary` column whose values are serialized protobuf messages may be
+declared so, `{ name = "detail", format = "protobuf" }` in
+[`value_columns`](configuration.md#tables), and a lookup may then name
+top-level field numbers to trim each value to
+([RFD 024](rfd/024-field-projection.md)). The trimmed value keeps every
+occurrence of each field named, in the value's order: each element of a
+repeated field, each record of a packed one, each map entry, and each
+occurrence of a singular field, so a scalar's last write still wins and
+a singular message still merges. A `fixed` or `string` column declared
+protobuf is refused as `value_type_unsupported`. Projection saves the
+bytes on the wire and the caller's decode, never a GET.
+
+The writer's part is that every value of the column parses as protobuf,
+and so does the default the column states, if any. A value that does not
+is served whole to a lookup that names no fields and fails one that
+names some as `FAILED_PRECONDITION`, every time, until it is rewritten;
+`icetray doctor` walks the column's default and one value page of each
+protobuf column and reports such a value as `malformed_protobuf`. The
+page is the first one of the first file holding the column, or of the
+next of up to three files when it holds only nulls, so a malformed value
+elsewhere, or on a column null on every page walked, is found when a
+lookup first names fields of it, and counted by
+`icetray_projection_errors_total`.
+
+The caller's part is two rules, which icetray cannot check because it
+holds no schema:
+
+- **Oneofs.** A caller that names a member of a oneof names every member
+  of it. Setting one member clears the others, so when the whole value
+  sets a member and later another, a projection naming only the first
+  returns it set, with no error.
+- **Required fields.** A message with proto2 `required` fields, or
+  `LEGACY_REQUIRED` under editions, may come back without them, so the
+  caller parses it partially: Go's
+  `proto.UnmarshalOptions{AllowPartial: true}`, Java's
+  `parser().parsePartialFrom`, C++'s `ParsePartialFromString`.
+
+A field not named reads as unset, which for a field without presence is
+its zero value. A number the message does not define is not an error:
+the projection holds whatever the value carries under that number, which
+the caller's runtime keeps as unknown fields.
 
 ## Changing the schema
 
@@ -204,6 +249,7 @@ penalties), [RFD 009](rfd/009-writes-between-builds.md) (writes between
 builds), [RFD 016](rfd/016-doctor.md) (the doctor), [RFD
 020](rfd/020-lookup-levels.md) (lookup levels), [RFD
 021](rfd/021-merge-on-read.md) (delete files), [RFD
-022](rfd/022-value-columns.md) (value columns), and [RFD
-023](rfd/023-column-resolution.md) (column resolution). Terms such as
+022](rfd/022-value-columns.md) (value columns), [RFD
+023](rfd/023-column-resolution.md) (column resolution), and [RFD
+024](rfd/024-field-projection.md) (field projection). Terms such as
 residency, level, and strict are in the [glossary](glossary.md).

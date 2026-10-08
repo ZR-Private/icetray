@@ -8,6 +8,8 @@ use std::fmt::Write as _;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{Key, KeyType};
 
+use crate::protobuf;
+
 /// The spacing between fixture keys, shared with the golden recipe
 /// (`dev/golden-tables.py`): `key + 1` is absent and inside the range.
 pub const KEY_STEP: u64 = 3;
@@ -389,6 +391,9 @@ pub enum ValueKind {
     /// skew, beside numbers that vary per row, so a page of them compresses
     /// as structured records do.
     Text,
+    /// `protobuf::value`: a protobuf message of every wire type, written by
+    /// hand, for a column declared protobuf (RFD 024).
+    Protobuf,
 }
 
 /// The `len`-byte value of `kind` stored for `key`.
@@ -396,6 +401,7 @@ pub fn value_of_kind(key: &Key, len: usize, kind: ValueKind) -> Vec<u8> {
     match kind {
         ValueKind::Random => value_for_len(key, len),
         ValueKind::Text => text_value_for_len(key, len),
+        ValueKind::Protobuf => protobuf::value(key, len, FIRST_VERSION),
     }
 }
 
@@ -412,8 +418,12 @@ const MASK_BYTE_SET_BIT: u8 = 1;
 /// that value with every byte masked by a stream seeded from the key and
 /// the version, so an update's value differs from every other version's
 /// and a lookup that answered from a deleted copy is told apart from one
-/// that answered from the live row.
+/// that answered from the live row. A protobuf value's later version is the
+/// message its stream draws under that version, which stays protobuf.
 pub fn value_of_version(key: &Key, len: usize, kind: ValueKind, version: u64) -> Vec<u8> {
+    if kind == ValueKind::Protobuf {
+        return protobuf::value(key, len, version);
+    }
     let mut value = value_of_kind(key, len, kind);
     if version != FIRST_VERSION {
         let mut mask = Stream::from_key(key);
@@ -490,12 +500,12 @@ pub fn text_value_for_len(key: &Key, len: usize) -> Vec<u8> {
 
 /// A key's xorshift64 stream: seeded from the key (a long's bits, or FNV-1a
 /// over the key's bytes) spread by `SEED_MULTIPLIER`.
-struct Stream {
+pub(crate) struct Stream {
     state: u64,
 }
 
 impl Stream {
-    fn from_key(key: &Key) -> Self {
+    pub(crate) fn from_key(key: &Key) -> Self {
         let seed = match key {
             Key::Long(value) => u64::from_ne_bytes(value.to_ne_bytes()),
             Key::Str(_) | Key::Bytes(_) | Key::Uuid(_) => fnv1a(&key.as_bytes()),
@@ -505,8 +515,15 @@ impl Stream {
         }
     }
 
+    /// The stream of `key` under `version`, apart from its first version's.
+    pub(crate) fn from_key_at(key: &Key, version: u64) -> Self {
+        let mut stream = Self::from_key(key);
+        stream.state = (stream.state ^ version.wrapping_mul(SEED_MULTIPLIER)) | 1;
+        stream
+    }
+
     /// The next state of the stream.
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.state ^= self.state << XORSHIFT_FIRST_LEFT;
         self.state ^= self.state >> XORSHIFT_RIGHT;
         self.state ^= self.state << XORSHIFT_SECOND_LEFT;

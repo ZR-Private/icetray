@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use icetray_core::ColumnRead;
 use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, StorageConfig, TableConfig, ValueColumnConfig,
 };
@@ -18,6 +19,11 @@ use icetray_testkit::{FixtureSpec, Result, verify, write_fixture};
 const VALUE_TABLE: &str = "jobs_value";
 /// The entry that names `SECOND_VALUE_COLUMN`.
 const DETAIL_TABLE: &str = "jobs_detail";
+
+/// The read of the fixture's `value` column, whole.
+const VALUE_READ: [ColumnRead<'static>; 1] = [ColumnRead::whole(VALUE_COLUMN)];
+/// The read of `SECOND_VALUE_COLUMN`, whole.
+const DETAIL_READ: [ColumnRead<'static>; 1] = [ColumnRead::whole(SECOND_VALUE_COLUMN)];
 
 /// The local directory's chunk file subdirectory.
 const INDEX_DIR: &str = "index";
@@ -65,26 +71,26 @@ async fn test_two_entries_over_one_table_serve_their_own_value_columns() -> Resu
         for id in SAMPLE {
             let key = fixture.key(id);
             assert_eq!(
-                value.get(&key, &[VALUE_COLUMN]).await?.row,
+                value.get(&key, &VALUE_READ).await?.row,
                 fixture.expected(&key),
                 "{residency:?} {key}"
             );
             assert_eq!(
-                detail.get(&key, &[SECOND_VALUE_COLUMN]).await?.row,
+                detail.get(&key, &DETAIL_READ).await?.row,
                 fixture.expected_of(&key, &[SECOND_VALUE_COLUMN]),
                 "{residency:?} {key}"
             );
             assert_ne!(
-                value.get(&key, &[VALUE_COLUMN]).await?.row,
-                detail.get(&key, &[SECOND_VALUE_COLUMN]).await?.row,
+                value.get(&key, &VALUE_READ).await?.row,
+                detail.get(&key, &DETAIL_READ).await?.row,
                 "the entries read different columns"
             );
         }
         let gets = stats.gets();
         for id in SAMPLE {
             let key = fixture.key(id);
-            value.get(&key, &[VALUE_COLUMN]).await?;
-            detail.get(&key, &[SECOND_VALUE_COLUMN]).await?;
+            value.get(&key, &VALUE_READ).await?;
+            detail.get(&key, &DETAIL_READ).await?;
         }
         assert_eq!(
             stats.gets(),
@@ -92,11 +98,8 @@ async fn test_two_entries_over_one_table_serve_their_own_value_columns() -> Resu
             "{residency:?}: both columns' pages stay in the one page cache"
         );
         let absent = fixture.absent_near(SAMPLE[0]);
-        assert_eq!(value.get(&absent, &[VALUE_COLUMN]).await?.row, Row::Absent);
-        assert_eq!(
-            detail.get(&absent, &[SECOND_VALUE_COLUMN]).await?.row,
-            Row::Absent
-        );
+        assert_eq!(value.get(&absent, &VALUE_READ).await?.row, Row::Absent);
+        assert_eq!(detail.get(&absent, &DETAIL_READ).await?.row, Row::Absent);
 
         if residency == Residency::Disk {
             let chunk_files = std::fs::read_dir(scratch.path().join(INDEX_DIR))?.count();

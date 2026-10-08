@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
+use icetray_core::ColumnRead;
 use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::metric;
@@ -69,7 +70,11 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
     let v1 = served.current();
     let new_key = fixture.key(FUTURE_ID);
     assert_eq!(
-        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&new_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Absent
     );
     let stats = served.storage.stats();
@@ -102,12 +107,19 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
         "metadata file, manifest list, two manifests, then a footer and a chunk per new file"
     );
 
-    let lookup = served.table.get(&new_key, &[VALUE_COLUMN]).await?;
+    let lookup = served
+        .table
+        .get(&new_key, &[ColumnRead::whole(VALUE_COLUMN)])
+        .await?;
     assert_eq!(lookup.snapshot_id, v2.snapshot_id);
     assert_eq!(lookup.row, fixture.expected(&new_key));
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&old_key)
     );
     Ok(())
@@ -139,7 +151,11 @@ async fn test_refresh_follows_a_static_root_through_its_hint() -> Result<()> {
     assert_ne!(served.current().snapshot_id, v1.snapshot_id);
     let new_key = fixture.key(NEW_ID);
     assert_eq!(
-        served.table.get(&new_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&new_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&new_key)
     );
     Ok(())
@@ -173,7 +189,11 @@ async fn test_refresh_refuses_duplicate_keys_and_keeps_serving() -> Result<()> {
     assert_eq!(served.current().snapshot_id, v1);
     let old_key = fixture.key(OLD_ID);
     assert_eq!(
-        served.table.get(&old_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&old_key)
     );
     assert!(
@@ -246,7 +266,11 @@ async fn test_refresh_recovers_when_the_offending_file_is_dropped() -> Result<()
     for id in SAMPLE_4K {
         let key = fixture.key(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             fixture.expected(&key)
         );
     }
@@ -415,7 +439,11 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
     );
     let held_key = fixture.key(appended[0]);
     assert_eq!(
-        served.table.get(&held_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&held_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Absent
     );
     assert!(
@@ -435,7 +463,11 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
         [Some(at_level), Some(optimal), Some(optimal)]
     );
     assert_eq!(
-        served.table.get(&held_key, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&held_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         fixture.expected(&held_key)
     );
     Ok(())

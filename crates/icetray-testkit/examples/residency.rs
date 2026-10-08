@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iceberg::spec::MAIN_BRANCH;
+use icetray_core::ColumnRead;
 use icetray_core::config::{
     LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
@@ -512,7 +513,10 @@ async fn lookups(
                 let mut took = Vec::with_capacity(part.len());
                 for key in &part {
                     let started = Instant::now();
-                    let found = served.table.get(key, &[VALUE_COLUMN]).await?;
+                    let found = served
+                        .table
+                        .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                        .await?;
                     took.push(started.elapsed());
                     if verify::one_value(&found.row).is_some() != (kind == Kind::Hit) {
                         return Err(format!("{key:?} answered as no {kind}").into());

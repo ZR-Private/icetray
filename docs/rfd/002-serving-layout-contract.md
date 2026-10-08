@@ -10,6 +10,11 @@
 > packed column performs best. A null is a value of a present row. See
 > RFD 022.
 
+> Updated 2026-10-07: a binary column may be declared protobuf, and a
+> lookup may trim its value to the top-level fields it names after the
+> page cache; projection is decided there, not as a serving tier. See
+> RFD 024.
+
 ## Problem
 
 icetray serves a lookup by reading the Parquet data files a batch pipeline
@@ -51,7 +56,9 @@ them are the writer recipe in the
   evolution, costs one GET. A table read by several kinds of caller
   splits its row along how it is read: fields read together share a
   column, and a large part read on its own, such as an embedding, gets a
-  column of its own.
+  column of its own. A packed column declared protobuf may be trimmed by
+  a lookup to the top-level fields it names, which saves the caller's
+  bytes and decode but not the GET (RFD 024 (Field projection)).
 - Columns found by name and field id, as Iceberg's writers record them
   (RFD 023 (Column resolution)). A value column added to the schema after
   a file was written answers its default in that file, so a column can be
@@ -128,8 +135,9 @@ Typed value columns, such as a long or a double read by name. Rejected
 because such a value has no "bytes unchanged" form, and typed per-column
 values with projection amount to most of a query API. Several columns of
 bytes, each read only when a lookup names it, are RFD 022 (Value
-columns). If projection inside a packed column is ever wanted, which
-tier it belongs to is RFD 007's call.
+columns). Projection inside a packed protobuf column, to top-level
+field numbers with no schema, is RFD 024 (Field projection), a request
+option on a declared column rather than a serving tier.
 
 Refusing null values. Rejected because a key with a null value is a
 legitimate row and the wire can say so without ambiguity. Refusing nulls

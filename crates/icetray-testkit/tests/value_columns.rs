@@ -7,7 +7,8 @@
 
 use std::path::Path;
 
-use icetray_core::config::{Residency, TableConfig, ValueColumnConfig};
+use icetray_core::ColumnRead;
+use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::{KeyType, Level, Row, diagnose};
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, local_catalog};
 use icetray_testkit::layout::VALUE_COLUMN;
@@ -130,7 +131,7 @@ async fn test_both_columns_answer_in_request_order_at_one_get_per_column_cold() 
         let before = stats.gets();
         for key in &keys {
             assert_eq!(
-                served.table.get(key, &BOTH).await?.row,
+                served.table.get(key, &verify::whole(&BOTH)).await?.row,
                 fixture.expected_of(key, &BOTH),
                 "{residency} {key}"
             );
@@ -153,18 +154,26 @@ async fn test_the_other_order_answers_the_other_order_and_warm_pages_cost_nothin
         let scratch = tempfile::tempdir()?;
         let served = serve_both(&fixture, residency, scratch.path()).await?;
         for key in &keys {
-            served.table.get(key, &BOTH).await?;
+            served.table.get(key, &verify::whole(&BOTH)).await?;
         }
         let stats = served.storage.stats();
         let before = stats.gets();
         for key in &keys {
             assert_eq!(
-                served.table.get(key, &BOTH_REVERSED).await?.row,
+                served
+                    .table
+                    .get(key, &verify::whole(&BOTH_REVERSED))
+                    .await?
+                    .row,
                 fixture.expected_of(key, &BOTH_REVERSED),
                 "{residency} {key}"
             );
             assert_eq!(
-                served.table.get(key, &[SECOND_VALUE_COLUMN]).await?.row,
+                served
+                    .table
+                    .get(key, &[ColumnRead::whole(SECOND_VALUE_COLUMN)])
+                    .await?
+                    .row,
                 fixture.expected_of(key, &[SECOND_VALUE_COLUMN]),
                 "{residency} {key}"
             );
@@ -227,7 +236,11 @@ async fn test_one_column_named_reads_that_columns_pages_alone() -> Result<()> {
         let before = stats.gets();
         for key in &keys {
             assert_eq!(
-                served.table.get(key, &[VALUE_COLUMN]).await?.row,
+                served
+                    .table
+                    .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?
+                    .row,
                 fixture.expected_of(key, &[VALUE_COLUMN]),
                 "{residency} {key}"
             );
@@ -252,7 +265,10 @@ async fn test_multi_get_across_columns_answers_from_one_generation() -> Result<(
     let expected_gets = verify::expected_cold_gets(&served.current(), &keys, &BOTH_REVERSED)?;
     let stats = served.storage.stats();
     let before = stats.gets();
-    let batch = served.table.multi_get(&keys, &BOTH_REVERSED).await?;
+    let batch = served
+        .table
+        .multi_get(&keys, &verify::whole(&BOTH_REVERSED))
+        .await?;
     assert_eq!(stats.gets() - before, expected_gets);
     assert_eq!(batch.snapshot_id, served.current().snapshot_id);
     let expected: Vec<Row> = keys[..SAMPLE.len()]
@@ -275,7 +291,7 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
     let scratch = tempfile::tempdir()?;
     let served = serve_both(&fixture, Residency::Full, scratch.path()).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
     let names: Vec<&str> = report
         .summary
         .value_columns

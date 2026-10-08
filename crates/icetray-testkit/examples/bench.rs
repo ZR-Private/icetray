@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use iceberg::spec::MAIN_BRANCH;
+use icetray_core::ColumnRead;
 use icetray_core::config::{
     LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
 };
@@ -1024,7 +1025,9 @@ impl Op {
     async fn run(&self, table: &Table, i: usize) -> BenchResult<()> {
         match self {
             Self::Get { keys, present } => {
-                let lookup = table.get(&keys[i % keys.len()], &[VALUE_COLUMN]).await?;
+                let lookup = table
+                    .get(&keys[i % keys.len()], &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?;
                 let found = icetray_testkit::verify::one_value(&lookup.row).is_some();
                 if found != *present {
                     return Err(format!("key {i} answered {:?}", lookup.row).into());
@@ -1033,7 +1036,10 @@ impl Op {
             Self::MultiGet { keys, batch } => {
                 let start = (i * batch) % (keys.len() - batch);
                 let lookup = table
-                    .multi_get(&keys[start..start + batch], &[VALUE_COLUMN])
+                    .multi_get(
+                        &keys[start..start + batch],
+                        &[ColumnRead::whole(VALUE_COLUMN)],
+                    )
                     .await?;
                 if !lookup
                     .rows
@@ -1283,7 +1289,9 @@ async fn measure(
 /// before a warm run starts.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
     for id in (0..shape.rows).step_by(approx::length(PRIME_STRIDE)) {
-        table.get(&shape.key(id), &[VALUE_COLUMN]).await?;
+        table
+            .get(&shape.key(id), &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?;
     }
     Ok(())
 }

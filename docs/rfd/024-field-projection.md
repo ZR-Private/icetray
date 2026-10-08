@@ -30,9 +30,13 @@ with the whole value returned when the request names none.
   may declare `format = "protobuf"`; on a `fixed` or `string` column the
   declaration is a configuration error, since a trimmed value has no
   fixed width and a protobuf is not text. TableInfo reports each
-  column's format. A field list sent for a column not declared protobuf
-  is `INVALID_ARGUMENT`. A change of format touches no layout, so it is
-  applied in place, as RFD 020 (Lookup levels) applies `lookups`.
+  column's format as the entry declares it when the call is answered,
+  which a retune changes under the same snapshot id. A field list sent
+  for a column not declared protobuf is `INVALID_ARGUMENT`. A change of
+  format touches no layout, so it is applied in place, as RFD 020
+  (Lookup levels) applies `lookups`. A declaration of protobuf on a
+  column the serving snapshot types `fixed` or `string` refuses the
+  reload, as RFD 020 refuses a strict level the snapshot misses.
 - **Named per request.** Each column a Get or MultiGet reads carries a
   list of field numbers, applied to every key of the call, and empty
   for the whole value; there is no default list in the configuration.
@@ -63,10 +67,16 @@ with the whole value returned when the request names none.
   `parser().parsePartialFrom` do. Icetray holds no schema, so it knows
   neither oneofs nor required fields, and does not check that a named
   number exists.
-- **Malformed values.** A value is malformed when its top-level walk
-  meets wire type 6 or 7, a field number of 0 or above 536,870,911, a
-  tag over 5 bytes or a varint over 10, a length past the value's end,
-  or a group whose end tag is missing or names another number. A
+- **Malformed values.** The walk reads the framing as prost's decoder
+  does: a tag is a varint whose value fits 32 bits, and a varint is at
+  most 10 bytes, its tenth at most 1. A value is malformed when its
+  top-level walk meets wire type 6 or 7; a field number of 0, or a tag
+  that does not fit 32 bits, which is a field number above 536,870,911;
+  a varint over 10 bytes or past 64 bits; a tag, a varint, or a fixed
+  value cut off by the value's end, or a length past it; a group whose
+  end tag is missing or names another number; or an end tag with no
+  group open. That is exactly where prost's decoder refuses the
+  framing, except that the walk refuses no depth of nesting. A
   malformed value fails a projected lookup as `FAILED_PRECONDITION`,
   naming the table, column, and key: the bytes are what the writer
   wrote, and it is the declaration they do not meet. The failure is the
@@ -86,12 +96,24 @@ with the whole value returned when the request names none.
   `icetray_value_bytes_returned_total` count, by table and column, the
   bytes of the values a lookup read and the bytes it returned, a
   whole-value lookup counting the same in both, so an owner can see
-  what projection saves. `icetray_projection_errors_total` counts
+  what projection saves. They count each lookup that answers, a miss
+  and a null counting none and a default its bytes; a lookup that
+  fails, a malformed value included, counts no bytes, and a MultiGet
+  that fails counts the keys it answered before the failure, as
+  `icetray_lookups_total` does. `icetray_projection_errors_total` counts
   malformed values by table and column.
-- **Checked by the doctor.** The `doctor` command walks the values of
-  one value page of each protobuf column, one GET each, and reports a
-  malformed value as a finding, which catches a column declared
-  protobuf that holds another format. The check at every load does not,
+- **Checked by the doctor.** The `doctor` command walks the default
+  each protobuf column states (RFD 023), with no GET, and the values of
+  one value page of the column, one GET, two when the column's chunk is
+  dictionary-encoded, and reports a malformed value or default as the
+  advice `malformed_protobuf`, which catches a column declared protobuf
+  that holds another format. The page is the first of the first file
+  holding the column; when it holds only nulls the walk passes to the
+  next such file, up to three. A page the doctor cannot read is reported
+  as an error for its column, and the doctor goes on with the table's
+  other findings and its judgement. `malformed_protobuf` is advice only
+  the doctor raises, so the findings gauge, which reports what a load
+  found, has no series for it. The check at every load walks neither,
   since it reads no value page.
 
 ## Alternatives Considered
@@ -149,7 +171,8 @@ and the table contract says so.
 A malformed value that the doctor's page did not hold is found when a
 caller first projects it, and fails every projected batch that holds it
 until it is rewritten or the caller stops projecting it. The error
-counter is how an owner learns of it.
+counter is how an owner learns of it. The doctor checks nothing of a
+column whose first page is all nulls in each file it walks.
 
 Removing a column's declaration reaches the clients first, since a field
 list for an undeclared column is `INVALID_ARGUMENT`.

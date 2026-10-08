@@ -13,6 +13,10 @@
 > listed twice, or the key column listed, is invalid. The server's
 > MultiGet limit is `server.max_multi_get_values`. See RFD 022.
 
+> Updated 2026-10-07: a `value_columns` entry is a name, or a table of
+> `name` and `format`, `opaque` by default or `protobuf`, a key the table
+> form does not know being a schema fault. See RFD 024.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -56,12 +60,16 @@ optional local directory of RFD 012 (Deployment contract). Tables are a
 list of at least one, and each entry has a name, a source, a ref, a key
 column, `value_columns`, `lookups` and `strict` (whose meanings are RFD
 020 (Lookup levels)), and the `residency` and resident-bytes budget of RFD
-017 (Residency tiers). `value_columns` is a required list of the column
-names the table serves (RFD 022 (Value columns)). It may be empty, for a
-table that answers only whether a key is present. A name listed twice,
-or the key column listed as a value, is invalid. Order carries no
-meaning, so two entries that list the same set in another order are
-equal. The source is one of four kinds: a static table
+017 (Residency tiers). `value_columns` is a required list of the columns
+the table serves (RFD 022 (Value columns)). It may be empty, for a
+table that answers only whether a key is present. Each entry is a
+column's name, or a table of its `name` and its `format`, `opaque` by
+default or `protobuf` (RFD 024 (Field projection)), so
+`{ name = "detail", format = "protobuf" }`; a key the table form does not
+know is a schema fault, placed at the key. A name listed twice, or the
+key column listed as a value, is invalid. Order carries no meaning, so
+two entries that list the same columns, each with its format, in another
+order are equal. The source is one of four kinds: a static table
 root or metadata file, an Iceberg REST catalog, or a table in Glue or in S3
 Tables (RFD 019 (AWS catalog sources)). The prototype's TOML configuration had this shape
 ([prototype findings, what was built](../analysis/2026-09-10-prototype-findings.md#what-was-built)).

@@ -8,7 +8,7 @@
 //! they hold at most `server.max_in_flight` slots, and a call that finds
 //! none is refused at once. A `MultiGet` asks for at most
 //! `server.max_multi_get_values` values, its keys times the columns it
-//! names (RFD 022).
+//! names, whatever fields each names (RFD 022, RFD 024).
 
 use std::fmt;
 use std::sync::Arc;
@@ -19,7 +19,8 @@ use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{
-    CacheError, Error, Key, KeyType, Opened, Row, Table, TableLayout, Tables, ValueType, approx,
+    CacheError, ColumnRead, Error, Key, KeyType, Opened, Row, Table, TableConfig, TableLayout,
+    Tables, ValueFormat, ValueType, approx,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -242,8 +243,11 @@ async fn within<T>(
 }
 
 /// Core's error as a status (RFD 010): a key of the wrong type, and a
-/// column the table does not serve or named twice (RFD 022), is
-/// `INVALID_ARGUMENT`; a page fetch that ran past `server.get_deadline` is
+/// column the table does not serve, named twice (RFD 022), or read with a
+/// field list its format does not take (RFD 024), is `INVALID_ARGUMENT`; a
+/// value a field list trims that is not the protobuf its column declares is
+/// `FAILED_PRECONDITION`, which a retry meets again (RFD 024); a page
+/// fetch that ran past `server.get_deadline` is
 /// `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a `Get`'s
 /// deadline and its fetch's pass moments apart, and the call answers one
 /// code whichever passes first; a read the caller can
@@ -258,6 +262,7 @@ pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {
         Error::KeyType { .. } | Error::ColumnRequest { .. } => Status::invalid_argument(message),
+        Error::MalformedValue { .. } => Status::failed_precondition(message),
         Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }
         | Error::ObjectStore(_)
@@ -308,8 +313,9 @@ fn column_value_wire(value: Option<Bytes>) -> ColumnValue {
 }
 
 /// The table's value columns on the wire, in the layout's order, which is
-/// by name.
-fn value_columns_wire(layout: &TableLayout) -> Vec<v1::ValueColumn> {
+/// by name, each with the format `entry`, the table's entry as it stands,
+/// declares it in.
+fn value_columns_wire(layout: &TableLayout, entry: &TableConfig) -> Vec<v1::ValueColumn> {
     layout
         .value_columns
         .iter()
@@ -324,18 +330,29 @@ fn value_columns_wire(layout: &TableLayout) -> Vec<v1::ValueColumn> {
                 ),
                 ValueType::String => (v1::ValueType::String, 0),
             };
+            let format = match entry.format_of(&column.name).unwrap_or_default() {
+                ValueFormat::Opaque => v1::ValueFormat::Opaque,
+                ValueFormat::Protobuf => v1::ValueFormat::Protobuf,
+            };
             v1::ValueColumn {
                 name: column.name.clone(),
                 value_type: i32::from(value_type),
                 width,
+                format: i32::from(format),
             }
         })
         .collect()
 }
 
-/// The column names a request carries, as the core takes them.
-fn names(columns: &[String]) -> Vec<&str> {
-    columns.iter().map(String::as_str).collect()
+/// The column reads a request carries, as the core takes them.
+fn reads(columns: &[v1::ColumnRead]) -> Vec<ColumnRead<'_>> {
+    columns
+        .iter()
+        .map(|read| ColumnRead {
+            name: &read.name,
+            fields: &read.fields,
+        })
+        .collect()
 }
 
 /// The table's key type on the wire.
@@ -356,7 +373,7 @@ impl Service {
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, key_type)?;
         let lookup = table
-            .get(&key, &names(&request.columns))
+            .get(&key, &reads(&request.columns))
             .await
             .map_err(|error| status_from(&error))?;
         let (presence, values) = row_wire(lookup.row);
@@ -381,7 +398,7 @@ impl Service {
             .map(|key| key_from_wire(Some(key), key_type))
             .collect::<Result<Vec<Key>, WireKeyFault>>()?;
         let lookup = table
-            .multi_get(&keys, &names(&request.columns))
+            .multi_get(&keys, &reads(&request.columns))
             .await
             .map_err(|error| status_from(&error))?;
         let results = lookup
@@ -437,7 +454,7 @@ impl Service {
             records: generation.records,
             key_type: i32::from(key_type_wire(generation.layout.key_type)),
             index_bytes: approx::count(generation.index_bytes),
-            value_columns: value_columns_wire(&generation.layout),
+            value_columns: value_columns_wire(&generation.layout, &table.config()),
         }))
     }
 }
@@ -471,7 +488,8 @@ mod tests {
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
     use icetray_core::{
-        ColumnRequestFault, FileFault, LocalFault, RefusalReason, Storage, TableFault,
+        ColumnRequestFault, FileFault, LocalFault, Malformed, RefusalReason, SourceConfig, Storage,
+        TableFault, ValueColumnConfig,
     };
     use tonic::Code;
 
@@ -763,27 +781,41 @@ mod tests {
         .collect()
     }
 
-    /// A column a lookup names that the table does not serve, and one it
-    /// names twice, beside their code.
-    fn column_cases() -> [(Error, Code); 2] {
+    /// Every fault of a column a lookup names, beside its code, and a
+    /// malformed value a projection met.
+    fn column_cases() -> Vec<(Error, Code)> {
+        let field = 7;
         [
-            (
-                Error::ColumnRequest {
-                    table: TABLE.to_string(),
-                    column: "absent".to_string(),
-                    fault: ColumnRequestFault::NotServed,
-                },
-                Code::InvalidArgument,
-            ),
+            ColumnRequestFault::NotServed,
+            ColumnRequestFault::Repeated,
+            ColumnRequestFault::NotProtobuf,
+            ColumnRequestFault::FieldOutOfRange { field: 0 },
+            ColumnRequestFault::RepeatedField { field },
+        ]
+        .into_iter()
+        .map(|fault| {
             (
                 Error::ColumnRequest {
                     table: TABLE.to_string(),
                     column: "value".to_string(),
-                    fault: ColumnRequestFault::Repeated,
+                    fault,
                 },
                 Code::InvalidArgument,
-            ),
-        ]
+            )
+        })
+        .chain([(
+            Error::MalformedValue {
+                table: TABLE.to_string(),
+                column: "value".to_string(),
+                key: Key::Long(LONG_VALUE),
+                fault: Malformed::WireType {
+                    at: 0,
+                    wire_type: 7,
+                },
+            },
+            Code::FailedPrecondition,
+        )])
+        .collect()
     }
 
     /// The variants a canceled task ends in, beside their code.
@@ -882,7 +914,12 @@ mod tests {
         let request = |keys: usize, columns: usize| MultiGetRequest {
             table: TABLE.to_string(),
             keys: vec![wire(v1::key::Key::Long(LONG_VALUE)); keys],
-            columns: (0..columns).map(|at| format!("c{at}")).collect(),
+            columns: (0..columns)
+                .map(|at| v1::ColumnRead {
+                    name: format!("c{at}"),
+                    fields: vec![1, 2, 3],
+                })
+                .collect(),
         };
         let columns_named = 2;
         let at_limit = SAMPLE_LIMIT / columns_named;
@@ -903,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_columns_wire_names_each_type_and_a_fixed_width() {
+    fn test_value_columns_wire_names_each_type_a_fixed_width_and_each_format() {
         let fixed_width = 16;
         let column = |name: &str, value_type| icetray_core::ValueColumnLayout {
             name: name.to_string(),
@@ -923,20 +960,44 @@ mod tests {
                 column("c", ValueType::String),
             ],
         };
-        let wire: Vec<(String, i32, u32)> = value_columns_wire(&layout)
+        let entry = TableConfig {
+            name: TABLE.to_string(),
+            source: SourceConfig::Static {
+                location: "mem://w/db/kv".to_string(),
+            },
+            r#ref: "main".to_string(),
+            key_column: "key".to_string(),
+            value_columns: vec![
+                ValueColumnConfig::named("c"),
+                ValueColumnConfig::of("a", ValueFormat::Protobuf),
+                ValueColumnConfig::named("b"),
+            ],
+            strict: false,
+            lookups: None,
+            residency: icetray_core::Residency::Full,
+            resident_budget_bytes: None,
+        };
+        let wire: Vec<(String, i32, u32, i32)> = value_columns_wire(&layout, &entry)
             .into_iter()
-            .map(|column| (column.name, column.value_type, column.width))
+            .map(|column| (column.name, column.value_type, column.width, column.format))
             .collect();
+        let opaque = i32::from(v1::ValueFormat::Opaque);
         assert_eq!(
             wire,
             [
-                ("a".to_string(), i32::from(v1::ValueType::Binary), 0),
+                (
+                    "a".to_string(),
+                    i32::from(v1::ValueType::Binary),
+                    0,
+                    i32::from(v1::ValueFormat::Protobuf)
+                ),
                 (
                     "b".to_string(),
                     i32::from(v1::ValueType::Fixed),
-                    u32::try_from(fixed_width).unwrap()
+                    u32::try_from(fixed_width).unwrap(),
+                    opaque
                 ),
-                ("c".to_string(), i32::from(v1::ValueType::String), 0),
+                ("c".to_string(), i32::from(v1::ValueType::String), 0, opaque),
             ]
         );
     }

@@ -7,6 +7,7 @@
 
 use std::time::Instant;
 
+use icetray_core::ColumnRead;
 use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::{KeyType, Row};
@@ -77,7 +78,14 @@ async fn main() -> Result<()> {
     for i in 0..u64::from(LOOKUPS) {
         let key = fixture.key(i * LOOKUP_STRIDE % ROWS);
         assert!(
-            verify::one_value(&served.table.get(&key, &[VALUE_COLUMN]).await?.row).is_some(),
+            verify::one_value(
+                &served
+                    .table
+                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await?
+                    .row
+            )
+            .is_some(),
             "a written key answers present"
         );
     }
@@ -90,7 +98,11 @@ async fn main() -> Result<()> {
     for i in 0..u64::from(LOOKUPS) {
         let key = fixture.absent_near(i * LOOKUP_STRIDE % ROWS);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "an unwritten key answers absent"
         );

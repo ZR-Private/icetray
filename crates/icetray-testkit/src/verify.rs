@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use iceberg::Catalog;
+use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, LocalConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
@@ -260,6 +261,12 @@ pub fn one_value(row: &Row) -> Option<&Bytes> {
     }
 }
 
+/// Each column `names` names, read whole: the reads of a lookup that
+/// trims nothing.
+pub fn whole<'a>(names: &[&'a str]) -> Vec<ColumnRead<'a>> {
+    names.iter().map(|&name| ColumnRead::whole(name)).collect()
+}
+
 /// The positions in `generation`'s layout of the value columns `columns`
 /// names.
 ///
@@ -371,7 +378,10 @@ pub async fn verify_hits(served: &Served, fixture: &Fixture, ids: &[u64]) -> Res
     let generation = served.current();
     for &id in ids {
         let key = fixture.key(id);
-        let lookup = served.table.get(&key, &[VALUE_COLUMN]).await?;
+        let lookup = served
+            .table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?;
         assert_eq!(lookup.row, fixture.expected(&key), "value for key {key}");
         assert_eq!(
             lookup.snapshot_id, generation.snapshot_id,
@@ -411,14 +421,22 @@ pub async fn verify_misses(served: &Served, fixture: &Fixture, ids: &[u64]) -> R
     for &id in ids {
         let key = fixture.absent_near(id);
         assert_eq!(
-            served.table.get(&key, &[VALUE_COLUMN]).await?.row,
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
             Row::Absent,
             "key {key}"
         );
     }
     let far = far_key(fixture.spec().key_type);
     assert_eq!(
-        served.table.get(&far, &[VALUE_COLUMN]).await?.row,
+        served
+            .table
+            .get(&far, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
         Row::Absent,
         "key {far}"
     );

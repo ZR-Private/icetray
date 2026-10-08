@@ -5,7 +5,8 @@
 //! failure of the daemon once its configuration and logging are in place,
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
 //! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
-//! is not a rule; `WireKeyFault` why a wire key is not a key; `CallFault`
+//! is not a rule; `ColumnTextFault` why `--column` text is not a column
+//! read; `WireKeyFault` why a wire key is not a key; `CallFault`
 //! why the service ended a call on one of its own bounds.
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
 //! failure to an exit code; the two failures before any subcommand runs, a
@@ -167,6 +168,19 @@ pub enum RewriteTextFault {
     /// `TO` is empty, so every location it matches would become relative.
     #[error("TO is empty")]
     EmptyTo,
+}
+
+/// Why `--column` text is not a column read. clap reports it as a value
+/// validation failure with the flag and the text, so the run ends with
+/// `EXIT_USAGE` before anything is opened.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ColumnTextFault {
+    /// An entry of the field list is not a number a `u32` holds.
+    #[error("{text:?} is not a field number")]
+    NotAFieldNumber {
+        /// The entry as given.
+        text: String,
+    },
 }
 
 /// Why a key from the wire is not a key of the table's type (RFD 010).
@@ -372,8 +386,9 @@ pub enum CliError {
     /// Command-line text that is not a key of the table's type.
     #[error(transparent)]
     Key(#[from] KeyTextFault),
-    /// A `get --column` the table is not configured to serve, or one given
-    /// twice: `icetray_core::Error::ColumnRequest`, found before the load.
+    /// A `get --column` the table is not configured to serve, one given
+    /// twice, or a field list its configured format does not take:
+    /// `icetray_core::Error::ColumnRequest`, found before the load.
     #[error(transparent)]
     Column(icetray_core::Error),
     /// Writing a line failed for a reason other than a closed pipe.
