@@ -67,11 +67,13 @@ listeners accept connections while the tables load.
 Callers speak gRPC through
 [`icetray.proto`](../crates/icetray-proto/proto/icetray.proto).
 [Calling icetray](calling.md) covers requests, responses, the limits a
-call meets, and which errors a client retries. The operator sets three of
+call meets, and which errors a client retries. The operator sets four of
 those limits in `[server]` ([Configuration](configuration.md#server)):
 `max_in_flight` calls at once, past which a call is `RESOURCE_EXHAUSTED`;
-`max_multi_get_values` per `MultiGet`; and the `get_deadline` and
-`multi_get_deadline` past which a call is `DEADLINE_EXCEEDED`.
+`max_multi_get_values` per `MultiGet`; `multi_get_fan_out` GETs in flight
+per `MultiGet`, past which a batch's next GET waits for one to end; and
+the `get_deadline` and `multi_get_deadline` past which a call is
+`DEADLINE_EXCEEDED`.
 
 The listener serves plaintext gRPC and authenticates no caller. TLS,
 authentication, and access policy are left to the platform: run icetray

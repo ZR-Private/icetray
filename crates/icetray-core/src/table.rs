@@ -44,24 +44,6 @@ use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
-/// The GETs one `multi_get` holds in flight at once: 32, across every task
-/// the batch runs on (RFD 013, RFD 022). Each GET a lookup issues, a
-/// Bloom-tier key page, a column's value page, and its dictionary page each
-/// one, takes one of the batch's permits on the lookup's own task before
-/// it asks the page cache for a page not in memory, and the GET holds it
-/// until it ends, on the task the page cache runs it on (`cache::Issue`);
-/// a page the cache serves, or a fetch the lookup joins, frees it unused.
-/// No GET holds one while waiting for another, so a lookup naming more
-/// columns than the bound still runs, and a lookup waiting for one has
-/// nothing queued in the cache, so a `get` of the same page never waits
-/// behind the batch. Each GET has at most one hedge
-/// beside it, so a batch holds at most twice this many GETs open on the
-/// store however many keys and columns it carries. A full batch of cold
-/// hits takes about thirty GET round trips, inside the `MultiGet` deadline
-/// at the latency a live lookup expects, well under 200 ms each; the wait
-/// for a permit is not charged against a fetch's `get_deadline`.
-const MULTI_GET_FAN_OUT: usize = 32;
-
 /// The fewest keys one task of a `multi_get` is given: 8. A warm hit's
 /// decode is on the order of ten microseconds, so a task of eight keys
 /// holds about a hundred microseconds of work, far more than spawning it
@@ -172,10 +154,10 @@ impl fmt::Display for StateName {
 
 /// What a table is built over beside its configuration and source: the
 /// storage its reads go through, the page cache, the local directory (RFD
-/// 017) when one is configured, and the count of `get` and `multi_get`
-/// calls in flight. `open_with` builds one and hands every table it opens
-/// a clone, so a process's tables share one of each. Clones share what
-/// they hold.
+/// 017) when one is configured, the count of `get` and `multi_get` calls
+/// in flight, and the bound of GETs one `multi_get` holds in flight.
+/// `open_with` builds one and hands every table it opens a clone, so a
+/// process's tables share one of each. Clones share what they hold.
 #[derive(Clone)]
 pub struct TableHandles {
     /// The storage the table's reads go through.
@@ -190,6 +172,23 @@ pub struct TableHandles {
     /// What the tables do with the doctor's findings on each generation
     /// they admit.
     pub findings: FindingLog,
+    /// The GETs one `multi_get` holds in flight at once, across every task
+    /// the batch runs on, from `server.multi_get_fan_out` (RFD 013, RFD
+    /// 022); above zero, as `Config::validated` holds that setting, and
+    /// held to tokio's `Semaphore::MAX_PERMITS`. Each GET a lookup issues,
+    /// a Bloom-tier key page, a column's value page, and its dictionary
+    /// page each one, takes one of the batch's permits on the lookup's own
+    /// task before it asks the page cache for a page not in memory, and the
+    /// GET holds it until it ends, on the task the page cache runs it on
+    /// (`cache::Issue`); a page the cache serves, or a fetch the lookup
+    /// joins, frees it unused. No GET holds one while waiting for another,
+    /// so a lookup naming more columns than the bound still runs, and a
+    /// lookup waiting for one has nothing queued in the cache, so a `get`
+    /// of the same page never waits behind the batch. Each GET has at most
+    /// one hedge beside it, so a batch holds at most twice this many GETs
+    /// open on the store however many keys and columns it carries. The
+    /// wait for a permit is not charged against a fetch's `get_deadline`.
+    pub multi_get_fan_out: usize,
 }
 
 /// What a table does with the doctor's findings on each generation it
@@ -443,6 +442,8 @@ struct Lookups {
     /// The calls in flight on every table sharing the table's handles, its
     /// own among them.
     in_flight: CallsInFlight,
+    /// `TableHandles::multi_get_fan_out`, held to `Semaphore::MAX_PERMITS`.
+    multi_get_fan_out: usize,
 }
 
 /// One call counted in a `CallsInFlight` while held, on the shard it was
@@ -558,7 +559,7 @@ impl Lookups {
     /// `keys` looked up through `generation`, each reading the value
     /// columns `selection` names, and answered in their order. Every GET a
     /// lookup issues holds one permit of `fan_out`, the batch's bound
-    /// (`MULTI_GET_FAN_OUT`), while it runs, so the batch's
+    /// (`TableHandles::multi_get_fan_out`), while it runs, so the batch's
     /// tasks together hold at most that many GETs in flight; this task
     /// waits on at most that many lookups itself. The first failure ends
     /// the run.
@@ -577,7 +578,7 @@ impl Lookups {
             .map(|key| self.one(generation, key, selection, Some(fan_out)))
             .collect();
         stream::iter(lookups)
-            .buffered(MULTI_GET_FAN_OUT)
+            .buffered(self.multi_get_fan_out)
             .try_collect()
             .await
     }
@@ -816,12 +817,14 @@ impl Table {
             local,
             calls,
             findings,
+            multi_get_fan_out,
         } = handles;
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
             metrics: LookupMetrics::new(&config.name, &config.value_column_names()),
             in_flight: calls,
+            multi_get_fan_out: multi_get_fan_out.min(Semaphore::MAX_PERMITS),
         });
         let swaps = metrics::counter!(
             metric::GENERATION_SWAPS_TOTAL,
@@ -1140,8 +1143,8 @@ impl Table {
     /// looked up here, unspawned. `open_with` gives every table of a
     /// process one count, so calls to any of them count toward holding a
     /// batch back from splitting. The runs share one bound of
-    /// `MULTI_GET_FAN_OUT` GETs in flight, each GET holding a permit while
-    /// it runs (`Lookups::run`). Dropping the returned future, as a
+    /// `TableHandles::multi_get_fan_out` GETs in flight, each GET holding a
+    /// permit while it runs (`Lookups::run`). Dropping the returned future, as a
     /// deadline does, aborts the runs still going; a GET already issued
     /// runs on, holding its permit, and a lookup still waiting for one
     /// issues nothing. A run's panic is resumed here; a run
@@ -1153,7 +1156,7 @@ impl Table {
             self.check_key_type(&generation, key)?;
         }
         let selection = generation.layout.select(&self.config.load(), columns)?;
-        let fan_out = Arc::new(Semaphore::new(MULTI_GET_FAN_OUT));
+        let fan_out = Arc::new(Semaphore::new(self.lookups.multi_get_fan_out));
         let runs = self.lookups.runs(keys.len());
         let rows = if runs <= 1 {
             self.lookups
@@ -1999,7 +2002,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::TableFault;
-    use crate::config::{Residency, ServerConfig, ValueColumnConfig, ValueFormat};
+    use crate::config::{
+        DEFAULT_MULTI_GET_FAN_OUT, Residency, ServerConfig, ValueColumnConfig, ValueFormat,
+    };
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
     use crate::generation::testing::{
@@ -2094,6 +2099,7 @@ mod tests {
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Events,
+            multi_get_fan_out: DEFAULT_MULTI_GET_FAN_OUT,
         }
     }
 
@@ -2443,7 +2449,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_get_runs_at_most_the_fan_out_bound_at_once_in_key_order() {
-        fills_the_fan_out_bound_in_key_order().await;
+        fills_the_fan_out_bound_in_key_order(DEFAULT_MULTI_GET_FAN_OUT).await;
+    }
+
+    /// A table built under a bound other than the default holds that one.
+    #[tokio::test]
+    async fn test_multi_get_under_a_configured_fan_out_holds_that_bound() {
+        let configured = 4;
+        fills_the_fan_out_bound_in_key_order(configured).await;
     }
 
     /// On several workers the batch is split over spawned runs, and the
@@ -2454,7 +2467,7 @@ mod tests {
             shard::workers() > 1,
             "the batch is split only over several workers"
         );
-        fills_the_fan_out_bound_in_key_order().await;
+        fills_the_fan_out_bound_in_key_order(DEFAULT_MULTI_GET_FAN_OUT).await;
     }
 
     /// A loaded table of `key_count` keys, one row per page, so every key
@@ -2509,17 +2522,30 @@ mod tests {
         (fixture, all, gauged)
     }
 
-    /// A batch of cold hits, each on a page of its own, reaches exactly
-    /// `MULTI_GET_FAN_OUT` GETs in flight at once and answers in key order.
-    async fn fills_the_fan_out_bound_in_key_order() {
+    /// A batch of cold hits, each on a page of its own, on a table built
+    /// under a fan-out of `bound`, reaches exactly `bound` GETs in flight at
+    /// once and answers in key order.
+    async fn fills_the_fan_out_bound_in_key_order(bound: usize) {
         let batches_of_the_bound = 3;
-        let (table, _fixture, all, gauged) =
-            one_row_per_page(MULTI_GET_FAN_OUT * batches_of_the_bound).await;
+        let (fixture, all, gauged) = one_row_per_page_fixture(bound * batches_of_the_bound).await;
+        let handles = TableHandles {
+            multi_get_fan_out: bound,
+            ..handles_over(&fixture).await
+        };
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            &fixture,
+            lenient(&fixture),
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        table.load().await.unwrap();
         let keys = long_keys(&all);
         // A batch that never has the bound's lookups in flight at once
         // never passes the gate: its page fetches end at the get deadline
         // and the call fails.
-        gauged.fill_to(MULTI_GET_FAN_OUT);
+        gauged.fill_to(bound);
         let answered = table
             .multi_get(&keys, &[ColumnRead::whole(VALUE_COLUMN)])
             .await
@@ -2528,7 +2554,7 @@ mod tests {
         assert_eq!(answered.rows, expected);
         assert_eq!(
             gauged.high_water(),
-            MULTI_GET_FAN_OUT,
+            bound,
             "the batch fills the bound and never passes it"
         );
     }
@@ -2602,15 +2628,15 @@ mod tests {
     }
 
     /// A batch naming two columns holds one permit per column a lookup
-    /// reads, so it reaches exactly `MULTI_GET_FAN_OUT` value-page GETs in
+    /// reads, so it reaches exactly `DEFAULT_MULTI_GET_FAN_OUT` value-page GETs in
     /// flight, half as many lookups, and never passes it (RFD 022).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_multi_get_naming_two_columns_holds_the_fan_out_bound_of_gets() {
         let batches_of_the_bound = 3;
         let (table, _fixture, all, gauged) =
-            two_columns_one_row_per_page(MULTI_GET_FAN_OUT * batches_of_the_bound).await;
+            two_columns_one_row_per_page(DEFAULT_MULTI_GET_FAN_OUT * batches_of_the_bound).await;
         let keys = long_keys(&all);
-        gauged.fill_to(MULTI_GET_FAN_OUT);
+        gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT);
         let answered = table
             .multi_get(
                 &keys,
@@ -2625,7 +2651,7 @@ mod tests {
         assert_eq!(answered.rows, expected, "every key, both columns, in order");
         assert_eq!(
             gauged.high_water(),
-            MULTI_GET_FAN_OUT,
+            DEFAULT_MULTI_GET_FAN_OUT,
             "the batch fills the bound of GETs and never passes it"
         );
     }
@@ -2797,16 +2823,17 @@ mod tests {
 
     /// A `get` of a page whose batch lookup is still waiting for a permit
     /// issues its own GET rather than waiting behind the batch: the store
-    /// holds the `MULTI_GET_FAN_OUT` GETs of the batch's first half until
+    /// holds the `DEFAULT_MULTI_GET_FAN_OUT` GETs of the batch's first half until
     /// one more is in flight, which only the `get` brings (RFD 013).
     #[tokio::test]
     async fn test_get_of_a_page_a_batch_has_queued_is_not_held_behind_its_permits() {
-        let (table, fixture, all, gauged) = two_columns_one_row_per_page(MULTI_GET_FAN_OUT).await;
+        let (table, fixture, all, gauged) =
+            two_columns_one_row_per_page(DEFAULT_MULTI_GET_FAN_OUT).await;
         let keys = long_keys(&all);
-        let last = all[MULTI_GET_FAN_OUT - 1];
-        gauged.fill_to(MULTI_GET_FAN_OUT + 1);
+        let last = all[DEFAULT_MULTI_GET_FAN_OUT - 1];
+        gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT + 1);
         let get_beside = async {
-            reach(&gauged, MULTI_GET_FAN_OUT).await;
+            reach(&gauged, DEFAULT_MULTI_GET_FAN_OUT).await;
             let before = fixture.gets();
             let row = get_within_the_deadline(&table, &Key::Long(last)).await;
             (row, fixture.gets() - before)
@@ -2819,23 +2846,24 @@ mod tests {
     }
 
     /// A batch dropped while half its lookups wait for permits issues no
-    /// GET after the drop beyond the `MULTI_GET_FAN_OUT` it admitted: a
+    /// GET after the drop beyond the `DEFAULT_MULTI_GET_FAN_OUT` it admitted: a
     /// `get` of its last page issues the one GET that releases the store,
     /// and once the admitted GETs have ended, which a batch of the admitted
     /// lookups waits for by joining them, nothing else has been issued.
     #[tokio::test]
     async fn test_multi_get_dropped_issues_no_get_beyond_those_admitted() {
-        let (table, fixture, all, gauged) = two_columns_one_row_per_page(MULTI_GET_FAN_OUT).await;
+        let (table, fixture, all, gauged) =
+            two_columns_one_row_per_page(DEFAULT_MULTI_GET_FAN_OUT).await;
         let keys = long_keys(&all);
-        let admitted_lookups = MULTI_GET_FAN_OUT / BOTH_READS.len();
-        gauged.fill_to(MULTI_GET_FAN_OUT + 1);
+        let admitted_lookups = DEFAULT_MULTI_GET_FAN_OUT / BOTH_READS.len();
+        gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT + 1);
         let at_drop = tokio::select! {
             answered = table.multi_get(&keys, &BOTH_READS) => {
                 panic!("the store holds every GET: {answered:?}")
             }
-            () = reach(&gauged, MULTI_GET_FAN_OUT) => fixture.gets(),
+            () = reach(&gauged, DEFAULT_MULTI_GET_FAN_OUT) => fixture.gets(),
         };
-        let last = all[MULTI_GET_FAN_OUT - 1];
+        let last = all[DEFAULT_MULTI_GET_FAN_OUT - 1];
         assert_eq!(
             get_within_the_deadline(&table, &Key::Long(last)).await,
             present(last)
@@ -3341,7 +3369,7 @@ mod tests {
         );
     }
 
-    /// The runs a batch of `MULTI_GET_FAN_OUT` cold hits on one table
+    /// The runs a batch of `DEFAULT_MULTI_GET_FAN_OUT` cold hits on one table
     /// spawns while `others` cold-hit `get`s are in flight on another table
     /// over the same handles and file, each on a page of its own. The store
     /// holds every GET of both, so the `get`s stay in flight while the
@@ -3350,7 +3378,8 @@ mod tests {
     /// read's are the runs.
     async fn runs_spawned_beside_another_table(others: usize) -> usize {
         let holders_of_an_inline_batch = 3;
-        let (fixture, all, gauged) = one_row_per_page_fixture(MULTI_GET_FAN_OUT + others).await;
+        let (fixture, all, gauged) =
+            one_row_per_page_fixture(DEFAULT_MULTI_GET_FAN_OUT + others).await;
         let handles = handles_over(&fixture).await;
         let defaults = ServerConfig::default();
         let batch_table = table_sharing(
@@ -3372,13 +3401,13 @@ mod tests {
         ));
         batch_table.load().await.unwrap();
         other.load().await.unwrap();
-        let (batch, beside) = all.split_at(MULTI_GET_FAN_OUT);
+        let (batch, beside) = all.split_at(DEFAULT_MULTI_GET_FAN_OUT);
         let keys = long_keys(batch);
         // One GET per key and no hedge, since neither table has recorded a
         // lookup GET to take a delay from, so one more GET than both ask
         // is never reached and the store holds every one until the test
         // drops them.
-        gauged.fill_to(MULTI_GET_FAN_OUT + others + 1);
+        gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT + others + 1);
         let mut held = JoinSet::new();
         for key in long_keys(beside) {
             let other = Arc::clone(&other);
@@ -3386,7 +3415,7 @@ mod tests {
         }
         reach(&gauged, others).await;
         let every_get_held = async {
-            reach(&gauged, others + MULTI_GET_FAN_OUT).await;
+            reach(&gauged, others + DEFAULT_MULTI_GET_FAN_OUT).await;
             Arc::strong_count(&batch_table.current().unwrap()) - holders_of_an_inline_batch
         };
         let value = [ColumnRead::whole(VALUE_COLUMN)];
@@ -3396,7 +3425,7 @@ mod tests {
         }
     }
 
-    /// The runs a batch of `MULTI_GET_FAN_OUT` cold hits spawns while
+    /// The runs a batch of `DEFAULT_MULTI_GET_FAN_OUT` cold hits spawns while
     /// `others` calls are counted in flight on its table, which the test
     /// holds directly rather than running them. Read while the store holds
     /// every GET of the batch: each spawned run holds the generation's
@@ -3404,16 +3433,16 @@ mod tests {
     /// read's are the runs.
     async fn runs_spawned_beside(others: usize) -> usize {
         let holders_of_an_inline_batch = 3;
-        let (table, _fixture, all, gauged) = one_row_per_page(MULTI_GET_FAN_OUT).await;
+        let (table, _fixture, all, gauged) = one_row_per_page(DEFAULT_MULTI_GET_FAN_OUT).await;
         let keys = long_keys(&all);
         let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
         // The batch issues one GET per key and no hedge, since its table
         // has recorded no lookup GET to take a delay from, so one more GET
         // than it has keys is never reached and the store holds every one
         // until the batch is dropped.
-        gauged.fill_to(MULTI_GET_FAN_OUT + 1);
+        gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT + 1);
         let every_get_held = async {
-            reach(&gauged, MULTI_GET_FAN_OUT).await;
+            reach(&gauged, DEFAULT_MULTI_GET_FAN_OUT).await;
             Arc::strong_count(&table.current().unwrap()) - holders_of_an_inline_batch
         };
         let value = [ColumnRead::whole(VALUE_COLUMN)];

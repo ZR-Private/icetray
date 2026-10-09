@@ -96,14 +96,15 @@ pub async fn build(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let server = ServerConfig::default();
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
+        multi_get_fan_out: server.multi_get_fan_out,
     };
-    let server = ServerConfig::default();
     let table = Table::new(
         config,
         source,

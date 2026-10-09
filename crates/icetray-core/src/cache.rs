@@ -680,7 +680,7 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Issue<'a> {
     /// The fan-out of the `multi_get` the lookup is one of
-    /// (`MULTI_GET_FAN_OUT`): one of its permits is taken before the page
+    /// (`TableHandles::multi_get_fan_out`): one of its permits is taken before the page
     /// cache is asked, so a lookup still waiting for one has nothing queued
     /// there for another call to join, and the wait is not charged against
     /// the deadline. The permit moves into the fetch and is held until the

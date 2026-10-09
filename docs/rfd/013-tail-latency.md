@@ -9,6 +9,10 @@
 > fan-out bounds GETs in flight across the batch rather than lookups.
 > See RFD 022.
 
+> Updated 2026-10-08: the MultiGet fan-out is configuration,
+> `server.multi_get_fan_out`, default 32, which a restart applies like
+> every server setting. See RFD 018.
+
 ## Problem
 
 A cold hit costs one GET per value column it names, and the latency of
@@ -116,10 +120,10 @@ seconds for open requests, which the 15-second cap lets finish, and leaves
 time to flush the page cache before an orchestrator's usual 30-second
 kill.
 
-The deadlines, the two limits, the retry count, and the connect and
-catalog timeouts are configuration with these defaults (RFD 011). The
-retry window, the per-attempt timeout, and the fan-out of 32 are
-constants, the first two because the credential margin bounds their sum.
+The deadlines, the two limits, the fan-out, the retry count, and the
+connect and catalog timeouts are configuration with these defaults (RFD
+011). The retry window and the per-attempt timeout are constants, because
+the credential margin bounds their sum.
 The 1024 requests in flight and 1000 values per batch are single-pod
 guesses, and how they hold under concurrent load is open.
 

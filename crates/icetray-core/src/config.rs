@@ -129,6 +129,13 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// A single-pod guess, to revisit with measurement (RFD 013).
 const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
+/// GETs one `MultiGet` holds in flight at once when the file says nothing:
+/// 32 (RFD 013, RFD 022). A full batch of cold hits, a GET for each of
+/// `DEFAULT_MAX_MULTI_GET_VALUES` values, takes about thirty GET round
+/// trips, inside `DEFAULT_MULTI_GET_DEADLINE` at the latency a live lookup
+/// expects, well under 200 ms each.
+pub(crate) const DEFAULT_MULTI_GET_FAN_OUT: usize = 32;
+
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after
 /// one failed, reads every file's footer and key chunks, so it is allowed
@@ -511,6 +518,10 @@ pub enum ConfigViolation {
     /// refused.
     #[error("server.max_multi_get_values 0 is not above zero")]
     MaxMultiGetValuesZero,
+    /// No GET may be in flight for a `MultiGet`, so every batch would wait
+    /// for a permit until its deadline.
+    #[error("server.multi_get_fan_out 0 is not above zero")]
+    MultiGetFanOutZero,
     /// A load deadline of zero, which would fail every first load
     /// unstarted.
     #[error("server.load_deadline 0s is not above zero")]
@@ -752,6 +763,7 @@ impl Config {
             multi_get_deadline,
             max_in_flight,
             max_multi_get_values,
+            multi_get_fan_out,
             load_deadline,
             refresh_deadline,
             drain_deadline,
@@ -794,6 +806,10 @@ impl Config {
             (
                 "server.max_multi_get_values",
                 *max_multi_get_values == server.max_multi_get_values,
+            ),
+            (
+                "server.multi_get_fan_out",
+                *multi_get_fan_out == server.multi_get_fan_out,
             ),
             (
                 "server.load_deadline",
@@ -1062,6 +1078,10 @@ fn validate_bounds(
             server.max_multi_get_values,
             ConfigViolation::MaxMultiGetValuesZero,
         ),
+        (
+            server.multi_get_fan_out,
+            ConfigViolation::MultiGetFanOutZero,
+        ),
     ];
     if let Some((_, violation)) = durations
         .into_iter()
@@ -1119,8 +1139,8 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
 /// serves `/metrics` and `/ready`, and RFD 012 makes both part of the
 /// surface. Every duration is written as a friendly duration such as
 /// `"5s"`. `Config::validated` holds `poll_interval` between one second
-/// and one day, and every other duration, `max_in_flight`, and
-/// `max_multi_get_values` above zero.
+/// and one day, and every other duration, `max_in_flight`,
+/// `max_multi_get_values`, and `multi_get_fan_out` above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -1159,6 +1179,13 @@ pub struct ServerConfig {
     /// names, a key of a call that names none counting one (RFD 022); more
     /// is `INVALID_ARGUMENT` before any lookup.
     pub max_multi_get_values: usize,
+    /// GETs one `MultiGet` holds in flight at once, across every task the
+    /// batch runs on: each GET a lookup issues, a key page under `bloom`, a
+    /// value page, or a dictionary page, holds one until it ends (RFD 013,
+    /// RFD 022). Like `max_in_flight`, it is set for the process: every
+    /// table is built under it at start, so a reload that changes it is
+    /// refused and a restart applies it (RFD 018).
+    pub multi_get_fan_out: usize,
     /// How long a build from no serving generation, a table's first load
     /// or a retry after one failed, may run before it fails and the table
     /// is `Degraded`; the next poll tries again.
@@ -1187,6 +1214,7 @@ impl Default for ServerConfig {
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             max_multi_get_values: DEFAULT_MAX_MULTI_GET_VALUES,
+            multi_get_fan_out: DEFAULT_MULTI_GET_FAN_OUT,
             load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
@@ -2062,6 +2090,8 @@ mod tests {
     const FIXTURE_MAX_IN_FLIGHT: usize = 512;
     /// The `MultiGet` value limit the full fixture names.
     const FIXTURE_MAX_MULTI_GET_VALUES: usize = 500;
+    /// The `MultiGet` fan-out the full fixture names.
+    const FIXTURE_MULTI_GET_FAN_OUT: usize = 16;
     /// The load deadline the full fixture names, `"45m"`.
     const FIXTURE_LOAD_DEADLINE: Duration = Duration::from_mins(45);
     /// The refresh deadline the full fixture names, `"10m"`.
@@ -2121,6 +2151,7 @@ get_deadline = "2s"
 multi_get_deadline = "8s"
 max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
 max_multi_get_values = {FIXTURE_MAX_MULTI_GET_VALUES}
+multi_get_fan_out = {FIXTURE_MULTI_GET_FAN_OUT}
 load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
@@ -2231,6 +2262,7 @@ endpoint = "https://s3tables.example"
                 "multi_get_deadline": "8s",
                 "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
                 "max_multi_get_values": FIXTURE_MAX_MULTI_GET_VALUES,
+                "multi_get_fan_out": FIXTURE_MULTI_GET_FAN_OUT,
                 "load_deadline": "45m",
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
@@ -2362,6 +2394,7 @@ value_columns = ["value"]
                 multi_get_deadline: FIXTURE_MULTI_GET_DEADLINE,
                 max_in_flight: FIXTURE_MAX_IN_FLIGHT,
                 max_multi_get_values: FIXTURE_MAX_MULTI_GET_VALUES,
+                multi_get_fan_out: FIXTURE_MULTI_GET_FAN_OUT,
                 load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
                 drain_deadline: FIXTURE_DRAIN_DEADLINE,
@@ -2505,6 +2538,7 @@ value_columns = ["value"]
             config.server.max_multi_get_values,
             DEFAULT_MAX_MULTI_GET_VALUES
         );
+        assert_eq!(config.server.multi_get_fan_out, DEFAULT_MULTI_GET_FAN_OUT);
         assert_eq!(config.server.load_deadline, DEFAULT_LOAD_DEADLINE);
         assert_eq!(config.server.refresh_deadline, DEFAULT_REFRESH_DEADLINE);
         assert_eq!(config.server.drain_deadline, DEFAULT_DRAIN_DEADLINE);
@@ -2772,10 +2806,15 @@ locaton = "typo"
         next.tables.clear();
         assert!(running.restart_settings(&next).is_empty());
         next.server.poll_interval += Duration::from_secs(1);
+        next.server.multi_get_fan_out += 1;
         next.storage.max_retries += 1;
         assert_eq!(
             running.restart_settings(&next),
-            ["server.poll_interval", "storage.max_retries"]
+            [
+                "server.poll_interval",
+                "server.multi_get_fan_out",
+                "storage.max_retries"
+            ]
         );
     }
 
@@ -3501,10 +3540,36 @@ locaton = "typo"
                 "max_multi_get_values",
                 ConfigViolation::MaxMultiGetValuesZero,
             ),
+            ("multi_get_fan_out", ConfigViolation::MultiGetFanOutZero),
         ];
         for (key, expected) in limits {
             let text = format!("{TOML_MINIMAL}\n[server]\n{key} = 0\n");
             assert_eq!(violation(&text), expected, "server.{key}");
+        }
+    }
+
+    /// `server.multi_get_fan_out` as TOML and as JSON names it.
+    fn with_fan_out(fan_out: usize) -> [String; 2] {
+        let toml = format!("{TOML_MINIMAL}\n[server]\nmulti_get_fan_out = {fan_out}\n");
+        let json = format!(
+            r#"{{"server": {{"multi_get_fan_out": {fan_out}}}, "tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": "key", "value_columns": ["value"]}}]}}"#
+        );
+        [toml, json]
+    }
+
+    #[test]
+    fn test_parse_reads_multi_get_fan_out_and_refuses_zero_in_toml_and_json() {
+        let fan_out = 4;
+        for text in with_fan_out(fan_out) {
+            let config = Config::parse(&text).unwrap();
+            assert_eq!(config.server.multi_get_fan_out, fan_out, "{text}");
+        }
+        for text in with_fan_out(0) {
+            assert_eq!(
+                violation(&text),
+                ConfigViolation::MultiGetFanOutZero,
+                "{text}"
+            );
         }
     }
 

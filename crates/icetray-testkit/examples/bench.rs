@@ -570,6 +570,14 @@ struct Cli {
     /// `--rewrite-location file:///dir/=s3://bucket/dir/`.
     #[arg(long, value_parser = parse_rewrite)]
     rewrite_location: Vec<RewriteRule>,
+    /// The GETs one `MultiGet` holds in flight on every table of the run,
+    /// as `server.multi_get_fan_out` bounds them; its default when absent.
+    #[arg(
+        long,
+        default_value_t = ServerConfig::default().multi_get_fan_out,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    multi_get_fan_out: usize,
 }
 
 /// What separates a `--rewrite-location` rule's two prefixes.
@@ -586,23 +594,44 @@ fn parse_rewrite(text: &str) -> Result<RewriteRule, String> {
     })
 }
 
-/// The storage configuration every table of the run is served over: the
-/// production defaults with the run's `--rewrite-location` rules.
-static STORAGE_CONFIG: OnceLock<StorageConfig> = OnceLock::new();
-
-/// Sets `STORAGE_CONFIG` from `cli`'s `--rewrite-location` rules, once.
-fn set_storage_config(cli: &Cli) {
-    STORAGE_CONFIG
-        .set(StorageConfig {
-            rewrite: cli.rewrite_location.clone(),
-            ..StorageConfig::default()
-        })
-        .expect("main sets the storage configuration once");
+/// How every table of the run is served: over the production storage
+/// defaults with the run's `--rewrite-location` rules, under the run's
+/// `--multi-get-fan-out`.
+#[derive(Clone, Debug)]
+struct Serving {
+    storage: StorageConfig,
+    multi_get_fan_out: usize,
 }
 
-/// `STORAGE_CONFIG`, or the defaults before `main` sets it.
-fn storage_config() -> StorageConfig {
-    STORAGE_CONFIG.get().cloned().unwrap_or_default()
+impl Default for Serving {
+    fn default() -> Self {
+        Self {
+            storage: StorageConfig::default(),
+            multi_get_fan_out: ServerConfig::default().multi_get_fan_out,
+        }
+    }
+}
+
+/// The run's `Serving`.
+static SERVING: OnceLock<Serving> = OnceLock::new();
+
+/// Sets `SERVING` from `cli`'s `--rewrite-location` rules and
+/// `--multi-get-fan-out`, once.
+fn set_serving(cli: &Cli) {
+    SERVING
+        .set(Serving {
+            storage: StorageConfig {
+                rewrite: cli.rewrite_location.clone(),
+                ..StorageConfig::default()
+            },
+            multi_get_fan_out: cli.multi_get_fan_out,
+        })
+        .expect("main sets the serving configuration once");
+}
+
+/// `SERVING`, or the defaults before `main` sets it.
+fn serving() -> Serving {
+    SERVING.get().cloned().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,7 +1247,8 @@ async fn serve(
     source: SourceConfig,
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
-    let storage = Arc::new(Storage::with_sdk_defaults(storage_config()));
+    let serving = serving();
+    let storage = Arc::new(Storage::with_sdk_defaults(serving.storage));
     let (local, dir) = local_for(tier, &storage, reuse)?;
     let cache = PageCache::new(cache_bytes, None).await?;
     let handles = TableHandles {
@@ -1227,6 +1257,7 @@ async fn serve(
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
+        multi_get_fan_out: serving.multi_get_fan_out,
     };
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
@@ -1670,6 +1701,8 @@ struct RunLabel {
     tier: Tier,
     mode: Mode,
     tasks: usize,
+    /// The bound its tables were served under, `Serving::multi_get_fan_out`.
+    multi_get_fan_out: usize,
 }
 
 /// A measured run.
@@ -1708,6 +1741,7 @@ impl Measured {
             "tier": format!("{:?}", self.label.tier).to_lowercase(),
             "mode": self.label.mode.name(),
             "tasks": self.label.tasks,
+            "multi_get_fan_out": self.label.multi_get_fan_out,
             "keys_per_op": self.keys_per_op,
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
@@ -1877,6 +1911,7 @@ async fn lookups(
                 tier,
                 mode,
                 tasks,
+                multi_get_fan_out: serving().multi_get_fan_out,
             };
             let run = measure(
                 served,
@@ -1924,7 +1959,8 @@ async fn serve_together(
     prepared: &[&Prepared],
     tier: Tier,
 ) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
-    let storage = Arc::new(Storage::with_sdk_defaults(storage_config()));
+    let serving = serving();
+    let storage = Arc::new(Storage::with_sdk_defaults(serving.storage));
     let (local, dir) = local_for(tier, &storage, None)?;
     let handles = TableHandles {
         storage,
@@ -1932,6 +1968,7 @@ async fn serve_together(
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
+        multi_get_fan_out: serving.multi_get_fan_out,
     };
     let mut tables = Vec::with_capacity(prepared.len());
     for table in prepared {
@@ -1995,12 +2032,14 @@ async fn two_tables(
     let (batch_ops, batch_samples, batch_bytes) = join_loops(batch_loops).await?;
     let elapsed = started.elapsed();
 
+    let multi_get_fan_out = serving().multi_get_fan_out;
     let label = |table, mode, tasks| RunLabel {
         scenario: Scenario::TwoTable,
         table,
         tier,
         mode,
         tasks,
+        multi_get_fan_out,
     };
     let rows = vec![
         Measured {
@@ -2493,7 +2532,7 @@ fn install_recorder() -> BenchResult<()> {
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let cli = Cli::parse();
-    set_storage_config(&cli);
+    set_serving(&cli);
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
@@ -2579,6 +2618,7 @@ async fn main() -> BenchResult<()> {
             "cold_cache_bytes": COLD_CACHE_BYTES,
             "warmup_seconds": cli.warmup,
             "duration_seconds": cli.duration,
+            "multi_get_fan_out": cli.multi_get_fan_out,
             "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
             "compression": compression,
         },

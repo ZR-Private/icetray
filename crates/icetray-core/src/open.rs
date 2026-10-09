@@ -444,6 +444,7 @@ pub async fn open_with(
         local: local.clone(),
         calls: CallsInFlight::new(),
         findings,
+        multi_get_fan_out: config.server.multi_get_fan_out,
     };
     let deadlines = Deadlines {
         load: config.server.load_deadline,

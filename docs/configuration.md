@@ -104,11 +104,12 @@ table = "profiles"
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
 | `max_in_flight` | count | `1024` | The most `Get` and `MultiGet` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
 | `max_multi_get_values` | count | `1000` | The most values one `MultiGet` may request: its keys times the columns it requests, a presence-only request counting one per key. icetray rejects a larger request with `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
+| `multi_get_fan_out` | count | `32` | The most GETs one `MultiGet` holds in flight at once, across every key and column it requests. Each GET a lookup issues, a key page under `bloom`, a value page, or a dictionary page, holds one slot until it ends, and a page served from the page cache takes none. When a batch needs more GETs than this, icetray issues the rest as slots free. Each GET has at most one hedge beside it. Zero is invalid, as `server.multi_get_fan_out 0 is not above zero`. |
 | `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table is serving: a first load, or a retry after one failed. |
 | `refresh_deadline` | duration | `"5m"` | The longest one refresh over a serving generation may run. Past it the table is [degraded](glossary.md) and the next poll retries. |
 | `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls to finish. |
 
-Every duration and both counts must be above zero. The gRPC layer
+Every duration and every count must be above zero. The gRPC layer
 enforces a client's own deadline, and its expiry is reported as the
 client's.
 
