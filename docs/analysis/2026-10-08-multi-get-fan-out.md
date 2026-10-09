@@ -25,7 +25,7 @@ more than its share.
   limited it to 4 CPUs and 32 GiB. The table was in an S3 general-purpose
   bucket in the node's region.
 - **Program.** `crates/icetray-testkit/examples/bench.rs`, built with
-  Cargo's standard release profile at commit `27e587f` on the host, with
+  Cargo's standard release profile at commit `920b2e9` on the host, with
   `--rewrite-location` reading the table from S3 and
   `--multi-get-fan-out` set per run. Lookups run in process through
   `Table` over `Storage`, with no gRPC, against a 1 MiB page cache, so

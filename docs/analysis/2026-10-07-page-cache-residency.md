@@ -38,7 +38,7 @@ interval open for the same reason.
   this volume's and not a property of EBS in general.
 - **Program.** `crates/icetray-testkit/examples/residency.rs` and the
   benchmark program that prepares its table, built with Cargo's standard
-  release profile, with no overrides, from commit `ee8025b` and
+  release profile, with no overrides, from commit `c3b35fc` and
   cross-built for aarch64 Linux. `dev/residency-sweep.sh` builds both,
   prepares the table, and runs the sweep; the run here passed it
   `--concurrency 4`, the cgroup's CPUs:

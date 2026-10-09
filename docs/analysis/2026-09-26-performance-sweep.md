@@ -79,12 +79,12 @@ icetray's own work, or how a lookup scaled across cores.
   kernel 6.8) ran a `rust:1.98.1-bookworm` container, with the repository
   mounted read-only and its target directory inside the container. The
   tables and the disk tier's local directories were on the container's own
-  filesystem. It was the same program at `261751b`, whose core is the final
+  filesystem. It was the same program at `6d85774`, whose core is the final
   tree's, with 4 tasks for "multi".
 
 ## The baseline
 
-Commit `1ccd453`, random values. The items are numbered in the baseline's
+Commit `d3e4c2a`, random values. The items are numbered in the baseline's
 ranking, which the changes below cite. On one task, a warm hit took 22.2 µs and allocated 37 times
 (270 KiB) to return 100 bytes. A Full-tier miss took 10.4 µs. The profiles
 put the cost here:
@@ -122,31 +122,31 @@ row says otherwise.
 
 | commit | change | what moved |
 |---|---|---|
-| `d769cad` | A lookup plans only the page holding its row, and the skip counts from that page's first row (baseline 1) | warm hit, 1 task: 22.6 → 15.1 µs; Full miss: 10.5 → 6.9 µs; MultiGet 1,000, 1 task: 23.2 → 15.7 ms |
-| `56fa875` | icetray decompresses zstd pages itself into one buffer, with one context per thread (baseline 2) | warm hit, 11 tasks: 322,491 → 488,087/s; 1 task: 15.1 → 12.8 µs; 37 → 29 allocations and 239 → 130 KiB per hit; Full miss, 11 tasks: 777,858 → 1,089,772/s |
-| `045d827` | A Get borrows the generation through a guard; lookup counts go to per-thread shards, published at scrape (baseline 5) | Bloom miss, 11 tasks: 6.23M → 8.05M/s (+29%); hits unchanged |
-| `5ad3cd1` | A MultiGet's keys are split into runs spawned on several workers, under one 32-lookup bound (baseline 4) | MultiGet 1,000, 1 task: 13.88 → 2.94 ms; on 11 busy tasks, p99 49.45 → 106.47 ms |
-| `e85ffae` | The page cache has one memory shard per worker, rounded up to a power of two, and the budget minimum follows (baseline 7) | gRPC MultiGet 100 at saturation, one profiled run each: 2,585 → 2,806 rps; foyer's exclusive-lock spin 31.4% → 25.5% of server CPU |
-| `19bf8ad` | A long key's bytes are held inline, not allocated (baseline 12) | Bloom miss, 1 task: 4.55M → 4.90M/s, 2 → 0 allocations |
-| `57f86a5` | The hedge delay is recomputed every window/16 GETs (baseline 11) | `HedgeWindow` 1.43% → 0.08% of cold-hit CPU; throughput within the runs' spread |
-| `974161e` | Load verification checks a row group one decode batch at a time, with an ASCII fast path for UTF-8 (baseline 9) | string load: 21.76 → 16.43 ms wall, 74.9 → 54.5 ms CPU, 190 → 67 MiB allocated |
-| `d26de07` | A MultiGet splits only while the table has fewer calls in flight than workers | MultiGet 1,000, 11 tasks: p99 94.61 → 33.17 ms, p50 16.21 → 24.67 ms; 1 task unchanged |
-| `8102e89` | The gRPC handlers read the key type through a guard, not a clone of the generation | no benchmark moved beyond its spread; kept on the two shared reference-count writes per Get it removes |
-| `9eb79dd` | A page cache hit counts on its own shard; the counter handle is registered once | one allocation fewer per page hit; Bloom-tier p50 down in every run (long 19.2–19.3 → 18.3–18.5 µs); throughput within the spread |
-| `261751b` | The split's count is one per process, shared by every table through `TableHandles` | two tables in one process (below): the other table's warm hits 115,837 → 224,766/s; the string table's MultiGet 1,000, 184 → 131 batches/s, p99 8.06 → 43.50 ms |
+| `53af717` | A lookup plans only the page holding its row, and the skip counts from that page's first row (baseline 1) | warm hit, 1 task: 22.6 → 15.1 µs; Full miss: 10.5 → 6.9 µs; MultiGet 1,000, 1 task: 23.2 → 15.7 ms |
+| `b2c3fcb` | icetray decompresses zstd pages itself into one buffer, with one context per thread (baseline 2) | warm hit, 11 tasks: 322,491 → 488,087/s; 1 task: 15.1 → 12.8 µs; 37 → 29 allocations and 239 → 130 KiB per hit; Full miss, 11 tasks: 777,858 → 1,089,772/s |
+| `1ccce23` | A Get borrows the generation through a guard; lookup counts go to per-thread shards, published at scrape (baseline 5) | Bloom miss, 11 tasks: 6.23M → 8.05M/s (+29%); hits unchanged |
+| `9c4bd9b` | A MultiGet's keys are split into runs spawned on several workers, under one 32-lookup bound (baseline 4) | MultiGet 1,000, 1 task: 13.88 → 2.94 ms; on 11 busy tasks, p99 49.45 → 106.47 ms |
+| `0590cd9` | The page cache has one memory shard per worker, rounded up to a power of two, and the budget minimum follows (baseline 7) | gRPC MultiGet 100 at saturation, one profiled run each: 2,585 → 2,806 rps; foyer's exclusive-lock spin 31.4% → 25.5% of server CPU |
+| `d8b5f1b` | A long key's bytes are held inline, not allocated (baseline 12) | Bloom miss, 1 task: 4.55M → 4.90M/s, 2 → 0 allocations |
+| `a27b3e3` | The hedge delay is recomputed every window/16 GETs (baseline 11) | `HedgeWindow` 1.43% → 0.08% of cold-hit CPU; throughput within the runs' spread |
+| `559ebe3` | Load verification checks a row group one decode batch at a time, with an ASCII fast path for UTF-8 (baseline 9) | string load: 21.76 → 16.43 ms wall, 74.9 → 54.5 ms CPU, 190 → 67 MiB allocated |
+| `605370d` | A MultiGet splits only while the table has fewer calls in flight than workers | MultiGet 1,000, 11 tasks: p99 94.61 → 33.17 ms, p50 16.21 → 24.67 ms; 1 task unchanged |
+| `e71ce56` | The gRPC handlers read the key type through a guard, not a clone of the generation | no benchmark moved beyond its spread; kept on the two shared reference-count writes per Get it removes |
+| `359137b` | A page cache hit counts on its own shard; the counter handle is registered once | one allocation fewer per page hit; Bloom-tier p50 down in every run (long 19.2–19.3 → 18.3–18.5 µs); throughput within the spread |
+| `6d85774` | The split's count is one per process, shared by every table through `TableHandles` | two tables in one process (below): the other table's warm hits 115,837 → 224,766/s; the string table's MultiGet 1,000, 184 → 131 batches/s, p99 8.06 → 43.50 ms |
 
 Beside these, five commits only measure: the `profiling` build profile
-(`fd72ba6`), the bench program (`f160914`), the gRPC script (`522e8c8`),
-the two-table scenario (`49317a4`), and the text values (`4c2b3d4`).
+(`7321686`), the bench program (`5c5ec13`), the gRPC script (`6d56c9a`),
+the two-table scenario (`31936b7`), and the text values (`1c020ab`).
 
 Three of the changes are one decision made in steps, and the steps are
-worth reading together. Splitting a batch across cores (`5ad3cd1`) made an
+worth reading together. Splitting a batch across cores (`9c4bd9b`) made an
 isolated batch 3.7 to 5.2 times faster. When every core was already busy,
 though, the 1,000-key p99 doubled to tripled, because a batch waits for its
-slowest run and its runs queue behind other batches. `d26de07` split a batch
+slowest run and its runs queue behind other batches. `605370d` split a batch
 only while the table had fewer calls in flight than workers, which brought
 the p99 below its level before the split (as measured in the earlier
-session). `261751b` made that count one per
+session). `6d85774` made that count one per
 process, so another table's Gets hold a batch back too.
 
 The two-table scenario measures that last step: 11 loops of warm hits on the
@@ -159,7 +159,7 @@ once. The batches held back take 40 to 45 ms inline, about a third of the
 window, and meanwhile the other table's Gets have ten workers to
 themselves. So the change moves CPU from the batch to the other table:
 
-| two tables, Full, 11 workers | before `261751b` | after |
+| two tables, Full, 11 workers | before `6d85774` | after |
 |---|--:|--:|
 | string MultiGet 1,000, batches/s | 184 | 131 |
 | its p50 / p90 / p99 | 5.21 / 6.02 / 8.06 ms | 5.21 / 6.44 / 43.50 ms |
@@ -171,7 +171,7 @@ Batches on one table alone did not move (MultiGet 1,000, 1 task: 2.57 →
 
 ## The closing numbers
 
-The final tree is `4c2b3d4`. The results record it as `5aff4e8`, the same
+The final tree is `1c020ab`. The results record it as `5aff4e8`, the same
 tree before that commit's message was reworded. These are medians of three
 runs of the whole matrix. p50 is on one task; ops/s is on eleven tasks.
 

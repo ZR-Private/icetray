@@ -33,7 +33,7 @@ revisited if the check adds more than a tenth of a decode to a lookup.
   ext4 on the node's EBS volume, whose type was not confirmed.
 - **Program.** `crates/icetray-testkit/examples/deletes.rs`, built with
   Cargo's standard release profile, with no overrides, from commit
-  `3a8dbc0` and cross-built for aarch64 Linux, run at its defaults with
+  `8c7cc95` and cross-built for aarch64 Linux, run at its defaults with
   seed 7. It writes contract-layout tables of long keys with the fixture
   writer and serves them in process through `Table` over `Storage`'s
   `file://` store, so a "GET" is a local file read and no figure includes
