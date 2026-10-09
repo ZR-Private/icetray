@@ -87,7 +87,9 @@ SERVER="target/$CARGO_PROFILE/icetray"
 BENCH="target/$CARGO_PROFILE/examples/bench"
 
 log "tables under $TABLES_DIR"
-"$BENCH" --prepare --data-dir "$TABLES_DIR" >"$OUT_DIR/tables.tsv"
+# The four tables of random and text values: the page cache above is sized
+# for them, and the protobuf tables' second column is not served here.
+"$BENCH" --prepare --values random,text --data-dir "$TABLES_DIR" >"$OUT_DIR/tables.tsv"
 
 CONFIG="$OUT_DIR/icetray.toml"
 {

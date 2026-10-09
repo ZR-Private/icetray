@@ -3,17 +3,20 @@
 //! filesystem, so every number is icetray's own CPU and allocation cost with
 //! no object-store latency in it. It writes a long-key and a string-key
 //! table of `ROWS` rows each, once with random values and once with text
-//! values (`Values`), and, when `--table scattered` names it, a table shaped
-//! like a serving table (`SCATTERED_ROWS` rows of random-looking string
-//! keys and 4 KiB values in byte-bounded pages, `SCATTERED_ROWS_PER_FILE`
-//! rows per file), through the fixture writer (once, then reused from
-//! `--data-dir`), reports how far zstd compressed each table's key and
-//! value columns, serves them through `Table` over `Storage`'s
-//! `file://` store in every residency tier, and reports latency
-//! percentiles, throughput, and allocations per operation, plus the wall
-//! time, CPU time, allocations, and peak resident set of a load and a
-//! refresh. Results print as a table and are written as JSON under
-//! `--out-dir`. Run with
+//! values (`Values`); two long-key tables of protobuf values beside a
+//! second value column, one of `ROWS` rows at the other tables' value size
+//! and one of `LARGE_VALUE_ROWS` rows of 4 KiB values, served with `value`
+//! declared protobuf (RFD 022, RFD 024); and, when `--table scattered`
+//! names it, a table shaped like a serving table (`SCATTERED_ROWS` rows of
+//! random-looking string keys and 4 KiB values in byte-bounded pages,
+//! `SCATTERED_ROWS_PER_FILE` rows per file), through the fixture writer
+//! (once, then reused from `--data-dir`), reports how far zstd compressed
+//! each table's key and value columns, serves them through `Table` over
+//! `Storage`'s `file://` store in every residency tier, and reports latency
+//! percentiles, throughput, allocations per operation, and the value bytes
+//! an operation read and returned, plus the wall time, CPU time,
+//! allocations, and peak resident set of a load and a refresh. Results
+//! print as a table and are written as JSON under `--out-dir`. Run with
 //! `cargo run -p icetray-testkit --example bench --release -- --help`; a
 //! profile of one scenario narrows `--scenario`, `--tier`, `--table`,
 //! `--values`, and `--mode`, and lengthens `--duration`.
@@ -33,21 +36,26 @@ use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
     LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    ValueColumnConfig, ValueFormat,
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, FindingLog, Key, KeyType, LocalDir, PageCache, Storage, Table, TableHandles,
-    TableSource,
+    CallsInFlight, FindingLog, Key, KeyType, LocalDir, PageCache, Row, Storage, Table,
+    TableHandles, TableSource,
 };
 use icetray_core::{approx, catalog, time};
-use icetray_testkit::fixture::{NAMESPACE, memory_catalog_local};
+use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
 use icetray_testkit::keys::{
     SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES, VALUE_BYTES,
 };
 use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
+use icetray_testkit::protobuf::{
+    CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
+};
 use icetray_testkit::{
-    FixtureSpec, KeyShape, MemoryCatalog, ValueKind, absent_key_from, key_at_shaped, write_fixture,
+    FixtureSpec, KeyShape, MemoryCatalog, ValueKind, absent_key_from, key_at_shaped, value_of_kind,
+    write_fixture,
 };
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use rand::rngs::StdRng;
@@ -202,10 +210,31 @@ enum Scenario {
     /// `MultiGet` of 1,000 warm hits on the string table of random values.
     /// Serves those two whatever `--table` and `--values` select.
     TwoTable,
+    /// A warm hit naming both value columns, `value` and `detail`, whole:
+    /// against `warm-hit` on the same table, the cost of a second column.
+    /// Protobuf tables only.
+    WarmHitBoth,
+    /// A warm hit naming no column, which answers presence alone.
+    PresenceHit,
+    /// A warm hit projecting `value` to `PROJECT_FEW`: against `warm-hit`
+    /// on the same table, the walk's cost and the bytes it saves. Protobuf
+    /// tables only.
+    WarmHitProjectFew,
+    /// A warm hit projecting `value` to `PROJECT_MOST`, a walk that copies
+    /// nearly the whole value. Protobuf tables only.
+    WarmHitProjectMost,
+    /// A `MultiGet` of 100 warm hits naming both value columns. Protobuf
+    /// tables only.
+    #[value(name = "multi-get-100-both")]
+    MultiGet100Both,
+    /// A `MultiGet` of 100 warm hits projecting `value` to `PROJECT_FEW`.
+    /// Protobuf tables only.
+    #[value(name = "multi-get-100-project")]
+    MultiGet100Project,
 }
 
 impl Scenario {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 14] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -214,22 +243,83 @@ impl Scenario {
         Self::Load,
         Self::Refresh,
         Self::TwoTable,
+        Self::WarmHitBoth,
+        Self::PresenceHit,
+        Self::WarmHitProjectFew,
+        Self::WarmHitProjectMost,
+        Self::MultiGet100Both,
+        Self::MultiGet100Project,
     ];
 
-    const LOOKUPS: [Self; 5] = [
+    const LOOKUPS: [Self; 11] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
         Self::MultiGet100,
         Self::MultiGet1000,
+        Self::WarmHitBoth,
+        Self::PresenceHit,
+        Self::WarmHitProjectFew,
+        Self::WarmHitProjectMost,
+        Self::MultiGet100Both,
+        Self::MultiGet100Project,
     ];
 
     /// Whether the scenario measures a page cache primed to hold every
     /// value page.
     fn is_warm(self) -> bool {
         match self {
-            Self::WarmHit | Self::MultiGet100 | Self::MultiGet1000 | Self::TwoTable => true,
+            Self::WarmHit
+            | Self::MultiGet100
+            | Self::MultiGet1000
+            | Self::TwoTable
+            | Self::WarmHitBoth
+            | Self::PresenceHit
+            | Self::WarmHitProjectFew
+            | Self::WarmHitProjectMost
+            | Self::MultiGet100Both
+            | Self::MultiGet100Project => true,
             Self::ColdHit | Self::Miss | Self::Load | Self::Refresh => false,
+        }
+    }
+
+    /// Whether the scenario reads `SECOND_VALUE_COLUMN` or projects
+    /// `VALUE_COLUMN`, which only a protobuf table serves.
+    fn needs_protobuf(self) -> bool {
+        match self {
+            Self::WarmHitBoth
+            | Self::WarmHitProjectFew
+            | Self::WarmHitProjectMost
+            | Self::MultiGet100Both
+            | Self::MultiGet100Project => true,
+            Self::WarmHit
+            | Self::ColdHit
+            | Self::Miss
+            | Self::MultiGet100
+            | Self::MultiGet1000
+            | Self::Load
+            | Self::Refresh
+            | Self::TwoTable
+            | Self::PresenceHit => false,
+        }
+    }
+
+    /// Whether the scenario projects `VALUE_COLUMN`, whose bytes read per
+    /// key are then the whole value's, not what it returns.
+    fn projects(self) -> bool {
+        match self {
+            Self::WarmHitProjectFew | Self::WarmHitProjectMost | Self::MultiGet100Project => true,
+            Self::WarmHit
+            | Self::ColdHit
+            | Self::Miss
+            | Self::MultiGet100
+            | Self::MultiGet1000
+            | Self::Load
+            | Self::Refresh
+            | Self::TwoTable
+            | Self::WarmHitBoth
+            | Self::PresenceHit
+            | Self::MultiGet100Both => false,
         }
     }
 
@@ -243,6 +333,12 @@ impl Scenario {
             Self::Load => "load",
             Self::Refresh => "refresh",
             Self::TwoTable => "two-table",
+            Self::WarmHitBoth => "warm-hit-both",
+            Self::PresenceHit => "presence-hit",
+            Self::WarmHitProjectFew => "warm-hit-project-few",
+            Self::WarmHitProjectMost => "warm-hit-project-most",
+            Self::MultiGet100Both => "multi-get-100-both",
+            Self::MultiGet100Project => "multi-get-100-project",
         }
     }
 }
@@ -270,7 +366,8 @@ impl Tier {
 /// A benchmark table, by its keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum TableName {
-    /// Long keys, contract layout.
+    /// Long keys, contract layout; under `--values protobuf-large`, value
+    /// pages bounded by bytes.
     Long,
     /// Sequential string keys sharing a long prefix, contract layout.
     String,
@@ -291,15 +388,33 @@ enum Values {
     /// (`text_value_for_len`), which zstd compresses as structured values
     /// compress.
     Text,
+    /// Protobuf messages of every wire type padded by a repeated filler
+    /// field (`protobuf::value`), at the random table's value size, in
+    /// `value` declared protobuf, beside `detail`, each row's value
+    /// reversed, opaque.
+    Protobuf,
+    /// As `Protobuf`, at `SERVING_VALUE_BYTES` per value and
+    /// `LARGE_VALUE_ROWS` rows, in value pages bounded by bytes as a
+    /// serving table's are.
+    ProtobufLarge,
 }
 
 impl Values {
-    const ALL: [Self; 2] = [Self::Random, Self::Text];
+    const ALL: [Self; 4] = [
+        Self::Random,
+        Self::Text,
+        Self::Protobuf,
+        Self::ProtobufLarge,
+    ];
 
+    /// The values' name in the results and, after the key column's, in a
+    /// table's name.
     fn as_str(self) -> &'static str {
         match self {
             Self::Random => "random",
             Self::Text => "text",
+            Self::Protobuf => "protobuf",
+            Self::ProtobufLarge => "protobuf_large",
         }
     }
 
@@ -307,6 +422,16 @@ impl Values {
         match self {
             Self::Random => ValueKind::Random,
             Self::Text => ValueKind::Text,
+            Self::Protobuf | Self::ProtobufLarge => ValueKind::Protobuf,
+        }
+    }
+
+    /// Whether the table holds `SECOND_VALUE_COLUMN` and is served with
+    /// `VALUE_COLUMN` declared protobuf.
+    fn is_protobuf(self) -> bool {
+        match self {
+            Self::Protobuf | Self::ProtobufLarge => true,
+            Self::Random | Self::Text => false,
         }
     }
 }
@@ -345,7 +470,8 @@ struct Cli {
     /// Tables to run them over, by keys; `scattered` runs only when named.
     #[arg(long, value_enum, value_delimiter = ',')]
     table: Vec<TableName>,
-    /// Tables to run them over, by values.
+    /// Tables to run them over, by values; the protobuf values are on long
+    /// keys alone.
     #[arg(long, value_enum, value_delimiter = ',')]
     values: Vec<Values>,
     /// Single-task latency, multi-task throughput, or both.
@@ -417,9 +543,19 @@ const SCATTERED_APPENDED_ROWS: u64 = SCATTERED_ROWS / APPEND_DIVISOR;
 // Both builds' ids have scattered keys.
 const _: () = assert!(SCATTERED_ROWS + SCATTERED_APPENDED_ROWS <= SCATTERED_ID_SPACE);
 
-/// Bytes per value of the scattered table: 4 KiB, a serving table's
-/// value, so a 64 KiB value page holds about sixteen.
-const SCATTERED_VALUE_BYTES: usize = 4_096;
+/// Bytes per value of the scattered table and of the large protobuf
+/// table: 4 KiB, a serving table's value, so a 64 KiB value page holds
+/// about sixteen.
+const SERVING_VALUE_BYTES: usize = 4_096;
+
+/// Rows of the large protobuf table's first build: two columns of
+/// `SERVING_VALUE_BYTES` per row, about 780 MiB of value pages, which
+/// `WARM_CACHE_BYTES` holds with the key pages beside, so the table runs
+/// warm, and about 800 MiB of disk.
+const LARGE_VALUE_ROWS: u64 = 100_000;
+
+/// Rows the large protobuf table's second build appends.
+const LARGE_VALUE_APPENDED_ROWS: u64 = LARGE_VALUE_ROWS / APPEND_DIVISOR;
 
 /// The file size target of the scattered table: 256 MiB, above the
 /// ~155 MB a bucket's incompressible rows take, so the rolling writer
@@ -457,7 +593,7 @@ struct TableShape {
     appended_rows: u64,
 }
 
-const SHAPES: [TableShape; 5] = [
+const SHAPES: [TableShape; 7] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
@@ -497,21 +633,42 @@ const SHAPES: [TableShape; 5] = [
         values: Values::Text,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+    },
+    TableShape {
+        name: TableName::Long,
+        key_type: KeyType::Long,
+        key_shape: KeyShape::Sequential,
+        key_bytes: size_of::<i64>(),
+        value_bytes: VALUE_BYTES,
+        values: Values::Protobuf,
+        rows: ROWS,
+        appended_rows: APPENDED_ROWS,
+    },
+    TableShape {
+        name: TableName::Long,
+        key_type: KeyType::Long,
+        key_shape: KeyShape::Sequential,
+        key_bytes: size_of::<i64>(),
+        value_bytes: SERVING_VALUE_BYTES,
+        values: Values::ProtobufLarge,
+        rows: LARGE_VALUE_ROWS,
+        appended_rows: LARGE_VALUE_APPENDED_ROWS,
     },
     TableShape {
         name: TableName::Scattered,
         key_type: KeyType::String,
         key_shape: KeyShape::Scattered,
         key_bytes: SCATTERED_KEY_FIXED_BYTES,
-        value_bytes: SCATTERED_VALUE_BYTES,
+        value_bytes: SERVING_VALUE_BYTES,
         values: Values::Random,
         rows: SCATTERED_ROWS,
         appended_rows: SCATTERED_APPENDED_ROWS,
     },
 ];
 
-/// What a text table's name adds to its key column's.
-const TEXT_TABLE_SUFFIX: &str = "_text";
+/// What separates the key column's name from the values' in the name of
+/// a table whose values are not random.
+const VALUES_SEPARATOR: &str = "_";
 
 impl TableName {
     fn as_str(self) -> &'static str {
@@ -525,17 +682,51 @@ impl TableName {
 
 impl TableShape {
     /// The table's name in the catalog and in the results: the key
-    /// column's, with `TEXT_TABLE_SUFFIX` for text values.
+    /// column's, followed after `VALUES_SEPARATOR` by the values' unless
+    /// they are random.
     fn table_name(self) -> String {
         match self.values {
             Values::Random => self.name.as_str().to_string(),
-            Values::Text => format!("{}{TEXT_TABLE_SUFFIX}", self.name.as_str()),
+            Values::Text | Values::Protobuf | Values::ProtobufLarge => format!(
+                "{}{VALUES_SEPARATOR}{}",
+                self.name.as_str(),
+                self.values.as_str()
+            ),
         }
     }
 
+    /// Every value column the table serves, each read whole: `value`, and
+    /// `detail` beside it on a protobuf table.
+    fn whole_reads(self) -> &'static [ColumnRead<'static>] {
+        if self.values.is_protobuf() {
+            &BOTH_READS
+        } else {
+            &VALUE_READS
+        }
+    }
+
+    /// The value columns a configuration serves: `value` opaque, or on a
+    /// protobuf table `value` declared protobuf and `detail` opaque.
+    fn value_columns(self) -> Vec<ValueColumnConfig> {
+        if self.values.is_protobuf() {
+            vec![
+                ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf),
+                ValueColumnConfig::named(SECOND_VALUE_COLUMN),
+            ]
+        } else {
+            vec![ValueColumnConfig::named(VALUE_COLUMN)]
+        }
+    }
+
+    /// The bytes of a row's values before compression: `value_bytes` for
+    /// each column the table serves.
+    fn row_value_bytes(self) -> usize {
+        self.value_bytes * self.whole_reads().len()
+    }
+
     /// A contract table has one file per bucket at the contract's upper
-    /// file size: the raw row bytes over `TARGET_FILE_BYTES_MAX`, rounded
-    /// up. Random values do not shrink under zstd, so those files come
+    /// file size: the raw row bytes, its key and every value column, over
+    /// `TARGET_FILE_BYTES_MAX`, rounded up. Random values do not shrink under zstd, so those files come
     /// close to the raw size, inside the contract's 32 to 64 MiB. A text
     /// table keeps the bucket count of the random table with its key
     /// column, so the two differ in their values alone; its files come out
@@ -544,7 +735,7 @@ impl TableShape {
     fn buckets(self) -> u32 {
         let buckets = match self.name {
             TableName::Long | TableName::String => {
-                let row_bytes = approx::count(self.key_bytes + self.value_bytes);
+                let row_bytes = approx::count(self.key_bytes + self.row_value_bytes());
                 (self.rows * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
             }
             TableName::Scattered => self.rows.div_ceil(SCATTERED_ROWS_PER_FILE),
@@ -552,27 +743,45 @@ impl TableShape {
         u32::try_from(buckets).expect("a benchmark table has a few dozen buckets at most")
     }
 
-    /// The Parquet layout: the contract's, or for the scattered table value
-    /// pages bounded at the contract's `VALUE_PAGE_BYTES` (the byte bound
-    /// shortens the writer's page-size check to every two rows, so a page
-    /// overshoots it by one value at most) and files rolled at
+    /// The Parquet layout: the contract's, or for the scattered table and
+    /// the large protobuf table value pages bounded at the contract's
+    /// `VALUE_PAGE_BYTES` (the byte bound shortens the writer's page-size
+    /// check to every two rows, so a page overshoots it by one value at
+    /// most), and for the scattered table files rolled at
     /// `SCATTERED_FILE_BYTES`.
     fn layout(self) -> FileLayout {
+        let byte_pages = FileLayout {
+            page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
+            ..FileLayout::contract()
+        };
         match self.name {
-            TableName::Long | TableName::String => FileLayout::contract(),
+            TableName::Long | TableName::String => match self.values {
+                Values::Random | Values::Text | Values::Protobuf => FileLayout::contract(),
+                Values::ProtobufLarge => byte_pages,
+            },
             TableName::Scattered => FileLayout {
-                page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
                 target_file_bytes: SCATTERED_FILE_BYTES,
                 column_index_truncate: Some(SCATTERED_COLUMN_INDEX_TRUNCATE),
-                ..FileLayout::contract()
+                ..byte_pages
             },
         }
     }
 
+    /// Ids between two keys of the pass that fills the warm cache: every
+    /// id when value pages are bounded by bytes, since such a page holds a
+    /// few rows of its bucket, which a stride would step over;
+    /// `PRIME_STRIDE` under the contract's pages.
+    fn prime_stride(self) -> u64 {
+        match self.layout().page_bytes {
+            Some(_) => BYTE_PAGE_PRIME_STRIDE,
+            None => PRIME_STRIDE,
+        }
+    }
+
     /// Whether the warm scenarios' page cache holds every value page of the
-    /// table, which their measurement assumes.
+    /// table, of every column it serves, which their measurement assumes.
     fn fits_warm_cache(self) -> bool {
-        approx::length(self.rows) * self.value_bytes <= WARM_CACHE_BYTES
+        approx::length(self.rows) * self.row_value_bytes() <= WARM_CACHE_BYTES
     }
 
     /// The table's `i`-th key.
@@ -667,6 +876,7 @@ async fn write_table(
         value_bytes: shape.value_bytes,
         value_kind: shape.values.kind(),
         layout: shape.layout(),
+        second_value: shape.values.is_protobuf(),
         ..FixtureSpec::small(&name, shape.key_type)
     };
     let mut fixture = write_fixture(catalog, NAMESPACE, spec).await?;
@@ -789,10 +999,19 @@ impl ColumnBytes {
     }
 }
 
+/// The bytes of a table's columns over every data file of both builds.
+#[derive(Clone, Copy, Debug, Default)]
+struct TableBytes {
+    key: ColumnBytes,
+    value: ColumnBytes,
+    /// `SECOND_VALUE_COLUMN`, zero on a table without it.
+    detail: ColumnBytes,
+}
+
 /// The key and value columns' bytes over every data file of `prepared`
 /// (both builds), summed from the files' footers.
-fn column_bytes(prepared: &Prepared) -> BenchResult<(ColumnBytes, ColumnBytes)> {
-    let (mut key, mut value) = (ColumnBytes::default(), ColumnBytes::default());
+fn column_bytes(prepared: &Prepared) -> BenchResult<TableBytes> {
+    let mut bytes = TableBytes::default();
     let mut pending = vec![local_path(&prepared.root)?];
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(dir)? {
@@ -811,8 +1030,9 @@ fn column_bytes(prepared: &Prepared) -> BenchResult<(ColumnBytes, ColumnBytes)> 
             for group in reader.metadata().row_groups() {
                 for column in group.columns() {
                     let sum = match column.column_descr().name() {
-                        KEY_COLUMN => &mut key,
-                        VALUE_COLUMN => &mut value,
+                        KEY_COLUMN => &mut bytes.key,
+                        VALUE_COLUMN => &mut bytes.value,
+                        SECOND_VALUE_COLUMN => &mut bytes.detail,
                         _ => continue,
                     };
                     sum.compressed += u64::try_from(column.compressed_size())?;
@@ -821,27 +1041,37 @@ fn column_bytes(prepared: &Prepared) -> BenchResult<(ColumnBytes, ColumnBytes)> 
             }
         }
     }
-    Ok((key, value))
+    Ok(bytes)
 }
 
 /// Every table's key and value column bytes (`column_bytes`), printed and
-/// as the report's JSON.
+/// as the report's JSON, `detail` among them on a protobuf table.
 fn compression(prepared: &[Prepared]) -> BenchResult<Vec<Json>> {
     let mut report = Vec::with_capacity(prepared.len());
     for table in prepared {
-        let (key, value) = column_bytes(table)?;
+        let TableBytes { key, value, detail } = column_bytes(table)?;
+        let protobuf = table.shape.values.is_protobuf();
+        let detail_ratio = if protobuf {
+            format!(", detail column {:.2}x", detail.ratio())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{}: key column compresses {:.2}x, value column {:.2}x ({:.1} MiB on disk)",
+            "{}: key column compresses {:.2}x, value column {:.2}x{detail_ratio} ({:.1} MiB on disk)",
             table.shape.table_name(),
             key.ratio(),
             value.ratio(),
-            mib(key.compressed + value.compressed)
+            mib(key.compressed + value.compressed + detail.compressed)
         );
-        report.push(json!({
+        let mut entry = json!({
             "table": table.shape.table_name(),
             "key": key.to_json(),
             "value": value.to_json(),
-        }));
+        });
+        if protobuf {
+            entry["detail"] = detail.to_json();
+        }
+        report.push(entry);
     }
     Ok(report)
 }
@@ -953,7 +1183,7 @@ async fn table_over(
         source: source.clone(),
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
-        value_columns: vec![icetray_core::ValueColumnConfig::named(VALUE_COLUMN)],
+        value_columns: prepared.shape.value_columns(),
         strict: true,
         lookups: None,
         residency: tier.residency(),
@@ -993,64 +1223,204 @@ const KEY_SEED: u64 = 0x1ce7_4a7b_e4c4_0001;
 /// every page is asked many times over.
 const PRIME_STRIDE: u64 = 100;
 
+/// Ids between two keys of the pass that fills the warm cache of a table
+/// whose value pages are bounded by bytes: every id.
+const BYTE_PAGE_PRIME_STRIDE: u64 = 1;
+
 /// The samples a run reserves beyond what its warm-up rate predicts,
 /// relative to that prediction: twice, so a run faster than its warm-up
 /// still records into memory reserved before it started.
 const SAMPLE_HEADROOM: usize = 2;
 
-/// Pools of hits and misses over `shape`'s key space: uniform random ids of
-/// the first build, as keys and as the absent key just above each.
-fn key_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
+/// The ids of the hit pool over `shape`'s key space, in its order: uniform
+/// random ids of the first build.
+fn hit_ids(shape: TableShape) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(KEY_SEED);
-    let hits: Vec<Key> = (0..KEY_POOL)
-        .map(|_| shape.key(rng.random_range(0..shape.rows)))
-        .collect();
+    (0..KEY_POOL)
+        .map(|_| rng.random_range(0..shape.rows))
+        .collect()
+}
+
+/// Pools of hits and misses over `shape`'s key space: the `hit_ids` as
+/// keys and as the absent key just above each.
+fn key_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
+    let hits: Vec<Key> = hit_ids(shape).into_iter().map(|id| shape.key(id)).collect();
     let misses = hits.iter().map(absent_key_from).collect();
     (Arc::new(hits), Arc::new(misses))
+}
+
+/// The top-level fields the few-field projections keep: two scalars and
+/// a short text, none of the filler that is most of a value's bytes, so a
+/// projection returns a few dozen bytes whatever the value's length.
+const PROJECT_FEW: [u32; 3] = [ID_FIELD, NAME_FIELD, FLAGS_FIELD];
+
+/// The top-level fields the most-field projection keeps: every field a
+/// value holds but `NAME_FIELD`, the filler included, so the walk copies
+/// nearly the whole value.
+const PROJECT_MOST: [u32; 6] = [
+    ID_FIELD,
+    CHECKSUM_FIELD,
+    SCORES_FIELD,
+    FLAGS_FIELD,
+    GROUP_FIELD,
+    FILLER_FIELD,
+];
+
+/// `VALUE_COLUMN` whole: what every scenario reads unless it says
+/// otherwise.
+const VALUE_READS: [ColumnRead<'static>; 1] = [ColumnRead::whole(VALUE_COLUMN)];
+
+/// Both value columns of a protobuf table, whole.
+const BOTH_READS: [ColumnRead<'static>; 2] = [
+    ColumnRead::whole(VALUE_COLUMN),
+    ColumnRead::whole(SECOND_VALUE_COLUMN),
+];
+
+/// `VALUE_COLUMN` projected to `PROJECT_FEW`.
+const FEW_READS: [ColumnRead<'static>; 1] = [ColumnRead {
+    name: VALUE_COLUMN,
+    fields: &PROJECT_FEW,
+}];
+
+/// `VALUE_COLUMN` projected to `PROJECT_MOST`.
+const MOST_READS: [ColumnRead<'static>; 1] = [ColumnRead {
+    name: VALUE_COLUMN,
+    fields: &PROJECT_MOST,
+}];
+
+/// No column: a lookup that answers presence alone.
+const NO_READS: [ColumnRead<'static>; 0] = [];
+
+/// What an operation reads of each row it finds. The reads are static, so
+/// naming them allocates nothing inside a measured operation.
+#[derive(Clone, Debug)]
+enum Reads {
+    /// Columns read whole, or none: the bytes read are those returned.
+    Whole(&'static [ColumnRead<'static>]),
+    /// Columns of which `VALUE_COLUMN` is projected, and per key of the
+    /// operation's pool its whole value's bytes, which the walk reads
+    /// whatever it returns.
+    Projected {
+        columns: &'static [ColumnRead<'static>],
+        whole: Arc<Vec<usize>>,
+    },
+}
+
+/// `VALUE_COLUMN` read whole.
+const WHOLE_VALUE: Reads = Reads::Whole(&VALUE_READS);
+
+impl Reads {
+    fn columns(&self) -> &'static [ColumnRead<'static>] {
+        match self {
+            Self::Whole(columns) | Self::Projected { columns, .. } => columns,
+        }
+    }
+
+    /// The value bytes read for the pool keys `at`, which returned
+    /// `returned`.
+    fn read_bytes(&self, at: std::ops::Range<usize>, returned: usize) -> usize {
+        match self {
+            Self::Whole(_) => returned,
+            Self::Projected { whole, .. } => whole[at].iter().sum(),
+        }
+    }
+}
+
+/// The value bytes a run's operations read and returned, summed over every
+/// column they named. A projection reads the whole value and returns what
+/// it keeps; a whole read returns what it reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct ValueBytes {
+    read: u64,
+    returned: u64,
+}
+
+impl ValueBytes {
+    fn of(read: usize, returned: usize) -> Self {
+        Self {
+            read: approx::count(read),
+            returned: approx::count(returned),
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            read: self.read + other.read,
+            returned: self.returned + other.returned,
+        }
+    }
+}
+
+/// The bytes `row` returned over the `columns` values it carries, or `None`
+/// when its key was absent or it does not carry a value for each column:
+/// a null, which no benchmark table holds, or a wrong count.
+fn returned_bytes(row: &Row, columns: usize) -> Option<usize> {
+    match row {
+        Row::Present(values) if values.len() == columns => values
+            .iter()
+            .try_fold(0, |sum, value| Some(sum + value.as_ref()?.len())),
+        Row::Present(_) | Row::Absent => None,
+    }
 }
 
 /// What one operation of a run does.
 #[derive(Clone)]
 enum Op {
-    /// One `get` of the next pool key, which must answer present, or absent
-    /// when `present` is false.
-    Get { keys: Arc<Vec<Key>>, present: bool },
-    /// One `multi_get` of the next `batch` pool keys, all present.
-    MultiGet { keys: Arc<Vec<Key>>, batch: usize },
+    /// One `get` of the next pool key reading `reads`, which must answer
+    /// present with a value per column, or absent when `present` is false.
+    Get {
+        keys: Arc<Vec<Key>>,
+        present: bool,
+        reads: Reads,
+    },
+    /// One `multi_get` of the next `batch` pool keys reading `reads`, all
+    /// present with a value per column.
+    MultiGet {
+        keys: Arc<Vec<Key>>,
+        batch: usize,
+        reads: Reads,
+    },
 }
 
 impl Op {
-    /// Runs operation `i`; an answer of the wrong presence is an error, so
-    /// a run that measured nothing but failures cannot pass for fast.
-    async fn run(&self, table: &Table, i: usize) -> BenchResult<()> {
+    /// Runs operation `i` and returns the value bytes it read and
+    /// returned; an answer of the wrong presence is an error, so a run that
+    /// measured nothing but failures cannot pass for fast.
+    async fn run(&self, table: &Table, i: usize) -> BenchResult<ValueBytes> {
         match self {
-            Self::Get { keys, present } => {
-                let lookup = table
-                    .get(&keys[i % keys.len()], &[ColumnRead::whole(VALUE_COLUMN)])
-                    .await?;
-                let found = icetray_testkit::verify::one_value(&lookup.row).is_some();
-                if found != *present {
+            Self::Get {
+                keys,
+                present,
+                reads,
+            } => {
+                let at = i % keys.len();
+                let lookup = table.get(&keys[at], reads.columns()).await?;
+                let returned = returned_bytes(&lookup.row, reads.columns().len());
+                if returned.is_some() != *present {
                     return Err(format!("key {i} answered {:?}", lookup.row).into());
                 }
+                let returned = returned.unwrap_or(0);
+                Ok(ValueBytes::of(
+                    reads.read_bytes(at..at + 1, returned),
+                    returned,
+                ))
             }
-            Self::MultiGet { keys, batch } => {
+            Self::MultiGet { keys, batch, reads } => {
                 let start = (i * batch) % (keys.len() - batch);
                 let lookup = table
-                    .multi_get(
-                        &keys[start..start + batch],
-                        &[ColumnRead::whole(VALUE_COLUMN)],
-                    )
+                    .multi_get(&keys[start..start + batch], reads.columns())
                     .await?;
-                if !lookup
-                    .rows
-                    .iter()
-                    .all(|row| icetray_testkit::verify::one_value(row).is_some())
-                {
-                    return Err(format!("batch {i} answered a key absent").into());
+                let mut returned = 0;
+                for row in &lookup.rows {
+                    returned += returned_bytes(row, reads.columns().len())
+                        .ok_or_else(|| format!("batch {i} answered a key absent"))?;
                 }
+                Ok(ValueBytes::of(
+                    reads.read_bytes(start..start + batch, returned),
+                    returned,
+                ))
             }
         }
-        Ok(())
     }
 }
 
@@ -1066,6 +1436,10 @@ enum Pace {
     Yielding,
 }
 
+/// What a run's task loops did: the operations, their samples when
+/// recorded, and the value bytes they read and returned.
+type Done = (usize, Vec<Duration>, ValueBytes);
+
 /// One task's share of a run: operations `task`, `task + tasks`, ... until
 /// `until`, each timed into `samples` when it is given.
 async fn task_loop(
@@ -1075,24 +1449,26 @@ async fn task_loop(
     pace: Pace,
     until: Instant,
     mut samples: Option<Vec<Duration>>,
-) -> BenchResult<(usize, Vec<Duration>)> {
+) -> BenchResult<Done> {
     let mut done = 0;
+    let mut bytes = ValueBytes::default();
     while Instant::now() < until {
         let started = Instant::now();
-        op.run(&table, done * tasks + task).await?;
+        let op_bytes = op.run(&table, done * tasks + task).await?;
         if let Some(samples) = samples.as_mut() {
             samples.push(started.elapsed());
         }
+        bytes = bytes.plus(op_bytes);
         done += 1;
         if let Pace::Yielding = pace {
             tokio::task::yield_now().await;
         }
     }
-    Ok((done, samples.unwrap_or_default()))
+    Ok((done, samples.unwrap_or_default(), bytes))
 }
 
 /// The task loops of a run, as they are spawned.
-type Loops = Vec<tokio::task::JoinHandle<BenchResult<(usize, Vec<Duration>)>>>;
+type Loops = Vec<tokio::task::JoinHandle<BenchResult<Done>>>;
 
 /// `tasks` task loops of `op` over `table` at `pace` until `until`, each
 /// reserving `reserve` samples when recording, spawned and not yet joined.
@@ -1118,14 +1494,15 @@ fn spawn_loops(
 }
 
 /// `tasks` task loops for `length`, each reserving `reserve` samples when
-/// recording; the operations done and the samples, merged.
+/// recording; the operations done, the samples, and the value bytes,
+/// merged.
 async fn spawn_run(
     served: &Served,
     op: &Op,
     tasks: usize,
     length: Duration,
     reserve: Option<usize>,
-) -> BenchResult<(usize, Vec<Duration>)> {
+) -> BenchResult<Done> {
     let until = Instant::now() + length;
     join_loops(spawn_loops(
         &served.table,
@@ -1137,17 +1514,19 @@ async fn spawn_run(
     .await
 }
 
-/// Waits for every loop of `handles`; the operations they did and their
-/// samples, merged.
-async fn join_loops(handles: Loops) -> BenchResult<(usize, Vec<Duration>)> {
+/// Waits for every loop of `handles`; the operations they did, their
+/// samples, and their value bytes, merged.
+async fn join_loops(handles: Loops) -> BenchResult<Done> {
     let mut done = 0;
     let mut samples = Vec::new();
+    let mut bytes = ValueBytes::default();
     for handle in handles {
-        let (ops, mut task_samples) = handle.await??;
+        let (ops, mut task_samples, task_bytes) = handle.await??;
         done += ops;
         samples.append(&mut task_samples);
+        bytes = bytes.plus(task_bytes);
     }
-    Ok((done, samples))
+    Ok((done, samples, bytes))
 }
 
 /// Counters of a served table and the process, read before and after a
@@ -1207,6 +1586,8 @@ struct Measured {
     /// Every operation's latency.
     latencies: Latencies,
     counters: Counters,
+    /// The value bytes the operations read and returned.
+    bytes: ValueBytes,
 }
 
 /// One second, the unit of the throughput figure.
@@ -1246,6 +1627,8 @@ impl Measured {
             "gets_per_op": self.per_op(counters.gets),
             "local_reads_per_op": self.per_op(counters.local_reads),
             "hedges": counters.hedges,
+            "value_bytes_read_per_op": self.per_op(self.bytes.read),
+            "value_bytes_returned_per_op": self.per_op(self.bytes.returned),
         })
     }
 }
@@ -1262,12 +1645,12 @@ async fn measure(
     duration: Duration,
     windows: u64,
 ) -> BenchResult<Measured> {
-    let (warm_ops, _) = spawn_run(served, op, label.tasks, warmup, None).await?;
+    let (warm_ops, _, _) = spawn_run(served, op, label.tasks, warmup, None).await?;
     let windows = approx::length(windows);
     let reserve = (warm_ops / label.tasks + 1) * windows * SAMPLE_HEADROOM;
     let before = Counters::read(served);
     let started = Instant::now();
-    let (ops, samples) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
+    let (ops, samples, bytes) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
     let keys_per_op = match op {
@@ -1281,19 +1664,34 @@ async fn measure(
         elapsed,
         latencies: Latencies::of(samples),
         counters,
+        bytes,
     })
 }
 
-/// Asks every page of the table once, `PRIME_STRIDE` ids apart, so the
-/// warm cache holds every value page (and under Bloom every key page)
-/// before a warm run starts.
+/// Asks every page of the table, of every column it serves, at least once,
+/// `prime_stride` ids apart, so the warm cache holds every value page (and
+/// under Bloom every key page) before a warm run starts.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
-    for id in (0..shape.rows).step_by(approx::length(PRIME_STRIDE)) {
-        table
-            .get(&shape.key(id), &[ColumnRead::whole(VALUE_COLUMN)])
-            .await?;
+    for id in (0..shape.rows).step_by(approx::length(shape.prime_stride())) {
+        table.get(&shape.key(id), shape.whole_reads()).await?;
     }
     Ok(())
+}
+
+/// Per key of the hit pool (`hit_ids`), the bytes of its whole
+/// `VALUE_COLUMN` value as the first build wrote it (`value_of_kind`), which
+/// a whole read of it returns: what a projection of that key reads. Each
+/// row's value is built once, outside any measured window.
+fn whole_lengths(shape: TableShape) -> Arc<Vec<usize>> {
+    let by_id: Vec<usize> = (0..shape.rows)
+        .map(|id| value_of_kind(&shape.key(id), shape.value_bytes, shape.values.kind()).len())
+        .collect();
+    Arc::new(
+        hit_ids(shape)
+            .into_iter()
+            .map(|id| by_id[approx::length(id)])
+            .collect(),
+    )
 }
 
 /// Settings every lookup run shares.
@@ -1333,14 +1731,34 @@ async fn lookups(
     } else {
         None
     };
+    let whole = scenarios
+        .iter()
+        .any(|s| s.projects())
+        .then(|| whole_lengths(shape));
+    let projected = |columns| Reads::Projected {
+        columns,
+        whole: Arc::clone(
+            whole
+                .as_ref()
+                .expect("whole lengths are read when a projecting scenario is selected"),
+        ),
+    };
     let mut results = Vec::new();
     for &scenario in scenarios {
         let (served, op) = match scenario {
-            Scenario::WarmHit => (&warm, get(&hits, true)),
-            Scenario::ColdHit => (&cold, get(&hits, true)),
-            Scenario::Miss => (&warm, get(&misses, false)),
-            Scenario::MultiGet100 => (&warm, multi(&hits, BATCH_100)),
-            Scenario::MultiGet1000 => (&warm, multi(&hits, BATCH_1000)),
+            Scenario::WarmHit => (&warm, get(&hits, true, WHOLE_VALUE)),
+            Scenario::ColdHit => (&cold, get(&hits, true, WHOLE_VALUE)),
+            Scenario::Miss => (&warm, get(&misses, false, WHOLE_VALUE)),
+            Scenario::MultiGet100 => (&warm, multi(&hits, BATCH_100, WHOLE_VALUE)),
+            Scenario::MultiGet1000 => (&warm, multi(&hits, BATCH_1000, WHOLE_VALUE)),
+            Scenario::WarmHitBoth => (&warm, get(&hits, true, Reads::Whole(&BOTH_READS))),
+            Scenario::PresenceHit => (&warm, get(&hits, true, Reads::Whole(&NO_READS))),
+            Scenario::WarmHitProjectFew => (&warm, get(&hits, true, projected(&FEW_READS))),
+            Scenario::WarmHitProjectMost => (&warm, get(&hits, true, projected(&MOST_READS))),
+            Scenario::MultiGet100Both => {
+                (&warm, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
+            }
+            Scenario::MultiGet100Project => (&warm, multi(&hits, BATCH_100, projected(&FEW_READS))),
             Scenario::Load | Scenario::Refresh | Scenario::TwoTable => continue,
         };
         let served = served
@@ -1378,17 +1796,19 @@ async fn lookups(
 const BATCH_100: usize = 100;
 const BATCH_1000: usize = 1_000;
 
-fn get(keys: &Arc<Vec<Key>>, present: bool) -> Op {
+fn get(keys: &Arc<Vec<Key>>, present: bool, reads: Reads) -> Op {
     Op::Get {
         keys: Arc::clone(keys),
         present,
+        reads,
     }
 }
 
-fn multi(keys: &Arc<Vec<Key>>, batch: usize) -> Op {
+fn multi(keys: &Arc<Vec<Key>>, batch: usize, reads: Reads) -> Op {
     Op::MultiGet {
         keys: Arc::clone(keys),
         batch,
+        reads,
     }
 }
 
@@ -1428,7 +1848,8 @@ async fn serve_together(
 /// loops would otherwise hold every worker, and the batch and its runs
 /// would wait for the window to end. One row per table. Neither row carries counters: both tables'
 /// operations run in one window over one storage and one cache, so no
-/// count belongs to either row alone.
+/// count belongs to either row alone; each carries the value bytes its own
+/// loops read and returned.
 async fn two_tables(
     prepared: &[Prepared],
     tier: Tier,
@@ -1443,8 +1864,8 @@ async fn two_tables(
     let (long, string) = (find(TableName::Long)?, find(TableName::String)?);
     let (tables, _dir) = serve_together(&[long, string], tier).await?;
     let (long_table, string_table) = (&tables[0], &tables[1]);
-    let hit_op = get(&key_pools(long.shape).0, true);
-    let batch_op = multi(&key_pools(string.shape).0, BATCH_1000);
+    let hit_op = get(&key_pools(long.shape).0, true, WHOLE_VALUE);
+    let batch_op = multi(&key_pools(string.shape).0, BATCH_1000, WHOLE_VALUE);
     let hits = (&hit_op, Pace::Yielding);
     let batches = (&batch_op, Pace::Yielding);
     let tasks = settings.tasks;
@@ -1453,8 +1874,8 @@ async fn two_tables(
     let until = Instant::now() + settings.warmup;
     let hit_loops = spawn_loops(long_table, hits, tasks, until, None);
     let batch_loops = spawn_loops(string_table, batches, one, until, None);
-    let (warm_hits, _) = join_loops(hit_loops).await?;
-    let (warm_batches, _) = join_loops(batch_loops).await?;
+    let (warm_hits, _, _) = join_loops(hit_loops).await?;
+    let (warm_batches, _, _) = join_loops(batch_loops).await?;
 
     let windows = approx::length(settings.windows);
     let reserve = |ops: usize, tasks: usize| Some((ops / tasks + 1) * windows * SAMPLE_HEADROOM);
@@ -1468,8 +1889,8 @@ async fn two_tables(
         until,
         reserve(warm_batches, one),
     );
-    let (hit_ops, hit_samples) = join_loops(hit_loops).await?;
-    let (batch_ops, batch_samples) = join_loops(batch_loops).await?;
+    let (hit_ops, hit_samples, hit_bytes) = join_loops(hit_loops).await?;
+    let (batch_ops, batch_samples, batch_bytes) = join_loops(batch_loops).await?;
     let elapsed = started.elapsed();
 
     let label = |table, mode, tasks| RunLabel {
@@ -1487,6 +1908,7 @@ async fn two_tables(
             elapsed,
             latencies: Latencies::of(batch_samples),
             counters: Counters::default(),
+            bytes: batch_bytes,
         },
         Measured {
             label: label(long.shape, Mode::Multi, tasks),
@@ -1495,6 +1917,7 @@ async fn two_tables(
             elapsed,
             latencies: Latencies::of(hit_samples),
             counters: Counters::default(),
+            bytes: hit_bytes,
         },
     ];
     for run in &rows {
@@ -1739,7 +2162,7 @@ fn mib(bytes: u64) -> f64 {
 /// The column headings of the lookup table.
 fn header() -> String {
     format!(
-        "{:<15} {:<11} {:<6} {:<7} {:>5} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8}",
+        "{:<21} {:<19} {:<6} {:<7} {:>5} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>10} {:>10}",
         "scenario",
         "table",
         "tier",
@@ -1753,14 +2176,16 @@ fn header() -> String {
         "allocs/op",
         "bytes/op",
         "fetch/op",
-        "reads/op"
+        "reads/op",
+        "read B/op",
+        "ret B/op"
     )
 }
 
 fn row(run: &Measured) -> String {
     let counters = run.counters;
     format!(
-        "{:<15} {:<11} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3}",
+        "{:<21} {:<19} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0}",
         run.label.scenario.name(),
         run.label.table.table_name(),
         format!("{:?}", run.label.tier).to_lowercase(),
@@ -1775,12 +2200,14 @@ fn row(run: &Measured) -> String {
         run.per_op(counters.allocations.bytes),
         run.per_op(counters.fetches),
         run.per_op(counters.gets + counters.local_reads),
+        run.per_op(run.bytes.read),
+        run.per_op(run.bytes.returned),
     )
 }
 
 fn load_header() -> String {
     format!(
-        "{:<26} {:<11} {:<6} {:>5} {:>10} {:>10} {:>11} {:>10} {:>10} {:>9} {:>6} {:>10}",
+        "{:<26} {:<19} {:<6} {:>5} {:>10} {:>10} {:>11} {:>10} {:>10} {:>9} {:>6} {:>10}",
         "what",
         "table",
         "tier",
@@ -1798,7 +2225,7 @@ fn load_header() -> String {
 
 fn load_row(run: &Loaded) -> String {
     format!(
-        "{:<26} {:<11} {:<6} {:>5} {:>10.1?} {:>10.1?} {:>11} {:>10.1} {:>10.1} {:>9} {:>6} {:>10.1}",
+        "{:<26} {:<19} {:<6} {:>5} {:>10.1?} {:>10.1?} {:>11} {:>10.1} {:>10.1} {:>9} {:>6} {:>10.1}",
         run.what,
         run.table.table_name(),
         format!("{:?}", run.tier).to_lowercase(),
@@ -1913,18 +2340,32 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
 }
 
 /// The lookup scenarios of `scenarios` that measure what they say on
-/// `shape`: all of them, or without the warm ones when the warm cache
-/// cannot hold the table's value pages, which it says.
+/// `shape`: all of them, without the warm ones when the warm cache cannot
+/// hold the table's value pages, and without those reading a second
+/// column or a projection when the table is not a protobuf table, each
+/// of which it says.
 fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
     let fits = shape.fits_warm_cache();
-    let kept: Vec<Scenario> = scenarios
+    let protobuf = shape.values.is_protobuf();
+    let warm_kept: Vec<Scenario> = scenarios
         .iter()
         .copied()
         .filter(|scenario| fits || !scenario.is_warm())
         .collect();
-    if kept.len() < scenarios.len() {
+    if warm_kept.len() < scenarios.len() {
         eprintln!(
             "{}: warm scenarios skipped, its value pages outrun the warm cache",
+            shape.table_name()
+        );
+    }
+    let kept: Vec<Scenario> = warm_kept
+        .iter()
+        .copied()
+        .filter(|scenario| protobuf || !scenario.needs_protobuf())
+        .collect();
+    if kept.len() < warm_kept.len() {
+        eprintln!(
+            "{}: column and projection scenarios skipped, it is not a protobuf table",
             shape.table_name()
         );
     }
@@ -2030,6 +2471,8 @@ async fn main() -> BenchResult<()> {
             "key_pool": KEY_POOL,
             "key_seed": KEY_SEED,
             "warm_cache_bytes": WARM_CACHE_BYTES,
+            "project_few_fields": PROJECT_FEW,
+            "project_most_fields": PROJECT_MOST,
             "cold_cache_bytes": COLD_CACHE_BYTES,
             "warmup_seconds": cli.warmup,
             "duration_seconds": cli.duration,
