@@ -231,10 +231,24 @@ enum Scenario {
     /// Protobuf tables only.
     #[value(name = "multi-get-100-project")]
     MultiGet100Project,
+    /// A cold hit naming both value columns: against `cold-hit`, what a
+    /// second column's concurrent GET adds to the latency. Protobuf tables
+    /// only.
+    ColdHitBoth,
+    /// A cold hit projecting `value` to `PROJECT_FEW`: against `cold-hit`,
+    /// the walk's cost beside a GET. Protobuf tables only.
+    ColdHitProjectFew,
+    /// A `MultiGet` of 100 cold hits: the batch fan-out under GETs.
+    #[value(name = "multi-get-100-cold")]
+    MultiGet100Cold,
+    /// A `MultiGet` of 100 cold hits naming both value columns, two GETs a
+    /// key under one fan-out. Protobuf tables only.
+    #[value(name = "multi-get-100-cold-both")]
+    MultiGet100ColdBoth,
 }
 
 impl Scenario {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 18] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -249,9 +263,13 @@ impl Scenario {
         Self::WarmHitProjectMost,
         Self::MultiGet100Both,
         Self::MultiGet100Project,
+        Self::ColdHitBoth,
+        Self::ColdHitProjectFew,
+        Self::MultiGet100Cold,
+        Self::MultiGet100ColdBoth,
     ];
 
-    const LOOKUPS: [Self; 11] = [
+    const LOOKUPS: [Self; 15] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -263,6 +281,10 @@ impl Scenario {
         Self::WarmHitProjectMost,
         Self::MultiGet100Both,
         Self::MultiGet100Project,
+        Self::ColdHitBoth,
+        Self::ColdHitProjectFew,
+        Self::MultiGet100Cold,
+        Self::MultiGet100ColdBoth,
     ];
 
     /// Whether the scenario measures a page cache primed to hold every
@@ -279,8 +301,28 @@ impl Scenario {
             | Self::WarmHitProjectMost
             | Self::MultiGet100Both
             | Self::MultiGet100Project => true,
-            Self::ColdHit | Self::Miss | Self::Load | Self::Refresh => false,
+            Self::ColdHit
+            | Self::Miss
+            | Self::Load
+            | Self::Refresh
+            | Self::ColdHitBoth
+            | Self::ColdHitProjectFew
+            | Self::MultiGet100Cold
+            | Self::MultiGet100ColdBoth => false,
         }
+    }
+
+    /// Whether the scenario measures hits through the `COLD_CACHE_BYTES`
+    /// page cache, which holds almost none of the table's value pages.
+    fn is_cold(self) -> bool {
+        matches!(
+            self,
+            Self::ColdHit
+                | Self::ColdHitBoth
+                | Self::ColdHitProjectFew
+                | Self::MultiGet100Cold
+                | Self::MultiGet100ColdBoth
+        )
     }
 
     /// Whether the scenario reads `SECOND_VALUE_COLUMN` or projects
@@ -291,7 +333,10 @@ impl Scenario {
             | Self::WarmHitProjectFew
             | Self::WarmHitProjectMost
             | Self::MultiGet100Both
-            | Self::MultiGet100Project => true,
+            | Self::MultiGet100Project
+            | Self::ColdHitBoth
+            | Self::ColdHitProjectFew
+            | Self::MultiGet100ColdBoth => true,
             Self::WarmHit
             | Self::ColdHit
             | Self::Miss
@@ -300,7 +345,8 @@ impl Scenario {
             | Self::Load
             | Self::Refresh
             | Self::TwoTable
-            | Self::PresenceHit => false,
+            | Self::PresenceHit
+            | Self::MultiGet100Cold => false,
         }
     }
 
@@ -308,7 +354,10 @@ impl Scenario {
     /// key are then the whole value's, not what it returns.
     fn projects(self) -> bool {
         match self {
-            Self::WarmHitProjectFew | Self::WarmHitProjectMost | Self::MultiGet100Project => true,
+            Self::WarmHitProjectFew
+            | Self::WarmHitProjectMost
+            | Self::MultiGet100Project
+            | Self::ColdHitProjectFew => true,
             Self::WarmHit
             | Self::ColdHit
             | Self::Miss
@@ -319,7 +368,10 @@ impl Scenario {
             | Self::TwoTable
             | Self::WarmHitBoth
             | Self::PresenceHit
-            | Self::MultiGet100Both => false,
+            | Self::MultiGet100Both
+            | Self::ColdHitBoth
+            | Self::MultiGet100Cold
+            | Self::MultiGet100ColdBoth => false,
         }
     }
 
@@ -339,6 +391,10 @@ impl Scenario {
             Self::WarmHitProjectMost => "warm-hit-project-most",
             Self::MultiGet100Both => "multi-get-100-both",
             Self::MultiGet100Project => "multi-get-100-project",
+            Self::ColdHitBoth => "cold-hit-both",
+            Self::ColdHitProjectFew => "cold-hit-project-few",
+            Self::MultiGet100Cold => "multi-get-100-cold",
+            Self::MultiGet100ColdBoth => "multi-get-100-cold-both",
         }
     }
 }
@@ -1755,7 +1811,7 @@ async fn lookups(
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let warm_needed = scenarios.iter().any(|s| *s != Scenario::ColdHit);
+    let warm_needed = scenarios.iter().any(|s| !s.is_cold());
     let warm = if warm_needed {
         let served = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), None).await?;
         served.table.load().await?;
@@ -1764,7 +1820,7 @@ async fn lookups(
     } else {
         None
     };
-    let cold = if scenarios.contains(&Scenario::ColdHit) {
+    let cold = if scenarios.iter().any(|s| s.is_cold()) {
         let served = serve(prepared, tier, COLD_CACHE_BYTES, pinned(prepared), None).await?;
         served.table.load().await?;
         Some(served)
@@ -1799,6 +1855,12 @@ async fn lookups(
                 (&warm, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
             }
             Scenario::MultiGet100Project => (&warm, multi(&hits, BATCH_100, projected(&FEW_READS))),
+            Scenario::ColdHitBoth => (&cold, get(&hits, true, Reads::Whole(&BOTH_READS))),
+            Scenario::ColdHitProjectFew => (&cold, get(&hits, true, projected(&FEW_READS))),
+            Scenario::MultiGet100Cold => (&cold, multi(&hits, BATCH_100, WHOLE_VALUE)),
+            Scenario::MultiGet100ColdBoth => {
+                (&cold, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
+            }
             Scenario::Load | Scenario::Refresh | Scenario::TwoTable => continue,
         };
         let served = served
