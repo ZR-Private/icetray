@@ -26,8 +26,8 @@ use std::error::Error;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,7 @@ use clap::{Parser, ValueEnum};
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
-    LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    LocalConfig, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig, TableConfig,
     ValueColumnConfig, ValueFormat,
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
@@ -507,6 +507,46 @@ struct Cli {
     /// difference against a run with it is the metrics' cost.
     #[arg(long)]
     no_metrics: bool,
+    /// A location rewrite, `FROM=TO`, applied to every location the tables'
+    /// metadata names, as `[[storage.rewrite]]` applies it; repeatable. A
+    /// table written under a local directory and copied to object storage
+    /// is read from the copy with
+    /// `--rewrite-location file:///dir/=s3://bucket/dir/`.
+    #[arg(long, value_parser = parse_rewrite)]
+    rewrite_location: Vec<RewriteRule>,
+}
+
+/// What separates a `--rewrite-location` rule's two prefixes.
+const REWRITE_SEPARATOR: char = '=';
+
+/// A `--rewrite-location` rule from `FROM=TO`, split at the first `=`.
+fn parse_rewrite(text: &str) -> Result<RewriteRule, String> {
+    let (from, to) = text
+        .split_once(REWRITE_SEPARATOR)
+        .ok_or_else(|| format!("{text:?} is not FROM=TO"))?;
+    Ok(RewriteRule {
+        from: from.to_string(),
+        to: to.to_string(),
+    })
+}
+
+/// The storage configuration every table of the run is served over: the
+/// production defaults with the run's `--rewrite-location` rules.
+static STORAGE_CONFIG: OnceLock<StorageConfig> = OnceLock::new();
+
+/// Sets `STORAGE_CONFIG` from `cli`'s `--rewrite-location` rules, once.
+fn set_storage_config(cli: &Cli) {
+    STORAGE_CONFIG
+        .set(StorageConfig {
+            rewrite: cli.rewrite_location.clone(),
+            ..StorageConfig::default()
+        })
+        .expect("main sets the storage configuration once");
+}
+
+/// `STORAGE_CONFIG`, or the defaults before `main` sets it.
+fn storage_config() -> StorageConfig {
+    STORAGE_CONFIG.get().cloned().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1162,7 @@ async fn serve(
     source: SourceConfig,
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
-    let storage = Arc::new(Storage::new(StorageConfig::default()));
+    let storage = Arc::new(Storage::new(storage_config()));
     let (local, dir) = local_for(tier, &storage, reuse)?;
     let cache = PageCache::new(cache_bytes, None).await?;
     let handles = TableHandles {
@@ -1822,7 +1862,7 @@ async fn serve_together(
     prepared: &[&Prepared],
     tier: Tier,
 ) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
-    let storage = Arc::new(Storage::new(StorageConfig::default()));
+    let storage = Arc::new(Storage::new(storage_config()));
     let (local, dir) = local_for(tier, &storage, None)?;
     let handles = TableHandles {
         storage,
@@ -2391,6 +2431,7 @@ fn install_recorder() -> BenchResult<()> {
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     let cli = Cli::parse();
+    set_storage_config(&cli);
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
