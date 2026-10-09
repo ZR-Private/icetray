@@ -10,10 +10,8 @@
 //! column and adds another under the same name changes what an unchanged
 //! file means.
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fmt::Write as _;
 
 use bytes::Bytes;
 use iceberg::spec::{DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveLiteral, TableMetadata};
@@ -136,11 +134,8 @@ pub(crate) enum Found {
 /// `Found::Absent`, and a file that records none cannot tell. A file
 /// records field ids when every top-level column carries one; one where
 /// only some do records none. A column of that name is the one named
-/// `name`, else the one named `avro_compatible(name)`, the name Iceberg's
-/// Java writers give it in the file, when that one carries `field_id`:
-/// those writers always record field ids, and the escaped form can be the
-/// name of another column, `a_x2Db` beside `a-b` in the schema, so a
-/// column under it with another field id or none is not this one.
+/// exactly `name`; configuration validation admits only names that
+/// Iceberg's writers record unchanged (`is_served_name`).
 pub(crate) fn find(
     schema: &SchemaDescriptor,
     name: &str,
@@ -149,17 +144,7 @@ pub(crate) fn find(
     let fields = schema.root_schema().get_fields();
     let ids: Vec<Option<i32>> = fields.iter().map(|field| field_id_of(field)).collect();
     let records_ids = ids.iter().all(Option::is_some);
-    let compatible = avro_compatible(name);
-    let named = fields
-        .iter()
-        .position(|field| field.name() == name)
-        .or_else(|| {
-            fields
-                .iter()
-                .zip(&ids)
-                .position(|(field, &id)| field.name() == compatible && id == Some(field_id))
-        });
-    match named {
+    match fields.iter().position(|field| field.name() == name) {
         Some(at) => match ids[at] {
             Some(found) if found != field_id => Err(ColumnMismatch::OtherFieldId {
                 expected: field_id,
@@ -180,48 +165,32 @@ pub(crate) fn find(
     }
 }
 
-/// The prefix `avro_compatible` gives a character a name may not hold
-/// where it is, before the character's UTF-16 code unit in uppercase hex.
-const AVRO_ESCAPE: &str = "_x";
-
-/// The prefix `avro_compatible` gives a digit that starts a name.
-const AVRO_DIGIT_ESCAPE: char = '_';
-
-/// `name` as Iceberg's Java writers name its column in a Parquet file:
-/// `TypeToMessageType` names every field
-/// `AvroSchemaUtil.makeCompatibleName(name)` (apache/iceberg,
+/// Whether `name` is a valid Avro name: an ASCII letter or `_`, then
+/// ASCII letters, digits, and `_`. Iceberg's Java writers name a column in
+/// a Parquet file `AvroSchemaUtil.makeCompatibleName(name)` (apache/iceberg,
 /// core/src/main/java/org/apache/iceberg/avro/AvroSchemaUtil.java), which
-/// keeps a name that starts with a letter or `_` and goes on in letters,
-/// digits, and `_`, and otherwise replaces, per UTF-16 code unit, a
-/// leading digit `d` with `_d` and every other unit outside those classes
-/// with `_x` and the unit's uppercase hex: `user-id` is `user_x2Did`, `1st`
-/// is `_1st`. A surrogate is never a letter or digit, as in Java. For
-/// ASCII the classes are Java's exactly; beyond it they are Rust's
-/// `char::is_alphabetic` and `char::is_numeric`, which differ from Java's
-/// `Character.isLetter` and `isDigit` on a few characters.
-fn avro_compatible(name: &str) -> Cow<'_, str> {
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let kept = |at: usize, unit: u16| {
-        char::from_u32(u32::from(unit)).is_some_and(|character| {
-            character == '_' || character.is_alphabetic() || (at > 0 && character.is_numeric())
-        })
-    };
-    if units.iter().enumerate().all(|(at, &unit)| kept(at, unit)) {
-        return Cow::Borrowed(name);
-    }
-    let mut compatible = String::with_capacity(name.len());
-    for (at, &unit) in units.iter().enumerate() {
-        match char::from_u32(u32::from(unit)) {
-            Some(character) if kept(at, unit) => compatible.push(character),
-            Some(digit) if digit.is_numeric() => {
-                compatible.push(AVRO_DIGIT_ESCAPE);
-                compatible.push(digit);
-            }
-            Some(_) | None => write!(compatible, "{AVRO_ESCAPE}{unit:X}")
-                .expect("writing to a String does not fail"),
-        }
-    }
-    Cow::Owned(compatible)
+/// keeps such a name and rewrites any other with escapes, `user-id` as
+/// `user_x2Did`, so a file would hold the column under a name the schema
+/// does not give it and `find`, which matches the schema's name, would not
+/// find it. Configuration validation refuses any other name for a key or
+/// value column, so the name in every file Iceberg writes is the schema's.
+/// Non-ASCII letters, which Java's check also keeps, are outside the Avro
+/// name grammar and refused with the rest.
+pub(crate) fn is_served_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters.next().is_some_and(starts_served_name) && characters.all(continues_served_name)
+}
+
+/// A character a served column name may start with: an ASCII letter or
+/// `_`.
+fn starts_served_name(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+/// A character a served column name may hold after its first: an ASCII
+/// letter, an ASCII digit, or `_`.
+fn continues_served_name(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 /// The field id a top-level column of a Parquet schema carries, if any.
@@ -617,80 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn test_avro_compatible_escapes_as_iceberg_java_writers_name_columns() {
-        for (name, compatible) in [
-            ("user_id", "user_id"),
-            ("_1st", "_1st"),
-            ("user-id", "user_x2Did"),
-            ("1st", "_1st"),
-            ("a.b c", "a_x2Eb_x20c"),
-            ("día", "día"),
-            ("😀", "_xD83D_xDE00"),
-        ] {
-            assert_eq!(avro_compatible(name), compatible, "{name}");
+    fn test_is_served_name_admits_valid_avro_names_alone() {
+        for name in ["key", "user_id", "_1st", "_", "Value2", "A"] {
+            assert!(is_served_name(name), "{name}");
         }
-    }
-
-    #[test]
-    fn test_find_matches_the_name_an_iceberg_java_writer_gives_the_column() {
-        let message = "message m { required int64 _1key = 1; optional binary user_x2Did = 2; }";
-        assert_eq!(
-            found(message, "user-id", VALUE_FIELD_ID),
-            Ok(Found::Leaf(1))
-        );
-        assert_eq!(found(message, "1key", KEY_FIELD_ID), Ok(Found::Leaf(0)));
-        assert_eq!(
-            found(message, "user-id", OTHER_FIELD_ID),
-            Ok(Found::Absent),
-            "the escaped name under another field id is another column"
-        );
-    }
-
-    #[test]
-    fn test_find_prefers_the_exact_name_over_an_avro_escaped_sibling() {
-        /// The field ids of `a-b` and of its sibling `a_x2Db`, written `= 5`
-        /// and `= 6`; the file lists the sibling first.
-        const EXACT_FIELD_ID: i32 = 5;
-        const ESCAPED_FIELD_ID: i32 = 6;
-        let with_ids = "message m { required int64 key = 1; optional binary a_x2Db = 6; optional binary a-b = 5; }";
-        assert_eq!(found(with_ids, "a-b", EXACT_FIELD_ID), Ok(Found::Leaf(2)));
-        assert_eq!(
-            found(with_ids, "a_x2Db", ESCAPED_FIELD_ID),
-            Ok(Found::Leaf(1))
-        );
-        let without_ids =
-            "message m { required int64 key; optional binary a_x2Db; optional binary a-b; }";
-        assert_eq!(
-            found(without_ids, "a-b", EXACT_FIELD_ID),
-            Ok(Found::Leaf(2))
-        );
-        assert_eq!(
-            found(without_ids, "a_x2Db", ESCAPED_FIELD_ID),
-            Ok(Found::Leaf(1))
-        );
-        // A file written before `a-b` was added holds only its sibling:
-        // `a-b` is absent, never the sibling's bytes.
-        let sibling_only = "message m { required int64 key = 1; optional binary a_x2Db = 6; }";
-        assert_eq!(
-            found(sibling_only, "a-b", EXACT_FIELD_ID),
-            Ok(Found::Absent)
-        );
-        let sibling_only_without_ids = "message m { required int64 key; optional binary a_x2Db; }";
-        assert_eq!(
-            found(sibling_only_without_ids, "a-b", EXACT_FIELD_ID),
-            Err(ColumnMismatch::AbsentWithoutFieldIds)
-        );
-        // A key column under the escaped name does not answer for `a-b`.
-        let key_named_sibling = "message m { required binary a_x2Db = 1; }";
-        assert_eq!(
-            found(key_named_sibling, "a-b", EXACT_FIELD_ID),
-            Ok(Found::Absent)
-        );
-        let key_named_sibling_without_ids = "message m { required binary a_x2Db; }";
-        assert_eq!(
-            found(key_named_sibling_without_ids, "a-b", EXACT_FIELD_ID),
-            Err(ColumnMismatch::AbsentWithoutFieldIds)
-        );
+        for name in ["", "user-id", "a.b", "a b", "1st", "9", "día", "naïve"] {
+            assert!(!is_served_name(name), "{name}");
+        }
     }
 
     #[test]

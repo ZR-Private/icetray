@@ -45,9 +45,10 @@ pub use check::{
 };
 pub use column::ColumnMismatch;
 pub use config::{
-    Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig, LocalConfig, LogConfig,
-    Residency, RewriteFault, RewriteRule, S3Config, ServerConfig, SourceConfig, SourceSetting,
-    StandardField, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
+    ColumnSetting, Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig,
+    LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, S3Config, ServerConfig,
+    SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig, ValueColumnConfig,
+    ValueFormat,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{

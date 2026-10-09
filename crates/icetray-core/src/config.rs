@@ -15,6 +15,7 @@ use serde_json::error::Category;
 use crate::approx;
 use crate::aws_catalog;
 use crate::cache::min_memory_bytes;
+use crate::column;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
@@ -339,6 +340,21 @@ pub enum ConfigViolation {
     EmptyValueColumn {
         /// The table's position in `tables`.
         index: usize,
+    },
+    /// A table's key column or one of its value columns has a name that is
+    /// not a valid Avro name (`column::is_served_name`, RFD 023). Iceberg's
+    /// Java writers store such a column under an escaped name, so the name
+    /// in the files would differ from the schema's.
+    #[error(
+        "tables[{index}].{setting} names {column:?}, which icetray does not serve: a column name is ASCII letters, digits, and underscores, and does not start with a digit"
+    )]
+    ColumnNameRewritten {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The setting that names the column.
+        setting: ColumnSetting,
+        /// The name as configured.
+        column: String,
     },
     /// A table lists one value column twice (RFD 022).
     #[error("tables[{index}].value_columns lists {column:?} more than once")]
@@ -855,8 +871,9 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     validate_tables(config)
 }
 
-/// Each table has a name of its own, a residency its settings fit, value
-/// columns listed once each and apart from the key, a `lookups` level its
+/// Each table has a name of its own, a residency its settings fit, a key
+/// column and value columns of names Iceberg's writers keep, value columns
+/// listed once each and apart from the key, a `lookups` level its
 /// residency reaches, and a source whose settings `validate_source`
 /// accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
@@ -889,7 +906,7 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
                 index: Some(index),
             });
         }
-        table.check_value_columns(index)?;
+        table.check_columns(index)?;
         table.check_lookups(Some(index))?;
         validate_source(index, &table.source, &config.storage)?;
     }
@@ -1686,15 +1703,28 @@ impl TableConfig {
         .map(drop)
     }
 
-    /// `ConfigViolation::EmptyValueColumn` for a column of an empty name,
-    /// `ConfigViolation::DuplicateValueColumn` for a column listed twice,
-    /// and `ConfigViolation::KeyColumnAsValue` for the key column listed as
-    /// a value; `index` is the table's place in `tables`.
-    fn check_value_columns(&self, index: usize) -> std::result::Result<(), ConfigViolation> {
+    /// `ConfigViolation::ColumnNameRewritten` for a key column or a value
+    /// column whose name is not a valid Avro name,
+    /// `ConfigViolation::EmptyValueColumn` for a value column of an empty
+    /// name, `ConfigViolation::DuplicateValueColumn` for a column listed
+    /// twice, and `ConfigViolation::KeyColumnAsValue` for the key column
+    /// listed as a value; `index` is the table's place in `tables`.
+    fn check_columns(&self, index: usize) -> std::result::Result<(), ConfigViolation> {
+        let rewritten = |setting, column: &str| ConfigViolation::ColumnNameRewritten {
+            index,
+            setting,
+            column: column.to_string(),
+        };
+        if !column::is_served_name(&self.key_column) {
+            return Err(rewritten(ColumnSetting::KeyColumn, &self.key_column));
+        }
         let mut seen = HashSet::new();
         for column in &self.value_columns {
             if column.name.is_empty() {
                 return Err(ConfigViolation::EmptyValueColumn { index });
+            }
+            if !column::is_served_name(&column.name) {
+                return Err(rewritten(ColumnSetting::ValueColumns, &column.name));
             }
             if column.name == self.key_column {
                 return Err(ConfigViolation::KeyColumnAsValue {
@@ -1930,6 +1960,25 @@ pub enum SourceConfig {
         /// AWS's.
         endpoint: Option<String>,
     },
+}
+
+/// A table setting that names columns, by its key in the file, for a
+/// violation that names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnSetting {
+    /// `key_column`.
+    KeyColumn,
+    /// `value_columns`.
+    ValueColumns,
+}
+
+impl fmt::Display for ColumnSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::KeyColumn => "key_column",
+            Self::ValueColumns => "value_columns",
+        })
+    }
 }
 
 /// A setting of a table's source, by its key in the file, for a violation
@@ -2920,6 +2969,62 @@ locaton = "typo"
                 column: "key".to_string(),
             }
         );
+    }
+
+    /// A configuration of one table keyed by `key` serving `value`, in TOML
+    /// and in JSON, the value listed as a bare name in one and as a table in
+    /// the other.
+    fn named_columns(key: &str, value: &str) -> [String; 2] {
+        let toml = TOML_MINIMAL
+            .replace(r#"key_column = "key""#, &format!("key_column = {key:?}"))
+            .replace(
+                r#"value_columns = ["value"]"#,
+                &format!("value_columns = [{{ name = {value:?} }}]"),
+            );
+        let json = format!(
+            r#"{{"tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": {key:?}, "value_columns": [{value:?}]}}]}}"#
+        );
+        [toml, json]
+    }
+
+    #[test]
+    fn test_parse_refuses_a_column_name_a_java_writer_rewrites_in_toml_and_json() {
+        for text in named_columns("user_id", "_payload2") {
+            let config = Config::parse(&text).unwrap();
+            assert_eq!(config.tables[0].key_column, "user_id");
+            assert_eq!(config.tables[0].value_column_names(), ["_payload2"]);
+        }
+        for name in ["user-id", "a.b", "1st", "día"] {
+            for text in named_columns(name, "value") {
+                assert_eq!(
+                    violation(&text),
+                    ConfigViolation::ColumnNameRewritten {
+                        index: 0,
+                        setting: ColumnSetting::KeyColumn,
+                        column: name.to_string(),
+                    },
+                    "{text}"
+                );
+            }
+            for text in named_columns("key", name) {
+                assert_eq!(
+                    violation(&text),
+                    ConfigViolation::ColumnNameRewritten {
+                        index: 0,
+                        setting: ColumnSetting::ValueColumns,
+                        column: name.to_string(),
+                    },
+                    "{text}"
+                );
+            }
+        }
+        for text in named_columns("key", "") {
+            assert_eq!(
+                violation(&text),
+                ConfigViolation::EmptyValueColumn { index: 0 },
+                "an empty value column keeps its own violation"
+            );
+        }
     }
 
     #[test]

@@ -609,7 +609,7 @@ impl Target {
 mod tests {
     use clap::CommandFactory as _;
     use clap::error::ErrorKind;
-    use icetray_core::config::{ConfigError, ConfigViolation};
+    use icetray_core::config::{ColumnSetting, ConfigError, ConfigViolation};
     use icetray_core::{LocationError, LocationFault};
 
     use super::*;
@@ -1103,6 +1103,36 @@ value_columns = ["value"]
             [ValueFormat::Protobuf, ValueFormat::Opaque],
             "detail, then payload"
         );
+    }
+
+    /// A located table's `--key-column` and `--value-column` are held to
+    /// the configuration's column name rule.
+    #[test]
+    fn test_config_location_refuses_a_column_name_a_java_writer_rewrites() {
+        let cases = [
+            ("--key-column", ColumnSetting::KeyColumn),
+            ("--value-column", ColumnSetting::ValueColumns),
+        ];
+        for (flag, setting) in cases {
+            let rewritten = "user-id";
+            let refused =
+                target(parse(&["info", "--location", LOCATION, flag, rewritten]).unwrap())
+                    .config(None)
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    &refused,
+                    CliError::Core(icetray_core::Error::Config(ConfigError::Invalid(
+                        ConfigViolation::ColumnNameRewritten {
+                            index: 0,
+                            setting: refused_setting,
+                            column,
+                        }
+                    ))) if *refused_setting == setting && column == rewritten
+                ),
+                "{flag}: {refused:?}"
+            );
+        }
     }
 
     #[test]
