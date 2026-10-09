@@ -76,6 +76,7 @@ doctor's output and the metrics spell it.
 
 | Requirement | If missed | What fixes it |
 |---|---|---|
+| Data files in Parquet | Refused: `data_format_unsupported`, naming the file and the format its manifest entry records. Iceberg also allows ORC and Avro data files; icetray reads rows from Parquet alone and refuses the snapshot from its manifests, before it reads the file | `'write.format.default' = 'parquet'`, Iceberg's default, then a compaction to rewrite the files written in another format |
 | One key column of Iceberg type `long`, `string`, `binary`, `fixed` (served as binary), or `uuid` | Refused: `key_type_unsupported`. A key column whose Parquet type contradicts the schema is refused as `key_type_mismatch` | Declare the key with one of those types. The writer and the caller encode a composite key into one column. |
 | Keys of at most 4,096 bytes | Refused: `key_too_long`. Keys over 128 bytes draw the advice `long_keys` | A shorter key encoding |
 | No null keys | Refused: `null_keys` | Filter nulls before the write |

@@ -909,10 +909,9 @@ impl Fixture {
             &path,
             self.metadata.default_partition_spec_id(),
             file.partition,
-            file.records,
-            count(file.bytes.len()),
+            (file.records, count(file.bytes.len())),
             file.bounds.as_ref(),
-            DataContentType::Data,
+            DataFileFormat::Parquet,
         )?;
         self.commit_files(catalog, vec![data_file]).await?;
         self.remember_current();
@@ -1925,22 +1924,21 @@ fn datum(key: &Key) -> Datum {
     }
 }
 
-/// A data file of `content` at `path` under `spec_id`, with `records` rows,
-/// `size` bytes, and key bounds when given.
+/// A data file entry at `path` in `format` under `spec_id`, with
+/// `(records, size)` rows and bytes, and key bounds when given.
 fn data_file(
     path: &str,
     spec_id: i32,
     partition: Struct,
-    records: u64,
-    size: u64,
+    (records, size): (u64, u64),
     bounds: Option<&(Key, Key)>,
-    content: DataContentType,
+    format: DataFileFormat,
 ) -> Result<DataFile> {
     let mut builder = DataFileBuilder::default();
     builder
-        .content(content)
+        .content(DataContentType::Data)
         .file_path(path.to_string())
-        .file_format(DataFileFormat::Parquet)
+        .file_format(format)
         .partition(partition)
         .partition_spec_id(spec_id)
         .record_count(records)
@@ -1957,6 +1955,21 @@ fn data_file(
         )
         .into()
     })
+}
+
+/// A data file entry at `path` in `format` under `spec_id` with `partition`
+/// as its tuple and no key bounds, for `HandSnapshot::data`, with nothing
+/// written there: for a format icetray refuses from the manifest alone,
+/// ORC, Avro, or Puffin.
+pub fn data_file_entry(
+    path: &str,
+    spec_id: i32,
+    partition: Struct,
+    records: u64,
+    size: u64,
+    format: DataFileFormat,
+) -> Result<DataFile> {
+    data_file(path, spec_id, partition, (records, size), None, format)
 }
 
 /// A position-delete file entry at `path` in `format` under `spec_id` with

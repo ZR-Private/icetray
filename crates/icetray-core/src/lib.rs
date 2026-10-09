@@ -50,7 +50,9 @@ pub use config::{
     StandardField, StorageConfig, TableConfig, ValueColumnConfig, ValueFormat,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
-pub use error::{Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete};
+pub use error::{
+    Budget, Error, ErrorKind, RefusalReason, Result, UnsupportedDelete, UnsupportedFormat,
+};
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Row};
 pub use index::{
     ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, PageHeaderFault, PageRef,

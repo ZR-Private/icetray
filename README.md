@@ -175,6 +175,10 @@ icetray serves exact-key lookups on tables a batch job writes, so writes,
 scans, and range queries need another tool. Each limit below has a
 workaround at write time or in the platform:
 
+- **Data files in ORC or Avro.** icetray reads data files in Parquet and
+  refuses a snapshot that lists a data file in ORC or Avro, which Iceberg
+  also allows. Write the table in Parquet, Iceberg's default format
+  (`'write.format.default' = 'parquet'`).
 - **Equality deletes.** icetray serves deletion vectors and Parquet
   position deletes, and refuses a snapshot with equality deletes. For a
   writer that uses them, serve a tag or branch that a compaction job

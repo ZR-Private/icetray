@@ -168,9 +168,9 @@ type RankedRoutes = BTreeMap<Option<Bucketing>, BTreeMap<u32, Vec<ProbeRank>>>;
 impl Generation {
     /// The footer stage of a load of `snapshot` of `table`: derives the
     /// layout from the snapshot's schema, lists its live files
-    /// (`manifest::list_files`, which refuses the deletes it documents),
-    /// bounds the memory its deletes take from the manifests alone
-    /// (`deletes::bound`), reuses from `previous` every file the snapshot
+    /// (`manifest::list_files`, which refuses the data and delete files it
+    /// documents), bounds the memory its deletes take from the manifests
+    /// alone (`deletes::bound`), reuses from `previous` every file the snapshot
     /// still names by the same path at the same size and data sequence
     /// number (the same `Arc`, RFD 005; `reuse_or_open`) with the rows its
     /// deletes removed there, checks every reused file's columns against

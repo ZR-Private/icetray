@@ -514,6 +514,9 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         RefusalReason::KeyTooLong { path, bytes } => {
             format!("{reason} (file {path}, {bytes} bytes)")
         }
+        RefusalReason::DataFormatUnsupported { path, format } => {
+            format!("{reason} (file {path}, recorded as {format})")
+        }
         RefusalReason::EqualityDeletes { path } => format!("{reason} (file {path})"),
         RefusalReason::DeleteKindUnsupported { path, kind } => {
             format!("{reason} (file {path}, {kind})")
@@ -654,6 +657,16 @@ pub enum RefusalReason {
         /// types, and `Protobuf` for one only that declaration excludes.
         format: ValueFormat,
     },
+    /// A data file's manifest entry records a format other than Parquet
+    /// (RFD 007). Iceberg also allows ORC and Avro data files; icetray reads
+    /// Parquet alone, so the refusal is made from the entry before any read
+    /// of the file.
+    DataFormatUnsupported {
+        /// The data file's location.
+        path: String,
+        /// The format its manifest entry records.
+        format: UnsupportedFormat,
+    },
     /// An equality delete applies to a data file the snapshot holds: its
     /// data sequence number is above that of the snapshot's oldest data
     /// file, so it may delete rows of it (RFD 021). Equality deletes are
@@ -731,6 +744,7 @@ impl Recurs for RefusalReason {
             | Self::KeyTypeUnsupported
             | Self::ColumnMismatch { .. }
             | Self::ValueTypeUnsupported { .. }
+            | Self::DataFormatUnsupported { .. }
             | Self::EqualityDeletes { .. }
             | Self::DeleteKindUnsupported { .. }
             | Self::KeyTooLong { .. }
@@ -789,6 +803,30 @@ impl fmt::Display for UnsupportedDelete {
     }
 }
 
+/// A data file format other than Parquet, as a manifest entry records it
+/// and `RefusalReason::DataFormatUnsupported` names it. Display gives the
+/// format's name as the Iceberg spec writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnsupportedFormat {
+    /// `avro`.
+    Avro,
+    /// `orc`.
+    Orc,
+    /// `puffin`, which holds statistics and deletion vectors, never rows.
+    Puffin,
+}
+
+impl fmt::Display for UnsupportedFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Avro => "avro",
+            Self::Orc => "orc",
+            Self::Puffin => "puffin",
+        };
+        f.write_str(name)
+    }
+}
+
 /// The budget an `OverBudget` refusal is held to (RFD 017). Display gives
 /// the setting that sets it, for a log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -821,6 +859,7 @@ impl fmt::Display for RefusalReason {
             Self::KeyTypeUnsupported => "key_type_unsupported",
             Self::ColumnMismatch { .. } => "column_mismatch",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
+            Self::DataFormatUnsupported { .. } => "data_format_unsupported",
             Self::EqualityDeletes { .. } => "equality_deletes",
             Self::DeleteKindUnsupported { .. } => "delete_kind_unsupported",
             Self::KeyTooLong { .. } => "key_too_long",
@@ -932,7 +971,7 @@ mod tests {
         ]
         .into_iter()
         .chain(column_reason_cases())
-        .chain(delete_reason_cases())
+        .chain(listing_reason_cases())
         .collect()
     }
 
@@ -979,9 +1018,31 @@ mod tests {
         ]
     }
 
-    /// One delete refusal of every reason and kind, beside its label.
-    fn delete_reason_cases() -> Vec<(RefusalReason, &'static str)> {
+    /// One file-listing refusal of every reason, format, and delete kind,
+    /// beside its label.
+    fn listing_reason_cases() -> Vec<(RefusalReason, &'static str)> {
         vec![
+            (
+                RefusalReason::DataFormatUnsupported {
+                    path: FILE_PATH.to_string(),
+                    format: UnsupportedFormat::Avro,
+                },
+                "data_format_unsupported",
+            ),
+            (
+                RefusalReason::DataFormatUnsupported {
+                    path: FILE_PATH.to_string(),
+                    format: UnsupportedFormat::Orc,
+                },
+                "data_format_unsupported",
+            ),
+            (
+                RefusalReason::DataFormatUnsupported {
+                    path: FILE_PATH.to_string(),
+                    format: UnsupportedFormat::Puffin,
+                },
+                "data_format_unsupported",
+            ),
             (
                 RefusalReason::EqualityDeletes {
                     path: FILE_PATH.to_string(),

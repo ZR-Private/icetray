@@ -29,6 +29,12 @@
 > dictionary-encoded value column's extra GET falls on the hits that name
 > that column. See RFD 022.
 
+> Updated 2026-10-08: a data file whose manifest entry records a format
+> other than Parquet, such as ORC or Avro, which Iceberg also allows, is
+> refused as `data_format_unsupported`, from the manifests before any
+> read of the file. See
+> [the optimal layout's requirements](../table-layout.md#requirements).
+
 ## Problem
 
 icetray serves tables it did not write, and tables that miss a clause of
@@ -46,13 +52,14 @@ deviation costs, and the two must agree on one classification.
 
 ## Decision
 
-A table icetray cannot serve correctly (unsorted files, null or duplicate
-keys, keys outside their file's recorded bucket, a key column whose
-physical type does not match the schema, a configured column a data file
-does not hold as the schema means it, a configured value column that is
-not binary, fixed, or string, equality deletes and unreadable deletes that
-may apply, keys over 4,096 bytes, and the residency refusals of RFD 017
-(Residency tiers)) will be refused at load with a named reason; a table it
+A table icetray cannot serve correctly (a data file in a format other
+than Parquet, unsorted files, null or duplicate keys, keys outside their
+file's recorded bucket, a key column whose physical type does not match
+the schema, a configured column a data file does not hold as the schema
+means it, a configured value column that is not binary, fixed, or
+string, equality deletes and unreadable deletes that may apply, keys over
+4,096 bytes, and the residency refusals of RFD 017 (Residency tiers))
+will be refused at load with a named reason; a table it
 can serve only inefficiently (a dictionary-encoded value column, key pages
 over 2,000 rows, no bucket partition, overlapping files in a bucket) will
 be served with its penalty measured and reported, and each such finding
@@ -121,6 +128,11 @@ Placements settled elsewhere:
   field ids and lacks a value column was written before the column was
   added and answers its default, which is no deviation. RFD 023 (Column
   resolution) gives the rule.
+- A data file whose manifest entry records ORC, Avro, or any format other
+  than Parquet is refused as `data_format_unsupported`, naming the file
+  and the format. icetray reads rows from Parquet alone, and the manifest
+  entry records the format, so the snapshot is refused from its manifests
+  before any read of the file.
 - Equality deletes and unreadable deletes that may apply are refused;
   RFD 021 (Merge-on-read) serves deletion vectors and Parquet position
   deletes and says why the rest stay refused.

@@ -24,7 +24,7 @@ use crate::catalog::{Resolved, TableFault};
 use crate::column::{self, ColumnMismatch, UnreadDefaults};
 use crate::config::{TableConfig, ValueFormat};
 use crate::deletes::{Sorted, oldest_by_partition};
-use crate::error::{Error, RefusalReason, Result, UnsupportedDelete};
+use crate::error::{Error, RefusalReason, Result, UnsupportedDelete, UnsupportedFormat};
 use crate::key::{Key, KeyType};
 use crate::projection::{FieldSet, MAX_FIELD_NUMBER};
 use crate::snapshot::SequenceNumber;
@@ -689,10 +689,13 @@ pub(crate) struct SnapshotFiles {
 /// bounds come from the manifest's lower and upper bounds for the key field
 /// through `Key::from_datum`.
 ///
-/// A delete file is classified wherever it is listed (`classify_delete`).
-/// Refused, after every manifest is read so that the verdict is the same
-/// for the same manifests in any order: first the position delete file in
-/// Avro or ORC with the least path among those that may apply to a data
+/// A data file whose entry records a format other than Parquet is set
+/// aside unread (`unsupported_format`), and a delete file is classified
+/// wherever it is listed (`classify_delete`). Refused, after every manifest
+/// is read so that the verdict is the same for the same manifests in any
+/// order: first the data file with the least path among those not in
+/// Parquet, as `RefusalReason::DataFormatUnsupported`; then the position
+/// delete file in Avro or ORC with the least path among those that may apply to a data
 /// file of the snapshot no deletion vector masks
 /// (`Listed::applying_unsupported`; one that provably applies to none is
 /// dropped), as `RefusalReason::DeleteKindUnsupported`; then the equality
@@ -757,6 +760,12 @@ pub(crate) async fn list_files(
                 .clone();
             match data_file.content_type() {
                 DataContentType::Data => {
+                    if let Some(format) = unsupported_format(data_file.file_format()) {
+                        listed
+                            .unsupported_data
+                            .push((data_file.file_path().to_string(), format));
+                        continue;
+                    }
                     let (bucketing, bucket) = match bucket_field {
                         None => (None, UNBUCKETED),
                         Some(field) => (
@@ -791,6 +800,8 @@ pub(crate) async fn list_files(
 struct Listed {
     data: Vec<DataFileEntry>,
     deletes: Vec<DeleteFileEntry>,
+    /// The data files in a format other than Parquet, by path.
+    unsupported_data: Vec<(String, UnsupportedFormat)>,
     /// The position delete files icetray cannot read.
     unsupported: Vec<Unsupported>,
     /// Every equality delete, by path, with its data sequence number.
@@ -811,6 +822,15 @@ impl Listed {
     /// The refusals `list_files` documents, else the files, the data files
     /// in order.
     fn judge(mut self, table: &str) -> Result<SnapshotFiles> {
+        if let Some((path, format)) = std::mem::take(&mut self.unsupported_data)
+            .into_iter()
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+        {
+            return Err(Error::refused(
+                table,
+                RefusalReason::DataFormatUnsupported { path, format },
+            ));
+        }
         if let Some(Unsupported { path, kind, .. }) = self.applying_unsupported() {
             return Err(Error::refused(
                 table,
@@ -878,6 +898,17 @@ impl Listed {
             .min_by_key(|(_, delete)| &delete.path)
             .map(|(at, _)| at)?;
         Some(self.unsupported.swap_remove(least))
+    }
+}
+
+/// The format of a data file's entry as icetray refuses it, or `None` for
+/// Parquet, the one format icetray reads rows from.
+fn unsupported_format(format: DataFileFormat) -> Option<UnsupportedFormat> {
+    match format {
+        DataFileFormat::Parquet => None,
+        DataFileFormat::Avro => Some(UnsupportedFormat::Avro),
+        DataFileFormat::Orc => Some(UnsupportedFormat::Orc),
+        DataFileFormat::Puffin => Some(UnsupportedFormat::Puffin),
     }
 }
 
@@ -2793,6 +2824,80 @@ mod tests {
                         kind: kind.clone(),
                     },
                     "{format:?} in either manifest order"
+                );
+            }
+        }
+    }
+
+    /// An unpartitioned data file entry named `name` recording `format`;
+    /// nothing is written there.
+    fn unpartitioned_data_in(
+        root: &str,
+        name: &str,
+        format: DataFileFormat,
+    ) -> iceberg::spec::DataFile {
+        iceberg::spec::DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(data_path(root, name))
+            .file_format(format)
+            .partition(testing::partition(testing::Partition::None))
+            .partition_spec_id(UNPARTITIONED_SPEC)
+            .record_count(RECORDS)
+            .file_size_in_bytes(SIZE)
+            .build()
+            .unwrap()
+    }
+
+    /// A data file entry in ORC, Avro, or Puffin is refused from the
+    /// manifests, the least such path named whatever the manifest order,
+    /// ahead of an unreadable position delete and a live equality delete
+    /// that would each refuse the snapshot too.
+    #[tokio::test]
+    async fn test_list_files_refuses_a_data_file_not_in_parquet_before_any_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let cases = [
+            (DataFileFormat::Orc, UnsupportedFormat::Orc),
+            (DataFileFormat::Avro, UnsupportedFormat::Avro),
+            (DataFileFormat::Puffin, UnsupportedFormat::Puffin),
+        ];
+        for (format, named) in cases {
+            let foreign = |name: &str| {
+                (
+                    unpartitioned_data_in(&root, name, format),
+                    Written::Existing(SEQUENCE_A),
+                )
+            };
+            let parquet = (
+                unpartitioned_data(&root, "parquet"),
+                Written::Existing(SEQUENCE_A),
+            );
+            let deletes = vec![
+                (
+                    unpartitioned_delete(
+                        &root,
+                        "avro_positions",
+                        DeleteSpec::Positions(DataFileFormat::Avro),
+                    ),
+                    Written::Added,
+                ),
+                (
+                    unpartitioned_delete(&root, "equality", DeleteSpec::Equality),
+                    Written::Added,
+                ),
+            ];
+            let orders = [
+                vec![foreign("z_foreign"), parquet.clone(), foreign("y_foreign")],
+                vec![foreign("y_foreign"), foreign("z_foreign"), parquet],
+            ];
+            for data in orders {
+                assert_eq!(
+                    refusal_of(listed(&root, data, deletes.clone()).await),
+                    RefusalReason::DataFormatUnsupported {
+                        path: data_path(&root, "y_foreign"),
+                        format: named,
+                    },
+                    "{format:?} in either order"
                 );
             }
         }

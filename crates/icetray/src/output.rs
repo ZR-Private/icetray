@@ -378,7 +378,7 @@ mod tests {
 
     use icetray_core::{
         Capping, ColumnSummary, DeleteSummary, FindingCode, KeyType, Level, LookupCost, Residency,
-        ResidentBytes, TableFault, ValueColumnReport,
+        ResidentBytes, TableFault, UnsupportedFormat, ValueColumnReport,
     };
     use serde_json::Value as Json;
 
@@ -628,7 +628,18 @@ mod tests {
                 }],
             },
         };
-        for (error, code) in [(refused, "equality_deletes"), (below_level, "below_level")] {
+        let data_format = icetray_core::Error::Refused {
+            table: TABLE.to_string(),
+            reason: RefusalReason::DataFormatUnsupported {
+                path: TABLE.to_string(),
+                format: UnsupportedFormat::Orc,
+            },
+        };
+        for (error, code) in [
+            (refused, "equality_deletes"),
+            (data_format, "data_format_unsupported"),
+            (below_level, "below_level"),
+        ] {
             let line = serde_json::to_value(RefusalLine::new(TABLE, &error)).unwrap();
             assert_eq!(line["kind"], Json::String("refusal".to_string()));
             assert_eq!(line["reason"], Json::String(code.to_string()));

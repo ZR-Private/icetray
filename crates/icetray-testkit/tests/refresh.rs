@@ -1,29 +1,32 @@
 //! The ref moves and the table follows (RFD 005): an unchanged poll reads
 //! the catalog record or the hint and no object, a second snapshot appends
 //! files, the table advances on refresh reusing every unchanged file, a
-//! duplicate key is refused while the last generation keeps serving, a
-//! strict table below its level is held until a compaction, and
+//! duplicate key and an Avro data file are each refused while the last
+//! generation keeps serving, a strict table below its level is held until a compaction, and
 //! overlapping files are verified once per group that gained a file.
 
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
+use iceberg::spec::{DataFileFormat, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx;
 use icetray_core::config::Residency;
 use icetray_core::metric;
 use icetray_core::{
     Capping, Error, ErrorKind, FindingCode, KeyType, Level, RefusalReason, Row, TableSource,
-    TableState,
+    TableState, UnsupportedFormat,
 };
 use icetray_testkit::fixture::{
-    APPENDED_4K_6K, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
+    APPENDED_4K_6K, DATA_DIR, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
-    THREE_FILES, TWO_FILES, local_catalog, residue_class,
+    THREE_FILES, TWO_FILES, data_file_entry, local_catalog, residue_class,
 };
 use icetray_testkit::layout::VALUE_COLUMN;
-use icetray_testkit::verify::{self, HINT_POLL_GETS, LOAD_GETS_PER_FILE, Served};
+use icetray_testkit::verify::{
+    self, HINT_POLL_GETS, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served,
+};
 use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
 
 /// The first build of the reuse fixture and the range its second appends.
@@ -36,6 +39,11 @@ const FUTURE_ID: u64 = 9_000;
 /// Refresh GETs beyond the per-file ones after one append through the
 /// catalog: the new metadata file, the manifest list, and two manifests.
 const REFRESH_METADATA_GETS: u64 = 4;
+
+/// Records and bytes the manifest records for the Avro data file entry,
+/// with nothing written at its path.
+const UNWRITTEN_RECORDS: u64 = 1;
+const UNWRITTEN_BYTES: u64 = 1;
 
 /// Files of the interleaved fixture after the second class: two per bucket.
 const INTERLEAVED_FILES: usize = 8;
@@ -207,6 +215,90 @@ async fn test_refresh_refuses_duplicate_keys_and_keeps_serving() -> Result<()> {
         ),
         "{:?}",
         served.table.state()
+    );
+    Ok(())
+}
+
+/// A refresh to a snapshot that adds a data file recorded as Avro is
+/// refused from its manifests, the file never read; the last generation
+/// keeps serving, and the refusal is remembered.
+#[tokio::test]
+async fn test_refresh_refuses_an_avro_data_file_and_keeps_serving() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: IDS_4K,
+        buckets: 0,
+        ..FixtureSpec::small("kv_avro_refresh", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture.write_hint().await?;
+    let served = serve_root(&fixture, false).await?;
+    let v1 = served.current().snapshot_id;
+
+    let path = format!("{}/{DATA_DIR}/rows.avro", fixture.root());
+    let mut data = fixture.files().to_vec();
+    data.push(data_file_entry(
+        &path,
+        fixture.metadata().default_partition_spec_id(),
+        Struct::empty(),
+        UNWRITTEN_RECORDS,
+        UNWRITTEN_BYTES,
+        DataFileFormat::Avro,
+    )?);
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data,
+            deletes: Vec::new(),
+        })
+        .await?;
+    let stats = served.storage.stats();
+    let before = stats.gets();
+    let error = served.table.refresh().await.unwrap_err();
+    let refused = RefusalReason::DataFormatUnsupported {
+        path,
+        format: UnsupportedFormat::Avro,
+    };
+    assert!(
+        matches!(&error, Error::Refused { reason, .. } if *reason == refused),
+        "{error:?}"
+    );
+    assert_eq!(
+        stats.gets() - before,
+        HINT_POLL_GETS + METADATA_FILE_GETS + LOAD_METADATA_GETS,
+        "the hint, the metadata, the manifest list and its manifest, and no data file"
+    );
+    assert_eq!(
+        served.current().snapshot_id,
+        v1,
+        "the last generation serves"
+    );
+    let old_key = fixture.key(OLD_ID);
+    assert_eq!(
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        fixture.expected(&old_key)
+    );
+    assert!(
+        matches!(
+            served.table.state(),
+            TableState::Degraded {
+                serving: Some(serving),
+                reason: ErrorKind::Refused(ref reason),
+                ..
+            } if serving == v1 && *reason == refused
+        ),
+        "{:?}",
+        served.table.state()
+    );
+    let before = stats.gets();
+    assert!(!served.table.refresh().await?, "the refusal is remembered");
+    assert_eq!(
+        stats.gets() - before,
+        HINT_POLL_GETS,
+        "a poll of the remembered location reads the hint alone"
     );
     Ok(())
 }

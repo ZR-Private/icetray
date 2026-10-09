@@ -22,12 +22,13 @@ use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
     Budget, Capping, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType, Level, LocalDir,
-    RefusalReason, Row, Storage, TableSource, TableState, UnsupportedDelete, bucket,
+    RefusalReason, Row, Storage, TableSource, TableState, UnsupportedDelete, UnsupportedFormat,
+    bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
-    STRAY_IDS, TINY_BUDGET, TWO_BUCKETS, equality_delete_file, local_catalog, position_delete_file,
-    residue_class, write_table_of_types,
+    STRAY_IDS, TINY_BUDGET, TWO_BUCKETS, data_file_entry, equality_delete_file, local_catalog,
+    position_delete_file, residue_class, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS};
@@ -48,10 +49,10 @@ const NULL_KEY_AT: usize = 1;
 /// The name of every raw file under its table's data directory.
 const RAW_FILE: &str = "raw.parquet";
 
-/// Records and bytes the manifest records for the delete file that need
-/// not exist.
-const DELETE_RECORDS: u64 = 1;
-const DELETE_BYTES: u64 = 1;
+/// Records and bytes a manifest records for a delete or data file entry
+/// with nothing written at its path.
+const UNWRITTEN_RECORDS: u64 = 1;
+const UNWRITTEN_BYTES: u64 = 1;
 
 /// A key pad that alone exceeds the cap, so every key is over it.
 const OVER_CAP_PAD: usize = MAX_KEY_BYTES;
@@ -439,9 +440,61 @@ async fn refused_through_root(fixture: &Fixture) -> Result<Refused> {
     .await
 }
 
-/// The location of delete file `name` under `fixture`'s data directory.
-fn delete_path(fixture: &Fixture, name: &str) -> String {
+/// The location of file `name` under `fixture`'s data directory.
+fn data_dir_path(fixture: &Fixture, name: &str) -> String {
     format!("{}/{DATA_DIR}/{name}", fixture.root())
+}
+
+/// A data file whose manifest entry records ORC or Avro is refused from
+/// the manifests alone: neither it nor any Parquet file's footer is read,
+/// so the entry's file need not exist.
+#[tokio::test]
+async fn test_data_file_in_orc_or_avro_is_refused_unread() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let cases = [
+        (
+            "kv_orc_data",
+            "rows.orc",
+            DataFileFormat::Orc,
+            UnsupportedFormat::Orc,
+        ),
+        (
+            "kv_avro_data",
+            "rows.avro",
+            DataFileFormat::Avro,
+            UnsupportedFormat::Avro,
+        ),
+    ];
+    for (name, file, recorded, format) in cases {
+        let mut fixture = unpartitioned_fixture(&catalog, name).await?;
+        let path = data_dir_path(&fixture, file);
+        let mut data = fixture.files().to_vec();
+        data.push(data_file_entry(
+            &path,
+            fixture.metadata().default_partition_spec_id(),
+            Struct::empty(),
+            UNWRITTEN_RECORDS,
+            UNWRITTEN_BYTES,
+            recorded,
+        )?);
+        fixture
+            .commit_by_hand(HandSnapshot {
+                data,
+                deletes: Vec::new(),
+            })
+            .await?;
+        let refused = refused_through_root(&fixture).await?;
+        assert_eq!(
+            refused.reason,
+            RefusalReason::DataFormatUnsupported { path, format }
+        );
+        assert_eq!(
+            refused.storage.stats().gets(),
+            verify::HINT_POLL_GETS + METADATA_FILE_GETS + LOAD_METADATA_GETS,
+            "{format}: refused from the manifest list and its one manifest"
+        );
+    }
+    Ok(())
 }
 
 /// A position delete file in Avro is refused from its manifest entry, before
@@ -450,13 +503,13 @@ fn delete_path(fixture: &Fixture, name: &str) -> String {
 async fn test_avro_position_delete_is_refused_as_an_unsupported_kind() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let mut fixture = unpartitioned_fixture(&catalog, "kv_avro_deletes").await?;
-    let path = delete_path(&fixture, "deletes.avro");
+    let path = data_dir_path(&fixture, "deletes.avro");
     let delete = position_delete_file(
         &path,
         fixture.metadata().default_partition_spec_id(),
         Struct::empty(),
-        DELETE_RECORDS,
-        DELETE_BYTES,
+        UNWRITTEN_RECORDS,
+        UNWRITTEN_BYTES,
         DataFileFormat::Avro,
         None,
     )?;
@@ -509,11 +562,11 @@ async fn test_avro_position_deletes_a_vector_masks_are_ignored() -> Result<()> {
     let named = Some(fixture.files()[0].file_path().to_string());
     for (name, referenced) in [("scoped.avro", named), ("unscoped.avro", None)] {
         deletes.push(position_delete_file(
-            &delete_path(&fixture, name),
+            &data_dir_path(&fixture, name),
             spec_id,
             Struct::empty(),
-            DELETE_RECORDS,
-            DELETE_BYTES,
+            UNWRITTEN_RECORDS,
+            UNWRITTEN_BYTES,
             DataFileFormat::Avro,
             referenced,
         )?);
@@ -572,13 +625,13 @@ const DELETE_SNAPSHOT_MANIFEST_GETS: u64 = 3;
 async fn test_equality_delete_is_refused_while_live_and_served_once_dangling() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let mut fixture = unpartitioned_fixture(&catalog, "kv_equality").await?;
-    let path = delete_path(&fixture, "equality.parquet");
+    let path = data_dir_path(&fixture, "equality.parquet");
     let delete = equality_delete_file(
         &path,
         fixture.metadata().default_partition_spec_id(),
         Struct::empty(),
-        DELETE_RECORDS,
-        DELETE_BYTES,
+        UNWRITTEN_RECORDS,
+        UNWRITTEN_BYTES,
     )?;
     commit_deletes(&mut fixture, vec![delete]).await?;
     let refused = refused_through_root(&fixture).await?;
