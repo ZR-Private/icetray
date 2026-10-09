@@ -2824,23 +2824,29 @@ mod tests {
     /// A `get` of a page whose batch lookup is still waiting for a permit
     /// issues its own GET rather than waiting behind the batch: the store
     /// holds the `DEFAULT_MULTI_GET_FAN_OUT` GETs of the batch's first half until
-    /// one more is in flight, which only the `get` brings (RFD 013).
+    /// one more is in flight, which only the `get` brings (RFD 013). The
+    /// store's high-water mark is then exactly one above the fan-out: the
+    /// batch never holds more than the fan-out, and the `get` adds its one.
+    /// The store's GET count is not asserted, since once the store
+    /// releases, the batch issues its next GETs while the `get` returns.
     #[tokio::test]
     async fn test_get_of_a_page_a_batch_has_queued_is_not_held_behind_its_permits() {
-        let (table, fixture, all, gauged) =
+        let (table, _fixture, all, gauged) =
             two_columns_one_row_per_page(DEFAULT_MULTI_GET_FAN_OUT).await;
         let keys = long_keys(&all);
         let last = all[DEFAULT_MULTI_GET_FAN_OUT - 1];
         gauged.fill_to(DEFAULT_MULTI_GET_FAN_OUT + 1);
         let get_beside = async {
             reach(&gauged, DEFAULT_MULTI_GET_FAN_OUT).await;
-            let before = fixture.gets();
-            let row = get_within_the_deadline(&table, &Key::Long(last)).await;
-            (row, fixture.gets() - before)
+            get_within_the_deadline(&table, &Key::Long(last)).await
         };
-        let (batch, (row, gets)) = tokio::join!(table.multi_get(&keys, &BOTH_READS), get_beside);
+        let (batch, row) = tokio::join!(table.multi_get(&keys, &BOTH_READS), get_beside);
         assert_eq!(row, present(last));
-        assert_eq!(gets, 1, "the get's own GET");
+        assert_eq!(
+            gauged.high_water(),
+            DEFAULT_MULTI_GET_FAN_OUT + 1,
+            "the get's GET in flight beside the batch's"
+        );
         let expected: Vec<Row> = all.iter().map(|key| both(*key)).collect();
         assert_eq!(batch.unwrap().rows, expected);
     }
