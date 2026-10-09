@@ -1218,7 +1218,7 @@ async fn serve(
     source: SourceConfig,
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
-    let storage = Arc::new(Storage::new(storage_config()));
+    let storage = Arc::new(Storage::with_sdk_defaults(storage_config()));
     let (local, dir) = local_for(tier, &storage, reuse)?;
     let cache = PageCache::new(cache_bytes, None).await?;
     let handles = TableHandles {
@@ -1924,7 +1924,7 @@ async fn serve_together(
     prepared: &[&Prepared],
     tier: Tier,
 ) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
-    let storage = Arc::new(Storage::new(storage_config()));
+    let storage = Arc::new(Storage::with_sdk_defaults(storage_config()));
     let (local, dir) = local_for(tier, &storage, None)?;
     let handles = TableHandles {
         storage,

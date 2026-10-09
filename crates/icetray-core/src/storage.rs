@@ -370,8 +370,9 @@ pub struct Storage {
 
 impl Storage {
     /// Builds from configuration with no SDK chain: an S3 store signs with
-    /// the configured static keys or not at all. For tests and embedders;
-    /// the binary uses `with_sdk_defaults`.
+    /// the configured static keys or not at all, in the configured region
+    /// or the store's default. For tests; a process that reads S3 under
+    /// the platform's credentials uses `with_sdk_defaults`.
     pub fn new(config: StorageConfig) -> Self {
         Self {
             config,
@@ -386,7 +387,7 @@ impl Storage {
     /// and instance metadata, loaded once, when `locate` first meets a
     /// location under an S3 prefix, and never for a process that reads
     /// none. Configured static keys still win for every S3 store.
-    pub(crate) fn with_sdk_defaults(config: StorageConfig) -> Self {
+    pub fn with_sdk_defaults(config: StorageConfig) -> Self {
         Self {
             sdk: Some(OnceCell::new()),
             ..Self::new(config)
