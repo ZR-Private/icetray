@@ -2035,3 +2035,47 @@ fn delete_file(
         .into()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::TestkitError;
+
+    /// A column no fixture schema names.
+    const OTHER_COLUMN: &str = "other";
+
+    /// The name a rename would give it.
+    const RENAMED: &str = "payload";
+
+    #[tokio::test]
+    async fn test_evolve_refuses_to_rename_or_drop_a_column_the_schema_lacks() -> Result<()> {
+        let (_dir, catalog) = local_catalog().await?;
+        let spec = FixtureSpec::small("kv_evolve_absent", KeyType::Long);
+        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        let version = fixture.metadata_location().to_string();
+        for change in [
+            SchemaChange::Rename {
+                from: OTHER_COLUMN.to_string(),
+                to: RENAMED.to_string(),
+            },
+            SchemaChange::Drop {
+                name: OTHER_COLUMN.to_string(),
+            },
+        ] {
+            let refused = fixture.evolve(&[change]).await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(TestkitError::Spec(SpecFault::ColumnNotInSchema { name })) if name == OTHER_COLUMN
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            fixture.metadata_location(),
+            version,
+            "nothing was committed"
+        );
+        Ok(())
+    }
+}

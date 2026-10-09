@@ -2020,6 +2020,7 @@ mod tests {
     use crate::manifest::ColumnRequestFault;
     use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN, whole};
     use crate::metric::LookupResult;
+    use crate::projection::MAX_FIELD_NUMBER;
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
 
@@ -2555,6 +2556,18 @@ mod tests {
         key_count: i64,
         layout: WriterLayout,
     ) -> (Table, Fixture, Vec<i64>, Arc<Gauged>) {
+        let (fixture, all, gauged) = two_column_fixture(key_count, layout).await;
+        let table = table_over(&fixture, lenient(&fixture)).await;
+        table.load().await.unwrap();
+        (table, fixture, all, gauged)
+    }
+
+    /// The fixture `two_column_table_of` serves, its keys, and the gauge
+    /// its storage reads through.
+    async fn two_column_fixture(
+        key_count: i64,
+        layout: WriterLayout,
+    ) -> (Fixture, Vec<i64>, Arc<Gauged>) {
         let all = keys_from(0, key_count);
         let keys = long_keys(&all);
         let mut fixture = Fixture::with_detail(KeyType::Long, manifest_testing::bucket_spec(1));
@@ -2575,9 +2588,7 @@ mod tests {
         fixture
             .storage
             .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
-        let table = table_over(&fixture, lenient(&fixture)).await;
-        table.load().await.unwrap();
-        (table, fixture, all, gauged)
+        (fixture, all, gauged)
     }
 
     /// What a lookup naming the value column and then `DETAIL_COLUMN`
@@ -2851,7 +2862,7 @@ mod tests {
     #[test]
     fn test_get_counts_each_value_page_get_once_where_it_is_issued() {
         let (gets, series) = recorded(async {
-            let (table, fixture, all, _gauged) = two_column_table_of(
+            let (table, fixture, all, gauged) = two_column_table_of(
                 FILE_KEYS,
                 WriterLayout {
                     dictionary: Dictionary::Value,
@@ -2865,11 +2876,19 @@ mod tests {
                 ColumnRead::whole(VALUE_COLUMN),
             ];
             let key = Key::Long(all[0]);
-            // On the current-thread runtime the second lookup reaches the
-            // page cache while the first one's fetch is still in flight, so
-            // it joins that fetch.
-            let (first, second) =
-                futures::join!(table.get(&key, &both_reads), table.get(&key, &both_reads));
+            gauged.hold();
+            let mut first = std::pin::pin!(table.get(&key, &both_reads));
+            assert!(
+                futures::poll!(&mut first).is_pending(),
+                "the first lookup's GETs are held at the gate"
+            );
+            let mut second = std::pin::pin!(table.get(&key, &both_reads));
+            assert!(
+                futures::poll!(&mut second).is_pending(),
+                "the second lookup joins the fetch in flight"
+            );
+            gauged.release();
+            let (first, second) = futures::join!(first, second);
             assert_eq!(first.unwrap().row, both(all[0]));
             assert_eq!(second.unwrap().row, both(all[0]));
             table.publish_lookup_counts();
@@ -2980,26 +2999,75 @@ mod tests {
         assert_eq!(lookups(LookupResult::Miss), 1);
     }
 
-    /// A column the generation does not serve, and one named twice, are
-    /// refused before any read, on `get` and `multi_get` alike (RFD 022).
+    /// A column the table does not serve, a column named twice, a field
+    /// list on a column not declared protobuf, and on a protobuf column a
+    /// field number out of range or given twice are each refused before
+    /// any read, on `get` and `multi_get` alike (RFD 022, RFD 024).
     #[tokio::test]
-    async fn test_get_and_multi_get_refuse_an_unserved_or_repeated_column_before_any_read() {
-        let (table, fixture, all, _gauged) =
-            two_column_table_of(FILE_KEYS, WriterLayout::contract()).await;
+    async fn test_get_and_multi_get_refuse_each_column_request_fault_before_any_read() {
+        let (fixture, all, _gauged) = two_column_fixture(FILE_KEYS, WriterLayout::contract()).await;
+        let config = TableConfig {
+            value_columns: vec![
+                ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf),
+                ValueColumnConfig::named(DETAIL_COLUMN),
+            ],
+            ..lenient(&fixture)
+        };
+        let table = table_over(&fixture, config).await;
+        table.load().await.unwrap();
         let key = Key::Long(all[0]);
         let before = fixture.gets();
-        for (names, column, fault) in [
-            (&["absent"][..], "absent", ColumnRequestFault::NotServed),
+        let one = [KEY_FIELD];
+        let zero = [0];
+        let past_the_range = [MAX_FIELD_NUMBER + 1];
+        let twice = [KEY_FIELD, FILLER_FIELD, KEY_FIELD];
+        let cases = [
+            (whole(&["absent"]), "absent", ColumnRequestFault::NotServed),
             (
-                &[VALUE_COLUMN, DETAIL_COLUMN, VALUE_COLUMN][..],
+                whole(&[VALUE_COLUMN, DETAIL_COLUMN, VALUE_COLUMN]),
                 VALUE_COLUMN,
                 ColumnRequestFault::Repeated,
             ),
-        ] {
+            (
+                vec![ColumnRead {
+                    name: DETAIL_COLUMN,
+                    fields: &one,
+                }],
+                DETAIL_COLUMN,
+                ColumnRequestFault::NotProtobuf,
+            ),
+            (
+                vec![ColumnRead {
+                    name: VALUE_COLUMN,
+                    fields: &zero,
+                }],
+                VALUE_COLUMN,
+                ColumnRequestFault::FieldOutOfRange { field: 0 },
+            ),
+            (
+                vec![ColumnRead {
+                    name: VALUE_COLUMN,
+                    fields: &past_the_range,
+                }],
+                VALUE_COLUMN,
+                ColumnRequestFault::FieldOutOfRange {
+                    field: MAX_FIELD_NUMBER + 1,
+                },
+            ),
+            (
+                vec![ColumnRead {
+                    name: VALUE_COLUMN,
+                    fields: &twice,
+                }],
+                VALUE_COLUMN,
+                ColumnRequestFault::RepeatedField { field: KEY_FIELD },
+            ),
+        ];
+        for (reads, column, fault) in cases {
             let refused = [
-                table.get(&key, &whole(names)).await.unwrap_err(),
+                table.get(&key, &reads).await.unwrap_err(),
                 table
-                    .multi_get(std::slice::from_ref(&key), &whole(names))
+                    .multi_get(std::slice::from_ref(&key), &reads)
                     .await
                     .unwrap_err(),
             ];

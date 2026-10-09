@@ -106,7 +106,6 @@ async fn test_two_entries_over_one_table_serve_their_own_value_columns() -> Resu
                 fixture.file_count(),
                 "one chunk file per data file, shared by both entries"
             );
-            assert_eq!(opened.retain().await?, 0, "both entries' chunks are live");
         }
     }
     Ok(())

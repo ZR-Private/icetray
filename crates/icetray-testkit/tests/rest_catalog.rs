@@ -92,15 +92,14 @@ async fn test_rest_catalog_source_loads_polls_and_advances() -> Result<()> {
             .row,
         fixture.expected(&new_key)
     );
-    assert!(
-        verify::one_value(
-            &served
-                .table
-                .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
-                .await?
-                .row
-        )
-        .is_some()
+    assert_eq!(
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        fixture.expected(&old_key),
+        "a key of the first build still answers"
     );
     Ok(())
 }

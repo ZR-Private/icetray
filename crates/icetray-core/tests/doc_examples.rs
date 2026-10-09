@@ -8,7 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use icetray_core::Config;
+use icetray_core::config::SchemaFault;
+use icetray_core::{Config, ConfigError};
 
 /// The fence that opens a TOML example in Markdown.
 const TOML_FENCE: &str = "```toml";
@@ -123,14 +124,15 @@ fn test_toml_examples_finds_each_fenced_block_with_its_line() {
 #[test]
 fn test_completed_fragments_parse_and_a_stale_key_fails() {
     for fragment in [
-        "[server]\nlisten = \"0.0.0.0:7433\"\n",
+        "[server]\nlisten = \"0.0.0.0:4242\"\n",
         "[tables.source]\ntype = \"static\"\nlocation = \"/data/kv\"\n",
     ] {
         assert!(Config::parse(&completed(fragment)).is_ok(), "{fragment}");
     }
     let stale = "[[tables]]\nname = \"kv\"\nref = \"main\"\nkey_column = \"key\"\nvalue_column = \"value\"\n\n[tables.source]\ntype = \"static\"\nlocation = \"/data/kv\"\n";
-    assert!(
-        Config::parse(&completed(stale)).is_err(),
-        "a key the schema no longer knows fails"
-    );
+    let Err(ConfigError::Schema { at, fault }) = Config::parse(&completed(stale)) else {
+        panic!("a key the schema no longer knows is a schema fault");
+    };
+    assert!(matches!(*fault, SchemaFault::Toml(_)), "{fault}");
+    assert_eq!(at.to_string(), "tables[0].value_column");
 }

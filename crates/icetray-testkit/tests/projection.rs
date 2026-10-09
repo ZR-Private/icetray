@@ -199,84 +199,6 @@ async fn test_a_null_stays_null_and_a_value_of_none_of_the_fields_is_empty() -> 
 }
 
 #[tokio::test]
-async fn test_a_field_list_the_format_does_not_take_is_refused_before_any_read() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let fixture = fixture_of(
-        dir.path(),
-        "kv_project_bad",
-        ValueKind::Protobuf,
-        Nulls::None,
-    )
-    .await?;
-    let scratch = tempfile::tempdir()?;
-    let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = verify::serve_in(config, scratch.path()).await?;
-    let key = fixture.key(SAMPLE[1]);
-    let one = [ID_FIELD];
-    let cases = [
-        (
-            ColumnRead {
-                name: SECOND_VALUE_COLUMN,
-                fields: &one,
-            },
-            SECOND_VALUE_COLUMN,
-            ColumnRequestFault::NotProtobuf,
-        ),
-        (
-            ColumnRead {
-                name: VALUE_COLUMN,
-                fields: &[0],
-            },
-            VALUE_COLUMN,
-            ColumnRequestFault::FieldOutOfRange { field: 0 },
-        ),
-        (
-            ColumnRead {
-                name: VALUE_COLUMN,
-                fields: &[icetray_core::MAX_FIELD_NUMBER + 1],
-            },
-            VALUE_COLUMN,
-            ColumnRequestFault::FieldOutOfRange {
-                field: icetray_core::MAX_FIELD_NUMBER + 1,
-            },
-        ),
-        (
-            ColumnRead {
-                name: VALUE_COLUMN,
-                fields: &[ID_FIELD, NAME_FIELD, ID_FIELD],
-            },
-            VALUE_COLUMN,
-            ColumnRequestFault::RepeatedField { field: ID_FIELD },
-        ),
-    ];
-    let stats = served.storage.stats();
-    let before = stats.gets();
-    for (read, column, fault) in cases {
-        let refused = [
-            served.table.get(&key, &[read]).await.unwrap_err(),
-            served
-                .table
-                .multi_get(std::slice::from_ref(&key), &[read])
-                .await
-                .unwrap_err(),
-        ];
-        for error in refused {
-            let Error::ColumnRequest {
-                column: named,
-                fault: got,
-                ..
-            } = error
-            else {
-                panic!("expected a column request fault, got {error:?}");
-            };
-            assert_eq!((named.as_str(), got), (column, fault));
-        }
-    }
-    assert_eq!(stats.gets(), before, "a refused request reads nothing");
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_a_malformed_value_fails_get_and_its_multi_get_naming_the_key() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let fixture = fixture_of(
@@ -491,37 +413,5 @@ async fn test_doctor_walks_one_value_page_per_protobuf_column() -> Result<()> {
             );
         }
     }
-    Ok(())
-}
-
-/// A walk whose page read fails leaves its column unwalked and the rest of
-/// the report whole: the summary, the load's findings, and the level.
-#[tokio::test]
-async fn test_doctor_reports_a_failed_walk_beside_a_whole_report() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let fixture = fixture_of(
-        dir.path(),
-        "kv_doctor_unread",
-        ValueKind::Protobuf,
-        Nulls::None,
-    )
-    .await?;
-    let scratch = tempfile::tempdir()?;
-    let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
-    let served = verify::serve_in(config.clone(), scratch.path()).await?;
-    let generation = served.current();
-    let formats = config.formats();
-    let whole = icetray_core::diagnose(&generation, Level::Optimal, &formats);
-    assert!(verify::remove_data_files(dir.path())? > 0);
-    let examined = examine(&generation, Level::Optimal, &formats).await;
-    let columns: Vec<&str> = examined
-        .unwalked
-        .iter()
-        .map(|unwalked| unwalked.column.as_str())
-        .collect();
-    assert_eq!(columns, [VALUE_COLUMN], "the protobuf column alone");
-    assert_eq!(examined.report.summary.level, whole.summary.level);
-    assert_eq!(examined.report.findings.len(), whole.findings.len());
-    assert_eq!(examined.report.files.len(), whole.files.len());
     Ok(())
 }

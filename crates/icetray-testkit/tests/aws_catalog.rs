@@ -135,15 +135,14 @@ async fn test_glue_source_loads_answers_polls_with_one_call_and_follows_a_move()
             .row,
         fixture.expected(&new_key)
     );
-    assert!(
-        verify::one_value(
-            &served
-                .table
-                .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
-                .await?
-                .row
-        )
-        .is_some()
+    assert_eq!(
+        served
+            .table
+            .get(&old_key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        fixture.expected(&old_key),
+        "a key of the first build still answers"
     );
     assert_signed_with_storage_keys(&catalog);
     Ok(())

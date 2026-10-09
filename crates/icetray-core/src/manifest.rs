@@ -2037,10 +2037,6 @@ mod tests {
         }
         assert_eq!(
             ValueType::Fixed { width: fixed_width }.to_string(),
-            "fixed(16)"
-        );
-        assert_eq!(
-            ValueType::Fixed { width: fixed_width }.to_string(),
             Type::Primitive(PrimitiveType::Fixed(fixed_width)).to_string(),
             "as Iceberg displays the type"
         );

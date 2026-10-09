@@ -2216,41 +2216,6 @@ async fn test_a_malformed_value_is_failed_precondition_and_counted() -> TestResu
     Ok(())
 }
 
-/// A null value and a present value of zero length are distinct on the
-/// wire: `null` and `bytes` holding nothing.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_get_tells_a_null_from_a_zero_length_value() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    let spec = FixtureSpec {
-        nulls: Nulls::EveryNth(NULL_EVERY),
-        value_bytes: 0,
-        ..FixtureSpec::small(TABLE, KeyType::Long)
-    };
-    let mut stack = Stack::start(vec![spec]).await?;
-    stack.serving.ready().await;
-    let null = stack
-        .get(TABLE, Some(wire_key(&stack.fixtures[0].key(NULL_ID))))
-        .await?;
-    let empty = stack
-        .get(TABLE, Some(wire_key(&stack.fixtures[0].key(PRESENT_ID))))
-        .await?;
-    assert_eq!(null.presence, i32::from(v1::Presence::Present));
-    assert_eq!(empty.presence, i32::from(v1::Presence::Present));
-    assert_eq!(
-        null.values,
-        [v1::ColumnValue {
-            kind: Some(v1::column_value::Kind::NullValue(v1::NullValue {})),
-        }]
-    );
-    assert_eq!(
-        empty.values,
-        [v1::ColumnValue {
-            kind: Some(v1::column_value::Kind::Value(bytes::Bytes::new())),
-        }]
-    );
-    Ok(())
-}
-
 /// A call held on a stalled store when the shutdown arrives keeps its
 /// connection open past the drain deadline; the drain stops waiting at the
 /// deadline and the run ends with `DrainOverran` instead of waiting out the

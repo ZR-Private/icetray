@@ -1333,6 +1333,17 @@ pub(crate) mod testing {
             self.fill.store(fill, Ordering::SeqCst);
             self.open.send_replace(false);
         }
+
+        /// Holds every GET from here until `release`, however many are in
+        /// flight: a fetch a test starts cannot finish before it looks.
+        pub(crate) fn hold(&self) {
+            self.fill_to(usize::MAX);
+        }
+
+        /// Lets the GETs `hold` holds pass.
+        pub(crate) fn release(&self) {
+            self.open.send_replace(true);
+        }
     }
 
     impl fmt::Display for Gauged {
@@ -1631,7 +1642,7 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, watch};
 
     use super::testing::{CountingProvider, LocalHttp, MEM_PREFIX, Reply};
     use super::*;
@@ -1867,7 +1878,8 @@ mod tests {
     struct Scripted {
         inner: InMemory,
         script: Vec<Step>,
-        calls: AtomicUsize,
+        /// GETs made so far, which `arrived` watches.
+        calls: watch::Sender<usize>,
         release: Notify,
         done: Notify,
     }
@@ -1877,7 +1889,7 @@ mod tests {
             Self {
                 inner: InMemory::new(),
                 script: script.to_vec(),
-                calls: AtomicUsize::new(0),
+                calls: watch::Sender::new(0),
                 release: Notify::new(),
                 done: Notify::new(),
             }
@@ -1885,8 +1897,22 @@ mod tests {
 
         /// The step for the next GET.
         fn step(&self) -> Step {
-            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut call = 0;
+            self.calls.send_modify(|calls| {
+                call = *calls;
+                *calls += 1;
+            });
             self.script.get(call).copied().unwrap_or(PASS)
+        }
+
+        /// Resolves once `calls` GETs have been made, whether or not any
+        /// has answered.
+        async fn arrived(&self, calls: usize) {
+            self.calls
+                .subscribe()
+                .wait_for(|made| *made >= calls)
+                .await
+                .expect("the store outlives the wait");
         }
     }
 
@@ -2661,17 +2687,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_range_hedged_dropped_after_its_hedge_counts_against_the_ceiling() {
-        let (storage, located) = storage_with(Arc::new(Scripted::new(&[STALL, STALL]))).await;
+        let scripted = Arc::new(Scripted::new(&[STALL, STALL]));
+        let (storage, located) = storage_with(Arc::<Scripted>::clone(&scripted)).await;
         let window = eager_window();
         assert!(window.delay().is_some(), "the window would hedge a lookup");
+        let both_of_the_pair = 2;
         tokio::time::timeout(HUGE, async {
-            let mut read = pin!(storage.read_range_hedged(&located, INNER_RANGE, &window));
-            while storage.stats().hedges() == 0 {
-                tokio::select! {
-                    biased;
-                    _ = &mut read => panic!("neither request of the pair answers"),
-                    () = tokio::task::yield_now() => {}
-                }
+            let read = pin!(storage.read_range_hedged(&located, INNER_RANGE, &window));
+            tokio::select! {
+                biased;
+                _ = read => panic!("neither request of the pair answers"),
+                () = scripted.arrived(both_of_the_pair) => {}
             }
         })
         .await

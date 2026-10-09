@@ -430,8 +430,11 @@ impl UnreadDefaults {
 
 #[cfg(test)]
 impl UnreadDefaults {
-    /// The unread defaults of one field alone, for a test that needs a
-    /// metadata whose default did not read without writing its JSON.
+    /// The set naming field `field_id` of schema `schema_id` alone. `of`
+    /// yields an entry only from raw metadata whose default the crate's
+    /// parser drops, so a test of what takes the set (a layout's
+    /// derivation, a source's resolution) states the set it hands over
+    /// here, and a test of `of` compares what it read against it.
     pub(crate) fn naming(schema_id: i32, field_id: i32) -> Self {
         Self(BTreeSet::from([(schema_id, field_id)]))
     }

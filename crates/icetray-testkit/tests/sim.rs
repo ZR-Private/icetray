@@ -325,6 +325,10 @@ fn run_tail(
     let keys: Vec<Key> = (0..warm_up + measured)
         .map(|i| written.fixture.key(i * stride))
         .collect();
+    let expected: Vec<Row> = keys
+        .iter()
+        .map(|key| written.fixture.expected(key))
+        .collect();
     sim.client(CLIENT_HOST, async move {
         let storage = client_storage(&root, hedge)?;
         let stats = storage.stats();
@@ -341,7 +345,7 @@ fn run_tail(
                 .get(key, &[ColumnRead::whole(VALUE_COLUMN)])
                 .await?;
             let elapsed = turmoil::elapsed().saturating_sub(started);
-            assert!(verify::one_value(&lookup.row).is_some(), "key {key}");
+            assert_eq!(lookup.row, expected[at], "key {key}");
             if at >= HEDGE_WINDOW {
                 max = max.max(elapsed);
                 total += elapsed;

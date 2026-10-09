@@ -2863,14 +2863,24 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_eq_and_same_but_tuning_see_a_format_change_apart_from_a_column_change() {
+    fn test_eq_and_same_but_tuning_compare_columns_as_a_set_and_formats_as_tuning() {
         let entry =
             |columns: &str| Config::parse(&with_value_columns(columns)).unwrap().tables[0].clone();
         let opaque = entry(r#"["value", "detail"]"#);
+        let reordered = entry(r#"["detail", "value"]"#);
+        assert_eq!(opaque, reordered, "order carries no meaning");
+        assert!(opaque.same_but_tuning(&reordered));
+        assert_eq!(opaque.value_column_names(), ["detail", "value"]);
+        assert_eq!(reordered.value_column_names(), ["detail", "value"]);
         let protobuf = entry(r#"[{ name = "detail", format = "protobuf" }, "value"]"#);
         assert_ne!(opaque, protobuf, "a format change is a change");
         assert!(opaque.same_but_tuning(&protobuf), "and is applied in place");
         assert!(protobuf.same_but_tuning(&opaque));
+        assert_eq!(
+            protobuf,
+            entry(r#"["value", { name = "detail", format = "protobuf" }]"#),
+            "whichever order the formats are listed in"
+        );
         let retuned = TableConfig {
             lookups: Some(Level::Permissive),
             strict: !protobuf.strict,
@@ -2878,17 +2888,14 @@ locaton = "typo"
         };
         assert!(opaque.same_but_tuning(&retuned), "with lookups and strict");
         let fewer = entry(r#"[{ name = "detail", format = "protobuf" }]"#);
-        assert!(!opaque.same_but_tuning(&fewer), "a column removed reloads");
+        assert_ne!(opaque, fewer, "a column removed is a change");
+        assert!(!opaque.same_but_tuning(&fewer), "that reloads");
         let renamed = entry(r#"["value", { name = "details", format = "protobuf" }]"#);
         assert!(
             !opaque.same_but_tuning(&renamed),
             "a column renamed reloads"
         );
-        assert_eq!(
-            protobuf,
-            entry(r#"["value", { name = "detail", format = "protobuf" }]"#),
-            "order carries no meaning"
-        );
+        assert_ne!(entry(r#"["value"]"#), entry("[]"));
     }
 
     #[test]
@@ -2913,22 +2920,6 @@ locaton = "typo"
                 column: "key".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn test_eq_table_config_compares_value_columns_as_a_set() {
-        let entry =
-            |columns: &str| Config::parse(&with_value_columns(columns)).unwrap().tables[0].clone();
-        let two = entry(r#"["value", "detail"]"#);
-        let reordered = entry(r#"["detail", "value"]"#);
-        assert_eq!(two, reordered, "order carries no meaning");
-        assert!(two.same_but_tuning(&reordered));
-        assert_eq!(two.value_column_names(), ["detail", "value"]);
-        assert_eq!(reordered.value_column_names(), ["detail", "value"]);
-        let one = entry(r#"["value"]"#);
-        assert_ne!(two, one, "a column added is a change");
-        assert!(!two.same_but_tuning(&one));
-        assert_ne!(one, entry("[]"));
     }
 
     #[test]

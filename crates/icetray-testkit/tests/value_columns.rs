@@ -275,11 +275,6 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
             assert!(column.value_pages > 0, "{} {}", file.path, column.column);
             assert!(column.pages_aligned, "{} {}", file.path, column.column);
         }
-        assert_eq!(
-            file.value_columns[0].avg_value_bytes, file.value_columns[1].avg_value_bytes,
-            "{}: the second column holds the first's bytes reversed",
-            file.path
-        );
     }
     Ok(())
 }

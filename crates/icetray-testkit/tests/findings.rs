@@ -652,15 +652,13 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
         .step_by(row_group_rows / PROBES_PER_ROW_GROUP)
     {
         let key = fixture.key(id);
-        assert!(
-            verify::one_value(
-                &served
-                    .table
-                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
-                    .await?
-                    .row
-            )
-            .is_some(),
+        assert_eq!(
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
+            fixture.expected(&key),
             "key {key}"
         );
     }

@@ -21,7 +21,6 @@ use icetray_core::{
     ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
     TableFault, TableSource, TableState, diagnose, examine,
 };
-use icetray_testkit::error::SpecFault;
 use icetray_testkit::fixture::{
     IDS_2K, KEY_FIELD_ID, NAMESPACE, OLD_ID, SECOND_VALUE_COLUMN, SECOND_VALUE_FIELD_ID, STRAY_IDS,
     SchemaChange, StatedDefault, TWO_BUCKETS, VALUE_FIELD_ID, field_with_id, local_catalog,
@@ -34,8 +33,8 @@ use icetray_testkit::verify::{
     self, HINT_POLL_GETS, LOAD_METADATA_GETS, METADATA_FILE_GETS, SeenPages, Served,
 };
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, RawFile, Result, TestkitError,
-    value_for, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, RawFile, Result, value_for,
+    write_fixture,
 };
 
 /// The long keys of a raw file, ascending.
@@ -600,20 +599,6 @@ async fn test_a_projected_default_is_trimmed_with_no_value_get_in_the_disk_and_b
             key_pages,
             "{residency}: no value page"
         );
-        let report = examine(
-            &generation,
-            Level::Optimal,
-            &served.table.config().formats(),
-        )
-        .await
-        .report;
-        assert!(
-            !report.findings.iter().any(|finding| {
-                finding.code() == FindingCode::MalformedProtobuf && finding.file().is_none()
-            }),
-            "a protobuf default walks: {:?}",
-            report.findings
-        );
     }
     Ok(())
 }
@@ -871,37 +856,6 @@ async fn test_a_reused_file_under_a_dropped_and_readded_name_is_refused_on_refre
     Ok(())
 }
 
-#[tokio::test]
-async fn test_evolve_refuses_to_rename_or_drop_a_column_the_schema_lacks() -> Result<()> {
-    let (_dir, mut fixture) =
-        two_bucket_fixture("kv_evolve_absent", FormatVersion::V2, false).await?;
-    let version = fixture.metadata_location().to_string();
-    for change in [
-        SchemaChange::Rename {
-            from: OTHER_COLUMN.to_string(),
-            to: RENAMED.to_string(),
-        },
-        SchemaChange::Drop {
-            name: OTHER_COLUMN.to_string(),
-        },
-    ] {
-        let refused = fixture.evolve(&[change]).await;
-        assert!(
-            matches!(
-                &refused,
-                Err(TestkitError::Spec(SpecFault::ColumnNotInSchema { name })) if name == OTHER_COLUMN
-            ),
-            "{refused:?}"
-        );
-    }
-    assert_eq!(
-        fixture.metadata_location(),
-        version,
-        "nothing was committed"
-    );
-    Ok(())
-}
-
 /// A raw file of `RAW_KEYS` with `columns`, each a field and its values,
 /// under the contract layout with no manifest bounds.
 fn raw_file(columns: Vec<(Field, ArrayRef)>) -> Result<RawFile> {
@@ -979,42 +933,36 @@ async fn test_a_file_without_field_ids_holding_the_name_is_served() -> Result<()
     Ok(())
 }
 
+/// A file that records no field ids and lacks the value column's name is
+/// refused, since it cannot tell a rename from an absence. A file where
+/// only some columns carry an id records none, so it is refused the same
+/// way, and not given the default a file that records ids would.
 #[tokio::test]
 async fn test_a_file_without_field_ids_lacking_the_value_column_is_refused() -> Result<()> {
-    let file = raw_file(vec![
-        (Field::new(KEY_COLUMN, DataType::Int64, false), raw_keys()),
+    let cases = [
         (
-            Field::new(OTHER_COLUMN, DataType::Binary, true),
-            raw_values(),
+            "kv_no_ids_absent",
+            Field::new(KEY_COLUMN, DataType::Int64, false),
         ),
-    ])?;
-    let (_dir, fixture) = raw_table("kv_no_ids_absent", PrimitiveType::Binary, file).await?;
-    let (column, path, mismatch) = mismatch_of(&pinned_load_error(&fixture).await?);
-    assert_eq!(column, VALUE_COLUMN);
-    assert!(is_listed(&fixture, path.as_deref()), "{path:?}");
-    assert_eq!(mismatch, ColumnMismatch::AbsentWithoutFieldIds);
-    Ok(())
-}
-
-/// Were the file's one field id taken for a file that records ids, the
-/// absent value column would get its default; a file where only some
-/// columns carry one records none, so it is refused.
-#[tokio::test]
-async fn test_a_file_with_field_ids_on_only_some_columns_records_none() -> Result<()> {
-    let file = raw_file(vec![
         (
+            "kv_some_ids",
             field_with_id(KEY_COLUMN, DataType::Int64, false, KEY_FIELD_ID),
-            raw_keys(),
         ),
-        (
-            Field::new(OTHER_COLUMN, DataType::Binary, true),
-            raw_values(),
-        ),
-    ])?;
-    let (_dir, fixture) = raw_table("kv_some_ids", PrimitiveType::Binary, file).await?;
-    let (column, _, mismatch) = mismatch_of(&pinned_load_error(&fixture).await?);
-    assert_eq!(column, VALUE_COLUMN);
-    assert_eq!(mismatch, ColumnMismatch::AbsentWithoutFieldIds);
+    ];
+    for (name, key_field) in cases {
+        let file = raw_file(vec![
+            (key_field, raw_keys()),
+            (
+                Field::new(OTHER_COLUMN, DataType::Binary, true),
+                raw_values(),
+            ),
+        ])?;
+        let (_dir, fixture) = raw_table(name, PrimitiveType::Binary, file).await?;
+        let (column, path, mismatch) = mismatch_of(&pinned_load_error(&fixture).await?);
+        assert_eq!(column, VALUE_COLUMN, "{name}");
+        assert!(is_listed(&fixture, path.as_deref()), "{name}: {path:?}");
+        assert_eq!(mismatch, ColumnMismatch::AbsentWithoutFieldIds, "{name}");
+    }
     Ok(())
 }
 

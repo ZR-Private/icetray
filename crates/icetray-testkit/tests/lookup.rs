@@ -100,15 +100,13 @@ async fn round_trip(spec: FixtureSpec) -> Result<()> {
     verify::verify_misses(&served, &fixture, &SAMPLE).await?;
     for id in fixture.id_range().step_by(SWEEP_STRIDE) {
         let key = fixture.key(id);
-        assert!(
-            verify::one_value(
-                &served
-                    .table
-                    .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
-                    .await?
-                    .row
-            )
-            .is_some(),
+        assert_eq!(
+            served
+                .table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
+            fixture.expected(&key),
             "key {key}"
         );
     }
@@ -430,15 +428,13 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
     );
     assert_eq!(stats.gets(), before, "and nothing warm");
     let present = fixture.key(PRESENT_ID);
-    assert!(
-        verify::one_value(
-            &served
-                .table
-                .get(&present, &[ColumnRead::whole(VALUE_COLUMN)])
-                .await?
-                .row
-        )
-        .is_some()
+    assert_eq!(
+        served
+            .table
+            .get(&present, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        fixture.expected(&present)
     );
     assert_eq!(
         served
@@ -450,6 +446,33 @@ async fn test_null_values_are_present_with_null() -> Result<()> {
             .await?
             .row,
         Row::Absent
+    );
+    Ok(())
+}
+
+/// A present value of zero length is distinct from a null: present with
+/// empty bytes against present with null, in one fixture holding both.
+#[tokio::test]
+async fn test_a_zero_length_value_is_present_with_empty_bytes_apart_from_a_null() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        nulls: Nulls::EveryNth(NULL_EVERY),
+        value_bytes: 0,
+        ..FixtureSpec::small("kv_empty_values", KeyType::Long)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
+    let read = async |id: u64| -> Result<Row> {
+        Ok(served
+            .table
+            .get(&fixture.key(id), &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row)
+    };
+    assert_eq!(read(NULL_ID).await?, Row::Present(vec![None]));
+    assert_eq!(
+        read(PRESENT_ID).await?,
+        Row::Present(vec![Some(bytes::Bytes::new())])
     );
     Ok(())
 }
