@@ -130,11 +130,14 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
 /// GETs one `MultiGet` holds in flight at once when the file says nothing:
-/// 32 (RFD 013, RFD 022). A full batch of cold hits, a GET for each of
-/// `DEFAULT_MAX_MULTI_GET_VALUES` values, takes about thirty GET round
-/// trips, inside `DEFAULT_MULTI_GET_DEADLINE` at the latency a live lookup
-/// expects, well under 200 ms each.
-pub(crate) const DEFAULT_MULTI_GET_FAN_OUT: usize = 32;
+/// 64 (RFD 013, RFD 022). Measured against S3, a lone cold batch keeps
+/// getting faster up to about 128, while several concurrent batches reach
+/// the process's shared GET throughput by 64, past which a larger bound
+/// only lets one batch take more of it from the others
+/// (docs/analysis/2026-10-08-multi-get-fan-out.md). A full batch of cold
+/// hits, a GET for each of `DEFAULT_MAX_MULTI_GET_VALUES` values, takes
+/// about sixteen GET round trips, inside `DEFAULT_MULTI_GET_DEADLINE`.
+pub(crate) const DEFAULT_MULTI_GET_FAN_OUT: usize = 64;
 
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after

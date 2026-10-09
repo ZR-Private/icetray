@@ -41,19 +41,32 @@ cache and a device read when it is not. `icetray get` prints each
 lookup's `gets`, so an owner can measure a residency's GET count on a
 real table before configuring it.
 
+### MultiGet fan-out
+
 icetray holds at most `server.multi_get_fan_out` GETs in flight for one
-`MultiGet`, 32 by default, and each GET a lookup issues holds one slot
+`MultiGet`, 64 by default, and each GET a lookup issues holds one slot
 until it ends. A lookup takes its slot before it asks the page cache for
 a page not in memory, so a page in memory costs no slot, and a `Get` of a
 page a batch is still waiting to fetch issues its own GET rather than
 waiting behind the batch. A batch whose keys are all cold therefore waits
 about one GET's latency for every `multi_get_fan_out` GETs. At the
-default, under `full` or `disk`, that is every 32 keys when it requests
-one column, every 16 when it requests two, and fewer when a column is
+default, under `full` or `disk`, that is every 64 keys when it requests
+one column, every 32 when it requests two, and fewer when a column is
 dictionary-encoded, since its dictionary page is a GET of its own. Under
 `bloom` each key's key page takes a slot as well. A larger bound shortens
 a cold batch's latency, and each batch then holds more GETs open on the
 object store, up to twice the bound with a hedge beside each GET.
+
+Measured against S3 on a 4-vCPU host, a cold batch of 100 keys stops
+getting faster at a fan-out of about 128, where it takes about three GET
+round trips. Several concurrent batches reach the process's shared GET
+throughput sooner, by 64 for two-column batches, and past that point a
+larger bound speeds no one up: it only lets one batch take more of the
+shared throughput from the others. The default of 64 keeps most of a lone
+batch's gain and holds one caller to a fair share. A deployment with few
+concurrent batch callers can raise it toward 128; above that, the
+process's throughput is the limit
+([the measurements](analysis/2026-10-08-multi-get-fan-out.md)).
 
 ## Packing or splitting a row
 

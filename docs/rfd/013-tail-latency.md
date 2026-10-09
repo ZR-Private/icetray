@@ -10,8 +10,11 @@
 > See RFD 022.
 
 > Updated 2026-10-08: the MultiGet fan-out is configuration,
-> `server.multi_get_fan_out`, default 32, which a restart applies like
-> every server setting. See RFD 018.
+> `server.multi_get_fan_out`, default 64, which a restart applies like
+> every server setting (RFD 018). Measured against S3, a lone cold batch
+> stops getting faster near 128 and concurrent batches share the
+> process's GET throughput by 64; see
+> [the measurements](../analysis/2026-10-08-multi-get-fan-out.md).
 
 ## Problem
 
