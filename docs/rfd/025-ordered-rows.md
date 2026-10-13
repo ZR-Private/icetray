@@ -1,0 +1,371 @@
+# Ordered rows per key
+
+## Problem
+
+icetray serves tables with at most one row per key, and that remains its
+primary use. A second shape is common: many rows per key in a defined
+order, such as a time series ordered by key and timestamp, an activity
+log per user, or the versions of an entity. Callers request the last N
+rows of a key, every row of a key in order, or the rows on one side of
+an order value, for one key or for many in a batch, at request time.
+Most keys in such a table are cold for the reason most keys in a
+key-value table are: a small active set beside a long tail whose history
+is read rarely and unpredictably.
+
+Under RFD 002 (Serving layout) the load refuses this shape: a key
+repeated within a file or across live files is `duplicate_keys`, and a
+file sorted by key alone leaves the order of a key's rows undefined. A
+writer can pack each key's history into one value, at the costs
+Alternatives Considered sets out.
+
+The resident index already bounds where a key's rows lie. Each file's
+fences hold the first key of every key page, so they bound the pages a
+key's rows occupy, and each column's offset index maps a range of rows
+to that column's pages.
+
+## Decision
+
+Ordered rows per key will be served from an opt-in table kind, the
+ordered table, which the owner configures with an order column and
+writes sorted by key and then order value, through two new calls, Scan
+and MultiScan, with which a caller requests a key's rows in either
+direction under a limit and optional bounds on the order value.
+
+- **Configuration.** A table entry that sets `order_column` is an
+  ordered table; every other table is a key-value table. Configuring the
+  key column or a value column as the order column is a configuration
+  error. Setting, changing, or removing `order_column` reloads the whole
+  table under RFD 018 (Configuration reload). `max_scan_rows`, set only
+  on an ordered table, is the most rows one Scan returns, 1,000 by
+  default, and a change to it applies in place. `value_columns` and
+  their formats follow RFD 022 (Value columns) and RFD 024 (Field
+  projection).
+- **Order values.** The order column is Iceberg `int`, `long`, `date`,
+  `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`,
+  `string`, `binary`, or `fixed`, and the load refuses any other type as
+  `order_type_unsupported`. A file that stores the order column in
+  another Parquet type than Iceberg's, such as INT96 or millisecond
+  timestamps, is refused as `order_type_mismatch`, the order column's
+  counterpart of `key_type_mismatch`. Integer and time values compare as
+  signed 64-bit integers in Iceberg's unit (days, microseconds,
+  nanoseconds), and string, binary, and fixed values compare as their
+  bytes, the order RFD 008 (Keys) gives keys. The column may hold any
+  quantity with a total order in one of these types, such as a
+  timestamp, a sequence number, a version, or a log offset. A file
+  written before Iceberg promoted the column from `int` to `long` is
+  served, its values read as longs, and a promotion that changes the
+  unit, such as `date` to `timestamp`, is `order_type_mismatch`.
+- **Uniqueness.** A key and order value appear together at most once
+  within a data file, deleted rows included, and at most once across
+  live rows, so every Scan has one correct response in either direction.
+  A writer deduplicates before the write, or upserts with `MERGE` on key
+  and order value, whose deletes the server applies under RFD 021
+  (Merge-on-read). Rows of one key that share a timestamp need a
+  tiebreak inside the order value, such as a sequence number or a time
+  with a counter.
+- **Wire.** `Scan` takes a table, a key, the value columns to read as
+  `Get` takes them, a direction (`NEWEST_FIRST` or `OLDEST_FIRST`), a
+  limit, and optional exclusive bounds `after` and `before`. A limit of
+  0 reads up to `max_scan_rows`. The response carries the rows in the
+  requested direction, each its order value and one value per requested
+  column, a `more` flag set when live rows remain inside the bounds past
+  the last row returned, and the snapshot id. For a key with no rows the
+  server returns no rows with `more` unset. An order value travels as an
+  `OrderValue`, a long, a string, or bytes, with time types sent as a
+  long in Iceberg's unit, so a bound past an `int` or `date` column's
+  range admits every row on its side. A MultiScan carries one set of
+  columns, direction, limit, and bounds for many keys; the server
+  returns one result per key, each with its own rows and `more`, in
+  request order from one snapshot, a key listed twice answered at each
+  position as `MultiGet` answers it, and fails the whole call when any
+  key fails, as for `MultiGet`. `TableInfo` reports the order column,
+  its type, and `max_scan_rows`. Errors follow RFD 010 (Transport and
+  client contract) as for `Get` and `MultiGet`, and a malformed request
+  is `INVALID_ARGUMENT`: an unspecified direction, a limit above
+  `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
+  above `before`, a MultiScan above `max_multi_scan_values`, or a call
+  of the wrong kind for the table.
+- **Paging.** A caller pages by order value: reading newest first, the
+  next request sets `before` to the oldest order value of the previous
+  response, and reading oldest first, `after` to the newest. Within one
+  snapshot, uniqueness makes the next response exact, and paging is
+  stateless on the server. After a refresh between two requests the
+  server responds from the new snapshot, whose id the response carries,
+  and a row committed on the side the caller has already read appears in
+  a Scan that starts over.
+- **Layout.** The optimal layout for an ordered table is RFD 002's with
+  two changes: each file is sorted locally by key and then order value,
+  ascending, and a key may repeat within a file. A key's rows in one
+  file are therefore consecutive, a run sorted by order value, which may
+  span key pages and row groups. Partitioning stays `bucket(N, key)`, so
+  within a bucketing all of a key's rows share a bucket. Appends write
+  files that overlap a bucket's existing ones, and a compaction merges
+  them. The order column carries an offset index and a column index, the
+  minimum and maximum of each page, which Iceberg's writers write by
+  default.
+- **Load.** The load verifies that each file's rows strictly increase by
+  key and then order value, across row-group boundaries included: an
+  equal pair is `duplicate_rows`, naming the key and the order value, a
+  decrease is `unsorted`, and a null order value is `null_order`, and a
+  `string` order value that is not UTF-8 is a file fault, as a string
+  key that is not UTF-8 is. To verify, it reads the order column's
+  chunks, one GET per row group, and records per file the exact minimum
+  and maximum order value over all its rows, its distinct keys per row
+  group, and its longest run. Resident per file are those facts and the
+  order column's offset index and column index. A file without an order
+  column offset index is a file fault, as a key or value column without
+  one is. Since the load decodes every order value, it checks that each
+  order page's values lie within that page's column index entry, and a
+  file whose index fails to bound its pages is a file fault, so the
+  server places a bound only by an index it has checked. Order pages get
+  RFD 004's value-page header checks and its 64 MiB ceiling, at load and
+  in a Scan. Under `disk` every chunk file is named by its data file and
+  the rules it was verified under, the key-value rules or the ordered
+  rules with the order column's field id, and its verification record
+  names those rules. An ordered table's chunk file holds its key chunks,
+  its order chunks, and those facts. Entries that serve one table with
+  different order columns, or with none, therefore each keep their own
+  chunk file, and none trusts a file verified under other rules. The
+  chunk-file budget reserves an ordered chunk file from the footer's
+  sizes, estimating string and binary order values as it estimates
+  fences. Column resolution under RFD 023 (Column resolution) applies to
+  the order column, and a file written before the order column was added
+  is refused as `column_mismatch`, since its default would give every
+  row of the file one order value.
+- **Refresh.** Across files, the load checks for a repeated live pair
+  only among files where one can occur. A file is checked when it is
+  new, or reused with deletes that shrank: deleted rows that are not a
+  superset of those the previous generation applied (RFD 021). It is
+  checked against every file, new or reused, that can share a key with
+  it under RFD 005's overlap rule across buckets and bucketings and
+  whose key range and order range both intersect its own, ranges whose
+  ends touch included. A file whose order range is disjoint from those
+  of every such file, as an append of later rows is, needs no merge.
+  Where ranges intersect, the load reads only the order pages of the
+  other files that can hold the checked file's rows, judged by the key
+  pages each order page's rows span and by its checked column index. It
+  fetches them by GET under `full`, reads them from the ordered chunk
+  file under `disk`, and fetches them with the key pages they span under
+  `bloom`; and it refuses a live pair present twice as `duplicate_rows`,
+  naming the later file in file order, as `duplicate_keys` does. The
+  load fetches the order chunks of a reused file whose deletes shrank
+  again under `full`, and its key chunks with them under `bloom`. A
+  refresh that appends later rows therefore reads only its new files,
+  and an append of rows inside an existing file's order range costs the
+  order pages those rows fall among.
+- **Cost.** Per file that holds the key, a Scan finds the run, then
+  reads the order column and each requested column over the run's rows,
+  in one round across all files:
+
+  | Step | `full` | `disk` | `bloom` |
+  |---|---|---|---|
+  | Find the run | decode of at most two key pages per row group it spans, from memory | the same, read from the local file | the filter screens the file, then GETs of those key pages, concurrently, and of the key column's dictionary page when it has one |
+  | Read the rows | per column and row group, one GET per contiguous span of uncached pages, and the column's dictionary page when it is dictionary-encoded | the same, with the order column read from the local chunk file | the same as `full` |
+  | A file without the key | one key-page decode | one local read | a key-page GET at the filter's false-positive rate |
+
+  Within a row group, the run lies between the first and last key pages
+  the fences allow for the key, and every page between them holds only
+  the key, so decoding those two gives the run's exact rows; the
+  resident first and last key of each row group give the row groups a
+  run spans. The server takes up to the limit of the run's newest or
+  oldest live rows, counted against the resident deleted rows without
+  I/O. With a bound, the server selects from the order column's resident
+  column index the pages that can hold the bound and reads them with the
+  value pages in the same round, so with a full-length column index,
+  beyond the rows the limit selects, a bounded Scan reads in each
+  requested column at most the rest of the order page that holds the
+  bound and one run-edge page, whose minimum and maximum include a
+  neighbouring key's values. Across K files that hold the key, a Scan
+  with limit L reads up to K·L rows and returns L; to set `more`
+  exactly, the server reads the order value of one more live row in each
+  file. A Scan of a key held in one file, with none of its pages cached,
+  no dictionary-encoded column, and its run in one row group, costs one
+  GET per requested column and, under `full` and `bloom`, one for the
+  order column, as a cold Get with one more column does, with the
+  key-page GETs first under `bloom`, and its bytes grow with the limit
+  and the values' size.
+- **Caching and hedging.** Each page a span GET fetches is cached as its
+  own entry, keyed by file and offset, in a memory cache for ordered
+  tables, bounded by `server.scan_page_cache_bytes`, 256 MiB by default,
+  and kept out of the disk level, so a scan evicts only other scans'
+  pages. Span GETs are hedged under RFD 013 (Tail latency) in a window
+  of their own per table, whose delay scales with a span's pages, since
+  a span's latency grows with its size; key-page GETs under `bloom` use
+  the table's lookup window.
+- **Limits.** `server.batch_fan_out`, renamed from
+  `server.multi_get_fan_out`, bounds the GETs one MultiGet, one Scan, or
+  one MultiScan holds in flight. `server.max_multi_scan_values`, 4,000
+  by default, bounds a MultiScan's keys times its limit times one more
+  than its requested columns, a limit of 0 counting as `max_scan_rows`,
+  and the server rejects a larger call before it reads any key. A
+  configuration whose `max_multi_scan_values` is below twice an ordered
+  table's `max_scan_rows` is refused, so a MultiScan of one key at the
+  full limit and one column is always valid. That limit applies to a
+  MultiScan of one key as to any other, and a caller reading one key's
+  full limit over many columns uses Scan. `server.scan_deadline`, 5 s by
+  default, bounds one Scan and each span GET, and
+  `server.multi_scan_deadline`, 15 s by default, one MultiScan.
+  `server.max_in_flight` counts every call.
+- **Levels and findings.** RFD 020 (Lookup levels) applies, read for a
+  Scan of one key. When no two files in a bucket have key ranges that
+  intersect, ends included, every Scan reads one file, and the table can
+  reach `optimal`; decoding two key pages per row group, and a run that
+  spans row groups, leave it there. Files that one snapshot added, as a
+  compaction that rolls files by size writes them, may meet where one
+  file's last key is the next file's first, so a Scan of such an edge
+  key reads every file that holds it. That cost follows from how those
+  files were written and does not grow with later commits, so
+  `shared_edge_keys` caps the table at `balanced` and reports the most
+  files one edge key spans. Any other overlap, as appends write, is
+  `permissive` under `overlapping_files`, including a file of another
+  snapshot that touches only an edge key. The strict gate tells the
+  three apart from key ranges, edge keys, and the snapshot each manifest
+  entry records as adding its file, inherited from its manifest when the
+  entry leaves it null, as RFD 021 inherits sequence numbers, before any
+  chunk is built. `lookups` defaults as RFD 020 sets it, so an owner
+  whose ordered table takes appends between compactions sets `lookups =
+  "permissive"` to keep it from being reported below its level.
+  `no_bucket_partition` and `large_key_pages` apply unchanged. Under
+  `full` and `bloom`, two more findings cap the table at `balanced`:
+  `dictionary_encoded_order`, for a dictionary-encoded order column,
+  whose dictionary page every Scan also fetches, and
+  `order_index_missing`, for a file without an order column index, where
+  a bounded Scan takes a second round; under `disk` the dictionary page
+  and the bound's order pages are local reads. A truncated order column
+  index draws the advice `order_index_truncated`, since long string
+  values sharing a prefix widen the pages a bound selects. The advice
+  `long_runs` reports a file holding a run of more than 1,000 rows, and
+  `large_runs` a file where 1,000 rows of the configured value columns,
+  at the footer's uncompressed bytes per row, would exceed 4 MiB, a gRPC
+  client's default message limit. The bloom findings divide a row
+  group's filter bits by its distinct keys, which the load counts.
+- **Metrics.** `icetray_scans_total` by table and result (`rows`,
+  `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
+  histograms, and `icetray_scan_seconds`, cold and warm. A Scan is cold
+  when any page it reads came from object storage.
+  `icetray_value_page_gets_total` counts the order column's GETs under
+  its column name. `icetray_table_gets_per_scan` predicts a cold Scan at
+  `max_scan_rows` of one key held in one file and one row group.
+  `icetray_table_files_probed_per_lookup` and the per-column levels are
+  published for ordered tables as for key-value ones, RFD 020's per-hit
+  and per-miss gauges are published for key-value tables only.
+
+## Alternatives Considered
+
+Each key's history packed into one value, served by `Get`. It works with
+no change. Rejected as the design, because every read fetches the whole
+history, the number of rows a caller receives is fixed when the table is
+built, a value is bounded by the page ceiling and the message size, and
+each append rewrites every touched key's history.
+
+A range scan over a composite key, with the key column encoding key and
+order value together. Rejected because `bucket(N, key)` over the
+composite would scatter one key's rows across buckets, so the table
+would still need a separate column to partition on, and every caller
+would encode ranges itself.
+
+Ties within a key broken by file and row position. Rejected because the
+order that results carries no meaning, and a retried duplicate would be
+served as a second row.
+
+Server-streaming calls. Rejected for the first version, because a limit
+bounds every response and paging by order value reads a longer history
+with no state on the server.
+
+Opaque cursor tokens. Rejected because uniqueness makes the order value
+an exact cursor that the caller already holds.
+
+A snapshot id on the request, refused once the server has moved on.
+Rejected for the first version, because the response's snapshot id
+already shows a caller that a refresh came between two requests.
+
+The order column decoded and resident. Rejected because its memory grows
+with rows, which in an ordered table outnumber keys, while the column
+index already lets a bound select its pages.
+
+A two-phase read across files, order values first and then values only
+for the rows returned. Not chosen for the first version, because it adds
+a round to every Scan of a key in several files, while the one round
+reads an excess that a compaction removes.
+
+One GET per page in place of span GETs. Rejected because a full run of
+small values spans dozens of value pages, and each GET is a round trip
+billed on its own.
+
+A shared page cache. Rejected because a long run would evict a key-value
+table's hot pages.
+
+A re-merge of every overlap group that gains a file, as a key-value
+table's refresh does. Rejected because appends make every file in a
+touched bucket overlap, so each refresh would re-read the order column
+of every file in those buckets.
+
+Order values normalized from other units, such as millisecond
+timestamps. Rejected because Iceberg writers store Iceberg's units, and
+a file in another unit comes from a migration that a rewrite repairs.
+
+`bloom` residency refused for ordered tables. Rejected because a bloom
+filter covers a column's distinct values, so a key repeated across rows
+is one entry, and the fences bound the key pages a Scan needs.
+
+Truncation by response bytes. Rejected in favor of a row limit the owner
+sizes against value size and an advice finding for runs too large for a
+message.
+
+One Scan across several tables that share a key type, merged by order
+value. Deferred: a caller can issue one Scan per table and merge by the
+order values each row carries, and a later decision can add such a read
+as a call of its own or an extension of these.
+
+## Consequences
+
+A key-value table keeps every check, layout requirement, and cost per
+call. The ordered rules run only for a table with an order column, its
+pages use a cache of their own, and its chunk files are named by the
+ordered rules they were verified under. A process that serves both kinds
+shares `server.max_in_flight`, its GET throughput, and resident memory
+across them, and one `server.batch_fan_out` setting governs both. A
+regression benchmark of warm and cold Get, MultiGet, and misses, on a
+process serving key-value tables alone and on one serving both kinds,
+holds the key-value path to its current costs.
+
+The wire contract grows by two calls and an order value, and
+`server.multi_get_fan_out` is renamed `server.batch_fan_out`, which
+before 1.0 is allowed in place (`CONTRIBUTING.md`, Stability).
+
+A cold Scan of a key in K files costs K times the GETs of a compacted
+one and waits on the slowest of them, so an ordered table's latency
+follows its compaction cadence; `icetray_scan_files` reports the files
+each Scan reads. Under `disk`, the residency sample of RFD 020 covers an
+ordered chunk file's order chunks with its key chunks, since every Scan
+reads both. A long run costs bytes in proportion to the rows read, a run
+the cache holds in part costs one GET per uncached span, and under
+`bloom` a Scan waits on a key-page round before its row round. At the
+defaults, a MultiScan at the full limit with one value column covers two
+keys, so a caller reading many keys requests a smaller limit.
+
+A load reads the order column once per row group, so a file costs one
+more GET per row group than RFD 004 (Resident key-chunk index) counts,
+and the resident budget counts the order column's indexes and per-file
+facts. A table whose writer leaves files unsorted, as streaming appends
+often do, is refused as `unsorted` until a compaction sorts them.
+
+Earlier RFDs are revised to match: RFD 002 (the optimal layout for an
+ordered table); RFD 004 and RFD 017 (Residency tiers) (the order
+column's resident indexes and per-file facts, an ordered table's chunk
+file, its name, record, and budget, and the descriptor count and
+retention that cover it, and finding a run in each tier); RFD 006
+(Lookup hot path) (a Scan's steps); RFD 022 (entries over one table
+share chunk files only within one kind and order column); RFD 023 (the
+order column's resolution and its promotion); RFD 005 (Generations and
+refresh) and RFD 021 (which files a refresh checks, and live rows
+counted against deleted rows); RFD 007 (Serving tiers) and RFD 016
+(Doctor) (the new refusals and findings, and bloom sizing by distinct
+keys); RFD 010 (Scan, MultiScan, `OrderValue`, and their errors); RFD
+011 (Configuration) and RFD 018 (`order_column`, `max_scan_rows` applied
+in place, and the new and renamed server settings); RFD 013 (the batch
+fan-out, the scan deadlines, and the span hedge window); and RFD 020
+(the levels read for a Scan, and `balanced` extended to edge keys shared
+by files one snapshot added). The table layout, the configuration
+reference, the calling guide, and the operating guide describe ordered
+tables.
