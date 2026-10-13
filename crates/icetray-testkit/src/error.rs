@@ -12,6 +12,7 @@ use icetray_core::config::Residency;
 use icetray_core::{Key, KeyType};
 
 use crate::golden::WAREHOUSE_VAR;
+use crate::ordered::{OrderKind, TestOrder};
 use crate::truth::TruthFault;
 
 /// The environment variable that names the REST catalog the container-gated
@@ -145,6 +146,32 @@ pub enum SpecFault {
         /// The delete file's location.
         path: String,
     },
+    /// A raw order value the order column's type cannot hold.
+    #[error("{kind:?} cannot hold the order value {raw}")]
+    OrderUnencodable {
+        /// The order column's type.
+        kind: OrderKind,
+        /// The raw value.
+        raw: i64,
+    },
+    /// An id's order values `start + step * j` run past the largest long.
+    #[error("the order values of id {id} are past the largest long")]
+    OrderOverflow {
+        /// The id.
+        id: u64,
+    },
+    /// A delete or update named a row that is not live.
+    #[error("id {id} has no live row at order {order}")]
+    RowNotLive {
+        /// The id.
+        id: u64,
+        /// The raw order value.
+        order: i64,
+    },
+    /// A call that addresses rows by order value on a fixture whose
+    /// specification names no order column.
+    #[error("the fixture has no order column")]
+    NotOrdered,
 }
 
 /// What a value `SpecFault::PastLong` names is; closed.
@@ -200,11 +227,15 @@ pub enum Precondition {
 /// leaves a key without one answer; closed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OracleFault {
-    /// Two live rows hold one key.
-    #[error("key {key} is live in {first} and {second}")]
+    /// Two live rows hold one key, or in an ordered table one key and
+    /// order value.
+    #[error("key {key} at order {order:?} is live in {first} and {second}")]
     LiveDuplicate {
         /// The key.
         key: Key,
+        /// The order value the two rows share; `None` in a key-value
+        /// table.
+        order: Option<TestOrder>,
         /// The data file of one live copy.
         first: String,
         /// The data file of another.

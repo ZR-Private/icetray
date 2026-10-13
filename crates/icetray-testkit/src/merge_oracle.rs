@@ -7,13 +7,16 @@
 //! the file's data sequence number is no greater than the delete's and the
 //! two entries record one partition (spec id and tuple), a deletion vector
 //! masks position deletes for its file, and at most one deletion vector
-//! applies to a file. It shares no code with icetray's reader, so a test
+//! applies to a file. An ordered table's rows are told apart by key and
+//! order value together. It shares no code with icetray's reader, so a test
 //! checks every answer the server gives against it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::array::{
-    Array, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+    Array, BinaryArray, Date32Array, FixedSizeBinaryArray, Int32Array, Int64Array,
+    LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::DataType;
 use bytes::Bytes;
@@ -32,6 +35,7 @@ use crate::delete_files::{VECTOR_FRAME_BYTES, VECTOR_MAGIC};
 use crate::error::{OracleFault, Result};
 use crate::fixture::Fixture;
 use crate::layout::{KEY_COLUMN, VALUE_COLUMN};
+use crate::ordered::{ORDER_COLUMN, TestOrder};
 
 /// One copy of a key: a row of a live data file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +44,9 @@ pub struct RowCopy {
     pub path: String,
     /// The row's position in the file, counted from its first row.
     pub position: u64,
+    /// The row's order value, read from the order column; `None` in a
+    /// file without one.
+    pub order: Option<TestOrder>,
     /// The row's value; `None` is a null.
     pub value: Option<Vec<u8>>,
     /// Whether a delete that applies to the file names the row.
@@ -74,7 +81,8 @@ impl Live {
 
 impl MergeOracle {
     /// The oracle of `fixture`'s current snapshot. Two live copies of one
-    /// key are `OracleFault::LiveDuplicate`, two deletion vectors applying
+    /// key, or of one key and order value in an ordered table, are
+    /// `OracleFault::LiveDuplicate`, two deletion vectors applying
     /// to one data file `OracleFault::TwoVectors`, and a deletion vector
     /// that does not decode or contradicts its entry
     /// `OracleFault::MalformedVector`.
@@ -124,22 +132,25 @@ impl MergeOracle {
         for live in &data {
             let path = live.file.file_path();
             let gone = deleted.get(path);
-            for (position, (key, value)) in (0_u64..).zip(read_rows(file_io, path).await?) {
-                copies.entry(key).or_default().push(RowCopy {
+            for (position, row) in (0_u64..).zip(read_rows(file_io, path).await?) {
+                copies.entry(row.key).or_default().push(RowCopy {
                     path: path.to_string(),
                     position,
-                    value,
+                    order: row.order,
+                    value: row.value,
                     deleted: gone.is_some_and(|gone| gone.contains(&position)),
                 });
             }
         }
-        for (key, held) in &copies {
-            let mut live = held.iter().filter(|copy| !copy.deleted);
-            if let (Some(first), Some(second)) = (live.next(), live.next()) {
+        for (key, held) in &mut copies {
+            held.sort_by(|a, b| a.order.cmp(&b.order));
+            let live: Vec<&RowCopy> = held.iter().filter(|copy| !copy.deleted).collect();
+            if let Some(pair) = live.windows(2).find(|pair| pair[0].order == pair[1].order) {
                 return Err(OracleFault::LiveDuplicate {
                     key: key.clone(),
-                    first: first.path.clone(),
-                    second: second.path.clone(),
+                    order: pair[0].order.clone(),
+                    first: pair[0].path.clone(),
+                    second: pair[1].path.clone(),
                 }
                 .into());
             }
@@ -157,13 +168,22 @@ impl MergeOracle {
         }
     }
 
-    /// The live copy of `key`, when it has one.
+    /// The live copy of `key`, when it has one; of an ordered table's key,
+    /// the live row with the lowest order value.
     pub fn live_copy(&self, key: &Key) -> Option<&RowCopy> {
         self.copies(key).iter().find(|copy| !copy.deleted)
     }
 
-    /// Every copy of `key`, live and deleted, in the order the data files
-    /// are listed.
+    /// The live copy of `key` at order value `order`, when it has one.
+    pub fn live_copy_at(&self, key: &Key, order: &TestOrder) -> Option<&RowCopy> {
+        self.copies(key)
+            .iter()
+            .find(|copy| !copy.deleted && copy.order.as_ref() == Some(order))
+    }
+
+    /// Every copy of `key`, live and deleted: in the order the data files
+    /// are listed, and for an ordered table ascending by order value, a
+    /// pair's copies in file order.
     pub fn copies(&self, key: &Key) -> &[RowCopy] {
         self.copies.get(key).map_or(&[], Vec::as_slice)
     }
@@ -240,9 +260,17 @@ async fn apply(
     Ok(by_file)
 }
 
-/// The rows of the Parquet file at `path`, in file order, as (key, value)
-/// from the fixture's key and value columns.
-pub(crate) async fn read_rows(file_io: &FileIO, path: &str) -> Result<Vec<(Key, Option<Vec<u8>>)>> {
+/// One row of a data file as the oracle reads it.
+struct FileRow {
+    key: Key,
+    /// The order column's value, `None` for a file without the column.
+    order: Option<TestOrder>,
+    value: Option<Vec<u8>>,
+}
+
+/// The rows of the Parquet file at `path`, in file order, from the
+/// fixture's key, value, and order columns.
+async fn read_rows(file_io: &FileIO, path: &str) -> Result<Vec<FileRow>> {
     let mut rows = Vec::new();
     for batch in read_batches(file_io, path).await? {
         let keys = batch
@@ -255,9 +283,16 @@ pub(crate) async fn read_rows(file_io: &FileIO, path: &str) -> Result<Vec<(Key, 
             &DataType::Binary,
         )?;
         let values = downcast::<BinaryArray>(&values, path, VALUE_COLUMN)?;
+        let orders = batch.column_by_name(ORDER_COLUMN);
         for row in 0..batch.num_rows() {
-            let value = values.is_valid(row).then(|| values.value(row).to_vec());
-            rows.push((key_at(keys.as_ref(), row, path)?, value));
+            rows.push(FileRow {
+                key: key_at(keys.as_ref(), row, path)?,
+                order: orders
+                    .map(|orders| order_at(orders.as_ref(), row, path))
+                    .transpose()?
+                    .flatten(),
+                value: values.is_valid(row).then(|| values.value(row).to_vec()),
+            });
         }
     }
     Ok(rows)
@@ -285,6 +320,49 @@ fn key_at(keys: &dyn Array, row: usize, path: &str) -> Result<Key> {
         path: path.to_string(),
         column: KEY_COLUMN.to_string(),
         found: keys.data_type().to_string(),
+    }
+    .into())
+}
+
+/// The order value at `row` of an order column, `None` for a null: an
+/// integer, date, or timestamp as a long in its unit, a string, or the bytes
+/// of a binary (as the library's writer stores one, large) or fixed value.
+fn order_at(orders: &dyn Array, row: usize, path: &str) -> Result<Option<TestOrder>> {
+    if orders.is_null(row) {
+        return Ok(None);
+    }
+    let any = orders.as_any();
+    let long = if let Some(values) = any.downcast_ref::<Int64Array>() {
+        Some(values.value(row))
+    } else if let Some(values) = any.downcast_ref::<Int32Array>() {
+        Some(i64::from(values.value(row)))
+    } else if let Some(values) = any.downcast_ref::<Date32Array>() {
+        Some(i64::from(values.value(row)))
+    } else if let Some(values) = any.downcast_ref::<TimestampMicrosecondArray>() {
+        Some(values.value(row))
+    } else {
+        any.downcast_ref::<TimestampNanosecondArray>()
+            .map(|values| values.value(row))
+    };
+    if let Some(long) = long {
+        return Ok(Some(TestOrder::Long(long)));
+    }
+    if let Some(values) = any.downcast_ref::<StringArray>() {
+        return Ok(Some(TestOrder::Str(values.value(row).to_string())));
+    }
+    if let Some(values) = any.downcast_ref::<BinaryArray>() {
+        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+    }
+    if let Some(values) = any.downcast_ref::<LargeBinaryArray>() {
+        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+    }
+    if let Some(values) = any.downcast_ref::<FixedSizeBinaryArray>() {
+        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+    }
+    Err(OracleFault::UnexpectedColumn {
+        path: path.to_string(),
+        column: ORDER_COLUMN.to_string(),
+        found: orders.data_type().to_string(),
     }
     .into())
 }

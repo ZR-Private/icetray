@@ -9,6 +9,8 @@ use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
+use crate::ordered::ORDER_COLUMN;
+
 /// The key column of every fixture table.
 pub const KEY_COLUMN: &str = "key";
 
@@ -95,6 +97,14 @@ pub struct Layout {
     pub column_index_truncate: Option<usize>,
     /// What the key column's statistics carry.
     pub statistics: Statistics,
+    /// What the order column's statistics carry; the column index of an
+    /// ordered table's order column, which a bounded Scan selects pages
+    /// from. A truncation length cuts the byte-array statistics of every
+    /// column in the file, the key's included, and the shorter of the two
+    /// modes' lengths applies.
+    pub order_statistics: Statistics,
+    /// Whether the order column is dictionary-encoded.
+    pub order_dictionary: bool,
     /// The key column's bloom filter.
     pub bloom: Bloom,
     /// Rows per row group; `None` leaves the writer's default, one row group
@@ -116,6 +126,8 @@ impl Layout {
             dictionary: Dictionary::Off,
             column_index_truncate: None,
             statistics: Statistics::Full,
+            order_statistics: Statistics::Full,
+            order_dictionary: false,
             bloom: Bloom::Sized,
             row_group_rows: None,
             target_file_bytes: length(contract::TARGET_FILE_BYTES_MAX),
@@ -126,8 +138,21 @@ impl Layout {
     /// filter. The write batch is the page row limit so that limit binds
     /// exactly, or `BYTE_BOUNDED_BATCH_ROWS` under a byte bound. The filter
     /// setters enable a filter on the column they name, so the value column
-    /// never gets one.
+    /// never gets one. The file is sorted by its key column.
     pub(crate) fn properties(&self, rows: usize) -> WriterProperties {
+        self.build(rows, &[KEY_COLUMN_INDEX])
+    }
+
+    /// `properties` for a file of an ordered table: sorted by its key
+    /// column and then its order column, at position `order_column` of the
+    /// schema, which takes `order_dictionary` and `order_statistics`.
+    pub(crate) fn ordered_properties(&self, rows: usize, order_column: i32) -> WriterProperties {
+        self.build(rows, &[KEY_COLUMN_INDEX, order_column])
+    }
+
+    /// The properties of a file of `rows` rows sorted by the columns at
+    /// `sorted`, ascending.
+    fn build(&self, rows: usize, sorted: &[i32]) -> WriterProperties {
         let batch_rows = if self.page_bytes.is_some() {
             BYTE_BOUNDED_BATCH_ROWS
         } else {
@@ -142,11 +167,16 @@ impl Layout {
             .set_column_index_truncate_length(self.column_index_truncate)
             .set_bloom_filter_enabled(false)
             .set_max_row_group_row_count(self.row_group_rows)
-            .set_sorting_columns(Some(vec![SortingColumn {
-                column_idx: KEY_COLUMN_INDEX,
-                descending: false,
-                nulls_first: false,
-            }]));
+            .set_sorting_columns(Some(
+                sorted
+                    .iter()
+                    .map(|&column_idx| SortingColumn {
+                        column_idx,
+                        descending: false,
+                        nulls_first: false,
+                    })
+                    .collect(),
+            ));
         if let Some(page_bytes) = self.page_bytes {
             builder = builder.set_data_page_size_limit(page_bytes);
         }
@@ -167,6 +197,24 @@ impl Layout {
                 .set_statistics_truncate_length(Some(bytes)),
             Statistics::None => builder.set_statistics_enabled(EnabledStatistics::None),
         };
+        let order = ColumnPath::from(ORDER_COLUMN);
+        builder = match self.order_statistics {
+            Statistics::Full => {
+                builder.set_column_statistics_enabled(order.clone(), EnabledStatistics::Page)
+            }
+            Statistics::Truncated(bytes) => builder
+                .set_column_statistics_enabled(order.clone(), EnabledStatistics::Page)
+                .set_statistics_truncate_length(match self.statistics {
+                    Statistics::Truncated(key_bytes) => Some(key_bytes.min(bytes)),
+                    Statistics::Full | Statistics::None => Some(bytes),
+                }),
+            Statistics::None => {
+                builder.set_column_statistics_enabled(order.clone(), EnabledStatistics::None)
+            }
+        };
+        if self.order_dictionary {
+            builder = builder.set_column_dictionary_enabled(order, true);
+        }
         let fpp = match self.bloom {
             Bloom::Off => None,
             Bloom::Sized => Some(KEY_BLOOM_FPP),
@@ -198,6 +246,9 @@ mod tests {
     /// A truncation length for the statistics test.
     const TRUNCATE: usize = 8;
 
+    /// The position of the order column in the sorting test's schema.
+    const ORDER_AT: i32 = 2;
+
     #[test]
     fn test_contract_derives_from_contract_constants() {
         let layout = Layout::contract();
@@ -213,6 +264,8 @@ mod tests {
         assert_eq!(layout.dictionary, Dictionary::Off);
         assert_eq!(layout.column_index_truncate, None);
         assert_eq!(layout.statistics, Statistics::Full);
+        assert_eq!(layout.order_statistics, Statistics::Full);
+        assert!(!layout.order_dictionary);
         assert_eq!(layout.bloom, Bloom::Sized);
         assert_eq!(layout.row_group_rows, None);
     }
@@ -314,5 +367,65 @@ mod tests {
         }
         .properties(ROWS);
         assert_eq!(none.statistics_enabled(&key), EnabledStatistics::None);
+    }
+
+    #[test]
+    fn test_ordered_properties_sort_by_the_key_and_then_the_order_column() {
+        let sorted = |properties: &WriterProperties| -> Vec<i32> {
+            properties
+                .sorting_columns()
+                .expect("the writer declares its sort")
+                .iter()
+                .map(|column| column.column_idx)
+                .collect()
+        };
+        assert_eq!(
+            sorted(&Layout::contract().properties(ROWS)),
+            [KEY_COLUMN_INDEX]
+        );
+        assert_eq!(
+            sorted(&Layout::contract().ordered_properties(ROWS, ORDER_AT)),
+            [KEY_COLUMN_INDEX, ORDER_AT]
+        );
+    }
+
+    #[test]
+    fn test_properties_order_column_follows_its_own_dictionary_and_statistics() {
+        let key = ColumnPath::from(KEY_COLUMN);
+        let order = ColumnPath::from(ORDER_COLUMN);
+        let plain = Layout::contract().ordered_properties(ROWS, ORDER_AT);
+        assert!(!plain.dictionary_enabled(&order));
+        assert_eq!(plain.statistics_enabled(&order), EnabledStatistics::Page);
+        let tuned = Layout {
+            order_dictionary: true,
+            order_statistics: Statistics::None,
+            ..Layout::contract()
+        }
+        .ordered_properties(ROWS, ORDER_AT);
+        assert!(tuned.dictionary_enabled(&order));
+        assert!(!tuned.dictionary_enabled(&key));
+        assert_eq!(tuned.statistics_enabled(&order), EnabledStatistics::None);
+        assert_eq!(tuned.statistics_enabled(&key), EnabledStatistics::Page);
+        let truncated = Layout {
+            order_statistics: Statistics::Truncated(TRUNCATE),
+            ..Layout::contract()
+        }
+        .ordered_properties(ROWS, ORDER_AT);
+        assert_eq!(
+            truncated.statistics_enabled(&order),
+            EnabledStatistics::Page
+        );
+        assert_eq!(truncated.statistics_truncate_length(), Some(TRUNCATE));
+    }
+
+    #[test]
+    fn test_properties_truncation_takes_the_shorter_of_the_two_statistics() {
+        let both = Layout {
+            statistics: Statistics::Truncated(TRUNCATE * 2),
+            order_statistics: Statistics::Truncated(TRUNCATE),
+            ..Layout::contract()
+        }
+        .ordered_properties(ROWS, ORDER_AT);
+        assert_eq!(both.statistics_truncate_length(), Some(TRUNCATE));
     }
 }

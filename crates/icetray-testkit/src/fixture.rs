@@ -4,6 +4,8 @@
 //! function of the key and of the version that wrote it, so any answer is
 //! checkable without a stored oracle, and a live row is told apart from a
 //! deleted copy of its key.
+//! An ordered fixture (RFD 025) writes many rows per key, sorted by key and
+//! then order value, and tracks each row by its id and order value.
 //! What the library's writer cannot produce (a delete file, a dropped data
 //! file, a null key, a key column whose Parquet type contradicts the schema)
 //! is committed as a raw file or as a snapshot written by hand.
@@ -53,6 +55,7 @@ use icetray_core::key::UUID_BYTES;
 use icetray_core::time::millis_after;
 use icetray_core::{ColumnRead, Key, KeyType, Row};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+use parquet::file::properties::WriterProperties;
 use roaring::RoaringTreemap;
 use tempfile::TempDir;
 
@@ -63,7 +66,11 @@ use crate::keys::{
     absent_key_from, id_of, key_at_shaped, value_of_version,
 };
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
-use crate::merge_oracle::MergeOracle;
+use crate::merge_oracle::{MergeOracle, RowCopy};
+use crate::ordered::{
+    LiveRows, ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, RowId, ScanRows, TestScan,
+    row_value, scan_model,
+};
 use crate::protobuf;
 use crate::s3::S3Fixture;
 
@@ -295,6 +302,9 @@ pub struct FixtureSpec {
     pub format_version: FormatVersion,
     /// Whether the table also holds `SECOND_VALUE_COLUMN`.
     pub second_value: bool,
+    /// The rows per id and the order column of an ordered table (RFD 025);
+    /// `None` writes a key-value table, one row per id.
+    pub ordered: Option<Ordered>,
 }
 
 /// The order ids are handed to the writer within each bucket. `Descending`
@@ -337,6 +347,17 @@ impl FixtureSpec {
             layout: Layout::contract(),
             format_version: FormatVersion::V2,
             second_value: false,
+            ordered: None,
+        }
+    }
+
+    /// The small fixture as an ordered table: every id has the rows
+    /// `ordered` names, sorted by key and then order value, and every other
+    /// shape is a struct update on it as for `small`.
+    pub fn ordered(name: &str, key_type: KeyType, ordered: Ordered) -> Self {
+        Self {
+            ordered: Some(ordered),
+            ..Self::small(name, key_type)
         }
     }
 
@@ -377,6 +398,25 @@ impl FixtureSpec {
             Nulls::None => false,
             Nulls::EveryNth(n) => id.checked_rem(n) == Some(0),
         }
+    }
+
+    /// The rows of `ids`, each id's in the order they are written: the one
+    /// row of a key-value table, or the rows the ordered specification
+    /// gives the id.
+    fn rows_of(&self, ids: &[u64]) -> Result<Vec<RowId>> {
+        let Some(ordered) = &self.ordered else {
+            return Ok(ids.iter().map(|&id| RowId::keyed(id)).collect());
+        };
+        let mut rows = Vec::new();
+        for &id in ids {
+            rows.extend(
+                ordered
+                    .orders_of(id)?
+                    .into_iter()
+                    .map(|order| RowId::at(id, order)),
+            );
+        }
+        Ok(rows)
     }
 
     /// The ids the first commit writes, in `order`.
@@ -424,12 +464,25 @@ impl RawFile {
         partition: Struct,
         bounds: Option<(Key, Key)>,
     ) -> Result<Self> {
+        Self::written(
+            name,
+            batch,
+            layout.properties(batch.num_rows()),
+            partition,
+            bounds,
+        )
+    }
+
+    /// `batch` written as one Parquet file under `properties`.
+    fn written(
+        name: &str,
+        batch: &RecordBatch,
+        properties: WriterProperties,
+        partition: Struct,
+        bounds: Option<(Key, Key)>,
+    ) -> Result<Self> {
         let mut out = Vec::new();
-        let mut writer = ArrowWriter::try_new(
-            &mut out,
-            batch.schema(),
-            Some(layout.properties(batch.num_rows())),
-        )?;
+        let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(properties))?;
         writer.write(batch)?;
         writer.close()?;
         Ok(Self {
@@ -555,6 +608,9 @@ pub struct Fixture {
     /// The version each id's live row was written at, for ids an `update`
     /// rewrote; every other id is at `FIRST_VERSION`.
     versions: HashMap<u64, u64>,
+    /// The live rows of an ordered fixture, by (id, order value), each at
+    /// the version that wrote it; empty for a key-value one.
+    rows: LiveRows,
     /// What each snapshot this fixture committed by hand listed, by
     /// snapshot id, so `move_ref` can return the table to one.
     history: HashMap<i64, Listing>,
@@ -573,6 +629,7 @@ pub struct Fixture {
 struct Listing {
     ids: BTreeSet<u64>,
     versions: HashMap<u64, u64>,
+    rows: LiveRows,
     files: Vec<DataFile>,
     deletes: Vec<DataFile>,
     added: HashMap<String, AddedBy>,
@@ -594,6 +651,7 @@ impl Fixture {
             deletes: Vec::new(),
             added: HashMap::new(),
             versions: HashMap::new(),
+            rows: LiveRows::default(),
             history: HashMap::new(),
             by_hand: false,
             hand_commits: 0,
@@ -609,6 +667,15 @@ impl Fixture {
     /// The table's identifier in its catalog.
     pub fn ident(&self) -> &TableIdent {
         &self.ident
+    }
+
+    /// The field id the current schema gives the order column, `None` for a
+    /// schema without one (`ORDER_FIELD_ID`).
+    pub fn order_field_id(&self) -> Option<i32> {
+        self.metadata
+            .current_schema()
+            .field_by_name(ORDER_COLUMN)
+            .map(|field| field.id)
     }
 
     /// The table root.
@@ -636,7 +703,9 @@ impl Fixture {
         absent_key_from(&self.key(i))
     }
 
-    /// The value stored for `key`: `None` for an id `Nulls` names, else the
+    /// The value stored for `key` in a key-value fixture (an ordered
+    /// fixture's rows answer through `expected_scan`): `None` for an id
+    /// `Nulls` names, else the
     /// `value_bytes` bytes of `value_kind` derived from the key and the
     /// version its live row was written at (`value_of_version`).
     pub fn value(&self, key: &Key) -> Option<Vec<u8>> {
@@ -655,6 +724,16 @@ impl Fixture {
     /// an `update` rewrites it.
     pub(crate) fn version_of(&self, id: u64) -> u64 {
         self.versions.get(&id).copied().unwrap_or(FIRST_VERSION)
+    }
+
+    /// The version `row`'s live row was written at: `version_of` its id in
+    /// a key-value fixture, the version of its (id, order value) pair in an
+    /// ordered one.
+    fn version_of_row(&self, row: RowId) -> u64 {
+        match row.order {
+            None => self.version_of(row.id),
+            Some(order) => self.rows.version(row.id, order),
+        }
     }
 
     /// What a lookup naming `VALUE_COLUMN` alone answers for a key this
@@ -718,6 +797,46 @@ impl Fixture {
             }
         }
         Row::Present(values)
+    }
+
+    /// What a Scan of `key` naming `columns`, each `VALUE_COLUMN` or
+    /// `SECOND_VALUE_COLUMN`, answers on this ordered fixture: the naive
+    /// sort of `key`'s live rows (`scan_model`), each as its raw order value
+    /// and one value per column, `None` for a null, and whether live rows
+    /// remain inside the bounds past the last one returned. A key the
+    /// fixture holds no row for answers no rows.
+    ///
+    /// Panics on a fixture whose specification names no order column, and
+    /// on a column the fixture writes no value for.
+    pub fn expected_scan(&self, key: &Key, columns: &[&str], scan: &TestScan) -> (ScanRows, bool) {
+        assert!(
+            self.spec.ordered.is_some(),
+            "expected_scan is for a fixture with an order column"
+        );
+        let Some(id) = id_of(key, self.spec.key_pad, self.spec.key_shape) else {
+            return (Vec::new(), false);
+        };
+        let rows = self.rows.of_id(id).map(|(order, version)| {
+            let value = (!self.spec.is_null(id)).then(|| {
+                row_value(
+                    key,
+                    order,
+                    self.spec.value_bytes,
+                    self.spec.value_kind,
+                    version,
+                )
+            });
+            let values = columns
+                .iter()
+                .map(|&column| match column {
+                    VALUE_COLUMN => value.clone(),
+                    SECOND_VALUE_COLUMN => value.clone().map(reversed),
+                    other => panic!("the fixture writes no column {other}"),
+                })
+                .collect();
+            (order, values)
+        });
+        scan_model(rows, scan)
     }
 
     /// Every key written, ascending by id.
@@ -840,35 +959,110 @@ impl Fixture {
     }
 
     /// Writes `ids` in the given order as new data files and commits them
-    /// through `catalog` with a fast append; the table advances. Refused
-    /// once a snapshot was committed by hand.
+    /// through `catalog` with a fast append; the table advances. An ordered
+    /// fixture writes every row of each id, ascending by order value.
+    /// Refused once a snapshot was committed by hand.
     pub async fn append(
         &mut self,
         catalog: &dyn Catalog,
         ids: impl IntoIterator<Item = u64>,
         prefix: &str,
     ) -> Result<()> {
+        let ids: Vec<u64> = ids.into_iter().collect();
+        let rows = self.spec.rows_of(&ids)?;
+        self.append_rows(catalog, &rows, prefix).await
+    }
+
+    /// Writes the rows at (id, raw order value) of `rows`, in the given
+    /// order, as new data files and commits them through `catalog` with a
+    /// fast append. A caller that wants a valid file passes rows ascending
+    /// by id and then order value; a repeated pair or a descending run
+    /// writes the file a reader refuses. A fixture whose specification
+    /// names no order column is `SpecFault::NotOrdered`; once a snapshot
+    /// was committed by hand the append is refused.
+    pub async fn append_ordered(
+        &mut self,
+        catalog: &dyn Catalog,
+        rows: &[(u64, i64)],
+        prefix: &str,
+    ) -> Result<()> {
+        let rows = self.ordered_rows(rows)?;
+        self.append_rows(catalog, &rows, prefix).await
+    }
+
+    /// `rows` as `RowId`s, when the fixture is ordered.
+    fn ordered_rows(&self, rows: &[(u64, i64)]) -> Result<Vec<RowId>> {
+        if self.spec.ordered.is_none() {
+            return Err(SpecFault::NotOrdered.into());
+        }
+        Ok(rows
+            .iter()
+            .map(|&(id, order)| RowId::at(id, order))
+            .collect())
+    }
+
+    /// Writes `rows` in the given order as new data files and commits them
+    /// with a fast append (`append`).
+    async fn append_rows(
+        &mut self,
+        catalog: &dyn Catalog,
+        rows: &[RowId],
+        prefix: &str,
+    ) -> Result<()> {
         if self.by_hand {
             return Err(SpecFault::CatalogBehind.into());
         }
-        let ids: Vec<u64> = ids.into_iter().collect();
+        let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
         self.spec.check_ids(&ids)?;
         let files = write_data_files(
             &self.table,
             &self.spec,
-            ids.iter().copied(),
+            rows.iter().copied(),
             prefix,
-            &|id| self.version_of(id),
+            &|row| self.version_of_row(row),
         )
         .await?;
         self.commit_files(catalog, files).await?;
-        self.ids.extend(ids);
+        self.note_written(rows);
         self.remember_current();
         Ok(())
     }
 
+    /// Records `rows` as written: their ids as held and, in an ordered
+    /// fixture, their pairs as live, at the version a live pair already
+    /// has.
+    fn note_written(&mut self, rows: &[RowId]) {
+        for row in rows {
+            self.ids.insert(row.id);
+            if let Some(order) = row.order {
+                let version = self.rows.version(row.id, order);
+                self.rows.insert(row.id, order, version);
+            }
+        }
+    }
+
+    /// Records `rows` as no longer live, and their ids as no longer held
+    /// once none of an ordered id's rows is.
+    fn forget(&mut self, rows: &[RowId]) {
+        for row in rows {
+            match row.order {
+                None => {
+                    self.ids.remove(&row.id);
+                    self.versions.remove(&row.id);
+                }
+                Some(order) => {
+                    self.rows.remove(row.id, order);
+                    if !self.rows.holds(row.id) {
+                        self.ids.remove(&row.id);
+                    }
+                }
+            }
+        }
+    }
+
     /// The rows of `ids`, which ascend, as one raw file named `name` in this
-    /// fixture's key type, values, and layout, with exact bounds, recorded
+    /// fixture's key type, values, and layout (every row of an id, for an
+    /// ordered fixture), with exact key bounds, recorded
     /// under `bucket` whatever buckets its keys hash to: how a test commits
     /// a file whose keys fall outside its recorded bucket, which the
     /// library's writer, grouping rows by the bucket they hash to, cannot.
@@ -878,15 +1072,23 @@ impl Fixture {
         self.spec.check_ids(ids)?;
         let schema = self.metadata.current_schema();
         let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
-        let keys: Vec<Key> = ids.iter().map(|&id| self.key(id)).collect();
-        let rows = batch(&arrow_schema, &self.spec, ids, &keys, &|id| {
-            self.version_of(id)
+        let rows = self.spec.rows_of(ids)?;
+        let keys: Vec<Key> = rows.iter().map(|row| self.key(row.id)).collect();
+        let file_rows = batch(&arrow_schema, &self.spec, &rows, &keys, &|row| {
+            self.version_of_row(row)
         })?;
         let bounds = keys.first().cloned().zip(keys.last().cloned());
-        RawFile::from_batch(
+        let layout = &self.spec.layout;
+        let properties = match self.spec.ordered {
+            Some(_) => {
+                layout.ordered_properties(file_rows.num_rows(), order_column_index(&arrow_schema)?)
+            }
+            None => layout.properties(file_rows.num_rows()),
+        };
+        RawFile::written(
             name,
-            &rows,
-            &self.spec.layout,
+            &file_rows,
+            properties,
             Struct::from_iter([Some(Literal::int(bucket))]),
             bounds,
         )
@@ -1079,6 +1281,7 @@ impl Fixture {
         self.write_metadata(metadata).await?;
         self.ids = listing.ids;
         self.versions = listing.versions;
+        self.rows = listing.rows;
         self.files = listing.files;
         self.deletes = listing.deletes;
         self.added = listing.added;
@@ -1209,6 +1412,7 @@ impl Fixture {
             Listing {
                 ids: self.ids.clone(),
                 versions: self.versions.clone(),
+                rows: self.rows.clone(),
                 files: self.files.clone(),
                 deletes: self.deletes.clone(),
                 added: self.added.clone(),
@@ -1257,13 +1461,77 @@ impl Fixture {
     /// by hand in `form`, files named after `name`, beside every data file
     /// and every delete file the current snapshot lists except a deletion
     /// vector `form` replaces. The ids leave the fixture's (`ids`); an id
-    /// with no live row is `SpecFault::IdNotLive`.
+    /// with no live row is `SpecFault::IdNotLive`. An ordered fixture
+    /// deletes every live row of each id.
     pub async fn delete(&mut self, ids: &[u64], form: DeleteForm, name: &str) -> Result<()> {
-        let deletes = self.deletes_for(ids, form, name).await?;
-        for id in ids {
-            self.ids.remove(id);
-            self.versions.remove(id);
+        let targets = self.live_rows_of(ids)?;
+        self.delete_targets(&targets, form, name).await
+    }
+
+    /// Deletes the live rows at (id, raw order value) of `rows` as `delete`
+    /// does, an ordered fixture's rows addressed one by one. A pair with
+    /// no live row is `SpecFault::RowNotLive`, and a fixture whose
+    /// specification names no order column `SpecFault::NotOrdered`.
+    pub async fn delete_rows(
+        &mut self,
+        rows: &[(u64, i64)],
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<()> {
+        let targets = self.ordered_rows(rows)?;
+        self.delete_targets(&targets, form, name).await
+    }
+
+    /// Rewrites every one of `ids` at its next version into new data files
+    /// named after `name`, deletes its live row in `form`, and commits both
+    /// by hand in one snapshot, as a merge-on-read `UPDATE` does: the new
+    /// rows and the deletes share its sequence number. An id with no live
+    /// row is `SpecFault::IdNotLive`. An ordered fixture rewrites every
+    /// live row of each id.
+    pub async fn update(&mut self, ids: &[u64], form: DeleteForm, name: &str) -> Result<()> {
+        let targets = self.live_rows_of(ids)?;
+        self.update_targets(&targets, form, name).await
+    }
+
+    /// Rewrites the live rows at (id, raw order value) of `rows` as `update`
+    /// does, an ordered fixture's rows addressed one by one; the errors are
+    /// those of `delete_rows`.
+    pub async fn update_rows(
+        &mut self,
+        rows: &[(u64, i64)],
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<()> {
+        let targets = self.ordered_rows(rows)?;
+        self.update_targets(&targets, form, name).await
+    }
+
+    /// The live rows of `ids`: each id's row in a key-value fixture, every
+    /// live row of each id in an ordered one, where an id with none is
+    /// `SpecFault::IdNotLive`.
+    fn live_rows_of(&self, ids: &[u64]) -> Result<Vec<RowId>> {
+        if self.spec.ordered.is_none() {
+            return Ok(ids.iter().map(|&id| RowId::keyed(id)).collect());
         }
+        let mut rows = Vec::new();
+        for &id in ids {
+            if !self.rows.holds(id) {
+                return Err(SpecFault::IdNotLive { id }.into());
+            }
+            rows.extend(self.rows.of_id(id).map(|(order, _)| RowId::at(id, order)));
+        }
+        Ok(rows)
+    }
+
+    /// Deletes `targets` (`delete`).
+    async fn delete_targets(
+        &mut self,
+        targets: &[RowId],
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<()> {
+        let deletes = self.deletes_for(targets, form, name).await?;
+        self.forget(targets);
         self.commit_by_hand(HandSnapshot {
             data: self.files.clone(),
             deletes,
@@ -1271,22 +1539,34 @@ impl Fixture {
         .await
     }
 
-    /// Rewrites every one of `ids` at its next version into new data files
-    /// named after `name`, deletes its live row in `form`, and commits both
-    /// by hand in one snapshot, as a merge-on-read `UPDATE` does: the new
-    /// rows and the deletes share its sequence number. An id with no live
-    /// row is `SpecFault::IdNotLive`.
-    pub async fn update(&mut self, ids: &[u64], form: DeleteForm, name: &str) -> Result<()> {
-        let deletes = self.deletes_for(ids, form, name).await?;
-        let next: HashMap<u64, u64> = ids
+    /// Rewrites `targets` at their next versions (`update`).
+    async fn update_targets(
+        &mut self,
+        targets: &[RowId],
+        form: DeleteForm,
+        name: &str,
+    ) -> Result<()> {
+        let deletes = self.deletes_for(targets, form, name).await?;
+        let next: HashMap<RowId, u64> = targets
             .iter()
-            .map(|&id| (id, self.version_of(id) + 1))
+            .map(|&row| (row, self.version_of_row(row) + 1))
             .collect();
-        let written = write_data_files(&self.table, &self.spec, ids.iter().copied(), name, &|id| {
-            next.get(&id).copied().unwrap_or(FIRST_VERSION)
-        })
+        let written = write_data_files(
+            &self.table,
+            &self.spec,
+            targets.iter().copied(),
+            name,
+            &|row| next.get(&row).copied().unwrap_or(FIRST_VERSION),
+        )
         .await?;
-        self.versions.extend(next);
+        for (row, version) in next {
+            match row.order {
+                None => {
+                    self.versions.insert(row.id, version);
+                }
+                Some(order) => self.rows.insert(row.id, order, version),
+            }
+        }
         let mut data = self.files.clone();
         data.extend(written);
         self.commit_by_hand(HandSnapshot { data, deletes }).await
@@ -1305,27 +1585,40 @@ impl Fixture {
         write_data_files(
             &self.table,
             &self.spec,
-            ids.iter().copied(),
+            self.spec.rows_of(ids)?,
             prefix,
             &|_| version,
         )
         .await
     }
 
-    /// The delete files of the current snapshot with the live rows of `ids`
-    /// deleted in `form`, the new ones written under `name`.
+    /// The live copy of `row` in `oracle`, or the fault that names the row
+    /// that has none.
+    fn live_copy_of<'a>(&self, oracle: &'a MergeOracle, row: RowId) -> Result<&'a RowCopy> {
+        let key = self.key(row.id);
+        let Some(order) = row.order else {
+            return oracle
+                .live_copy(&key)
+                .ok_or_else(|| SpecFault::IdNotLive { id: row.id }.into());
+        };
+        let kind = self.spec.ordered.ok_or(SpecFault::NotOrdered)?.kind;
+        kind.encode(order)
+            .and_then(|encoded| oracle.live_copy_at(&key, &encoded))
+            .ok_or_else(|| SpecFault::RowNotLive { id: row.id, order }.into())
+    }
+
+    /// The delete files of the current snapshot with the live rows of
+    /// `targets` deleted in `form`, the new ones written under `name`.
     async fn deletes_for(
         &self,
-        ids: &[u64],
+        targets: &[RowId],
         form: DeleteForm,
         name: &str,
     ) -> Result<Vec<DataFile>> {
         let oracle = MergeOracle::read(self).await?;
         let mut by_file: BTreeMap<String, RoaringTreemap> = BTreeMap::new();
-        for &id in ids {
-            let copy = oracle
-                .live_copy(&self.key(id))
-                .ok_or(SpecFault::IdNotLive { id })?;
+        for &row in targets {
+            let copy = self.live_copy_of(&oracle, row)?;
             by_file
                 .entry(copy.path.clone())
                 .or_default()
@@ -1428,13 +1721,17 @@ impl Fixture {
     /// target allows. The current snapshot's delete files stay listed, as
     /// a rewrite of data files leaves them, now older than every data file.
     pub async fn compact(&mut self, prefix: &str) -> Result<()> {
-        let data = write_data_files(
-            &self.table,
-            &self.spec,
-            self.ids.iter().copied(),
-            prefix,
-            &|id| self.version_of(id),
-        )
+        let rows: Vec<RowId> = match self.spec.ordered {
+            None => self.ids.iter().map(|&id| RowId::keyed(id)).collect(),
+            Some(_) => self
+                .rows
+                .pairs()
+                .map(|(id, order)| RowId::at(id, order))
+                .collect(),
+        };
+        let data = write_data_files(&self.table, &self.spec, rows, prefix, &|row| {
+            self.version_of_row(row)
+        })
         .await?;
         self.commit_by_hand(HandSnapshot {
             data,
@@ -1558,7 +1855,8 @@ pub async fn memory_catalog_s3(s3: &S3Fixture, prefix: &str) -> Result<Arc<Memor
 
 /// Creates the table `spec` describes in `namespace` (creating the namespace
 /// when absent) and commits `spec.ids` at `spec.id_stride` in `spec.order`
-/// as its first snapshot. A `key_pad` on a long or uuid key is
+/// as its first snapshot, every row of each id when `spec.ordered` names an
+/// order column. A `key_pad` on a long or uuid key is
 /// `SpecFault::PadOnFixedWidthKey`, a scattered key of a type other than
 /// string `SpecFault::ScatteredNonStringKey`, and a scattered id at or
 /// above `SCATTERED_ID_SPACE` `SpecFault::IdOutsideScatteredSpace`.
@@ -1584,9 +1882,10 @@ pub async fn write_fixture(
         namespace,
         &spec.name,
         primitive_of(spec.key_type),
-        ValueColumns {
+        Columns {
             value: PrimitiveType::Binary,
             second: spec.second_value,
+            order: spec.ordered.map(|ordered| ordered.kind),
         },
         spec.buckets,
         spec.format_version,
@@ -1598,13 +1897,16 @@ pub async fn write_fixture(
     Ok(fixture)
 }
 
-/// The value columns `create_table` gives a table: `VALUE_COLUMN` of
-/// `value`'s type, and `SECOND_VALUE_COLUMN` when `second` is set.
-struct ValueColumns {
+/// The columns `create_table` gives a table beside its key: `VALUE_COLUMN`
+/// of `value`'s type, `SECOND_VALUE_COLUMN` when `second` is set, and the
+/// order column when `order` names a kind.
+struct Columns {
     /// The Iceberg type of `VALUE_COLUMN`.
     value: PrimitiveType,
     /// Whether the table also holds `SECOND_VALUE_COLUMN`.
     second: bool,
+    /// The type of the order column, which follows the key.
+    order: Option<OrderKind>,
 }
 
 /// Creates a table whose key and value columns have the given Iceberg types
@@ -1627,9 +1929,10 @@ pub async fn write_table_of_types(
         namespace,
         name,
         key,
-        ValueColumns {
+        Columns {
             value,
             second: false,
+            order: None,
         },
         buckets,
         FormatVersion::V2,
@@ -1660,13 +1963,17 @@ fn primitive_of(key_type: KeyType) -> PrimitiveType {
 /// `VALUE_FIELD_ID`, so a null value is a legal row per RFD 002), an
 /// optional binary `SECOND_VALUE_COLUMN` when `values.second` is set,
 /// `bucket(buckets, key)` when `buckets` is above zero, and a sort order on
-/// the key, at format `format_version`. Creates the namespace when absent.
+/// the key, at format `format_version`. `values.order` adds an optional
+/// order column of that type (`ORDER_COLUMN`) after the value columns, the
+/// last the catalog numbers (`ORDER_FIELD_ID`), and a second ascending sort
+/// field on it. Creates the
+/// namespace when absent.
 async fn create_table(
     catalog: &dyn Catalog,
     namespace: &str,
     name: &str,
     key: PrimitiveType,
-    values: ValueColumns,
+    values: Columns,
     buckets: u32,
     format_version: FormatVersion,
 ) -> Result<(Table, TableIdent)> {
@@ -1688,6 +1995,17 @@ async fn create_table(
             .into(),
         );
     }
+    let order_id = if values.second {
+        ORDER_FIELD_ID
+    } else {
+        SECOND_VALUE_FIELD_ID
+    };
+    if let Some(order) = values.order {
+        fields.push(
+            NestedField::optional(order_id, ORDER_COLUMN, Type::Primitive(order.primitive()))
+                .into(),
+        );
+    }
     let schema = Schema::builder()
         .with_schema_id(SCHEMA_ID)
         .with_fields(fields)
@@ -1700,17 +2018,22 @@ async fn create_table(
             Transform::Bucket(buckets),
         )?;
     }
-    let sort_order = SortOrder::builder()
-        .with_order_id(SORT_ORDER_ID)
-        .with_sort_field(
+    let mut sort_order = SortOrder::builder();
+    sort_order.with_order_id(SORT_ORDER_ID);
+    for source_id in [KEY_FIELD_ID]
+        .into_iter()
+        .chain(values.order.map(|_| order_id))
+    {
+        sort_order.with_sort_field(
             SortField::builder()
-                .source_id(KEY_FIELD_ID)
+                .source_id(source_id)
                 .transform(Transform::Identity)
                 .direction(SortDirection::Ascending)
                 .null_order(NullOrder::First)
                 .build(),
-        )
-        .build_unbound()?;
+        );
+    }
+    let sort_order = sort_order.build_unbound()?;
     let creation = TableCreation::builder()
         .name(name.to_string())
         .schema(schema)
@@ -1725,29 +2048,37 @@ async fn create_table(
 /// The rows of one bucket, in the order they reach the writer.
 #[derive(Default)]
 struct BucketRows {
-    ids: Vec<u64>,
+    rows: Vec<RowId>,
     keys: Vec<Key>,
 }
 
-/// Writes `ids` into `table`'s layout as new data files, not yet committed:
+/// Writes `rows` into `table`'s layout as new data files, not yet committed:
 /// keys through `key_at_shaped`, grouped by bucket through the library's own
 /// bucket transform, in the given order within a bucket, through a
 /// `ClusteredWriter` over the rolling data file writer under
 /// `spec.layout`'s properties and file size target, in batches of
-/// `spec.layout.page_rows` rows, each id's value at `version_of(id)`.
+/// `spec.layout.page_rows` rows, each row's value at `version_of(row)`. A
+/// row of an ordered fixture carries its order value, which sorts the
+/// file's sorting columns after the key.
 pub(crate) async fn write_data_files(
     table: &Table,
     spec: &FixtureSpec,
-    ids: impl IntoIterator<Item = u64>,
+    rows: impl IntoIterator<Item = RowId>,
     prefix: &str,
-    version_of: &dyn Fn(u64) -> u64,
+    version_of: &dyn Fn(RowId) -> u64,
 ) -> Result<Vec<DataFile>> {
     let schema = table.metadata().current_schema().clone();
     let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema)?);
     let partition_spec = PartitionSpec::clone(table.metadata().default_partition_spec());
-    let by_bucket = group_by_bucket(spec, ids)?;
-    let rows = by_bucket.values().map(|bucket| bucket.ids.len()).sum();
-    let parquet = ParquetWriterBuilder::new(spec.layout.properties(rows), Arc::clone(&schema));
+    let by_bucket = group_by_bucket(spec, rows)?;
+    let total = by_bucket.values().map(|bucket| bucket.rows.len()).sum();
+    let properties = match spec.ordered {
+        Some(_) => spec
+            .layout
+            .ordered_properties(total, order_column_index(&arrow_schema)?),
+        None => spec.layout.properties(total),
+    };
+    let parquet = ParquetWriterBuilder::new(properties, Arc::clone(&schema));
     let rolling = RollingFileWriterBuilder::new(
         parquet,
         spec.layout.target_file_bytes,
@@ -1764,15 +2095,15 @@ pub(crate) async fn write_data_files(
             Struct::from_iter([Some(Literal::int(*bucket))])
         };
         let key = PartitionKey::new(partition_spec.clone(), Arc::clone(&schema), partition);
-        for (ids, keys) in rows
-            .ids
+        for (rows, keys) in rows
+            .rows
             .chunks(batch_rows)
             .zip(rows.keys.chunks(batch_rows))
         {
             writer
                 .write(
                     key.clone(),
-                    batch(&arrow_schema, spec, ids, keys, version_of)?,
+                    batch(&arrow_schema, spec, rows, keys, version_of)?,
                 )
                 .await?;
         }
@@ -1780,17 +2111,23 @@ pub(crate) async fn write_data_files(
     Ok(writer.close().await?)
 }
 
-/// `ids` as keys, grouped by the bucket the library's transform gives each,
-/// ascending by bucket and in the given order within one; every id under
+/// The position of the order column among `arrow_schema`'s columns, which a
+/// file's sorting column names.
+fn order_column_index(arrow_schema: &ArrowSchema) -> Result<i32> {
+    Ok(i32::try_from(arrow_schema.index_of(ORDER_COLUMN)?).expect("a column position fits i32"))
+}
+
+/// `rows` as keys, grouped by the bucket the library's transform gives each,
+/// ascending by bucket and in the given order within one; every row under
 /// `UNPARTITIONED_BUCKET` for a table without a bucket spec.
 fn group_by_bucket(
     spec: &FixtureSpec,
-    ids: impl IntoIterator<Item = u64>,
+    rows: impl IntoIterator<Item = RowId>,
 ) -> Result<BTreeMap<i32, BucketRows>> {
-    let ids: Vec<u64> = ids.into_iter().collect();
-    let keys: Vec<Key> = ids.iter().map(|&id| spec.key(id)).collect();
+    let rows: Vec<RowId> = rows.into_iter().collect();
+    let keys: Vec<Key> = rows.iter().map(|row| spec.key(row.id)).collect();
     let buckets: Vec<i32> = if spec.buckets == 0 {
-        vec![UNPARTITIONED_BUCKET; ids.len()]
+        vec![UNPARTITIONED_BUCKET; rows.len()]
     } else {
         let transform = create_transform_function(&Transform::Bucket(spec.buckets))?;
         let array = transform.transform(key_array(spec.key_type, &keys))?;
@@ -1802,19 +2139,22 @@ fn group_by_bucket(
             .to_vec()
     };
     let mut by_bucket: BTreeMap<i32, BucketRows> = BTreeMap::new();
-    for ((id, key), bucket) in ids.into_iter().zip(keys).zip(buckets) {
-        let rows = by_bucket.entry(bucket).or_default();
-        rows.ids.push(id);
-        rows.keys.push(key);
+    for ((row, key), bucket) in rows.into_iter().zip(keys).zip(buckets) {
+        let held = by_bucket.entry(bucket).or_default();
+        held.rows.push(row);
+        held.keys.push(key);
     }
     Ok(by_bucket)
 }
 
-/// One batch of `keys` with their values at `version_of` each id, a null
+/// One batch of `keys` with their values at `version_of` each row, a null
 /// for every id `spec.nulls` names, one column per field of `arrow_schema`
 /// cast to its arrow type: `KEY_COLUMN` the keys, `VALUE_COLUMN` the
-/// values, `SECOND_VALUE_COLUMN` the values reversed, and a column the
-/// fixture derives nothing for, which `Fixture::evolve` may add, all nulls.
+/// values (`row_value` of a row that has an order value, else
+/// `value_of_version`), `SECOND_VALUE_COLUMN` the values reversed,
+/// `ORDER_COLUMN` the order values of an ordered fixture's rows, and a
+/// column the fixture derives nothing for, which `Fixture::evolve` may add,
+/// all nulls.
 /// A column `arrow_schema` lacks is not written, so after `evolve` drops
 /// or renames the key or value column the batch omits it rather than
 /// failing: a file written then lacks that column, as a writer under that
@@ -1822,19 +2162,36 @@ fn group_by_bucket(
 fn batch(
     arrow_schema: &Arc<ArrowSchema>,
     spec: &FixtureSpec,
-    ids: &[u64],
+    rows: &[RowId],
     keys: &[Key],
-    version_of: &dyn Fn(u64) -> u64,
+    version_of: &dyn Fn(RowId) -> u64,
 ) -> Result<RecordBatch> {
     let key = key_array(spec.key_type, keys);
-    let values: BinaryArray = ids
+    let values: BinaryArray = rows
         .iter()
         .zip(keys)
-        .map(|(&id, key)| {
-            (!spec.is_null(id))
-                .then(|| value_of_version(key, spec.value_bytes, spec.value_kind, version_of(id)))
+        .map(|(&row, key)| {
+            (!spec.is_null(row.id)).then(|| match row.order {
+                Some(order) => row_value(
+                    key,
+                    order,
+                    spec.value_bytes,
+                    spec.value_kind,
+                    version_of(row),
+                ),
+                None => value_of_version(key, spec.value_bytes, spec.value_kind, version_of(row)),
+            })
         })
         .collect();
+    let order: Option<ArrayRef> = match (
+        spec.ordered,
+        rows.iter()
+            .map(|row| row.order)
+            .collect::<Option<Vec<i64>>>(),
+    ) {
+        (Some(shape), Some(orders)) => Some(shape.kind.array(&orders)?),
+        (Some(_) | None, _) => None,
+    };
     let second: ArrayRef = Arc::new(
         values
             .iter()
@@ -1846,11 +2203,12 @@ fn batch(
         .fields()
         .iter()
         .map(|field| {
-            let column = match field.name().as_str() {
-                KEY_COLUMN => Arc::clone(&key),
-                VALUE_COLUMN => Arc::clone(&value),
-                SECOND_VALUE_COLUMN => Arc::clone(&second),
-                _ => new_null_array(field.data_type(), ids.len()),
+            let column = match (field.name().as_str(), &order) {
+                (KEY_COLUMN, _) => Arc::clone(&key),
+                (VALUE_COLUMN, _) => Arc::clone(&value),
+                (SECOND_VALUE_COLUMN, _) => Arc::clone(&second),
+                (ORDER_COLUMN, Some(order)) => Arc::clone(order),
+                _ => new_null_array(field.data_type(), rows.len()),
             };
             Ok(arrow::compute::cast(&column, field.data_type())?)
         })
