@@ -27,7 +27,7 @@ use crate::deletes::{Sorted, oldest_by_partition};
 use crate::error::{Error, RefusalReason, Result, UnsupportedDelete, UnsupportedFormat};
 use crate::key::{Key, KeyType};
 use crate::projection::{FieldSet, MAX_FIELD_NUMBER};
-use crate::snapshot::SequenceNumber;
+use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::Storage;
 
 /// Manifests read at once while a snapshot's files are listed. A manifest
@@ -579,6 +579,11 @@ pub struct DataFileEntry {
     /// to the file only when its own is no lower (RFD 021), and a path
     /// listed again at another sequence number is another file.
     pub sequence: SequenceNumber,
+    /// The snapshot that added the file: the entry's own record of it, or
+    /// the one its manifest records (`added_snapshot`). A snapshot that
+    /// lists the file as existing is not this one, so two files share it
+    /// only when a single commit wrote both.
+    pub added_by: SnapshotId,
     /// The file's size in bytes, from the manifest; what `FileHandle::open`
     /// takes in place of a request.
     pub size: u64,
@@ -779,6 +784,7 @@ pub(crate) async fn list_files(
                         bucketing,
                         records: data_file.record_count(),
                         sequence,
+                        added_by: added_snapshot(entry, file),
                         size: data_file.file_size_in_bytes(),
                         key_min: key_bound(data_file.lower_bounds(), layout.key_field_id),
                         key_max: key_bound(data_file.upper_bounds(), layout.key_field_id),
@@ -996,6 +1002,23 @@ fn data_sequence(
             },
         )
     })
+}
+
+/// The snapshot that added `entry` of `manifest`: the entry's own record of
+/// it, or the one `manifest` records as having added its entries. Like the
+/// sequence number (`data_sequence`), `Manifest::parse_avro` leaves an
+/// entry's null as written, so the inheritance iceberg-rust applies only on
+/// its own `FileIO` path is applied here.
+fn added_snapshot(entry: &ManifestEntry, manifest: &ManifestFile) -> SnapshotId {
+    added_snapshot_of(entry.snapshot_id(), manifest.added_snapshot_id)
+}
+
+/// Iceberg's inheritance of a snapshot id: an entry's `own`, when it
+/// records one; else its manifest's, `manifest`. A manifest always records
+/// one, so unlike the sequence number (`inherited_sequence`) this never
+/// finds none.
+fn added_snapshot_of(own: Option<i64>, manifest: i64) -> SnapshotId {
+    SnapshotId(own.unwrap_or(manifest))
 }
 
 /// Iceberg's inheritance of a data sequence number: an entry's `own`, when
@@ -1325,8 +1348,14 @@ pub(crate) mod testing {
         Added,
         /// Added by the snapshot, the sequence number written as given.
         AddedAt(i64),
-        /// Carried from the commit at the given sequence number.
-        Existing(i64),
+        /// Carried from the commit at sequence number `sequence`, which
+        /// snapshot `added_by` made.
+        Existing {
+            /// The sequence number the entry records.
+            sequence: i64,
+            /// The id of the snapshot that added the file.
+            added_by: i64,
+        },
         /// Removed by the snapshot; it was added at the given sequence
         /// number.
         Deleted(i64),
@@ -1472,8 +1501,8 @@ pub(crate) mod testing {
                 match written {
                     Written::Added => writer.add_file(data_file, UNASSIGNED_SEQUENCE).unwrap(),
                     Written::AddedAt(at) => writer.add_file(data_file, at).unwrap(),
-                    Written::Existing(at) => writer
-                        .add_existing_file(data_file, snapshot_id, at, Some(at))
+                    Written::Existing { sequence, added_by } => writer
+                        .add_existing_file(data_file, added_by, sequence, Some(sequence))
                         .unwrap(),
                     Written::Deleted(at) => {
                         writer.add_delete_file(data_file, at, Some(at)).unwrap();
@@ -1575,6 +1604,19 @@ mod tests {
     /// Their sequence numbers, in commit order.
     const SEQUENCE_A: i64 = 1;
     const SEQUENCE_B: i64 = 2;
+    /// The third fixture snapshot and its sequence number.
+    const SNAPSHOT_C: i64 = 33;
+    const SEQUENCE_C: i64 = 3;
+    /// The snapshot id an entry records for itself, and the one its
+    /// manifest records as having added it, distinct so a test that takes
+    /// the wrong one fails.
+    const ENTRY_SNAPSHOT: i64 = SNAPSHOT_A;
+    const MANIFEST_SNAPSHOT: i64 = SNAPSHOT_B;
+    /// An entry carried from the commit of snapshot `SNAPSHOT_A`.
+    const EXISTING_FROM_A: Written = Written::Existing {
+        sequence: SEQUENCE_A,
+        added_by: SNAPSHOT_A,
+    };
     /// The record count every fixture data file claims; nothing here reads
     /// a data file, so any count serves.
     const RECORDS: u64 = 1_000;
@@ -2434,6 +2476,7 @@ mod tests {
             bucketing: Some(bucketing(BUCKETS)),
             records: RECORDS,
             sequence: SequenceNumber(SEQUENCE_A),
+            added_by: SnapshotId(SNAPSHOT_A),
             size: SIZE,
             key_min: bounds.map(|(min, _)| Key::Long(min)),
             key_max: bounds.map(|(_, max)| Key::Long(max)),
@@ -2530,7 +2573,7 @@ mod tests {
                         delete(
                             "d0",
                             DeleteSpec::Positions(DataFileFormat::Parquet),
-                            Written::Existing(SEQUENCE_A),
+                            EXISTING_FROM_A,
                         ),
                     ],
                 },
@@ -2712,10 +2755,7 @@ mod tests {
         // The older data file at A, a newer one and the delete at B: the
         // delete may remove rows of the older file.
         let data = vec![
-            (
-                unpartitioned_data(&root, "old"),
-                Written::Existing(SEQUENCE_A),
-            ),
+            (unpartitioned_data(&root, "old"), EXISTING_FROM_A),
             (unpartitioned_data(&root, "new"), Written::Added),
         ];
         let deletes = vec![
@@ -2747,7 +2787,7 @@ mod tests {
         let deletes = vec![
             (
                 unpartitioned_delete(&root, "eq_old", DeleteSpec::Equality),
-                Written::Existing(SEQUENCE_A),
+                EXISTING_FROM_A,
             ),
             (
                 unpartitioned_delete(&root, "eq_same", DeleteSpec::Equality),
@@ -2772,7 +2812,7 @@ mod tests {
         let deletes = vec![
             (
                 unpartitioned_delete(&root, "eq_old", DeleteSpec::Equality),
-                Written::Existing(SEQUENCE_A),
+                EXISTING_FROM_A,
             ),
             (
                 unpartitioned_delete(&root, "pos", DeleteSpec::Positions(DataFileFormat::Parquet)),
@@ -2787,12 +2827,7 @@ mod tests {
     async fn test_list_files_refuses_avro_and_orc_position_deletes_before_equality_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let root = testing::file_root(dir.path());
-        let data = || {
-            vec![(
-                unpartitioned_data(&root, "old"),
-                Written::Existing(SEQUENCE_A),
-            )]
-        };
+        let data = || vec![(unpartitioned_data(&root, "old"), EXISTING_FROM_A)];
         let cases = [
             (DataFileFormat::Avro, UnsupportedDelete::AvroPositions),
             (DataFileFormat::Orc, UnsupportedDelete::OrcPositions),
@@ -2862,16 +2897,9 @@ mod tests {
             (DataFileFormat::Puffin, UnsupportedFormat::Puffin),
         ];
         for (format, named) in cases {
-            let foreign = |name: &str| {
-                (
-                    unpartitioned_data_in(&root, name, format),
-                    Written::Existing(SEQUENCE_A),
-                )
-            };
-            let parquet = (
-                unpartitioned_data(&root, "parquet"),
-                Written::Existing(SEQUENCE_A),
-            );
+            let foreign =
+                |name: &str| (unpartitioned_data_in(&root, name, format), EXISTING_FROM_A);
+            let parquet = (unpartitioned_data(&root, "parquet"), EXISTING_FROM_A);
             let deletes = vec![
                 (
                     unpartitioned_delete(
@@ -2926,10 +2954,10 @@ mod tests {
         let dangling = vec![
             (
                 unpartitioned_delete(&root, "older", DeleteSpec::Positions(avro)),
-                Written::Existing(SEQUENCE_A),
+                EXISTING_FROM_A,
             ),
             scoped("gone", "gone", Written::Added),
-            scoped("before", "new", Written::Existing(SEQUENCE_A)),
+            scoped("before", "new", EXISTING_FROM_A),
         ];
         let files = listed(&root, data(), dangling.clone()).await.unwrap();
         assert!(files.deletes.is_empty());
@@ -2976,15 +3004,13 @@ mod tests {
             ]
         };
         let masked = deletes(vector("target", Written::Added));
-        let files = listed(&root, data(Written::Existing(SEQUENCE_A)), masked)
-            .await
-            .unwrap();
+        let files = listed(&root, data(EXISTING_FROM_A), masked).await.unwrap();
         assert_eq!(delete_paths(&files), [data_path(&root, "vector")]);
         let refused = RefusalReason::DeleteKindUnsupported {
             path: data_path(&root, "avro"),
             kind: UnsupportedDelete::AvroPositions,
         };
-        let older = deletes(vector("target", Written::Existing(SEQUENCE_A)));
+        let older = deletes(vector("target", EXISTING_FROM_A));
         assert_eq!(
             refusal_of(listed(&root, data(Written::Added), older).await),
             refused,
@@ -2992,7 +3018,7 @@ mod tests {
         );
         let elsewhere = deletes(vector("other", Written::Added));
         assert_eq!(
-            refusal_of(listed(&root, data(Written::Existing(SEQUENCE_A)), elsewhere).await),
+            refusal_of(listed(&root, data(EXISTING_FROM_A), elsewhere).await),
             refused,
             "a vector of another file does not mask this one"
         );
@@ -3029,19 +3055,19 @@ mod tests {
         };
         let avro = || {
             let spec = DeleteSpec::Positions(DataFileFormat::Avro);
-            delete("avro", own, spec, Written::Existing(SEQUENCE_A))
+            delete("avro", own, spec, EXISTING_FROM_A)
         };
         let mut files = vec![
-            data("masked", own, Written::Existing(SEQUENCE_A)),
+            data("masked", own, EXISTING_FROM_A),
             data("newer", own, Written::Added),
-            data("elsewhere", other, Written::Existing(SEQUENCE_A)),
+            data("elsewhere", other, EXISTING_FROM_A),
         ];
         let deletes = vec![avro(), vector("masked", own)];
         let listed = listed_under(md.clone(), files.clone(), vec![deletes.clone()])
             .await
             .unwrap();
         assert_eq!(delete_paths(&listed), [data_path(&root, "masked_vector")]);
-        files.push(data("unmasked", own, Written::Existing(SEQUENCE_A)));
+        files.push(data("unmasked", own, EXISTING_FROM_A));
         assert_eq!(
             refusal_of(listed_under(md, files, vec![deletes]).await),
             RefusalReason::DeleteKindUnsupported {
@@ -3334,9 +3360,20 @@ mod tests {
         let a = data_files(TABLE, &md, &in_order, &layout, &storage)
             .await
             .unwrap();
-        let b = data_files(TABLE, &md, &shuffled, &layout, &storage)
+        // The second listing's manifests were written by another snapshot,
+        // whose id each added entry inherits; the rest is the same.
+        let b: Vec<DataFileEntry> = data_files(TABLE, &md, &shuffled, &layout, &storage)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                assert_eq!(entry.added_by, SnapshotId(SNAPSHOT_B));
+                DataFileEntry {
+                    added_by: SnapshotId(SNAPSHOT_A),
+                    ..entry
+                }
+            })
+            .collect();
         assert_eq!(a, b);
         assert_eq!(a.len(), 4);
         let order: Vec<(u32, Option<Key>)> = a
@@ -3366,6 +3403,108 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn test_added_snapshot_inherits_the_manifest_s_when_the_entry_leaves_it_null() {
+        assert_eq!(
+            added_snapshot_of(None, MANIFEST_SNAPSHOT),
+            SnapshotId(MANIFEST_SNAPSHOT)
+        );
+        assert_eq!(
+            added_snapshot_of(Some(ENTRY_SNAPSHOT), MANIFEST_SNAPSHOT),
+            SnapshotId(ENTRY_SNAPSHOT)
+        );
+    }
+
+    /// Every data file of `snapshot` with the snapshot that added it, in
+    /// listing order.
+    async fn added_by(md: &TableMetadata, snapshot: &Snapshot) -> Vec<(String, SnapshotId)> {
+        let layout = derive(md, snapshot).unwrap();
+        data_files(TABLE, md, snapshot, &layout, &storage())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path, entry.added_by))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_list_files_records_the_snapshot_that_added_each_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = testing::file_root(dir.path());
+        let md = testing::metadata(&root, testing::long_schema(), testing::unpartitioned());
+        let spec_id = md.default_partition_spec_id();
+        let file =
+            |name: &str, written: Written| (live(&root, name, spec_id, None, None).0, written);
+        let commit = |md: TableMetadata,
+                      id: i64,
+                      parent: Option<i64>,
+                      sequence: i64,
+                      entries: Vec<(iceberg::spec::DataFile, Written)>| {
+            let spec = testing::ManifestSpec {
+                spec_id,
+                content: ManifestContentType::Data,
+                entries,
+            };
+            async move {
+                let snapshot = testing::write_snapshot(
+                    &md,
+                    id,
+                    parent,
+                    sequence,
+                    md.current_schema_id(),
+                    vec![spec],
+                )
+                .await;
+                (testing::with_snapshot(md, snapshot.clone()), snapshot)
+            }
+        };
+        let carried = |sequence: i64, added_by: i64| Written::Existing { sequence, added_by };
+        let (md, first) = commit(
+            md,
+            SNAPSHOT_A,
+            None,
+            SEQUENCE_A,
+            vec![file("first", Written::Added)],
+        )
+        .await;
+        assert_eq!(
+            added_by(&md, &first).await,
+            [(data_path(&root, "first"), SnapshotId(SNAPSHOT_A))],
+            "an added entry leaves its snapshot to the manifest"
+        );
+        let (md, second) = commit(
+            md,
+            SNAPSHOT_B,
+            Some(SNAPSHOT_A),
+            SEQUENCE_B,
+            vec![
+                file("first", carried(SEQUENCE_A, SNAPSHOT_A)),
+                file("second", Written::Added),
+            ],
+        )
+        .await;
+        let (md, third) = commit(
+            md,
+            SNAPSHOT_C,
+            Some(SNAPSHOT_B),
+            SEQUENCE_C,
+            vec![
+                file("first", carried(SEQUENCE_A, SNAPSHOT_A)),
+                file("second", carried(SEQUENCE_B, SNAPSHOT_B)),
+            ],
+        )
+        .await;
+        assert_ne!(second.snapshot_id(), third.snapshot_id());
+        assert_eq!(
+            added_by(&md, &third).await,
+            [
+                (data_path(&root, "first"), SnapshotId(SNAPSHOT_A)),
+                (data_path(&root, "second"), SnapshotId(SNAPSHOT_B)),
+            ],
+            "each file is attributed to its own append, not to the listing snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_files_takes_an_explicit_sequence_number_and_inherits_a_null_added_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -3384,7 +3523,7 @@ mod tests {
                 spec_id,
                 content: ManifestContentType::Data,
                 entries: vec![
-                    file("existing", Written::Existing(SEQUENCE_A)),
+                    file("existing", EXISTING_FROM_A),
                     file("explicit", Written::AddedAt(SEQUENCE_A)),
                     file("inherited", Written::Added),
                 ],
@@ -3432,7 +3571,10 @@ mod tests {
                     live(&root, "added", spec_id, None, None),
                     (
                         live(&root, "existing", spec_id, None, None).0,
-                        Written::Existing(INITIAL_SEQUENCE_NUMBER),
+                        Written::Existing {
+                            sequence: INITIAL_SEQUENCE_NUMBER,
+                            added_by: SNAPSHOT_A,
+                        },
                     ),
                 ],
             }],
@@ -3495,7 +3637,7 @@ mod tests {
                 content: ManifestContentType::Data,
                 entries: vec![(
                     live(&root, "existing", spec_id, None, None).0,
-                    Written::Existing(SEQUENCE_A),
+                    EXISTING_FROM_A,
                 )],
             }],
         )

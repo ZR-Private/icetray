@@ -2422,9 +2422,10 @@ pub(crate) mod testing {
         /// Every data file written and delete file recorded so far with the
         /// spec it was written under: its entry for the next manifest.
         pub(crate) files: Vec<(DataFile, i32)>,
-        /// The sequence number of the commit that first listed each path of
-        /// `files`, which later commits carry it at as an existing entry.
-        committed: HashMap<String, i64>,
+        /// How later commits carry each path of `files` that an earlier
+        /// commit first listed: as an existing entry at that commit's
+        /// sequence number, added by its snapshot.
+        committed: HashMap<String, Written>,
     }
 
     impl Table {
@@ -2697,10 +2698,11 @@ pub(crate) mod testing {
             let mut by_spec: BTreeMap<(i32, bool), Vec<(DataFile, Written)>> = BTreeMap::new();
             for (file, spec_id) in &self.files {
                 let deletes = file.content_type() != DataContentType::Data;
-                let written = match self.committed.get(file.file_path()) {
-                    Some(&at) => Written::Existing(at),
-                    None => Written::Added,
-                };
+                let written = self
+                    .committed
+                    .get(file.file_path())
+                    .copied()
+                    .unwrap_or(Written::Added);
                 by_spec
                     .entry((*spec_id, deletes))
                     .or_default()
@@ -2709,7 +2711,10 @@ pub(crate) mod testing {
             for (file, _) in &self.files {
                 self.committed
                     .entry(file.file_path().to_string())
-                    .or_insert(sequence);
+                    .or_insert(Written::Existing {
+                        sequence,
+                        added_by: id,
+                    });
             }
             let manifests = by_spec
                 .into_iter()
@@ -2992,6 +2997,7 @@ mod tests {
                     bucketing,
                     records: approx::count(keys.len()),
                     sequence: SequenceNumber(FIRST_SEQUENCE),
+                    added_by: SnapshotId(FIRST_SNAPSHOT),
                     size,
                     key_min: bounds.map(|(min, _)| Key::Long(*min)),
                     key_max: bounds.map(|(_, max)| Key::Long(*max)),
@@ -5045,6 +5051,7 @@ mod tests {
             bucketing,
             records: 1,
             sequence: SequenceNumber(FIRST_SEQUENCE),
+            added_by: SnapshotId(FIRST_SNAPSHOT),
             size: 1,
             key_min: None,
             key_max: None,
