@@ -2019,6 +2019,7 @@ mod tests {
     use crate::index::{DecodedPart, FileFault};
     use crate::key::KeyType;
     use crate::level::{FALL_PER_MILLE, PER_MILLE};
+    use crate::local::ChunkRules;
     #[cfg(target_os = "linux")]
     use crate::local::testing::evict;
     use crate::local::testing::{chunks_offset, overwrite};
@@ -3778,7 +3779,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let chunk_file = local.chunk_path(&identity);
+        let chunk_file = local.chunk_path(&identity, ChunkRules::KeyValue);
         let at = chunks_offset(&chunk_file);
         let held = std::fs::read(&chunk_file).unwrap()[approx::length(at)..].to_vec();
         let more_than_the_file_holds = i32::try_from(FILE_KEYS + 1).unwrap();
@@ -5203,7 +5204,7 @@ mod tests {
                 .unwrap()
                 .identities()
                 .iter()
-                .map(|identity| local.chunk_path(identity))
+                .map(|identity| local.chunk_path(identity, ChunkRules::KeyValue))
                 .collect();
             for path in &paths {
                 evict(path);

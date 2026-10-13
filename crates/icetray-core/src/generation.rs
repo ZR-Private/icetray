@@ -35,7 +35,9 @@ use crate::error::{Budget, Error, RefusalReason, Result};
 use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition};
 use crate::key::Key;
 use crate::level::Level;
-use crate::local::{DataFileIdentity, LocalDir, Reservation, ResidentPages, Unobserved};
+use crate::local::{
+    ChunkRules, DataFileIdentity, LocalDir, Reservation, ResidentPages, Unobserved,
+};
 use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayout};
 use crate::metric::LookupResult;
 use crate::parquet_io::{FileHandle, Segments};
@@ -651,16 +653,31 @@ impl Generation {
             .filter_map(|(at, file)| file.index.page_of(key).map(|page| (at, file, page)))
     }
 
-    /// The identity of every file's chunk file, for `LocalDir::retain`:
-    /// the union over every table sharing the directory is the live set
-    /// (RFD 017). Meaningful for Disk residency, where each file has a
-    /// chunk file; the identities of a Full or Bloom generation name files
-    /// that were never written and retain nothing.
+    /// The identity of every file's key-value chunk file: the files
+    /// `LocalDir::chunks_for` finds. Meaningful for Disk residency, where
+    /// each file has a chunk file; the identities of a Full or Bloom
+    /// generation name files that were never written.
     pub fn identities(&self) -> HashSet<DataFileIdentity> {
         self.files
             .iter()
             .map(|file| index::identity_of(file.index.handle()))
             .collect()
+    }
+
+    /// Every file's chunk file as `LocalDir::retain` names it, by identity
+    /// and the rules this generation verified the file under: the union
+    /// over every table sharing the directory is the live set (RFD 017).
+    /// Like `identities`, a Full or Bloom generation's name files that were
+    /// never written and retain nothing.
+    pub(crate) fn live_chunk_files(
+        &self,
+    ) -> impl Iterator<Item = (DataFileIdentity, ChunkRules)> + '_ {
+        self.files.iter().map(|file| {
+            (
+                index::identity_of(file.index.handle()),
+                ChunkRules::KeyValue,
+            )
+        })
     }
 
     /// Every file's chunk file, with where its key chunks lie in it; the
@@ -2840,6 +2857,7 @@ mod tests {
     use crate::config::{ConfigError, ConfigViolation, HedgeConfig, ValueFormat};
     use crate::index::{FileFault, testing as index_testing};
     use crate::key::KeyType;
+    use crate::local::ChunkRules;
     use crate::local::testing as local_testing;
     use crate::manifest::UNBUCKETED;
     use crate::manifest::testing::{self as manifest_testing, DATA_DIR, Partition, unpartitioned};
@@ -5277,7 +5295,7 @@ mod tests {
             .identities()
             .iter()
             .map(|identity| {
-                let path = local.chunk_path(identity);
+                let path = local.chunk_path(identity, ChunkRules::KeyValue);
                 let start = local_testing::chunks_offset(&path);
                 let end = std::fs::metadata(&path).unwrap().len();
                 end.div_ceil(page) - start / page
@@ -5385,7 +5403,9 @@ mod tests {
         assert!(on_disk > 0);
         assert_eq!(loaded.identities().len(), 2);
         assert_eq!(
-            unbounded.retain(&loaded.identities()).unwrap(),
+            unbounded
+                .retain(&loaded.live_chunk_files().collect())
+                .unwrap(),
             0,
             "every chunk file is live"
         );

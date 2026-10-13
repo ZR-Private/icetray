@@ -21,7 +21,7 @@ use crate::approx;
 use crate::column;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
-use crate::local::{LocalDir, chunk_file_bytes};
+use crate::local::{ChunkRules, LocalDir, chunk_file_bytes};
 use crate::manifest::TableLayout;
 use crate::parquet_io::FileHandle;
 
@@ -81,7 +81,7 @@ impl Inspected {
     /// there over itself, at about the size `index/` already counts for it.
     pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
         let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
-        let under = verified_under(self.layout.key_shape.key_type());
+        let under = verified_under(self.layout.key_shape.key_type(), ChunkRules::KeyValue);
         Ok(
             match reusable_disk_chunks(&self.handle, local, &ranges, under)? {
                 OnDisk::Reusable(_) => 0,
@@ -492,7 +492,7 @@ impl ResidentSet {
             key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
             chunk_file: chunk_file_bytes(
                 &identity_of(handle),
-                verified_under(key_type),
+                verified_under(key_type, ChunkRules::KeyValue),
                 &placed,
                 record,
             ),

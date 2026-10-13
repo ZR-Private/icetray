@@ -18,7 +18,7 @@ use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
 use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
-use crate::local::{DataFileIdentity, LocalDir};
+use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
 use crate::storage::Storage;
 use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
 
@@ -389,10 +389,10 @@ impl Opened {
         for table in &tables {
             held.push(table.serialized().await);
         }
-        let live: HashSet<DataFileIdentity> = tables
+        let live: HashSet<(DataFileIdentity, ChunkRules)> = tables
             .iter()
             .filter_map(|table| table.current())
-            .flat_map(|generation| generation.identities())
+            .flat_map(|generation| generation.live_chunk_files().collect::<Vec<_>>())
             .collect();
         let freed = local.retain(&live)?;
         drop(held);

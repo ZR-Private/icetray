@@ -1,6 +1,7 @@
 //! The optional local directory (RFD 017, RFD 012): chunk files for disk
 //! residency under `index/`, each named by a digest of its data file's path
-//! and carrying that file's identity in a header inside the persisted-state
+//! and the rules it was verified under (RFD 025) and carrying that file's
+//! identity in a header inside the persisted-state
 //! envelope of RFD 011, so a restarted replica reuses them and a generation
 //! that drops a file deletes them; the page cache's disk level under
 //! `cache/`; positioned, counted reads of the pages the chunk files hold;
@@ -78,9 +79,10 @@ pub(crate) fn digest(bytes: &[u8]) -> [u8; DIGEST_BYTES] {
 }
 
 /// What a chunk file is named by and validated against (RFD 017). The name
-/// is the hex `digest` of `path`, so no path appears in a file name; the
-/// header carries all three fields, and a chunk file whose header disagrees
-/// with the identity the loader holds is stale and never reused.
+/// is the hex `digest` of `path` and the file's `ChunkRules`, so no path
+/// appears in a file name; the header carries all three fields and the
+/// rules, and a chunk file whose header disagrees with the identity the
+/// loader holds is stale and never reused.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DataFileIdentity {
     /// The data file's location as the manifest records it.
@@ -92,17 +94,35 @@ pub struct DataFileIdentity {
     pub footer_digest: [u8; DIGEST_BYTES],
 }
 
+/// The rules a data file was verified under, which a chunk file is named
+/// by (RFD 025): a key-value table and an ordered table over one data file
+/// verify different things, so each keeps its own chunk file and neither
+/// trusts the other's. An ordered table's rules include the order column,
+/// since a file verified in order of one column says nothing of another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChunkRules {
+    /// Distinct keys, one row per key.
+    KeyValue,
+    /// Rows strictly increasing by key and then the order column.
+    Ordered {
+        /// The order column's Iceberg field id.
+        order_field_id: i32,
+    },
+}
+
 /// What a chunk file's verification record was computed under (RFD 017):
-/// the key type the table verifies its keys as, and the version of the
-/// rules verification enforced (`index::VERIFIER_VERSION`). The header
-/// carries it, and a record computed under anything but the reader's is
-/// never trusted.
+/// the key type the table verifies its keys as, the version of the
+/// rules verification enforced (`index::VERIFIER_VERSION`), and the
+/// `ChunkRules` the file is named by. The header carries it, and a record
+/// computed under anything but the reader's is never trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VerifiedUnder {
     /// The key type the keys were verified as.
     pub(crate) key_type: KeyType,
     /// The verifier's rules.
     pub(crate) verifier_version: u32,
+    /// The table kind's rules, which also name the chunk file.
+    pub(crate) rules: ChunkRules,
 }
 
 /// What `LocalDir::lookup` finds under a data file's chunk file name.
@@ -244,32 +264,42 @@ impl LocalDir {
         })
     }
 
-    /// The chunk file for a data file, identified by path, size, and footer
-    /// digest; `None` if absent or failing a check of its envelope, header,
+    /// The key-value chunk file for a data file, identified by path, size,
+    /// and footer digest; `None` if absent or failing a check of its envelope, header,
     /// or identity (`lookup` says which). Only an I/O failure is an error.
     pub fn chunks_for(&self, identity: &DataFileIdentity) -> Result<Option<DiskChunks>> {
-        Ok(match self.lookup(identity)? {
+        Ok(match self.lookup(identity, ChunkRules::KeyValue)? {
             ChunkFileLookup::Found(disk) => Some(disk),
             ChunkFileLookup::Absent | ChunkFileLookup::Rejected(_) => None,
         })
     }
 
-    /// What is under the chunk file name for a data file: nothing, a file
-    /// failing a check of its envelope, header, or identity with the check
-    /// it failed, or a file passing them. Reads the envelope and header and
+    /// What is under the chunk file name for a data file verified under
+    /// `rules`: nothing, a file failing a check of its envelope, header, or
+    /// identity, or whose header names other rules, with the check it
+    /// failed, or a file passing them. Reads the envelope and header and
     /// no payload byte; the caller that trusts the file checks the payload
     /// (`DiskChunks::checked_verification`), and logs whatever makes it
     /// rebuild the file. A rejected file stays until `write_chunks` replaces
     /// it or `retain` deletes it. Only an I/O failure is an error.
-    pub(crate) fn lookup(&self, identity: &DataFileIdentity) -> Result<ChunkFileLookup> {
-        let path = self.chunk_path(identity);
-        Ok(match open_parsed(&path, |file| validate(file, identity))? {
-            Opened::Absent => ChunkFileLookup::Absent,
-            Opened::Rejected(rejection) => ChunkFileLookup::Rejected(rejection),
-            Opened::Parsed(file, parsed) => {
-                ChunkFileLookup::Found(DiskChunks::new(file, path, parsed, Arc::clone(&self.stats)))
-            }
-        })
+    pub(crate) fn lookup(
+        &self,
+        identity: &DataFileIdentity,
+        rules: ChunkRules,
+    ) -> Result<ChunkFileLookup> {
+        let path = self.chunk_path(identity, rules);
+        Ok(
+            match open_parsed(&path, |file| validate(file, identity, rules))? {
+                Opened::Absent => ChunkFileLookup::Absent,
+                Opened::Rejected(rejection) => ChunkFileLookup::Rejected(rejection),
+                Opened::Parsed(file, parsed) => ChunkFileLookup::Found(DiskChunks::new(
+                    file,
+                    path,
+                    parsed,
+                    Arc::clone(&self.stats),
+                )),
+            },
+        )
     }
 
     /// Writes verified key chunks with their verification record, the bytes
@@ -294,7 +324,7 @@ impl LocalDir {
         verification: &[u8],
         chunks: impl Iterator<Item = (Range<u64>, Bytes)>,
     ) -> Result<DiskChunks> {
-        let path = self.chunk_path(identity);
+        let path = self.chunk_path(identity, under.rules);
         let mut chunks: Vec<(Range<u64>, Bytes)> = chunks.collect();
         chunks.sort_by_key(|(range, _)| range.start);
         let header = header_for(identity, under, verification, &chunks)
@@ -313,14 +343,15 @@ impl LocalDir {
     /// Deletes every chunk file no current generation references and every
     /// temporary file no `write_chunks` in this process has open, and
     /// returns the bytes freed. A chunk file is kept only when it is
-    /// complete, passes every check, is named by its own header's path, and
-    /// its identity is in `live`; such a file is never touched. The
+    /// complete, passes every check, is named by its own header's path and
+    /// rules, and its identity and rules are in `live`; such a file is never touched. The
     /// directory is shared by every table, so `live` is the union over every
     /// table of every identity its serving generation and any load in
-    /// progress reference; the caller that owns all the tables builds it. A
+    /// progress reference, each with the rules its table verifies under; the
+    /// caller that owns all the tables builds it. A
     /// file that is gone by the time it is reached was freed by someone else
     /// and counts nothing.
-    pub(crate) fn retain(&self, live: &HashSet<DataFileIdentity>) -> Result<u64> {
+    pub(crate) fn retain(&self, live: &HashSet<(DataFileIdentity, ChunkRules)>) -> Result<u64> {
         let mut freed = 0;
         for (path, metadata) in self.index_files()? {
             if self.keeps(&path, live)? {
@@ -409,9 +440,10 @@ impl LocalDir {
         })
     }
 
-    /// The final path of the chunk file for `identity`.
-    pub(crate) fn chunk_path(&self, identity: &DataFileIdentity) -> PathBuf {
-        self.index_dir.join(chunk_name(&identity.path))
+    /// The final path of the chunk file for `identity` verified under
+    /// `rules`.
+    pub(crate) fn chunk_path(&self, identity: &DataFileIdentity, rules: ChunkRules) -> PathBuf {
+        self.index_dir.join(chunk_name(&identity.path, rules))
     }
 
     /// Every regular file directly under `index/` with its metadata.
@@ -439,10 +471,10 @@ impl LocalDir {
 
     /// Whether `retain` keeps a file under `index/`: a temporary file is
     /// kept while a `write_chunks` in this process has it open; a chunk file
-    /// is kept when it passes every check, its name is its header's path
-    /// digest, and its identity is in `live`. A file already gone is not
+    /// is kept when it passes every check, its name is the digest of its
+    /// header's path and rules, and its identity and rules are in `live`. A file already gone is not
     /// kept, and deleting it then frees nothing.
-    fn keeps(&self, path: &Path, live: &HashSet<DataFileIdentity>) -> Result<bool> {
+    fn keeps(&self, path: &Path, live: &HashSet<(DataFileIdentity, ChunkRules)>) -> Result<bool> {
         if is_temp(path) {
             return Ok(self.lock_in_flight().contains(path));
         }
@@ -454,11 +486,12 @@ impl LocalDir {
                 return Ok(false);
             }
         };
-        if path != self.chunk_path(&parsed.identity) {
+        let rules = parsed.under.rules;
+        if path != self.chunk_path(&parsed.identity, rules) {
             warn_rejected(path, Rejection::NameMismatch);
             return Ok(false);
         }
-        Ok(live.contains(&parsed.identity))
+        Ok(live.contains(&(parsed.identity, rules)))
     }
 
     /// A temporary path beside `path` for one `write_chunks` call,
@@ -649,8 +682,9 @@ mod tests {
     use crate::local::format::{CHUNK_FILE_MAGIC, MAGIC_OFFSET, chunk_name};
     use crate::local::testing::{
         DATA_SIZE, DISK_CACHE_BYTES, FIRST_BYTES, FIRST_RANGE, INNER_BYTES, INNER_RANGE,
-        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks, config,
-        entries, identity, open, overwrite, payload_len, stale_temp, write, write_for,
+        ORDER_FIELD_ID, OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file,
+        chunks, config, entries, identity, open, overwrite, payload_len, stale_temp, under_rules,
+        write, write_for, write_under,
     };
     use crate::local::{
         CACHE_DIR, DataFileIdentity, INDEX_DIR, LocalDir, LocalFault, is_temp, remove_if_present,
@@ -843,7 +877,9 @@ mod tests {
         let path = chunk_file(&local);
         let before = fs::metadata(&path).unwrap();
 
-        let freed = local.retain(&HashSet::from([identity()])).unwrap();
+        let freed = local
+            .retain(&HashSet::from([(identity(), ChunkRules::KeyValue)]))
+            .unwrap();
         assert_eq!(freed, 0);
         let after = fs::metadata(&path).unwrap();
         assert_eq!(after.len(), before.len());
@@ -860,7 +896,9 @@ mod tests {
         overwrite(&path, MAGIC_OFFSET, &[CHUNK_FILE_MAGIC.wrapping_add(1)]);
         let len = fs::metadata(&path).unwrap().len();
 
-        let freed = local.retain(&HashSet::from([identity()])).unwrap();
+        let freed = local
+            .retain(&HashSet::from([(identity(), ChunkRules::KeyValue)]))
+            .unwrap();
         assert_eq!(freed, len);
         assert!(entries(&local.index_dir).is_empty());
     }
@@ -875,10 +913,14 @@ mod tests {
             ..identity()
         };
         write_for(&local, &dropped, chunks().into_iter().take(1).collect());
-        let dropped_len = fs::metadata(local.chunk_path(&dropped)).unwrap().len();
+        let dropped_len = fs::metadata(local.chunk_path(&dropped, ChunkRules::KeyValue))
+            .unwrap()
+            .len();
         assert_eq!(entries(&local.index_dir).len(), 2);
 
-        let freed = local.retain(&HashSet::from([identity()])).unwrap();
+        let freed = local
+            .retain(&HashSet::from([(identity(), ChunkRules::KeyValue)]))
+            .unwrap();
         assert_eq!(freed, dropped_len);
         assert_eq!(entries(&local.index_dir), vec![chunk_file(&local)]);
         assert!(local.chunks_for(&identity()).unwrap().is_some());
@@ -938,13 +980,108 @@ mod tests {
         let (local, _) = open(dir.path());
         write(&local);
         let path = chunk_file(&local);
-        let misnamed = local.index_dir.join(chunk_name(OTHER_PATH));
+        let misnamed = local
+            .index_dir
+            .join(chunk_name(OTHER_PATH, ChunkRules::KeyValue));
         fs::copy(&path, &misnamed).unwrap();
         let len = fs::metadata(&misnamed).unwrap().len();
 
-        let freed = local.retain(&HashSet::from([identity()])).unwrap();
+        let freed = local
+            .retain(&HashSet::from([(identity(), ChunkRules::KeyValue)]))
+            .unwrap();
         assert_eq!(freed, len);
         assert_eq!(entries(&local.index_dir), vec![path]);
+    }
+
+    #[test]
+    fn test_chunk_path_differs_by_rules_for_one_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let id = identity();
+        let kv = local.chunk_path(&id, ChunkRules::KeyValue);
+        let ordered = local.chunk_path(
+            &id,
+            ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID,
+            },
+        );
+        let other = local.chunk_path(
+            &id,
+            ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID + 1,
+            },
+        );
+        assert_ne!(kv, ordered);
+        assert_ne!(ordered, other);
+        assert_ne!(kv, other);
+    }
+
+    #[test]
+    fn test_lookup_rejects_a_file_whose_header_names_other_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let ordered = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID,
+        };
+        write_under(&local, &identity(), under_rules(ordered), chunks());
+        fs::rename(
+            local.chunk_path(&identity(), ordered),
+            local.chunk_path(&identity(), ChunkRules::KeyValue),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            local.lookup(&identity(), ChunkRules::KeyValue).unwrap(),
+            ChunkFileLookup::Rejected(Rejection::NameMismatch)
+        ));
+    }
+
+    #[test]
+    fn test_lookup_finds_each_kind_of_one_data_file_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let ordered = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID,
+        };
+        write(&local);
+        write_under(&local, &identity(), under_rules(ordered), chunks());
+
+        for rules in [ChunkRules::KeyValue, ordered] {
+            let ChunkFileLookup::Found(disk) = local.lookup(&identity(), rules).unwrap() else {
+                panic!("no chunk file found under {rules:?}");
+            };
+            assert_eq!(disk.verified_under().rules, rules);
+        }
+        let other = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID + 1,
+        };
+        assert!(matches!(
+            local.lookup(&identity(), other).unwrap(),
+            ChunkFileLookup::Absent
+        ));
+    }
+
+    #[test]
+    fn test_retain_keeps_both_kinds_of_one_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let ordered = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID,
+        };
+        write(&local);
+        write_under(&local, &identity(), under_rules(ordered), chunks());
+        let ordered_path = local.chunk_path(&identity(), ordered);
+        let ordered_len = fs::metadata(&ordered_path).unwrap().len();
+        assert!(ordered_len > 0);
+        assert_eq!(entries(&local.index_dir).len(), 2);
+
+        let both = HashSet::from([(identity(), ChunkRules::KeyValue), (identity(), ordered)]);
+        assert_eq!(local.retain(&both).unwrap(), 0);
+        assert_eq!(entries(&local.index_dir).len(), 2);
+
+        let key_value_only = HashSet::from([(identity(), ChunkRules::KeyValue)]);
+        assert_eq!(local.retain(&key_value_only).unwrap(), ordered_len);
+        assert_eq!(entries(&local.index_dir), vec![chunk_file(&local)]);
     }
 
     #[test]

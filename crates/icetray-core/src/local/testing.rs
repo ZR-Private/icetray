@@ -19,7 +19,7 @@ use crate::local::format::{
     VERSION_OFFSET,
 };
 use crate::local::{
-    DIGEST_BYTES, DataFileIdentity, DiskChunks, LocalDir, TEMP_EXTENSION, VerifiedUnder,
+    ChunkRules, DIGEST_BYTES, DataFileIdentity, DiskChunks, LocalDir, TEMP_EXTENSION, VerifiedUnder,
 };
 use crate::storage::IoStats;
 
@@ -52,7 +52,12 @@ pub(super) const EMPTY_AT_FIRST_END: Range<u64> = 106..106;
 pub(super) const UNDER: VerifiedUnder = VerifiedUnder {
     key_type: KeyType::Long,
     verifier_version: 1,
+    rules: ChunkRules::KeyValue,
 };
+/// The order column's field id in the ordered rules the fixtures write
+/// under; any id, since the local directory stores it and names a file by
+/// it and never interprets it.
+pub(super) const ORDER_FIELD_ID: i32 = 1;
 /// The verification record the fixture files carry; any bytes, since the
 /// local directory frames the record and never reads it.
 pub(super) const VERIFICATION: &[u8] = b"verified";
@@ -124,13 +129,29 @@ pub(super) fn write_for(
     identity: &DataFileIdentity,
     chunks: Vec<(Range<u64>, Bytes)>,
 ) -> DiskChunks {
+    write_under(local, identity, UNDER, chunks)
+}
+
+/// Writes `chunks` for `identity` with the fixture record under `under`.
+pub(super) fn write_under(
+    local: &LocalDir,
+    identity: &DataFileIdentity,
+    under: VerifiedUnder,
+    chunks: Vec<(Range<u64>, Bytes)>,
+) -> DiskChunks {
     local
-        .write_chunks(identity, UNDER, VERIFICATION, chunks.into_iter())
+        .write_chunks(identity, under, VERIFICATION, chunks.into_iter())
         .unwrap()
 }
 
+/// The fixture context with `rules`.
+pub(super) fn under_rules(rules: ChunkRules) -> VerifiedUnder {
+    VerifiedUnder { rules, ..UNDER }
+}
+
+/// The key-value chunk file of the fixture identity.
 pub(super) fn chunk_file(local: &LocalDir) -> PathBuf {
-    local.chunk_path(&identity())
+    local.chunk_path(&identity(), ChunkRules::KeyValue)
 }
 
 /// Overwrites the bytes at `offset` of the file at `path` with `bytes`.

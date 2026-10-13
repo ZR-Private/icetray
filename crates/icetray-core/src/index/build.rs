@@ -34,7 +34,8 @@ use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{
-    ChunkFileLookup, DiskChunks, LocalDir, LocalFault, Rejection, Reservation, VerifiedUnder,
+    ChunkFileLookup, ChunkRules, DiskChunks, LocalDir, LocalFault, Rejection, Reservation,
+    VerifiedUnder,
 };
 use crate::parquet_io::{FileHandle, Segments};
 
@@ -326,7 +327,8 @@ async fn disk_chunks(
 ) -> Result<(DiskChunks, Verified)> {
     let handle = &to_verify.handle;
     let identity = identity_of(handle);
-    let path = local.chunk_path(&identity);
+    let under = verified_under(to_verify.shape.key_type(), ChunkRules::KeyValue);
+    let path = local.chunk_path(&identity, under.rules);
     let found = match found {
         Some(found) => found,
         None => reused(to_verify, local, ranges).await?,
@@ -342,7 +344,6 @@ async fn disk_chunks(
             "chunk file is stale; fetching its chunks to rewrite it"
         ),
     }
-    let under = verified_under(to_verify.shape.key_type());
     let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
     let verification = record::encode(&verified);
     let (local, reservation, written_path) =
@@ -380,10 +381,10 @@ async fn reused(
     ranges: &[Range<u64>],
 ) -> Result<Reuse> {
     let handle = &to_verify.handle;
-    let under = verified_under(to_verify.shape.key_type());
+    let under = verified_under(to_verify.shape.key_type(), ChunkRules::KeyValue);
     Ok(match reusable_disk_chunks(handle, local, ranges, under)? {
         OnDisk::Reusable(disk) => {
-            let path = local.chunk_path(&identity_of(handle));
+            let path = local.chunk_path(&identity_of(handle), under.rules);
             trusted(to_verify, disk, &path).await?.map_err(Some)
         }
         OnDisk::Stale(stale) => Err(Some(stale)),
@@ -489,7 +490,7 @@ pub(super) fn reusable_disk_chunks(
     ranges: &[Range<u64>],
     under: VerifiedUnder,
 ) -> Result<OnDisk> {
-    let disk = match local.lookup(&identity_of(handle))? {
+    let disk = match local.lookup(&identity_of(handle), under.rules)? {
         ChunkFileLookup::Absent => return Ok(OnDisk::Absent),
         ChunkFileLookup::Rejected(rejection) => {
             return Ok(OnDisk::Stale(Stale::Rejected(rejection)));
@@ -558,11 +559,13 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 /// object storage, so a result computed under other rules is never trusted.
 pub(super) const VERIFIER_VERSION: u32 = 1;
 
-/// The verification context of this build for keys of `key_type`.
-pub(super) fn verified_under(key_type: KeyType) -> VerifiedUnder {
+/// The verification context of this build for keys of `key_type` under
+/// `rules`.
+pub(super) fn verified_under(key_type: KeyType, rules: ChunkRules) -> VerifiedUnder {
     VerifiedUnder {
         key_type,
         verifier_version: VERIFIER_VERSION,
+        rules,
     }
 }
 
@@ -2431,7 +2434,7 @@ mod tests {
 
     /// The chunk file `local` holds for `opened`'s data file.
     fn chunk_file_of(opened: &Opened, local: &LocalDir) -> std::path::PathBuf {
-        local.chunk_path(&identity_of(&opened.handle))
+        local.chunk_path(&identity_of(&opened.handle), ChunkRules::KeyValue)
     }
 
     /// A Disk-tier build of the contract fixture of `key_type` in a fresh
@@ -2523,6 +2526,56 @@ mod tests {
             assert_eq!(self.opened.stats().local_reads(), reads, "{case}");
             assert_lookups_match(&reused, &oracle, key_type, PROBE_STRIDE).await;
         }
+    }
+
+    /// The order column's field id in the ordered rules a test verifies
+    /// under; any id.
+    const ORDER_FIELD_ID: i32 = 1;
+
+    #[tokio::test]
+    async fn test_reusable_disk_chunks_never_trusts_a_file_verified_under_other_rules() {
+        let key_type = KeyType::Long;
+        let written = written(key_type).await;
+        let inspected = FileIndex::inspect(
+            TABLE,
+            Arc::clone(&written.opened.handle),
+            &crate::manifest::testing::layout(key_type, None),
+        )
+        .await
+        .unwrap();
+        let ranges = key_chunk_ranges(
+            &inspected.metadata,
+            inspected.layout.key_leaf,
+            inspected.handle.size(),
+        );
+        let on_disk = |rules| {
+            reusable_disk_chunks(
+                &inspected.handle,
+                &written.local,
+                &ranges,
+                verified_under(key_type, rules),
+            )
+            .unwrap()
+        };
+        assert!(matches!(on_disk(ChunkRules::KeyValue), OnDisk::Reusable(_)));
+        let ordered = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID,
+        };
+        assert!(
+            matches!(on_disk(ordered), OnDisk::Absent),
+            "the key-value file is not the ordered file"
+        );
+        std::fs::rename(
+            &written.path,
+            written
+                .local
+                .chunk_path(&identity_of(&inspected.handle), ordered),
+        )
+        .unwrap();
+        assert!(matches!(
+            on_disk(ordered),
+            OnDisk::Stale(Stale::Rejected(Rejection::NameMismatch))
+        ));
     }
 
     /// The bytes at the end of a torn chunk file that a crash left
@@ -2688,7 +2741,10 @@ mod tests {
         assert_eq!(
             written
                 .local
-                .retain(&std::collections::HashSet::from([identity]))
+                .retain(&std::collections::HashSet::from([(
+                    identity,
+                    ChunkRules::KeyValue
+                )]))
                 .unwrap(),
             approx::count(bytes.len() / 2),
             "the leftover is swept, the chunk file kept"

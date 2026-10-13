@@ -20,7 +20,7 @@ use std::path::Path;
 use bytes::Bytes;
 use prost::Message as _;
 
-use super::{DIGEST_BYTES, DataFileIdentity, LocalFault, VerifiedUnder, digest};
+use super::{ChunkRules, DIGEST_BYTES, DataFileIdentity, LocalFault, VerifiedUnder, digest};
 use crate::approx;
 use crate::key::{HEX_DIGITS_PER_BYTE, KeyType};
 
@@ -33,7 +33,7 @@ pub(super) const CHUNK_FILE_MAGIC: u8 = 0xC1;
 /// one it reads (RFD 011). A build that changes the layout raises it, and a
 /// file of another version is stale and rebuilt from object storage, never
 /// converted (RFD 017).
-pub(super) const CHUNK_FILE_VERSION: u8 = 2;
+pub(super) const CHUNK_FILE_VERSION: u8 = 3;
 /// Where the magic byte sits in a chunk file.
 pub(super) const MAGIC_OFFSET: u64 = 0;
 /// Where the version byte sits: right after the magic byte.
@@ -94,6 +94,9 @@ pub(crate) enum Rejection {
         /// The value the header carries.
         value: i32,
     },
+    /// The header names no rules, or a kind of rules this build does not
+    /// know.
+    UnknownRules,
     /// The header's spans are not what a page read's binary search needs:
     /// one is empty, starts before the end of the one before it, or ends
     /// past `u64::MAX`; or the payload, the verification record and the
@@ -111,8 +114,9 @@ pub(crate) enum Rejection {
     SizeMismatch,
     /// The header's footer digest is not the one looked up.
     DigestMismatch,
-    /// The file's name is not the digest of the header's path, so no lookup
-    /// ever finds it.
+    /// The file's name is not the digest of the header's path and rules, so
+    /// the lookup that opened it, or no lookup at all, is not the one its
+    /// header answers to.
     NameMismatch,
     /// The verification record is longer than the reader's bound for the
     /// data file it describes; checked before the record is read.
@@ -138,6 +142,7 @@ impl fmt::Display for Rejection {
             Self::DigestLength { .. } => "digest_length",
             Self::MissingChecksum => "missing_checksum",
             Self::UnknownKeyType { .. } => "unknown_key_type",
+            Self::UnknownRules => "unknown_rules",
             Self::SpanLayout => "span_layout",
             Self::ShortPayload => "short_payload",
             Self::TrailingBytes => "trailing_bytes",
@@ -214,6 +219,66 @@ pub(super) struct ChunkFileHeader {
     /// The rules the record was verified under (`index::VERIFIER_VERSION`).
     #[prost(uint32, tag = "8")]
     pub verifier_version: u32,
+    /// The table kind's rules the record was verified under, which also
+    /// name the file.
+    #[prost(message, optional, tag = "9")]
+    pub rules: Option<StoredRules>,
+}
+
+/// `ChunkRules` as the header stores it. A message that names no kind is
+/// rejected rather than read as one.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub(super) struct StoredRules {
+    /// Which rules, and for ordered rules the order column.
+    #[prost(oneof = "StoredRulesKind", tags = "1, 2")]
+    pub kind: Option<StoredRulesKind>,
+}
+
+/// The kinds of rules a header stores.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Oneof)]
+pub(super) enum StoredRulesKind {
+    /// `ChunkRules::KeyValue`.
+    #[prost(message, tag = "1")]
+    KeyValue(StoredKeyValueRules),
+    /// `ChunkRules::Ordered`.
+    #[prost(message, tag = "2")]
+    Ordered(StoredOrderedRules),
+}
+
+/// The key-value rules carry nothing.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub(super) struct StoredKeyValueRules {}
+
+/// The ordered rules carry the order column.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub(super) struct StoredOrderedRules {
+    /// The order column's Iceberg field id.
+    #[prost(int32, tag = "1")]
+    pub order_field_id: i32,
+}
+
+impl StoredRules {
+    /// How the header stores `rules`.
+    fn of(rules: ChunkRules) -> Self {
+        Self {
+            kind: Some(match rules {
+                ChunkRules::KeyValue => StoredRulesKind::KeyValue(StoredKeyValueRules {}),
+                ChunkRules::Ordered { order_field_id } => {
+                    StoredRulesKind::Ordered(StoredOrderedRules { order_field_id })
+                }
+            }),
+        }
+    }
+
+    /// The rules a header's message names; `None` for one naming no kind.
+    fn rules(&self) -> Option<ChunkRules> {
+        Some(match self.kind? {
+            StoredRulesKind::KeyValue(StoredKeyValueRules {}) => ChunkRules::KeyValue,
+            StoredRulesKind::Ordered(StoredOrderedRules { order_field_id }) => {
+                ChunkRules::Ordered { order_field_id }
+            }
+        })
+    }
 }
 
 /// `KeyType` as the header stores it. Zero is no key type, so a header
@@ -318,6 +383,11 @@ impl ParsedChunkFile {
             StoredKeyType::key_type(header.key_type).ok_or(Rejection::UnknownKeyType {
                 value: header.key_type,
             })?;
+        let rules = header
+            .rules
+            .as_ref()
+            .and_then(StoredRules::rules)
+            .ok_or(Rejection::UnknownRules)?;
         let chunks_offset = payload_offset
             .checked_add(header.verification_length)
             .ok_or(Rejection::SpanLayout)?;
@@ -336,6 +406,7 @@ impl ParsedChunkFile {
             under: VerifiedUnder {
                 key_type,
                 verifier_version: header.verifier_version,
+                rules,
             },
             payload_offset,
             verification_length: header.verification_length,
@@ -346,14 +417,19 @@ impl ParsedChunkFile {
 }
 
 /// Reads the envelope and header of an open chunk file, then checks the
-/// header's identity against `identity`. The order of the checks is the
-/// order of the `Rejection` variants.
+/// header's identity against `identity` and its rules against `rules`, the
+/// ones whose name it was opened by. The order of the checks is the order of
+/// the `Rejection` variants.
 pub(super) fn validate(
     file: &File,
     identity: &DataFileIdentity,
+    rules: ChunkRules,
 ) -> std::result::Result<ParsedChunkFile, ParseFailure> {
     let parsed = parse_chunk_file(file)?;
     check_identity(&parsed.identity, identity)?;
+    if parsed.under.rules != rules {
+        return Err(Rejection::NameMismatch.into());
+    }
     Ok(parsed)
 }
 
@@ -540,6 +616,7 @@ fn header_of(
         payload_crc32c: Some(crc),
         key_type: StoredKeyType::of(under.key_type).into(),
         verifier_version: under.verifier_version,
+        rules: Some(StoredRules::of(under.rules)),
     }
 }
 
@@ -618,10 +695,28 @@ pub(super) fn write_envelope(
     Ok(file)
 }
 
-/// The chunk file name for a data file path: the lowercase hex `digest` of
-/// the path's bytes, so no path appears in a file name.
-pub(super) fn chunk_name(path: &str) -> String {
-    hex(&digest(path.as_bytes()))
+/// What separates the path from the order column's field id in the bytes an
+/// ordered chunk file's name digests. A NUL cannot occur in a path an
+/// object store names, so no path and field id digest as another path.
+const ORDERED_NAME_SEPARATOR: u8 = 0;
+
+/// The chunk file name for a data file path verified under `rules`: the
+/// lowercase hex `digest` of the path's bytes for key-value rules, so no path
+/// appears in a file name, and of the path, a separator, and the order
+/// column's field id for ordered rules, so each order column keeps a file
+/// of its own beside the key-value one.
+pub(super) fn chunk_name(path: &str, rules: ChunkRules) -> String {
+    match rules {
+        ChunkRules::KeyValue => hex(&digest(path.as_bytes())),
+        ChunkRules::Ordered { order_field_id } => hex(&digest(
+            &[
+                path.as_bytes(),
+                &[ORDERED_NAME_SEPARATOR],
+                &order_field_id.to_le_bytes(),
+            ]
+            .concat(),
+        )),
+    }
 }
 
 /// Lowercase hex, `HEX_DIGITS_PER_BYTE` per byte.
@@ -646,8 +741,8 @@ mod tests {
     use crate::error::Error;
     use crate::local::testing::{
         DATA_PATH, DATA_SIZE, EMPTY_AT_FIRST_END, FIRST_BYTES, FIRST_RANGE, FOOTER_DIGEST,
-        OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file, chunks, entries,
-        identity, inverted_range, open, overwrite, payload_len, range_len, write,
+        ORDER_FIELD_ID, OTHER_PATH, SECOND_BYTES, SECOND_RANGE, UNDER, VERIFICATION, chunk_file,
+        chunks, entries, identity, inverted_range, open, overwrite, payload_len, range_len, write,
     };
     use crate::local::{ChunkFileLookup, LocalDir};
 
@@ -714,7 +809,7 @@ mod tests {
 
     /// The check a file fails for `identity`.
     fn rejection_of(path: &Path, identity: &DataFileIdentity) -> Rejection {
-        let result = validate(&File::open(path).unwrap(), identity);
+        let result = validate(&File::open(path).unwrap(), identity, ChunkRules::KeyValue);
         let Err(ParseFailure::Rejected(rejection)) = result else {
             panic!("expected a rejected chunk file, got {result:?}");
         };
@@ -961,10 +1056,48 @@ mod tests {
             write_under(&path, &header);
             assert_eq!(rejection_of(&path, &identity()), expected);
             assert!(matches!(
-                local.lookup(&identity()).unwrap(),
+                local.lookup(&identity(), ChunkRules::KeyValue).unwrap(),
                 ChunkFileLookup::Rejected(rejection) if rejection == expected
             ));
             fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_validate_header_without_known_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let path = chunk_file(&local);
+        let mut absent = fixture_header();
+        absent.rules = None;
+        let mut unnamed = fixture_header();
+        unnamed.rules = Some(StoredRules { kind: None });
+        for header in [absent, unnamed] {
+            write_under(&path, &header);
+            assert_eq!(rejection_of(&path, &identity()), Rejection::UnknownRules);
+            assert!(matches!(
+                local.lookup(&identity(), ChunkRules::KeyValue).unwrap(),
+                ChunkFileLookup::Rejected(Rejection::UnknownRules)
+            ));
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_stored_rules_round_trip_every_kind() {
+        let kinds = [
+            ChunkRules::KeyValue,
+            ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID,
+            },
+            ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID + 1,
+            },
+        ];
+        for rules in kinds {
+            let decoded =
+                StoredRules::decode(StoredRules::of(rules).encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded.rules(), Some(rules));
         }
     }
 
@@ -998,6 +1131,34 @@ mod tests {
         assert!(!name.contains(DATA_FILE_NAME));
         let listed = entries(&local.index_dir);
         assert_eq!(listed, vec![local.index_dir.join(&name)]);
+    }
+
+    #[test]
+    fn test_chunk_name_of_ordered_rules_digests_the_path_and_the_field_id() {
+        let ordered = ChunkRules::Ordered {
+            order_field_id: ORDER_FIELD_ID,
+        };
+        let digested = [
+            DATA_PATH.as_bytes(),
+            &[ORDERED_NAME_SEPARATOR],
+            &ORDER_FIELD_ID.to_le_bytes(),
+        ]
+        .concat();
+        let expected: [u8; DIGEST_BYTES] = Sha256::digest(&digested).into();
+        assert_eq!(chunk_name(DATA_PATH, ordered), hex(&expected));
+        assert_ne!(
+            chunk_name(DATA_PATH, ordered),
+            chunk_name(DATA_PATH, ChunkRules::KeyValue)
+        );
+        assert_ne!(
+            chunk_name(DATA_PATH, ordered),
+            chunk_name(
+                DATA_PATH,
+                ChunkRules::Ordered {
+                    order_field_id: ORDER_FIELD_ID + 1
+                }
+            )
+        );
     }
 
     #[test]
@@ -1038,6 +1199,7 @@ mod tests {
                 payload_crc32c: Some(crc32c::crc32c(&payload)),
                 key_type: StoredKeyType::of(UNDER.key_type).into(),
                 verifier_version: UNDER.verifier_version,
+                rules: Some(StoredRules::of(UNDER.rules)),
             }
         );
         assert_eq!(header.encoded_len(), header_len);
@@ -1152,6 +1314,7 @@ mod tests {
             (Rejection::DigestLength { len: 0 }, "digest_length"),
             (Rejection::MissingChecksum, "missing_checksum"),
             (Rejection::UnknownKeyType { value: 0 }, "unknown_key_type"),
+            (Rejection::UnknownRules, "unknown_rules"),
             (Rejection::SpanLayout, "span_layout"),
             (Rejection::ShortPayload, "short_payload"),
             (Rejection::TrailingBytes, "trailing_bytes"),
