@@ -103,7 +103,7 @@ pub async fn build(
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
-        multi_get_fan_out: server.multi_get_fan_out,
+        batch_fan_out: server.batch_fan_out,
     };
     let table = Table::new(
         config,

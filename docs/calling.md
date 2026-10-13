@@ -181,7 +181,7 @@ default, counting its keys times its columns, with a presence-only batch
 counting one per key. The server rejects a larger batch as
 `INVALID_ARGUMENT` before it looks up any key, so a caller with more
 values splits them across batches. The server caps the GETs a batch holds
-in flight at `server.multi_get_fan_out`, 64 by default, so a large batch
+in flight at `server.batch_fan_out`, 64 by default, so a large batch
 takes longer and its load on object storage stays within that cap.
 
 ## Snapshots and consistency

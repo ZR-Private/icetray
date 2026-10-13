@@ -129,15 +129,39 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// A single-pod guess, to revisit with measurement (RFD 013).
 const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
-/// GETs one `MultiGet` holds in flight at once when the file says nothing:
-/// 64 (RFD 013, RFD 022). Measured against S3, a lone cold batch keeps
-/// getting faster up to about 128, while several concurrent batches reach
-/// the process's shared GET throughput by 64, past which a larger bound
-/// only lets one batch take more of it from the others
+/// GETs one batch (a `MultiGet`, a `Scan`, or a `MultiScan`) holds in
+/// flight at once when the file says nothing: 64 (RFD 013, RFD 022, RFD
+/// 025). Measured against S3, a lone cold batch keeps getting faster up to
+/// about 128, while several concurrent batches reach the process's shared
+/// GET throughput by 64, past which a larger bound only lets one batch take
+/// more of it from the others
 /// (docs/analysis/2026-10-08-multi-get-fan-out.md). A full batch of cold
 /// hits, a GET for each of `DEFAULT_MAX_MULTI_GET_VALUES` values, takes
 /// about sixteen GET round trips, inside `DEFAULT_MULTI_GET_DEADLINE`.
-pub(crate) const DEFAULT_MULTI_GET_FAN_OUT: usize = 64;
+pub(crate) const DEFAULT_BATCH_FAN_OUT: usize = 64;
+
+/// Values one `MultiScan` may ask for when the file says nothing: 4,000,
+/// its keys times its limit times one more than its requested columns
+/// (RFD 025). A larger call is refused before any key is read, so the work
+/// one call can ask for, and the answer it holds in memory, is bounded.
+/// Four times `DEFAULT_MAX_MULTI_GET_VALUES`, since a `MultiScan` reads
+/// spans of rows where a `MultiGet` reads single values.
+pub(crate) const DEFAULT_MAX_MULTI_SCAN_VALUES: usize = 4_000;
+
+/// How long a `Scan`, and each span GET of one, may run when the file says
+/// nothing: five seconds, as long as a `Get` (RFD 025).
+pub(crate) const DEFAULT_SCAN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a `MultiScan` may run when the file says nothing: fifteen
+/// seconds, flat whatever the call's size, as long as a `MultiGet`
+/// (RFD 025).
+pub(crate) const DEFAULT_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The memory cache that holds the pages ordered tables' span GETs fetch,
+/// when the file says nothing: 256 mebibytes, as large as the default
+/// value-page cache (RFD 025). It is separate from the page cache and keeps
+/// off the disk level, so a scan evicts only other scans' pages.
+pub(crate) const DEFAULT_SCAN_PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after
@@ -521,10 +545,21 @@ pub enum ConfigViolation {
     /// refused.
     #[error("server.max_multi_get_values 0 is not above zero")]
     MaxMultiGetValuesZero,
-    /// No GET may be in flight for a `MultiGet`, so every batch would wait
-    /// for a permit until its deadline.
-    #[error("server.multi_get_fan_out 0 is not above zero")]
-    MultiGetFanOutZero,
+    /// No GET may be in flight for a batch, so every `MultiGet`, `Scan`,
+    /// and `MultiScan` would wait for a permit until its deadline.
+    #[error("server.batch_fan_out 0 is not above zero")]
+    BatchFanOutZero,
+    /// No value may be asked for in a `MultiScan`, so every call would be
+    /// refused.
+    #[error("server.max_multi_scan_values 0 is not above zero")]
+    MaxMultiScanValuesZero,
+    /// A `Scan` deadline of zero, which would fail every scan unstarted.
+    #[error("server.scan_deadline 0s is not above zero")]
+    ScanDeadlineZero,
+    /// A `MultiScan` deadline of zero, which would fail every call
+    /// unstarted.
+    #[error("server.multi_scan_deadline 0s is not above zero")]
+    MultiScanDeadlineZero,
     /// A load deadline of zero, which would fail every first load
     /// unstarted.
     #[error("server.load_deadline 0s is not above zero")]
@@ -752,10 +787,21 @@ impl Config {
     /// The settings outside `tables` whose value in `next` differs from
     /// this configuration's, by their names in the file, in file order:
     /// what a reload refuses, since the server builds them once at start
-    /// (RFD 018). Empty when only the tables differ. Every field is named
-    /// in a destructuring with no rest pattern, so a setting added later
-    /// does not compile until it is compared.
+    /// (RFD 018). Empty when only the tables differ. Every field of
+    /// `[server]` and `[storage]` is named in a destructuring with no rest
+    /// pattern, so a setting added later does not compile until it is
+    /// compared.
     pub fn restart_settings(&self, next: &Self) -> Vec<&'static str> {
+        let mut differing = self.server.differing_settings(&next.server);
+        differing.extend(self.storage.differing_settings(&next.storage));
+        differing
+    }
+}
+
+impl ServerConfig {
+    /// The names, in file order, of the settings whose value in `next`
+    /// differs from this one's.
+    fn differing_settings(&self, next: &Self) -> Vec<&'static str> {
         let ServerConfig {
             listen,
             metrics_listen,
@@ -766,22 +812,16 @@ impl Config {
             multi_get_deadline,
             max_in_flight,
             max_multi_get_values,
-            multi_get_fan_out,
+            batch_fan_out,
+            max_multi_scan_values,
+            scan_deadline,
+            multi_scan_deadline,
+            scan_page_cache_bytes,
             load_deadline,
             refresh_deadline,
             drain_deadline,
-        } = &self.server;
-        let StorageConfig {
-            s3,
-            rewrite,
-            hedge,
-            local,
-            max_retries,
-            connect_timeout,
-            catalog_timeout,
-        } = &self.storage;
-        let server = &next.server;
-        let storage = &next.storage;
+        } = self;
+        let server = next;
         let compared = [
             ("server.listen", *listen == server.listen),
             (
@@ -811,8 +851,24 @@ impl Config {
                 *max_multi_get_values == server.max_multi_get_values,
             ),
             (
-                "server.multi_get_fan_out",
-                *multi_get_fan_out == server.multi_get_fan_out,
+                "server.batch_fan_out",
+                *batch_fan_out == server.batch_fan_out,
+            ),
+            (
+                "server.max_multi_scan_values",
+                *max_multi_scan_values == server.max_multi_scan_values,
+            ),
+            (
+                "server.scan_deadline",
+                *scan_deadline == server.scan_deadline,
+            ),
+            (
+                "server.multi_scan_deadline",
+                *multi_scan_deadline == server.multi_scan_deadline,
+            ),
+            (
+                "server.scan_page_cache_bytes",
+                *scan_page_cache_bytes == server.scan_page_cache_bytes,
             ),
             (
                 "server.load_deadline",
@@ -826,6 +882,30 @@ impl Config {
                 "server.drain_deadline",
                 *drain_deadline == server.drain_deadline,
             ),
+        ];
+        compared
+            .into_iter()
+            .filter(|(_, same)| !same)
+            .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+impl StorageConfig {
+    /// The names, in file order, of the settings whose value in `next`
+    /// differs from this one's.
+    fn differing_settings(&self, next: &Self) -> Vec<&'static str> {
+        let StorageConfig {
+            s3,
+            rewrite,
+            hedge,
+            local,
+            max_retries,
+            connect_timeout,
+            catalog_timeout,
+        } = self;
+        let storage = next;
+        let compared = [
             ("storage.s3", *s3 == storage.s3),
             ("storage.rewrite", *rewrite == storage.rewrite),
             ("storage.hedge", *hedge == storage.hedge),
@@ -1066,6 +1146,11 @@ fn validate_bounds(
             server.multi_get_deadline,
             ConfigViolation::MultiGetDeadlineZero,
         ),
+        (server.scan_deadline, ConfigViolation::ScanDeadlineZero),
+        (
+            server.multi_scan_deadline,
+            ConfigViolation::MultiScanDeadlineZero,
+        ),
         (server.load_deadline, ConfigViolation::LoadDeadlineZero),
         (
             server.refresh_deadline,
@@ -1081,9 +1166,10 @@ fn validate_bounds(
             server.max_multi_get_values,
             ConfigViolation::MaxMultiGetValuesZero,
         ),
+        (server.batch_fan_out, ConfigViolation::BatchFanOutZero),
         (
-            server.multi_get_fan_out,
-            ConfigViolation::MultiGetFanOutZero,
+            server.max_multi_scan_values,
+            ConfigViolation::MaxMultiScanValuesZero,
         ),
     ];
     if let Some((_, violation)) = durations
@@ -1143,7 +1229,8 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
 /// surface. Every duration is written as a friendly duration such as
 /// `"5s"`. `Config::validated` holds `poll_interval` between one second
 /// and one day, and every other duration, `max_in_flight`,
-/// `max_multi_get_values`, and `multi_get_fan_out` above zero.
+/// `max_multi_get_values`, `batch_fan_out`, and `max_multi_scan_values`
+/// above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -1182,13 +1269,31 @@ pub struct ServerConfig {
     /// names, a key of a call that names none counting one (RFD 022); more
     /// is `INVALID_ARGUMENT` before any lookup.
     pub max_multi_get_values: usize,
-    /// GETs one `MultiGet` holds in flight at once, across every task the
-    /// batch runs on: each GET a lookup issues, a key page under `bloom`, a
-    /// value page, or a dictionary page, holds one until it ends (RFD 013,
-    /// RFD 022). Like `max_in_flight`, it is set for the process: every
-    /// table is built under it at start, so a reload that changes it is
-    /// refused and a restart applies it (RFD 018).
-    pub multi_get_fan_out: usize,
+    /// GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once,
+    /// across every task the batch runs on: each GET a lookup issues, a key
+    /// page under `bloom`, a value page, or a dictionary page, holds one
+    /// until it ends (RFD 013, RFD 022, RFD 025). Like `max_in_flight`, it
+    /// is set for the process: every table is built under it at start, so a
+    /// reload that changes it is refused and a restart applies it (RFD
+    /// 018).
+    pub batch_fan_out: usize,
+    /// Values one `MultiScan` may ask for: its keys times its limit times
+    /// one more than its requested columns, a limit of 0 counting as the
+    /// table's `max_scan_rows`; more is `INVALID_ARGUMENT` before any key
+    /// is read (RFD 025).
+    pub max_multi_scan_values: usize,
+    /// How long a `Scan` may run before it is `DEADLINE_EXCEEDED`, and how
+    /// long each span GET of it may run (RFD 025).
+    #[serde(with = "time::friendly_duration")]
+    pub scan_deadline: Duration,
+    /// How long a `MultiScan` may run before it is `DEADLINE_EXCEEDED`,
+    /// whatever its size (RFD 025).
+    #[serde(with = "time::friendly_duration")]
+    pub multi_scan_deadline: Duration,
+    /// The budget in bytes of the memory cache for the pages ordered
+    /// tables' span GETs fetch, kept out of the disk level so a scan evicts
+    /// only other scans' pages (RFD 025).
+    pub scan_page_cache_bytes: u64,
     /// How long a build from no serving generation, a table's first load
     /// or a retry after one failed, may run before it fails and the table
     /// is `Degraded`; the next poll tries again.
@@ -1217,7 +1322,11 @@ impl Default for ServerConfig {
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             max_multi_get_values: DEFAULT_MAX_MULTI_GET_VALUES,
-            multi_get_fan_out: DEFAULT_MULTI_GET_FAN_OUT,
+            batch_fan_out: DEFAULT_BATCH_FAN_OUT,
+            max_multi_scan_values: DEFAULT_MAX_MULTI_SCAN_VALUES,
+            scan_deadline: DEFAULT_SCAN_DEADLINE,
+            multi_scan_deadline: DEFAULT_MULTI_SCAN_DEADLINE,
+            scan_page_cache_bytes: DEFAULT_SCAN_PAGE_CACHE_BYTES,
             load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
@@ -2093,8 +2202,16 @@ mod tests {
     const FIXTURE_MAX_IN_FLIGHT: usize = 512;
     /// The `MultiGet` value limit the full fixture names.
     const FIXTURE_MAX_MULTI_GET_VALUES: usize = 500;
-    /// The `MultiGet` fan-out the full fixture names.
-    const FIXTURE_MULTI_GET_FAN_OUT: usize = 16;
+    /// The batch fan-out the full fixture names.
+    const FIXTURE_BATCH_FAN_OUT: usize = 16;
+    /// The `MultiScan` value limit the full fixture names.
+    const FIXTURE_MAX_MULTI_SCAN_VALUES: usize = 2_000;
+    /// The `Scan` deadline the full fixture names, `"3s"`.
+    const FIXTURE_SCAN_DEADLINE: Duration = Duration::from_secs(3);
+    /// The `MultiScan` deadline the full fixture names, `"9s"`.
+    const FIXTURE_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(9);
+    /// The scan page cache budget the full fixture names, in bytes.
+    const FIXTURE_SCAN_PAGE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
     /// The load deadline the full fixture names, `"45m"`.
     const FIXTURE_LOAD_DEADLINE: Duration = Duration::from_mins(45);
     /// The refresh deadline the full fixture names, `"10m"`.
@@ -2154,7 +2271,11 @@ get_deadline = "2s"
 multi_get_deadline = "8s"
 max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
 max_multi_get_values = {FIXTURE_MAX_MULTI_GET_VALUES}
-multi_get_fan_out = {FIXTURE_MULTI_GET_FAN_OUT}
+batch_fan_out = {FIXTURE_BATCH_FAN_OUT}
+max_multi_scan_values = {FIXTURE_MAX_MULTI_SCAN_VALUES}
+scan_deadline = "3s"
+multi_scan_deadline = "9s"
+scan_page_cache_bytes = {FIXTURE_SCAN_PAGE_CACHE_BYTES}
 load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
@@ -2265,7 +2386,11 @@ endpoint = "https://s3tables.example"
                 "multi_get_deadline": "8s",
                 "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
                 "max_multi_get_values": FIXTURE_MAX_MULTI_GET_VALUES,
-                "multi_get_fan_out": FIXTURE_MULTI_GET_FAN_OUT,
+                "batch_fan_out": FIXTURE_BATCH_FAN_OUT,
+                "max_multi_scan_values": FIXTURE_MAX_MULTI_SCAN_VALUES,
+                "scan_deadline": "3s",
+                "multi_scan_deadline": "9s",
+                "scan_page_cache_bytes": FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 "load_deadline": "45m",
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
@@ -2397,7 +2522,11 @@ value_columns = ["value"]
                 multi_get_deadline: FIXTURE_MULTI_GET_DEADLINE,
                 max_in_flight: FIXTURE_MAX_IN_FLIGHT,
                 max_multi_get_values: FIXTURE_MAX_MULTI_GET_VALUES,
-                multi_get_fan_out: FIXTURE_MULTI_GET_FAN_OUT,
+                batch_fan_out: FIXTURE_BATCH_FAN_OUT,
+                max_multi_scan_values: FIXTURE_MAX_MULTI_SCAN_VALUES,
+                scan_deadline: FIXTURE_SCAN_DEADLINE,
+                multi_scan_deadline: FIXTURE_MULTI_SCAN_DEADLINE,
+                scan_page_cache_bytes: FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
                 drain_deadline: FIXTURE_DRAIN_DEADLINE,
@@ -2541,7 +2670,7 @@ value_columns = ["value"]
             config.server.max_multi_get_values,
             DEFAULT_MAX_MULTI_GET_VALUES
         );
-        assert_eq!(config.server.multi_get_fan_out, DEFAULT_MULTI_GET_FAN_OUT);
+        assert_eq!(config.server.batch_fan_out, DEFAULT_BATCH_FAN_OUT);
         assert_eq!(config.server.load_deadline, DEFAULT_LOAD_DEADLINE);
         assert_eq!(config.server.refresh_deadline, DEFAULT_REFRESH_DEADLINE);
         assert_eq!(config.server.drain_deadline, DEFAULT_DRAIN_DEADLINE);
@@ -2809,13 +2938,21 @@ locaton = "typo"
         next.tables.clear();
         assert!(running.restart_settings(&next).is_empty());
         next.server.poll_interval += Duration::from_secs(1);
-        next.server.multi_get_fan_out += 1;
+        next.server.batch_fan_out += 1;
+        next.server.max_multi_scan_values += 1;
+        next.server.scan_deadline += Duration::from_secs(1);
+        next.server.multi_scan_deadline += Duration::from_secs(1);
+        next.server.scan_page_cache_bytes += 1;
         next.storage.max_retries += 1;
         assert_eq!(
             running.restart_settings(&next),
             [
                 "server.poll_interval",
-                "server.multi_get_fan_out",
+                "server.batch_fan_out",
+                "server.max_multi_scan_values",
+                "server.scan_deadline",
+                "server.multi_scan_deadline",
+                "server.scan_page_cache_bytes",
                 "storage.max_retries"
             ]
         );
@@ -3511,6 +3648,12 @@ locaton = "typo"
                 "multi_get_deadline",
                 ConfigViolation::MultiGetDeadlineZero,
             ),
+            ("server", "scan_deadline", ConfigViolation::ScanDeadlineZero),
+            (
+                "server",
+                "multi_scan_deadline",
+                ConfigViolation::MultiScanDeadlineZero,
+            ),
             ("server", "load_deadline", ConfigViolation::LoadDeadlineZero),
             (
                 "server",
@@ -3543,7 +3686,11 @@ locaton = "typo"
                 "max_multi_get_values",
                 ConfigViolation::MaxMultiGetValuesZero,
             ),
-            ("multi_get_fan_out", ConfigViolation::MultiGetFanOutZero),
+            ("batch_fan_out", ConfigViolation::BatchFanOutZero),
+            (
+                "max_multi_scan_values",
+                ConfigViolation::MaxMultiScanValuesZero,
+            ),
         ];
         for (key, expected) in limits {
             let text = format!("{TOML_MINIMAL}\n[server]\n{key} = 0\n");
@@ -3551,26 +3698,57 @@ locaton = "typo"
         }
     }
 
-    /// `server.multi_get_fan_out` as TOML and as JSON names it.
+    /// `server.batch_fan_out` as TOML and as JSON names it.
     fn with_fan_out(fan_out: usize) -> [String; 2] {
-        let toml = format!("{TOML_MINIMAL}\n[server]\nmulti_get_fan_out = {fan_out}\n");
+        let toml = format!("{TOML_MINIMAL}\n[server]\nbatch_fan_out = {fan_out}\n");
         let json = format!(
-            r#"{{"server": {{"multi_get_fan_out": {fan_out}}}, "tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": "key", "value_columns": ["value"]}}]}}"#
+            r#"{{"server": {{"batch_fan_out": {fan_out}}}, "tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": "key", "value_columns": ["value"]}}]}}"#
         );
         [toml, json]
     }
 
     #[test]
-    fn test_parse_reads_multi_get_fan_out_and_refuses_zero_in_toml_and_json() {
+    fn test_parse_reads_batch_fan_out_and_refuses_zero_in_toml_and_json() {
         let fan_out = 4;
         for text in with_fan_out(fan_out) {
             let config = Config::parse(&text).unwrap();
-            assert_eq!(config.server.multi_get_fan_out, fan_out, "{text}");
+            assert_eq!(config.server.batch_fan_out, fan_out, "{text}");
         }
         for text in with_fan_out(0) {
+            assert_eq!(violation(&text), ConfigViolation::BatchFanOutZero, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_parse_reads_the_scan_settings_and_their_defaults() {
+        let config = Config::parse(TOML_MINIMAL).unwrap();
+        assert_eq!(config.server.batch_fan_out, DEFAULT_BATCH_FAN_OUT);
+        assert_eq!(
+            config.server.max_multi_scan_values,
+            DEFAULT_MAX_MULTI_SCAN_VALUES
+        );
+        assert_eq!(config.server.scan_deadline, DEFAULT_SCAN_DEADLINE);
+        assert_eq!(
+            config.server.multi_scan_deadline,
+            DEFAULT_MULTI_SCAN_DEADLINE
+        );
+        assert_eq!(
+            config.server.scan_page_cache_bytes,
+            DEFAULT_SCAN_PAGE_CACHE_BYTES
+        );
+    }
+
+    /// The old name of `server.batch_fan_out` is unknown, so a file that
+    /// still uses it fails the parse as a schema fault at that key instead
+    /// of serving the default.
+    #[test]
+    fn test_parse_refuses_multi_get_fan_out_as_unknown() {
+        let toml = format!("{TOML_MINIMAL}\n[server]\nmulti_get_fan_out = 8\n");
+        let json = r#"{"server": {"multi_get_fan_out": 8}, "tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "ref": "main", "key_column": "key", "value_columns": ["value"]}]}"#;
+        for text in [toml.as_str(), json] {
             assert_eq!(
-                violation(&text),
-                ConfigViolation::MultiGetFanOutZero,
+                schema_fault_at(text),
+                [key("server"), key("multi_get_fan_out")],
                 "{text}"
             );
         }

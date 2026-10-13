@@ -979,7 +979,7 @@ mod tests {
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Debug,
-            multi_get_fan_out: server.multi_get_fan_out,
+            batch_fan_out: server.batch_fan_out,
         };
         Arc::new(Table::new(
             config,

@@ -43,13 +43,13 @@ real table before configuring it.
 
 ### MultiGet fan-out
 
-icetray holds at most `server.multi_get_fan_out` GETs in flight for one
+icetray holds at most `server.batch_fan_out` GETs in flight for one
 `MultiGet`, 64 by default, and each GET a lookup issues holds one slot
 until it ends. A lookup takes its slot before it asks the page cache for
 a page not in memory, so a page in memory costs no slot, and a `Get` of a
 page a batch is still waiting to fetch issues its own GET rather than
 waiting behind the batch. A batch whose keys are all cold therefore waits
-about one GET's latency for every `multi_get_fan_out` GETs. At the
+about one GET's latency for every `batch_fan_out` GETs. At the
 default, under `full` or `disk`, that is every 64 keys when it requests
 one column, every 32 when it requests two, and fewer when a column is
 dictionary-encoded, since its dictionary page is a GET of its own. Under

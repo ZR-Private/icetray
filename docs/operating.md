@@ -70,7 +70,7 @@ Callers speak gRPC through
 call meets, and which errors a client retries. The operator sets four of
 those limits in `[server]` ([Configuration](configuration.md#server)):
 `max_in_flight` calls at once, past which a call is `RESOURCE_EXHAUSTED`;
-`max_multi_get_values` per `MultiGet`; `multi_get_fan_out` GETs in flight
+`max_multi_get_values` per `MultiGet`; `batch_fan_out` GETs in flight
 per `MultiGet`, past which a batch's next GET waits for one to end; and
 the `get_deadline` and `multi_get_deadline` past which a call is
 `DEADLINE_EXCEEDED`.
