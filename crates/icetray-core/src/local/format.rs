@@ -30,10 +30,9 @@ use crate::key::{HEX_DIGITS_PER_BYTE, KeyType};
 /// passes the check by accident.
 pub(super) const CHUNK_FILE_MAGIC: u8 = 0xC1;
 /// The version byte of the chunk file format this build writes and the only
-/// one it reads (RFD 011). A build that changes the layout raises it and
-/// decides whether to convert or refuse older files; a file of another
-/// version is stale and rebuilt from object storage, which is what the
-/// directory's disposability allows.
+/// one it reads (RFD 011). A build that changes the layout raises it, and a
+/// file of another version is stale and rebuilt from object storage, never
+/// converted (RFD 017).
 pub(super) const CHUNK_FILE_VERSION: u8 = 2;
 /// Where the magic byte sits in a chunk file.
 pub(super) const MAGIC_OFFSET: u64 = 0;

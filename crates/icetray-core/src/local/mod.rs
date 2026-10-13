@@ -43,6 +43,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::approx;
 use crate::config::LocalConfig;
+use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Budget, Error, Recurrence, Recurs, RefusalReason, Result};
 use crate::key::KeyType;
 use crate::storage::IoStats;
@@ -52,6 +53,13 @@ const INDEX_DIR: &str = "index";
 /// The directory under `LocalConfig::dir` that holds the page cache's disk
 /// level.
 const CACHE_DIR: &str = "cache";
+/// The file beside `CACHE_DIR` that names the format the disk level was
+/// written in (`cache_format`). It sits outside `CACHE_DIR`, which the
+/// cache's device owns.
+const CACHE_FORMAT_FILE: &str = "cache.format";
+/// The first byte of `CACHE_FORMAT_FILE`, as `format::CHUNK_FILE_MAGIC`
+/// opens a chunk file (RFD 011).
+const CACHE_FORMAT_MAGIC: u8 = 0xC2;
 /// The extension of a chunk file still being written. A file carrying it is
 /// incomplete: `write_chunks` renames it away once it is written, and
 /// `retain` deletes any that no writer in this process has open, which is
@@ -216,14 +224,14 @@ pub struct LocalDir {
 
 impl LocalDir {
     /// Opens the directory, creating `index/` and `cache/` under it when
-    /// they are absent. A directory that cannot be created is
-    /// `Error::Local` on that directory.
+    /// they are absent, and emptying `cache/` when `CACHE_FORMAT_FILE` does
+    /// not hold this build's `cache_format` (`open_cache_dir`). A directory
+    /// that cannot be created or emptied is `Error::Local` on that path.
     pub fn open(config: &LocalConfig, stats: Arc<IoStats>) -> Result<Self> {
         let index_dir = config.dir.join(INDEX_DIR);
         let cache_dir = config.dir.join(CACHE_DIR);
-        for dir in [&index_dir, &cache_dir] {
-            fs::create_dir_all(dir).map_err(|error| local_error(dir.clone(), error))?;
-        }
+        fs::create_dir_all(&index_dir).map_err(|error| local_error(index_dir.clone(), error))?;
+        open_cache_dir(&cache_dir, &config.dir.join(CACHE_FORMAT_FILE))?;
         Ok(Self {
             index_dir,
             cache_dir,
@@ -561,6 +569,55 @@ fn open_parsed<T>(
     }
 }
 
+/// What `CACHE_FORMAT_FILE` holds for the disk level this build writes:
+/// `CACHE_FORMAT_MAGIC`, the block size as eight little-endian bytes, and
+/// the crate's major and minor version. A change to what the level stores,
+/// a foyer upgrade that changes its files included, raises the minor
+/// version (`CONTRIBUTING.md`, Stability), so a level survives a patch
+/// release and is emptied by any other.
+fn cache_format() -> Vec<u8> {
+    let mut format = vec![CACHE_FORMAT_MAGIC];
+    format.extend_from_slice(&PAGE_CACHE_DISK_BLOCK_BYTES.to_le_bytes());
+    format.extend_from_slice(cache_release().as_bytes());
+    format
+}
+
+/// The release a disk level is kept within: the crate's major and minor
+/// version, as `major.minor`.
+fn cache_release() -> String {
+    format!(
+        "{}.{}",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR")
+    )
+}
+
+/// Creates `cache_dir`, first emptying it when `marker` is missing, cannot
+/// be read, or holds anything but `cache_format()`: everything in the local
+/// directory that does not match this build's format is treated as absent
+/// (RFD 017), so a disk level is recovered only by a release of the minor
+/// version that wrote it. The marker is written after the directory is emptied, so a
+/// crash between the two empties it again on the next open.
+fn open_cache_dir(cache_dir: &Path, marker: &Path) -> Result<()> {
+    let format = cache_format();
+    let ours = fs::read(marker).is_ok_and(|held| held == format);
+    if !ours {
+        match fs::remove_dir_all(cache_dir) {
+            Ok(()) => tracing::info!(
+                path = %cache_dir.display(),
+                "page cache disk level emptied: written by another minor release"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(local_error(cache_dir.to_path_buf(), error)),
+        }
+    }
+    fs::create_dir_all(cache_dir).map_err(|error| local_error(cache_dir.to_path_buf(), error))?;
+    if !ours {
+        fs::write(marker, &format).map_err(|error| local_error(marker.to_path_buf(), error))?;
+    }
+    Ok(())
+}
+
 /// A failure of the local directory at `path` as the crate's error; the one
 /// place `Error::Local` is built.
 fn local_fault(path: PathBuf, fault: LocalFault) -> Error {
@@ -619,6 +676,73 @@ mod tests {
             Arc::new(IoStats::default()),
         );
         assert!(again.is_ok(), "existing directories are reused");
+    }
+
+    #[test]
+    fn test_open_marks_a_new_cache_dir_with_this_build_s_format() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path());
+        let marker = fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap();
+        assert_eq!(marker, cache_format());
+    }
+
+    #[test]
+    fn test_open_keeps_a_cache_dir_this_build_s_format_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path());
+        let page = dir.path().join(CACHE_DIR).join("page");
+        fs::write(&page, LEFTOVER).unwrap();
+        open(dir.path());
+        assert_eq!(fs::read(&page).unwrap(), LEFTOVER);
+    }
+
+    #[test]
+    fn test_open_empties_a_cache_dir_with_no_format_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(CACHE_DIR);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("page"), LEFTOVER).unwrap();
+        open(dir.path());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+        let marker = fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap();
+        assert_eq!(marker, cache_format());
+    }
+
+    #[test]
+    fn test_open_empties_a_cache_dir_another_minor_release_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path());
+        let cache = dir.path().join(CACHE_DIR);
+        fs::write(cache.join("page"), LEFTOVER).unwrap();
+        let next_minor: u32 = env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap() + 1;
+        let mut other = vec![CACHE_FORMAT_MAGIC];
+        other.extend_from_slice(&PAGE_CACHE_DISK_BLOCK_BYTES.to_le_bytes());
+        other.extend_from_slice(
+            format!("{}.{next_minor}", env!("CARGO_PKG_VERSION_MAJOR")).as_bytes(),
+        );
+        fs::write(dir.path().join(CACHE_FORMAT_FILE), &other).unwrap();
+        open(dir.path());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+        let marker = fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap();
+        assert_eq!(marker, cache_format());
+    }
+
+    #[test]
+    fn test_cache_format_names_the_block_size_and_the_minor_release() {
+        let format = cache_format();
+        assert_eq!(format[0], CACHE_FORMAT_MAGIC);
+        assert_eq!(&format[1..9], &PAGE_CACHE_DISK_BLOCK_BYTES.to_le_bytes());
+        assert_eq!(&format[9..], cache_release().as_bytes());
+    }
+
+    #[test]
+    fn test_cache_release_leaves_out_the_patch_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let patch = env!("CARGO_PKG_VERSION_PATCH");
+        assert_eq!(
+            cache_release(),
+            version.strip_suffix(&format!(".{patch}")).unwrap()
+        );
     }
 
     #[test]

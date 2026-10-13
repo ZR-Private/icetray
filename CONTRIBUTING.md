@@ -111,6 +111,16 @@ older layout, and no field number held open, since no deployment depends
 on the old shape yet. Releases before 1.0.0 are cut to publish binaries
 and images, and they promise nothing to one another.
 
+A release raises the patch version for a change that leaves every
+interface and every format icetray writes as it was. It raises the minor
+version for a breaking internal change, such as a format icetray writes to
+its local directory or a dependency upgrade that changes one, and, before
+1.0.0, for a change to an interface. From 1.0.0, a change to the API or
+another interface the contracts below protect raises the major version.
+The page cache's disk level is kept across releases of one minor version
+and emptied by any other (RFD 017 (Residency tiers)), so a patch release
+starts warm.
+
 From 1.0.0 these are contracts, and the rules here and in the RFDs that
 protect them hold within a major version: a renamed key or metric, a
 reused field number, or a changed output line waits for the next major

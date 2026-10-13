@@ -31,6 +31,11 @@
 > are one per column it names, on top of what each tier spends finding
 > the row. See RFD 022.
 
+> Updated 2026-10-13: anything in the local directory that does not
+> match the running build is treated as absent; the page cache's disk
+> level carries a format marker and is emptied when another minor
+> release wrote it.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -128,8 +133,19 @@ rebuilt from object storage, so it needs capacity and nothing else, and
 how a deployer supplies its path is RFD 012 (Deployment contract). Beside
 the chunk files it holds the page cache's disk level, whose value pages
 are evicted by size and never for staleness: a page is keyed by file and
-offset, and a file never changes. That level survives a restart, so
-repeated cold reads become local reads instead of GETs.
+offset, and a file never changes. That level survives a restart, and a patch release, of the minor
+version that wrote it, so repeated cold reads become local reads instead
+of GETs.
+
+Anything in the local directory that does not match the running build
+in every respect is treated as absent and rebuilt from object storage: a
+chunk file whose identity, verification context, envelope version, or
+checksum differs, and a disk level whose format marker, kept beside it, names another
+minor release, which the server empties before it opens the level.
+Nothing in the directory is converted or kept valid across a change of
+format, so a format change raises a version, the minor version for the
+disk level (`CONTRIBUTING.md`, Stability), and costs one cold start, as
+a new replica does.
 
 ## Alternatives Considered
 

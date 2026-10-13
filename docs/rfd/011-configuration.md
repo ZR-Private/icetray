@@ -17,6 +17,9 @@
 > `name` and `format`, `opaque` by default or `protobuf`, a key the table
 > form does not know being a schema fault. See RFD 024.
 
+> Updated 2026-10-13: a file of another format version is treated as
+> absent and never converted. See RFD 017.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -85,8 +88,8 @@ anything else, which takes a restart (RFD 018 (Configuration reload)).
 
 The envelope rule exists so that the first persisted artifact does not
 invent a format. The magic byte identifies a file as icetray's before any
-of it is parsed. The version lets a newer build refuse or convert an older
-file instead of misreading it. The length prefix frames the message, so
+of it is parsed. The version lets a build recognize a file of another format, which it
+treats as absent rather than misreading it (RFD 017 (Residency tiers)). The length prefix frames the message, so
 truncation is detected and several messages can share one file. Protobuf
 is already in the build for RFD 010 (Transport and client contract), so
 the rule adds no dependency.

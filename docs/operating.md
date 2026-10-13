@@ -307,10 +307,13 @@ container's overlay filesystem, icetray sends every local read to the
 blocking pool.
 
 Everything in the directory is a copy of bytes in object storage, which
-icetray checks against its data file's identity and rebuilds on demand. A
-restarted replica reuses every chunk file whose data file is still
-referenced and deletes the rest. Each replica has its own directory,
-which needs only capacity and no backup; losing it costs one cold load.
+icetray checks against its data file's identity and rebuilds on demand. A restarted replica reuses every chunk file whose data file is still
+referenced and deletes the rest, and it keeps the page cache's disk level when a release of the same
+minor version wrote it. A chunk file of another format, or a disk level
+another minor release wrote, is discarded and rebuilt, so a minor or
+major upgrade starts the disk level cold and a patch release keeps it. Each
+replica has its own directory, which needs only capacity and no backup;
+losing it costs one cold load.
 
 The trade-offs between `full`, `disk`, and `bloom` are in
 [Choosing a residency](configuration.md#choosing-a-residency).
@@ -609,7 +612,7 @@ at most 1,024), so load time and the lookup rate both scale with it.
 ### The local volume
 
 - A local volume is optional. Mount one for `disk` tables or to keep the
-  page cache's disk level across restarts.
+  page cache's disk level across restarts and patch releases.
 - Put it on instance-store NVMe, such as AWS's `d`-suffixed instance
   types or `i4i`. The directory is disposable: icetray rebuilds its chunk
   files from object storage, so losing an instance store's data with its
