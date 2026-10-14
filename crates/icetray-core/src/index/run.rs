@@ -271,12 +271,16 @@ impl FileIndex {
     /// entry, an integer one or a byte-array one no writer truncated, they
     /// lie on the page that holds the bound and on the run-edge pages,
     /// since the run ascends and so at most one page that holds the run
-    /// alone lies across each bound (`PAGES_ACROSS_A_BOUND`). Where more do,
-    /// as under a truncated byte-array entry that a bound shares a prefix
-    /// with, those order pages are read in a first round and the value
-    /// pages of exactly the rows taken in a second; so are they where a row
-    /// group of the run has no column index on its order chunk and a bound
-    /// is set (`order_index_missing`).
+    /// alone lies across each bound (`PAGES_ACROSS_A_BOUND`). Where more
+    /// lie across either bound, as under a truncated byte-array entry that
+    /// a bound shares a prefix with, those order pages are read in a first
+    /// round and the value pages of exactly the rows taken in a second; so
+    /// are they where a row group of the run has no column index on its
+    /// order chunk and a bound is set (`order_index_missing`). The pages
+    /// are counted per bound over the whole run, not per row group, so
+    /// under a truncated entry a bound with one such page on each side of
+    /// a row group boundary takes two rounds: a round more, never a byte
+    /// more, and never under an exact entry.
     ///
     /// Per column and row group, the pages are one span GET through
     /// `source`'s cache under its span window for every contiguous run the
@@ -318,7 +322,11 @@ impl FileIndex {
                 order_column_index(self.order_values(order).group(part.row_group)).is_some()
             });
         let placed = walk.rows(|piece, _| piece.fit);
-        let one_round = indexed && placed.pages_across <= PAGES_ACROSS_A_BOUND * cut.bounds();
+        let one_round = indexed
+            && placed
+                .pages_across
+                .iter()
+                .all(|&pages| pages <= PAGES_ACROSS_A_BOUND);
         let (walked, orders, values) = if one_round {
             let walked = placed.rows;
             let (order_spans, value_spans) = (spans_of(&walked, false), spans_of(&walked, true));
@@ -609,11 +617,6 @@ impl Cut<'_> {
         self.after.is_none() && self.before.is_none()
     }
 
-    /// How many bounds are set.
-    fn bounds(self) -> usize {
-        usize::from(self.after.is_some()) + usize::from(self.before.is_some())
-    }
-
     /// Where `value` lies against the bounds: `Inside`, `Below`, or
     /// `Above`, never `Straddles`.
     fn fit(self, value: &OrderValue) -> PageFit {
@@ -666,10 +669,11 @@ struct Walked {
 }
 
 /// The rows a walk takes up, and how many pieces holding the run alone it
-/// takes rows up from with their values across a bound (`Walk::rows`).
+/// takes rows up from with their values across each bound, `after`'s and
+/// then `before`'s (`Walk::rows`).
 struct Taken {
     rows: Vec<Walked>,
-    pages_across: usize,
+    pages_across: [usize; 2],
 }
 
 /// The pages holding a run alone that one bound lies across under an
@@ -703,7 +707,7 @@ impl Walk<'_> {
         };
         let mut taken = Taken {
             rows: Vec::new(),
-            pages_across: 0,
+            pages_across: [0; 2],
         };
         let mut inside = 0;
         for piece in pieces {
@@ -730,11 +734,12 @@ impl Walk<'_> {
                         inside += 1;
                         taken.rows.push(Walked { row, values: true });
                     }
-                    PageFit::Straddles => {
+                    PageFit::Straddles { after, before } => {
                         let values = inside < self.limit;
                         if values && piece.whole && !across {
                             across = true;
-                            taken.pages_across += 1;
+                            taken.pages_across[0] += usize::from(after);
+                            taken.pages_across[1] += usize::from(before);
                         }
                         taken.rows.push(Walked { row, values });
                     }
@@ -1721,11 +1726,23 @@ mod tests {
     /// beyond the few a small limit's rows lie on.
     const LONG_PREFIXED_RUN_ROWS: usize = 120;
 
-    /// Pages of each column a bounded read may take beyond the rows the
-    /// limit selects, on each side of them: the rest of the order page that
-    /// holds the bound and one run-edge page, whose minimum and maximum
-    /// include a neighbouring key's values (RFD 025, Cost).
+    /// Pages of each column a bounded read may take beyond the near end of
+    /// the rows the limit selects, the end its direction starts from: the
+    /// rest of the order page that holds the bound and one run-edge page,
+    /// whose minimum and maximum include a neighbouring key's values (RFD
+    /// 025, Cost). Where the limit selects no row, the pages a read may
+    /// take per bound.
     const BEYOND_THE_LIMIT_PAGES: usize = 2;
+    /// Pages of each column a one-round read may take beyond the far end
+    /// of the rows the limit selects. Rows across a bound count nothing
+    /// toward the limit, so the walk takes as many more live rows past
+    /// that end as it took inside the bounds across a bound near it, those
+    /// of at most `PAGES_ACROSS_A_BOUND` page holding only the run per
+    /// bound and of one run-edge page; and where the limit takes every
+    /// live row inside, it reads on over the page that holds the far bound
+    /// and the far run-edge page. Counted in pages, which holds while no
+    /// deleted rows fill a page there, as in the cost model's fixtures.
+    const SHIFTED_PAST_THE_LIMIT_PAGES: usize = 2;
     /// The limits the cost model reads every bound under: none, one, a
     /// few, and more than any run holds.
     const COST_LIMITS: [u32; 4] = [0, 1, 3, WHOLE_RUN];
@@ -1754,7 +1771,25 @@ mod tests {
     /// a page of either half is one prefix, which places a bound of the
     /// other half exactly.
     fn halved(j: usize) -> Vec<u8> {
-        let byte = if j < LOW_PREFIX_ROWS {
+        split_at(LOW_PREFIX_ROWS, j)
+    }
+
+    /// Rows of a run whose order values `two_low_pages` starts with
+    /// `LOW_PREFIX_BYTE`: the run's first page, which holds the previous
+    /// key's row too, and exactly two whole pages.
+    const TWO_LOW_PAGES_ROWS: usize = 11;
+
+    /// The `j`th order value of a run whose first `TWO_LOW_PAGES_ROWS` rows
+    /// share one prefix and the rest another, as `halved`'s do.
+    fn two_low_pages(j: usize) -> Vec<u8> {
+        split_at(TWO_LOW_PAGES_ROWS, j)
+    }
+
+    /// The `j`th order value of a run whose first `low_rows` rows repeat
+    /// `LOW_PREFIX_BYTE` and the rest `PREFIX_BYTE`, then `j` in four
+    /// digits.
+    fn split_at(low_rows: usize, j: usize) -> Vec<u8> {
+        let byte = if j < low_rows {
             LOW_PREFIX_BYTE
         } else {
             PREFIX_BYTE
@@ -1900,9 +1935,11 @@ mod tests {
     }
 
     /// Asserts that the pages `read` of leaf `leaf` lie among the pages of
-    /// the run `rows` that hold the rows `selected` names and
-    /// `BEYOND_THE_LIMIT_PAGES` more on each side of them; where it names
-    /// none, that they are no more than that many per bound `scan` sets.
+    /// the run `rows` that hold the rows `selected` names,
+    /// `BEYOND_THE_LIMIT_PAGES` more before them in `scan`'s direction and
+    /// `SHIFTED_PAST_THE_LIMIT_PAGES` more after them; where it names none,
+    /// that they are no more than `BEYOND_THE_LIMIT_PAGES` per bound `scan`
+    /// sets.
     fn assert_within_the_promise(
         index: &FileIndex,
         leaf: usize,
@@ -1925,8 +1962,12 @@ mod tests {
             let page = page_of(index, leaf, rows[row]);
             run.iter().position(|held| *held == page).unwrap()
         };
-        let low = at(*selected.start()).saturating_sub(BEYOND_THE_LIMIT_PAGES);
-        let high = (at(*selected.end()) + BEYOND_THE_LIMIT_PAGES).min(run.len() - 1);
+        let (below, above) = match scan.direction {
+            Direction::OldestFirst => (BEYOND_THE_LIMIT_PAGES, SHIFTED_PAST_THE_LIMIT_PAGES),
+            Direction::NewestFirst => (SHIFTED_PAST_THE_LIMIT_PAGES, BEYOND_THE_LIMIT_PAGES),
+        };
+        let low = at(*selected.start()).saturating_sub(below);
+        let high = (at(*selected.end()) + above).min(run.len() - 1);
         let allowed: BTreeSet<PageAt> = run[low..=high].iter().copied().collect();
         assert!(
             read.is_subset(&allowed),
@@ -1959,7 +2000,7 @@ mod tests {
         let mut placed: BTreeSet<PageAt> = pages
             .iter()
             .copied()
-            .filter(|&page| entry_fit(index, page, scan) == PageFit::Straddles)
+            .filter(|&page| matches!(entry_fit(index, page, scan), PageFit::Straddles { .. }))
             .collect();
         if scan.direction == Direction::NewestFirst {
             pages.reverse();
@@ -1980,13 +2021,18 @@ mod tests {
     }
 
     /// Every bounded read the cost model runs at `points`, ascending order
-    /// values: in each direction, each point as `after` and as `before`,
-    /// and each pair `BOUND_GAPS` apart as both.
+    /// values whose first lies below and whose last above every value of
+    /// the run: in each direction, each point as `after` and as `before`,
+    /// each with the other bound at the extreme point beyond it, which
+    /// excludes nothing, and each pair `BOUND_GAPS` apart as both.
     fn bounded_scans(points: &[OrderValue]) -> Vec<ScanBounds> {
+        let (first, last) = (points[0].clone(), points[points.len() - 1].clone());
         let mut cuts = Vec::new();
         for (at, point) in points.iter().enumerate() {
             cuts.push((Some(point.clone()), None));
             cuts.push((None, Some(point.clone())));
+            cuts.push((Some(point.clone()), Some(last.clone())));
+            cuts.push((Some(first.clone()), Some(point.clone())));
             for gap in BOUND_GAPS {
                 if let Some(upper) = points.get(at + gap) {
                     cuts.push((Some(point.clone()), Some(upper.clone())));
@@ -2016,16 +2062,13 @@ mod tests {
     /// A file the cost model reads: key 2's run, whose `j`th row has order
     /// value `value(j)` under `order_type`, read at the bound values
     /// `points`; `exact` where its order column index is integer or full
-    /// length, and `placing_nothing` where its every entry lies across
-    /// every bound inside the run, as a truncated entry that every value
-    /// shares a prefix with does.
+    /// length.
     struct CostFixture {
         fixture: Fixture,
         order_type: OrderType,
         value: Box<dyn Fn(usize) -> OrderValue>,
         points: Vec<OrderValue>,
         exact: bool,
-        placing_nothing: bool,
     }
 
     /// A run of an index whose file is read through `gauged`.
@@ -2078,15 +2121,34 @@ mod tests {
         }
     }
 
+    /// The pages of leaf `leaf` holding the rows of the run `rows` from the
+    /// first to the last of the run positions `taken`; none for none.
+    fn taken_pages(
+        index: &FileIndex,
+        leaf: usize,
+        rows: &[RowRef],
+        taken: &[usize],
+    ) -> BTreeSet<PageAt> {
+        match (taken.iter().min(), taken.iter().max()) {
+            (Some(&first), Some(&last)) => pages_of(index, leaf, &rows[first..=last])
+                .into_iter()
+                .collect(),
+            (None | Some(_), None | Some(_)) => BTreeSet::new(),
+        }
+    }
+
     /// Reads `cost`'s run at every bounded read of its points, every limit
     /// of `COST_LIMITS`, with no row deleted and with `some_deleted`, in
     /// every residency, and asserts the rows and `next` are the model's
-    /// and the pages read in each column are within RFD 025's promise:
-    /// within `BEYOND_THE_LIMIT_PAGES` of the rows the limit selects, in
-    /// one round, under an exact index; under a truncated one, the value
-    /// pages within that too, and those of the rows taken alone where the
-    /// index places nothing, and the order pages those the column index
-    /// needs to place the limit and `next` (`placing`).
+    /// and the pages read in each column are within RFD 025's promise
+    /// (`assert_within_the_promise`). Under an exact index the read is one
+    /// round. Under a truncated one, the order pages are those the column
+    /// index needs to place the limit and `next` (`placing`), and the value
+    /// pages those of the rows taken alone, as a two-round read reads them;
+    /// a read whose value pages are more is one round, all its GETs in
+    /// flight at once. Rounds are seen in Full and Bloom: under Disk the
+    /// order pages are local reads, and the choice of rounds is the same
+    /// in every residency.
     async fn assert_reads_within_the_cost_promise(cost: &CostFixture) {
         let (opened, gauged) = store_gauged(&cost.fixture).await;
         let mut rounds_seen = 0;
@@ -2137,41 +2199,23 @@ mod tests {
                             );
                         };
                         promise(value_leaf, expected.values.as_ref(), &values, "values");
-                        if cost.placing_nothing {
-                            let taken_pages: BTreeSet<PageAt> =
-                                match (expected.taken.iter().min(), expected.taken.iter().max()) {
-                                    (Some(&first), Some(&last)) => {
-                                        pages_of(&index, value_leaf, &rows[first..=last])
-                                            .into_iter()
-                                            .collect()
-                                    }
-                                    (None | Some(_), None | Some(_)) => BTreeSet::new(),
-                                };
-                            assert!(
-                                values.is_subset(&taken_pages),
-                                "{case}: value pages {values:?}, the rows taken's {taken_pages:?}"
-                            );
-                        }
                         if cost.exact {
                             promise(order_leaf, expected.orders.as_ref(), &order_pages, "orders");
-                            if ranges.len() > 1 {
-                                probe
-                                    .assert_one_round(
-                                        &scan,
-                                        limit,
-                                        &is_deleted,
-                                        ranges.len(),
-                                        &case,
-                                    )
-                                    .await;
-                                rounds_seen += 1;
-                            }
                         } else {
                             let allowed = placing(&index, &rows, &scan, limit, &deleted);
                             assert!(
                                 order_pages.is_subset(&allowed),
                                 "{case}: order pages {order_pages:?}, beyond {allowed:?}"
                             );
+                        }
+                        let taken = taken_pages(&index, value_leaf, &rows, &expected.taken);
+                        let one_round = cost.exact || !values.is_subset(&taken);
+                        if one_round && ranges.len() > 1 {
+                            let case = format!("{case}: value pages {values:?}, taken {taken:?}");
+                            probe
+                                .assert_one_round(&scan, limit, &is_deleted, ranges.len(), &case)
+                                .await;
+                            rounds_seen += 1;
                         }
                     }
                 }
@@ -2218,12 +2262,11 @@ mod tests {
     }
 
     /// The cost fixture of `prefixed_run_of(truncate, rows, value)` read as
-    /// `order_type`, whose index places nothing where `placing_nothing`.
+    /// `order_type`.
     fn byte_cost(
         truncate: Option<usize>,
         order_type: OrderType,
         value: fn(usize) -> Vec<u8>,
-        placing_nothing: bool,
     ) -> CostFixture {
         CostFixture {
             fixture: prefixed_run_of(truncate, PREFIXED_RUN_ROWS, value),
@@ -2231,7 +2274,6 @@ mod tests {
             value: Box::new(move |j| travelling(order_type, value(j))),
             points: byte_points(order_type, PREFIXED_RUN_ROWS, value),
             exact: truncate.is_none(),
-            placing_nothing,
         }
     }
 
@@ -2254,7 +2296,6 @@ mod tests {
                 value: Box::new(|j| order_at(i64::try_from(j).unwrap())),
                 points: long_points(rows),
                 exact: true,
-                placing_nothing: false,
             })
             .await;
         }
@@ -2265,27 +2306,22 @@ mod tests {
     #[tokio::test]
     async fn test_read_run_under_a_full_length_index_reads_one_round_within_the_promise() {
         for order_type in [OrderType::String, OrderType::Binary] {
-            assert_reads_within_the_cost_promise(&byte_cost(None, order_type, prefixed, false))
-                .await;
+            assert_reads_within_the_cost_promise(&byte_cost(None, order_type, prefixed)).await;
         }
     }
 
     /// Under a truncated string or binary order column index, every bounded
-    /// read reads the values of the rows it takes alone, and the order
-    /// pages a bound straddles besides those of the rows it selects: over a
-    /// run whose values all share a prefix longer than the index keeps, and
-    /// over one whose two halves have different prefixes.
+    /// read reads the values of the rows it takes alone or in one round
+    /// within RFD 025's promise, and the order pages the column index needs
+    /// to place the limit: over a run whose values all share a prefix
+    /// longer than the index keeps, one whose two halves have different
+    /// prefixes, and one whose first prefix fills exactly two whole pages.
     #[tokio::test]
     async fn test_read_run_under_a_truncated_index_reads_the_values_of_the_rows_taken_alone() {
         for order_type in [OrderType::String, OrderType::Binary] {
-            let shapes = [(prefixed as fn(usize) -> Vec<u8>, true), (halved, false)];
-            for (value, placing_nothing) in shapes {
-                let cost = byte_cost(
-                    Some(TRUNCATED_INDEX_BYTES),
-                    order_type,
-                    value,
-                    placing_nothing,
-                );
+            let shapes: [fn(usize) -> Vec<u8>; 3] = [prefixed, halved, two_low_pages];
+            for value in shapes {
+                let cost = byte_cost(Some(TRUNCATED_INDEX_BYTES), order_type, value);
                 assert_reads_within_the_cost_promise(&cost).await;
             }
         }
@@ -2568,6 +2604,76 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The run position, in `two_low_pages`, of the bound of the reads of
+    /// `test_read_run_with_two_pages_across_one_of_two_bounds_reads_two_rounds`.
+    const LOW_BOUND_ROW: usize = 5;
+
+    /// Under a 16-byte truncated index, oldest first after a value of the
+    /// run's low prefix: the two whole pages of that prefix lie across
+    /// `after`, more than one per bound, so the read takes two rounds and
+    /// reads the value pages of the rows taken alone, and a `before` bound
+    /// that excludes nothing changes neither, since the pages across it are
+    /// counted against it alone.
+    #[tokio::test]
+    async fn test_read_run_with_two_pages_across_one_of_two_bounds_reads_two_rounds() {
+        let limit = 3;
+        let fixture = prefixed_run_of(
+            Some(TRUNCATED_INDEX_BYTES),
+            PREFIXED_RUN_ROWS,
+            two_low_pages,
+        );
+        let (opened, gauged) = store_gauged(&fixture).await;
+        for order_type in [OrderType::String, OrderType::Binary] {
+            let value = |j: usize| travelling(order_type, two_low_pages(j));
+            let after = ScanBounds {
+                after: Some(value(LOW_BOUND_ROW)),
+                ..bounds(Direction::OldestFirst)
+            };
+            let both = ScanBounds {
+                before: Some(travelling(order_type, vec![ABOVE_EVERY_PREFIX])),
+                ..after.clone()
+            };
+            let taken = [LOW_BOUND_ROW + 1, LOW_BOUND_ROW + 2, LOW_BOUND_ROW + 3];
+            for residency in Residency::ALL {
+                let dir = tempfile::tempdir().unwrap();
+                let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
+                let run = index
+                    .locate_run(&Key::Long(2), Reads::new().await.source())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let probe = Probe {
+                    index: &index,
+                    gauged: &gauged,
+                    run: &run,
+                };
+                let rows = rows_of(&run);
+                let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
+                let value_leaf = index.value_leaf(0).unwrap();
+                let held: BTreeSet<PageAt> =
+                    pages_of(&index, value_leaf, &rows[taken[0]..=taken[2]])
+                        .into_iter()
+                        .collect();
+                let needed = bytes_of(&index, value_leaf, &held);
+                assert!(needed > 0);
+                for scan in [&after, &both] {
+                    let case = format!("{residency} {order_type} {scan:?}");
+                    let (got, ranges) = probe.read(scan, limit, &none_deleted).await;
+                    let expected = model(&index, &rows, &orders, &BTreeSet::new(), scan, limit);
+                    assert_eq!(expected.taken, taken, "{case}");
+                    assert_eq!(got.rows, expected.rows, "{case}");
+                    assert_eq!(got.next, Some(value(LOW_BOUND_ROW + 4)), "{case}");
+                    let values = fetched(&index, value_leaf, &ranges);
+                    assert_eq!(
+                        bytes_of(&index, value_leaf, &values),
+                        needed,
+                        "{case}: value pages {values:?}, the rows taken's {held:?}"
+                    );
                 }
             }
         }

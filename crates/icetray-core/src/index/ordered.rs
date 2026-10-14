@@ -559,7 +559,14 @@ pub(super) enum PageFit {
     /// Every value of the page is inside the bounds.
     Inside,
     /// Some may be, or nothing known says: the page is decoded to tell.
-    Straddles,
+    /// `after` and `before` tell which bounds its values may lie on both
+    /// sides of.
+    Straddles {
+        /// Whether its values may lie on both sides of `after`.
+        after: bool,
+        /// Whether its values may lie on both sides of `before`.
+        before: bool,
+    },
 }
 
 /// What is known of the order values of a run's rows on one order page:
@@ -672,7 +679,8 @@ impl<'a> ValueRange<'a> {
     /// when the least is at or above `before`, `Inside` when the least is
     /// above `after` and the greatest below `before`, and `Straddles` for
     /// any other range, one with a side unknown, and one whose sides bound
-    /// nothing for these values.
+    /// nothing for these values, across `after` where the least is not
+    /// above it and across `before` where the greatest is not below it.
     pub(super) fn fit(self, after: Option<&OrderValue>, before: Option<&OrderValue>) -> PageFit {
         let at_or_below_after = after.is_some_and(|after| {
             self.high
@@ -705,7 +713,10 @@ impl<'a> ValueRange<'a> {
         if above_after && below_before {
             PageFit::Inside
         } else {
-            PageFit::Straddles
+            PageFit::Straddles {
+                after: !above_after,
+                before: !below_before,
+            }
         }
     }
 }

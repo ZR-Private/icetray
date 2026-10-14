@@ -238,16 +238,16 @@ direction under a limit and optional bounds on the order value.
   and the bound's order pages are local reads. A truncated order column
   index draws the advice `order_index_truncated`, since long string
   values sharing a prefix widen the pages a bound selects; where more
-  than one page that holds only the key's rows lies across a bound, the
-  server reads in a first round the order pages up to those where the
-  column index places the limit's rows, and in a second the value pages
-  of exactly the rows taken, so the value reads stay bounded by the
-  limit. The advice `long_runs` reports a file holding a run of more
-  than 1,000 rows, and `large_runs` a file where 1,000 rows of the
-  configured value columns, at the footer's uncompressed bytes per row,
-  would exceed 4 MiB, a gRPC client's default message limit. The bloom
-  findings divide a row group's filter bits by its distinct keys, which
-  the load counts.
+  than one page that holds only the key's rows lies across the same
+  bound, wherever in the run they lie, the server reads in a first round
+  the order pages up to those where the column index places the limit's
+  rows, and in a second the value pages of exactly the rows taken, so
+  the value reads stay bounded by the limit. The advice `long_runs`
+  reports a file holding a run of more than 1,000 rows, and `large_runs`
+  a file where 1,000 rows of the configured value columns, at the
+  footer's uncompressed bytes per row, would exceed 4 MiB, a gRPC
+  client's default message limit. The bloom findings divide a row
+  group's filter bits by its distinct keys, which the load counts.
 - **Metrics.** `icetray_scans_total` by table and result (`rows`,
   `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
   histograms, and `icetray_scan_seconds`, cold and warm. A Scan is cold
