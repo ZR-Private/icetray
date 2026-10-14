@@ -6,20 +6,24 @@
 //! values (`Values`); two long-key tables of protobuf values beside a
 //! second value column, one of `ROWS` rows at the other tables' value size
 //! and one of `LARGE_VALUE_ROWS` rows of 4 KiB values, served with `value`
-//! declared protobuf (RFD 022, RFD 024); and, when `--table scattered`
-//! names it, a table shaped like a serving table (`SCATTERED_ROWS` rows of
-//! random-looking string keys and 4 KiB values in byte-bounded pages,
-//! `SCATTERED_ROWS_PER_FILE` rows per file), through the fixture writer
-//! (once, then reused from `--data-dir`), reports how far zstd compressed
-//! each table's key and value columns, serves them through `Table` over
-//! `Storage`'s `file://` store in every residency tier, and reports latency
-//! percentiles, throughput, allocations per operation, and the value bytes
-//! an operation read and returned, plus the wall time, CPU time,
-//! allocations, and peak resident set of a load and a refresh. Results
-//! print as a table and are written as JSON under `--out-dir`. Run with
-//! `cargo run -p icetray-testkit --example bench --release -- --help`; a
-//! profile of one scenario narrows `--scenario`, `--tier`, `--table`,
-//! `--values`, and `--mode`, and lengthens `--duration`.
+//! declared protobuf (RFD 022, RFD 024); an ordered table of
+//! `ORDERED_KEYS` long keys of `ORDERED_ROWS_PER_KEY` rows each by a
+//! timestamp order column (RFD 025), which the Scan and `MultiScan`
+//! scenarios read and beside which the key-value scenarios also run; and,
+//! when `--table scattered` names it, a table shaped like a serving table
+//! (`SCATTERED_ROWS` rows of random-looking string keys and 4 KiB values in
+//! byte-bounded pages, `SCATTERED_ROWS_PER_FILE` rows per file), through
+//! the fixture writer (once, then reused from `--data-dir`), reports how
+//! far zstd compressed each table's key and value columns, serves them
+//! through `Table` over `Storage`'s `file://` store in every residency
+//! tier, and reports latency percentiles, throughput, allocations per
+//! operation, and the value bytes an operation read and returned, plus the
+//! wall time, CPU time, allocations, and peak resident set of a load and a
+//! refresh. Results print as a table and are written as JSON under
+//! `--out-dir`. Run with `cargo run -p icetray-testkit --example bench
+//! --release -- --help`; a profile of one scenario narrows `--scenario`,
+//! `--tier`, `--table`, `--values`, and `--mode`, and lengthens
+//! `--duration`.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::error::Error;
@@ -40,13 +44,14 @@ use icetray_core::config::{
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, FindingLog, Key, KeyType, LocalDir, PageCache, Row, Storage, Table,
-    TableHandles, TableSource,
+    CallsInFlight, Direction, FindingLog, Key, KeyType, LocalDir, OrderValue, PageCache, Row,
+    ScanBounds, ScanRow, Scanned, Storage, Table, TableHandles, TableSource,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
 use icetray_testkit::keys::{
-    SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES, VALUE_BYTES,
+    FIRST_VERSION, SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES,
+    VALUE_BYTES,
 };
 use icetray_testkit::latency::{Latencies, P50, P90, P99, micros};
 use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
@@ -54,7 +59,8 @@ use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
 use icetray_testkit::{
-    FixtureSpec, KeyShape, MemoryCatalog, ValueKind, absent_key_from, key_at_shaped, value_of_kind,
+    FixtureSpec, KeyShape, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered, TestScan, ValueKind,
+    absent_key_from, key_at_shaped, order_value, row_value, scan_model, value_of_kind,
     write_fixture,
 };
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
@@ -245,10 +251,35 @@ enum Scenario {
     /// key under one fan-out. Protobuf tables only.
     #[value(name = "multi-get-100-cold-both")]
     MultiGet100ColdBoth,
+    /// A Scan of one key's whole run, newest first, whose pages the scan
+    /// cache holds. Ordered table only.
+    ScanWarm,
+    /// A Scan of one key's whole run through the `COLD_CACHE_BYTES` scan
+    /// cache, which holds almost none of the table's pages. Ordered table
+    /// only.
+    ScanCold,
+    /// A Scan of `SCAN_PAGE_ROWS` rows, newest first, inside a window over
+    /// the middle half of the key's run, warm: one page of a read paged by
+    /// order value. Ordered table only.
+    ScanBounded,
+    /// A `MultiScan` of `MULTI_SCAN_KEYS` keys at the largest limit
+    /// `server.max_multi_scan_values` admits for them, warm. Ordered table
+    /// only.
+    #[value(name = "multi-scan-10")]
+    MultiScan10,
+    /// `multi-scan-10` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// table only.
+    #[value(name = "multi-scan-10-cold")]
+    MultiScan10Cold,
+    /// The key-value scenarios of `BESIDE_ORDERED` on the long table of
+    /// random values, in a process that also serves the ordered table over
+    /// the same handles, the ordered table loaded, primed, and idle. Serves
+    /// those two whatever `--table` and `--values` select.
+    KvBesideOrdered,
 }
 
 impl Scenario {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 24] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -267,9 +298,15 @@ impl Scenario {
         Self::ColdHitProjectFew,
         Self::MultiGet100Cold,
         Self::MultiGet100ColdBoth,
+        Self::ScanWarm,
+        Self::ScanCold,
+        Self::ScanBounded,
+        Self::MultiScan10,
+        Self::MultiScan10Cold,
+        Self::KvBesideOrdered,
     ];
 
-    const LOOKUPS: [Self; 15] = [
+    const LOOKUPS: [Self; 20] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -285,7 +322,16 @@ impl Scenario {
         Self::ColdHitProjectFew,
         Self::MultiGet100Cold,
         Self::MultiGet100ColdBoth,
+        Self::ScanWarm,
+        Self::ScanCold,
+        Self::ScanBounded,
+        Self::MultiScan10,
+        Self::MultiScan10Cold,
     ];
+
+    /// The key-value scenarios `kv-beside-ordered` runs on the long table
+    /// beside the ordered table.
+    const BESIDE_ORDERED: [Self; 4] = [Self::WarmHit, Self::ColdHit, Self::Miss, Self::MultiGet100];
 
     /// Whether the scenario measures a page cache primed to hold every
     /// value page.
@@ -300,7 +346,11 @@ impl Scenario {
             | Self::WarmHitProjectFew
             | Self::WarmHitProjectMost
             | Self::MultiGet100Both
-            | Self::MultiGet100Project => true,
+            | Self::MultiGet100Project
+            | Self::ScanWarm
+            | Self::ScanBounded
+            | Self::MultiScan10
+            | Self::KvBesideOrdered => true,
             Self::ColdHit
             | Self::Miss
             | Self::Load
@@ -308,12 +358,15 @@ impl Scenario {
             | Self::ColdHitBoth
             | Self::ColdHitProjectFew
             | Self::MultiGet100Cold
-            | Self::MultiGet100ColdBoth => false,
+            | Self::MultiGet100ColdBoth
+            | Self::ScanCold
+            | Self::MultiScan10Cold => false,
         }
     }
 
-    /// Whether the scenario measures hits through the `COLD_CACHE_BYTES`
-    /// page cache, which holds almost none of the table's value pages.
+    /// Whether the scenario measures reads through the `COLD_CACHE_BYTES`
+    /// page cache and scan cache, which hold almost none of the table's
+    /// value pages.
     fn is_cold(self) -> bool {
         matches!(
             self,
@@ -322,6 +375,8 @@ impl Scenario {
                 | Self::ColdHitProjectFew
                 | Self::MultiGet100Cold
                 | Self::MultiGet100ColdBoth
+                | Self::ScanCold
+                | Self::MultiScan10Cold
         )
     }
 
@@ -346,7 +401,13 @@ impl Scenario {
             | Self::Refresh
             | Self::TwoTable
             | Self::PresenceHit
-            | Self::MultiGet100Cold => false,
+            | Self::MultiGet100Cold
+            | Self::ScanWarm
+            | Self::ScanCold
+            | Self::ScanBounded
+            | Self::MultiScan10
+            | Self::MultiScan10Cold
+            | Self::KvBesideOrdered => false,
         }
     }
 
@@ -371,7 +432,44 @@ impl Scenario {
             | Self::MultiGet100Both
             | Self::ColdHitBoth
             | Self::MultiGet100Cold
-            | Self::MultiGet100ColdBoth => false,
+            | Self::MultiGet100ColdBoth
+            | Self::ScanWarm
+            | Self::ScanCold
+            | Self::ScanBounded
+            | Self::MultiScan10
+            | Self::MultiScan10Cold
+            | Self::KvBesideOrdered => false,
+        }
+    }
+
+    /// Whether the scenario is a Scan or `MultiScan` lookup, which only an
+    /// ordered table serves, as only a key-value table serves the others.
+    fn is_scan(self) -> bool {
+        match self {
+            Self::ScanWarm
+            | Self::ScanCold
+            | Self::ScanBounded
+            | Self::MultiScan10
+            | Self::MultiScan10Cold => true,
+            Self::WarmHit
+            | Self::ColdHit
+            | Self::Miss
+            | Self::MultiGet100
+            | Self::MultiGet1000
+            | Self::Load
+            | Self::Refresh
+            | Self::TwoTable
+            | Self::WarmHitBoth
+            | Self::PresenceHit
+            | Self::WarmHitProjectFew
+            | Self::WarmHitProjectMost
+            | Self::MultiGet100Both
+            | Self::MultiGet100Project
+            | Self::ColdHitBoth
+            | Self::ColdHitProjectFew
+            | Self::MultiGet100Cold
+            | Self::MultiGet100ColdBoth
+            | Self::KvBesideOrdered => false,
         }
     }
 
@@ -395,6 +493,12 @@ impl Scenario {
             Self::ColdHitProjectFew => "cold-hit-project-few",
             Self::MultiGet100Cold => "multi-get-100-cold",
             Self::MultiGet100ColdBoth => "multi-get-100-cold-both",
+            Self::ScanWarm => "scan-warm",
+            Self::ScanCold => "scan-cold",
+            Self::ScanBounded => "scan-bounded",
+            Self::MultiScan10 => "multi-scan-10",
+            Self::MultiScan10Cold => "multi-scan-10-cold",
+            Self::KvBesideOrdered => "kv-beside-ordered",
         }
     }
 }
@@ -432,6 +536,10 @@ enum TableName {
     /// file. Runs only when named, and only its load, refresh, cold-hit,
     /// and miss scenarios: its value pages outrun the warm cache.
     Scattered,
+    /// Long keys of `ORDERED_ROWS_PER_KEY` rows each by a timestamp order
+    /// column, contract layout: the table the Scan and `MultiScan`
+    /// scenarios read, and the only one they read.
+    Ordered,
 }
 
 /// What a benchmark table's values are made of.
@@ -682,6 +790,43 @@ const LARGE_VALUE_ROWS: u64 = 100_000;
 /// Rows the large protobuf table's second build appends.
 const LARGE_VALUE_APPENDED_ROWS: u64 = LARGE_VALUE_ROWS / APPEND_DIVISOR;
 
+/// Rows per key of the ordered table: a time series of 100 points, a
+/// tenth of the default `max_scan_rows`, so a Scan of limit 0 returns the
+/// whole run, and a run of 100-byte values lies in one or two of the
+/// contract's 1,000-row value pages.
+const ORDERED_ROWS_PER_KEY: u64 = 100;
+
+/// Keys of the ordered table's first build: `ROWS` rows at
+/// `ORDERED_ROWS_PER_KEY` a key, as many rows as a key-value table holds.
+const ORDERED_KEYS: u64 = ROWS / ORDERED_ROWS_PER_KEY;
+
+/// Keys the ordered table's second build appends, each with its whole run.
+const ORDERED_APPENDED_KEYS: u64 = ORDERED_KEYS / APPEND_DIVISOR;
+
+/// The timestamp of every key's first row: 2026-01-01T00:00:00Z, in the
+/// order column's microseconds.
+const ORDER_START: i64 = 1_767_225_600_000_000;
+
+/// The raw distance between a key's consecutive rows: one minute, in the
+/// order column's microseconds.
+const ORDER_STEP: i64 = 60_000_000;
+
+/// The order column of the ordered table: every key holds
+/// `ORDERED_ROWS_PER_KEY` rows a minute apart from `ORDER_START`, the same
+/// order values for every key, so one answer of the model serves a Scan
+/// scenario's every key (`ScanCase`).
+const ORDERED: Ordered = Ordered {
+    kind: OrderKind::Timestamp,
+    rows_per_key: ordered_rows_per_key,
+    start: ORDER_START,
+    step: ORDER_STEP,
+};
+
+/// `ORDERED_ROWS_PER_KEY` for every id.
+fn ordered_rows_per_key(_: u64) -> u64 {
+    ORDERED_ROWS_PER_KEY
+}
+
 /// The file size target of the scattered table: 256 MiB, above the
 /// ~155 MB a bucket's incompressible rows take, so the rolling writer
 /// keeps each bucket in one file of `SCATTERED_ROWS_PER_FILE` rows.
@@ -704,8 +849,10 @@ const FILE_URI: &str = "file://";
 
 /// A benchmark table as written: its name, key type and shape, the bytes a
 /// key and a value hold before compression, from which a contract table's
-/// bucket count follows, what its values are made of, and its two builds'
-/// rows.
+/// bucket count follows, what its values are made of, its two builds'
+/// keys, and for an ordered table its order column and rows per key. A
+/// key-value table has one row per key, so `rows` and `appended_rows` are
+/// its rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TableShape {
     name: TableName,
@@ -716,9 +863,10 @@ struct TableShape {
     values: Values,
     rows: u64,
     appended_rows: u64,
+    ordered: Option<Ordered>,
 }
 
-const SHAPES: [TableShape; 7] = [
+const SHAPES: [TableShape; 8] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
@@ -728,6 +876,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Random,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::String,
@@ -738,6 +887,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Random,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::Long,
@@ -748,6 +898,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Text,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::String,
@@ -758,6 +909,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Text,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::Long,
@@ -768,6 +920,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Protobuf,
         rows: ROWS,
         appended_rows: APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::Long,
@@ -778,6 +931,7 @@ const SHAPES: [TableShape; 7] = [
         values: Values::ProtobufLarge,
         rows: LARGE_VALUE_ROWS,
         appended_rows: LARGE_VALUE_APPENDED_ROWS,
+        ordered: None,
     },
     TableShape {
         name: TableName::Scattered,
@@ -788,6 +942,18 @@ const SHAPES: [TableShape; 7] = [
         values: Values::Random,
         rows: SCATTERED_ROWS,
         appended_rows: SCATTERED_APPENDED_ROWS,
+        ordered: None,
+    },
+    TableShape {
+        name: TableName::Ordered,
+        key_type: KeyType::Long,
+        key_shape: KeyShape::Sequential,
+        key_bytes: size_of::<i64>(),
+        value_bytes: VALUE_BYTES,
+        values: Values::Random,
+        rows: ORDERED_KEYS,
+        appended_rows: ORDERED_APPENDED_KEYS,
+        ordered: Some(ORDERED),
     },
 ];
 
@@ -801,6 +967,7 @@ impl TableName {
             Self::Long => "long",
             Self::String => "string",
             Self::Scattered => "scattered",
+            Self::Ordered => "ordered",
         }
     }
 }
@@ -849,9 +1016,27 @@ impl TableShape {
         self.value_bytes * self.whole_reads().len()
     }
 
+    /// Rows per key: one in a key-value table, and in the ordered table as
+    /// many as its first key has, which every key has (`ORDERED`).
+    fn rows_per_key(self) -> u64 {
+        self.ordered.map_or(1, |ordered| (ordered.rows_per_key)(0))
+    }
+
+    /// The bytes of a row before compression: its key, its order value in
+    /// an ordered table, and its values.
+    fn row_bytes(self) -> usize {
+        let order_bytes = if self.ordered.is_some() {
+            size_of::<i64>()
+        } else {
+            0
+        };
+        self.key_bytes + order_bytes + self.row_value_bytes()
+    }
+
     /// A contract table has one file per bucket at the contract's upper
-    /// file size: the raw row bytes, its key and every value column, over
-    /// `TARGET_FILE_BYTES_MAX`, rounded up. Random values do not shrink under zstd, so those files come
+    /// file size: the raw row bytes, its key, its order value in an ordered
+    /// table, and every value column, over `TARGET_FILE_BYTES_MAX`, rounded
+    /// up. Random values do not shrink under zstd, so those files come
     /// close to the raw size, inside the contract's 32 to 64 MiB. A text
     /// table keeps the bucket count of the random table with its key
     /// column, so the two differ in their values alone; its files come out
@@ -859,9 +1044,9 @@ impl TableShape {
     /// file of `SCATTERED_ROWS_PER_FILE` rows per bucket.
     fn buckets(self) -> u32 {
         let buckets = match self.name {
-            TableName::Long | TableName::String => {
-                let row_bytes = approx::count(self.key_bytes + self.row_value_bytes());
-                (self.rows * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
+            TableName::Long | TableName::String | TableName::Ordered => {
+                let row_bytes = approx::count(self.row_bytes());
+                (self.rows * self.rows_per_key() * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
             }
             TableName::Scattered => self.rows.div_ceil(SCATTERED_ROWS_PER_FILE),
         };
@@ -880,6 +1065,7 @@ impl TableShape {
             ..FileLayout::contract()
         };
         match self.name {
+            TableName::Ordered => FileLayout::contract(),
             TableName::Long | TableName::String => match self.values {
                 Values::Random | Values::Text | Values::Protobuf => FileLayout::contract(),
                 Values::ProtobufLarge => byte_pages,
@@ -894,19 +1080,20 @@ impl TableShape {
 
     /// Ids between two keys of the pass that fills the warm cache: every
     /// id when value pages are bounded by bytes, since such a page holds a
-    /// few rows of its bucket, which a stride would step over;
-    /// `PRIME_STRIDE` under the contract's pages.
+    /// few rows of its bucket, which a stride would step over, and every id
+    /// of the ordered table, whose page holds the runs of a few keys of its
+    /// bucket; `PRIME_STRIDE` under the contract's pages otherwise.
     fn prime_stride(self) -> u64 {
-        match self.layout().page_bytes {
-            Some(_) => BYTE_PAGE_PRIME_STRIDE,
-            None => PRIME_STRIDE,
+        match (self.ordered, self.layout().page_bytes) {
+            (Some(_), _) | (None, Some(_)) => EVERY_ID_STRIDE,
+            (None, None) => PRIME_STRIDE,
         }
     }
 
     /// Whether the warm scenarios' page cache holds every value page of the
     /// table, of every column it serves, which their measurement assumes.
     fn fits_warm_cache(self) -> bool {
-        approx::length(self.rows) * self.row_value_bytes() <= WARM_CACHE_BYTES
+        approx::length(self.rows * self.rows_per_key()) * self.row_value_bytes() <= WARM_CACHE_BYTES
     }
 
     /// The table's `i`-th key.
@@ -937,8 +1124,11 @@ struct Prepared {
 }
 
 impl Prepared {
+    /// The table as the manifest records it; `rows` and `appended_rows`
+    /// are keys, and an ordered table records its `rows_per_key` beside
+    /// them.
     fn to_json(&self) -> Json {
-        json!({
+        let mut table = json!({
             "name": self.shape.table_name(),
             "values": self.shape.values.as_str(),
             "buckets": self.shape.buckets(),
@@ -948,7 +1138,11 @@ impl Prepared {
             "root": self.root,
             "first": self.first,
             "second": self.second,
-        })
+        });
+        if self.shape.ordered.is_some() {
+            table["rows_per_key"] = json!(self.shape.rows_per_key());
+        }
+        table
     }
 }
 
@@ -981,8 +1175,8 @@ async fn prepare(dir: &Path, rewrite: bool, shapes: &[TableShape]) -> BenchResul
 }
 
 /// Writes `shape` under `dir` through `catalog`, after removing what its
-/// directory held: the first build of `shape.rows` rows, then the second,
-/// `shape.appended_rows` more above them.
+/// directory held: the first build of `shape.rows` keys, then the second,
+/// `shape.appended_rows` more above them, each key with its rows.
 async fn write_table(
     catalog: &MemoryCatalog,
     dir: &Path,
@@ -1002,6 +1196,7 @@ async fn write_table(
         value_kind: shape.values.kind(),
         layout: shape.layout(),
         second_value: shape.values.is_protobuf(),
+        ordered: shape.ordered,
         ..FixtureSpec::small(&name, shape.key_type)
     };
     let mut fixture = write_fixture(catalog, NAMESPACE, spec).await?;
@@ -1014,8 +1209,9 @@ async fn write_table(
         )
         .await?;
     eprintln!(
-        "wrote {name} ({} rows, {} buckets, then {} more): {:.1?}",
+        "wrote {name} ({} keys of {} rows, {} buckets, then {} more keys): {:.1?}",
         shape.rows,
+        shape.rows_per_key(),
         shape.buckets(),
         shape.appended_rows,
         started.elapsed()
@@ -1069,7 +1265,8 @@ fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
             && table["buckets"].as_u64() == Some(u64::from(shape.buckets()))
             && table["rows"].as_u64() == Some(shape.rows)
             && table["appended_rows"].as_u64() == Some(shape.appended_rows)
-            && table["value_bytes"].as_u64() == Some(approx::count(shape.value_bytes));
+            && table["value_bytes"].as_u64() == Some(approx::count(shape.value_bytes))
+            && table["rows_per_key"].as_u64() == shape.ordered.map(|_| shape.rows_per_key());
         if current && local_path(&first)?.exists() && local_path(&second)?.exists() {
             recorded.push(Prepared {
                 shape,
@@ -1228,20 +1425,30 @@ const WARM_CACHE_BYTES: usize = 1 << 30;
 const COLD_CACHE_BYTES: usize = 1 << 20;
 
 /// One table served over storage of its own, so its counters are its own,
-/// and a local directory that lives as long as it does under the Disk tier.
+/// beside at most one other table over the same handles, and a local
+/// directory that lives as long as they do under the Disk tier.
 struct Served {
     table: Arc<Table>,
+    /// The table served beside `table` over the same storage, caches,
+    /// local directory, and count of calls in flight, loaded and primed:
+    /// idle unless a scenario drives it.
+    beside: Option<Arc<Table>>,
     storage: Arc<Storage>,
     cache: PageCache,
+    scan_cache: PageCache,
     _local: Option<TempDir>,
 }
 
 /// `prepared` in `tier` from `source`, over the production storage
-/// defaults (hedging on) and a `cache_bytes` page cache, not yet loaded.
-/// The Disk tier gets a fresh local directory with no page-cache disk
-/// level, or `reuse`'s when given, whose chunk files a load then reuses.
+/// defaults (hedging on), a `cache_bytes` page cache, and a `cache_bytes`
+/// scan cache, not yet loaded; beside it, over the same handles as
+/// `open_with` gives a process's tables, `beside` pinned, loaded, and
+/// primed as the warm scenarios are. The Disk tier gets a fresh local
+/// directory with no page-cache disk level, or `reuse`'s when given, whose
+/// chunk files a load then reuses.
 async fn serve(
     prepared: &Prepared,
+    beside: Option<&Prepared>,
     tier: Tier,
     cache_bytes: usize,
     source: SourceConfig,
@@ -1251,6 +1458,7 @@ async fn serve(
     let storage = Arc::new(Storage::with_sdk_defaults(serving.storage));
     let (local, dir) = local_for(tier, &storage, reuse)?;
     let cache = PageCache::new(cache_bytes, None).await?;
+    let scan_cache = PageCache::for_scans(cache_bytes);
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
@@ -1258,14 +1466,25 @@ async fn serve(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: serving.batch_fan_out,
-        scan_cache: scan_cache(),
+        scan_cache: scan_cache.clone(),
         max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
+    };
+    let beside = match beside {
+        Some(other) => {
+            let table = table_over(other, tier, pinned(other), handles.clone()).await?;
+            table.load().await?;
+            prime_cache(&table, other.shape).await?;
+            Some(Arc::new(table))
+        }
+        None => None,
     };
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
         table: Arc::new(table),
+        beside,
         storage,
         cache,
+        scan_cache,
         _local: dir,
     })
 }
@@ -1300,7 +1519,8 @@ fn local_for(
 }
 
 /// `prepared` as a `Table` in `tier` from `source`, strict, over
-/// `handles`, with the default deadlines.
+/// `handles`, with the default deadlines, the ordered table with its order
+/// column at the default `max_scan_rows`.
 async fn table_over(
     prepared: &Prepared,
     tier: Tier,
@@ -1313,7 +1533,7 @@ async fn table_over(
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
         value_columns: prepared.shape.value_columns(),
-        order_column: None,
+        order_column: prepared.shape.ordered.map(|_| ORDER_COLUMN.to_string()),
         max_scan_rows: None,
         strict: true,
         lookups: None,
@@ -1330,15 +1550,6 @@ async fn table_over(
         server.get_deadline,
         server.scan_deadline,
     ))
-}
-
-/// The scan cache of a benchmark process at the default budget; the
-/// key-value tables it serves never read it.
-fn scan_cache() -> PageCache {
-    PageCache::for_scans(
-        usize::try_from(ServerConfig::default().scan_page_cache_bytes)
-            .expect("the default scan cache budget fits usize"),
-    )
 }
 
 /// The first build's metadata file, which never advances.
@@ -1365,8 +1576,9 @@ const KEY_SEED: u64 = 0x1ce7_4a7b_e4c4_0001;
 const PRIME_STRIDE: u64 = 100;
 
 /// Ids between two keys of the pass that fills the warm cache of a table
-/// whose value pages are bounded by bytes: every id.
-const BYTE_PAGE_PRIME_STRIDE: u64 = 1;
+/// whose value pages are bounded by bytes, or of the ordered table: every
+/// id.
+const EVERY_ID_STRIDE: u64 = 1;
 
 /// The samples a run reserves beyond what its warm-up rate predicts,
 /// relative to that prediction: twice, so a run faster than its warm-up
@@ -1504,6 +1716,124 @@ fn returned_bytes(row: &Row, columns: usize) -> Option<usize> {
     }
 }
 
+/// Keys of a `MultiScan` scenario's batch.
+const MULTI_SCAN_KEYS: usize = 10;
+
+/// Rows of the bounded Scan's page: a page of a read paged by order value.
+const SCAN_PAGE_ROWS: u32 = 10;
+
+/// A key's run over the rows the bounded Scan's window leaves out at each
+/// end: a quarter, so the window is the run's middle half, which holds
+/// more rows than `SCAN_PAGE_ROWS`.
+const WINDOW_MARGIN_DIVISOR: usize = 4;
+
+/// Operations of a Scan scenario whose answers are compared whole with
+/// the model's before it is measured (`verify_scans`).
+const VERIFIED_OPS: usize = 100;
+
+/// A Scan scenario's request and the model's answer to it as order values
+/// (`scan_model`), which is every key's answer: every key of the ordered
+/// table holds the same order values (`ORDERED`).
+struct ScanCase {
+    /// The request in raw order values, as the model takes it.
+    test: TestScan,
+    /// The request as the table takes it.
+    bounds: ScanBounds,
+    /// The order value of each row the model returns, in order.
+    orders: Vec<OrderValue>,
+    /// Whether the model leaves live rows inside the bounds past the last.
+    more: bool,
+}
+
+impl ScanCase {
+    /// The case of `test` over `shape`, which must be the ordered table.
+    fn of(shape: TableShape, test: TestScan) -> BenchResult<Arc<Self>> {
+        let ordered = shape
+            .ordered
+            .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+        let rows = ordered.orders_of(0)?.into_iter().map(|order| (order, ()));
+        let (rows, more) = scan_model(rows, &test);
+        Ok(Arc::new(Self {
+            bounds: ScanBounds {
+                direction: test.direction,
+                limit: test.limit,
+                after: test.after.map(|raw| order_value(ordered.kind, raw)),
+                before: test.before.map(|raw| order_value(ordered.kind, raw)),
+            },
+            orders: rows
+                .into_iter()
+                .map(|(order, ())| order_value(ordered.kind, order))
+                .collect(),
+            more,
+            test,
+        }))
+    }
+
+    /// The value bytes `scanned` returned, or what in it disagrees with the
+    /// model: another `more`, another row count or order value, or a row
+    /// without one value of `value_bytes` bytes. Allocates nothing when it
+    /// agrees, so the check costs a measured operation no allocation.
+    fn check(&self, scanned: &Scanned, value_bytes: usize) -> Result<usize, String> {
+        if scanned.more != self.more || scanned.rows.len() != self.orders.len() {
+            return Err(format!(
+                "{} rows, more {}, where the model has {} rows, more {}",
+                scanned.rows.len(),
+                scanned.more,
+                self.orders.len(),
+                self.more
+            ));
+        }
+        let mut returned = 0;
+        for (row, order) in scanned.rows.iter().zip(&self.orders) {
+            if row.order != *order {
+                return Err(format!(
+                    "a row at {} where the model has {order}",
+                    row.order
+                ));
+            }
+            match row.values.as_slice() {
+                [Some(value)] if value.len() == value_bytes => returned += value.len(),
+                values => return Err(format!("the row at {order} carries {values:?}")),
+            }
+        }
+        Ok(returned)
+    }
+}
+
+/// What a Scan of `shape`'s key `id` under `test` answers by the model:
+/// `scan_model` over the rows the fixture writer wrote for the key, each
+/// its order value and its `VALUE_COLUMN` value (`row_value` at
+/// `FIRST_VERSION`).
+fn modeled_scan(
+    shape: TableShape,
+    ordered: Ordered,
+    id: u64,
+    test: &TestScan,
+) -> BenchResult<Scanned> {
+    let key = shape.key(id);
+    let rows = ordered.orders_of(id)?.into_iter().map(|order| {
+        let value = row_value(
+            &key,
+            order,
+            shape.value_bytes,
+            shape.values.kind(),
+            FIRST_VERSION,
+        );
+        (order, value)
+    });
+    let (rows, more) = scan_model(rows, test);
+    Ok(Scanned {
+        rows: rows
+            .into_iter()
+            .map(|(order, value)| ScanRow {
+                order: order_value(ordered.kind, order),
+                values: vec![Some(value.into())],
+            })
+            .collect(),
+        more,
+    })
+}
+
 /// What one operation of a run does.
 #[derive(Clone)]
 enum Op {
@@ -1521,48 +1851,157 @@ enum Op {
         batch: usize,
         reads: Reads,
     },
+    /// One `scan` of the next pool key reading `VALUE_COLUMN` under
+    /// `case`'s bounds, which must return the model's rows, each with a
+    /// value of `value_bytes` bytes (`ScanCase::check`).
+    Scan {
+        keys: Arc<Vec<Key>>,
+        case: Arc<ScanCase>,
+        value_bytes: usize,
+    },
+    /// One `multi_scan` of the next `batch` pool keys, each answered as
+    /// `Scan` requires.
+    MultiScan {
+        keys: Arc<Vec<Key>>,
+        batch: usize,
+        case: Arc<ScanCase>,
+        value_bytes: usize,
+    },
 }
 
 impl Op {
+    /// The positions in the key pool that operation `i` asks: the next
+    /// key, or the next batch, which wraps before it would run past the
+    /// pool's end.
+    fn pool_range(&self, i: usize) -> std::ops::Range<usize> {
+        match self {
+            Self::Get { keys, .. } | Self::Scan { keys, .. } => {
+                let at = i % keys.len();
+                at..at + 1
+            }
+            Self::MultiGet { keys, batch, .. } | Self::MultiScan { keys, batch, .. } => {
+                let start = (i * batch) % (keys.len() - batch);
+                start..start + batch
+            }
+        }
+    }
+
+    /// Lookups per operation: one, or a batch's keys.
+    fn keys_per_op(&self) -> usize {
+        match self {
+            Self::Get { .. } | Self::Scan { .. } => 1,
+            Self::MultiGet { batch, .. } | Self::MultiScan { batch, .. } => *batch,
+        }
+    }
+
     /// Runs operation `i` and returns the value bytes it read and
-    /// returned; an answer of the wrong presence is an error, so a run that
-    /// measured nothing but failures cannot pass for fast.
+    /// returned; an answer of the wrong presence, or a Scan's answer that
+    /// disagrees with the model, is an error, so a run that measured
+    /// nothing but failures cannot pass for fast.
     async fn run(&self, table: &Table, i: usize) -> BenchResult<ValueBytes> {
+        let at = self.pool_range(i);
         match self {
             Self::Get {
                 keys,
                 present,
                 reads,
             } => {
-                let at = i % keys.len();
-                let lookup = table.get(&keys[at], reads.columns()).await?;
+                let lookup = table.get(&keys[at.start], reads.columns()).await?;
                 let returned = returned_bytes(&lookup.row, reads.columns().len());
                 if returned.is_some() != *present {
                     return Err(format!("key {i} answered {:?}", lookup.row).into());
                 }
                 let returned = returned.unwrap_or(0);
-                Ok(ValueBytes::of(
-                    reads.read_bytes(at..at + 1, returned),
-                    returned,
-                ))
+                Ok(ValueBytes::of(reads.read_bytes(at, returned), returned))
             }
-            Self::MultiGet { keys, batch, reads } => {
-                let start = (i * batch) % (keys.len() - batch);
-                let lookup = table
-                    .multi_get(&keys[start..start + batch], reads.columns())
-                    .await?;
+            Self::MultiGet { keys, reads, .. } => {
+                let lookup = table.multi_get(&keys[at.clone()], reads.columns()).await?;
                 let mut returned = 0;
                 for row in &lookup.rows {
                     returned += returned_bytes(row, reads.columns().len())
                         .ok_or_else(|| format!("batch {i} answered a key absent"))?;
                 }
-                Ok(ValueBytes::of(
-                    reads.read_bytes(start..start + batch, returned),
-                    returned,
-                ))
+                Ok(ValueBytes::of(reads.read_bytes(at, returned), returned))
+            }
+            Self::Scan {
+                keys,
+                case,
+                value_bytes,
+            } => {
+                let lookup = table
+                    .scan(&keys[at.start], &VALUE_READS, &case.bounds)
+                    .await?;
+                let returned = case
+                    .check(&lookup.scanned, *value_bytes)
+                    .map_err(|fault| format!("scan {i}: {fault}"))?;
+                Ok(ValueBytes::of(returned, returned))
+            }
+            Self::MultiScan {
+                keys,
+                case,
+                value_bytes,
+                ..
+            } => {
+                let lookup = table
+                    .multi_scan(&keys[at.clone()], &VALUE_READS, &case.bounds)
+                    .await?;
+                if lookup.results.len() != at.len() {
+                    return Err(format!(
+                        "batch {i} answered {} of {} keys",
+                        lookup.results.len(),
+                        at.len()
+                    )
+                    .into());
+                }
+                let mut returned = 0;
+                for scanned in &lookup.results {
+                    returned += case
+                        .check(scanned, *value_bytes)
+                        .map_err(|fault| format!("batch {i}: {fault}"))?;
+                }
+                Ok(ValueBytes::of(returned, returned))
             }
         }
     }
+}
+
+/// The first `VERIFIED_OPS` operations of a Scan or `MultiScan` op over
+/// `shape`, each key's answer compared whole, every value's bytes
+/// included, with the model's (`modeled_scan`), before the scenario is
+/// measured: `Op::run` checks the order values and value lengths alone, so
+/// this is what fails a run whose Scans return wrong bytes. A `Get` or
+/// `MultiGet` op is checked by `Op::run` alone.
+async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<()> {
+    let (keys, case) = match op {
+        Op::Scan { keys, case, .. } | Op::MultiScan { keys, case, .. } => (keys, case),
+        Op::Get { .. } | Op::MultiGet { .. } => return Ok(()),
+    };
+    let ordered = shape
+        .ordered
+        .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+    let ids = hit_ids(shape);
+    for i in 0..VERIFIED_OPS {
+        let at = op.pool_range(i);
+        let answers = table
+            .multi_scan(&keys[at.clone()], &VALUE_READS, &case.bounds)
+            .await?
+            .results;
+        let single = table
+            .scan(&keys[at.start], &VALUE_READS, &case.bounds)
+            .await?
+            .scanned;
+        if single != answers[0] {
+            return Err(
+                format!("operation {i}: a Scan and a MultiScan of one key disagree").into(),
+            );
+        }
+        for (answer, &id) in answers.iter().zip(&ids[at]) {
+            if *answer != modeled_scan(shape, ordered, id, &case.test)? {
+                return Err(format!("operation {i}: key {id} disagrees with the model").into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether a task loop gives its worker up between operations.
@@ -1671,7 +2110,8 @@ async fn join_loops(handles: Loops) -> BenchResult<Done> {
 }
 
 /// Counters of a served table and the process, read before and after a
-/// measured window.
+/// measured window; page fetches and hits are the page cache's and the
+/// scan cache's together, since an operation reads one or the other.
 #[derive(Clone, Copy, Debug, Default)]
 struct Counters {
     allocations: Allocations,
@@ -1690,8 +2130,8 @@ impl Counters {
             gets: stats.gets(),
             local_reads: stats.local_reads(),
             hedges: stats.hedges(),
-            fetches: served.cache.fetches(),
-            hits: served.cache.hits(),
+            fetches: served.cache.fetches() + served.scan_cache.fetches(),
+            hits: served.cache.hits() + served.scan_cache.hits(),
         }
     }
 
@@ -1717,7 +2157,27 @@ struct RunLabel {
     tasks: usize,
     /// The bound its tables were served under, `Serving::batch_fan_out`.
     batch_fan_out: usize,
+    /// The table its process also served, idle, under `kv-beside-ordered`.
+    beside: Option<TableShape>,
 }
+
+impl RunLabel {
+    /// The measured table's name, followed after `BESIDE_SEPARATOR` by the
+    /// name of the table served beside it.
+    fn table_label(&self) -> String {
+        match self.beside {
+            Some(beside) => format!(
+                "{}{BESIDE_SEPARATOR}{}",
+                self.table.table_name(),
+                beside.table_name()
+            ),
+            None => self.table.table_name(),
+        }
+    }
+}
+
+/// What separates a measured table's name from the one served beside it.
+const BESIDE_SEPARATOR: &str = "+";
 
 /// A measured run.
 struct Measured {
@@ -1756,6 +2216,7 @@ impl Measured {
             "mode": self.label.mode.name(),
             "tasks": self.label.tasks,
             "batch_fan_out": self.label.batch_fan_out,
+            "beside": self.label.beside.map(TableShape::table_name),
             "keys_per_op": self.keys_per_op,
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
@@ -1797,14 +2258,10 @@ async fn measure(
     let (ops, samples, bytes) = spawn_run(served, op, label.tasks, duration, Some(reserve)).await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
-    let keys_per_op = match op {
-        Op::Get { .. } => 1,
-        Op::MultiGet { batch, .. } => *batch,
-    };
     Ok(Measured {
         label,
         ops,
-        keys_per_op,
+        keys_per_op: op.keys_per_op(),
         elapsed,
         latencies: Latencies::of(samples),
         counters,
@@ -1814,10 +2271,26 @@ async fn measure(
 
 /// Asks every page of the table, of every column it serves, at least once,
 /// `prime_stride` ids apart, so the warm cache holds every value page (and
-/// under Bloom every key page) before a warm run starts.
+/// under Bloom every key page) before a warm run starts: a Get of each key
+/// of a key-value table, and a Scan of each key's whole run of the ordered
+/// table, which fills the scan cache.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
+    let whole_run = ScanBounds {
+        direction: Direction::NewestFirst,
+        limit: 0,
+        after: None,
+        before: None,
+    };
     for id in (0..shape.rows).step_by(approx::length(shape.prime_stride())) {
-        table.get(&shape.key(id), shape.whole_reads()).await?;
+        let key = shape.key(id);
+        match shape.ordered {
+            Some(_) => {
+                table.scan(&key, shape.whole_reads(), &whole_run).await?;
+            }
+            None => {
+                table.get(&key, shape.whole_reads()).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -1850,28 +2323,28 @@ struct RunSettings {
 }
 
 /// Every selected lookup scenario of one table in one tier, each in every
-/// selected mode, over a warm table and, for the cold hit, a cold one.
+/// selected mode, over a warm table and, for the cold scenarios, a cold
+/// one; each served beside `beside` when given (`serve`). A Scan scenario
+/// is checked against the model whole (`verify_scans`) before it is
+/// measured.
 async fn lookups(
     prepared: &Prepared,
+    beside: Option<&Prepared>,
     tier: Tier,
     scenarios: &[Scenario],
     settings: &RunSettings,
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let warm_needed = scenarios.iter().any(|s| !s.is_cold());
-    let warm = if warm_needed {
-        let served = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), None).await?;
-        served.table.load().await?;
+    let warm = if scenarios.iter().any(|s| !s.is_cold()) {
+        let served = serve_loaded(prepared, beside, tier, WARM_CACHE_BYTES).await?;
         prime_cache(&served.table, shape).await?;
         Some(served)
     } else {
         None
     };
     let cold = if scenarios.iter().any(|s| s.is_cold()) {
-        let served = serve(prepared, tier, COLD_CACHE_BYTES, pinned(prepared), None).await?;
-        served.table.load().await?;
-        Some(served)
+        Some(serve_loaded(prepared, beside, tier, COLD_CACHE_BYTES).await?)
     } else {
         None
     };
@@ -1886,6 +2359,10 @@ async fn lookups(
                 .as_ref()
                 .expect("whole lengths are read when a projecting scenario is selected"),
         ),
+    };
+    let scan_one = |test| ScanCase::of(shape, test).map(|case| scan(&hits, case, shape));
+    let scan_batch = |test| {
+        ScanCase::of(shape, test).map(|case| multi_scan(&hits, MULTI_SCAN_KEYS, case, shape))
     };
     let mut results = Vec::new();
     for &scenario in scenarios {
@@ -1909,38 +2386,107 @@ async fn lookups(
             Scenario::MultiGet100ColdBoth => {
                 (&cold, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
             }
-            Scenario::Load | Scenario::Refresh | Scenario::TwoTable => continue,
+            Scenario::ScanWarm => (&warm, scan_one(TestScan::default())?),
+            Scenario::ScanCold => (&cold, scan_one(TestScan::default())?),
+            Scenario::ScanBounded => (&warm, scan_one(bounded_page()?)?),
+            Scenario::MultiScan10 => (&warm, scan_batch(multi_scan_whole_runs())?),
+            Scenario::MultiScan10Cold => (&cold, scan_batch(multi_scan_whole_runs())?),
+            Scenario::Load | Scenario::Refresh | Scenario::TwoTable | Scenario::KvBesideOrdered => {
+                continue;
+            }
         };
         let served = served
             .as_ref()
             .expect("a table is served for every selected scenario");
-        for &mode in &settings.modes {
-            let tasks = match mode {
-                Mode::Single => 1,
-                Mode::Multi => settings.tasks,
-            };
-            let label = RunLabel {
-                scenario,
-                table: shape,
-                tier,
-                mode,
-                tasks,
-                batch_fan_out: serving().batch_fan_out,
-            };
-            let run = measure(
-                served,
-                &op,
-                label,
-                settings.warmup,
-                settings.duration,
-                settings.windows,
-            )
-            .await?;
-            eprintln!("{}", row(&run));
-            results.push(run);
-        }
+        verify_scans(&op, &served.table, shape).await?;
+        let label = RunLabel {
+            scenario,
+            table: shape,
+            tier,
+            mode: Mode::Single,
+            tasks: 1,
+            batch_fan_out: serving().batch_fan_out,
+            beside: beside.map(|other| other.shape),
+        };
+        results.extend(measure_modes(served, &op, label, settings).await?);
     }
     Ok(results)
+}
+
+/// `prepared` served beside `beside` in `tier` from its first build over
+/// `cache_bytes` caches (`serve`), and loaded.
+async fn serve_loaded(
+    prepared: &Prepared,
+    beside: Option<&Prepared>,
+    tier: Tier,
+    cache_bytes: usize,
+) -> BenchResult<Served> {
+    let served = serve(prepared, beside, tier, cache_bytes, pinned(prepared), None).await?;
+    served.table.load().await?;
+    Ok(served)
+}
+
+/// `op` over `served` measured in every selected mode, each row labeled
+/// `label` with that mode and its tasks.
+async fn measure_modes(
+    served: &Served,
+    op: &Op,
+    label: RunLabel,
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let mut runs = Vec::with_capacity(settings.modes.len());
+    for &mode in &settings.modes {
+        let tasks = match mode {
+            Mode::Single => 1,
+            Mode::Multi => settings.tasks,
+        };
+        let label = RunLabel {
+            mode,
+            tasks,
+            ..label
+        };
+        let run = measure(
+            served,
+            op,
+            label,
+            settings.warmup,
+            settings.duration,
+            settings.windows,
+        )
+        .await?;
+        eprintln!("{}", row(&run));
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
+/// The bounded Scan's request: `SCAN_PAGE_ROWS` rows, newest first,
+/// strictly between the order values of the rows a quarter and three
+/// quarters into a key's run (`WINDOW_MARGIN_DIVISOR`), counted oldest
+/// first.
+fn bounded_page() -> BenchResult<TestScan> {
+    let orders = ORDERED.orders_of(0)?;
+    let margin = orders.len() / WINDOW_MARGIN_DIVISOR;
+    Ok(TestScan {
+        direction: Direction::NewestFirst,
+        limit: SCAN_PAGE_ROWS,
+        after: Some(orders[margin]),
+        before: Some(orders[orders.len() - margin]),
+        ..TestScan::default()
+    })
+}
+
+/// The `MultiScan` scenarios' request: every row of each key, newest
+/// first, at the largest limit `server.max_multi_scan_values` admits for
+/// `MULTI_SCAN_KEYS` keys reading one column, each row counting its order
+/// value beside the column's.
+fn multi_scan_whole_runs() -> TestScan {
+    let values_per_row = VALUE_READS.len() + 1;
+    let limit = ServerConfig::default().max_multi_scan_values / (MULTI_SCAN_KEYS * values_per_row);
+    TestScan {
+        limit: u32::try_from(limit).expect("the default limit fits u32"),
+        ..TestScan::default()
+    }
 }
 
 /// The two `MultiGet` sizes measured.
@@ -1963,43 +2509,62 @@ fn multi(keys: &Arc<Vec<Key>>, batch: usize, reads: Reads) -> Op {
     }
 }
 
-/// Both tables in `tier` over one storage, one `WARM_CACHE_BYTES` page
-/// cache, under Disk one local directory, and one count of calls in
-/// flight, as `open_with` opens a process's tables; loaded, each primed as
-/// the warm scenarios are. The tables
-/// come in `prepared`'s order, beside the directory, which must outlive
-/// them.
-async fn serve_together(
-    prepared: &[&Prepared],
-    tier: Tier,
-) -> BenchResult<(Vec<Arc<Table>>, Option<TempDir>)> {
-    let serving = serving();
-    let storage = Arc::new(Storage::with_sdk_defaults(serving.storage));
-    let (local, dir) = local_for(tier, &storage, None)?;
-    let handles = TableHandles {
-        storage,
-        cache: PageCache::new(WARM_CACHE_BYTES, None).await?,
-        local,
-        calls: CallsInFlight::new(),
-        findings: FindingLog::Events,
-        batch_fan_out: serving.batch_fan_out,
-        scan_cache: scan_cache(),
-        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
-    };
-    let mut tables = Vec::with_capacity(prepared.len());
-    for table in prepared {
-        let served = table_over(table, tier, pinned(table), handles.clone()).await?;
-        served.load().await?;
-        prime_cache(&served, table.shape).await?;
-        tables.push(Arc::new(served));
+fn scan(keys: &Arc<Vec<Key>>, case: Arc<ScanCase>, shape: TableShape) -> Op {
+    Op::Scan {
+        keys: Arc::clone(keys),
+        case,
+        value_bytes: shape.value_bytes,
     }
-    Ok((tables, dir))
+}
+
+fn multi_scan(keys: &Arc<Vec<Key>>, batch: usize, case: Arc<ScanCase>, shape: TableShape) -> Op {
+    Op::MultiScan {
+        keys: Arc::clone(keys),
+        batch,
+        case,
+        value_bytes: shape.value_bytes,
+    }
+}
+
+/// The table of random values named `name` among `prepared`.
+fn random_table(prepared: &[Prepared], name: TableName) -> BenchResult<&Prepared> {
+    prepared
+        .iter()
+        .find(|table| table.shape.name == name && table.shape.values == Values::Random)
+        .ok_or_else(|| format!("no {} table of random values", name.as_str()).into())
+}
+
+/// The `kv-beside-ordered` scenario in `tier`: the key-value scenarios of
+/// `Scenario::BESIDE_ORDERED` on the long table of random values, served
+/// beside the ordered table over one storage, page cache, scan cache, under
+/// Disk one local directory, and one count of calls in flight, as
+/// `open_with` opens a process serving both kinds. The ordered table is
+/// loaded, primed, and idle, so a row against the same scenario on the long
+/// table alone is what serving an ordered table beside it costs the
+/// key-value path.
+async fn kv_beside_ordered(
+    prepared: &[Prepared],
+    tier: Tier,
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let long = random_table(prepared, TableName::Long)?;
+    let ordered = random_table(prepared, TableName::Ordered)?;
+    lookups(
+        long,
+        Some(ordered),
+        tier,
+        &Scenario::BESIDE_ORDERED,
+        settings,
+    )
+    .await
 }
 
 /// The two-table scenario in `tier`: `settings.tasks` loops of warm hits on
 /// the long table beside one loop of `MultiGet` 1,000 warm hits on the
-/// string table, run together for the warm-up and then for the measured
-/// window. Every loop yields between operations (`Pace::Yielding`): the hit
+/// string table, both served over one storage, one `WARM_CACHE_BYTES` page
+/// cache, under Disk one local directory, and one count of calls in flight,
+/// as `open_with` opens a process's tables, each loaded and primed, run
+/// together for the warm-up and then for the measured window. Every loop yields between operations (`Pace::Yielding`): the hit
 /// loops would otherwise hold every worker, and the batch and its runs
 /// would wait for the window to end. One row per table. Neither row carries counters: both tables'
 /// operations run in one window over one storage and one cache, so no
@@ -2010,15 +2575,24 @@ async fn two_tables(
     tier: Tier,
     settings: &RunSettings,
 ) -> BenchResult<Vec<Measured>> {
-    let find = |name: TableName| {
-        prepared
-            .iter()
-            .find(|table| table.shape.name == name && table.shape.values == Values::Random)
-            .ok_or_else(|| format!("no {} table of random values", name.as_str()))
-    };
-    let (long, string) = (find(TableName::Long)?, find(TableName::String)?);
-    let (tables, _dir) = serve_together(&[long, string], tier).await?;
-    let (long_table, string_table) = (&tables[0], &tables[1]);
+    let long = random_table(prepared, TableName::Long)?;
+    let string = random_table(prepared, TableName::String)?;
+    let served = serve(
+        long,
+        Some(string),
+        tier,
+        WARM_CACHE_BYTES,
+        pinned(long),
+        None,
+    )
+    .await?;
+    served.table.load().await?;
+    prime_cache(&served.table, long.shape).await?;
+    let long_table = &served.table;
+    let string_table = served
+        .beside
+        .as_ref()
+        .expect("the string table is served beside the long one");
     let hit_op = get(&key_pools(long.shape).0, true, WHOLE_VALUE);
     let batch_op = multi(&key_pools(string.shape).0, BATCH_1000, WHOLE_VALUE);
     let hits = (&hit_op, Pace::Yielding);
@@ -2056,6 +2630,7 @@ async fn two_tables(
         mode,
         tasks,
         batch_fan_out,
+        beside: None,
     };
     let rows = vec![
         Measured {
@@ -2244,7 +2819,15 @@ async fn loads(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<Vec<
     let mut results = Vec::new();
     for round in 0..rounds {
         let key = (prepared.shape, tier, round);
-        let served = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), None).await?;
+        let served = serve(
+            prepared,
+            None,
+            tier,
+            WARM_CACHE_BYTES,
+            pinned(prepared),
+            None,
+        )
+        .await?;
         let run = timed(&served, "load", key, async {
             Ok(served.table.load().await?)
         })
@@ -2253,7 +2836,15 @@ async fn loads(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<Vec<
         results.push(run);
         if tier == Tier::Disk {
             let Served { _local: dir, .. } = served;
-            let again = serve(prepared, tier, WARM_CACHE_BYTES, pinned(prepared), dir).await?;
+            let again = serve(
+                prepared,
+                None,
+                tier,
+                WARM_CACHE_BYTES,
+                pinned(prepared),
+                dir,
+            )
+            .await?;
             let run = timed(&again, "load-reusing-chunk-files", key, async {
                 Ok(again.table.load().await?)
             })
@@ -2278,7 +2869,7 @@ async fn refreshes(prepared: &Prepared, tier: Tier, rounds: u32) -> BenchResult<
     for round in 0..rounds {
         let key = (prepared.shape, tier, round);
         std::fs::write(&hint, &prepared.first)?;
-        let served = serve(prepared, tier, WARM_CACHE_BYTES, source.clone(), None).await?;
+        let served = serve(prepared, None, tier, WARM_CACHE_BYTES, source.clone(), None).await?;
         served.table.load().await?;
         std::fs::write(&hint, &prepared.second)?;
         let run = timed(&served, "refresh-appended", key, async {
@@ -2344,7 +2935,7 @@ fn row(run: &Measured) -> String {
     format!(
         "{:<21} {:<19} {:<6} {:<7} {:>5} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0}",
         run.label.scenario.name(),
-        run.label.table.table_name(),
+        run.label.table_label(),
         format!("{:?}", run.label.tier).to_lowercase(),
         run.label.mode.name(),
         run.label.tasks,
@@ -2475,8 +3066,9 @@ fn print_prepared(prepared: &[Prepared]) {
 }
 
 /// The tables the command line measures, and beside them every table to
-/// prepare: those, and under the two-table scenario the long and string
-/// tables of random values it serves.
+/// prepare: those, under the two-table scenario the long and string tables
+/// of random values it serves, and under `kv-beside-ordered` the long table
+/// of random values and the ordered table.
 fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<TableShape>) {
     let values = or_all(&cli.values, &Values::ALL);
     let measured: Vec<TableShape> = SHAPES
@@ -2484,13 +3076,18 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
         .filter(|shape| shape.selected(&cli.table, &values))
         .collect();
     let two_table = scenarios.contains(&Scenario::TwoTable) && !cli.prepare;
+    let beside_ordered = scenarios.contains(&Scenario::KvBesideOrdered) && !cli.prepare;
     let needed = SHAPES
         .into_iter()
         .filter(|shape| {
+            let random = shape.values == Values::Random;
             measured.contains(shape)
                 || (two_table
-                    && shape.values == Values::Random
+                    && random
                     && matches!(shape.name, TableName::Long | TableName::String))
+                || (beside_ordered
+                    && random
+                    && matches!(shape.name, TableName::Long | TableName::Ordered))
         })
         .collect();
     (measured, needed)
@@ -2498,10 +3095,29 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
 
 /// The lookup scenarios of `scenarios` that measure what they say on
 /// `shape`: all of them, without the warm ones when the warm cache cannot
-/// hold the table's value pages, and without those reading a second
-/// column or a projection when the table is not a protobuf table, each
-/// of which it says.
+/// hold the table's value pages, without those reading a second column or
+/// a projection when the table is not a protobuf table, and without the
+/// Scan scenarios on a key-value table or the others on the ordered table,
+/// each of which it says.
 fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
+    let ordered = shape.ordered.is_some();
+    let kind_kept: Vec<Scenario> = scenarios
+        .iter()
+        .copied()
+        .filter(|scenario| scenario.is_scan() == ordered)
+        .collect();
+    if kind_kept.len() < scenarios.len() {
+        let (skipped, kind) = if ordered {
+            ("key-value", "an ordered")
+        } else {
+            ("scan", "a key-value")
+        };
+        eprintln!(
+            "{}: {skipped} scenarios skipped, it is {kind} table",
+            shape.table_name()
+        );
+    }
+    let scenarios = kind_kept.as_slice();
     let fits = shape.fits_warm_cache();
     let protobuf = shape.values.is_protobuf();
     let warm_kept: Vec<Scenario> = scenarios
@@ -2543,6 +3159,22 @@ fn install_recorder() -> BenchResult<()> {
         }
     });
     Ok(())
+}
+
+/// The machine, then a row per measured lookup run and per load or
+/// refresh, on stdout.
+fn print_results(machine: &Json, measured: &[Measured], loaded: &[Loaded]) {
+    println!("{machine}");
+    println!("{}", header());
+    for run in measured {
+        println!("{}", row(run));
+    }
+    if !loaded.is_empty() {
+        println!("{}", load_header());
+        for run in loaded {
+            println!("{}", load_row(run));
+        }
+    }
 }
 
 #[tokio::main]
@@ -2597,7 +3229,7 @@ async fn main() -> BenchResult<()> {
         let table_lookups = lookups_for(table.shape, &lookup_scenarios);
         for &tier in &tiers {
             if !table_lookups.is_empty() {
-                measured.extend(lookups(table, tier, &table_lookups, &settings).await?);
+                measured.extend(lookups(table, None, tier, &table_lookups, &settings).await?);
             }
             if scenarios.contains(&Scenario::Load) {
                 loaded.extend(loads(table, tier, cli.load_rounds).await?);
@@ -2612,17 +3244,12 @@ async fn main() -> BenchResult<()> {
             measured.extend(two_tables(&prepared, tier, &settings).await?);
         }
     }
-    println!("{machine}");
-    println!("{}", header());
-    for run in &measured {
-        println!("{}", row(run));
-    }
-    if !loaded.is_empty() {
-        println!("{}", load_header());
-        for run in &loaded {
-            println!("{}", load_row(run));
+    if scenarios.contains(&Scenario::KvBesideOrdered) {
+        for &tier in &tiers {
+            measured.extend(kv_beside_ordered(&prepared, tier, &settings).await?);
         }
     }
+    print_results(&machine, &measured, &loaded);
     let report = json!({
         "machine": machine,
         "settings": {
@@ -2635,6 +3262,10 @@ async fn main() -> BenchResult<()> {
             "warmup_seconds": cli.warmup,
             "duration_seconds": cli.duration,
             "batch_fan_out": cli.batch_fan_out,
+            "ordered_rows_per_key": ORDERED_ROWS_PER_KEY,
+            "scan_page_rows": SCAN_PAGE_ROWS,
+            "multi_scan_keys": MULTI_SCAN_KEYS,
+            "multi_scan_limit": multi_scan_whole_runs().limit,
             "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
             "compression": compression,
         },
