@@ -15,6 +15,12 @@
 > protobuf its column declares fails the call as `FAILED_PRECONDITION`,
 > a deterministic failure the caller does not retry. See RFD 024.
 
+> Updated 2026-10-14: an ordered table is read through Scan and
+> MultiScan, which take a direction, a limit, and optional exclusive
+> bounds as an `OrderValue` and return rows with their order values and
+> a `more` flag; TableInfo reports the order column, its type, and
+> `max_scan_rows`. See RFD 025.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one
@@ -38,11 +44,12 @@ command-line tool with nothing recording the contract between them
 
 ## Decision
 
-Clients will speak gRPC as defined in the checked-in protobuf service (Get;
-MultiGet, with results in request order and all from one snapshot; and
-TableInfo), every answer will carry the snapshot id it came from, and on
-the client side JSON will exist only as the output of the operator
-subcommands.
+Clients will speak gRPC as defined in the checked-in protobuf service
+(Get; MultiGet, with results in request order and all from one snapshot;
+Scan and MultiScan, which read an ordered table's rows (RFD 025 (Ordered
+rows per key)); and TableInfo), every answer will carry the snapshot id
+it came from, and on the client side JSON will exist only as the output
+of the operator subcommands.
 
 A key is a oneof of long, string, and bytes. The bytes variant carries the
 binary, `fixed`, and uuid keys RFD 008 (Keys) admits, and the table's key
@@ -82,9 +89,10 @@ rather than retrying.
 
 TableInfo reports the snapshot id, bucket count, file count, row count, key
 type, resident index bytes, and the table's value columns in name order,
-each with its type, a `fixed` column's width, and its format. The key
-type, each column's type, and its format are enums, so clients switch on
-them.
+each with its type, a `fixed` column's width, and its format, and for an
+ordered table its order column, the column's type and a `fixed` width,
+and `max_scan_rows`. The key type, each column's type, its format, and
+the order type are enums, so clients switch on them.
 
 Field comments in the proto describe what a caller can rely on and leave
 the server's internal structures out.
@@ -114,7 +122,8 @@ the value (RFD 024).
 
 Streaming MultiGet. Deferred. The fan-out pattern in archetype A merges the
 tier's results with the online store's, and request-order results in one
-response serve that merge. A stream can be added later as a fourth call.
+response serve that merge. A stream can be added later as a call of its
+own.
 
 ## Consequences
 

@@ -15,7 +15,7 @@ an RFD and implies nothing about order.
 | [007](007-serving-tiers.md) | Serving tiers | A table that cannot be served correctly is refused, a finding that adds work per lookup is served with its penalty measured and caps the table's lookup level (RFD 020), and advice never affects serving. |
 | [008](008-keys.md) | Keys | One key column of type long, string, binary, or uuid, moved as bytes unchanged, with keys over 4,096 bytes refused. |
 | [009](009-writes-between-builds.md) | Writes between builds | Appends and copy-on-write snapshots are served, with a ref advanced behind compaction as the pattern for merge-on-read tables that need `optimal`; its refusal of every delete file is replaced by RFD 021. |
-| [010](010-transport-and-client-contract.md) | Transport and client contract | Clients speak gRPC through the checked-in protobuf service (Get, MultiGet, TableInfo), and every answer carries its snapshot id. |
+| [010](010-transport-and-client-contract.md) | Transport and client contract | Clients speak gRPC through the checked-in protobuf service (Get, MultiGet, Scan, MultiScan, TableInfo), and every answer carries its snapshot id. |
 | [011](011-configuration.md) | Configuration | Configuration is TOML, the same schema is accepted as JSON, and state icetray persists for itself is versioned protobuf. |
 | [012](012-deployment-contract.md) | Deployment contract | icetray is operated through a twelve-factor surface alone (a config path, platform credentials, JSON logs, Prometheus metrics, health and readiness) with no deployer-specific code. |
 | [013](013-tail-latency.md) | Tail latency | Lookup GETs are hedged after a delay taken from observed latency and capped by a hedge-rate ceiling, and load reads are never hedged. |

@@ -5,6 +5,11 @@
 > indexes are dropped at build. A hit fetches one value page per column
 > it names. See RFD 022.
 
+> Updated 2026-10-14: an ordered table's file also keeps its order
+> column's offset index and column index and the order facts its load
+> records, and its load reads the order column's chunk of each row
+> group, one more GET per row group. See RFD 025.
+
 ## Problem
 
 A server that reads Iceberg tables in place pays one GET for every byte it

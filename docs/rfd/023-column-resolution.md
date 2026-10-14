@@ -1,5 +1,10 @@
 # Column resolution
 
+> Updated 2026-10-14: an ordered table's order column is resolved as the
+> key column is, a file without it refused as `column_mismatch`, and one
+> written before Iceberg promoted it from `int` to `long` read as longs.
+> See RFD 025.
+
 ## Problem
 
 A table's configuration names its key column and its value columns (RFD
@@ -69,6 +74,12 @@ each file holds for a configured column decides the answer:
   is refused.
 - **The key column** follows the same check but has no default: a file
   without its key column is refused.
+- **The order column** of an ordered table (RFD 025 (Ordered rows per
+  key)) follows the key column's check: a file without it is refused,
+  since its default would give every row of the file one order value. A
+  file written before Iceberg promoted the column from `int` to `long`
+  is read as longs, and a promotion that changes the unit is refused as
+  `order_type_mismatch`.
 - **A refusal is of the snapshot,** under the named reason
   `column_mismatch` (RFD 007 (Serving tiers)), naming the file and the
   column. The last good generation keeps serving, the refusal is

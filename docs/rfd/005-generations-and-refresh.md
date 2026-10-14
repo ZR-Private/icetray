@@ -36,6 +36,12 @@
 > of its configured value columns, of which there may be none, and
 > resolves each value column in every data file on its own. See RFD 022.
 
+> Updated 2026-10-14: on an ordered table, uniqueness holds for a key
+> and order value together, checked only for a new file, or one whose
+> deletes shrank, against the files whose key and order ranges both meet
+> its own, in one merge per overlap group; an append of later rows
+> merges nothing. See RFD 025.
+
 ## Problem
 
 Batch jobs rebuild the tables icetray serves on a schedule and publish each
@@ -89,12 +95,14 @@ In simulation a small build takes well under one dependent round trip per
 file; how that depth grows with more files is open
 ([prototype findings, finding 12](../analysis/2026-09-10-prototype-findings.md#12-deterministic-simulation)).
 
-Data files in one bucket whose exact key ranges intersect form an overlap
-group. The group's sorted key runs are merged from the resident key column
-chunks to find any key present in more than one file. A duplicate key is a
-refusal. Overlap without duplicates is a finding measured under RFD 007
-(Serving tiers) that caps the table's lookup level under RFD 020 (Lookup
-levels).
+Data files in one bucket whose exact key ranges intersect form an
+overlap group. The group's sorted key runs are merged from the resident
+key column chunks to find any key present in more than one file. A
+duplicate key is a refusal. An ordered table, whose key repeats, checks
+a key and order value together, and only for the files where a pair can
+repeat (RFD 025 (Ordered rows per key)). Overlap without duplicates is a
+finding measured under RFD 007 (Serving tiers) that caps the table's
+lookup level under RFD 020 (Lookup levels).
 
 When a refresh fails, the last good generation keeps serving and the
 failure is reported. A failure that is a function of the snapshot's

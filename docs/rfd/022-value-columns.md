@@ -4,6 +4,11 @@
 > format, and a format change applies in place; projection inside a
 > packed protobuf column is decided on its own. See RFD 024.
 
+> Updated 2026-10-14: a Scan reads value columns as Get does, and
+> entries over one table share a disk chunk file per data file only when
+> they are of one kind and, for ordered tables, one order column. See
+> RFD 025.
+
 ## Problem
 
 RFD 002 (Serving layout) gives a table one value column and

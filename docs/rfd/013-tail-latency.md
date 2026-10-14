@@ -16,6 +16,12 @@
 > process's GET throughput by 64; see
 > [the measurements](../analysis/2026-10-08-multi-get-fan-out.md).
 
+> Updated 2026-10-14: the fan-out is `server.batch_fan_out` and bounds
+> the GETs of a Scan and a MultiScan as of a MultiGet; a Scan has
+> `server.scan_deadline` and a MultiScan `server.multi_scan_deadline`,
+> and span GETs are hedged in a window of their own per table whose
+> delay scales with a span's pages. See RFD 025.
+
 ## Problem
 
 A cold hit costs one GET per value column it names, and the latency of

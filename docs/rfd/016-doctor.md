@@ -34,6 +34,12 @@
 > advice `malformed_protobuf`, naming the column; the table's report
 > gives each column's format. See RFD 024.
 
+> Updated 2026-10-14: on an ordered table the `table` line carries an
+> `order` object and each `file` line the file's order facts, the
+> ordered findings and advice are reported with their penalties, and the
+> bloom findings divide a row group's filter bits by its distinct keys.
+> See RFD 025.
+
 ## Problem
 
 RFD 002 (Serving layout) leaves to this RFD what the doctor

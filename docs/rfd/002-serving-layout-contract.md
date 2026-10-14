@@ -20,6 +20,10 @@
 > `optimal` level under `full` and `disk` residency. See
 > docs/table-layout.md.
 
+> Updated 2026-10-14: an ordered table, configured with an order column,
+> keeps this layout with each file sorted by key and then order value,
+> ascending, and a key repeating within and across files. See RFD 025.
+
 ## Problem
 
 icetray serves a lookup by reading the Parquet data files a batch pipeline
@@ -76,7 +80,9 @@ them are the writer recipe in the
   (RFD 017 (Residency tiers)) keeps that option open.
 - Each file sorted by key, as a local write order; the table needs no
   global sort. Correctness depends on this clause alone, because an
-  unsorted file cannot be served.
+  unsorted file cannot be served. An ordered table sorts each file by
+  key and then order value, and its key repeats (RFD 025 (Ordered rows
+  per key)).
 - Dictionary encoding off, since a dictionary-encoded value column costs a
   second GET per hit
   ([prototype findings, finding 1](../analysis/2026-09-10-prototype-findings.md#1-one-get-per-cold-hit-none-per-miss-on-every-layout)).

@@ -22,6 +22,11 @@
 > the entry; a format the serving layout's type for its column does not
 > take refuses the reload. See RFD 024.
 
+> Updated 2026-10-14: a change to only an ordered table's
+> `max_scan_rows` applies in place, as a change to `lookups` does, and
+> setting, changing, or removing `order_column` loads the table anew;
+> the new scan settings take a restart. See RFD 025.
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing
@@ -68,8 +73,9 @@ keeps its generation, its refresh, and its reservations untouched.
 `value_columns` is compared as a set, so a list that only reorders its
 columns is equal (RFD 022 (Value columns)), and a change to the set
 makes the table changed, which loads it whole. A table whose entry
-differs in `lookups`, `strict`, or the formats of the same columns alone
-(RFD 024 (Field projection)) keeps its generation and takes the new
+differs in `lookups`, `strict`, the formats of the same columns (RFD
+024 (Field projection)), or an ordered table's `max_scan_rows` (RFD 025
+(Ordered rows per key)) alone keeps its generation and takes the new
 entry in place at the swap, since none of them changes the layout the
 generation holds; the reload is refused when the serving snapshot would
 refuse the new entry, a strict level it does not meet or a protobuf

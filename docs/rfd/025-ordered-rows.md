@@ -135,24 +135,27 @@ direction under a limit and optional bounds on the order value.
 - **Refresh.** Across files, the load checks for a repeated live pair
   only among files where one can occur. A file is checked when it is
   new, or reused with deletes that shrank: deleted rows that are not a
-  superset of those the previous generation applied (RFD 021). It is
-  checked against every file, new or reused, that can share a key with
-  it under RFD 005's overlap rule across buckets and bucketings and
-  whose key range and order range both intersect its own, ranges whose
-  ends touch included. A file whose order range is disjoint from those
-  of every such file, as an append of later rows is, needs no merge.
-  Where ranges intersect, the load reads only the order pages of the
-  other files that can hold the checked file's rows, judged by the key
-  pages each order page's rows span and by its checked column index. It
-  fetches them by GET under `full`, reads them from the ordered chunk
-  file under `disk`, and fetches them with the key pages they span under
-  `bloom`; and it refuses a live pair present twice as `duplicate_rows`,
-  naming the later file in file order, as `duplicate_keys` does. The
-  load fetches the order chunks of a reused file whose deletes shrank
-  again under `full`, and its key chunks with them under `bloom`. A
-  refresh that appends later rows therefore reads only its new files,
-  and an append of rows inside an existing file's order range costs the
-  order pages those rows fall among.
+  superset of those the previous generation applied (RFD 021). It meets
+  another file, new or reused, when the two can share a key under RFD
+  005's overlap rule across buckets and bucketings and their key ranges
+  and order ranges both intersect, ranges whose ends touch included. A
+  checked file that meets no other, as an append of later rows does,
+  needs no merge and is read no further. In each overlap group that
+  holds a checked file meeting another, the load runs one k-way merge by
+  key and order value over every such checked file, read whole, and over
+  only the order pages of the group's other files that can hold a
+  checked file's rows, judged by the key pages each order page's rows
+  span and by its checked column index, each page read once. A checked
+  file is read again for the merge: its order chunks by GET under
+  `full`, one GET per row group, its key chunks with them under `bloom`,
+  and its chunk file under `disk`. The other files' order pages are
+  fetched by GET under `full`, read from the ordered chunk file under
+  `disk`, and fetched with the key pages they span under `bloom`. The
+  load refuses a live pair present twice as `duplicate_rows`, naming the
+  later file in file order, as `duplicate_keys` does. A refresh that
+  appends later rows therefore reads only its new files, and an append
+  of rows inside an existing file's order range costs the new file's
+  order chunks again and the order pages those rows fall among.
 - **Cost.** Per file that holds the key, a Scan finds the run, then
   reads the order column and each requested column over the run's rows,
   in one round across all files:
@@ -205,7 +208,8 @@ direction under a limit and optional bounds on the order value.
   full limit over many columns uses Scan. `server.scan_deadline`, 5 s by
   default, bounds one Scan and each span GET, and
   `server.multi_scan_deadline`, 15 s by default, one MultiScan.
-  `server.max_in_flight` counts every call.
+  `server.max_in_flight` counts every Get, MultiGet, Scan, and MultiScan,
+  and TableInfo takes none of its slots.
 - **Levels and findings.** RFD 020 (Lookup levels) applies, read for a
   Scan of one key. When no two files in a bucket have key ranges that
   intersect, ends included, every Scan reads one file, and the table can
@@ -242,7 +246,9 @@ direction under a limit and optional bounds on the order value.
 - **Metrics.** `icetray_scans_total` by table and result (`rows`,
   `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
   histograms, and `icetray_scan_seconds`, cold and warm. A Scan is cold
-  when any page it reads came from object storage.
+  when an order or value page it reads, or such a column's dictionary
+  page, came from object storage, as a Get's cold hit counts its value
+  pages (RFD 022); its key-page GETs under `bloom` leave it warm.
   `icetray_value_page_gets_total` counts the order column's GETs under
   its column name. `icetray_table_gets_per_scan` predicts a cold Scan at
   `max_scan_rows` of one key held in one file and one row group.

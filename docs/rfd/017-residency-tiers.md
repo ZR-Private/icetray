@@ -36,6 +36,11 @@
 > level carries a format marker and is emptied when another minor
 > release wrote it.
 
+> Updated 2026-10-14: an ordered table's chunk file holds its key
+> chunks, order chunks, and per-file order facts, and every chunk file
+> is named by the rules it was verified under; a run is found from the
+> fences in every tier, with key-page GETs under `bloom`. See RFD 025.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -103,12 +108,17 @@ budget, set per table, turns a `full` load that would exceed it into a
 refusal that carries the bytes needed and the budget, before anything
 expensive is fetched.
 
-The disk tier's chunk files are named by the data file they hold and carry
-its identity (path, size, footer digest). Each file also stores what
+The disk tier's chunk files are named by the data file they hold and the
+rules it was verified under, the key-value rules or the ordered rules
+with the order column's field id (RFD 025 (Ordered rows per key)), and
+carry its identity (path, size, footer digest). Each file also stores what
 verifying the data file's keys established (the fences, each row group's
-first and last key, the longest key), the key type and the version of the
-verifier's rules it was established under, and a crc32c of everything
-after its header. A data file is immutable, so a replica that restarts
+first and last key, the longest key), the key type, those rules, and the
+version of the verifier's rules it was established under, and a crc32c of
+everything after its header. An ordered table's chunk file holds its key
+chunks, its order chunks, and the file's order facts, so entries that
+verify one data file under different rules each keep a chunk file of
+their own. A data file is immutable, so a replica that restarts
 reuses every chunk file already on its disk whose identity, verification
 context, and checksum match. It does so without fetching the chunks again
 or decoding a key, and checking the checksum is one sequential local read

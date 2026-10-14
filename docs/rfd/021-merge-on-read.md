@@ -14,6 +14,11 @@
 > the lookup names, and deletes are checked once per row, whatever the
 > columns. See RFD 022.
 
+> Updated 2026-10-14: in an ordered table a key and order value appear
+> together at most once within a data file and among live rows, a reused
+> file whose deletes shrank is checked again, and a Scan counts a run's
+> live rows against the resident deleted rows. See RFD 025.
+
 ## Problem
 
 RFD 009 (Writes between builds) refuses every snapshot that carries a
@@ -199,7 +204,9 @@ footer with a reserved flag set is refused before its payload is parsed.
 A key appears at most once within a data file, before deletes, as today.
 Across files, the duplicate check of RFD 005 applies to live rows: an
 updated key whose older row is deleted is not a duplicate, and two live
-copies are refused as `duplicate_keys`.
+copies are refused as `duplicate_keys`. In an ordered table the same
+rules hold for a key and order value together (RFD 025 (Ordered rows per
+key)).
 
 A lookup finds the key's row in a candidate file exactly as RFD 006
 (Lookup hot path) describes, then checks that file's bitmap before it

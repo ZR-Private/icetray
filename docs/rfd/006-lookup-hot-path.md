@@ -8,6 +8,11 @@
 > walks each such value's top-level fields after decoding it, linear in
 > the value's bytes, and returns the fields named. See RFD 024.
 
+> Updated 2026-10-14: a Scan of an ordered table finds the key's run
+> by decoding at most two key pages per row group it spans, then reads
+> the order column and each requested column over the run's rows, one
+> GET per contiguous span of uncached pages, in one round. See RFD 025.
+
 ## Problem
 
 RFD 004 (Resident key-chunk index) settles what stays in memory for each

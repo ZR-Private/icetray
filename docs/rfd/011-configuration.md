@@ -20,6 +20,12 @@
 > Updated 2026-10-13: a file of another format version is treated as
 > absent and never converted. See RFD 017.
 
+> Updated 2026-10-14: a table entry that sets `order_column` is an
+> ordered table and may set `max_scan_rows`; `server.multi_get_fan_out`
+> is renamed `server.batch_fan_out`, and the server adds
+> `max_multi_scan_values`, `scan_deadline`, `multi_scan_deadline`, and
+> `scan_page_cache_bytes`. See RFD 025.
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -53,17 +59,19 @@ contract) says where the path comes from.
 
 The configuration covers the server, storage, and tables. For the server
 it holds the listen addresses, the interval at which RFD 005 (Generations
-and refresh) polls the ref, the page cache budget, and the MultiGet
+and refresh) polls the ref, the page cache budget, the MultiGet
 limit `server.max_multi_get_values` of RFD 010 (Transport and client
-contract), which must be above zero. For storage it
+contract), which must be above zero, and the scan settings of RFD 025
+(Ordered rows per key). For storage it
 holds the endpoint and region, the prefix map for location rewriting, the
 hedging percentile, window, and ceiling of RFD 013 (Tail latency), the
 static keys RFD 003 (One storage stack) lets configuration supply, and the
 optional local directory of RFD 012 (Deployment contract). Tables are a
 list of at least one, and each entry has a name, a source, a ref, a key
 column, `value_columns`, `lookups` and `strict` (whose meanings are RFD
-020 (Lookup levels)), and the `residency` and resident-bytes budget of RFD
-017 (Residency tiers). `value_columns` is a required list of the columns
+020 (Lookup levels)), the `residency` and resident-bytes budget of RFD
+017 (Residency tiers), and for an ordered table `order_column` and
+`max_scan_rows` (RFD 025). `value_columns` is a required list of the columns
 the table serves (RFD 022 (Value columns)). It may be empty, for a
 table that answers only whether a key is present. Each entry is a
 column's name, or a table of its `name` and its `format`, `opaque` by
