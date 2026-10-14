@@ -540,7 +540,7 @@ impl PageCache {
                         permit: issue.permit().await,
                         counted: issue.counted.cloned(),
                     };
-                    let outcome = match run_of.run(fetched).await {
+                    let outcome = match run_of.run(fetched, std::convert::identity).await {
                         Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
                         Err(failed) => Err(failed),
                     };
@@ -1096,7 +1096,14 @@ impl Run {
     /// `fut` is dropped when it passes, measured from the start, and the
     /// run fails as `FetchFailed::Deadline`. The permit is held until the
     /// run ends either way.
-    async fn fetch<Fut>(self, fut: Fut) -> std::result::Result<PageValue, FetchFailed>
+    ///
+    /// A plain `fn` returning `run`'s future: foyer stores this future
+    /// three times per page fetched, and an `async fn` around `run` would
+    /// hold a further copy of `fut` in its own state.
+    fn fetch<Fut>(
+        self,
+        fut: Fut,
+    ) -> impl Future<Output = std::result::Result<PageValue, FetchFailed>>
     where
         Fut: Future<Output = Result<Bytes>>,
     {
@@ -1104,14 +1111,17 @@ impl Run {
         // slice of a larger buffer, such as the HTTP connection's read
         // buffer, which the entry would keep alive while `weigh` charges
         // only the slice.
-        self.run(fut)
-            .await
-            .map(|page| PageValue(Bytes::copy_from_slice(&page)))
+        self.run(fut, |page| PageValue(Bytes::copy_from_slice(&page)))
     }
 
-    /// `fetch`'s run, the bytes as `fut` returned them: counted, bounded by
-    /// the deadline, and holding the permit until it ends.
-    async fn run<Fut>(self, fut: Fut) -> std::result::Result<Bytes, FetchFailed>
+    /// `fetch`'s run, the bytes as `fut` returned them passed through
+    /// `finish`: counted, bounded by the deadline, and holding the permit
+    /// until it ends.
+    async fn run<Fut, T>(
+        self,
+        fut: Fut,
+        finish: impl FnOnce(Bytes) -> T,
+    ) -> std::result::Result<T, FetchFailed>
     where
         Fut: Future<Output = Result<Bytes>>,
     {
@@ -1132,7 +1142,9 @@ impl Run {
                 .await
                 .map_err(|_elapsed| FetchFailed::Deadline { page, after })?,
         };
-        fetched.map_err(|error| FetchFailed::Failed(Arc::new(error)))
+        fetched
+            .map(finish)
+            .map_err(|error| FetchFailed::Failed(Arc::new(error)))
     }
 }
 
@@ -1217,12 +1229,38 @@ mod tests {
     /// one byte short of its length prefix.
     const ONE_ID_BYTE_SHORT: usize = OFFSET_BYTES + 1;
 
+    /// The bytes a padded fetch future carries: enough that one copy of it
+    /// outweighs every other field of the futures that hold it.
+    const PADDED_FETCH_BYTES: usize = 4_096;
+    /// The copies of the caller's fetch future that `Run::fetch`'s future
+    /// holds: the one `run` is given and the one it awaits under the
+    /// deadline.
+    const FETCH_COPIES: usize = 2;
+
     fn key(offset: u64) -> (Arc<str>, u64) {
         (Arc::from(FILE_ID), offset)
     }
 
     fn page_bytes(page: &[u8]) -> u64 {
         count(page.len())
+    }
+
+    /// A fetch whose future holds `PADDED_FETCH_BYTES` bytes, so its size
+    /// shows in the size of a future that holds it.
+    fn padded() -> impl Future<Output = Result<Bytes>> + Send + 'static {
+        let pad = [0_u8; PADDED_FETCH_BYTES];
+        async move { Ok(Bytes::copy_from_slice(&pad)) }
+    }
+
+    /// A run with a deadline, its fetch never started.
+    fn deadline_run() -> Run {
+        Run {
+            page: PageKey(Arc::from(FILE_ID), FIRST_OFFSET),
+            fetches: Arc::new(Fetches::new(CacheName::Lookup)),
+            deadline: Some(FETCH_DEADLINE),
+            permit: None,
+            counted: None,
+        }
     }
 
     /// A fetch whose future counts its runs in `runs` and answers `page`.
@@ -1873,6 +1911,21 @@ mod tests {
             cache.fetches(),
             fetches,
             "every page is served alone or again"
+        );
+    }
+
+    /// `Run::fetch`'s future holds `FETCH_COPIES` copies of the caller's
+    /// fetch future and no more: foyer stores the run's future three times
+    /// for each page a lookup fetches, so each further copy adds three
+    /// times the fetch future's size to every cold page fetch.
+    #[test]
+    fn test_fetch_future_holds_two_copies_of_the_callers_fetch() {
+        let fetch = size_of_val(&padded());
+        let run = size_of_val(&deadline_run().fetch(padded()));
+        assert!(fetch >= PADDED_FETCH_BYTES, "{fetch} bytes");
+        assert!(
+            run < (FETCH_COPIES + 1) * fetch,
+            "{run} bytes over a fetch of {fetch}"
         );
     }
 

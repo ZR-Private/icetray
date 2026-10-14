@@ -492,14 +492,16 @@ impl Storage {
     /// window with its elapsed time, so the ceiling counts every hedge
     /// spent; that includes a read dropped after its delay passed
     /// (`WindowSample`).
-    /// One lookup GET, plus one more when a hedge is issued.
-    pub(crate) async fn read_range_hedged(
-        &self,
-        l: &Located,
+    /// One lookup GET, plus one more when a hedge is issued. A plain `fn`
+    /// returning `read_span_hedged`'s future: every lookup future lays out
+    /// two of these, and an `async fn` around it would add its own state.
+    pub(crate) fn read_range_hedged<'a>(
+        &'a self,
+        l: &'a Located,
         range: Range<u64>,
-        window: &HedgeWindow,
-    ) -> Result<Bytes> {
-        self.read_span_hedged(l, range, 1, window).await
+        window: &'a HedgeWindow,
+    ) -> impl Future<Output = Result<Bytes>> + 'a {
+        self.read_span_hedged(l, range, 1, window)
     }
 
     /// `read_range_hedged` of a range holding `pages` pages, a Scan's span
@@ -2691,6 +2693,23 @@ mod tests {
             window.delay().is_none(),
             "the failed attempt entered the window as hedged"
         );
+    }
+
+    /// The pages of a plain lookup GET, which `read_range_hedged` reads
+    /// through `read_span_hedged`.
+    const ONE_PAGE: u32 = 1;
+
+    /// `read_range_hedged`'s future is no larger than `read_span_hedged`'s:
+    /// every lookup future lays out two of them, warm hits included, and a
+    /// batched key's future is stored three times over, so state a wrapper
+    /// keeps of its own is paid on every key-value call.
+    #[tokio::test]
+    async fn test_read_range_hedged_future_is_no_larger_than_read_span_hedged() {
+        let (storage, located) = storage_with(Arc::new(InMemory::new())).await;
+        let window = HedgeWindow::new(&hedge_config(MEDIAN, TWO, HALF));
+        let range = size_of_val(&storage.read_range_hedged(&located, INNER_RANGE, &window));
+        let span = size_of_val(&storage.read_span_hedged(&located, INNER_RANGE, ONE_PAGE, &window));
+        assert!(range <= span, "{range} bytes against {span}");
     }
 
     /// The pages of the span the span-window tests read.
