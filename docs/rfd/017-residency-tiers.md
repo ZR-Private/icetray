@@ -113,9 +113,9 @@ rules it was verified under, the key-value rules or the ordered rules
 with the order column's field id (RFD 025 (Ordered rows per key)), and
 carry its identity (path, size, footer digest). Each file also stores what
 verifying the data file's keys established (the fences, each row group's
-first and last key, the longest key), the key type, those rules, and the
-version of the verifier's rules it was established under, and a crc32c of
-everything after its header. An ordered table's chunk file holds its key
+first and last key, the longest key), the key type, the rule set it was
+verified under, and the verifier's version, and a crc32c of everything
+after its header. An ordered table's chunk file holds its key
 chunks, its order chunks, and the file's order facts, so entries that
 verify one data file under different rules each keep a chunk file of
 their own. A data file is immutable, so a replica that restarts
@@ -208,14 +208,14 @@ the file's access-time update. Under `relatime` that update comes on the
 first read after the file is written and at most once a day after that,
 and a directory mounted `noatime` makes none.
 
-The disk tier holds one open file descriptor per data file for the life of
-its generation, and twice that while a refresh that rewrote the table
-loads beside the serving generation. The page cache's disk level holds one
+The disk tier holds one open file descriptor per chunk file, one per data
+file and rule set, for the life of its generation, and twice that while
+a refresh that rewrote the table loads beside the serving generation. The page cache's disk level holds one
 descriptor per 4 MiB block for the life of the process, 2,048 for an 8 GiB
 level, and a load keeps up to 128 reads in flight per worker thread, at
 most 1,024, each a descriptor. Every configured table loads at once at
 start, and each load keeps its own reads in flight. A deployment
-therefore sizes its descriptor limit to at least twice its disk-tier data
+therefore sizes its descriptor limit to at least twice its disk-tier chunk
 files, plus `page_cache_disk_bytes` / 4 MiB, plus one load's concurrent
 reads, up to 1,024, for each configured table, plus a headroom for
 sockets and the one chunk file that retention opens at a time. The disk
@@ -295,7 +295,10 @@ generation would write. A file's footer gives what the file would write,
 except for its stored verification result, a key per key page. That part
 is exact for keys of one width (longs, uuids, fixed-width binary) and
 estimated for string and binary keys the same way the fences' memory is,
-and it is a small fraction of the chunks beside it. Several disk tables
+and it is a small fraction of the chunks beside it. An ordered chunk
+file is reserved from the footer's sizes too, its order chunks exactly
+and its order facts estimated, string and binary order values the same
+way as fences. Several disk tables
 load at once, so each load reserves what it would write from the check
 until its writes finish, and the check counts every other load's
 reservation too. Two loads that fit alone but not together cannot both
@@ -319,17 +322,20 @@ deleting the chunk files at once would make that build fetch and write
 them again.
 
 Chunk files that no serving generation references are deleted with every
-table's load lock held, taken in configuration order. A load in flight has
-written chunk files that its generation will reference once it swaps in,
-and a live set computed beside it would delete them. The tables a reload
-is loading count as live in the same way until it swaps them in or drops
-them (RFD 018 (Configuration reload)), and deletions run one at a time.
-The cost is that a slow table holds the deletion up, and with it the next
-refresh of every table whose lock the deletion already holds. A refresh
-gives its lock up once its deadline under RFD 013 (Tail latency) has
-passed, five minutes by default and thirty for a first load, so one slow
-table holds the others up at most that long. When several are slow, a
-table early in the order can wait one deadline for each slow table after
-it, since a table whose lock is not yet taken can start a refresh in the
-meantime. The cost is accepted, because a live set computed without the
-locks could miss a load in flight.
+table's load lock held, taken in configuration order. A chunk file is
+live when a serving generation references both its data file and the
+rule set it was verified under, so each one a live entry uses is kept. A
+load in flight has written chunk files that its generation will
+reference once it swaps in, and a live set computed beside it would
+delete them. The tables a reload is loading count as live in the same
+way until it swaps them in or drops them (RFD 018 (Configuration
+reload)), and deletions run one at a time. The cost is that a slow table
+holds the deletion up, and with it the next refresh of every table whose
+lock the deletion already holds. A refresh gives its lock up once its
+deadline under RFD 013 (Tail latency) has passed, five minutes by
+default and thirty for a first load, so one slow table holds the others
+up at most that long. When several are slow, a table early in the order
+can wait one deadline for each slow table after it, since a table whose
+lock is not yet taken can start a refresh in the meantime. The cost is
+accepted, because a live set computed without the locks could miss a
+load in flight.

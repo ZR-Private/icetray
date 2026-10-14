@@ -17,9 +17,9 @@
 
 > Updated 2026-10-14: an ordered table's levels are read for a Scan of
 > one key; `shared_edge_keys`, `dictionary_encoded_order`, and
-> `order_index_missing` cap it at `balanced`, and it publishes
-> `icetray_table_gets_per_scan` in place of the per-hit and per-miss
-> gauges. See RFD 025.
+> `order_index_missing` cap it at `balanced`, and icetray publishes
+> `icetray_table_gets_per_scan` for it in place of the per-hit and
+> per-miss gauges. See RFD 025.
 
 ## Problem
 
@@ -61,17 +61,22 @@ table:
 - `balanced`: a lookup still probes one file, with a fixed extra cost:
   extra GETs per hit, GETs on a miss at a filter's false-positive rate
   or for a deleted key (RFD 021), larger key pages, or device reads of key
-  chunks.
+  chunks. On an ordered table it also admits a Scan of an edge key shared
+  by files one snapshot added, as a compaction that rolls files by size
+  writes them, which reads every file that holds the key: that cost is
+  fixed by how those files were written, and no later commit grows it
+  (RFD 025 (Ordered rows per key)).
 - `permissive`: any snapshot icetray can serve correctly, including one
   where a lookup probes more than one file.
 
 The line between `balanced` and `permissive` is the one that matters for
 operations: costs within one file follow from how files are written,
-while extra files probed come from how the table is committed to and grow
-until a compaction removes them. The definitions above are the rule, and
-the doctor's findings apply it. Each finding that bears on cost caps the
-level, and a table's level is the lowest cap any of its files, buckets, or
-conditions sets:
+while extra files probed come from how the table is committed to and
+grow until a compaction removes them. Edge keys that one snapshot's
+files share stay on the `balanced` side, since one write fixed them. The
+definitions above are the rule, and the doctor's findings apply it. Each
+finding that bears on cost caps the level, and a table's level is the
+lowest cap any of its files, buckets, or conditions sets:
 
 | Cap | Finding or condition |
 |---|---|

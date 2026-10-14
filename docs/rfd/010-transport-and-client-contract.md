@@ -19,7 +19,10 @@
 > MultiScan, which take a direction, a limit, and optional exclusive
 > bounds as an `OrderValue` and return rows with their order values and
 > a `more` flag; TableInfo reports the order column, its type, and
-> `max_scan_rows`. See RFD 025.
+> `max_scan_rows`. A call of the wrong kind for the table, an unspecified
+> direction, a limit above `max_scan_rows`, a bound of the wrong variant,
+> or an `after` at or above `before` is `INVALID_ARGUMENT`, and a
+> MultiScan fails whole as a MultiGet does. See RFD 025.
 
 ## Problem
 
@@ -139,13 +142,18 @@ A MultiGet carries at most `server.max_multi_get_values` values, 1000 by
 default, counted as its keys times the columns it names, a presence-only
 call counting one per key. A larger batch is `INVALID_ARGUMENT` before any
 lookup runs, which bounds the value reads one call can ask for (RFD 013
-(Tail latency)). The
+(Tail latency)). A MultiScan carries at most
+`server.max_multi_scan_values` values, 4,000 by default, counted as its
+keys times its limit times one more than the columns it names, a limit
+of 0 counting as the table's `max_scan_rows`, and a larger call is
+`INVALID_ARGUMENT` before any key is read (RFD 025). The MultiGet's
 1000 is a single-pod guess. How lookups behave under concurrent load,
 MultiGet fan-out included, is an open question
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
 and its answer may move the limit.
 
-A whole-batch failure discards the keys that were answered, which costs the
-fan-out pattern in archetype A a second round of GETs for keys it already
-had. If failures turn out to be common, a later version adds a separate
-call with per-entry outcomes, and the shape of this one stays as it is.
+A whole-batch failure, of a MultiGet or a MultiScan, discards the keys
+that were answered, which costs the fan-out pattern in archetype A a
+second round of GETs for keys it already had. If failures turn out to be
+common, a later version adds a separate call with per-entry outcomes,
+and the shape of this one stays as it is.
