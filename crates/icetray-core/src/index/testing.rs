@@ -154,7 +154,7 @@ pub(super) const ORDER_FIELD_ID: i32 = 3;
 /// What an ordered fixture's order column holds, a `None` a null, which
 /// makes the column nullable.
 #[derive(Clone)]
-pub(super) enum Orders {
+pub(crate) enum Orders {
     /// An `INT64` column, which a `long` order column serves.
     Long(Vec<Option<i64>>),
     /// A `BYTE_ARRAY` column without annotation, which a `string` or a
@@ -187,13 +187,13 @@ impl Orders {
 }
 
 /// `values` as a long order column.
-pub(super) fn long_orders(values: &[i64]) -> Orders {
+pub(crate) fn long_orders(values: &[i64]) -> Orders {
     Orders::Long(values.iter().copied().map(Some).collect())
 }
 
 /// The contract layout of `key_type` served as an ordered table whose
 /// order column is `ORDER_COLUMN` of `order_type`.
-pub(super) fn ordered_layout(key_type: KeyType, order_type: OrderType) -> TableLayout {
+pub(crate) fn ordered_layout(key_type: KeyType, order_type: OrderType) -> TableLayout {
     TableLayout {
         order: Some(OrderColumnLayout {
             name: ORDER_COLUMN.to_string(),
@@ -215,11 +215,11 @@ pub(super) enum ValueColumn {
 
 /// The writer's layout knobs; `contract` is RFD 002's shape.
 #[derive(Clone, Copy)]
-pub(super) struct Layout {
-    pub(super) page_rows: usize,
-    pub(super) row_group_rows: usize,
+pub(crate) struct Layout {
+    pub(crate) page_rows: usize,
+    pub(crate) row_group_rows: usize,
     pub(super) page_bytes: usize,
-    pub(super) write_batch: usize,
+    pub(crate) write_batch: usize,
     pub(super) dictionary: Dictionary,
     pub(super) statistics: EnabledStatistics,
     pub(super) truncate: Option<usize>,
@@ -280,7 +280,7 @@ impl Layout {
 /// lays it out. A `None` key or value is a null, and makes its column
 /// nullable; `nullable_key` makes the key column nullable without one, as
 /// an Iceberg column not declared `NOT NULL` is.
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     key_column: KeyColumn,
     pub(super) nullable_key: bool,
     pub(super) value_column: ValueColumn,
@@ -293,7 +293,7 @@ pub(super) struct Fixture {
     /// The order column of an ordered fixture, as many values as keys;
     /// `None` writes none.
     pub(super) orders: Option<Orders>,
-    pub(super) layout: Layout,
+    pub(crate) layout: Layout,
 }
 
 impl Fixture {
@@ -321,7 +321,7 @@ impl Fixture {
     }
 
     /// `with_keys` over long keys `keys` with `orders` as the order column.
-    pub(super) fn ordered(keys: &[i64], orders: Orders) -> Self {
+    pub(crate) fn ordered(keys: &[i64], orders: Orders) -> Self {
         Self {
             orders: Some(orders),
             ..Self::with_keys(KeyColumn::Int64, longs(keys))
@@ -395,13 +395,13 @@ fn value_array(column: ValueColumn, values: &[Option<Vec<u8>>]) -> ArrayRef {
 
 /// A fixture file in an in-memory store behind a fresh storage, with a
 /// handle over it and a fresh hedge window.
-pub(super) struct Opened {
+pub(crate) struct Opened {
     storage: Arc<Storage>,
-    pub(super) handle: Arc<FileHandle>,
+    pub(crate) handle: Arc<FileHandle>,
     pub(super) file: Bytes,
 }
 
-pub(super) async fn store(fixture: &Fixture) -> Opened {
+pub(crate) async fn store(fixture: &Fixture) -> Opened {
     store_file(fixture.write()).await
 }
 
@@ -444,7 +444,7 @@ async fn store_file_hedged_by(file: Bytes, window: Arc<HedgeWindow>) -> Opened {
 }
 
 impl Opened {
-    pub(super) fn stats(&self) -> Arc<IoStats> {
+    pub(crate) fn stats(&self) -> Arc<IoStats> {
         self.storage.stats()
     }
 
@@ -459,7 +459,7 @@ impl Opened {
     }
 
     /// A build under `layout`.
-    pub(super) async fn build_under(
+    pub(crate) async fn build_under(
         &self,
         layout: &TableLayout,
         residency: Residency,
@@ -471,7 +471,7 @@ impl Opened {
     /// A build of long keys under `ordered_layout` with an order column of
     /// `order_type`, in `residency`, with a local directory under `dir` for
     /// the Disk tier and none for the others.
-    pub(super) async fn build_ordered_in(
+    pub(crate) async fn build_ordered_in(
         &self,
         order_type: OrderType,
         residency: Residency,

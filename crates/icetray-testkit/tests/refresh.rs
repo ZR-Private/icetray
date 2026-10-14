@@ -818,6 +818,43 @@ async fn test_refresh_reads_the_order_dictionary_with_the_pages_late_rows_fall_a
     Ok(())
 }
 
+/// Late rows of `AN_ID` that fall on one order page of the file holding
+/// it: both between its second row and its third, which share a page.
+fn one_page_lates() -> [i64; 2] {
+    [order_of(1) + 1, order_of(1) + 2]
+}
+
+/// The GETs of the one order page late rows fall on under `full`, which
+/// holds the key chunks and writes the order column without a dictionary.
+const ONE_ORDER_PAGE: u64 = 1;
+
+/// Two new files of one refresh whose rows fall on the same order page of
+/// a file the table held read that page once (RFD 025, Refresh): under
+/// `full` one GET; under `bloom` the page and the key pages it spans, as
+/// many as one late row costs; under `disk` none.
+#[tokio::test]
+async fn test_late_rows_read_each_touched_old_page_once() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let spec = ordered_spec(&format!("ord_late_once_{at}"), long_runs);
+        let lates = one_page_lates();
+        let one = refresh_with_late_rows(spec, residency, &lates[..1]).await?;
+        let spec = ordered_spec(&format!("ord_late_twice_{at}"), long_runs);
+        let two = refresh_with_late_rows(spec, residency, &lates).await?;
+        assert_eq!(two.other_gets, 0, "{residency:?}");
+        match residency {
+            Residency::Full => assert_eq!(two.holding_gets, ONE_ORDER_PAGE),
+            Residency::Bloom => assert!(
+                two.holding_gets > ONE_ORDER_PAGE && two.holding_gets == one.holding_gets,
+                "{residency:?}: {} pages for two late files, {} for one",
+                two.holding_gets,
+                one.holding_gets
+            ),
+            Residency::Disk => assert_eq!(two.holding_gets, 0),
+        }
+    }
+    Ok(())
+}
+
 /// The order pages a run of `LONG_RUN_ROWS` rows fills, at least.
 fn long_run_pages() -> u64 {
     approx::count(
@@ -839,6 +876,16 @@ struct LateRead {
 /// its second and third appended and the table refreshed; what the refresh
 /// read of the files it held before.
 async fn refresh_with_a_late_row(spec: FixtureSpec, residency: Residency) -> Result<LateRead> {
+    refresh_with_late_rows(spec, residency, &[order_of(1) + 1]).await
+}
+
+/// `refresh_with_a_late_row` with a row of `AN_ID` at each raw order value
+/// of `lates`, each appended as a file of its own before one refresh.
+async fn refresh_with_late_rows(
+    spec: FixtureSpec,
+    residency: Residency,
+    lates: &[i64],
+) -> Result<LateRead> {
     let (_dir, catalog) = local_catalog().await?;
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
@@ -852,9 +899,11 @@ async fn refresh_with_a_late_row(spec: FixtureSpec, residency: Residency) -> Res
         .clone();
     assert!(before.iter().any(|(path, _)| *path == holding));
     let local_reads = served.storage.stats().local_reads();
-    fixture
-        .append_ordered(catalog.as_ref(), &[(AN_ID, order_of(1) + 1)], "late")
-        .await?;
+    for (at, &late) in lates.iter().enumerate() {
+        fixture
+            .append_ordered(catalog.as_ref(), &[(AN_ID, late)], &format!("late{at}"))
+            .await?;
+    }
     fixture.write_hint().await?;
     assert!(served.table.refresh().await?, "{residency:?}");
     assert_eq!(served.current().overlap_groups_verified(), 1);

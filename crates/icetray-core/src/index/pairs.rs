@@ -26,6 +26,11 @@ use crate::key::Key;
 use crate::order::OrderValue;
 use crate::parquet_io::Segments;
 
+/// A closed key range and a closed order range: the rows a file a load
+/// checks can hold, which the order pages of another file are judged
+/// against (`FileIndex::order_pages_meeting`).
+pub(crate) type Bounds<'a> = ((&'a Key, &'a Key), (&'a OrderValue, &'a OrderValue));
+
 /// Rows of one row group whose pairs decode together: one order page, or
 /// a window of a row group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,27 +132,31 @@ impl FileIndex {
             .map_or(&self.key_range.1, |group| &group.last)
     }
 
-    /// The order pages, in file order, that can hold a row whose key lies
-    /// in `keys` and whose order value lies in `orders`, both closed: those
+    /// The order pages, in file order, that can hold a row within one of
+    /// `bounds`, each a closed key range and a closed order range: those
     /// whose rows' keys, bounded below by the first key of the key page
     /// holding the page's first row and above by the first key of the key
     /// page after the one holding its last row (the row group's last key
-    /// for its last key page), meet `keys`, and whose column index entry
-    /// meets `orders`. A file without a column index for a row group's
-    /// order chunk keeps every page of it whose keys meet. No I/O.
-    pub(crate) fn order_pages_within(
-        &self,
-        keys: (&Key, &Key),
-        orders: (&OrderValue, &OrderValue),
-    ) -> Vec<RowSpan> {
+    /// for its last key page), meet the bound's keys, and whose column
+    /// index entry meets its order values. A file without a column index
+    /// for a row group's order chunk keeps every page of it whose keys
+    /// meet. With them, per bound, whether a page kept meets it. No I/O.
+    pub(crate) fn order_pages_meeting(&self, bounds: &[Bounds<'_>]) -> (Vec<RowSpan>, Vec<bool>) {
         let order = self.order_leaf_of();
         let mut spans = Vec::new();
+        let mut met = vec![false; bounds.len()];
         for (row_group, fences) in self.fences.iter().enumerate() {
             let Some(first) = fences.first() else {
                 continue;
             };
             let last = self.group_last(row_group);
-            if !(first <= keys.1 && keys.0 <= last) {
+            let in_group: Vec<usize> = (0..bounds.len())
+                .filter(|&at| {
+                    let (keys, _) = bounds[at];
+                    first <= keys.1 && keys.0 <= last
+                })
+                .collect();
+            if in_group.is_empty() {
                 continue;
             }
             let key_chunk = self.key_column().group(row_group);
@@ -162,16 +171,24 @@ impl FileIndex {
                 let high = fences
                     .get(key_chunk.page_holding(row_index(rows.end - 1)) + 1)
                     .unwrap_or(last);
-                let keys_meet = low <= keys.1 && keys.0 <= high;
-                if keys_meet && index.is_none_or(|entry| page_meets(entry, page, orders)) {
+                let mut kept = false;
+                for &at in &in_group {
+                    let (keys, orders) = bounds[at];
+                    let keys_meet = low <= keys.1 && keys.0 <= high;
+                    if keys_meet && index.is_none_or(|entry| page_meets(entry, page, orders)) {
+                        met[at] = true;
+                        kept = true;
+                    }
+                }
+                if kept {
                     spans.push(RowSpan { row_group, rows });
                 }
             }
         }
-        spans
+        (spans, met)
     }
 
-    /// The bytes `spans`, order pages `order_pages_within` chose, decode
+    /// The bytes `spans`, order pages `order_pages_meeting` chose, decode
     /// from: each page and its chunk's dictionary page, with the key pages
     /// its rows span. Full fetches the order pages by load GET, one per
     /// page and dictionary page, and holds its key chunks; Disk reads both

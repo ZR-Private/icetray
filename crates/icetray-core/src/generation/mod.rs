@@ -146,9 +146,8 @@ pub struct Generation {
     /// Per bucket a member of an overlap group is in, how many files a
     /// lookup there may probe (`widest_per_bucket`).
     overlapping: BTreeMap<u32, usize>,
-    /// Overlap groups this load merged to prove key uniqueness; on an
-    /// ordered table, the files it checked that merged with another to
-    /// prove pair uniqueness (`ordered::verify_rows`).
+    /// Overlap groups this load merged to prove key uniqueness, or on an
+    /// ordered table pair uniqueness (`ordered::verify_rows`).
     verified_groups: usize,
     /// Per file of `files`, the rows its deletes remove (RFD 021); `None`
     /// where no delete applies.
@@ -268,8 +267,9 @@ impl Generation {
     /// files where the snapshot changed it: a key-value table merges every
     /// group that a non-reused file belongs to, or a member whose deletes
     /// shrank, refusing a live key two files share (`verify_groups`); an
-    /// ordered table checks each such file against the files that can
-    /// share a live pair with it, refusing one (`ordered::verify_rows`). A
+    /// ordered table merges, once per such group, those files with the
+    /// order pages of the group's other files that can share a live pair
+    /// with them, refusing one (`ordered::verify_rows`). A
     /// row a file's deletes remove is not live (RFD 021). A data file with
     /// deletes whose manifest records another row count than its footer is
     /// `DeleteFault::RecordCountMismatch`, since its deletes' positions
@@ -305,7 +305,17 @@ impl Generation {
             overlapping: &overlapping,
         });
         let verified_groups = match layout.order {
-            Some(_) => ordered::verify_rows(table, &members, &files, &groups, &deletes).await?,
+            Some(_) => {
+                let check =
+                    ordered::verify_rows(table, &members, &files, &groups, &deletes).await?;
+                tracing::debug!(
+                    table,
+                    merges = check.merges,
+                    compared = check.compared,
+                    "checked ordered rows across files"
+                );
+                check.merges
+            }
             None => verify_groups(table, &members, &files, groups, &deletes).await?,
         };
         let records = files.iter().map(|file| file.entry.records).sum();
@@ -486,9 +496,9 @@ impl Generation {
 
     /// Overlap groups this load merged to prove key uniqueness: the groups
     /// that gained a file since `previous`, or every group on a first load.
-    /// On an ordered table, the files this load checked, new or reused
-    /// with deletes that shrank, that merged with another (RFD 025,
-    /// Refresh).
+    /// On an ordered table, the groups holding a file this load checked,
+    /// new or reused with deletes that shrank, whose check merged it with
+    /// another (RFD 025, Refresh).
     pub fn overlap_groups_verified(&self) -> usize {
         self.verified_groups
     }
@@ -865,9 +875,9 @@ impl Planned {
     /// (`deletes::load`), the first failure of either stopping the other,
     /// then assembles the generation: files sorted, overlap groups found,
     /// and every group that gained a file or whose deletes shrank merged to
-    /// refuse a duplicate live key, or on an ordered table every such file
-    /// checked to refuse a repeated live pair. `Err` leaves nothing behind; the caller
-    /// keeps serving the previous generation.
+    /// refuse a duplicate live key, or on an ordered table to refuse a
+    /// repeated live pair. `Err` leaves nothing behind; the caller keeps
+    /// serving the previous generation.
     pub(crate) async fn build(self, local: Option<&Arc<LocalDir>>) -> Result<Generation> {
         let table = self.config.name.as_str();
         let reservation = check_budget(
