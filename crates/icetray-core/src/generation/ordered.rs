@@ -68,41 +68,76 @@ pub(super) fn checked(members: &[Member]) -> Vec<usize> {
         .collect()
 }
 
-/// For the file at `at`, the files it is checked against: every other that
-/// can share a key with it (`buckets_may_share_a_key`) and whose key range
-/// and order range both meet its own, ends included; ascending.
-pub(super) fn counterparts(spans: &[OrderedSpan<'_>], at: usize) -> Vec<usize> {
+/// Whether the file `theirs` spans is checked against the file `ours`
+/// spans: one key can fall in both their buckets (`buckets_may_share_a_key`)
+/// and their key ranges and order ranges both meet, ends included.
+fn is_counterpart(ours: OrderedSpan<'_>, theirs: OrderedSpan<'_>) -> bool {
+    buckets_may_share_a_key(
+        (ours.bucketing, ours.bucket),
+        (theirs.bucketing, theirs.bucket),
+    ) && meet(ours.keys, theirs.keys)
+        && meet(ours.orders, theirs.orders)
+}
+
+/// For the file at `at`, the files it is checked against
+/// (`is_counterpart`), ascending, found among `group`: the members of its
+/// overlap group (`overlap_groups`), ascending by least order value. The
+/// groups link every two files whose key ranges meet and whose buckets one
+/// key can fall in, so every counterpart is in the file's group; the scan
+/// stops at the first member whose least order value is above the file's
+/// greatest, which no later member's order range can meet.
+pub(super) fn counterparts(spans: &[OrderedSpan<'_>], at: usize, group: &[usize]) -> Vec<usize> {
     let ours = spans[at];
-    spans
+    let mut found: Vec<usize> = group
+        .iter()
+        .copied()
+        .take_while(|&other| spans[other].orders.0 <= ours.orders.1)
+        .filter(|&other| other != at && is_counterpart(ours, spans[other]))
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// `groups`, overlap groups of the files `spans` describe, each sorted
+/// ascending by least order value, and per file the group it is in;
+/// `None` for a file in no group, which has no counterpart.
+fn by_least_order(
+    spans: &[OrderedSpan<'_>],
+    groups: &[Vec<usize>],
+) -> (Vec<Vec<usize>>, Vec<Option<usize>>) {
+    let mut group_of = vec![None; spans.len()];
+    let sorted = groups
         .iter()
         .enumerate()
-        .filter(|&(other, theirs)| {
-            other != at
-                && buckets_may_share_a_key(
-                    (ours.bucketing, ours.bucket),
-                    (theirs.bucketing, theirs.bucket),
-                )
-                && meet(ours.keys, theirs.keys)
-                && meet(ours.orders, theirs.orders)
+        .map(|(index, group)| {
+            for &at in group {
+                group_of[at] = Some(index);
+            }
+            let mut sorted = group.clone();
+            sorted.sort_by(|&a, &b| spans[a].orders.0.cmp(spans[b].orders.0));
+            sorted
         })
-        .map(|(other, _)| other)
-        .collect()
+        .collect();
+    (sorted, group_of)
 }
 
 /// Checks every file of `files`, sorted as `members` is, that `checked`
-/// names against its counterparts, one checked file at a time, and refuses
-/// the first live pair two files share; `deletes` are the rows each file's
-/// deletes remove. Two checked files that are each other's counterparts
-/// are merged once, from the earlier: a check reads every row of its file,
-/// so it finds every pair the two share. How many checked files were
-/// merged with a counterpart.
+/// names against its counterparts within its overlap group of `groups`
+/// (`overlap_groups`), one checked file at a time, and refuses the first
+/// live pair two files share; `deletes` are the rows each file's deletes
+/// remove. Two checked files that are each other's counterparts are merged
+/// once, from the earlier: a check reads every row of its file, so it finds
+/// every pair the two share. How many checked files were merged with a
+/// counterpart.
 pub(super) async fn verify_rows(
     table: &str,
     members: &[Member],
     files: &[Arc<LoadedFile>],
+    groups: &[Vec<usize>],
     deletes: &Arc<[Option<Arc<FileDeletes>>]>,
 ) -> Result<usize> {
     let spans: Vec<OrderedSpan<'_>> = files.iter().map(|file| OrderedSpan::of(file)).collect();
+    let (groups, group_of) = by_least_order(&spans, groups);
     let checked = checked(members);
     let mut is_checked = vec![false; files.len()];
     for &at in &checked {
@@ -110,7 +145,10 @@ pub(super) async fn verify_rows(
     }
     let mut merged = 0;
     for &at in &checked {
-        let against: Vec<usize> = counterparts(&spans, at)
+        let Some(group) = group_of[at] else {
+            continue;
+        };
+        let against: Vec<usize> = counterparts(&spans, at, &groups[group])
             .into_iter()
             .filter(|&other| !is_checked[other] || other > at)
             .collect();
@@ -331,20 +369,24 @@ fn refuse_shared_pairs(
 #[cfg(test)]
 mod tests {
     use super::super::testing::bucketing;
+    use super::super::{Span, overlap_groups, routes};
     use super::*;
+    use crate::approx;
 
     /// Bucket counts of a table before and after a spec evolution: one key
     /// falls in buckets congruent modulo two under both.
     const TWO: u32 = 2;
     const FOUR: u32 = 4;
 
-    /// A span over the long keys `keys` and the long order values `orders`
-    /// under `place`, its bucketing's count and its bucket, or unbucketed.
-    fn span<'a>(
-        place: Option<(u32, u32)>,
-        keys: &'a (Key, Key),
-        orders: &'a (OrderValue, OrderValue),
-    ) -> OrderedSpan<'a> {
+    /// Where a file is filed: its bucketing's count and its bucket, or
+    /// unbucketed. Ordered as file order orders bucketings and buckets.
+    type Place = Option<(u32, u32)>;
+
+    /// One file of a fixture: its place, its key range, its order range.
+    type Described = (Place, (Key, Key), (OrderValue, OrderValue));
+
+    fn span(described: &Described) -> OrderedSpan<'_> {
+        let (place, keys, orders) = described;
         OrderedSpan {
             bucketing: place.map(|(count, _)| bucketing(count)),
             bucket: place.map_or(0, |(_, bucket)| bucket),
@@ -353,37 +395,133 @@ mod tests {
         }
     }
 
-    fn longs(low: i64, high: i64) -> (Key, Key) {
-        (Key::Long(low), Key::Long(high))
+    fn file(place: Place, keys: (i64, i64), orders: (i64, i64)) -> Described {
+        (
+            place,
+            (Key::Long(keys.0), Key::Long(keys.1)),
+            (OrderValue::Long(orders.0), OrderValue::Long(orders.1)),
+        )
     }
 
-    fn orders(low: i64, high: i64) -> (OrderValue, OrderValue) {
-        (OrderValue::Long(low), OrderValue::Long(high))
+    /// Every file's counterparts by a scan of every other file: the oracle
+    /// the search within overlap groups is checked against.
+    fn by_full_scan(spans: &[OrderedSpan<'_>]) -> Vec<Vec<usize>> {
+        (0..spans.len())
+            .map(|at| {
+                (0..spans.len())
+                    .filter(|&other| other != at && is_counterpart(spans[at], spans[other]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every file's counterparts as `verify_rows` finds them: within its
+    /// overlap group, the groups found over `spans`, which are in file
+    /// order, as `assemble` finds them; and how many groups there are.
+    fn by_group(spans: &[OrderedSpan<'_>]) -> (Vec<Vec<usize>>, usize) {
+        let swept: Vec<Span<'_>> = spans
+            .iter()
+            .map(|span| Span {
+                bucketing: span.bucketing,
+                bucket: span.bucket,
+                first: span.keys.0,
+                last: span.keys.1,
+            })
+            .collect();
+        let groups = overlap_groups(&swept, &routes(&swept));
+        let (groups, group_of) = by_least_order(spans, &groups);
+        let found = (0..spans.len())
+            .map(|at| {
+                group_of[at].map_or_else(Vec::new, |group| counterparts(spans, at, &groups[group]))
+            })
+            .collect();
+        (found, groups.len())
     }
 
     #[test]
     fn test_counterparts_meet_by_key_and_order_range_ends_included_in_buckets_that_share() {
-        let (keys, other_keys, apart_keys) = (longs(0, 10), longs(10, 20), longs(11, 20));
-        let (early, touching, later) = (orders(0, 5), orders(5, 9), orders(6, 9));
-        let spans = [
-            span(Some((TWO, 0)), &keys, &early),
-            span(Some((TWO, 0)), &other_keys, &touching),
-            span(Some((TWO, 0)), &keys, &later),
-            span(Some((TWO, 0)), &apart_keys, &early),
-            span(Some((TWO, 1)), &keys, &early),
-            span(None, &keys, &early),
-            span(Some((FOUR, 2)), &keys, &early),
-            span(Some((FOUR, 3)), &keys, &early),
+        let files = [
+            file(None, (0, 10), (0, 5)),
+            file(Some((TWO, 0)), (0, 10), (0, 5)),
+            file(Some((TWO, 0)), (0, 10), (6, 9)),
+            file(Some((TWO, 0)), (10, 20), (5, 9)),
+            file(Some((TWO, 0)), (11, 20), (0, 5)),
+            file(Some((TWO, 1)), (0, 10), (0, 5)),
+            file(Some((FOUR, 2)), (0, 10), (0, 5)),
+            file(Some((FOUR, 3)), (0, 10), (0, 5)),
         ];
+        let spans: Vec<OrderedSpan<'_>> = files.iter().map(span).collect();
+        let (found, _) = by_group(&spans);
+        assert_eq!(found, by_full_scan(&spans));
         assert_eq!(
-            counterparts(&spans, 0),
-            [1, 5, 6],
+            found[1],
+            [0, 3, 6],
             "ends that touch meet; an order range or key range apart, or a bucket no key shares, does not"
         );
         assert_eq!(
-            counterparts(&spans, 5),
-            [0, 1, 4, 6, 7],
+            found[0],
+            [1, 3, 5, 6, 7],
             "an unbucketed file shares every bucket"
         );
+    }
+
+    /// Files of a fixture spread over several groups.
+    const SPREAD_FILES: u64 = 120;
+
+    /// A multiplier and an increment of a linear congruential sequence,
+    /// which spreads the fixture's places and ranges without a seed.
+    const MIX: u64 = 6_364_136_223_846_793_005;
+    const STEP: u64 = 1_442_695_040_888_963_407;
+
+    /// The span of key and order values the spread fixture's ranges fall in,
+    /// and the widest range it draws.
+    const SPACE: u64 = 1_000;
+    const WIDEST: u64 = 60;
+
+    #[test]
+    fn test_counterparts_within_overlap_groups_are_those_of_a_full_scan() {
+        let mut state = 0_u64;
+        let mut draw = |below: u64| {
+            state = state.wrapping_mul(MIX).wrapping_add(STEP);
+            (state >> 33) % below
+        };
+        let range = |draw: &mut dyn FnMut(u64) -> u64| {
+            let low = draw(SPACE);
+            let high = low + draw(WIDEST);
+            (i64::try_from(low).unwrap(), i64::try_from(high).unwrap())
+        };
+        let places: [Place; 7] = [
+            None,
+            Some((TWO, 0)),
+            Some((TWO, 1)),
+            Some((FOUR, 0)),
+            Some((FOUR, 1)),
+            Some((FOUR, 2)),
+            Some((FOUR, 3)),
+        ];
+        let mut files: Vec<Described> = (0..SPREAD_FILES)
+            .map(|_| {
+                let place = places[usize::try_from(draw(approx::count(places.len()))).unwrap()];
+                let keys = range(&mut draw);
+                file(place, keys, range(&mut draw))
+            })
+            .collect();
+        files.sort_by(|a, b| (a.0, &a.1.0).cmp(&(b.0, &b.1.0)));
+        let spans: Vec<OrderedSpan<'_>> = files.iter().map(span).collect();
+        let oracle = by_full_scan(&spans);
+        let (grouped, groups) = by_group(&spans);
+        assert_eq!(grouped, oracle);
+        assert!(groups > 1, "{groups} overlap groups");
+        let found: usize = oracle.iter().map(Vec::len).sum();
+        let keys_meet_only = (0..spans.len())
+            .flat_map(|at| (0..spans.len()).map(move |other| (at, other)))
+            .filter(|&(at, other)| {
+                at != other
+                    && meet(spans[at].keys, spans[other].keys)
+                    && !meet(spans[at].orders, spans[other].orders)
+            })
+            .count();
+        assert!(found > 0, "some files are counterparts");
+        assert!(keys_meet_only > 0, "some files meet by key alone");
     }
 }

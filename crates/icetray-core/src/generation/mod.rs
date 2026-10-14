@@ -305,7 +305,7 @@ impl Generation {
             overlapping: &overlapping,
         });
         let verified_groups = match layout.order {
-            Some(_) => ordered::verify_rows(table, &members, &files, &deletes).await?,
+            Some(_) => ordered::verify_rows(table, &members, &files, &groups, &deletes).await?,
             None => verify_groups(table, &members, &files, groups, &deletes).await?,
         };
         let records = files.iter().map(|file| file.entry.records).sum();
