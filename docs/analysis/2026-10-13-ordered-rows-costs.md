@@ -33,11 +33,12 @@ requested more bytes: 96 bytes more per hit, about 290 bytes more per key
 of a MultiGet, and about 8 KiB more per page a cold read fetches, the
 same in every run. Two `async fn` wrappers in the read path had grown
 the futures those allocations hold. `22b04dc` returns the inner futures
-from both, and the bytes per call match the baseline's within the
-variation between runs, at most about 1 byte per key. Serving an idle ordered table beside the key-value one
-moves no figure outside the spread of the key-value runs alone, except
-the Full-tier warm hit on one task, 0.7% slower and inside the spread of
-the runs before the change.
+from both, and the bytes per call differ from the baseline's by at most
+9 bytes per one-key call and about 1 byte per key of a MultiGet, within
+the run-to-run variation. Serving an idle ordered table beside the key-value
+one moves no figure outside the spread of the key-value runs alone,
+except the Full-tier warm hit on one task, 0.7% slower and inside the
+spread of the runs before the change.
 
 A warm Scan of a key's 100 rows takes 20.5 µs on one task in the Full
 and Bloom tiers and 38.4 µs in the Disk tier, where the order column is
@@ -372,15 +373,17 @@ first two sets, and after the allocation fix 0.6% slower over nine runs
 per binary, outside the spread in one of three sets (+0.45%, +0.65%,
 −0.09%), which does not establish a slowdown. The path keeps its
 allocation counts, GETs, and local reads exactly, and at `22b04dc` its
-allocated bytes per call within the variation between runs, at most
-about 1 byte per key. The bytes are
-deterministic, so any build can check them with the bench's allocation
-counter, and the two size tests fail on a wrapper of the kind that grew
-them. The one-task p50 and eleven-task throughput tables, the Scan and
-MultiScan table, and the load table are the first set's, at `a126a1c`,
-before the fix; only the one-task bytes per operation and the one-task p50 of
-the 1,000-key MultiGet in the Bloom and Full tiers were measured again
-at `22b04dc`.
+allocated bytes per call differ from the baseline's by at most 9 bytes
+per one-key call and about 1 byte per key of a MultiGet, within the
+run-to-run variation. The allocation counter is exact within a run, and
+its average per operation varies between runs by the amounts above, so
+any build can compare its bytes with these through the bench's counter,
+and the two size tests fail on a wrapper of the kind that grew them. The
+one-task p50 and eleven-task throughput tables, the Scan and MultiScan
+table, and the load table are the first set's, at `a126a1c`, before the
+fix; only the one-task bytes per operation and the one-task p50 of the
+1,000-key MultiGet in the Bloom and Full tiers were measured again at
+`22b04dc`.
 
 An idle ordered table beside the key-value one costs the key-value calls
 nothing these runs resolve. A Scan load running beside them would share
