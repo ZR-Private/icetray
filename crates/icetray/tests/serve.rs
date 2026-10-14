@@ -21,7 +21,7 @@ use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat,
 };
 use icetray_core::key::UUID_BYTES;
-use icetray_core::metric::{self, Kind, LookupResult};
+use icetray_core::metric::{self, CacheName, Kind, LookupResult, ScanResult, Temperature};
 use icetray_core::{
     ColumnRead, ErrorKind, Generation, IoStats, Key, KeyType, MAX_FIELD_NUMBER, Row, Storage,
     TableState,
@@ -29,15 +29,17 @@ use icetray_core::{
 use icetray_proto::v1::icetray_client::IcetrayClient;
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
-    self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, TableInfoRequest,
-    TableInfoResponse,
+    self, GetRequest, GetResponse, MultiGetRequest, MultiGetResponse, MultiScanRequest,
+    MultiScanResponse, ScanRequest, ScanResponse, TableInfoRequest, TableInfoResponse,
 };
-use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS};
+use icetray_testkit::fixture::{
+    NAMESPACE, ONE_BUCKET, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS,
+};
 use icetray_testkit::protobuf;
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
-    DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, S3Fixture,
-    ValueKind, memory_catalog_s3, write_fixture,
+    DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, OrderKind, Ordered,
+    S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
 };
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -82,6 +84,53 @@ const SAMPLED_TABLE: &str = "kv_sampled";
 /// How long the page-cache test waits for the first sample: the start's
 /// sample runs as the tables serve, so this is room for a loaded machine.
 const FIRST_SAMPLE_WAIT: Duration = Duration::from_secs(10);
+
+/// The name of the ordered table beside `TABLE`.
+const ORDERED_TABLE: &str = "events";
+
+/// An ordered table no other test serves, so its scan counters read this
+/// test's alone.
+const FRESH_ORDERED_TABLE: &str = "events_fresh";
+
+/// The ids an ordered fixture of these tests writes: few, so each test
+/// writes it quickly.
+const ORDERED_IDS: std::ops::Range<u64> = 0..32;
+
+/// The rows every key of an ordered fixture of these tests has.
+const ROWS_PER_KEY: usize = 7;
+
+/// The raw order value of a key's first row, and the distance between
+/// consecutive rows.
+const ORDER_START: i64 = 1_000;
+const ORDER_STEP: i64 = 10;
+
+/// The rows a Scan page of the paging test asks for: fewer than a key has.
+const PAGE_ROWS: u32 = 3;
+
+/// The `max_scan_rows` the limit tests configure: fewer than a key's rows,
+/// so a limit of 0 leaves rows behind.
+const SCAN_CAP: u32 = 5;
+
+/// How many keys the refused-before-any-read test asks a `MultiScan` for
+/// beside the one that fits: the product with the limit and the columns
+/// passes `max_multi_scan_values`.
+const SCAN_KEYS_OVER: usize = 3;
+
+/// The `max_multi_scan_values` the `MultiScan` limit test configures: two
+/// keys at `SCAN_CAP` rows and one value column, each row counting its
+/// order value and its column.
+const MULTI_SCAN_VALUES: usize = 2 * SCAN_CAP as usize * 2;
+
+/// The `max_scan_rows` of a table that sets none: the default, which
+/// bounds every Scan the tests ask in full.
+const SCAN_CAP_DEFAULT: u32 = icetray_core::config::DEFAULT_MAX_SCAN_ROWS;
+
+/// A direction number the contract does not name.
+const UNKNOWN_DIRECTION: i32 = 99;
+
+/// The `scans_total` keys of `MultiScan` the counting test reads, and the
+/// `Scan` before them.
+const COUNTED_SCAN_KEYS: usize = 2;
 
 /// A table served with deletes beside `TABLE`.
 const DELETED_TABLE: &str = "kv_deleted";
@@ -403,6 +452,55 @@ impl Stack {
             .map(tonic::Response::into_inner)
     }
 
+    /// One `Scan`.
+    async fn scan(&mut self, request: ScanRequest) -> Result<ScanResponse, Status> {
+        self.client
+            .scan(request)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// One `MultiScan`.
+    async fn multi_scan(&mut self, request: MultiScanRequest) -> Result<MultiScanResponse, Status> {
+        self.client
+            .multi_scan(request)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// `start` with the ordered table `ORDERED_TABLE` and a key-value table
+    /// `TABLE` beside it, `configure` run over the setup, loaded.
+    async fn ready_ordered_with(
+        configure: impl AsyncFnOnce(&mut Setup) -> Result<(), BoxError>,
+    ) -> Result<Self, BoxError> {
+        let mut stack = Self::start_with(
+            vec![
+                FixtureSpec::small(TABLE, KeyType::Long),
+                ordered_spec(ORDERED_TABLE),
+            ],
+            configure,
+        )
+        .await?;
+        stack.serving.ready().await;
+        Ok(stack)
+    }
+
+    /// The generation the table `name` holds.
+    fn generation_of(&self, name: &str) -> Arc<Generation> {
+        self.serving
+            .opened()
+            .tables()
+            .get(name)
+            .expect("the table is served")
+            .current()
+            .expect("the table was loaded")
+    }
+
+    /// The ordered fixture `ready_ordered_with` serves.
+    fn ordered(&self) -> &Fixture {
+        &self.fixtures[1]
+    }
+
     /// One `TableInfo` of `table`.
     async fn table_info(&mut self, table: &str) -> Result<TableInfoResponse, Status> {
         self.client
@@ -474,6 +572,102 @@ fn wire_key(key: &Key) -> v1::Key {
         Key::Uuid(bytes) => v1::key::Key::Bin(bytes.to_vec()),
     };
     v1::Key { key: Some(variant) }
+}
+
+/// The rows every key of the ordered fixtures has.
+fn seven_rows(_: u64) -> u64 {
+    u64::try_from(ROWS_PER_KEY).expect("a row count fits u64")
+}
+
+/// An ordered table named `name` of `ORDERED_IDS` keys, each with
+/// `ROWS_PER_KEY` rows of a long order column.
+fn ordered_spec(name: &str) -> FixtureSpec {
+    FixtureSpec {
+        ids: ORDERED_IDS,
+        buckets: ONE_BUCKET,
+        ..FixtureSpec::ordered(
+            name,
+            KeyType::Long,
+            Ordered {
+                kind: OrderKind::Long,
+                rows_per_key: seven_rows,
+                start: ORDER_START,
+                step: ORDER_STEP,
+            },
+        )
+    }
+}
+
+/// The raw order value of a key's `index`-th row, oldest first.
+fn order_at(index: i64) -> i64 {
+    ORDER_START + ORDER_STEP * index
+}
+
+/// A raw long order value as the wire carries it.
+fn wire_order(raw: i64) -> v1::OrderValue {
+    v1::OrderValue {
+        value: Some(v1::order_value::Value::Long(raw)),
+    }
+}
+
+/// A Scan of `key` on `table` reading `VALUE_COLUMN` newest first, every
+/// row: the request a test changes the one field it is about in.
+fn scan_of(table: &str, key: &Key) -> ScanRequest {
+    ScanRequest {
+        table: table.to_string(),
+        key: Some(wire_key(key)),
+        columns: wire_columns(&[VALUE_COLUMN]),
+        direction: i32::from(v1::Direction::NewestFirst),
+        limit: 0,
+        after: None,
+        before: None,
+    }
+}
+
+/// A `MultiScan` of `keys` on `table` as `scan_of` reads one.
+fn multi_scan_of(table: &str, keys: &[Key]) -> MultiScanRequest {
+    let one = scan_of(table, &keys[0]);
+    MultiScanRequest {
+        table: one.table,
+        keys: keys.iter().map(wire_key).collect(),
+        columns: one.columns,
+        direction: one.direction,
+        limit: one.limit,
+        after: None,
+        before: None,
+    }
+}
+
+/// The rows a Scan answered as the fixture model states them: each raw
+/// order value and its one value.
+///
+/// Panics on an order value that is not a long.
+fn scan_rows_of(rows: &[v1::ScanRow]) -> ScanRows {
+    rows.iter()
+        .map(|row| {
+            let Some(v1::order_value::Value::Long(order)) =
+                row.order.as_ref().and_then(|order| order.value.as_ref())
+            else {
+                panic!("a long order value: {row:?}");
+            };
+            (*order, vec![one_wire_value(&row.values)])
+        })
+        .collect()
+}
+
+/// What the model answers for a Scan of `key` in `fixture` under `scan`,
+/// reading `VALUE_COLUMN`.
+fn expected(fixture: &Fixture, key: &Key, scan: &TestScan) -> (ScanRows, bool) {
+    fixture.expected_scan(key, &[VALUE_COLUMN], scan)
+}
+
+/// The model's request of every row, newest first, at a table whose
+/// `max_scan_rows` is `max_scan_rows`.
+fn every_row(max_scan_rows: u32) -> TestScan {
+    TestScan {
+        max_scan_rows,
+        ..TestScan::default()
+    }
 }
 
 /// The `requests_total` count of `call` answering `code` in `exposition`:
@@ -884,7 +1078,7 @@ async fn test_storage_failure_is_unavailable_and_fails_a_batch_whole() -> TestRe
 #[tokio::test(flavor = "multi_thread")]
 async fn test_requests_total_counts_every_call() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let mut stack = Stack::ready_small().await?;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
     let before = stack.scrape().await?;
 
     let key = stack.fixtures[0].key(SAMPLE[0]);
@@ -937,6 +1131,38 @@ async fn test_requests_total_counts_every_call() -> TestResult {
         age >= 0.0,
         "the snapshot was committed before the scrape: {age}"
     );
+
+    // Scan, MultiScan, and a refused Scan are counted as the others are,
+    // and the scans' own series count each key read.
+    let keys: Vec<Key> = (ORDERED_IDS.start..)
+        .take(COUNTED_SCAN_KEYS)
+        .map(|id| stack.ordered().key(id))
+        .collect();
+    stack.scan(scan_of(ORDERED_TABLE, &keys[0])).await?;
+    stack
+        .multi_scan(multi_scan_of(ORDERED_TABLE, &keys))
+        .await?;
+    let refused = ScanRequest {
+        direction: i32::from(v1::Direction::Unspecified),
+        ..scan_of(ORDERED_TABLE, &keys[0])
+    };
+    assert_eq!(code_of(stack.scan(refused).await), Code::InvalidArgument);
+    let scanned = stack.scrape().await?;
+    assert_every_metric_described(&scanned);
+    assert_counted(&after, &scanned, Call::Scan, Code::Ok, 1);
+    assert_counted(&after, &scanned, Call::MultiScan, Code::Ok, 1);
+    assert_counted(&after, &scanned, Call::Scan, Code::InvalidArgument, 1);
+    let table = [(metric::LABEL_TABLE, ORDERED_TABLE)];
+    let read = |exposition: &str, name: &str| series_sum(exposition, name, &table);
+    let keys_read = approx::gauge(1 + COUNTED_SCAN_KEYS as u64);
+    for name in [
+        metric::SCANS_TOTAL,
+        &format!("{}_count", metric::SCAN_ROWS),
+        &format!("{}_count", metric::SCAN_FILES),
+    ] {
+        let counted = read(&scanned, name) - read(&after, name);
+        assert_eq!(counted.to_bits(), keys_read.to_bits(), "{name}");
+    }
     Ok(())
 }
 
@@ -1043,6 +1269,62 @@ async fn test_requests_total_counts_a_request_answered_before_its_handler() -> T
     Ok(())
 }
 
+/// Asserts that `scrape` exposes an ordered table's scan series at zero, the
+/// histograms bucketed, before any Scan, and a key-value table's none.
+fn assert_scan_series_exposed_at_zero(scrape: &str) {
+    let table = (metric::LABEL_TABLE, FRESH_TABLE);
+    let ordered = (metric::LABEL_TABLE, FRESH_ORDERED_TABLE);
+    for result in ScanResult::ALL {
+        let result = result.to_string();
+        assert_eq!(
+            series_value(
+                scrape,
+                metric::SCANS_TOTAL,
+                &[ordered, (metric::LABEL_RESULT, result.as_str())]
+            ),
+            Some(0.0),
+            "{result}"
+        );
+    }
+    let infinite = ("le", "+Inf");
+    for name in [metric::SCAN_ROWS, metric::SCAN_FILES] {
+        assert_eq!(
+            series_value(scrape, &format!("{name}_bucket"), &[ordered, infinite]),
+            Some(0.0),
+            "{name}"
+        );
+    }
+    for temperature in Temperature::ALL {
+        let temperature = temperature.to_string();
+        assert_eq!(
+            series_value(
+                scrape,
+                &format!("{}_bucket", metric::SCAN_SECONDS),
+                &[
+                    ordered,
+                    (metric::LABEL_TEMPERATURE, temperature.as_str()),
+                    infinite
+                ]
+            ),
+            Some(0.0),
+            "{temperature}"
+        );
+    }
+    let scan_series = [
+        metric::SCANS_TOTAL.to_string(),
+        format!("{}_bucket", metric::SCAN_ROWS),
+        format!("{}_bucket", metric::SCAN_FILES),
+        format!("{}_bucket", metric::SCAN_SECONDS),
+    ];
+    for name in &scan_series {
+        assert_eq!(
+            series_value(scrape, name, &[table]),
+            None,
+            "a key-value table exposes no {name}"
+        );
+    }
+}
+
 /// Every series an alert keys on is exposed once the server serves, before
 /// any call, swap, or reload: a new table's counters at zero, each call's
 /// `OK` count, each reload result, the page cache's counters and bytes,
@@ -1054,7 +1336,10 @@ async fn test_requests_total_counts_a_request_answered_before_its_handler() -> T
 async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
     let _serial = SERIAL.lock().await;
     let mut stack = Stack::start_with(
-        vec![FixtureSpec::small(FRESH_TABLE, KeyType::Long)],
+        vec![
+            FixtureSpec::small(FRESH_TABLE, KeyType::Long),
+            ordered_spec(FRESH_ORDERED_TABLE),
+        ],
         async |setup| {
             setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
             Ok(())
@@ -1063,6 +1348,7 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
     .await?;
     stack.serving.ready().await;
     let scrape = stack.scrape().await?;
+    assert_every_metric_described(&scrape);
 
     let table = (metric::LABEL_TABLE, FRESH_TABLE);
     for result in LookupResult::ALL {
@@ -1078,26 +1364,7 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         series_value(&scrape, metric::GENERATION_SWAPS_TOTAL, &[table]),
         Some(0.0)
     );
-    // The state label's values are spelled out: `StateName` is private to
-    // icetray-core.
-    for state in ["degraded", "held"] {
-        assert_eq!(
-            series_value(
-                &scrape,
-                metric::TABLE_STATE,
-                &[table, (metric::LABEL_STATE, state)]
-            ),
-            Some(0.0),
-            "{state}"
-        );
-    }
-    for name in [
-        metric::TABLE_BELOW_LEVEL,
-        metric::TABLE_LEVEL,
-        metric::TABLE_DECLARED_LEVEL,
-    ] {
-        assert_eq!(series_value(&scrape, name, &[table]), Some(0.0), "{name}");
-    }
+    assert_scan_series_exposed_at_zero(&scrape);
     for call in Call::ALL {
         assert!(calls_exposed(&scrape, call, Code::Ok), "{call} in {scrape}");
     }
@@ -1115,6 +1382,18 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         metric::PAGE_CACHE_BYTES,
     ] {
         gauge(&scrape, name);
+    }
+    for cache in [CacheName::Lookup, CacheName::Scan] {
+        let cache = cache.to_string();
+        for name in [
+            metric::PAGE_CACHE_FETCHES_TOTAL,
+            metric::PAGE_CACHE_HITS_TOTAL,
+        ] {
+            assert!(
+                series_value(&scrape, name, &[(metric::LABEL_CACHE, cache.as_str())]).is_some(),
+                "{name} of the {cache} cache in {scrape}"
+            );
+        }
     }
     assert_in_flight(&scrape, 0, ServerConfig::default().max_in_flight);
     assert_eq!(
@@ -1604,6 +1883,99 @@ async fn test_get_and_multi_get_end_at_their_deadlines_over_a_held_store() -> Te
         tokio::time::timeout(SHUTDOWN_WAIT, timed(stack.multi_get(TABLE, &keys[1..]))).await?;
     assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
     assert!(stack.s3.held() > 0, "the calls reached the held store");
+    Ok(())
+}
+
+/// Over a store that has stopped answering, a `Scan` ends at the configured
+/// `scan_deadline` and a `MultiScan` at a shorter `multi_scan_deadline`,
+/// each with `DEADLINE_EXCEEDED`, instead of waiting on the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_and_multi_scan_end_at_their_deadlines_over_a_held_store() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |setup| {
+        setup.config.server.scan_deadline = LONGER_DEADLINE;
+        setup.config.server.multi_scan_deadline = SHORT_DEADLINE;
+        Ok(())
+    })
+    .await?;
+    let keys = stack
+        .ordered()
+        .keys_at(&[ORDERED_IDS.start, ORDERED_IDS.start + 1]);
+    stack.s3.hold();
+
+    let (outcome, elapsed) = tokio::time::timeout(
+        SHUTDOWN_WAIT,
+        timed(stack.scan(scan_of(ORDERED_TABLE, &keys[0]))),
+    )
+    .await?;
+    assert_ended_at(outcome, elapsed, LONGER_DEADLINE, Code::DeadlineExceeded);
+
+    let (outcome, elapsed) = tokio::time::timeout(
+        SHUTDOWN_WAIT,
+        timed(stack.multi_scan(multi_scan_of(ORDERED_TABLE, &keys[1..]))),
+    )
+    .await?;
+    assert_ended_at(outcome, elapsed, SHORT_DEADLINE, Code::DeadlineExceeded);
+    assert!(stack.s3.held() > 0, "the calls reached the held store");
+    Ok(())
+}
+
+/// A `Scan` and a `MultiScan` hold in-flight slots as `Get` and `MultiGet`
+/// do: with both slots taken by scans held on a stalled store, one more call
+/// of any kind is refused at once with `RESOURCE_EXHAUSTED`, and the held
+/// scans end at their deadlines and give their slots back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scans_hold_in_flight_slots_and_a_call_beyond_them_is_refused() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |setup| {
+        setup.config.server.max_in_flight = IN_FLIGHT_CAP;
+        setup.config.server.scan_deadline = LONGER_DEADLINE;
+        setup.config.server.multi_scan_deadline = LONGER_DEADLINE;
+        Ok(())
+    })
+    .await?;
+    let keys = stack.ordered().keys_at(&[
+        ORDERED_IDS.start,
+        ORDERED_IDS.start + 1,
+        ORDERED_IDS.start + 2,
+    ]);
+    stack.s3.hold();
+
+    let mut client = stack.client.clone();
+    let held_scan = tokio::spawn({
+        let request = scan_of(ORDERED_TABLE, &keys[0]);
+        async move { client.scan(request).await.map(|_| ()) }
+    });
+    let mut client = stack.client.clone();
+    let held_batch = tokio::spawn({
+        let request = multi_scan_of(ORDERED_TABLE, &keys[1..2]);
+        async move { client.multi_scan(request).await.map(|_| ()) }
+    });
+    let before = poll_until(SHUTDOWN_WAIT, "both scans taking a slot", async || {
+        let exposition = stack.scrape().await?;
+        let taken = gauge(&exposition, metric::REQUESTS_IN_FLIGHT).to_bits();
+        Ok((taken == approx::gauge_len(IN_FLIGHT_CAP).to_bits()).then_some(exposition))
+    })
+    .await?;
+    assert_in_flight(&before, IN_FLIGHT_CAP, IN_FLIGHT_CAP);
+    let (outcome, elapsed) = timed(stack.scan(scan_of(ORDERED_TABLE, &keys[2]))).await;
+    assert_eq!(code_of(outcome), Code::ResourceExhausted);
+    assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
+    let (outcome, elapsed) =
+        timed(stack.multi_scan(multi_scan_of(ORDERED_TABLE, &keys[2..]))).await;
+    assert_eq!(code_of(outcome), Code::ResourceExhausted);
+    assert!(elapsed < REFUSED_WITHIN, "refused after {elapsed:?}");
+
+    for held in [held_scan, held_batch] {
+        let outcome = tokio::time::timeout(SHUTDOWN_WAIT, held).await??;
+        assert_eq!(code_of(outcome), Code::DeadlineExceeded);
+    }
+    let after = stack.scrape().await?;
+    for call in [Call::Scan, Call::MultiScan] {
+        assert_counted(&before, &after, call, Code::ResourceExhausted, 1);
+        assert_counted(&before, &after, call, Code::DeadlineExceeded, 1);
+    }
+    assert_in_flight(&after, 0, IN_FLIGHT_CAP);
     Ok(())
 }
 
@@ -2638,5 +3010,383 @@ async fn test_reload_refuses_a_strict_change_the_serving_snapshot_is_below() -> 
     assert!(!table.config().strict, "the refused entry is not taken");
     assert_eq!(stack.pending().await?, Some(1.0));
     stack.table_info(TABLE).await?;
+    Ok(())
+}
+
+/// A Scan answers a key's rows as the model states them, in the direction
+/// asked, with `more` set while rows remain past the page and the id of the
+/// snapshot served; the pages of a walk by `before` join into the whole run
+/// with no row twice; a key with no rows answers none and no `more`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_returns_rows_more_and_the_snapshot_id() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    let snapshot = stack.generation_of(ORDERED_TABLE).snapshot_id.0;
+
+    let gets = stack.stats.gets();
+    let request = ScanRequest {
+        limit: PAGE_ROWS,
+        ..scan_of(ORDERED_TABLE, &key)
+    };
+    let response = stack.scan(request.clone()).await?;
+    let scan = TestScan {
+        limit: PAGE_ROWS,
+        ..every_row(SCAN_CAP_DEFAULT)
+    };
+    let (rows, more) = expected(stack.ordered(), &key, &scan);
+    assert_eq!(rows.len(), PAGE_ROWS as usize);
+    assert!(more, "the key has rows past the page");
+    assert_eq!(scan_rows_of(&response.rows), rows);
+    assert_eq!(response.more, more);
+    assert_eq!(response.snapshot_id, snapshot);
+    assert!(stack.stats.gets() > gets, "a cold Scan reads the store");
+
+    // Oldest first, every row, nothing left behind.
+    let oldest = ScanRequest {
+        direction: i32::from(v1::Direction::OldestFirst),
+        ..scan_of(ORDERED_TABLE, &key)
+    };
+    let response = stack.scan(oldest).await?;
+    let scan = TestScan {
+        direction: icetray_core::Direction::OldestFirst,
+        ..every_row(SCAN_CAP_DEFAULT)
+    };
+    let (rows, more) = expected(stack.ordered(), &key, &scan);
+    assert_eq!(rows.len(), ROWS_PER_KEY);
+    assert_eq!(scan_rows_of(&response.rows), rows);
+    assert!(!more && !response.more);
+
+    // Paging newest first by `before`: the pages are the run, each row once.
+    let mut paged = Vec::new();
+    let mut before = None;
+    loop {
+        let page = stack
+            .scan(ScanRequest {
+                limit: PAGE_ROWS,
+                before: before.take(),
+                ..scan_of(ORDERED_TABLE, &key)
+            })
+            .await?;
+        let last = page.rows.last().and_then(|row| row.order.clone());
+        paged.extend(scan_rows_of(&page.rows));
+        match (page.more, last) {
+            (true, Some(last)) => before = Some(last),
+            (false, _) => break,
+            (true, None) => panic!("a page with more rows returned none"),
+        }
+    }
+    let (whole, _) = expected(stack.ordered(), &key, &every_row(SCAN_CAP_DEFAULT));
+    assert_eq!(paged, whole);
+
+    // A key no row holds.
+    let absent = stack.ordered().absent_near(ORDERED_IDS.end);
+    let response = stack.scan(scan_of(ORDERED_TABLE, &absent)).await?;
+    assert!(response.rows.is_empty());
+    assert!(!response.more);
+    assert_eq!(response.snapshot_id, snapshot);
+    Ok(())
+}
+
+/// A Scan that sets no direction, or one the contract does not name, is
+/// `INVALID_ARGUMENT` before any read.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_with_unspecified_direction_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    let gets = stack.stats.gets();
+    for direction in [i32::from(v1::Direction::Unspecified), UNKNOWN_DIRECTION] {
+        let scan = ScanRequest {
+            direction,
+            ..scan_of(ORDERED_TABLE, &key)
+        };
+        assert_eq!(
+            code_of(stack.scan(scan).await),
+            Code::InvalidArgument,
+            "{direction}"
+        );
+        let multi = MultiScanRequest {
+            direction,
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))
+        };
+        assert_eq!(
+            code_of(stack.multi_scan(multi).await),
+            Code::InvalidArgument,
+            "{direction}"
+        );
+    }
+    assert_eq!(stack.stats.gets(), gets, "a refused Scan issues no GET");
+    Ok(())
+}
+
+/// A limit above the table's `max_scan_rows` is `INVALID_ARGUMENT` before
+/// any read; a limit of exactly it is answered, and a limit of 0 reads up to
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_with_a_limit_above_max_scan_rows_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |setup| {
+        setup.config.tables[1].max_scan_rows = Some(SCAN_CAP);
+        Ok(())
+    })
+    .await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+
+    let gets = stack.stats.gets();
+    let over = ScanRequest {
+        limit: SCAN_CAP + 1,
+        ..scan_of(ORDERED_TABLE, &key)
+    };
+    assert_eq!(code_of(stack.scan(over).await), Code::InvalidArgument);
+    assert_eq!(stack.stats.gets(), gets, "a refused Scan issues no GET");
+
+    for limit in [SCAN_CAP, 0] {
+        let response = stack
+            .scan(ScanRequest {
+                limit,
+                ..scan_of(ORDERED_TABLE, &key)
+            })
+            .await?;
+        let (rows, more) = expected(stack.ordered(), &key, &every_row(SCAN_CAP));
+        assert_eq!(rows.len(), SCAN_CAP as usize, "limit {limit}");
+        assert_eq!(scan_rows_of(&response.rows), rows, "limit {limit}");
+        assert!(more && response.more, "limit {limit}");
+    }
+    Ok(())
+}
+
+/// A bound `after` at or above `before`, a bound of another variant than
+/// the order type takes, and a bound that sets no variant are
+/// `INVALID_ARGUMENT` before any read; the bounds in order are answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_with_inverted_bounds_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    let (low, high) = (order_at(1), order_at(5));
+    let wrong_variant = v1::OrderValue {
+        value: Some(v1::order_value::Value::Str("not a long".to_string())),
+    };
+    let no_variant = v1::OrderValue { value: None };
+    let gets = stack.stats.gets();
+    let refused = [
+        (Some(wire_order(high)), Some(wire_order(low))),
+        (Some(wire_order(low)), Some(wire_order(low))),
+        (Some(wrong_variant.clone()), None),
+        (None, Some(wrong_variant)),
+        (Some(no_variant.clone()), None),
+        (None, Some(no_variant)),
+    ];
+    for (after, before) in refused {
+        let request = ScanRequest {
+            after: after.clone(),
+            before: before.clone(),
+            ..scan_of(ORDERED_TABLE, &key)
+        };
+        assert_eq!(
+            code_of(stack.scan(request).await),
+            Code::InvalidArgument,
+            "{after:?} {before:?}"
+        );
+    }
+    assert_eq!(stack.stats.gets(), gets, "a refused Scan issues no GET");
+
+    let request = ScanRequest {
+        after: Some(wire_order(low)),
+        before: Some(wire_order(high)),
+        ..scan_of(ORDERED_TABLE, &key)
+    };
+    let response = stack.scan(request).await?;
+    let scan = TestScan {
+        after: Some(low),
+        before: Some(high),
+        ..every_row(SCAN_CAP_DEFAULT)
+    };
+    let (rows, more) = expected(stack.ordered(), &key, &scan);
+    assert!(!rows.is_empty(), "the bounds enclose rows");
+    assert_eq!(scan_rows_of(&response.rows), rows);
+    assert_eq!(response.more, more);
+    Ok(())
+}
+
+/// A Scan or `MultiScan` of a key-value table is `INVALID_ARGUMENT`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_on_a_key_value_table_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.fixtures[0].key(SAMPLE[0]);
+    assert_eq!(
+        code_of(stack.scan(scan_of(TABLE, &key)).await),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        code_of(
+            stack
+                .multi_scan(multi_scan_of(TABLE, std::slice::from_ref(&key)))
+                .await
+        ),
+        Code::InvalidArgument
+    );
+    Ok(())
+}
+
+/// A Get or `MultiGet` of an ordered table is `INVALID_ARGUMENT`, and the
+/// key-value table beside it still answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_on_an_ordered_table_is_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    assert_eq!(
+        code_of(stack.get(ORDERED_TABLE, Some(wire_key(&key))).await),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        code_of(
+            stack
+                .multi_get(ORDERED_TABLE, std::slice::from_ref(&key))
+                .await
+        ),
+        Code::InvalidArgument
+    );
+    let kv = stack.fixtures[0].key(SAMPLE[0]);
+    let response = stack.get(TABLE, Some(wire_key(&kv))).await?;
+    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    Ok(())
+}
+
+/// A `MultiScan` whose keys times its limit times one more than its columns
+/// pass `max_multi_scan_values` is `INVALID_ARGUMENT` before any read, a
+/// limit of 0 counting as `max_scan_rows`; one at the bound is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_scan_over_max_values_is_invalid_argument_before_any_read() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |setup| {
+        setup.config.tables[1].max_scan_rows = Some(SCAN_CAP);
+        setup.config.server.max_multi_scan_values = MULTI_SCAN_VALUES;
+        Ok(())
+    })
+    .await?;
+    let keys: Vec<Key> = (ORDERED_IDS.start..)
+        .take(2 + SCAN_KEYS_OVER)
+        .map(|id| stack.ordered().key(id))
+        .collect();
+    let fits = &keys[..2];
+
+    let gets = stack.stats.gets();
+    for limit in [SCAN_CAP, 0] {
+        let over = MultiScanRequest {
+            limit,
+            ..multi_scan_of(ORDERED_TABLE, &keys)
+        };
+        assert_eq!(
+            code_of(stack.multi_scan(over).await),
+            Code::InvalidArgument,
+            "limit {limit}"
+        );
+    }
+    assert_eq!(stack.stats.gets(), gets, "a refused call issues no GET");
+
+    for limit in [SCAN_CAP, 0] {
+        let at_bound = MultiScanRequest {
+            limit,
+            ..multi_scan_of(ORDERED_TABLE, fits)
+        };
+        let response = stack.multi_scan(at_bound).await?;
+        assert_eq!(response.results.len(), fits.len(), "limit {limit}");
+        for (key, result) in fits.iter().zip(&response.results) {
+            let (rows, more) = expected(stack.ordered(), key, &every_row(SCAN_CAP));
+            assert_eq!(scan_rows_of(&result.rows), rows, "{key} limit {limit}");
+            assert_eq!(result.more, more, "{key} limit {limit}");
+        }
+    }
+    assert!(stack.stats.gets() > gets, "the calls at the bound read");
+    Ok(())
+}
+
+/// A `MultiScan` answers one result per key in request order from one
+/// snapshot, and a key listed twice is answered at each position.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_scan_answers_a_repeated_key_at_each_position() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let first = stack.ordered().key(ORDERED_IDS.start);
+    let second = stack.ordered().key(ORDERED_IDS.start + 1);
+    let absent = stack.ordered().absent_near(ORDERED_IDS.end);
+    let keys = [first.clone(), second.clone(), first.clone(), absent.clone()];
+    let snapshot = stack.generation_of(ORDERED_TABLE).snapshot_id.0;
+
+    let request = MultiScanRequest {
+        limit: PAGE_ROWS,
+        ..multi_scan_of(ORDERED_TABLE, &keys)
+    };
+    let response = stack.multi_scan(request).await?;
+    assert_eq!(response.snapshot_id, snapshot);
+    assert_eq!(response.results.len(), keys.len());
+    let scan = TestScan {
+        limit: PAGE_ROWS,
+        ..every_row(SCAN_CAP_DEFAULT)
+    };
+    for (position, (key, result)) in keys.iter().zip(&response.results).enumerate() {
+        let (rows, more) = expected(stack.ordered(), key, &scan);
+        assert_eq!(scan_rows_of(&result.rows), rows, "position {position}");
+        assert_eq!(result.more, more, "position {position}");
+    }
+    assert_eq!(response.results[0], response.results[2]);
+    assert_ne!(response.results[0], response.results[1]);
+    assert!(response.results[3].rows.is_empty());
+    assert!(!response.results[3].more);
+    Ok(())
+}
+
+/// `TableInfo` of an ordered table names its order column and type, the
+/// width of a fixed one, and `max_scan_rows`; of a key-value table it
+/// leaves those unset.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestResult {
+    /// The width of the second ordered table's `fixed` order column.
+    const FIXED_WIDTH: u32 = 12;
+    /// The second ordered table.
+    const FIXED_TABLE: &str = "events_fixed";
+    let _serial = SERIAL.lock().await;
+    let fixed = FixtureSpec {
+        ordered: Some(Ordered {
+            kind: OrderKind::Fixed(FIXED_WIDTH),
+            ..ordered_spec(FIXED_TABLE).ordered.expect("an ordered spec")
+        }),
+        ..ordered_spec(FIXED_TABLE)
+    };
+    let mut stack = Stack::start_with(
+        vec![
+            FixtureSpec::small(TABLE, KeyType::Long),
+            ordered_spec(ORDERED_TABLE),
+            fixed,
+        ],
+        async |setup| {
+            setup.config.tables[1].max_scan_rows = Some(SCAN_CAP);
+            Ok(())
+        },
+    )
+    .await?;
+    stack.serving.ready().await;
+
+    let info = stack.table_info(ORDERED_TABLE).await?;
+    assert_eq!(info.order_column, icetray_testkit::ORDER_COLUMN);
+    assert_eq!(info.order_type(), v1::OrderType::Long);
+    assert_eq!(info.order_width, 0);
+    assert_eq!(info.max_scan_rows, SCAN_CAP);
+
+    let info = stack.table_info(FIXED_TABLE).await?;
+    assert_eq!(info.order_column, icetray_testkit::ORDER_COLUMN);
+    assert_eq!(info.order_type(), v1::OrderType::Fixed);
+    assert_eq!(info.order_width, FIXED_WIDTH);
+    assert_eq!(info.max_scan_rows, SCAN_CAP_DEFAULT);
+
+    let info = stack.table_info(TABLE).await?;
+    assert_eq!(info.order_column, "");
+    assert_eq!(info.order_type(), v1::OrderType::Unspecified);
+    assert_eq!(info.order_width, 0);
+    assert_eq!(info.max_scan_rows, 0);
     Ok(())
 }

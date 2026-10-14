@@ -205,11 +205,11 @@ or the snapshot changes.
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
-| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, or a batch over the values limit. | No; fix the request |
+| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a batch over the values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` of an ordered table, `Scan` of a key-value table). | No; fix the request |
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
-| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), or a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
+| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan` ran past `server.scan_deadline` (5 seconds), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds). | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |
 
 The gRPC layer enforces a deadline the client sends and reports its

@@ -168,8 +168,8 @@ pub const TABLE_OLDEST_DELETE_AGE_SECONDS: &str = "icetray_table_oldest_delete_a
 /// 1 while the configuration file differs from the configuration the
 /// server applied, 0 once they match (RFD 018).
 pub const CONFIG_PENDING: &str = "icetray_config_pending";
-/// `Get` and `MultiGet` calls admitted and not yet ended, each holding one
-/// of the `max_in_flight` slots.
+/// `Get`, `MultiGet`, `Scan`, and `MultiScan` calls admitted and not yet
+/// ended, each holding one of the `max_in_flight` slots.
 pub const REQUESTS_IN_FLIGHT: &str = "icetray_requests_in_flight";
 /// The in-flight slots there are, `server.max_in_flight`: a call that finds
 /// every one held is refused `RESOURCE_EXHAUSTED`.
@@ -442,7 +442,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 52] = [
     (
         REQUESTS_IN_FLIGHT,
         Kind::Gauge,
-        "Get and MultiGet calls admitted and not yet ended.",
+        "Get, MultiGet, Scan, and MultiScan calls admitted and not yet ended.",
     ),
     (
         MAX_IN_FLIGHT,

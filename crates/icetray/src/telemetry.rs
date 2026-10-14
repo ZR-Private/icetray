@@ -31,6 +31,29 @@ pub const LATENCY_BUCKETS: [f64; 14] = [
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
 ];
 
+/// Histogram bucket bounds in seconds for `scan_seconds`: `LATENCY_BUCKETS`
+/// extended to 10 seconds, since one Scan of one key may read a span of
+/// pages in several rounds and `server.scan_deadline` is 5 seconds by
+/// default.
+pub const SCAN_LATENCY_BUCKETS: [f64; 16] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
+    5.0, 10.0,
+];
+
+/// Histogram bucket bounds for `scan_rows`: 0 for a key with no rows inside
+/// the bounds, then a 1-2.5-5 progression through the default
+/// `max_scan_rows` of 1,000 and two bounds past it, for a table that raises
+/// it.
+pub const SCAN_ROWS_BUCKETS: [f64; 14] = [
+    0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+];
+
+/// Histogram bucket bounds for `scan_files`: 0 for a key no file holds, 1
+/// for a compacted table, and then the counts appends and overlap reach,
+/// up to the 64 files past which a table is far from any level.
+pub const SCAN_FILES_BUCKETS: [f64; 11] =
+    [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0];
+
 /// How long a gauge no one writes stays in the exposition: none, so a
 /// render drops every gauge left unwritten since the render before it.
 /// Every render writes each live gauge first (`render_after`), so what it
@@ -53,7 +76,8 @@ static INSTALLING: Mutex<()> = Mutex::new(());
 /// Installs the Prometheus recorder once per process and returns its handle;
 /// every later call returns the same handle, since a `metrics` recorder is
 /// global and the daemon's tests start several servers in one process.
-/// Histograms use `LATENCY_BUCKETS`; gauges expire after
+/// Histograms use `LATENCY_BUCKETS`, or the scan sets for the scan
+/// histograms; gauges expire after
 /// `GAUGE_IDLE_TIMEOUT`; every metric is described (`metric::describe`).
 pub fn install() -> Result<PrometheusHandle, ServeError> {
     let _installing = INSTALLING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -68,6 +92,18 @@ pub fn install() -> Result<PrometheusHandle, ServeError> {
         .set_buckets_for_metric(
             Matcher::Full(metric::OBJECT_GET_SECONDS.to_string()),
             &LATENCY_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(metric::SCAN_SECONDS.to_string()),
+            &SCAN_LATENCY_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(metric::SCAN_ROWS.to_string()),
+            &SCAN_ROWS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(metric::SCAN_FILES.to_string()),
+            &SCAN_FILES_BUCKETS,
         )?
         .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT))
         .install_recorder()?;
@@ -89,12 +125,22 @@ pub enum Call {
     MultiGet,
     /// `Icetray.TableInfo`.
     TableInfo,
+    /// `Icetray.Scan`.
+    Scan,
+    /// `Icetray.MultiScan`.
+    MultiScan,
 }
 
 impl Call {
     /// Every call, for the series registered at start, each at its
     /// `index`.
-    pub const ALL: [Self; 3] = [Self::Get, Self::MultiGet, Self::TableInfo];
+    pub const ALL: [Self; 5] = [
+        Self::Get,
+        Self::MultiGet,
+        Self::TableInfo,
+        Self::Scan,
+        Self::MultiScan,
+    ];
 
     /// The call's place in `ALL`.
     const fn index(self) -> usize {
@@ -102,6 +148,8 @@ impl Call {
             Self::Get => 0,
             Self::MultiGet => 1,
             Self::TableInfo => 2,
+            Self::Scan => 3,
+            Self::MultiScan => 4,
         }
     }
 
@@ -111,6 +159,8 @@ impl Call {
             Self::Get => "Get",
             Self::MultiGet => "MultiGet",
             Self::TableInfo => "TableInfo",
+            Self::Scan => "Scan",
+            Self::MultiScan => "MultiScan",
         }
     }
 
@@ -132,6 +182,8 @@ impl fmt::Display for Call {
             Self::Get => "get",
             Self::MultiGet => "multi_get",
             Self::TableInfo => "table_info",
+            Self::Scan => "scan",
+            Self::MultiScan => "multi_scan",
         };
         f.write_str(name)
     }
@@ -374,6 +426,8 @@ mod tests {
             (Call::Get, "get"),
             (Call::MultiGet, "multi_get"),
             (Call::TableInfo, "table_info"),
+            (Call::Scan, "scan"),
+            (Call::MultiScan, "multi_scan"),
         ];
         for (call, name) in cases {
             assert_eq!(call.to_string(), name);
@@ -477,6 +531,54 @@ mod tests {
         let second = render_after(&handle, || metrics::gauge!(KEPT).set(1.0));
         assert!(series_value(&second, KEPT, &[]).is_some(), "{second}");
         assert_eq!(series_value(&second, DROPPED, &[]), None, "{second}");
+    }
+
+    #[test]
+    fn test_scan_buckets_strictly_increase() {
+        for buckets in [
+            &SCAN_LATENCY_BUCKETS[..],
+            &SCAN_ROWS_BUCKETS[..],
+            &SCAN_FILES_BUCKETS[..],
+        ] {
+            assert!(
+                buckets
+                    .windows(2)
+                    .all(|pair| pair[0].total_cmp(&pair[1]).is_lt()),
+                "{buckets:?}"
+            );
+        }
+        assert_eq!(
+            SCAN_LATENCY_BUCKETS[..LATENCY_BUCKETS.len()],
+            LATENCY_BUCKETS,
+            "a Scan's latency is bucketed as a lookup's, and further"
+        );
+    }
+
+    /// A scan histogram recorded under a table is exposed as buckets, with
+    /// its own bounds, not as the summary a histogram with no bounds gets.
+    #[test]
+    fn test_install_buckets_the_scan_histograms() {
+        const TABLE: &str = "icetray_test_scan_buckets";
+        let handle = install().unwrap();
+        for (name, bounds) in [
+            (metric::SCAN_SECONDS, &SCAN_LATENCY_BUCKETS[..]),
+            (metric::SCAN_ROWS, &SCAN_ROWS_BUCKETS[..]),
+            (metric::SCAN_FILES, &SCAN_FILES_BUCKETS[..]),
+        ] {
+            metrics::histogram!(name, metric::LABEL_TABLE => TABLE).record(bounds[0]);
+            let exposition = render_after(&handle, || {});
+            let le = bounds[0].to_string();
+            let bucket = format!("{name}_bucket");
+            assert_eq!(
+                series_value(
+                    &exposition,
+                    &bucket,
+                    &[(metric::LABEL_TABLE, TABLE), ("le", &le)]
+                ),
+                Some(1.0),
+                "{name} in {exposition}"
+            );
+        }
     }
 
     #[test]

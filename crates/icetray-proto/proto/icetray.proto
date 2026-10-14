@@ -31,6 +31,17 @@ service Icetray {
   // the request. A caller that retries resends the whole batch; a
   // FAILED_PRECONDITION error recurs on every retry.
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
+  // Read the rows of one key in one ordered table, in order-value order,
+  // one page at a time. The response carries the id of the snapshot the
+  // server read it from.
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  // Read the rows of many keys in one ordered table, each as a Scan reads
+  // them, all from one snapshot. The response returns one result per key in
+  // request order, a key listed twice answered at each position. When the
+  // read of any key fails, the whole call fails, so a response always
+  // covers every key of the request. A caller that retries resends the
+  // whole call; a FAILED_PRECONDITION error recurs on every retry.
+  rpc MultiScan(MultiScanRequest) returns (MultiScanResponse);
   // Describe the snapshot the server currently serves for a table.
   rpc TableInfo(TableInfoRequest) returns (TableInfoResponse);
 }
@@ -197,6 +208,187 @@ message MultiGetResponse {
   int64 snapshot_id = 2;
 }
 
+// The Iceberg type of an ordered table's order column. It determines which
+// OrderValue variant a bound sets and how order values compare: the integer,
+// date, and timestamp types as numbers, and the string, binary, and fixed
+// types as their bytes. Clients switch on it.
+enum OrderType {
+  // The proto3 default. TableInfoResponse carries it for a table with no
+  // order column; no ordered table has it.
+  ORDER_TYPE_UNSPECIFIED = 0;
+  // Iceberg `int`. Bounds and order values are OrderValue.long.
+  ORDER_TYPE_INT = 1;
+  // Iceberg `long`. Bounds and order values are OrderValue.long.
+  ORDER_TYPE_LONG = 2;
+  // Iceberg `date`: days since the epoch, as OrderValue.long.
+  ORDER_TYPE_DATE = 3;
+  // Iceberg `timestamp`: microseconds, as OrderValue.long.
+  ORDER_TYPE_TIMESTAMP = 4;
+  // Iceberg `timestamptz`: microseconds since the epoch, as
+  // OrderValue.long.
+  ORDER_TYPE_TIMESTAMPTZ = 5;
+  // Iceberg `timestamp_ns`: nanoseconds, as OrderValue.long.
+  ORDER_TYPE_TIMESTAMP_NS = 6;
+  // Iceberg `timestamptz_ns`: nanoseconds since the epoch, as
+  // OrderValue.long.
+  ORDER_TYPE_TIMESTAMPTZ_NS = 7;
+  // Iceberg `string`. Bounds and order values are OrderValue.str, compared
+  // as their UTF-8 bytes.
+  ORDER_TYPE_STRING = 8;
+  // Iceberg `binary`. Bounds and order values are OrderValue.bin, compared
+  // bytewise.
+  ORDER_TYPE_BINARY = 9;
+  // Iceberg `fixed`: every value is `TableInfoResponse.order_width` bytes.
+  // Bounds and order values are OrderValue.bin, compared bytewise.
+  ORDER_TYPE_FIXED = 10;
+}
+
+// The value of an ordered table's order column: a bound of a Scan, or the
+// position of a returned row. The variant must match the order type, which
+// TableInfoResponse.order_type reports: `long` for the integer, date, and
+// timestamp types, `str` for ORDER_TYPE_STRING, and `bin` for
+// ORDER_TYPE_BINARY and ORDER_TYPE_FIXED. A bound that sets no variant or
+// another one is an INVALID_ARGUMENT error. A bound outside an `int` or
+// `date` column's range is valid: it admits every row on its side.
+message OrderValue {
+  // Exactly one variant is set.
+  oneof value {
+    // An order value of an integer, date, or timestamp type, a signed
+    // 64-bit integer in the type's unit (days, microseconds, or
+    // nanoseconds).
+    int64 long = 1;
+    // An order value of ORDER_TYPE_STRING: UTF-8 text, compared as its
+    // bytes.
+    string str = 2;
+    // An order value of ORDER_TYPE_BINARY or ORDER_TYPE_FIXED, compared
+    // bytewise.
+    bytes bin = 3;
+  }
+}
+
+// The direction a Scan reads a key's rows in.
+enum Direction {
+  // Never sent by the server. A request that sets it is an
+  // INVALID_ARGUMENT error: the server has no default direction.
+  DIRECTION_UNSPECIFIED = 0;
+  // The highest order value first.
+  DIRECTION_NEWEST_FIRST = 1;
+  // The lowest order value first.
+  DIRECTION_OLDEST_FIRST = 2;
+}
+
+// One Scan of one key in one ordered table. A request is an
+// INVALID_ARGUMENT error when it omits the key or sets no variant in it,
+// sets a variant that does not match the table's key type, lists a value
+// column the table does not serve or lists one twice, lists fields of a
+// column in a way ColumnRead does not allow, sets no direction, sets a
+// limit above TableInfoResponse.max_scan_rows, sets a bound of another
+// variant than the table's order type takes or one with no variant, sets
+// `after` at or above `before`, or names a table that has no order column.
+message ScanRequest {
+  // The name the server is configured to serve the table under. A name the
+  // server does not serve is a NOT_FOUND error.
+  string table = 1;
+  // The key whose rows to read. Its variant must match the table's key
+  // type; a request that omits it is an INVALID_ARGUMENT error.
+  Key key = 2;
+  // The value columns to read for each row, as GetRequest.columns reads
+  // them: the response carries one value per column listed, in this order,
+  // for every row. An empty list reads the order values alone, and a
+  // ColumnRead with no fields reads its column whole.
+  repeated ColumnRead columns = 3;
+  // The direction the rows are returned in. It must be set.
+  Direction direction = 4;
+  // The most rows to return. 0 reads up to TableInfoResponse.max_scan_rows;
+  // a limit above it is an INVALID_ARGUMENT error.
+  uint32 limit = 5;
+  // When set, only rows whose order value is above this one, exclusive. A
+  // caller reading oldest first pages by setting it to the newest order
+  // value of the previous response.
+  OrderValue after = 6;
+  // When set, only rows whose order value is below this one, exclusive. A
+  // caller reading newest first pages by setting it to the oldest order
+  // value of the previous response. When both bounds are set, `after` must
+  // be below `before`.
+  OrderValue before = 7;
+}
+
+// One row of a Scan.
+message ScanRow {
+  // The row's order value, in the variant the table's order type takes.
+  OrderValue order = 1;
+  // One value per column the request listed, in the request's order:
+  // values[i] is the value of columns[i], as GetResponse.values reads.
+  // Empty for a request that listed no column.
+  repeated ColumnValue values = 2;
+}
+
+// The response to one Scan.
+message ScanResponse {
+  // The key's rows within the bounds, in the requested direction and no
+  // more than the limit. Empty for a key with no rows, which is a
+  // successful response, never an error. No two rows of one response
+  // share an order value.
+  repeated ScanRow rows = 1;
+  // Whether the key has rows within the bounds past the last one returned,
+  // in the requested direction. Unset for a key with no rows.
+  bool more = 2;
+  // The id of the Iceberg snapshot the server read the response from. Two
+  // responses carrying different ids were read from different snapshots of
+  // the table, and a page read after the table advanced is read from the
+  // newer one.
+  int64 snapshot_id = 3;
+}
+
+// Several Scans in one ordered table with one set of columns, direction,
+// limit, and bounds, all read from one snapshot. The request is an
+// INVALID_ARGUMENT error for every reason a ScanRequest is, for a key of
+// any position, and when its keys times its limit times one more than its
+// columns exceed the server's limit, a limit of 0 counting as
+// TableInfoResponse.max_scan_rows; the server refuses that before it reads
+// any key.
+message MultiScanRequest {
+  // The name the server is configured to serve the table under. A name the
+  // server does not serve is a NOT_FOUND error.
+  string table = 1;
+  // The keys whose rows to read. Every variant must match the table's key
+  // type. The response carries one result per key, in this order, and a
+  // key listed twice is answered at each position.
+  repeated Key keys = 2;
+  // The value columns to read for every row of every key, as
+  // ScanRequest.columns reads them.
+  repeated ColumnRead columns = 3;
+  // The direction every key's rows are returned in. It must be set.
+  Direction direction = 4;
+  // The most rows to return per key, as ScanRequest.limit.
+  uint32 limit = 5;
+  // The exclusive lower bound on every key's rows, as ScanRequest.after.
+  OrderValue after = 6;
+  // The exclusive upper bound on every key's rows, as ScanRequest.before.
+  OrderValue before = 7;
+}
+
+// The result for one key of a MultiScan: what a Scan of the key answers,
+// without a snapshot id of its own.
+message ScanResult {
+  // The key's rows, as ScanResponse.rows.
+  repeated ScanRow rows = 1;
+  // Whether the key has rows past the last one returned, as
+  // ScanResponse.more.
+  bool more = 2;
+}
+
+// The response to a MultiScan. The call fails as a whole when the read of
+// any key fails, so a response covers every key of the request.
+message MultiScanResponse {
+  // One result per requested key, in request order: results[i] is the
+  // result for keys[i].
+  repeated ScanResult results = 1;
+  // The id of the Iceberg snapshot the server read every result from, so
+  // the results of a call are consistent with each other.
+  int64 snapshot_id = 2;
+}
+
 // A request to describe the snapshot the server serves for one table.
 message TableInfoRequest {
   // The name the server is configured to serve the table under. A name the
@@ -267,8 +459,9 @@ message ValueColumn {
 message TableInfoResponse {
   // The name the table was requested under.
   string table = 1;
-  // The Iceberg snapshot id being served. Get and MultiGet responses for
-  // the table carry this id until the table advances to another snapshot.
+  // The Iceberg snapshot id being served. Get, MultiGet, Scan, and
+  // MultiScan responses for the table carry this id until the table
+  // advances to another snapshot.
   int64 snapshot_id = 2;
   // The bucket count of the key column's bucket partition; 0 when the
   // table is not bucket-partitioned.
@@ -286,4 +479,17 @@ message TableInfoResponse {
   // The value columns a request may list, in name order, names compared as
   // their UTF-8 bytes; empty for a table that serves only key presence.
   repeated ValueColumn value_columns = 8;
+  // The name of the order column of an ordered table, whose rows Scan and
+  // MultiScan read; empty for a table with no order column, which Get and
+  // MultiGet serve.
+  string order_column = 9;
+  // The order column's type. It determines which OrderValue variant a
+  // bound sets. ORDER_TYPE_UNSPECIFIED for a table with no order column.
+  OrderType order_type = 10;
+  // The bytes of every order value of an ORDER_TYPE_FIXED column; 0 for
+  // every other type.
+  uint32 order_width = 11;
+  // The most rows one Scan may ask for, and what a limit of 0 reads; 0
+  // for a table with no order column.
+  uint32 max_scan_rows = 12;
 }

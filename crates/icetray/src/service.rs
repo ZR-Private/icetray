@@ -1,14 +1,16 @@
 //! The gRPC service over the generated contract (RFD 010): `Get`,
-//! `MultiGet`, and `TableInfo` over the tables `open` built, the wire key
-//! read under the table's key type, and core's errors mapped to status codes
-//! by variant. Every call is counted under `requests_total` by the code it
-//! answered around the service, not in it (`counted::Counted`). `Get` and
-//! `MultiGet` run under the server's deadline for the method (RFD 013); a
-//! client's own deadline is tonic's, which drops the call at it. Together
-//! they hold at most `server.max_in_flight` slots, and a call that finds
-//! none is refused at once. A `MultiGet` asks for at most
-//! `server.max_multi_get_values` values, its keys times the columns it
-//! names, whatever fields each names (RFD 022, RFD 024).
+//! `MultiGet`, `Scan`, `MultiScan`, and `TableInfo` over the tables `open`
+//! built, the wire key read under the table's key type, and core's errors
+//! mapped to status codes by variant. Every call is counted under
+//! `requests_total` by the code it answered around the service, not in it
+//! (`counted::Counted`). `Get`, `MultiGet`, `Scan`, and `MultiScan` run
+//! under the server's deadline for the method (RFD 013); a client's own
+//! deadline is tonic's, which drops the call at it. Together they hold at
+//! most `server.max_in_flight` slots, and a call that finds none is refused
+//! at once. A `MultiGet` asks for at most `server.max_multi_get_values`
+//! values, its keys times the columns it names, whatever fields each names
+//! (RFD 022, RFD 024); a `MultiScan`'s bound, `server.max_multi_scan_values`,
+//! and a Scan's other checks against the table are core's (RFD 025).
 
 use std::fmt;
 use std::sync::Arc;
@@ -19,21 +21,23 @@ use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{
-    CacheError, ColumnRead, Error, Key, KeyType, Opened, Row, Table, TableConfig, TableLayout,
-    Tables, ValueFormat, ValueType, approx,
+    CacheError, ColumnRead, Direction, Error, Key, KeyType, Opened, OrderType, OrderValue, Row,
+    ScanBounds, ScanRow, Scanned, Table, TableConfig, TableLayout, Tables, ValueFormat, ValueType,
+    approx,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
 use icetray_proto::v1::{
-    ColumnValue, GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, NullValue,
-    TableInfoRequest, TableInfoResponse, column_value,
+    ColumnValue, GetRequest, GetResponse, Hit, MultiGetRequest, MultiGetResponse, MultiScanRequest,
+    MultiScanResponse, NullValue, ScanRequest, ScanResponse, TableInfoRequest, TableInfoResponse,
+    column_value, order_value,
 };
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
-use crate::error::{CallFault, WireKeyFault};
+use crate::error::{CallFault, WireBound, WireKeyFault, WireScanFault};
 
-/// The in-flight slots `Get` and `MultiGet` hold together, at most
+/// The in-flight slots every call but `TableInfo` holds together, at most
 /// `server.max_in_flight`: what admits a call, and what
 /// `requests_in_flight` reads, so the gauge counts the slots the bound
 /// holds and cannot drift from it. Clone shares the slots.
@@ -89,7 +93,9 @@ pub struct Service {
     opened: Arc<Opened>,
     get_deadline: Duration,
     multi_get_deadline: Duration,
-    /// `Get` and `MultiGet` together.
+    scan_deadline: Duration,
+    multi_scan_deadline: Duration,
+    /// `Get`, `MultiGet`, `Scan`, and `MultiScan` together.
     slots: Slots,
     /// The most values one `MultiGet` may ask for.
     max_multi_get_values: usize,
@@ -103,6 +109,8 @@ impl Service {
             opened: Arc::clone(opened),
             get_deadline: server.get_deadline,
             multi_get_deadline: server.multi_get_deadline,
+            scan_deadline: server.scan_deadline,
+            multi_scan_deadline: server.multi_scan_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_values: server.max_multi_get_values,
         }
@@ -189,6 +197,61 @@ pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Wir
                 got: WireVariant::of(&variant),
             })
         }
+    }
+}
+
+/// A Scan's direction from the wire: `Direction::try_from` of the number a
+/// request carries, which names `NEWEST_FIRST` and `OLDEST_FIRST`. The server
+/// has no default direction, so unspecified and a number the contract does
+/// not name are `WireScanFault::Direction`.
+pub fn direction_from_wire(number: i32) -> Result<Direction, WireScanFault> {
+    match v1::Direction::try_from(number) {
+        Ok(v1::Direction::NewestFirst) => Ok(Direction::NewestFirst),
+        Ok(v1::Direction::OldestFirst) => Ok(Direction::OldestFirst),
+        Ok(v1::Direction::Unspecified) | Err(_) => Err(WireScanFault::Direction { number }),
+    }
+}
+
+/// A Scan's bound from the wire: `None` when the request sets none, the
+/// order value when it sets a variant, and `WireScanFault::EmptyBound`
+/// for a bound that is present with no variant. Whether the variant is the
+/// one the table's order type takes is core's check (`ScanRequestFault`).
+pub fn order_value_from_wire(
+    bound: Option<v1::OrderValue>,
+    which: WireBound,
+) -> Result<Option<OrderValue>, WireScanFault> {
+    let Some(bound) = bound else {
+        return Ok(None);
+    };
+    match bound.value {
+        Some(order_value::Value::Long(value)) => Ok(Some(OrderValue::Long(value))),
+        Some(order_value::Value::Str(text)) => Ok(Some(OrderValue::Str(text))),
+        Some(order_value::Value::Bin(bytes)) => Ok(Some(OrderValue::Bytes(bytes))),
+        None => Err(WireScanFault::EmptyBound { bound: which }),
+    }
+}
+
+/// What a request's direction, limit, and bounds ask of each key, read from
+/// the wire.
+fn scan_bounds_from_wire(
+    direction: i32,
+    limit: u32,
+    after: Option<v1::OrderValue>,
+    before: Option<v1::OrderValue>,
+) -> Result<ScanBounds, WireScanFault> {
+    Ok(ScanBounds {
+        direction: direction_from_wire(direction)?,
+        limit,
+        after: order_value_from_wire(after, WireBound::After)?,
+        before: order_value_from_wire(before, WireBound::Before)?,
+    })
+}
+
+/// A wire scan fault as a status: every fault is the caller's, so
+/// `INVALID_ARGUMENT`, with the fault's `Display` as the message.
+impl From<WireScanFault> for Status {
+    fn from(fault: WireScanFault) -> Self {
+        Self::invalid_argument(fault.to_string())
     }
 }
 
@@ -361,6 +424,48 @@ fn reads(columns: &[v1::ColumnRead]) -> Vec<ColumnRead<'_>> {
         .collect()
 }
 
+/// An order value on the wire, in the variant the table's order type takes.
+fn order_value_wire(value: OrderValue) -> v1::OrderValue {
+    let value = match value {
+        OrderValue::Long(value) => order_value::Value::Long(value),
+        OrderValue::Str(text) => order_value::Value::Str(text),
+        OrderValue::Bytes(bytes) => order_value::Value::Bin(bytes),
+    };
+    v1::OrderValue { value: Some(value) }
+}
+
+/// One Scan's answer on the wire: each row's order value and one value per
+/// column, in the order the rows were read, and whether rows remain. The
+/// values' bytes are the Scan's own, moved into the message, not copied.
+fn scanned_wire(scanned: Scanned) -> (Vec<v1::ScanRow>, bool) {
+    let rows = scanned
+        .rows
+        .into_iter()
+        .map(|ScanRow { order, values }| v1::ScanRow {
+            order: Some(order_value_wire(order)),
+            values: values.into_iter().map(column_value_wire).collect(),
+        })
+        .collect();
+    (rows, scanned.more)
+}
+
+/// The order column's type on the wire, and the width of a `fixed` one, 0
+/// for every other type.
+fn order_type_wire(order_type: OrderType) -> (v1::OrderType, u32) {
+    match order_type {
+        OrderType::Int => (v1::OrderType::Int, 0),
+        OrderType::Long => (v1::OrderType::Long, 0),
+        OrderType::Date => (v1::OrderType::Date, 0),
+        OrderType::Timestamp => (v1::OrderType::Timestamp, 0),
+        OrderType::TimestampTz => (v1::OrderType::Timestamptz, 0),
+        OrderType::TimestampNs => (v1::OrderType::TimestampNs, 0),
+        OrderType::TimestampTzNs => (v1::OrderType::TimestamptzNs, 0),
+        OrderType::String => (v1::OrderType::String, 0),
+        OrderType::Binary => (v1::OrderType::Binary, 0),
+        OrderType::Fixed(width) => (v1::OrderType::Fixed, width),
+    }
+}
+
 /// The table's key type on the wire.
 fn key_type_wire(key_type: KeyType) -> v1::KeyType {
     match key_type {
@@ -424,6 +529,67 @@ impl Service {
         }))
     }
 
+    /// `Scan` inside its deadline.
+    async fn scan_rows(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
+        let tables = self.serving();
+        let table = table(&tables, &request.table)?;
+        let key_type = table.key_type().map_err(|error| status_from(&error))?;
+        let key = key_from_wire(request.key, key_type)?;
+        let bounds = scan_bounds_from_wire(
+            request.direction,
+            request.limit,
+            request.after,
+            request.before,
+        )?;
+        let lookup = table
+            .scan(&key, &reads(&request.columns), &bounds)
+            .await
+            .map_err(|error| status_from(&error))?;
+        let (rows, more) = scanned_wire(lookup.scanned);
+        Ok(Response::new(ScanResponse {
+            rows,
+            more,
+            snapshot_id: lookup.snapshot_id.0,
+        }))
+    }
+
+    /// `MultiScan` inside its deadline.
+    async fn scan_batch(
+        &self,
+        request: MultiScanRequest,
+    ) -> Result<Response<MultiScanResponse>, Status> {
+        let tables = self.serving();
+        let table = table(&tables, &request.table)?;
+        let key_type = table.key_type().map_err(|error| status_from(&error))?;
+        let keys = request
+            .keys
+            .into_iter()
+            .map(|key| key_from_wire(Some(key), key_type))
+            .collect::<Result<Vec<Key>, WireKeyFault>>()?;
+        let bounds = scan_bounds_from_wire(
+            request.direction,
+            request.limit,
+            request.after,
+            request.before,
+        )?;
+        let lookup = table
+            .multi_scan(&keys, &reads(&request.columns), &bounds)
+            .await
+            .map_err(|error| status_from(&error))?;
+        let results = lookup
+            .results
+            .into_iter()
+            .map(|scanned| {
+                let (rows, more) = scanned_wire(scanned);
+                v1::ScanResult { rows, more }
+            })
+            .collect();
+        Ok(Response::new(MultiScanResponse {
+            results,
+            snapshot_id: lookup.snapshot_id.0,
+        }))
+    }
+
     /// `Get`, admitted and inside its deadline.
     async fn answer_get(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let _slot = self.slots.admit()?;
@@ -441,6 +607,24 @@ impl Service {
         within(self.multi_get_deadline, self.lookup_batch(request)).await
     }
 
+    /// `Scan`, admitted and inside its deadline. Its limit, bounds, and
+    /// columns are checked against the table before any read (`Table::scan`).
+    async fn answer_scan(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
+        let _slot = self.slots.admit()?;
+        within(self.scan_deadline, self.scan_rows(request)).await
+    }
+
+    /// `MultiScan`, admitted and inside its deadline. Its keys times its
+    /// limit times its columns plus one are held to `max_multi_scan_values`
+    /// before any key is read (`Table::multi_scan`).
+    async fn answer_multi_scan(
+        &self,
+        request: MultiScanRequest,
+    ) -> Result<Response<MultiScanResponse>, Status> {
+        let _slot = self.slots.admit()?;
+        within(self.multi_scan_deadline, self.scan_batch(request)).await
+    }
+
     /// `TableInfo`: the serving generation's description.
     fn answer_table_info(
         &self,
@@ -449,6 +633,11 @@ impl Service {
         let tables = self.serving();
         let table = table(&tables, &request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
+        let entry = table.config();
+        let order = generation.layout.order.as_ref();
+        let (order_type, order_width) = order.map_or((v1::OrderType::Unspecified, 0), |order| {
+            order_type_wire(order.order_type)
+        });
         Ok(Response::new(TableInfoResponse {
             table: request.table,
             snapshot_id: generation.snapshot_id.0,
@@ -460,7 +649,11 @@ impl Service {
             records: generation.records,
             key_type: i32::from(key_type_wire(generation.layout.key_type)),
             index_bytes: approx::count(generation.index_bytes),
-            value_columns: value_columns_wire(&generation.layout, &table.config()),
+            value_columns: value_columns_wire(&generation.layout, &entry),
+            order_column: order.map_or_else(String::new, |order| order.name.clone()),
+            order_type: i32::from(order_type),
+            order_width,
+            max_scan_rows: entry.scan_rows().unwrap_or(0),
         }))
     }
 }
@@ -476,6 +669,17 @@ impl Icetray for Service {
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
         self.answer_multi_get(request.into_inner()).await
+    }
+
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
+        self.answer_scan(request.into_inner()).await
+    }
+
+    async fn multi_scan(
+        &self,
+        request: Request<MultiScanRequest>,
+    ) -> Result<Response<MultiScanResponse>, Status> {
+        self.answer_multi_scan(request.into_inner()).await
     }
 
     async fn table_info(
@@ -494,8 +698,8 @@ mod tests {
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
     use icetray_core::{
-        ColumnRequestFault, FileFault, LocalFault, Malformed, RefusalReason, SourceConfig, Storage,
-        TableFault, ValueColumnConfig,
+        ColumnRequestFault, FileFault, LocalFault, Malformed, OrderVariant, RefusalReason,
+        ScanRequestFault, SourceConfig, Storage, TableFault, TableKind, ValueColumnConfig,
     };
     use tonic::Code;
 
@@ -618,11 +822,17 @@ mod tests {
         }
     }
 
+    /// A direction number the contract does not name.
+    const UNKNOWN_DIRECTION: i32 = 99;
+
     /// A deadline for the sample fault.
     const SAMPLE_DEADLINE: Duration = Duration::from_millis(250);
 
     /// A limit for the sample faults.
     const SAMPLE_LIMIT: usize = 8;
+
+    /// A row limit for the sample Scan faults.
+    const SAMPLE_LIMIT_U32: u32 = 8;
 
     #[test]
     fn test_from_call_fault_code_per_variant() {
@@ -783,7 +993,39 @@ mod tests {
         ]
         .into_iter()
         .chain(column_cases())
+        .chain(scan_cases())
         .chain(canceled_cases())
+        .collect()
+    }
+
+    /// Every fault of a Scan request core finds, and a call of the wrong
+    /// kind, beside its code.
+    fn scan_cases() -> Vec<(Error, Code)> {
+        let (limit, max) = (SAMPLE_LIMIT_U32 + 1, SAMPLE_LIMIT_U32);
+        [
+            ScanRequestFault::LimitAboveMax { limit, max },
+            ScanRequestFault::BoundVariant {
+                expected: OrderVariant::Long,
+            },
+            ScanRequestFault::BoundsInverted,
+            ScanRequestFault::TooManyValues {
+                keys: SAMPLE_LIMIT,
+                limit,
+                columns: 1,
+                max: SAMPLE_LIMIT,
+            },
+        ]
+        .into_iter()
+        .map(|fault| (Error::ScanRequest(fault), Code::InvalidArgument))
+        .chain([TableKind::KeyValue, TableKind::Ordered].map(|kind| {
+            (
+                Error::WrongTableKind {
+                    table: TABLE.to_string(),
+                    kind,
+                },
+                Code::InvalidArgument,
+            )
+        }))
         .collect()
     }
 
@@ -1022,6 +1264,157 @@ mod tests {
         assert_eq!(cases.map(|(key_type, _)| key_type), KeyType::ALL);
         for (key_type, wire) in cases {
             assert_eq!(key_type_wire(key_type), wire);
+        }
+    }
+
+    #[test]
+    fn test_direction_from_wire_names_both_directions_and_refuses_every_other_number() {
+        assert_eq!(
+            direction_from_wire(i32::from(v1::Direction::NewestFirst)),
+            Ok(Direction::NewestFirst)
+        );
+        assert_eq!(
+            direction_from_wire(i32::from(v1::Direction::OldestFirst)),
+            Ok(Direction::OldestFirst)
+        );
+        for number in [i32::from(v1::Direction::Unspecified), UNKNOWN_DIRECTION, -1] {
+            assert_eq!(
+                direction_from_wire(number),
+                Err(WireScanFault::Direction { number })
+            );
+        }
+    }
+
+    #[test]
+    fn test_order_value_from_wire_carries_each_variant_and_refuses_a_bound_with_none() {
+        let cases = [
+            (
+                order_value::Value::Long(LONG_VALUE),
+                OrderValue::Long(LONG_VALUE),
+            ),
+            (
+                order_value::Value::Str(STR_VALUE.to_string()),
+                OrderValue::Str(STR_VALUE.to_string()),
+            ),
+            (
+                order_value::Value::Bin(vec![0u8; SHORT_BIN_LEN]),
+                OrderValue::Bytes(vec![0u8; SHORT_BIN_LEN]),
+            ),
+        ];
+        for (wire, order) in cases {
+            let bound = v1::OrderValue { value: Some(wire) };
+            assert_eq!(
+                order_value_from_wire(Some(bound), WireBound::After),
+                Ok(Some(order))
+            );
+        }
+        assert_eq!(order_value_from_wire(None, WireBound::Before), Ok(None));
+        for which in [WireBound::After, WireBound::Before] {
+            assert_eq!(
+                order_value_from_wire(Some(v1::OrderValue { value: None }), which),
+                Err(WireScanFault::EmptyBound { bound: which })
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_wire_scan_fault_is_invalid_argument_per_variant() {
+        let faults = [
+            WireScanFault::Direction { number: 0 },
+            WireScanFault::EmptyBound {
+                bound: WireBound::After,
+            },
+        ];
+        for fault in faults {
+            assert_eq!(Status::from(fault).code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn test_order_value_wire_round_trips_each_variant() {
+        let values = [
+            OrderValue::Long(LONG_VALUE),
+            OrderValue::Str(STR_VALUE.to_string()),
+            OrderValue::Bytes(vec![0u8; SHORT_BIN_LEN]),
+        ];
+        for value in values {
+            assert_eq!(
+                order_value_from_wire(Some(order_value_wire(value.clone())), WireBound::After),
+                Ok(Some(value))
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanned_wire_keeps_each_row_in_order_with_its_values_and_more() {
+        let bytes = Bytes::from_static(STR_VALUE.as_bytes());
+        let scanned = Scanned {
+            rows: vec![
+                ScanRow {
+                    order: OrderValue::Long(LONG_VALUE),
+                    values: vec![Some(bytes.clone()), None],
+                },
+                ScanRow {
+                    order: OrderValue::Long(LONG_VALUE - 1),
+                    values: vec![Some(Bytes::new()), None],
+                },
+            ],
+            more: true,
+        };
+        let (rows, more) = scanned_wire(scanned);
+        assert!(more);
+        let orders: Vec<_> = rows
+            .iter()
+            .map(|row| order_value_from_wire(row.order.clone(), WireBound::After))
+            .collect();
+        assert_eq!(
+            orders,
+            [
+                Ok(Some(OrderValue::Long(LONG_VALUE))),
+                Ok(Some(OrderValue::Long(LONG_VALUE - 1)))
+            ]
+        );
+        assert_eq!(
+            rows[0].values,
+            [
+                ColumnValue {
+                    kind: Some(column_value::Kind::Value(bytes)),
+                },
+                ColumnValue {
+                    kind: Some(column_value::Kind::NullValue(NullValue {})),
+                },
+            ]
+        );
+        assert_eq!(
+            rows[1].values[0],
+            ColumnValue {
+                kind: Some(column_value::Kind::Value(Bytes::new())),
+            },
+            "a value of zero length is not a null"
+        );
+    }
+
+    #[test]
+    fn test_order_type_wire_maps_every_order_type_and_the_fixed_width() {
+        let width = u32::try_from(SHORT_BIN_LEN).unwrap();
+        let cases = [
+            (OrderType::Int, v1::OrderType::Int, 0),
+            (OrderType::Long, v1::OrderType::Long, 0),
+            (OrderType::Date, v1::OrderType::Date, 0),
+            (OrderType::Timestamp, v1::OrderType::Timestamp, 0),
+            (OrderType::TimestampTz, v1::OrderType::Timestamptz, 0),
+            (OrderType::TimestampNs, v1::OrderType::TimestampNs, 0),
+            (OrderType::TimestampTzNs, v1::OrderType::TimestamptzNs, 0),
+            (OrderType::String, v1::OrderType::String, 0),
+            (OrderType::Binary, v1::OrderType::Binary, 0),
+            (OrderType::Fixed(width), v1::OrderType::Fixed, width),
+        ];
+        for (order_type, wire, wire_width) in cases {
+            assert_eq!(
+                order_type_wire(order_type),
+                (wire, wire_width),
+                "{order_type}"
+            );
         }
     }
 }

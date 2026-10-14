@@ -6,7 +6,8 @@
 //! which reaches the exit code as `CliError::Serve`; `KeyTextFault` why
 //! command-line text is not a key; `RewriteTextFault` why `--rewrite` text
 //! is not a rule; `ColumnTextFault` why `--column` text is not a column
-//! read; `WireKeyFault` why a wire key is not a key; `CallFault`
+//! read; `WireKeyFault` why a wire key is not a key; `WireScanFault` why a
+//! Scan's direction or bound is not one; `CallFault`
 //! why the service ended a call on one of its own bounds.
 //! `CliError::exit_code` is the one exhaustive match from a subcommand's
 //! failure to an exit code; the two failures before any subcommand runs, a
@@ -203,6 +204,46 @@ pub enum WireKeyFault {
     UuidLength {
         /// The length the wire carried.
         bytes: usize,
+    },
+}
+
+/// A Scan's bound on the wire: the field a `WireScanFault` names.
+/// Display gives the field's name in the contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireBound {
+    /// `ScanRequest.after`: exclusive, below every row returned.
+    After,
+    /// `ScanRequest.before`: exclusive, above every row returned.
+    Before,
+}
+
+impl fmt::Display for WireBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::After => "after",
+            Self::Before => "before",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Why a Scan's direction or bound from the wire is not one (RFD 025). The
+/// variant a bound takes and the order between the bounds are core's to
+/// check against the table (`ScanRequestFault`). Every variant is the
+/// caller's fault, `INVALID_ARGUMENT` on the wire.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WireScanFault {
+    /// The direction is unset, or a number the contract does not name.
+    #[error("direction must be newest first or oldest first, got {number}")]
+    Direction {
+        /// The number the wire carried.
+        number: i32,
+    },
+    /// A bound is present but sets no variant.
+    #[error("the {bound} bound sets no variant")]
+    EmptyBound {
+        /// The bound that set none.
+        bound: WireBound,
     },
 }
 

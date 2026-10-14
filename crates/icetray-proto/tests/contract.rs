@@ -9,9 +9,10 @@ use std::fmt::Debug;
 
 use icetray_proto::v1::icetray_server::SERVICE_NAME;
 use icetray_proto::v1::{
-    ColumnRead, ColumnValue, GetRequest, GetResponse, Hit, Key, KeyType, MultiGetRequest,
-    MultiGetResponse, NullValue, Presence, TableInfoRequest, TableInfoResponse, ValueColumn,
-    ValueFormat, ValueType, column_value, key,
+    ColumnRead, ColumnValue, Direction, GetRequest, GetResponse, Hit, Key, KeyType,
+    MultiGetRequest, MultiGetResponse, MultiScanRequest, MultiScanResponse, NullValue, OrderType,
+    OrderValue, Presence, ScanRequest, ScanResponse, ScanResult, ScanRow, TableInfoRequest,
+    TableInfoResponse, ValueColumn, ValueFormat, ValueType, column_value, key, order_value,
 };
 use prost::bytes::Bytes;
 use prost::{Message, UnknownEnumValue};
@@ -89,6 +90,34 @@ const FIELD_3_VARINT_TAG: u8 = 0x18;
 /// `ValueColumn.format`.
 const FIELD_4_VARINT_TAG: u8 = 0x20;
 
+/// The tag byte that opens a varint field 5, `5 << 3`:
+/// `ScanRequest.limit`.
+const FIELD_5_VARINT_TAG: u8 = 0x28;
+
+/// The tag byte that opens a length-delimited field 6, `(6 << 3) | 2`:
+/// `ScanRequest.after`.
+const FIELD_6_LEN_TAG: u8 = 0x32;
+
+/// The tag byte that opens a length-delimited field 7, `(7 << 3) | 2`:
+/// `ScanRequest.before`.
+const FIELD_7_LEN_TAG: u8 = 0x3a;
+
+/// The tag byte that opens a length-delimited field 9, `(9 << 3) | 2`:
+/// `TableInfoResponse.order_column`.
+const FIELD_9_LEN_TAG: u8 = 0x4a;
+
+/// The tag byte that opens a varint field 10, `10 << 3`:
+/// `TableInfoResponse.order_type`.
+const FIELD_10_VARINT_TAG: u8 = 0x50;
+
+/// The tag byte that opens a varint field 11, `11 << 3`:
+/// `TableInfoResponse.order_width`.
+const FIELD_11_VARINT_TAG: u8 = 0x58;
+
+/// The tag byte that opens a varint field 12, `12 << 3`:
+/// `TableInfoResponse.max_scan_rows`.
+const FIELD_12_VARINT_TAG: u8 = 0x60;
+
 /// A snapshot id under 128, whose varint is the one byte of its value.
 const SMALL_SNAPSHOT_ID: u8 = 7;
 
@@ -141,6 +170,47 @@ const KEY_TYPE_NUMBERS: &[(KeyType, i32)] = &[
     (KeyType::Binary, 3),
     (KeyType::Uuid, 4),
 ];
+
+/// Every `Direction` value beside the integer `icetray.proto` gives it.
+const DIRECTION_NUMBERS: &[(Direction, i32)] = &[
+    (Direction::Unspecified, 0),
+    (Direction::NewestFirst, 1),
+    (Direction::OldestFirst, 2),
+];
+
+/// Every `OrderType` value beside the integer `icetray.proto` gives it.
+const ORDER_TYPE_NUMBERS: &[(OrderType, i32)] = &[
+    (OrderType::Unspecified, 0),
+    (OrderType::Int, 1),
+    (OrderType::Long, 2),
+    (OrderType::Date, 3),
+    (OrderType::Timestamp, 4),
+    (OrderType::Timestamptz, 5),
+    (OrderType::TimestampNs, 6),
+    (OrderType::TimestamptzNs, 7),
+    (OrderType::String, 8),
+    (OrderType::Binary, 9),
+    (OrderType::Fixed, 10),
+];
+
+/// An order value that is a negative long: it takes the full ten varint
+/// bytes.
+const ORDER_LONG: i64 = -1_700_000_000_000_000;
+
+/// An order string with non-ASCII characters.
+const ORDER_STR: &str = "v2.0-é";
+
+/// Order bytes that are neither valid UTF-8 nor a varint.
+const ORDER_BIN: &[u8] = &[0xff, 0x00, 0x80];
+
+/// The page limit the fixture scan asks for.
+const SCAN_LIMIT: u32 = 250;
+
+/// The most rows the fixture ordered table serves per Scan.
+const MAX_SCAN_ROWS: u32 = 1_000;
+
+/// The width of the fixture ordered table's `fixed` order column.
+const ORDER_WIDTH: u32 = 12;
 
 /// The full name of the service as it appears in a gRPC request path.
 const SERVICE_FULL_NAME: &str = "icetray.v1.Icetray";
@@ -314,6 +384,128 @@ fn test_round_trip_table_info_request_all_fields() {
     });
 }
 
+/// An order value of each variant.
+fn order_values() -> Vec<OrderValue> {
+    vec![
+        OrderValue {
+            value: Some(order_value::Value::Long(ORDER_LONG)),
+        },
+        OrderValue {
+            value: Some(order_value::Value::Str(ORDER_STR.to_owned())),
+        },
+        OrderValue {
+            value: Some(order_value::Value::Bin(ORDER_BIN.to_vec())),
+        },
+    ]
+}
+
+/// A scanned row at `order`, carrying `values()`.
+fn scan_row(order: OrderValue) -> ScanRow {
+    ScanRow {
+        order: Some(order),
+        values: values(),
+    }
+}
+
+/// One row per order value variant.
+fn scan_rows() -> Vec<ScanRow> {
+    order_values().into_iter().map(scan_row).collect()
+}
+
+#[test]
+fn test_round_trip_order_value_every_variant() {
+    for value in order_values() {
+        assert_round_trips(&value);
+    }
+}
+
+#[test]
+fn test_round_trip_scan_request_every_direction() {
+    let [after, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    for &(direction, _) in DIRECTION_NUMBERS {
+        let request = ScanRequest {
+            table: TABLE.to_owned(),
+            key: Some(str_key()),
+            columns: columns(),
+            direction: i32::from(direction),
+            limit: SCAN_LIMIT,
+            after: Some(after.clone()),
+            before: Some(before.clone()),
+        };
+        assert_round_trips(&request);
+        assert_eq!(round_trip(&request).direction(), direction);
+    }
+}
+
+#[test]
+fn test_round_trip_scan_row_every_order_variant() {
+    for order in order_values() {
+        assert_round_trips(&scan_row(order));
+    }
+}
+
+#[test]
+fn test_round_trip_scan_response_with_more_and_snapshot() {
+    for more in [false, true] {
+        assert_round_trips(&ScanResponse {
+            rows: scan_rows(),
+            more,
+            snapshot_id: SNAPSHOT_ID,
+        });
+    }
+}
+
+#[test]
+fn test_round_trip_multi_scan_request_every_key_variant() {
+    let [after, before, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    assert_round_trips(&MultiScanRequest {
+        table: TABLE.to_owned(),
+        keys: vec![long_key(), str_key(), bin_key()],
+        columns: columns(),
+        direction: i32::from(Direction::OldestFirst),
+        limit: SCAN_LIMIT,
+        after: Some(after),
+        before: Some(before),
+    });
+}
+
+#[test]
+fn test_round_trip_multi_scan_response_one_result_per_key() {
+    let results = [false, true]
+        .into_iter()
+        .map(|more| ScanResult {
+            rows: scan_rows(),
+            more,
+        })
+        .collect();
+    let response = MultiScanResponse {
+        results,
+        snapshot_id: SNAPSHOT_ID,
+    };
+    assert_round_trips(&response);
+    assert_eq!(round_trip(&response).results.len(), 2);
+}
+
+#[test]
+fn test_round_trip_table_info_response_order_fields_every_order_type() {
+    for &(order_type, _) in ORDER_TYPE_NUMBERS {
+        let response = TableInfoResponse {
+            table: TABLE.to_owned(),
+            order_column: "ts".to_owned(),
+            order_type: i32::from(order_type),
+            order_width: if order_type == OrderType::Fixed {
+                ORDER_WIDTH
+            } else {
+                0
+            },
+            max_scan_rows: MAX_SCAN_ROWS,
+            ..TableInfoResponse::default()
+        };
+        assert_round_trips(&response);
+        assert_eq!(round_trip(&response).order_type(), order_type);
+    }
+}
+
 #[test]
 fn test_round_trip_table_info_response_every_key_type() {
     for &(key_type, _) in KEY_TYPE_NUMBERS {
@@ -342,6 +534,7 @@ fn test_round_trip_table_info_response_every_key_type() {
                     }),
                 })
                 .collect(),
+            ..TableInfoResponse::default()
         };
         assert_round_trips(&response);
         assert_eq!(round_trip(&response).key_type(), key_type);
@@ -531,6 +724,176 @@ fn test_encode_table_info_value_column_exact_bytes() {
     let wire = [
         delimited(FIELD_8_LEN_TAG, &fixed),
         delimited(FIELD_8_LEN_TAG, &protobuf),
+    ]
+    .concat();
+    assert_eq!(response.encode_to_vec(), wire);
+    assert_eq!(
+        TableInfoResponse::decode(wire.as_slice()).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn test_direction_as_i32_matches_proto() {
+    for &(direction, number) in DIRECTION_NUMBERS {
+        assert_eq!(direction as i32, number);
+        assert_eq!(Direction::try_from(number), Ok(direction));
+    }
+}
+
+#[test]
+fn test_direction_try_from_unknown_is_err() {
+    let unknown = unknown_number(DIRECTION_NUMBERS);
+    assert_eq!(Direction::try_from(unknown), Err(UnknownEnumValue(unknown)));
+}
+
+#[test]
+fn test_order_type_as_i32_matches_proto() {
+    for &(order_type, number) in ORDER_TYPE_NUMBERS {
+        assert_eq!(order_type as i32, number);
+        assert_eq!(OrderType::try_from(number), Ok(order_type));
+    }
+}
+
+#[test]
+fn test_order_type_try_from_unknown_is_err() {
+    let unknown = unknown_number(ORDER_TYPE_NUMBERS);
+    assert_eq!(OrderType::try_from(unknown), Err(UnknownEnumValue(unknown)));
+}
+
+/// Each `OrderValue` variant is its own field, 1 to 3, so a long, a
+/// string, and bytes of one content are three different encodings.
+#[test]
+fn test_encode_order_value_exact_bytes() {
+    let [long, str, bin] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    assert_eq!(
+        long.encode_to_vec(),
+        [vec![FIELD_1_VARINT_TAG], varint(ORDER_LONG)].concat()
+    );
+    assert_eq!(
+        str.encode_to_vec(),
+        delimited(FIELD_2_LEN_TAG, ORDER_STR.as_bytes())
+    );
+    assert_eq!(bin.encode_to_vec(), delimited(FIELD_3_LEN_TAG, ORDER_BIN));
+}
+
+/// `value` as a protobuf varint of its two's-complement `u64`.
+fn varint(value: i64) -> Vec<u8> {
+    let mut wire = Vec::new();
+    prost::encoding::encode_varint(value.cast_unsigned(), &mut wire);
+    wire
+}
+
+/// A scan request carries its bounds as fields 6 and 7, the direction and
+/// limit as varint fields 4 and 5, and leaves an unset bound off the wire.
+#[test]
+fn test_encode_scan_request_bounds_exact_bytes() {
+    let [after, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let request = ScanRequest {
+        direction: i32::from(Direction::NewestFirst),
+        limit: SCAN_LIMIT,
+        after: Some(after.clone()),
+        before: Some(before.clone()),
+        ..ScanRequest::default()
+    };
+    let head = [
+        vec![
+            FIELD_4_VARINT_TAG,
+            u8::try_from(i32::from(Direction::NewestFirst)).unwrap(),
+        ],
+        vec![FIELD_5_VARINT_TAG],
+        varint(i64::from(SCAN_LIMIT)),
+    ]
+    .concat();
+    let wire = [
+        head.clone(),
+        delimited(FIELD_6_LEN_TAG, &after.encode_to_vec()),
+        delimited(FIELD_7_LEN_TAG, &before.encode_to_vec()),
+    ]
+    .concat();
+    assert_eq!(request.encode_to_vec(), wire);
+    assert_eq!(ScanRequest::decode(wire.as_slice()).unwrap(), request);
+    let unbounded = ScanRequest {
+        after: None,
+        before: None,
+        ..request
+    };
+    assert_eq!(
+        unbounded.encode_to_vec(),
+        head,
+        "an unset bound is absent from the wire"
+    );
+}
+
+/// A scan answer carries each row as field 1, `more` as field 2, and the
+/// snapshot id as field 3; a row carries its order value as field 1 and
+/// each value as field 2.
+#[test]
+fn test_encode_scan_response_exact_bytes() {
+    let order = order_values().remove(0);
+    let response = ScanResponse {
+        rows: vec![scan_row(order.clone())],
+        more: true,
+        snapshot_id: i64::from(SMALL_SNAPSHOT_ID),
+    };
+    let row = [
+        delimited(FIELD_1_LEN_TAG, &order.encode_to_vec()),
+        delimited(FIELD_2_LEN_TAG, &delimited(FIELD_1_LEN_TAG, VALUE)),
+        delimited(FIELD_2_LEN_TAG, &[FIELD_2_LEN_TAG, EMPTY_LEN]),
+    ]
+    .concat();
+    let wire = [
+        delimited(FIELD_1_LEN_TAG, &row),
+        vec![FIELD_2_VARINT_TAG, 1],
+        vec![FIELD_3_VARINT_TAG, SMALL_SNAPSHOT_ID],
+    ]
+    .concat();
+    assert_eq!(response.encode_to_vec(), wire);
+    assert_eq!(ScanResponse::decode(wire.as_slice()).unwrap(), response);
+}
+
+/// A `MultiScan` answer carries each key's result as field 1 and the snapshot
+/// id as field 2, a result its rows as field 1 and `more` as field 2.
+#[test]
+fn test_encode_multi_scan_response_exact_bytes() {
+    let response = MultiScanResponse {
+        results: vec![ScanResult {
+            rows: Vec::new(),
+            more: true,
+        }],
+        snapshot_id: i64::from(SMALL_SNAPSHOT_ID),
+    };
+    let wire = [
+        delimited(FIELD_1_LEN_TAG, &[FIELD_2_VARINT_TAG, 1]),
+        vec![FIELD_2_VARINT_TAG, SMALL_SNAPSHOT_ID],
+    ]
+    .concat();
+    assert_eq!(response.encode_to_vec(), wire);
+    assert_eq!(
+        MultiScanResponse::decode(wire.as_slice()).unwrap(),
+        response
+    );
+}
+
+/// The order column's description is `TableInfoResponse`'s fields 9 to 12.
+#[test]
+fn test_encode_table_info_order_fields_exact_bytes() {
+    let response = TableInfoResponse {
+        order_column: "ts".to_owned(),
+        order_type: i32::from(OrderType::Fixed),
+        order_width: ORDER_WIDTH,
+        max_scan_rows: SCAN_LIMIT,
+        ..TableInfoResponse::default()
+    };
+    let wire = [
+        delimited(FIELD_9_LEN_TAG, b"ts"),
+        vec![
+            FIELD_10_VARINT_TAG,
+            u8::try_from(i32::from(OrderType::Fixed)).unwrap(),
+        ],
+        vec![FIELD_11_VARINT_TAG, u8::try_from(ORDER_WIDTH).unwrap()],
+        vec![FIELD_12_VARINT_TAG],
+        varint(i64::from(SCAN_LIMIT)),
     ]
     .concat();
     assert_eq!(response.encode_to_vec(), wire);

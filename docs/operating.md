@@ -71,9 +71,10 @@ call meets, and which errors a client retries. The operator sets four of
 those limits in `[server]` ([Configuration](configuration.md#server)):
 `max_in_flight` calls at once, past which a call is `RESOURCE_EXHAUSTED`;
 `max_multi_get_values` per `MultiGet`; `batch_fan_out` GETs in flight
-per `MultiGet`, past which a batch's next GET waits for one to end; and
-the `get_deadline` and `multi_get_deadline` past which a call is
-`DEADLINE_EXCEEDED`.
+per `MultiGet`, `Scan`, or `MultiScan`, past which the next GET waits for
+one to end; `max_multi_scan_values` per `MultiScan`; and the
+`get_deadline`, `multi_get_deadline`, `scan_deadline`, and
+`multi_scan_deadline` past which a call is `DEADLINE_EXCEEDED`.
 
 The listener serves plaintext gRPC and authenticates no caller. TLS,
 authentication, and access policy are left to the platform: run icetray
@@ -113,10 +114,12 @@ Counters and histograms:
 | `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 on a compacted table, more where appends overlap. |
 | `icetray_scan_seconds` (histogram) | `table`, `temperature` | every ordered table and temperature | Latency of each answered Scan of one key. |
 
-The histograms' buckets run from 100 microseconds to 2 seconds.
+The latency histograms' buckets run from 100 microseconds to 2 seconds,
+and `icetray_scan_seconds`' to 10. `icetray_scan_rows`' run from 0 to
+10,000 rows and `icetray_scan_files`' from 0 to 64 files.
 
-`icetray_requests_total` counts every call to `Get`, `MultiGet`, and
-`TableInfo`, including those the gRPC layer fails before icetray's
+`icetray_requests_total` counts every call to `Get`, `MultiGet`, `Scan`,
+`MultiScan`, and `TableInfo`, including those the gRPC layer fails before icetray's
 handler runs: a body that does not decode (`internal`), a message over the
 4 MiB limit (`out_of_range`), and an encoding the server does not support
 (`unimplemented`). A call dropped before it completes, as when its client
@@ -128,7 +131,7 @@ Gauges, written at each scrape:
 
 | Metric | Labels | Value |
 |---|---|---|
-| `icetray_requests_in_flight` | | `Get` and `MultiGet` calls admitted and not yet ended. |
+| `icetray_requests_in_flight` | | `Get`, `MultiGet`, `Scan`, and `MultiScan` calls admitted and not yet ended. |
 | `icetray_max_in_flight` | | `server.max_in_flight`. A call that finds every slot held is refused with `RESOURCE_EXHAUSTED`. |
 | `icetray_table_state` | `table`, `state` | 1 for the table's current state, 0 for the others. |
 | `icetray_table_below_level` | `table` | 1 while the table is below its `lookups` level, else 0. icetray judges the layout on the newest snapshot it measured: the serving one or, while the table is held, the refused one. It judges the kernel's page cache on the serving generation's chunk files. |
@@ -177,7 +180,7 @@ every page resident, which would hide a shortfall.
 
 The label values:
 
-- `call`: `get`, `multi_get`, `table_info`.
+- `call`: `get`, `multi_get`, `scan`, `multi_scan`, `table_info`.
 - `code`: the gRPC status in lower snake case, every one of the 17 gRPC
   codes. icetray's handlers return `ok`, `invalid_argument`,
   `failed_precondition`, `deadline_exceeded`, `not_found`,
