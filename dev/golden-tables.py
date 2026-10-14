@@ -166,6 +166,9 @@ COLUMN_INDEX_TRUNCATE_DEFAULT = 64
 # files of a target size, far above what a hundred thousand small rows
 # amount to, so the overlap table lowers it to a few tasks per bucket.
 SPLIT_PARTITION_BYTES = 1_048_576
+# The compaction's target file size for the rolled table: about a quarter of
+# a bucket's bytes, so the compaction writes several files per bucket.
+ROLLED_TARGET_FILE_BYTES = 524_288
 
 LONG_KEY = f"id * {KEY_STEP}"
 STRING_KEY = (
@@ -389,6 +392,18 @@ def rewrite_sorted(spark, name, table):
     )
 
 
+def rewrite_rolled(spark, name, table):
+    """`rewrite_sorted` with a target file size far below a bucket's bytes,
+    so each bucket rolls into several files whose edges fall where the sort
+    cuts, inside a key's run."""
+    spark.sql(
+        f"CALL {CATALOG}.system.rewrite_data_files(table => '{qualified(name)}', "
+        f"strategy => 'sort', sort_order => 'key ASC, {ORDER_COLUMN} ASC', "
+        f"options => map('rewrite-all', 'true', "
+        f"'target-file-size-bytes', '{ROLLED_TARGET_FILE_BYTES}'))"
+    )
+
+
 def qualified(name):
     """The table's name within the catalog, as a procedure takes it."""
     return name.removeprefix(f"{CATALOG}.")
@@ -591,6 +606,18 @@ TABLES = [
         extra={"write.spark.advisory-partition-size-bytes": str(SPLIT_PARTITION_BYTES)},
         skew=True,
         order=OrderShape(permuted=True),
+    ),
+    # A compaction that rolls each bucket into several files by size.
+    Golden(
+        "ordered_rolled_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        changes=(rewrite_rolled,),
+        order=OrderShape(),
     ),
     # A MERGE on the key and the order value, recorded as Parquet position
     # deletes.

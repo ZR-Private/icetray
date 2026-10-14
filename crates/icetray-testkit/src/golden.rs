@@ -180,6 +180,10 @@ pub enum GoldenTable {
     /// `ordered_compacted_100k`: an ordered table of long keys and a long
     /// order column, rewritten by a sorting compaction.
     OrderedCompacted100k,
+    /// `ordered_rolled_100k`: the same rows, then a sorting compaction with
+    /// a target file size far below a bucket's bytes, which rolls each bucket
+    /// into several files.
+    OrderedRolled100k,
     /// `ordered_appended_100k`: the same rows, then `APPEND_ROWS_PER_KEY`
     /// more for every key at later order values, in a second file per bucket.
     OrderedAppended100k,
@@ -201,8 +205,9 @@ pub enum GoldenTable {
 
 impl GoldenTable {
     /// Every table the recipe's `ordered` group writes.
-    pub const ORDERED: [Self; 7] = [
+    pub const ORDERED: [Self; 8] = [
         Self::OrderedCompacted100k,
+        Self::OrderedRolled100k,
         Self::OrderedAppended100k,
         Self::OrderedOverlap100k,
         Self::OrderedMergeV2_100k,
@@ -215,6 +220,7 @@ impl GoldenTable {
     pub fn order_kind(self) -> Option<OrderKind> {
         match self {
             Self::OrderedCompacted100k
+            | Self::OrderedRolled100k
             | Self::OrderedAppended100k
             | Self::OrderedOverlap100k
             | Self::OrderedMergeV2_100k
@@ -250,6 +256,7 @@ impl GoldenTable {
             | Self::LongMorV2Compacted100k
             | Self::LongMorV3Compacted100k
             | Self::OrderedCompacted100k
+            | Self::OrderedRolled100k
             | Self::OrderedAppended100k
             | Self::OrderedOverlap100k
             | Self::OrderedMergeV2_100k
@@ -274,6 +281,7 @@ impl GoldenTable {
             | Self::LongMorV2Compacted100k
             | Self::LongMorV3Compacted100k
             | Self::OrderedCompacted100k
+            | Self::OrderedRolled100k
             | Self::OrderedAppended100k
             | Self::OrderedMergeV2_100k
             | Self::OrderedMergeV3_100k
@@ -297,6 +305,7 @@ impl GoldenTable {
             | Self::LongMorV2Compacted100k
             | Self::LongMorV3Compacted100k
             | Self::OrderedCompacted100k
+            | Self::OrderedRolled100k
             | Self::OrderedAppended100k
             | Self::OrderedOverlap100k
             | Self::OrderedMergeV2_100k
@@ -323,6 +332,7 @@ impl fmt::Display for GoldenTable {
             Self::LongMorV2Compacted100k => "long_mor_v2_compacted_100k",
             Self::LongMorV3Compacted100k => "long_mor_v3_compacted_100k",
             Self::OrderedCompacted100k => "ordered_compacted_100k",
+            Self::OrderedRolled100k => "ordered_rolled_100k",
             Self::OrderedAppended100k => "ordered_appended_100k",
             Self::OrderedOverlap100k => "ordered_overlap_100k",
             Self::OrderedMergeV2_100k => "ordered_merge_v2_100k",
@@ -467,6 +477,7 @@ fn is_merged(table: GoldenTable) -> bool {
         | GoldenTable::LongMorV2Compacted100k
         | GoldenTable::LongMorV3Compacted100k
         | GoldenTable::OrderedCompacted100k
+        | GoldenTable::OrderedRolled100k
         | GoldenTable::OrderedAppended100k
         | GoldenTable::OrderedOverlap100k
         | GoldenTable::OrderedString100k => false,
@@ -480,6 +491,7 @@ pub fn ordered_key(table: GoldenTable, id: u64) -> Key {
     match table {
         GoldenTable::OrderedOverlap100k => permuted_key(id),
         GoldenTable::OrderedCompacted100k
+        | GoldenTable::OrderedRolled100k
         | GoldenTable::OrderedAppended100k
         | GoldenTable::OrderedMergeV2_100k
         | GoldenTable::OrderedMergeV3_100k
@@ -611,7 +623,7 @@ mod tests {
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
 
     /// Every table, beside the name the recipe writes it under.
-    const NAMES: [(GoldenTable, &str); 19] = [
+    const NAMES: [(GoldenTable, &str); 20] = [
         (GoldenTable::Long2m, "long_2m"),
         (GoldenTable::Str2m, "str_2m"),
         (GoldenTable::Bin16_500k, "bin16_500k"),
@@ -631,6 +643,7 @@ mod tests {
             "long_mor_v3_compacted_100k",
         ),
         (GoldenTable::OrderedCompacted100k, "ordered_compacted_100k"),
+        (GoldenTable::OrderedRolled100k, "ordered_rolled_100k"),
         (GoldenTable::OrderedAppended100k, "ordered_appended_100k"),
         (GoldenTable::OrderedOverlap100k, "ordered_overlap_100k"),
         (GoldenTable::OrderedMergeV2_100k, "ordered_merge_v2_100k"),

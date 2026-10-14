@@ -25,6 +25,7 @@ use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MERGE_KEY_IDS, MOR_DELETED_IDS,
     MOR_UPDATED_IDS, ORDERED_KEYS, ORDERED_ROWS_PER_KEY, OrderedRow, WIDE_REPEATS,
 };
+use icetray_testkit::keys::KEY_STEP;
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, SeenPages};
 use icetray_testkit::{Result, TestScan, absent_key_from, scan_model};
@@ -817,9 +818,9 @@ const SHORT_LIMIT: u32 = 7;
 const PAGE_LIMIT: u32 = 5;
 
 /// The key indexes whose Scans an ordered table is checked on: a stride
-/// through the table, its last key, and the ends and just beyond of the
-/// keys a MERGE changes.
-fn ordered_sample() -> BTreeSet<u64> {
+/// through the table, its last key, the ends and just beyond of the keys a
+/// MERGE changes, and `extra`.
+fn ordered_sample(extra: &BTreeSet<u64>) -> BTreeSet<u64> {
     let mut ids: BTreeSet<u64> = (0..ORDERED_KEYS).step_by(ORDERED_SAMPLE_STRIDE).collect();
     ids.insert(ORDERED_KEYS - 1);
     ids.extend([
@@ -828,6 +829,7 @@ fn ordered_sample() -> BTreeSet<u64> {
         MERGE_KEY_IDS.end - 1,
         MERGE_KEY_IDS.end,
     ]);
+    ids.extend(extra);
     ids
 }
 
@@ -900,16 +902,19 @@ fn ordered_bounds(table: GoldenTable, id: u64, scan: &TestScan) -> ScanBounds {
     }
 }
 
-/// Every sampled key of `table` answers every Scan of `ordered_scans` in
-/// every tier as the derivation says, and a key the table lacks answers
-/// nothing.
-async fn assert_ordered_scans_match_the_derivation(table: GoldenTable) -> Result<()> {
+/// Every sampled key of `table`, and the key indexes in `extra`, answers
+/// every Scan of `ordered_scans` in every tier as the derivation says, and a
+/// key the table lacks answers nothing.
+async fn assert_ordered_scans_match_the_derivation(
+    table: GoldenTable,
+    extra: &BTreeSet<u64>,
+) -> Result<()> {
     let scratch = tempfile::tempdir()?;
     let mut compared = 0_u64;
     let (mut cut, mut empty) = (0_u64, 0_u64);
     for residency in ORDERED_TIERS {
         let served = open_in(table, residency, scratch.path()).await?;
-        for id in ordered_sample() {
+        for id in ordered_sample(extra) {
             let key = golden::ordered_key(table, id);
             let rows = golden::ordered_rows(table, id);
             for scan in ordered_scans(&rows) {
@@ -958,43 +963,53 @@ async fn assert_ordered_scans_match_the_derivation(table: GoldenTable) -> Result
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_compacted_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedCompacted100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedCompacted100k, &BTreeSet::new())
+        .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_appended_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedAppended100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedAppended100k, &BTreeSet::new())
+        .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_overlap_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedOverlap100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedOverlap100k, &BTreeSet::new())
+        .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_merge_v2_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV2_100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV2_100k, &BTreeSet::new())
+        .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_merge_v3_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV3_100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV3_100k, &BTreeSet::new())
+        .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_merge_v3_compacted_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV3Compacted100k).await
+    assert_ordered_scans_match_the_derivation(
+        GoldenTable::OrderedMergeV3Compacted100k,
+        &BTreeSet::new(),
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_string_scans_match_the_derived_rows() -> Result<()> {
-    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedString100k).await
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedString100k, &BTreeSet::new())
+        .await
 }
 
 /// The ordered tables a sorting compaction rewrote last, one file a bucket.
@@ -1121,10 +1136,10 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
         let report = golden.report();
         let buckets = usize::try_from(table.buckets()).unwrap();
         assert_eq!(report.summary.level, Level::Permissive, "{table}");
-        let capping = codes_of(&report);
-        assert!(
-            capping.contains(&FindingCode::OverlappingFiles),
-            "{table} {capping:?}"
+        assert_eq!(
+            codes_of(&report),
+            [FindingCode::OverlappingFiles],
+            "{table}"
         );
         assert_eq!(
             golden.current().overlapping_buckets().len(),
@@ -1194,11 +1209,7 @@ async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Re
     let report = golden.report();
     let generation = golden.current();
     assert_eq!(report.summary.level, Level::Permissive);
-    let capping = codes_of(&report);
-    assert!(
-        capping.contains(&FindingCode::OverlappingFiles),
-        "{capping:?}"
-    );
+    assert_eq!(codes_of(&report), [FindingCode::OverlappingFiles]);
     assert!(
         report.summary.max_files_per_bucket > 1,
         "dev/golden-tables.py writes ordered_overlap_100k with skew splitting and a \
@@ -1219,5 +1230,103 @@ async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Re
         .expect("the table has files");
     assert!(deepest > 1, "overlapping files share a key range");
     assert_eq!(report.summary.lookup_cost.files_probed, deepest);
+    Ok(())
+}
+
+/// The key indexes of the keys two files of one bucket share as an edge: one
+/// file's greatest key is the next file's least.
+fn shared_edge_ids(golden: &Golden) -> BTreeSet<u64> {
+    let generation = golden.current();
+    let mut ids = BTreeSet::new();
+    for (index, file) in generation.files.iter().enumerate() {
+        let (_, greatest) = file.index.key_range();
+        let sharing = generation.files[index + 1..]
+            .iter()
+            .filter(|other| other.entry.bucket == file.entry.bucket)
+            .filter(|other| other.index.key_range().0 == greatest);
+        if sharing.count() > 0 {
+            let Key::Long(value) = greatest else {
+                panic!("an ordered golden table has long keys, got {greatest}");
+            };
+            ids.insert(u64::try_from(*value).expect("a golden key is not negative") / KEY_STEP);
+        }
+    }
+    ids
+}
+
+/// A compaction that rolls each bucket by size writes several files whose
+/// key ranges meet where the sort cut them, inside a key's run: `balanced`
+/// under `shared_edge_keys`, and no more. A Scan of a shared edge key reads
+/// both files that hold it and still answers as the derivation says.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_rolled_is_balanced_for_shared_edge_keys() -> Result<()> {
+    let table = GoldenTable::OrderedRolled100k;
+    let golden = open_golden(table, false).await?;
+    let report = golden.report();
+    assert_eq!(report.summary.level, Level::Balanced);
+    assert_eq!(codes_of(&report), [FindingCode::SharedEdgeKeys]);
+    assert!(
+        report.summary.max_files_per_bucket > 1,
+        "dev/golden-tables.py compacts ordered_rolled_100k with a target file size below \
+         a bucket's bytes, so each bucket rolls into several files; regenerate the table"
+    );
+    assert!(
+        golden.current().overlapping_buckets().is_empty(),
+        "rolled files meet at edge keys and overlap nowhere"
+    );
+    let edges = shared_edge_ids(&golden);
+    assert!(!edges.is_empty(), "the compaction shares edge keys");
+    let generation = golden.current();
+    for &id in &edges {
+        let key = golden::ordered_key(table, id);
+        let two_files = 2;
+        assert_eq!(
+            generation.candidates(&key).count(),
+            two_files,
+            "edge key {key}"
+        );
+    }
+    assert_ordered_scans_match_the_derivation(table, &edges).await
+}
+
+/// The MERGE's deletes are what the table's format version records: Parquet
+/// position delete files naming no data file in version 2, deletion vectors
+/// in Puffin files, each naming its data file, in version 3. Each holds the
+/// rows the MERGE matched, one file for each bucket's base file.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_merge_records_the_deletes_of_its_format_version() -> Result<()> {
+    let merged_keys = MERGE_KEY_IDS.end - MERGE_KEY_IDS.start;
+    let matched_rows = merged_keys * (ORDERED_ROWS_PER_KEY / golden::MERGE_UPDATE_EVERY);
+    let tables = [
+        (GoldenTable::OrderedMergeV2_100k, DataFileFormat::Parquet),
+        (GoldenTable::OrderedMergeV3_100k, DataFileFormat::Puffin),
+    ];
+    for (table, format) in tables {
+        let golden = open_golden(table, false).await?;
+        let deletes = listed_deletes(&golden).await?;
+        assert_eq!(
+            deletes.len(),
+            usize::try_from(table.buckets()).unwrap(),
+            "{table}"
+        );
+        for delete in &deletes {
+            let path = delete.file_path();
+            assert_eq!(
+                delete.content_type(),
+                DataContentType::PositionDeletes,
+                "{table} {path}"
+            );
+            assert_eq!(delete.file_format(), format, "{table} {path}");
+            assert_eq!(
+                delete.referenced_data_file().is_some(),
+                format == DataFileFormat::Puffin,
+                "{table} {path}"
+            );
+        }
+        let listed_rows: u64 = deletes.iter().map(DataFile::record_count).sum();
+        assert_eq!(listed_rows, matched_rows, "{table}");
+    }
     Ok(())
 }

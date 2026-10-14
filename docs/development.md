@@ -69,7 +69,17 @@ image, which carries Java 21, so the host needs a container runtime
 optimal layout), `--only off-contract` (the other layouts), `--only mor`
 (the merge-on-read tables), or `--only ordered` (the ordered tables, about
 100 MB together) writes one group, and `--only` with a table's name writes
-that table alone: `--only long_2m` writes about 80 MB. The recipe also
+that table alone: `--only long_2m` writes about 80 MB.
+Three ordered tables set a writer property the others leave at the recipe's
+contract value, each to produce the layout it exists to test:
+`ordered_overlap_100k` lowers `write.spark.advisory-partition-size-bytes` to
+1 MiB, since skew splitting never cuts a bucket of 100,000 small rows at
+Iceberg's own size; `ordered_string_100k` sets
+`parquet.columnindex.truncate.length` to 64, the writer's default, since the
+contract's 256 would not cut its 80-byte order values; and
+`ordered_rolled_100k` compacts with a `target-file-size-bytes` of 512 KiB,
+about a quarter of a bucket, so each bucket rolls into several files that
+share edge keys. The recipe also
 runs on the host with PySpark 4.1 and Java 17 or later, and writes to any
 object store or local directory:
 
