@@ -13,16 +13,16 @@ The key-value path was compared in 30 cells, p50 on one task and
 throughput on eleven, for five scenarios in three tiers. In 27 the two
 binaries' ranges overlap, and the medians move by at most 5.3%, the
 throughput of a 100-key MultiGet in the Disk tier on eleven tasks, which
-rose. Three fall outside the spread, and the two on the slow side were
-run again:
+rose. Three fall outside the spread, and the two slow-side comparisons
+were run again:
 
 - The Full-tier warm hit on one task: every after run is faster than
   every before run, by 1 ns at the closest (12.541 against 12.542 µs).
-- A 1,000-key MultiGet in the Bloom tier on one task takes 0.4% longer
-  (10 µs on 2.64 ms). The second set reproduced it at 0.8%, and after the
-  allocation fix three more sets measured it 0.6% slower over nine runs
-  per binary, outside the spread in one of the three. It is the one
-  slowdown that reproduced.
+- A 1,000-key MultiGet in the Bloom tier on one task took 0.4% longer
+  (10 µs on 2.64 ms) at `a126a1c`, and 0.8% longer in the second set.
+  After the allocation fix three more sets measured it 0.6% slower over
+  nine runs per binary, outside the spread in one of the three (+0.45%,
+  +0.65%, −0.09%), which does not establish a slowdown.
 - Cold-hit throughput in the Bloom tier on eleven tasks fell 3.8% in the
   first set. The second set did not reproduce it (0.6% lower, within its
   spread).
@@ -110,7 +110,9 @@ as well, 123.4 µs. A MultiScan of 10 keys costs 24 µs a key warm, and
   long table in every tier on one task, three runs per binary,
   alternating; then `multi-get-1000` on one task in the Bloom tier, and
   again in the Full and Bloom tiers, three runs per binary each,
-  alternating.
+  alternating. Only the one-task bytes per operation and the Bloom-tier
+  MultiGet of 1,000 keys come from this set; every other table reports
+  the first set, at `a126a1c`.
 
 The runs are reproduced from a checkout of the after commit. The before
 binary is built in a worktree of `97f39af`, and runs from there, so its
@@ -184,15 +186,15 @@ Throughput on 11 tasks, operations a second (a MultiGet's are batches):
 | MultiGet 1,000 | Disk | 112 (102–116) | 109 (105–111) | |
 | MultiGet 1,000 | Bloom | 465 (453–466) | 466 (449–471) | |
 
-The two comparisons outside the spread, run again:
+The two slow-side comparisons outside the spread, run again:
 
 | comparison | first set, before → after | second set, before → after |
 |---|--:|--:|
 | MultiGet 1,000, Bloom, 1 task, p50 | 2.638 (2.631–2.638) → 2.647 (2.644–2.657) ms, +0.4% | 2.638 (2.631–2.650) → 2.658 (2.653–2.675) ms, +0.8% |
 | cold hit, Bloom, 11 tasks, ops/s | 28,680 (28,434–28,710) → 27,599 (27,560–28,364), −3.8% | 28,667 (28,603–28,742) → 28,495 (27,151–28,658), −0.6% |
 
-The Bloom-tier MultiGet of 1,000 keys is slower after the change in both
-sets: all six after runs take 2.644 ms or more, and five of the six
+The Bloom-tier MultiGet of 1,000 keys measured slower at `a126a1c` in
+both sets: all six after runs take 2.644 ms or more, and five of the six
 before runs take 2.638 ms or less. The difference is 10 to 20 µs a
 batch, 10 to 20 ns a key. The same batch in the Full tier did not move
 (2.54 ms in both). The Bloom-tier cold hit on eleven tasks fell outside
@@ -210,9 +212,10 @@ the allocation fix, p50 in ms:
 | all nine runs | 2.638 (2.630–2.661) | 2.653 (2.642–3.143) | +0.6% |
 
 Every after run takes longer than 2.641 ms, and six of the nine before
-runs take 2.641 ms or less, so the slowdown of about 15 ns a key remains
-with the allocated bytes restored. The larger futures do not account for
-it, and these runs do not identify its cause. The Full-tier batch stays
+runs take 2.641 ms or less. The pooled medians differ by 0.6%, about
+15 ns a key, with the ranges outside the spread in one of the three sets
+(+0.45%, +0.65%, −0.09%), which does not establish a slowdown. The
+Full-tier batch stays
 within the spread: 2.548 ms before and 2.543 after among the other
 scenarios, and 2.559 before and 2.544 after beside the Bloom-tier batch.
 
@@ -241,9 +244,10 @@ about 290 bytes more, and each page a cold read fetches about 8 KiB
 more (0.99 page fetches per cold hit, 1.99 in the Bloom tier), in
 allocations that already existed. A miss, which reads only the key page,
 was unchanged then and was not measured again. At `22b04dc` the
-differences are at most 9 bytes for a one-key call and under a byte per
-key of a MultiGet, the size of the variation between runs of one binary,
-which the rare allocations inside a window move. GETs and local reads
+differences are at most 9 bytes for a one-key call and at most about
+1 byte per key of a MultiGet, of the size by which the before runs vary
+among themselves: up to 210 bytes for a 100-key MultiGet and 985 bytes
+for a 1,000-key one, both in the Disk tier. GETs and local reads
 per operation are the same in every scenario and build.
 
 A bisection of the branch, with an exact-size histogram of the
@@ -311,8 +315,9 @@ A Disk-tier Scan makes about two local reads warm or cold and takes
 38.4 µs warm against 20.5 µs in the Full tier; the inference, without a
 profile, is that the local reads make most of the difference. On eleven
 tasks the Disk tier serves about 49,000 Scans a second, about 102,000
-local reads, against 130,000 to 135,000 local reads a second for a
-Disk-tier Get, which makes one (the warm hit and the miss above). The
+local reads, against 131,000 to 137,000 local reads a second for a
+Disk-tier Get, which makes one (the medians of the warm hit and the miss
+above). The
 performance sweep traced a Disk-tier Get's ceiling near 135,000 a second
 to the handoff of each local read to the blocking pool
 ([the performance sweep](2026-09-26-performance-sweep.md)). The Scan's
@@ -359,15 +364,17 @@ than 2,000,000. A Disk-tier load that reuses the chunk files takes
 
 The key-value path keeps its latency and throughput within the run-to-run
 spread of this host in every comparison but one, the Bloom-tier MultiGet
-of 1,000 keys on one task: 0.4 to 0.8% slower in the first two sets, and
-0.6% slower over nine runs per binary after the allocation fix. Its cause
-is not identified; it is a finding for the maintainer to weigh against
-RFD 025's statement that a key-value table keeps its cost per call. The
-path keeps its allocation counts, GETs, and local reads exactly, and at
+of 1,000 keys on one task: 0.4 to 0.8% slower at `a126a1c` in the first
+two sets, and after the allocation fix 0.6% slower over nine runs per
+binary, outside the spread in one of three sets (+0.45%, +0.65%,
+−0.09%), which does not establish a slowdown. The path keeps its allocation counts, GETs, and local reads exactly, and at
 `22b04dc` its allocated bytes per call as well. The bytes are
 deterministic, so any build can check them with the bench's allocation
 counter, and the two size tests fail on a wrapper of the kind that grew
-them.
+them. The one-task p50 and eleven-task throughput tables, the Scan and
+MultiScan table, and the load table are the first set's, at `a126a1c`,
+before the fix; only the one-task bytes per operation and the Bloom-tier
+MultiGet of 1,000 keys were measured again at `22b04dc`.
 
 An idle ordered table beside the key-value one costs the key-value calls
 nothing these runs resolve. A Scan load running beside them would share
