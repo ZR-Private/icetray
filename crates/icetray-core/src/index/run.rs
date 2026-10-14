@@ -256,7 +256,8 @@ impl FileIndex {
     /// the bounds, outside them, or across one (`ValueRange::fit`); a page
     /// at the run's edge holds a neighbouring key's values too, which widen
     /// its entry, so it is judged by the page beside it where that one holds
-    /// the run alone, and kept where nothing rules it out (`pieces`). From
+    /// the run alone under an integer entry, which a writer never
+    /// truncates, and kept where nothing rules it out (`pieces`). From
     /// the direction's end the rows of pages outside are passed over, the
     /// live rows of pages across a bound are read without counting, and
     /// the live rows of pages inside count until `limit` are taken, then the
@@ -374,8 +375,10 @@ impl FileIndex {
     /// each with where the page's values lie against `cut`: by the page's
     /// column index entry, and for a page at an edge of the run, which
     /// holds a neighbouring key's rows too, also by the next or previous
-    /// page where that one holds the run's rows alone, since the run
-    /// ascends by order value (`ValueRange::after_page`).
+    /// page where that one holds the run's rows alone and its entry is an
+    /// integer one, since the run ascends by order value; a byte-array
+    /// entry may be truncated and bounds its own page alone
+    /// (`ValueRange::after_page`).
     fn pieces(&self, run: &Run, order: OrderLeaf, cut: Cut<'_>) -> Vec<Piece> {
         let mut pages = Vec::new();
         for part in &run.parts {
@@ -773,7 +776,7 @@ mod tests {
     use crate::config::{HedgeConfig, Residency};
     use crate::generation::testing::{self as generation_testing, cache};
     use crate::index::testing::{
-        EXTRA_COLUMN, Fixture, ORDER_FIELD_ID, Opened, long_orders, ordered_layout, store,
+        EXTRA_COLUMN, Fixture, ORDER_FIELD_ID, Opened, Orders, long_orders, ordered_layout, store,
         store_gauged, value_for,
     };
     use crate::key::KeyType;
@@ -831,7 +834,18 @@ mod tests {
         dir: &Path,
         extra: usize,
     ) -> FileIndex {
-        let mut layout = ordered_layout(KeyType::Long, OrderType::Long);
+        index_of_type(opened, residency, dir, extra, OrderType::Long).await
+    }
+
+    /// `index_in` with an order column of `order_type`.
+    async fn index_of_type(
+        opened: &Opened,
+        residency: Residency,
+        dir: &Path,
+        extra: usize,
+        order_type: OrderType,
+    ) -> FileIndex {
+        let mut layout = ordered_layout(KeyType::Long, order_type);
         for at in 0..extra {
             let field_id = EXTRA_FIELD_ID + i32::try_from(at).unwrap();
             layout
@@ -1522,6 +1536,128 @@ mod tests {
         assert_eq!(counted, [1, 1, 1], "each column's GET counted once");
         assert_eq!(gauged.high_water(), 1);
         assert_eq!(fan_out.available_permits(), 1, "every permit is back");
+    }
+
+    /// Bytes every byte-array order value of `prefixed_run` shares: longer
+    /// than `TRUNCATED_INDEX_BYTES`, so every truncated column index entry
+    /// of the order column is one and the same prefix, its maximum that
+    /// prefix incremented, above every value of the column.
+    const SHARED_PREFIX_BYTES: usize = 32;
+    /// The column index truncation of `prefixed_run`.
+    const TRUNCATED_INDEX_BYTES: usize = 16;
+    /// The byte the shared prefix repeats.
+    const PREFIX_BYTE: u8 = b'p';
+    /// Rows of key 2's run in `prefixed_run`.
+    const PREFIXED_RUN_ROWS: usize = 30;
+
+    /// The `j`th byte-array order value of a run in `prefixed_run`: the
+    /// shared prefix, then `j` in four digits, ascending with `j`.
+    fn prefixed(j: usize) -> Vec<u8> {
+        let mut value = vec![PREFIX_BYTE; SHARED_PREFIX_BYTES];
+        value.extend_from_slice(format!("{j:04}").as_bytes());
+        value
+    }
+
+    /// The order value `bytes` travel as under `order_type`.
+    fn travelling(order_type: OrderType, bytes: Vec<u8>) -> OrderValue {
+        match order_type {
+            OrderType::String => OrderValue::Str(String::from_utf8(bytes).unwrap()),
+            OrderType::Int
+            | OrderType::Long
+            | OrderType::Date
+            | OrderType::Timestamp
+            | OrderType::TimestampTz
+            | OrderType::TimestampNs
+            | OrderType::TimestampTzNs
+            | OrderType::Binary
+            | OrderType::Fixed(_) => OrderValue::Bytes(bytes),
+        }
+    }
+
+    /// Key 2's run of `PREFIXED_RUN_ROWS` rows between one row each of keys
+    /// 1 and 3, in pages of `PAGE` in one row group, every key's `j`th row
+    /// ordered by `prefixed(j)`, with the column index truncated to
+    /// `truncate` bytes, `None` leaving it whole.
+    fn prefixed_run(truncate: Option<usize>) -> Fixture {
+        let runs = [(1, 1), (2, PREFIXED_RUN_ROWS), (3, 1)];
+        let mut keys = Vec::new();
+        let mut orders = Vec::new();
+        for (key, rows) in runs {
+            for j in 0..rows {
+                keys.push(key);
+                orders.push(Some(prefixed(j)));
+            }
+        }
+        let mut fixture = Fixture::ordered(&keys, Orders::Bytes(orders));
+        fixture.layout.page_rows = PAGE;
+        fixture.layout.write_batch = PAGE;
+        fixture.layout.row_group_rows = keys.len();
+        fixture.layout.truncate = truncate;
+        fixture
+    }
+
+    /// A bounded read of a string or binary order column, whole or under a
+    /// truncated column index, answers what the model does in both
+    /// directions: no row inside the bounds is dropped. A truncated entry
+    /// is a bound on its own page alone, never a page's exact extremes, so
+    /// a run-edge page beside it is not ruled out by it.
+    #[tokio::test]
+    async fn test_read_run_bounds_byte_array_orders_under_a_truncated_index() {
+        let limit = 3;
+        let last = PREFIXED_RUN_ROWS - 1;
+        for truncate in [Some(TRUNCATED_INDEX_BYTES), None] {
+            let opened = store(&prefixed_run(truncate)).await;
+            for order_type in [OrderType::String, OrderType::Binary] {
+                let value = |j: usize| travelling(order_type, prefixed(j));
+                // Newest first below the run's last value, and oldest first
+                // above its first: each bound sits on a run-edge page.
+                let cases = [
+                    (
+                        ScanBounds {
+                            before: Some(value(last)),
+                            ..bounds(Direction::NewestFirst)
+                        },
+                        vec![last - 1, last - 2, last - 3],
+                        last - 4,
+                    ),
+                    (
+                        ScanBounds {
+                            after: Some(value(0)),
+                            ..bounds(Direction::OldestFirst)
+                        },
+                        vec![1, 2, 3],
+                        4,
+                    ),
+                ];
+                for residency in Residency::ALL {
+                    let dir = tempfile::tempdir().unwrap();
+                    let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
+                    let reads = Reads::new().await;
+                    let run = index
+                        .locate_run(&Key::Long(2), reads.source())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    for (scan, taken, next) in &cases {
+                        let got = index
+                            .read_run(&run, scan, limit, &[0], &none_deleted, reads.source())
+                            .await
+                            .unwrap();
+                        let expected: Vec<_> = taken
+                            .iter()
+                            .map(|&j| {
+                                let row = FIRST_RUN_ROW + i64::try_from(j).unwrap();
+                                let value = Bytes::from(value_for(usize::try_from(row).unwrap()));
+                                (travelling(order_type, prefixed(j)), vec![Some(value)])
+                            })
+                            .collect();
+                        let case = format!("{residency} {order_type} {truncate:?} {scan:?}");
+                        assert_eq!(got.rows, expected, "{case}");
+                        assert_eq!(got.next, Some(value(*next)), "{case}");
+                    }
+                }
+            }
+        }
     }
 
     /// The futures `FileIndex` hands out for a Scan are `Send`, so a

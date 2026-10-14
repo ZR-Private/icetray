@@ -568,7 +568,7 @@ pub(super) enum PageFit {
 /// edge of a key's run holds a neighbouring key's values too, which its
 /// entry covers, so the run's own rows there are bounded more tightly by
 /// the run's next or previous page where that page holds the run alone
-/// (`after_page`, `before_page`).
+/// and its entry is exact, an integer one (`after_page`, `before_page`).
 #[derive(Clone, Copy, Default)]
 pub(super) struct ValueRange<'a> {
     low: Option<Side<'a>>,
@@ -581,6 +581,19 @@ pub(super) struct ValueRange<'a> {
 struct Side<'a> {
     value: Extreme<'a>,
     exclusive: bool,
+}
+
+impl Side<'_> {
+    /// Whether the side is a value some row holds, as an integer entry's
+    /// extremes are: a writer truncates only byte-array entries, whose
+    /// minimum may then be a prefix and whose maximum a prefix incremented,
+    /// bounds that no row holds.
+    fn exact(side: &Self) -> bool {
+        match side.value {
+            Extreme::Long(_) => true,
+            Extreme::Bytes(_) => false,
+        }
+    }
 }
 
 impl<'a> ValueRange<'a> {
@@ -605,9 +618,13 @@ impl<'a> ValueRange<'a> {
 
     /// This range for rows that follow, in a run ascending by order value,
     /// every row `earlier` bounds: above `earlier`'s greatest value, where
-    /// that is tighter than the least this range knows.
+    /// that is tighter than the least this range knows. Only an integer
+    /// entry's greatest value is one a row holds; a byte-array entry may be
+    /// truncated, its greatest value then above every value of its page
+    /// (`Side::exact`), so it rules nothing out beyond its own page and this
+    /// range is left as it is.
     pub(super) fn after_page(self, earlier: Self) -> Self {
-        let Some(bound) = earlier.high else {
+        let Some(bound) = earlier.high.filter(Side::exact) else {
             return self;
         };
         let raised = Side {
@@ -626,9 +643,11 @@ impl<'a> ValueRange<'a> {
 
     /// This range for rows that precede every row `later` bounds: below
     /// `later`'s least value, where that is tighter than the greatest this
-    /// range knows.
+    /// range knows; only from an integer entry, as for `after_page`, since a
+    /// truncated byte-array entry's least value is a prefix below its
+    /// page's values.
     pub(super) fn before_page(self, later: Self) -> Self {
-        let Some(bound) = later.low else {
+        let Some(bound) = later.low.filter(Side::exact) else {
             return self;
         };
         let lowered = Side {
