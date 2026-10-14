@@ -68,8 +68,8 @@ use crate::keys::{
 use crate::layout::{KEY_COLUMN, Layout, VALUE_COLUMN};
 use crate::merge_oracle::{MergeOracle, RowCopy};
 use crate::ordered::{
-    LiveRows, ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, RowId, ScanRows, TestScan,
-    row_value, scan_model,
+    LiveRows, ORDER_COLUMN, ORDER_FIELD_ID, Ordered, RowId, ScanRows, TestScan, row_value,
+    scan_model,
 };
 use crate::protobuf;
 use crate::s3::S3Fixture;
@@ -897,9 +897,10 @@ impl Fixture {
     }
 
     /// A configuration serving this fixture's main branch in `residency`
-    /// from the pinned source, every value column the spec wrote opaque; a
-    /// caller that follows the root or a catalog overrides `source`. No
-    /// resident-bytes budget.
+    /// from the pinned source, every value column the spec wrote opaque and,
+    /// for an ordered fixture, `ORDER_COLUMN` as the order column at the
+    /// default `max_scan_rows`; a caller that follows the root or a catalog
+    /// overrides `source`. No resident-bytes budget.
     pub fn config(&self, residency: Residency, strict: bool) -> TableConfig {
         self.config_with_budget(residency, strict, None)
     }
@@ -921,6 +922,8 @@ impl Fixture {
             r#ref: MAIN_BRANCH.to_string(),
             key_column: KEY_COLUMN.to_string(),
             value_columns,
+            order_column: self.spec.ordered.map(|_| ORDER_COLUMN.to_string()),
+            max_scan_rows: None,
             strict,
             lookups: None,
             residency,
@@ -1885,7 +1888,7 @@ pub async fn write_fixture(
         Columns {
             value: PrimitiveType::Binary,
             second: spec.second_value,
-            order: spec.ordered.map(|ordered| ordered.kind),
+            order: spec.ordered.map(|ordered| ordered.kind.primitive()),
         },
         spec.buckets,
         spec.format_version,
@@ -1899,14 +1902,14 @@ pub async fn write_fixture(
 
 /// The columns `create_table` gives a table beside its key: `VALUE_COLUMN`
 /// of `value`'s type, `SECOND_VALUE_COLUMN` when `second` is set, and the
-/// order column when `order` names a kind.
+/// order column when `order` names its type.
 struct Columns {
     /// The Iceberg type of `VALUE_COLUMN`.
     value: PrimitiveType,
     /// Whether the table also holds `SECOND_VALUE_COLUMN`.
     second: bool,
-    /// The type of the order column, which follows the key.
-    order: Option<OrderKind>,
+    /// The type of the order column, which follows the value columns.
+    order: Option<PrimitiveType>,
 }
 
 /// Creates a table whose key and value columns have the given Iceberg types
@@ -1923,17 +1926,62 @@ pub async fn write_table_of_types(
     buckets: u32,
     file: RawFile,
 ) -> Result<Fixture> {
+    let columns = Columns {
+        value,
+        second: false,
+        order: None,
+    };
+    write_raw_table(catalog, namespace, name, key, columns, buckets, file).await
+}
+
+/// Creates an unbucketed table of a long `KEY_COLUMN`, a binary
+/// `VALUE_COLUMN`, and an order column `ORDER_COLUMN` of type `order`, and
+/// commits one raw data file, for the order columns icetray refuses by
+/// their type or by the Parquet type a file stores them in (RFD 025). The
+/// fixture's spec is a key-value one, so a caller serves it as an ordered
+/// table by setting `order_column` on its configuration.
+pub async fn write_ordered_table_of_types(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    name: &str,
+    order: PrimitiveType,
+    file: RawFile,
+) -> Result<Fixture> {
+    let columns = Columns {
+        value: PrimitiveType::Binary,
+        second: false,
+        order: Some(order),
+    };
+    write_raw_table(
+        catalog,
+        namespace,
+        name,
+        PrimitiveType::Long,
+        columns,
+        0,
+        file,
+    )
+    .await
+}
+
+/// Creates a table of `key` and `columns` under `buckets` and commits the
+/// raw data file `file`, as `write_table_of_types` documents.
+async fn write_raw_table(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    name: &str,
+    key: PrimitiveType,
+    columns: Columns,
+    buckets: u32,
+    file: RawFile,
+) -> Result<Fixture> {
     let key_type = KeyType::from_iceberg(&Type::Primitive(key.clone())).unwrap_or(KeyType::Binary);
     let (table, ident) = create_table(
         catalog,
         namespace,
         name,
         key,
-        Columns {
-            value,
-            second: false,
-            order: None,
-        },
+        columns,
         buckets,
         FormatVersion::V2,
     )
@@ -2000,11 +2048,9 @@ async fn create_table(
     } else {
         SECOND_VALUE_FIELD_ID
     };
+    let ordered = values.order.is_some();
     if let Some(order) = values.order {
-        fields.push(
-            NestedField::optional(order_id, ORDER_COLUMN, Type::Primitive(order.primitive()))
-                .into(),
-        );
+        fields.push(NestedField::optional(order_id, ORDER_COLUMN, Type::Primitive(order)).into());
     }
     let schema = Schema::builder()
         .with_schema_id(SCHEMA_ID)
@@ -2022,7 +2068,7 @@ async fn create_table(
     sort_order.with_order_id(SORT_ORDER_ID);
     for source_id in [KEY_FIELD_ID]
         .into_iter()
-        .chain(values.order.map(|_| order_id))
+        .chain(ordered.then_some(order_id))
     {
         sort_order.with_sort_field(
             SortField::builder()

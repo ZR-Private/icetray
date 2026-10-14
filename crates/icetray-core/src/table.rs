@@ -1223,7 +1223,7 @@ impl Table {
     }
 
     /// Whether `config`, an entry that differs from the table's in
-    /// `lookups`, `strict`, and value column formats alone
+    /// `lookups`, `strict`, value column formats, and `max_scan_rows` alone
     /// (`TableConfig::same_but_tuning`), can be applied in place: a
     /// `lookups` the residency cannot reach is refused as a load refuses it
     /// (`TableConfig::check_reachable`), a format the serving layout's type
@@ -1248,9 +1248,11 @@ impl Table {
     }
 
     /// Applies `config`, which `judge_retune` admitted under the same held
-    /// `serial`, in place (RFD 020, RFD 024): the serving generation keeps
-    /// serving and nothing is read, and the next lookup checks its field
-    /// lists against the new formats. The level gauges declare the new
+    /// `serial`, in place (RFD 020, RFD 024, RFD 025): the serving
+    /// generation keeps serving and nothing is read, the next lookup checks
+    /// its field lists against the new formats, and the next Scan reads up
+    /// to the new `max_scan_rows`, which validation held within
+    /// `max_multi_scan_values`. The level gauges declare the new
     /// `lookups` at once, against the newest measured snapshot's level,
     /// which a retune does not change. Every remembered refusal is
     /// forgotten, and logged as forgotten: the known location becomes the

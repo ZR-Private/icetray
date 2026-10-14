@@ -8,7 +8,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    ArrayRef, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::Catalog;
 use iceberg::spec::{DataFile, DataFileFormat, PrimitiveType, Struct};
@@ -21,20 +24,21 @@ use icetray_core::config::{
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, Capping, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType, Level, LocalDir,
-    RefusalReason, Row, Storage, TableSource, TableState, UnsupportedDelete, UnsupportedFormat,
-    bucket,
+    Budget, Capping, ColumnMismatch, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType,
+    Level, LocalDir, OrderType, RefusalReason, Row, Storage, TableSource, TableState,
+    UnsupportedDelete, UnsupportedFormat, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
-    STRAY_IDS, TINY_BUDGET, TWO_BUCKETS, data_file_entry, equality_delete_file, local_catalog,
-    position_delete_file, residue_class, write_table_of_types,
+    STRAY_IDS, SchemaChange, StatedDefault, TINY_BUDGET, TWO_BUCKETS, data_file_entry,
+    equality_delete_file, local_catalog, position_delete_file, residue_class,
+    write_ordered_table_of_types, write_table_of_types,
 };
 use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS};
 use icetray_testkit::{
-    Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, Order,
-    RawFile, Result, TestkitError, value_for, write_fixture,
+    Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle,
+    ORDER_COLUMN, Order, RawFile, Result, TestkitError, value_for, write_fixture,
 };
 
 /// The long keys of a raw file, ascending, and the same values as their
@@ -42,6 +46,11 @@ use icetray_testkit::{
 const RAW_KEYS: [i64; 3] = [0, 3, 6];
 const RAW_STRING_KEYS: [&str; 3] = ["a", "b", "c"];
 const RAW_INT_KEYS: [i32; 3] = [0, 3, 6];
+/// The order values of a raw file's three rows, one per key, as longs, as
+/// ints, and as doubles for an order column of a type icetray refuses.
+const RAW_ORDERS: [i64; 3] = [10, 20, 30];
+const RAW_INT_ORDERS: [i32; 3] = [10, 20, 30];
+const RAW_DOUBLE_ORDERS: [f64; 3] = [0.5, 1.5, 2.5];
 
 /// The position of the null in the null-key raw file.
 const NULL_KEY_AT: usize = 1;
@@ -1002,6 +1011,171 @@ async fn test_lookups_its_residency_cannot_reach_is_a_config_violation() -> Resu
         ),
         "{:?}",
         served.table.state()
+    );
+    Ok(())
+}
+
+/// A raw file of `RAW_KEYS`, their values, and `orders` as the order
+/// column `ORDER_COLUMN`, one row per key, under the contract layout with
+/// no manifest bounds.
+fn ordered_raw_file(orders: ArrayRef) -> Result<RawFile> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(KEY_COLUMN, DataType::Int64, false),
+        Field::new(VALUE_COLUMN, DataType::Binary, true),
+        Field::new(ORDER_COLUMN, orders.data_type().clone(), true),
+    ]));
+    let key: ArrayRef = Arc::new(Int64Array::from(RAW_KEYS.to_vec()));
+    let value: ArrayRef = Arc::new(BinaryArray::from_iter_values(raw_values()));
+    let batch = RecordBatch::try_new(schema, vec![key, value, orders])?;
+    RawFile::from_batch(RAW_FILE, &batch, &Layout::contract(), Struct::empty(), None)
+}
+
+/// `fixture`'s configuration in the Full tier as an ordered table over
+/// `ORDER_COLUMN`.
+fn ordered_config(fixture: &Fixture) -> TableConfig {
+    TableConfig {
+        order_column: Some(ORDER_COLUMN.to_string()),
+        ..fixture.config(Residency::Full, false)
+    }
+}
+
+/// The schema refuses before any file is read: a `double` is no order
+/// type (RFD 025).
+#[tokio::test]
+async fn test_order_type_unsupported_is_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let raw = ordered_raw_file(Arc::new(Float64Array::from(RAW_DOUBLE_ORDERS.to_vec())))?;
+    let fixture = write_ordered_table_of_types(
+        catalog.as_ref(),
+        NAMESPACE,
+        "ord_double",
+        PrimitiveType::Double,
+        raw,
+    )
+    .await?;
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::OrderTypeUnsupported {
+            column: ORDER_COLUMN.to_string(),
+            got: PrimitiveType::Double.to_string(),
+        }
+    );
+    assert_eq!(
+        refused.storage.stats().gets(),
+        METADATA_FILE_GETS,
+        "refused from the metadata file alone"
+    );
+    Ok(())
+}
+
+/// A `timestamp` order column a file stores in milliseconds is in another
+/// unit than Iceberg's microseconds, so its values would compare wrong
+/// against every other file's (RFD 025).
+#[tokio::test]
+async fn test_order_type_mismatch_is_refused_for_millisecond_timestamps() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let raw = ordered_raw_file(Arc::new(TimestampMillisecondArray::from(
+        RAW_ORDERS.to_vec(),
+    )))?;
+    let fixture = write_ordered_table_of_types(
+        catalog.as_ref(),
+        NAMESPACE,
+        "ord_millis",
+        PrimitiveType::Timestamp,
+        raw,
+    )
+    .await?;
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    let RefusalReason::OrderTypeMismatch {
+        path,
+        expected: OrderType::Timestamp,
+        ..
+    } = &refused.reason
+    else {
+        panic!("{:?}", refused.reason);
+    };
+    assert!(
+        fixture.files().iter().any(|file| file.file_path() == path),
+        "{path} is the raw file"
+    );
+    Ok(())
+}
+
+/// A file written before Iceberg promoted the order column from `int` to
+/// `long` stores it as `INT32`; it is served, its values read as longs
+/// (RFD 025).
+#[tokio::test]
+async fn test_int_order_promoted_to_long_is_served() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let raw = ordered_raw_file(Arc::new(Int32Array::from(RAW_INT_ORDERS.to_vec())))?;
+    let fixture = write_ordered_table_of_types(
+        catalog.as_ref(),
+        NAMESPACE,
+        "ord_promoted",
+        PrimitiveType::Long,
+        raw,
+    )
+    .await?;
+    let served = verify::serve(
+        ordered_config(&fixture),
+        fixture.catalog_source(Arc::clone(&catalog)),
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    for (&key, value) in RAW_KEYS.iter().zip(raw_values()) {
+        assert_eq!(
+            served
+                .table
+                .get(&Key::Long(key), &verify::whole(&[VALUE_COLUMN]))
+                .await?
+                .row,
+            Row::Present(vec![Some(value.into())]),
+            "{key}"
+        );
+    }
+    Ok(())
+}
+
+/// A file written before the order column was added has no order values:
+/// its default would give every row one value, so the file is refused
+/// naming the order column (RFD 025, RFD 023).
+#[tokio::test]
+async fn test_file_written_before_the_order_column_is_refused_as_column_mismatch() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: IDS_2K,
+        ..FixtureSpec::small("ord_added", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture
+        .evolve(&[SchemaChange::Add {
+            name: ORDER_COLUMN.to_string(),
+            ty: PrimitiveType::Long,
+            default: StatedDefault::None,
+        }])
+        .await?;
+    let source = fixture.root_source();
+    let refused = load_refused(
+        TableConfig {
+            source: source.clone(),
+            ..ordered_config(&fixture)
+        },
+        TableSource::from_config(&source).await?,
+    )
+    .await?;
+    let RefusalReason::ColumnMismatch {
+        column,
+        path: Some(path),
+        mismatch: ColumnMismatch::OrderAbsent,
+    } = &refused.reason
+    else {
+        panic!("{:?}", refused.reason);
+    };
+    assert_eq!(column, ORDER_COLUMN);
+    assert!(
+        fixture.files().iter().any(|file| file.file_path() == path),
+        "{path} is one of the files written before the column"
     );
     Ok(())
 }

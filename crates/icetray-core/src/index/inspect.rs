@@ -10,12 +10,12 @@ use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
-use parquet::schema::types::ColumnDescriptor;
+use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
 use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
 use super::{
-    FileFault, KeyShape, ResidentBytes, ValueColumn, ValueShape, bits_per_key, file_fault,
-    identity_of, record, saturating_sum, saturating_sum_all,
+    FileFault, KeyShape, OrderLeaf, OrderShape, ResidentBytes, ValueColumn, ValueShape,
+    bits_per_key, file_fault, identity_of, record, saturating_sum, saturating_sum_all,
 };
 use crate::approx;
 use crate::column;
@@ -23,6 +23,7 @@ use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{ChunkRules, LocalDir, chunk_file_bytes};
 use crate::manifest::TableLayout;
+use crate::order::{self, Admit, OrderColumnLayout, OrderType};
 use crate::parquet_io::FileHandle;
 
 /// A data file past the footer stage of `FileIndex::build`: its footer
@@ -91,8 +92,8 @@ impl Inspected {
     }
 }
 
-/// The key leaf of a file, each value column it holds, and how each
-/// decodes, from the footer.
+/// The key leaf of a file, each value column it holds, its order column
+/// on an ordered table, and how each decodes, from the footer.
 #[derive(Debug)]
 pub(super) struct Layout {
     pub(super) key_leaf: usize,
@@ -100,6 +101,8 @@ pub(super) struct Layout {
     /// Per value column of the table's layout, in its order, the column
     /// the file holds; `None` for one it was written before.
     pub(super) values: Vec<Option<ValueColumn>>,
+    /// The order column the file holds; `None` on a key-value table.
+    pub(super) order: Option<OrderLeaf>,
 }
 
 impl Layout {
@@ -121,12 +124,19 @@ impl Layout {
             .collect()
     }
 
+    /// The order column's leaf; `None` on a key-value table.
+    pub(super) fn order_leaf(&self) -> Option<usize> {
+        self.order.map(|order| order.leaf)
+    }
+
     /// The checks `FileIndex::inspect` makes on the footer, in order: every
     /// column resolves under `layout`, the snapshot's (`column::resolve`),
     /// the key's physical type matches the key type, each value column's
-    /// is a byte array, the file has rows and its row counts agree, and the
-    /// key column and every value column the file holds have an offset
-    /// index that describes their pages.
+    /// is a byte array, the order column's is one its order type admits
+    /// (`order_leaf`), the file has rows and its row counts agree, and the
+    /// key column, the order column, and every value column the file holds
+    /// have an offset index that describes their pages. Whether the order
+    /// column has a column index is not checked here.
     pub(super) fn inspect(
         table: &str,
         handle: &FileHandle,
@@ -149,11 +159,21 @@ impl Layout {
                 .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        let order = order_leaf(
+            table,
+            path,
+            schema,
+            layout.order.as_ref(),
+            columns.order_leaf,
+        )?;
         if metadata.file_metadata().num_rows() == 0 {
             return Err(file_fault(path, FileFault::NoRows));
         }
         check_row_counts(path, metadata)?;
         check_offset_index(path, metadata, key_leaf, size)?;
+        if let Some(order) = order {
+            check_offset_index(path, metadata, order.leaf, size)?;
+        }
         for value in values.iter().flatten() {
             check_offset_index(path, metadata, value.leaf, size)?;
         }
@@ -161,7 +181,60 @@ impl Layout {
             key_leaf,
             key_shape,
             values,
+            order,
         })
+    }
+}
+
+/// The order column `order` of the table, which the file at `path` holds
+/// at `leaf` of `schema` (`column::resolve`), with how it decodes, or
+/// `RefusalReason::OrderTypeMismatch` under `table` when its Parquet type
+/// is not one the order type admits (`OrderType::admits`). `None` on a
+/// key-value table, where both are `None`.
+pub(super) fn order_leaf(
+    table: &str,
+    path: &str,
+    schema: &SchemaDescriptor,
+    order: Option<&OrderColumnLayout>,
+    leaf: Option<usize>,
+) -> Result<Option<OrderLeaf>> {
+    order
+        .zip(leaf)
+        .map(|(order, leaf)| {
+            order_shape(table, path, order.order_type, &schema.column(leaf))
+                .map(|shape| OrderLeaf { leaf, shape })
+        })
+        .transpose()
+}
+
+/// How an order column of `order_type` stored as `descr` decodes, or
+/// `RefusalReason::OrderTypeMismatch` when the type does not admit it.
+fn order_shape(
+    table: &str,
+    path: &str,
+    order_type: OrderType,
+    descr: &ColumnDescriptor,
+) -> Result<OrderShape> {
+    match order_type.admits(descr) {
+        Admit::Exact => Ok(match order_type {
+            OrderType::Int | OrderType::Date => OrderShape::Int32,
+            OrderType::Long
+            | OrderType::Timestamp
+            | OrderType::TimestampTz
+            | OrderType::TimestampNs
+            | OrderType::TimestampTzNs => OrderShape::Int64,
+            OrderType::String | OrderType::Binary => OrderShape::Bytes,
+            OrderType::Fixed(width) => OrderShape::Fixed(width),
+        }),
+        Admit::PromotedFromInt => Ok(OrderShape::Int32),
+        Admit::Mismatch => Err(Error::refused(
+            table,
+            RefusalReason::OrderTypeMismatch {
+                path: path.to_string(),
+                expected: order_type,
+                got: order::stored_type(descr),
+            },
+        )),
     }
 }
 
@@ -301,29 +374,33 @@ fn check_offset_index(
 }
 
 /// The footer as the index keeps it: a copy of `metadata` with the column
-/// index of every column but the key replaced by `NONE` in every row group,
-/// so the page minimums and maximums of the value columns, which the reader
-/// never consults and which dominate the index of a large-value table, are
-/// not resident (RFD 017), and the offset index of every column but the key
-/// and `value_leaves`, the value columns the table serves that the file
-/// holds, replaced by an empty one, so a column the table does not serve
-/// costs nothing resident however wide the file (RFD 004, RFD 022). The key
-/// column keeps both indexes. A replaced entry stays in its place, so every
-/// kept one is still found at its leaf. Always a copy, never the footer
-/// moved: the bytes `ParquetMetaData::memory_size` reports follow each
-/// vector's capacity, which a copy sets from its contents alone, so the
-/// footer as kept and a copy of the footer as loaded measure the same and
-/// `predicted_resident_bytes` is exact from either.
+/// index of every column but the key and `order_leaf`, an ordered table's
+/// order column, replaced by `NONE` in every row group, so the page
+/// minimums and maximums of the value columns, which the reader never
+/// consults and which dominate the index of a large-value table, are not
+/// resident (RFD 017), and the offset index of every column but the key,
+/// the order column, and `value_leaves`, the value columns the table serves
+/// that the file holds, replaced by an empty one, so a column the table
+/// does not serve costs nothing resident however wide the file (RFD 004,
+/// RFD 022). The key column and the order column keep both indexes: a Scan
+/// places its bounds by the order column's (RFD 025). A replaced entry
+/// stays in its place, so every kept one is still found at its leaf. Always
+/// a copy, never the footer moved: the bytes `ParquetMetaData::memory_size`
+/// reports follow each vector's capacity, which a copy sets from its
+/// contents alone, so the footer as kept and a copy of the footer as loaded
+/// measure the same and `predicted_resident_bytes` is exact from either.
 pub(super) fn kept_footer(
     metadata: &ParquetMetaData,
     key_leaf: usize,
+    order_leaf: Option<usize>,
     value_leaves: &[usize],
 ) -> ParquetMetaData {
+    let indexed = |leaf: usize| leaf == key_leaf || order_leaf == Some(leaf);
     let mut builder = metadata.clone().into_builder();
     if let Some(mut column_index) = builder.take_column_index() {
         for row_group in &mut column_index {
             for (leaf, entry) in row_group.iter_mut().enumerate() {
-                if leaf != key_leaf {
+                if !indexed(leaf) {
                     *entry = ColumnIndexMetaData::NONE;
                 }
             }
@@ -333,7 +410,7 @@ pub(super) fn kept_footer(
     if let Some(mut offset_index) = builder.take_offset_index() {
         for row_group in &mut offset_index {
             for (leaf, entry) in row_group.iter_mut().enumerate() {
-                if leaf != key_leaf && !value_leaves.contains(&leaf) {
+                if !indexed(leaf) && !value_leaves.contains(&leaf) {
                     *entry = OffsetIndexMetaData {
                         page_locations: Vec::new(),
                         unencoded_byte_array_data_bytes: None,
@@ -449,16 +526,17 @@ pub(super) struct ResidentSet {
 
 impl ResidentSet {
     /// From `metadata` of the file `handle` opens, keyed by `key_type`, its
-    /// footer as kept with `value_leaves` (`kept_footer`), with the fences
-    /// exact when `fences` is given and estimated from the footer
-    /// otherwise. A key chunk `chunk_range` cannot place counts as zero and
-    /// is left out of the chunk file, whose verification record is
+    /// footer as kept with `order_leaf` and `value_leaves` (`kept_footer`),
+    /// with the fences exact when `fences` is given and estimated from the
+    /// footer otherwise. A key chunk `chunk_range` cannot place counts as
+    /// zero and is left out of the chunk file, whose verification record is
     /// estimated from the footer (`record::estimated_len`), and the filters
     /// are `None` when any row group's filter is one `filter_range` cannot
     /// place.
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        order_leaf: Option<usize>,
         value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
@@ -488,7 +566,9 @@ impl ResidentSet {
                 .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
         );
         Self {
-            footer: approx::count(kept_footer(metadata, key_leaf, value_leaves).memory_size()),
+            footer: approx::count(
+                kept_footer(metadata, key_leaf, order_leaf, value_leaves).memory_size(),
+            ),
             key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
             chunk_file: chunk_file_bytes(
                 &identity_of(handle),
@@ -873,6 +953,7 @@ mod tests {
             FileIndex::predicted_resident_bytes(
                 &disagreeing[0],
                 0,
+                None,
                 &[VALUE_LEAF],
                 KeyType::Long,
                 &opened.handle
@@ -1056,6 +1137,7 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
+            index.order_leaf(),
             &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
@@ -1100,6 +1182,7 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
+            index.order_leaf(),
             &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
@@ -1109,6 +1192,7 @@ mod tests {
         let serving_every_column = kept_footer(
             &loaded,
             index.key_leaf(),
+            None,
             &[VALUE_LEAF, extra_leaves[0], extra_leaves[1]],
         );
         assert!(
@@ -1150,6 +1234,153 @@ mod tests {
         );
     }
 
+    /// The contract layout serving no value column, with the fixture's
+    /// value column as an order column of `order_type`.
+    fn ordered_layout(order_type: OrderType) -> TableLayout {
+        TableLayout {
+            value_columns: Vec::new(),
+            order: Some(OrderColumnLayout {
+                name: VALUE_COLUMN.to_string(),
+                field_id: manifest_testing::VALUE_FIELD_ID,
+                order_type,
+            }),
+            ..manifest_testing::layout(KeyType::Long, None)
+        }
+    }
+
+    /// A contract fixture of `contract_rows` whose value column is a plain
+    /// `INT64`, which an ordered layout serves as a `long` order column.
+    async fn long_order_file() -> Opened {
+        let mut fixture = Fixture::contract(KeyType::Long, contract_rows());
+        fixture.value_column = ValueColumn::Int64;
+        store(&fixture).await
+    }
+
+    /// An ordered table keeps both page indexes of its order column, the
+    /// ones a Scan places its bounds by (RFD 025), where a key-value table
+    /// keeps neither for a column it does not serve; the prediction from
+    /// the footer as loaded stays exact.
+    #[tokio::test]
+    async fn test_build_keeps_both_page_indexes_of_the_order_column() {
+        let opened = long_order_file().await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let index = FileIndex::build(
+            TABLE,
+            Arc::clone(&opened.handle),
+            &ordered_layout(OrderType::Long),
+            Residency::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(index.order_leaf(), Some(VALUE_LEAF));
+        let kept = index.metadata();
+        for row_group in 0..ROW_GROUPS {
+            assert!(
+                matches!(
+                    kept.column_index().unwrap()[row_group][VALUE_LEAF],
+                    ColumnIndexMetaData::INT64(_)
+                ),
+                "row group {row_group}"
+            );
+            let pages = kept.offset_index().unwrap()[row_group][VALUE_LEAF].page_locations();
+            assert!(!pages.is_empty(), "row group {row_group}");
+            assert_eq!(
+                pages,
+                loaded.offset_index().unwrap()[row_group][VALUE_LEAF].page_locations()
+            );
+        }
+        let from_loaded = FileIndex::predicted_resident_bytes(
+            &loaded,
+            index.key_leaf(),
+            index.order_leaf(),
+            &[],
+            KeyType::Long,
+            &opened.handle,
+        );
+        assert_eq!(from_loaded, predicted_of(&index));
+        assert_eq!(from_loaded.full, count(index.resident_bytes()));
+        let key_value = kept_footer(&loaded, index.key_leaf(), None, &[]);
+        assert!(
+            key_value.memory_size() < kept.memory_size(),
+            "the order column's indexes are resident"
+        );
+        for row_group in 0..ROW_GROUPS {
+            assert_eq!(
+                key_value.column_index().unwrap()[row_group][VALUE_LEAF],
+                ColumnIndexMetaData::NONE
+            );
+        }
+    }
+
+    /// A file whose order column is stored as another Parquet type than
+    /// its order type admits is refused at the footer, naming the type
+    /// expected; a plain `INT64` is a `long` and nothing else.
+    #[tokio::test]
+    async fn test_build_refuses_an_order_column_its_type_does_not_admit() {
+        let opened = long_order_file().await;
+        let mismatched = [
+            OrderType::Int,
+            OrderType::Date,
+            OrderType::Timestamp,
+            OrderType::TimestampNs,
+            OrderType::String,
+        ];
+        for order_type in mismatched {
+            let result = FileIndex::build(
+                TABLE,
+                Arc::clone(&opened.handle),
+                &ordered_layout(order_type),
+                Residency::Full,
+                None,
+            )
+            .await;
+            let reason = refusal_of(result);
+            assert!(
+                matches!(
+                    &reason,
+                    RefusalReason::OrderTypeMismatch { path, expected, .. }
+                        if *path == location() && *expected == order_type
+                ),
+                "{order_type}: {reason:?}"
+            );
+        }
+        assert_eq!(
+            opened.stats().gets(),
+            count(mismatched.len()),
+            "each refused at its footer"
+        );
+    }
+
+    /// The order column's offset index is required as the key's is: a
+    /// footer without it is a file fault for an ordered table, and the same
+    /// footer serves a key-value table, which reads no order column.
+    #[tokio::test]
+    async fn test_inspect_without_an_order_offset_index_is_a_file_fault() {
+        let opened = long_order_file().await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let mut builder = ParquetMetaData::clone(&loaded).into_builder();
+        let mut offset_index = builder.take_offset_index().unwrap();
+        for row_group in &mut offset_index {
+            row_group.truncate(VALUE_LEAF);
+        }
+        let key_alone = builder.set_offset_index(Some(offset_index)).build();
+        assert_eq!(
+            fault_of(Layout::inspect(
+                TABLE,
+                &opened.handle,
+                &key_alone,
+                &ordered_layout(OrderType::Long)
+            )),
+            FileFault::MissingPageIndex
+        );
+        let presence_only = TableLayout {
+            value_columns: Vec::new(),
+            ..manifest_testing::layout(KeyType::Long, None)
+        };
+        assert!(Layout::inspect(TABLE, &opened.handle, &key_alone, &presence_only).is_ok());
+    }
+
     #[tokio::test]
     async fn test_predicted_resident_bytes_counts_an_unplaceable_key_chunk_as_zero() {
         let opened = store(&Fixture::contract(KeyType::Long, contract_rows())).await;
@@ -1160,6 +1391,7 @@ mod tests {
         let intact = FileIndex::predicted_resident_bytes(
             &loaded,
             key_leaf,
+            None,
             &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
@@ -1173,6 +1405,7 @@ mod tests {
             let estimated = FileIndex::predicted_resident_bytes(
                 &patched,
                 key_leaf,
+                None,
                 &[VALUE_LEAF],
                 KeyType::Long,
                 &opened.handle,
@@ -1241,6 +1474,7 @@ mod tests {
             FileIndex::predicted_resident_bytes(
                 &patched,
                 key_leaf,
+                None,
                 &[VALUE_LEAF],
                 KeyType::Long,
                 &opened.handle
@@ -1285,6 +1519,7 @@ mod tests {
                 FileIndex::predicted_resident_bytes(
                     &patched,
                     key_leaf,
+                    None,
                     &[VALUE_LEAF],
                     KeyType::Long,
                     &opened.handle

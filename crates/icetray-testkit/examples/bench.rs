@@ -1311,6 +1311,8 @@ async fn table_over(
         r#ref: MAIN_BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
         value_columns: prepared.shape.value_columns(),
+        order_column: None,
+        max_scan_rows: None,
         strict: true,
         lookups: None,
         residency: tier.residency(),

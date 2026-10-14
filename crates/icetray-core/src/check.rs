@@ -1361,6 +1361,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
     let predicted = FileIndex::predicted_resident_bytes(
         metadata,
         index.key_leaf(),
+        index.order_leaf(),
         &index.held_value_leaves(),
         index.key_type(),
         index.handle(),
@@ -3445,6 +3446,7 @@ mod tests {
                     FileIndex::predicted_resident_bytes(
                         file.index.metadata(),
                         file.index.key_leaf(),
+                        file.index.order_leaf(),
                         &file.index.held_value_leaves(),
                         file.index.key_type(),
                         file.index.handle(),

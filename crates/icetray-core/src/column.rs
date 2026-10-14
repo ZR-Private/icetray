@@ -52,6 +52,11 @@ pub enum ColumnMismatch {
     /// nor its field id. A lookup returns a value column's default there; a key
     /// column has none.
     KeyAbsent,
+    /// The file records field ids and holds neither the order column's
+    /// name nor its field id: it was written before the order column was
+    /// added (RFD 025). A default would give every row of the file one
+    /// order value, so the file is not served.
+    OrderAbsent,
     /// The configured name is not a top-level field of the snapshot's
     /// schema, such as a nested field's dotted name; names are matched
     /// among top-level fields alone.
@@ -90,6 +95,9 @@ impl fmt::Display for ColumnMismatch {
             }
             Self::KeyAbsent => {
                 f.write_str("the file holds neither the key column's name nor its field id")
+            }
+            Self::OrderAbsent => {
+                f.write_str("the file holds neither the order column's name nor its field id")
             }
             Self::NotTopLevel => f.write_str("the name is not a top-level field of the schema"),
             Self::UnreadableDefault => {
@@ -208,7 +216,7 @@ fn leaf_of(schema: &SchemaDescriptor, at: usize) -> Option<usize> {
     (0..schema.num_columns()).find(|&leaf| schema.get_column_root_idx(leaf) == at)
 }
 
-/// The key and value columns of one data file under a layout.
+/// The key, value, and order columns of one data file under a layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileColumns {
     /// The key column's leaf.
@@ -217,15 +225,21 @@ pub(crate) struct FileColumns {
     /// written before the column was added, for whose rows a lookup returns the column's
     /// default.
     pub(crate) value_leaves: Vec<Option<usize>>,
+    /// The order column's leaf; `None` for a key-value table, which has no
+    /// order column.
+    pub(crate) order_leaf: Option<usize>,
 }
 
-/// The key and value columns of the data file at `path`, whose schema is
-/// `schema`, under `layout`, the snapshot's (`find`), each value column by
-/// the same rules on its own (RFD 022), or `RefusalReason::ColumnMismatch`
-/// under `table` naming the first column at fault and the file: a key
-/// column the file lacks (`ColumnMismatch::KeyAbsent`, since a key has no
-/// default), any mismatch `find` gives, and a `fixed` key or value column
-/// stored at another width (`check_width`).
+/// The key, value, and order columns of the data file at `path`, whose
+/// schema is `schema`, under `layout`, the snapshot's (`find`), each value
+/// column by the same rules on its own (RFD 022) and the order column by
+/// them too (RFD 025), or `RefusalReason::ColumnMismatch` under `table`
+/// naming the first column at fault and the file: a key column the file
+/// lacks (`ColumnMismatch::KeyAbsent`, since a key has no default), an
+/// order column it lacks (`ColumnMismatch::OrderAbsent`, since a default
+/// would give every row one order value), any mismatch `find` gives, and a
+/// `fixed` key, value, or order column stored at another width
+/// (`check_width`).
 pub(crate) fn resolve(
     table: &str,
     path: &str,
@@ -260,9 +274,18 @@ pub(crate) fn resolve(
         .iter()
         .map(|column| locate(&column.name, column.field_id, column.width()))
         .collect::<Result<Vec<_>>>()?;
+    let order_leaf = layout
+        .order
+        .as_ref()
+        .map(|order| {
+            locate(&order.name, order.field_id, order.order_type.width())?
+                .ok_or_else(|| refuse(&order.name, ColumnMismatch::OrderAbsent))
+        })
+        .transpose()?;
     Ok(FileColumns {
         key_leaf,
         value_leaves,
+        order_leaf,
     })
 }
 
@@ -271,8 +294,9 @@ pub(crate) fn resolve(
 /// key compared, at another length than its type holds;
 /// `ColumnMismatch::FixedWidth` otherwise. `None` (every other type)
 /// admits any physical type here: a value column that is no byte array is
-/// the file fault `FileFault::ValuePhysicalType` at inspection, and a key
-/// column of the wrong physical type `RefusalReason::KeyTypeMismatch`.
+/// the file fault `FileFault::ValuePhysicalType` at inspection, a key
+/// column of the wrong physical type `RefusalReason::KeyTypeMismatch`, and
+/// an order column of one `RefusalReason::OrderTypeMismatch`.
 fn check_width(
     descr: &ColumnDescriptor,
     width: Option<u64>,
@@ -457,6 +481,7 @@ mod tests {
     use crate::key::KeyType;
     use crate::manifest::testing::{self as manifest_testing, KEY_FIELD_ID, VALUE_FIELD_ID};
     use crate::manifest::{ValueColumnLayout, ValueType};
+    use crate::order::{OrderColumnLayout, OrderType};
 
     /// The configured names and their field ids in the snapshot's schema.
     const KEY: &str = "key";
@@ -656,6 +681,7 @@ mod tests {
             FileColumns {
                 key_leaf: 0,
                 value_leaves: vec![None],
+                order_leaf: None,
             }
         );
     }
@@ -679,6 +705,7 @@ mod tests {
             FileColumns {
                 key_leaf: 0,
                 value_leaves: vec![None, Some(1)],
+                order_leaf: None,
             }
         );
         let swapped = schema_of("message m { required int64 key = 1; optional binary value = 3; }");
@@ -702,6 +729,7 @@ mod tests {
             FileColumns {
                 key_leaf: 0,
                 value_leaves: Vec::new(),
+                order_leaf: None,
             }
         );
     }
@@ -765,6 +793,98 @@ mod tests {
             mismatch_of(resolve(TABLE, PATH, &narrower, &layout)),
             (
                 KEY.to_string(),
+                Some(PATH.to_string()),
+                ColumnMismatch::FixedWidth {
+                    expected: FIXED_WIDTH,
+                    stored: Some(4),
+                }
+            )
+        );
+    }
+
+    /// The order column of the resolution tests, at `THIRD_FIELD_ID`.
+    const ORDER: &str = "ts";
+
+    /// `layout(None)` as an ordered table over `ORDER` of `order_type`.
+    fn ordered_layout(order_type: OrderType) -> TableLayout {
+        TableLayout {
+            order: Some(OrderColumnLayout {
+                name: ORDER.to_string(),
+                field_id: THIRD_FIELD_ID,
+                order_type,
+            }),
+            ..layout(None)
+        }
+    }
+
+    /// The order column is resolved by the rules a value column is (RFD
+    /// 025, RFD 023), except that a file holding neither its name nor its
+    /// field id is refused rather than given a default.
+    #[test]
+    fn test_resolve_finds_the_order_column_and_refuses_a_file_without_it() {
+        let ordered = schema_of(
+            "message m { required int64 key = 1; optional binary value = 2; optional int64 ts = 3; }",
+        );
+        let layout = ordered_layout(OrderType::Long);
+        assert_eq!(
+            resolve(TABLE, PATH, &ordered, &layout).unwrap(),
+            FileColumns {
+                key_leaf: 0,
+                value_leaves: vec![Some(1)],
+                order_leaf: Some(2),
+            }
+        );
+        assert_eq!(
+            resolve(TABLE, PATH, &ordered, &self::layout(None))
+                .unwrap()
+                .order_leaf,
+            None,
+            "a key-value table resolves no order column"
+        );
+        let before = schema_of("message m { required int64 key = 1; optional binary value = 2; }");
+        assert_eq!(
+            mismatch_of(resolve(TABLE, PATH, &before, &layout)),
+            (
+                ORDER.to_string(),
+                Some(PATH.to_string()),
+                ColumnMismatch::OrderAbsent
+            )
+        );
+        let renamed = schema_of(
+            "message m { required int64 key = 1; optional binary value = 2; optional int64 at = 3; }",
+        );
+        assert_eq!(
+            mismatch_of(resolve(TABLE, PATH, &renamed, &layout)).2,
+            ColumnMismatch::Renamed {
+                field_id: THIRD_FIELD_ID,
+                found: "at".to_string(),
+            }
+        );
+        let without_ids = schema_of("message m { required int64 key; optional binary value; }");
+        assert_eq!(
+            mismatch_of(resolve(TABLE, PATH, &without_ids, &layout)).2,
+            ColumnMismatch::AbsentWithoutFieldIds
+        );
+    }
+
+    #[test]
+    fn test_resolve_a_fixed_order_column_at_another_width_is_refused() {
+        let width = u32::try_from(FIXED_WIDTH).unwrap();
+        let layout = ordered_layout(OrderType::Fixed(width));
+        let at_width = schema_of(
+            "message m { required int64 key = 1; optional binary value = 2; optional fixed_len_byte_array(8) ts = 3; }",
+        );
+        assert_eq!(
+            resolve(TABLE, PATH, &at_width, &layout).unwrap().order_leaf,
+            Some(2)
+        );
+        let narrower = schema_of(
+            "message m { required int64 key = 1; optional binary value = 2; optional fixed_len_byte_array(4) ts = 3; }",
+        );
+        assert_eq!(
+            mismatch_of(resolve(TABLE, PATH, &narrower, &layout)),
+            (
+                ORDER.to_string(),
                 Some(PATH.to_string()),
                 ColumnMismatch::FixedWidth {
                     expected: FIXED_WIDTH,

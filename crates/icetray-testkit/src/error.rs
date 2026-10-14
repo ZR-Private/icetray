@@ -9,10 +9,10 @@
 use std::env::VarError;
 
 use icetray_core::config::Residency;
-use icetray_core::{Key, KeyType};
+use icetray_core::{Key, KeyType, OrderValue};
 
 use crate::golden::WAREHOUSE_VAR;
-use crate::ordered::{OrderKind, TestOrder};
+use crate::ordered::OrderKind;
 use crate::truth::TruthFault;
 
 /// The environment variable that names the REST catalog the container-gated
@@ -235,7 +235,7 @@ pub enum OracleFault {
         key: Key,
         /// The order value the two rows share; `None` in a key-value
         /// table.
-        order: Option<TestOrder>,
+        order: Option<OrderValue>,
         /// The data file of one live copy.
         first: String,
         /// The data file of another.

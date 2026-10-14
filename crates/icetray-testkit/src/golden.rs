@@ -228,6 +228,8 @@ pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableC
         r#ref: BRANCH.to_string(),
         key_column: KEY_COLUMN.to_string(),
         value_columns: vec![icetray_core::ValueColumnConfig::named(VALUE_COLUMN)],
+        order_column: None,
+        max_scan_rows: None,
         strict,
         lookups: None,
         residency: Residency::Full,

@@ -129,6 +129,18 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// A single-pod guess, to revisit with measurement (RFD 013).
 const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
+/// The most rows one Scan of an ordered table returns, and what a limit of
+/// zero reads, when its entry sets no `max_scan_rows`: 1,000 (RFD 025). A
+/// quarter of `DEFAULT_MAX_MULTI_SCAN_VALUES`, so a `MultiScan` of one key at
+/// the full limit fits with up to three columns.
+pub const DEFAULT_MAX_SCAN_ROWS: u32 = 1_000;
+
+/// The least multiple of an ordered table's `max_scan_rows` that
+/// `max_multi_scan_values` holds: a `MultiScan` of one key at the full
+/// limit and one column counts each row once for its order value and once
+/// for the column (RFD 025), so such a call is always valid.
+const MULTI_SCAN_VALUES_PER_SCAN_ROW: usize = 2;
+
 /// GETs one batch (a `MultiGet`, a `Scan`, or a `MultiScan`) holds in
 /// flight at once when the file says nothing: 64 (RFD 013, RFD 022, RFD
 /// 025). Measured against S3, a lone cold batch keeps getting faster up to
@@ -406,6 +418,52 @@ pub enum ConfigViolation {
         index: usize,
         /// The key column's name.
         column: String,
+    },
+    /// A table names its key column as its order column (RFD 025): the
+    /// key already orders the rows, so it orders nothing within a key.
+    #[error("tables[{index}].order_column names the key column")]
+    OrderColumnIsKey {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// A table lists its order column as a value column (RFD 025): a Scan
+    /// already returns each row's order value.
+    #[error("tables[{index}].value_columns lists the order column {column:?}")]
+    OrderColumnIsValue {
+        /// The table's position in `tables`.
+        index: usize,
+        /// The order column's name.
+        column: String,
+    },
+    /// A table sets `max_scan_rows` without an `order_column`: only an
+    /// ordered table is scanned (RFD 025).
+    #[error(
+        "tables[{index}].max_scan_rows is set, but the table sets no order_column, and only an ordered table is scanned"
+    )]
+    MaxScanRowsOnKeyValueTable {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// An ordered table's `max_scan_rows` is zero, so every Scan would
+    /// return nothing.
+    #[error("tables[{index}].max_scan_rows 0 is not above zero")]
+    MaxScanRowsZero {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// `server.max_multi_scan_values` is below twice an ordered table's
+    /// `max_scan_rows`, so a `MultiScan` of one key at the full limit and one
+    /// column would be refused (RFD 025).
+    #[error(
+        "server.max_multi_scan_values {max_multi_scan_values} is below twice tables[{index}].max_scan_rows {max_scan_rows}, so a MultiScan of one key at the full limit and one column would be refused"
+    )]
+    MaxMultiScanValuesBelowScanRows {
+        /// The ordered table's position in `tables`.
+        index: usize,
+        /// Its `max_scan_rows`, as `TableConfig::scan_rows` resolves it.
+        max_scan_rows: u32,
+        /// The configured `server.max_multi_scan_values`.
+        max_multi_scan_values: usize,
     },
     /// A table has the name of a table before it.
     #[error("tables[{index}].name {name} is configured more than once")]
@@ -971,10 +1029,12 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
 }
 
 /// Each table has a name of its own, a residency its settings fit, a key
-/// column and value columns of names Iceberg's writers keep, value columns
-/// listed once each and apart from the key, a `lookups` level its
-/// residency reaches, and a source whose settings `validate_source`
-/// accepts.
+/// column, value columns, and an order column of names Iceberg's writers
+/// keep, value columns listed once each and apart from the key, an order
+/// column apart from both, a `max_scan_rows` only when it has an order
+/// column, above zero and within half of `max_multi_scan_values`, a
+/// `lookups` level its residency reaches, and a source whose settings
+/// `validate_source` accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
@@ -1006,6 +1066,7 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
             });
         }
         table.check_columns(index)?;
+        table.check_scan_rows(index, config.server.max_multi_scan_values)?;
         table.check_lookups(Some(index))?;
         validate_source(index, &table.source, &config.storage)?;
     }
@@ -1589,8 +1650,9 @@ impl Default for StorageConfig {
 }
 
 /// One served table. Two entries are equal when every setting is, `lookups`
-/// compared as `TableConfig::lookups` resolves it, so an entry that spells
-/// out the default equals one that leaves it out, and `value_columns`
+/// compared as `TableConfig::lookups` resolves it and `max_scan_rows` as
+/// `TableConfig::scan_rows` does, so an entry that spells out a default
+/// equals one that leaves it out, and `value_columns`
 /// compared as the set of columns it lists, each a name and a format, so a
 /// reordered list is no change.
 #[derive(Clone, Debug, Deserialize)]
@@ -1611,6 +1673,17 @@ pub struct TableConfig {
     /// listed, is a violation. Order carries no meaning: two entries that
     /// list the same columns in another order are equal.
     pub value_columns: Vec<ValueColumnConfig>,
+    /// The order column of an ordered table (RFD 025): a top-level column
+    /// of an order type (`OrderType`), neither the key column nor a value
+    /// column, by which each key's rows are sorted after the key. `None`
+    /// for a key-value table. Setting, changing, or removing it reloads the
+    /// whole table.
+    pub order_column: Option<String>,
+    /// The most rows one Scan of an ordered table returns, and what a limit
+    /// of zero reads (RFD 025); above zero, and set only on an ordered
+    /// table. `None` there takes `DEFAULT_MAX_SCAN_ROWS`
+    /// (`TableConfig::scan_rows`). A change applies in place.
+    pub max_scan_rows: Option<u32>,
     /// Whether falling below `lookups` for a reason in the snapshot's
     /// layout is an error rather than a warning (RFD 020): a strict table
     /// refuses such a snapshot, failing the start when it is the first and
@@ -1843,12 +1916,15 @@ impl TableConfig {
         .map(drop)
     }
 
-    /// `ConfigViolation::ColumnNameRewritten` for a key column or a value
+    /// `ConfigViolation::ColumnNameRewritten` for a key, value, or order
     /// column whose name is not a valid Avro name,
     /// `ConfigViolation::EmptyValueColumn` for a value column of an empty
     /// name, `ConfigViolation::DuplicateValueColumn` for a column listed
-    /// twice, and `ConfigViolation::KeyColumnAsValue` for the key column
-    /// listed as a value; `index` is the table's place in `tables`.
+    /// twice, `ConfigViolation::KeyColumnAsValue` for the key column
+    /// listed as a value, and `ConfigViolation::OrderColumnIsKey` and
+    /// `ConfigViolation::OrderColumnIsValue` for an order column that is
+    /// the key or a value column; `index` is the table's place in
+    /// `tables`.
     fn check_columns(&self, index: usize) -> std::result::Result<(), ConfigViolation> {
         let rewritten = |setting, column: &str| ConfigViolation::ColumnNameRewritten {
             index,
@@ -1879,6 +1955,53 @@ impl TableConfig {
                 });
             }
         }
+        let Some(order) = &self.order_column else {
+            return Ok(());
+        };
+        if !column::is_served_name(order) {
+            return Err(rewritten(ColumnSetting::OrderColumn, order));
+        }
+        if *order == self.key_column {
+            return Err(ConfigViolation::OrderColumnIsKey { index });
+        }
+        if seen.contains(order.as_str()) {
+            return Err(ConfigViolation::OrderColumnIsValue {
+                index,
+                column: order.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `ConfigViolation::MaxScanRowsOnKeyValueTable` for `max_scan_rows` on
+    /// a table without an order column, `ConfigViolation::MaxScanRowsZero`
+    /// for a zero one, and `ConfigViolation::MaxMultiScanValuesBelowScanRows`
+    /// when `max_multi_scan_values` is below twice the table's
+    /// `scan_rows`, so a `MultiScan` of one key at the full limit and one
+    /// column is always valid (RFD 025); `index` is the table's place in
+    /// `tables`.
+    fn check_scan_rows(
+        &self,
+        index: usize,
+        max_multi_scan_values: usize,
+    ) -> std::result::Result<(), ConfigViolation> {
+        let Some(max_scan_rows) = self.scan_rows() else {
+            return match self.max_scan_rows {
+                Some(_) => Err(ConfigViolation::MaxScanRowsOnKeyValueTable { index }),
+                None => Ok(()),
+            };
+        };
+        if max_scan_rows == 0 {
+            return Err(ConfigViolation::MaxScanRowsZero { index });
+        }
+        let needed = approx::length(max_scan_rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW);
+        if max_multi_scan_values < needed {
+            return Err(ConfigViolation::MaxMultiScanValuesBelowScanRows {
+                index,
+                max_scan_rows,
+                max_multi_scan_values,
+            });
+        }
         Ok(())
     }
 
@@ -1888,12 +2011,13 @@ impl TableConfig {
         self.lookups.unwrap_or_else(|| self.residency.best_level())
     }
 
-    /// Whether `other` differs from this entry in `lookups`, `strict`, and
-    /// the formats of the same value columns alone, `lookups` compared as
-    /// resolved: a reload applies such a change to the serving generation
-    /// in place, since the level is judged from the layout the generation
-    /// already holds (RFD 020) and a format is read by each lookup from the
-    /// entry (RFD 024). True for equal entries too.
+    /// Whether `other` differs from this entry in `lookups`, `strict`, the
+    /// formats of the same value columns, and `max_scan_rows` alone,
+    /// `lookups` and `max_scan_rows` compared as resolved: a reload applies
+    /// such a change to the serving generation in place, since the level is
+    /// judged from the layout the generation already holds (RFD 020), a
+    /// format is read by each lookup from the entry (RFD 024), and the limit
+    /// by each Scan (RFD 025). True for equal entries too.
     pub(crate) fn same_but_tuning(&self, other: &Self) -> bool {
         self.value_column_names() == other.value_column_names()
             && *self
@@ -1901,8 +2025,18 @@ impl TableConfig {
                     lookups: self.lookups,
                     strict: self.strict,
                     value_columns: self.value_columns.clone(),
+                    max_scan_rows: self.max_scan_rows,
                     ..other.clone()
                 }
+    }
+
+    /// The most rows one Scan returns, `max_scan_rows` or
+    /// `DEFAULT_MAX_SCAN_ROWS` when unset, on an ordered table; `None` on
+    /// a key-value table, which is never scanned.
+    pub fn scan_rows(&self) -> Option<u32> {
+        self.order_column
+            .as_ref()
+            .map(|_| self.max_scan_rows.unwrap_or(DEFAULT_MAX_SCAN_ROWS))
     }
 
     /// `check_lookups` where the entry is used rather than validated, by a
@@ -1943,6 +2077,8 @@ impl PartialEq for TableConfig {
             r#ref,
             key_column,
             value_columns: _,
+            order_column,
+            max_scan_rows: _,
             strict,
             lookups: _,
             residency,
@@ -1953,6 +2089,8 @@ impl PartialEq for TableConfig {
             && *r#ref == other.r#ref
             && *key_column == other.key_column
             && self.sorted_value_columns() == other.sorted_value_columns()
+            && *order_column == other.order_column
+            && self.scan_rows() == other.scan_rows()
             && *strict == other.strict
             && self.lookups() == other.lookups()
             && *residency == other.residency
@@ -2110,6 +2248,8 @@ pub enum ColumnSetting {
     KeyColumn,
     /// `value_columns`.
     ValueColumns,
+    /// `order_column`.
+    OrderColumn,
 }
 
 impl fmt::Display for ColumnSetting {
@@ -2117,6 +2257,7 @@ impl fmt::Display for ColumnSetting {
         f.write_str(match self {
             Self::KeyColumn => "key_column",
             Self::ValueColumns => "value_columns",
+            Self::OrderColumn => "order_column",
         })
     }
 }
@@ -2210,6 +2351,9 @@ mod tests {
     const FIXTURE_SCAN_DEADLINE: Duration = Duration::from_secs(3);
     /// The `MultiScan` deadline the full fixture names, `"9s"`.
     const FIXTURE_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(9);
+    /// The `max_scan_rows` the full fixture's ordered table names, below
+    /// half of `FIXTURE_MAX_MULTI_SCAN_VALUES`.
+    const FIXTURE_MAX_SCAN_ROWS: u32 = 500;
     /// The scan page cache budget the full fixture names, in bytes.
     const FIXTURE_SCAN_PAGE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
     /// The load deadline the full fixture names, `"45m"`.
@@ -2362,6 +2506,8 @@ name = "events"
 ref = "main"
 key_column = "id"
 value_columns = ["payload"]
+order_column = "ts"
+max_scan_rows = {FIXTURE_MAX_SCAN_ROWS}
 
 [tables.source]
 type = "s3tables"
@@ -2486,7 +2632,9 @@ endpoint = "https://s3tables.example"
                 },
                 "ref": "main",
                 "key_column": "id",
-                "value_columns": ["payload"]
+                "value_columns": ["payload"],
+                "order_column": "ts",
+                "max_scan_rows": FIXTURE_MAX_SCAN_ROWS
             }
         ])
     }
@@ -2578,6 +2726,8 @@ value_columns = ["value"]
                     ValueColumnConfig::named("summary"),
                     ValueColumnConfig::named("payload"),
                 ],
+                order_column: None,
+                max_scan_rows: None,
                 strict: true,
                 lookups: Some(Level::Balanced),
                 residency: Residency::Full,
@@ -2594,6 +2744,8 @@ value_columns = ["value"]
                 r#ref: "serving".to_string(),
                 key_column: "user_id".to_string(),
                 value_columns: vec![ValueColumnConfig::named("vector")],
+                order_column: None,
+                max_scan_rows: None,
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: Residency::Disk,
@@ -2611,6 +2763,8 @@ value_columns = ["value"]
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
                 value_columns: vec![ValueColumnConfig::named("payload")],
+                order_column: None,
+                max_scan_rows: None,
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
@@ -2628,6 +2782,8 @@ value_columns = ["value"]
                 r#ref: "main".to_string(),
                 key_column: "id".to_string(),
                 value_columns: vec![ValueColumnConfig::named("payload")],
+                order_column: Some("ts".to_string()),
+                max_scan_rows: Some(FIXTURE_MAX_SCAN_ROWS),
                 strict: DEFAULT_STRICT,
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
@@ -3316,6 +3472,167 @@ locaton = "typo"
             ..retuned
         };
         assert!(!entry.same_but_tuning(&budgeted));
+    }
+
+    /// `TOML_MINIMAL` as an ordered table whose order column is `ts`, with
+    /// `extra` lines appended to its table.
+    fn ordered(extra: &str) -> String {
+        format!(
+            "{}\norder_column = \"ts\"\n{extra}\n",
+            TOML_MINIMAL.trim_end()
+        )
+    }
+
+    #[test]
+    fn test_parse_reads_order_column_and_max_scan_rows_in_toml_and_json() {
+        let defaulted = Config::parse(&ordered("")).unwrap().tables[0].clone();
+        assert_eq!(defaulted.order_column.as_deref(), Some("ts"));
+        assert_eq!(defaulted.max_scan_rows, None);
+        assert_eq!(defaulted.scan_rows(), Some(DEFAULT_MAX_SCAN_ROWS));
+        let rows = DEFAULT_MAX_SCAN_ROWS / 2;
+        let set = Config::parse(&ordered(&format!("max_scan_rows = {rows}"))).unwrap();
+        assert_eq!(set.tables[0].scan_rows(), Some(rows));
+        let json = format!(
+            r#"{{"tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": "key", "value_columns": ["value"], "order_column": "ts", "max_scan_rows": {rows}}}]}}"#
+        );
+        assert_eq!(Config::parse(&json).unwrap(), set);
+        let key_value = Config::parse(TOML_MINIMAL).unwrap().tables[0].clone();
+        assert_eq!(key_value.order_column, None);
+        assert_eq!(
+            key_value.scan_rows(),
+            None,
+            "a key-value table is never scanned"
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_the_key_column_as_the_order_column() {
+        assert_eq!(
+            violation(&TOML_MINIMAL.replace(
+                "value_columns = [\"value\"]",
+                "value_columns = [\"value\"]\norder_column = \"key\""
+            )),
+            ConfigViolation::OrderColumnIsKey { index: 0 }
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_a_value_column_as_the_order_column() {
+        assert_eq!(
+            violation(&ordered("").replace(
+                "value_columns = [\"value\"]",
+                "value_columns = [\"value\", \"ts\"]"
+            )),
+            ConfigViolation::OrderColumnIsValue {
+                index: 0,
+                column: "ts".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_an_order_column_name_a_java_writer_rewrites() {
+        for name in ["", "user-id", "a.b", "1st"] {
+            let text = TOML_MINIMAL.replace(
+                "value_columns = [\"value\"]",
+                &format!("value_columns = [\"value\"]\norder_column = {name:?}"),
+            );
+            assert_eq!(
+                violation(&text),
+                ConfigViolation::ColumnNameRewritten {
+                    index: 0,
+                    setting: ColumnSetting::OrderColumn,
+                    column: name.to_string(),
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_refuses_max_scan_rows_on_a_key_value_table() {
+        let text = format!("{}\nmax_scan_rows = 10\n", TOML_MINIMAL.trim_end());
+        assert_eq!(
+            violation(&text),
+            ConfigViolation::MaxScanRowsOnKeyValueTable { index: 0 }
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_max_scan_rows_zero() {
+        assert_eq!(
+            violation(&ordered("max_scan_rows = 0")),
+            ConfigViolation::MaxScanRowsZero { index: 0 }
+        );
+    }
+
+    #[test]
+    fn test_parse_refuses_max_multi_scan_values_below_twice_max_scan_rows() {
+        let with_values = |values: usize, extra: &str| {
+            format!(
+                "[server]\nmax_multi_scan_values = {values}\n{}",
+                ordered(extra)
+            )
+        };
+        let defaulted = approx::length(DEFAULT_MAX_SCAN_ROWS);
+        let exactly_twice = MULTI_SCAN_VALUES_PER_SCAN_ROW * defaulted;
+        assert!(Config::parse(&with_values(exactly_twice, "")).is_ok());
+        assert_eq!(
+            violation(&with_values(exactly_twice - 1, "")),
+            ConfigViolation::MaxMultiScanValuesBelowScanRows {
+                index: 0,
+                max_scan_rows: DEFAULT_MAX_SCAN_ROWS,
+                max_multi_scan_values: exactly_twice - 1,
+            },
+            "against the default max_scan_rows"
+        );
+        let rows =
+            u32::try_from(DEFAULT_MAX_MULTI_SCAN_VALUES / MULTI_SCAN_VALUES_PER_SCAN_ROW + 1)
+                .unwrap();
+        assert_eq!(
+            violation(&format!("{}max_scan_rows = {rows}\n", ordered(""))),
+            ConfigViolation::MaxMultiScanValuesBelowScanRows {
+                index: 0,
+                max_scan_rows: rows,
+                max_multi_scan_values: DEFAULT_MAX_MULTI_SCAN_VALUES,
+            },
+            "against the default max_multi_scan_values"
+        );
+        assert!(
+            Config::parse(&with_values(1, "").replace("order_column = \"ts\"\n", "")).is_ok(),
+            "a key-value table holds the limit to nothing"
+        );
+    }
+
+    #[test]
+    fn test_same_but_tuning_admits_a_max_scan_rows_change() {
+        let entry = Config::parse(&ordered("")).unwrap().tables[0].clone();
+        let spelled_out = TableConfig {
+            max_scan_rows: Some(DEFAULT_MAX_SCAN_ROWS),
+            ..entry.clone()
+        };
+        assert_eq!(entry, spelled_out, "the default spelled out is the default");
+        let retuned = TableConfig {
+            max_scan_rows: Some(DEFAULT_MAX_SCAN_ROWS / 2),
+            ..entry.clone()
+        };
+        assert_ne!(entry, retuned, "a limit change is a change");
+        assert!(entry.same_but_tuning(&retuned), "and is applied in place");
+        let reordered = TableConfig {
+            order_column: Some("seq".to_string()),
+            ..entry.clone()
+        };
+        assert!(
+            !entry.same_but_tuning(&reordered),
+            "another order column reloads"
+        );
+        let key_value = TableConfig {
+            order_column: None,
+            max_scan_rows: None,
+            ..entry.clone()
+        };
+        assert!(!entry.same_but_tuning(&key_value), "so does removing it");
+        assert!(!key_value.same_but_tuning(&entry), "and setting it");
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod manifest;
 pub mod memory;
 pub mod metric;
 pub mod open;
+pub mod order;
 mod parquet_io;
 mod projection;
 mod shard;
@@ -45,10 +46,10 @@ pub use check::{
 };
 pub use column::ColumnMismatch;
 pub use config::{
-    ColumnSetting, Config, ConfigError, ConfigViolation, DEFAULT_RESIDENCY, HedgeConfig,
-    LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, S3Config, ServerConfig,
-    SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig, ValueColumnConfig,
-    ValueFormat,
+    ColumnSetting, Config, ConfigError, ConfigViolation, DEFAULT_MAX_SCAN_ROWS, DEFAULT_RESIDENCY,
+    HedgeConfig, LocalConfig, LogConfig, Residency, RewriteFault, RewriteRule, S3Config,
+    ServerConfig, SourceConfig, SourceSetting, StandardField, StorageConfig, TableConfig,
+    ValueColumnConfig, ValueFormat,
 };
 pub use deletes::{BlobFraming, DeleteFault, DeleteSummary};
 pub use error::{
@@ -67,6 +68,7 @@ pub use manifest::{
     ValueType,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
+pub use order::{Direction, OrderColumnLayout, OrderType, OrderValue, OrderVariant, ScanBounds};
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, LocationError, LocationFault, Storage};

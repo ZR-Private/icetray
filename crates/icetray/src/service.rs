@@ -960,6 +960,7 @@ mod tests {
                 column("b", ValueType::Fixed { width: fixed_width }),
                 column("c", ValueType::String),
             ],
+            order: None,
         };
         let entry = TableConfig {
             name: TABLE.to_string(),
@@ -973,6 +974,8 @@ mod tests {
                 ValueColumnConfig::of("a", ValueFormat::Protobuf),
                 ValueColumnConfig::named("b"),
             ],
+            order_column: None,
+            max_scan_rows: None,
             strict: false,
             lookups: None,
             residency: icetray_core::Residency::Full,

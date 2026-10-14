@@ -15,7 +15,7 @@ use arrow::array::{
 };
 use arrow::buffer::Buffer;
 use iceberg::spec::PrimitiveType;
-use icetray_core::Key;
+use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue};
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{FIRST_VERSION, ValueKind, value_of_version};
@@ -30,10 +30,6 @@ pub const ORDER_FIELD_ID: i32 = 4;
 /// The order column of every ordered fixture: a timestamp, or whatever
 /// `OrderKind` the specification names.
 pub const ORDER_COLUMN: &str = "ts";
-
-/// The most rows one Scan returns when the table does not set
-/// `max_scan_rows` (RFD 025, Decision): what a limit of zero reads.
-pub const DEFAULT_MAX_SCAN_ROWS: u32 = 1_000;
 
 /// Digits a string order value is zero-padded to: those of the largest
 /// long, so bytewise order is numeric order for every non-negative value.
@@ -76,20 +72,6 @@ pub enum OrderKind {
     Fixed(u32),
 }
 
-/// An order value as a Scan compares it: integer and time types as signed
-/// 64-bit integers in Iceberg's unit, string, binary, and fixed types as
-/// their bytes (RFD 025, Order values). The testkit's stand-in for the
-/// core's order value type.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TestOrder {
-    /// An integer or time value.
-    Long(i64),
-    /// A string value.
-    Str(String),
-    /// A binary or fixed value.
-    Bytes(Vec<u8>),
-}
-
 impl OrderKind {
     /// The Iceberg type of the order column.
     pub fn primitive(self) -> PrimitiveType {
@@ -110,19 +92,19 @@ impl OrderKind {
     /// The order value `raw` is in this kind, or `None` when the kind
     /// cannot hold it: past 32 bits for `Int` and `Date`, negative or too
     /// wide for the byte kinds.
-    pub fn encode(self, raw: i64) -> Option<TestOrder> {
+    pub fn encode(self, raw: i64) -> Option<OrderValue> {
         match self {
             Self::Long
             | Self::Timestamp
             | Self::TimestampTz
             | Self::TimestampNs
-            | Self::TimestampTzNs => Some(TestOrder::Long(raw)),
+            | Self::TimestampTzNs => Some(OrderValue::Long(raw)),
             Self::Int | Self::Date => i32::try_from(raw)
                 .ok()
-                .map(|narrow| TestOrder::Long(i64::from(narrow))),
-            Self::Str => string_of(raw).map(TestOrder::Str),
-            Self::Bin => bytes_of(raw, ORDER_LONG_BYTES).map(TestOrder::Bytes),
-            Self::Fixed(width) => bytes_of(raw, width_of(width)).map(TestOrder::Bytes),
+                .map(|narrow| OrderValue::Long(i64::from(narrow))),
+            Self::Str => string_of(raw).map(OrderValue::Str),
+            Self::Bin => bytes_of(raw, ORDER_LONG_BYTES).map(OrderValue::Bytes),
+            Self::Fixed(width) => bytes_of(raw, width_of(width)).map(OrderValue::Bytes),
         }
     }
 
@@ -199,7 +181,7 @@ fn bytes_of(raw: i64, width: usize) -> Option<Vec<u8>> {
 /// order value is stated.
 ///
 /// Panics on a raw value the kind cannot hold (`OrderKind::encode`).
-pub fn order_value(kind: OrderKind, raw: i64) -> TestOrder {
+pub fn order_value(kind: OrderKind, raw: i64) -> OrderValue {
     kind.encode(raw)
         .unwrap_or_else(|| panic!("{kind:?} cannot hold {raw}"))
 }
@@ -330,22 +312,12 @@ impl LiveRows {
     }
 }
 
-/// Which end of a key's run a Scan starts from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TestDirection {
-    /// Highest order value first.
-    #[default]
-    NewestFirst,
-    /// Lowest order value first.
-    OldestFirst,
-}
-
 /// What a Scan asks for, in raw order values (`order_value` turns a bound
 /// into the kind's encoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TestScan {
     /// The direction the rows are returned in.
-    pub direction: TestDirection,
+    pub direction: Direction,
     /// The most rows to return; zero reads up to `max_scan_rows`.
     pub limit: u32,
     /// Only rows whose order value is above this.
@@ -360,7 +332,7 @@ impl Default for TestScan {
     /// Every row, newest first, up to the default `max_scan_rows`.
     fn default() -> Self {
         Self {
-            direction: TestDirection::default(),
+            direction: Direction::NewestFirst,
             limit: 0,
             after: None,
             before: None,
@@ -385,7 +357,7 @@ pub fn scan_model<T>(
         })
         .collect();
     inside.sort_by_key(|(order, _)| *order);
-    if scan.direction == TestDirection::NewestFirst {
+    if scan.direction == Direction::NewestFirst {
         inside.reverse();
     }
     let limit = match scan.limit {
@@ -459,7 +431,7 @@ mod tests {
     #[test]
     fn test_scan_model_applies_direction_bounds_and_limit() {
         let scan = TestScan {
-            direction: TestDirection::NewestFirst,
+            direction: Direction::NewestFirst,
             limit: ONE,
             before: Some(THIRD),
             ..TestScan::default()
@@ -472,7 +444,7 @@ mod tests {
     #[test]
     fn test_scan_model_bounds_are_exclusive_on_both_sides() {
         let scan = TestScan {
-            direction: TestDirection::OldestFirst,
+            direction: Direction::OldestFirst,
             after: Some(SECOND),
             before: Some(ORDERS[3]),
             ..TestScan::default()
@@ -488,7 +460,7 @@ mod tests {
         let oldest = scan_model(
             rows(),
             &TestScan {
-                direction: TestDirection::OldestFirst,
+                direction: Direction::OldestFirst,
                 ..TestScan::default()
             },
         );
@@ -557,7 +529,7 @@ mod tests {
         ];
         let raws = [0, 1, 9, 10, 255, 256, 65_536, LARGE_RAW];
         for kind in kinds {
-            let encoded: Vec<TestOrder> = raws.iter().map(|&raw| order_value(kind, raw)).collect();
+            let encoded: Vec<OrderValue> = raws.iter().map(|&raw| order_value(kind, raw)).collect();
             assert!(
                 encoded.windows(2).all(|pair| pair[0] < pair[1]),
                 "{kind:?}: {encoded:?}"
@@ -571,7 +543,7 @@ mod tests {
         assert_eq!(OrderKind::Date.encode(PAST_32_BITS), None);
         assert_eq!(
             OrderKind::Long.encode(PAST_32_BITS),
-            Some(TestOrder::Long(PAST_32_BITS))
+            Some(OrderValue::Long(PAST_32_BITS))
         );
         for kind in [OrderKind::Str, OrderKind::Bin, OrderKind::Fixed(WIDE_WIDTH)] {
             assert_eq!(kind.encode(-1), None, "{kind:?}");
@@ -704,8 +676,8 @@ mod tests {
             .iter()
             .filter(|copy| !copy.deleted)
             .map(|copy| match copy.order {
-                Some(TestOrder::Long(order)) => (order, vec![copy.value.clone()]),
-                Some(TestOrder::Str(_) | TestOrder::Bytes(_)) | None => {
+                Some(OrderValue::Long(order)) => (order, vec![copy.value.clone()]),
+                Some(OrderValue::Str(_) | OrderValue::Bytes(_)) | None => {
                     panic!("a long order value: {copy:?}")
                 }
             })
@@ -720,9 +692,10 @@ mod tests {
         let copies = oracle.copies(&key);
         assert_eq!(copies.len(), THREE);
         assert!(copies.windows(2).all(|pair| pair[0].order < pair[1].order));
-        let orders: Vec<Option<TestOrder>> = copies.iter().map(|copy| copy.order.clone()).collect();
-        let expected: Vec<Option<TestOrder>> = (0..THREE)
-            .map(|index| Some(TestOrder::Long(order_of(index))))
+        let orders: Vec<Option<OrderValue>> =
+            copies.iter().map(|copy| copy.order.clone()).collect();
+        let expected: Vec<Option<OrderValue>> = (0..THREE)
+            .map(|index| Some(OrderValue::Long(order_of(index))))
             .collect();
         assert_eq!(orders, expected);
         Ok(())
@@ -733,7 +706,7 @@ mod tests {
         let (_dir, _catalog, fixture) =
             written(spec("sorted", OrderKind::Long, up_to_four)).await?;
         let oracle = MergeOracle::read(&fixture).await?;
-        let mut by_file: BTreeMap<String, Vec<(u64, Key, Option<TestOrder>)>> = BTreeMap::new();
+        let mut by_file: BTreeMap<String, Vec<(u64, Key, Option<OrderValue>)>> = BTreeMap::new();
         for key in oracle.keys() {
             for copy in oracle.copies(key) {
                 by_file.entry(copy.path.clone()).or_default().push((
@@ -791,12 +764,12 @@ mod tests {
             );
             let oracle = MergeOracle::read(&fixture).await?;
             for id in IDS {
-                let read: Vec<Option<TestOrder>> = oracle
+                let read: Vec<Option<OrderValue>> = oracle
                     .copies(&fixture.key(id))
                     .iter()
                     .map(|copy| copy.order.clone())
                     .collect();
-                let expected: Vec<Option<TestOrder>> = (0..THREE)
+                let expected: Vec<Option<OrderValue>> = (0..THREE)
                     .map(|index| Some(order_value(kind, order_of(index))))
                     .collect();
                 assert_eq!(read, expected, "{kind:?} id {id}");
@@ -997,7 +970,7 @@ mod tests {
         );
         assert!(matches!(
             MergeOracle::read(&fixture).await,
-            Err(TestkitError::Oracle(OracleFault::LiveDuplicate { key: found, order: Some(TestOrder::Long(order)), .. }))
+            Err(TestkitError::Oracle(OracleFault::LiveDuplicate { key: found, order: Some(OrderValue::Long(order)), .. }))
                 if found == key && order == new_order
         ));
         Ok(())
@@ -1020,7 +993,7 @@ mod tests {
         );
         let at_pair: Vec<&RowCopy> = copies
             .iter()
-            .filter(|copy| copy.order == Some(TestOrder::Long(order_of(1))))
+            .filter(|copy| copy.order == Some(OrderValue::Long(order_of(1))))
             .collect();
         assert_eq!(at_pair.len(), 2);
         assert_eq!(at_pair.iter().filter(|copy| copy.deleted).count(), 1);
@@ -1126,12 +1099,12 @@ mod tests {
     /// without a limit, with bounds at and between its order values.
     fn scans(
         rows: &[(i64, Vec<Option<Vec<u8>>>)],
-    ) -> Vec<(TestDirection, u32, Option<i64>, Option<i64>)> {
+    ) -> Vec<(Direction, u32, Option<i64>, Option<i64>)> {
         let orders: Vec<i64> = rows.iter().map(|(order, _)| *order).collect();
         let first = orders.first().copied().unwrap_or(ORDER_START);
         let last = orders.last().copied().unwrap_or(ORDER_START);
         let mut scans = Vec::new();
-        for direction in [TestDirection::NewestFirst, TestDirection::OldestFirst] {
+        for direction in [Direction::NewestFirst, Direction::OldestFirst] {
             for limit in [0, ONE, ONE + 1] {
                 for (after, before) in [
                     (None, None),

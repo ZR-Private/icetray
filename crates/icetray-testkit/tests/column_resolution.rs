@@ -33,8 +33,8 @@ use icetray_testkit::verify::{
     self, HINT_POLL_GETS, LOAD_METADATA_GETS, METADATA_FILE_GETS, SeenPages, Served,
 };
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, RawFile, Result, value_for,
-    write_fixture,
+    DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, ORDER_COLUMN, OrderKind, Ordered,
+    RawFile, Result, TestScan, value_for, write_fixture,
 };
 
 /// The long keys of a raw file, ascending.
@@ -1029,5 +1029,134 @@ async fn test_a_fixed_value_column_at_another_width_is_refused() -> Result<()> {
             "{name}"
         );
     }
+    Ok(())
+}
+
+/// One row per key: an ordered fixture of this shape also holds under the
+/// key-value rules the load verifies with today.
+fn one_row(_id: u64) -> u64 {
+    1
+}
+
+/// A two-bucket ordered fixture of `IDS_2K` named `name`, one `long` order
+/// value per key, with `SECOND_VALUE_COLUMN` when `second_value`.
+async fn ordered_fixture(name: &str, second_value: bool) -> Result<(tempfile::TempDir, Fixture)> {
+    let (dir, catalog) = local_catalog().await?;
+    let ordered = Ordered {
+        kind: OrderKind::Long,
+        rows_per_key: one_row,
+        start: 0,
+        step: 1,
+    };
+    let spec = FixtureSpec {
+        ids: IDS_2K,
+        buckets: TWO_BUCKETS,
+        second_value,
+        ..FixtureSpec::ordered(name, KeyType::Long, ordered)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    Ok((dir, fixture))
+}
+
+/// The error the first load of `fixture` from its root fails with, serving
+/// `VALUE_COLUMN` with `order_column` as its order column.
+async fn order_load_error(fixture: &Fixture, order_column: &str) -> Result<Error> {
+    let config = TableConfig {
+        order_column: Some(order_column.to_string()),
+        ..root_entry(fixture, &[VALUE_COLUMN], Residency::Full)
+    };
+    let source = TableSource::from_config(&config.source).await?;
+    load_error(config, source).await
+}
+
+/// The order column is found as a value column is (RFD 023, RFD 025): by
+/// its name, checked against the field id the schema gives it, so a file
+/// holding it is served and a rename is refused under the new name.
+#[tokio::test]
+async fn test_the_order_column_resolves_by_name_and_field_id_like_a_value_column() -> Result<()> {
+    let (_dir, mut fixture) = ordered_fixture("ord_resolve", false).await?;
+    let config = fixture.config_serving(Residency::Full, &[VALUE_COLUMN]);
+    let source = TableSource::from_config(&config.source).await?;
+    let served = verify::serve(config, source, verify::storage_config_for_tests()).await?;
+    for id in FIRST_BUILD_SAMPLE {
+        let key = fixture.key(id);
+        let (rows, more) = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
+        let [(_order, values)] = &rows[..] else {
+            panic!("one row per key, got {rows:?}");
+        };
+        assert!(!more);
+        assert_eq!(
+            served
+                .table
+                .get(&key, &verify::whole(&[VALUE_COLUMN]))
+                .await?
+                .row,
+            Row::Present(
+                values
+                    .iter()
+                    .cloned()
+                    .map(|value| value.map(Into::into))
+                    .collect()
+            ),
+            "{id}"
+        );
+    }
+    let order_field_id = fixture
+        .order_field_id()
+        .expect("an ordered fixture has an order column");
+    fixture
+        .evolve(&[SchemaChange::Rename {
+            from: ORDER_COLUMN.to_string(),
+            to: RENAMED.to_string(),
+        }])
+        .await?;
+    let (column, path, mismatch) = mismatch_of(&order_load_error(&fixture, RENAMED).await?);
+    assert_eq!(column, RENAMED);
+    assert!(is_listed(&fixture, path.as_deref()), "{path:?}");
+    assert_eq!(
+        mismatch,
+        ColumnMismatch::Renamed {
+            field_id: order_field_id,
+            found: ORDER_COLUMN.to_string(),
+        }
+    );
+    Ok(())
+}
+
+/// A swap of the order column's name with a value column's is refused
+/// under the order column's name: the file's column of that name carries
+/// another field id than the schema gives it.
+#[tokio::test]
+async fn test_a_swapped_order_column_is_refused() -> Result<()> {
+    let (_dir, mut fixture) = ordered_fixture("ord_swap", true).await?;
+    let order_field_id = fixture
+        .order_field_id()
+        .expect("an ordered fixture has an order column");
+    fixture
+        .evolve(&[
+            SchemaChange::Rename {
+                from: ORDER_COLUMN.to_string(),
+                to: SWAP_SCRATCH.to_string(),
+            },
+            SchemaChange::Rename {
+                from: SECOND_VALUE_COLUMN.to_string(),
+                to: ORDER_COLUMN.to_string(),
+            },
+            SchemaChange::Rename {
+                from: SWAP_SCRATCH.to_string(),
+                to: SECOND_VALUE_COLUMN.to_string(),
+            },
+        ])
+        .await?;
+    let (column, path, mismatch) = mismatch_of(&order_load_error(&fixture, ORDER_COLUMN).await?);
+    assert_eq!(column, ORDER_COLUMN);
+    assert!(is_listed(&fixture, path.as_deref()), "{path:?}");
+    assert_eq!(
+        mismatch,
+        ColumnMismatch::OtherFieldId {
+            expected: SECOND_VALUE_FIELD_ID,
+            found: order_field_id,
+        }
+    );
     Ok(())
 }

@@ -27,7 +27,7 @@ use icetray_core::deletes::{
     CARDINALITY_PROPERTY, FILE_PATH_COLUMN, POS_COLUMN, REFERENCED_DATA_FILE_PROPERTY,
 };
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{Key, Row};
+use icetray_core::{Key, OrderValue, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringTreemap;
 
@@ -35,7 +35,7 @@ use crate::delete_files::{VECTOR_FRAME_BYTES, VECTOR_MAGIC};
 use crate::error::{OracleFault, Result};
 use crate::fixture::Fixture;
 use crate::layout::{KEY_COLUMN, VALUE_COLUMN};
-use crate::ordered::{ORDER_COLUMN, TestOrder};
+use crate::ordered::ORDER_COLUMN;
 
 /// One copy of a key: a row of a live data file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,7 +46,7 @@ pub struct RowCopy {
     pub position: u64,
     /// The row's order value, read from the order column; `None` in a
     /// file without one.
-    pub order: Option<TestOrder>,
+    pub order: Option<OrderValue>,
     /// The row's value; `None` is a null.
     pub value: Option<Vec<u8>>,
     /// Whether a delete that applies to the file names the row.
@@ -175,7 +175,7 @@ impl MergeOracle {
     }
 
     /// The live copy of `key` at order value `order`, when it has one.
-    pub fn live_copy_at(&self, key: &Key, order: &TestOrder) -> Option<&RowCopy> {
+    pub fn live_copy_at(&self, key: &Key, order: &OrderValue) -> Option<&RowCopy> {
         self.copies(key)
             .iter()
             .find(|copy| !copy.deleted && copy.order.as_ref() == Some(order))
@@ -264,7 +264,7 @@ async fn apply(
 struct FileRow {
     key: Key,
     /// The order column's value, `None` for a file without the column.
-    order: Option<TestOrder>,
+    order: Option<OrderValue>,
     value: Option<Vec<u8>>,
 }
 
@@ -327,7 +327,7 @@ fn key_at(keys: &dyn Array, row: usize, path: &str) -> Result<Key> {
 /// The order value at `row` of an order column, `None` for a null: an
 /// integer, date, or timestamp as a long in its unit, a string, or the bytes
 /// of a binary (as the library's writer stores one, large) or fixed value.
-fn order_at(orders: &dyn Array, row: usize, path: &str) -> Result<Option<TestOrder>> {
+fn order_at(orders: &dyn Array, row: usize, path: &str) -> Result<Option<OrderValue>> {
     if orders.is_null(row) {
         return Ok(None);
     }
@@ -345,19 +345,19 @@ fn order_at(orders: &dyn Array, row: usize, path: &str) -> Result<Option<TestOrd
             .map(|values| values.value(row))
     };
     if let Some(long) = long {
-        return Ok(Some(TestOrder::Long(long)));
+        return Ok(Some(OrderValue::Long(long)));
     }
     if let Some(values) = any.downcast_ref::<StringArray>() {
-        return Ok(Some(TestOrder::Str(values.value(row).to_string())));
+        return Ok(Some(OrderValue::Str(values.value(row).to_string())));
     }
     if let Some(values) = any.downcast_ref::<BinaryArray>() {
-        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+        return Ok(Some(OrderValue::Bytes(values.value(row).to_vec())));
     }
     if let Some(values) = any.downcast_ref::<LargeBinaryArray>() {
-        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+        return Ok(Some(OrderValue::Bytes(values.value(row).to_vec())));
     }
     if let Some(values) = any.downcast_ref::<FixedSizeBinaryArray>() {
-        return Ok(Some(TestOrder::Bytes(values.value(row).to_vec())));
+        return Ok(Some(OrderValue::Bytes(values.value(row).to_vec())));
     }
     Err(OracleFault::UnexpectedColumn {
         path: path.to_string(),

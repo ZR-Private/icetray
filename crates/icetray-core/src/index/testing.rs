@@ -483,6 +483,7 @@ pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(
         index.metadata(),
         index.key_leaf(),
+        index.order_leaf(),
         &index.held_value_leaves(),
         index.key_type(),
         index.handle(),

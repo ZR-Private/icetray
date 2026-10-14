@@ -26,6 +26,7 @@ use crate::config::{TableConfig, ValueFormat};
 use crate::deletes::{Sorted, oldest_by_partition};
 use crate::error::{Error, RefusalReason, Result, UnsupportedDelete, UnsupportedFormat};
 use crate::key::{Key, KeyType};
+use crate::order::{OrderColumnLayout, OrderType};
 use crate::projection::{FieldSet, MAX_FIELD_NUMBER};
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::Storage;
@@ -89,6 +90,9 @@ pub struct TableLayout {
     /// by name; a lookup names each by its position here, and every file's
     /// index holds its columns in this order.
     pub value_columns: Vec<ValueColumnLayout>,
+    /// The order column of an ordered table (RFD 025); `None` for a
+    /// key-value table. Every ordered-only rule is gated on it.
+    pub order: Option<OrderColumnLayout>,
 }
 
 /// One served value column as a snapshot's schema gives it (RFD 022, RFD
@@ -251,7 +255,9 @@ impl TableLayout {
     /// id the metadata lacks is `TableFault::SchemaMissing`. Bucketing comes
     /// from `md`'s default partition spec, since a snapshot records no spec
     /// of its own; a bucket count of zero there is
-    /// `TableFault::ZeroBuckets`.
+    /// `TableFault::ZeroBuckets`. An `order_column` is found as a value
+    /// column is, and refused as `RefusalReason::OrderTypeUnsupported`
+    /// when `OrderType::from_iceberg` does not admit its type (RFD 025).
     pub(crate) fn derive(
         table: &str,
         md: &TableMetadata,
@@ -259,6 +265,7 @@ impl TableLayout {
         snapshot: &Snapshot,
         key_column: &str,
         value_columns: &[&str],
+        order_column: Option<&str>,
     ) -> Result<Self> {
         let schema = match snapshot.schema_id() {
             Some(schema_id) => md.schema_by_id(schema_id).ok_or_else(|| {
@@ -310,6 +317,29 @@ impl TableLayout {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let order = order_column
+            .map(|name| -> Result<OrderColumnLayout> {
+                let field = column(name)?;
+                let order_type = match field.field_type.as_ref() {
+                    Type::Primitive(primitive) => OrderType::from_iceberg(primitive),
+                    Type::Struct(_) | Type::List(_) | Type::Map(_) => None,
+                }
+                .ok_or_else(|| {
+                    Error::refused(
+                        table,
+                        RefusalReason::OrderTypeUnsupported {
+                            column: name.to_string(),
+                            got: field.field_type.to_string(),
+                        },
+                    )
+                })?;
+                Ok(OrderColumnLayout {
+                    name: name.to_string(),
+                    field_id: field.id,
+                    order_type,
+                })
+            })
+            .transpose()?;
         let bucketing = bucket_field(table, md.default_partition_spec(), key_field.id)?
             .map(|field| field.bucketing);
         Ok(Self {
@@ -319,12 +349,13 @@ impl TableLayout {
             key_type,
             key_width: fixed_width(&key_field.field_type),
             value_columns,
+            order,
         })
     }
 
     /// The layout of `snapshot` for the table `config` describes, derived
     /// (`derive`) from `resolved`, its metadata and unread defaults, over
-    /// the configured key and value columns, with each column's declared
+    /// the configured key, value, and order columns, with each column's declared
     /// format checked against its type (`check_formats`): what a load and
     /// a key-type resolution both build.
     pub(crate) fn for_entry(
@@ -339,6 +370,7 @@ impl TableLayout {
             snapshot,
             &config.key_column,
             &config.value_column_names(),
+            config.order_column.as_deref(),
         )?;
         layout.check_formats(config)?;
         Ok(layout)
@@ -1199,6 +1231,7 @@ pub(crate) mod testing {
             key_type,
             key_width: None,
             value_columns: vec![binary_column(VALUE_COLUMN, VALUE_FIELD_ID)],
+            order: None,
         }
     }
 
@@ -1667,6 +1700,7 @@ mod tests {
             snapshot,
             KEY_COLUMN,
             &[VALUE_COLUMN],
+            None,
         )
     }
 
@@ -1758,6 +1792,7 @@ mod tests {
                     key_type: expected,
                     key_width,
                     value_columns: vec![testing::binary_column(VALUE_COLUMN, VALUE_FIELD_ID)],
+                    order: None,
                 }
             );
         }
@@ -1862,6 +1897,7 @@ mod tests {
                 &snapshot,
                 KEY_COLUMN,
                 columns,
+                None,
             )
         };
         let layout = derive_columns(&[RENAMED_VALUE_COLUMN, VALUE_COLUMN]).unwrap();
@@ -1893,6 +1929,7 @@ mod tests {
             &snapshot,
             KEY_COLUMN,
             &[VALUE_COLUMN, RENAMED_VALUE_COLUMN],
+            None,
         );
         assert_eq!(
             refusal_of(unsupported),
@@ -1900,6 +1937,66 @@ mod tests {
                 column: RENAMED_VALUE_COLUMN.to_string(),
                 got: Type::Primitive(PrimitiveType::Long).to_string(),
                 format: ValueFormat::Opaque,
+            }
+        );
+    }
+
+    /// The order column is a top-level field found as a value column is,
+    /// admitted when `OrderType::from_iceberg` takes its type and refused
+    /// as `order_type_unsupported` from the schema otherwise (RFD 025); a
+    /// key-value table derives none.
+    #[test]
+    fn test_derive_takes_an_order_column_of_an_order_type_and_refuses_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_with_schema(None);
+        let derive_ordered = |second: PrimitiveType, order_column: Option<&str>| {
+            TableLayout::derive(
+                TABLE,
+                &testing::metadata(
+                    &testing::file_root(dir.path()),
+                    two_value_schema(Type::Primitive(second)),
+                    testing::unpartitioned(),
+                ),
+                &UnreadDefaults::default(),
+                &snapshot,
+                KEY_COLUMN,
+                &[VALUE_COLUMN],
+                order_column,
+            )
+        };
+        for (second, order_type) in [
+            (PrimitiveType::Long, OrderType::Long),
+            (PrimitiveType::Timestamptz, OrderType::TimestampTz),
+            (PrimitiveType::String, OrderType::String),
+        ] {
+            assert_eq!(
+                derive_ordered(second, Some(RENAMED_VALUE_COLUMN))
+                    .unwrap()
+                    .order,
+                Some(OrderColumnLayout {
+                    name: RENAMED_VALUE_COLUMN.to_string(),
+                    field_id: RENAMED_VALUE_FIELD_ID,
+                    order_type,
+                })
+            );
+        }
+        for second in [PrimitiveType::Double, PrimitiveType::Uuid] {
+            assert_eq!(
+                refusal_of(derive_ordered(second.clone(), Some(RENAMED_VALUE_COLUMN))),
+                RefusalReason::OrderTypeUnsupported {
+                    column: RENAMED_VALUE_COLUMN.to_string(),
+                    got: second.to_string(),
+                }
+            );
+        }
+        assert_eq!(
+            derive_ordered(PrimitiveType::Long, None).unwrap().order,
+            None
+        );
+        assert_eq!(
+            fault_of(derive_ordered(PrimitiveType::Long, Some("absent"))),
+            TableFault::ColumnMissing {
+                column: "absent".to_string(),
             }
         );
     }
@@ -1915,6 +2012,8 @@ mod tests {
             r#ref: iceberg::spec::MAIN_BRANCH.to_string(),
             key_column: KEY_COLUMN.to_string(),
             value_columns: columns,
+            order_column: None,
+            max_scan_rows: None,
             strict: false,
             lookups: None,
             residency: crate::config::Residency::Full,
@@ -2134,7 +2233,8 @@ mod tests {
                     &UnreadDefaults::default(),
                     &snapshot,
                     key_column,
-                    &[value_column]
+                    &[value_column],
+                    None
                 )),
                 TableFault::ColumnMissing {
                     column: ABSENT_COLUMN.to_string(),
@@ -2203,6 +2303,7 @@ mod tests {
             &snapshot_with_schema(Some(current_schema_id)),
             KEY_COLUMN,
             &[RENAMED_VALUE_COLUMN],
+            None,
         )
         .unwrap();
         assert_eq!(renamed.value_columns[0].field_id, RENAMED_VALUE_FIELD_ID);
@@ -2214,6 +2315,7 @@ mod tests {
             &snapshot_with_schema(None),
             KEY_COLUMN,
             &[RENAMED_VALUE_COLUMN],
+            None,
         )
         .unwrap();
         assert_eq!(by_default.value_columns[0].field_id, RENAMED_VALUE_FIELD_ID);
@@ -2273,6 +2375,7 @@ mod tests {
                 &snapshot,
                 KEY_COLUMN,
                 &[value_column],
+                None,
             )
         };
         let dotted = format!("{NESTED_OUTER}.{NESTED_INNER}");
@@ -2332,6 +2435,7 @@ mod tests {
                 &snapshot,
                 KEY_COLUMN,
                 &[VALUE_COLUMN],
+                None,
             )),
             RefusalReason::ColumnMismatch {
                 column: VALUE_COLUMN.to_string(),

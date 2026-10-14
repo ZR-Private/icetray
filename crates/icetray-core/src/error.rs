@@ -18,6 +18,7 @@ use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::local::LocalFault;
 use crate::manifest::ColumnRequestFault;
+use crate::order::OrderType;
 use crate::projection::Malformed;
 use crate::storage::LocationError;
 
@@ -545,6 +546,14 @@ fn refusal_detail(reason: &RefusalReason) -> String {
             finding_list(findings)
         ),
         RefusalReason::KeyTypeUnsupported => reason.to_string(),
+        RefusalReason::OrderTypeUnsupported { column, got } => {
+            format!("{reason} (column {column}, got {got})")
+        }
+        RefusalReason::OrderTypeMismatch {
+            path,
+            expected,
+            got,
+        } => format!("{reason} (file {path}, expected {expected}, got {got})"),
     }
 }
 
@@ -622,13 +631,41 @@ pub enum RefusalReason {
     },
     /// The key column's Iceberg type is not long, string, binary, fixed, or uuid.
     KeyTypeUnsupported,
+    /// An ordered table's order column has an Iceberg type that is not one
+    /// of `OrderType`'s (RFD 025): not `int`, `long`, `date`, a timestamp,
+    /// `string`, `binary`, or `fixed`. Raised as the snapshot's layout is
+    /// derived, before any data file is read.
+    OrderTypeUnsupported {
+        /// The order column as configured.
+        column: String,
+        /// The Iceberg type's `Display`, held as text because
+        /// `iceberg::spec::Type` does not implement `Hash`.
+        got: String,
+    },
+    /// A data file stores the order column in another Parquet type than
+    /// Iceberg writes for the column's type (RFD 025), such as INT96 or a
+    /// timestamp in milliseconds, or under a promotion that changes the
+    /// unit, such as `date` to `timestamp`: the order column's counterpart
+    /// of `KeyTypeMismatch`. A plain `INT32` under `long`, written before
+    /// Iceberg promoted the column from `int`, is served.
+    OrderTypeMismatch {
+        /// The data file's location.
+        path: String,
+        /// The order type the snapshot's schema declares.
+        expected: OrderType,
+        /// The Parquet physical type and annotation the file stores the
+        /// column as, held as text because parquet's `LogicalType` does not
+        /// implement `Hash`.
+        got: String,
+    },
     /// A configured column is not found in the snapshot as its schema means
     /// it (RFD 023): the configured name is not a top-level field of the
     /// schema or states a default that does not read, or a data file holds
     /// the column under another field id or name, lacks it with no field ids
-    /// to say it was added after the file, lacks the key column, holds the
-    /// name as a nested group, or stores a `fixed` key or value column at
-    /// another width. Checked against every file of
+    /// to say it was added after the file, lacks the key column or an
+    /// ordered table's order column, holds the name as a nested group, or
+    /// stores a `fixed` key, value, or order column at another width.
+    /// Checked against every file of
     /// the snapshot, a reused file included, from the footer it keeps.
     ColumnMismatch {
         /// The column as configured.
@@ -742,6 +779,8 @@ impl Recurs for RefusalReason {
             | Self::KeyOutsideBucket { .. }
             | Self::KeyTypeMismatch { .. }
             | Self::KeyTypeUnsupported
+            | Self::OrderTypeUnsupported { .. }
+            | Self::OrderTypeMismatch { .. }
             | Self::ColumnMismatch { .. }
             | Self::ValueTypeUnsupported { .. }
             | Self::DataFormatUnsupported { .. }
@@ -857,6 +896,8 @@ impl fmt::Display for RefusalReason {
             Self::KeyOutsideBucket { .. } => "key_outside_bucket",
             Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
+            Self::OrderTypeUnsupported { .. } => "order_type_unsupported",
+            Self::OrderTypeMismatch { .. } => "order_type_mismatch",
             Self::ColumnMismatch { .. } => "column_mismatch",
             Self::ValueTypeUnsupported { .. } => "value_type_unsupported",
             Self::DataFormatUnsupported { .. } => "data_format_unsupported",
@@ -934,6 +975,21 @@ mod tests {
                 "key_type_mismatch",
             ),
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
+            (
+                RefusalReason::OrderTypeUnsupported {
+                    column: "ts".to_string(),
+                    got: iceberg::spec::PrimitiveType::Double.to_string(),
+                },
+                "order_type_unsupported",
+            ),
+            (
+                RefusalReason::OrderTypeMismatch {
+                    path: FILE_PATH.to_string(),
+                    expected: OrderType::Timestamp,
+                    got: parquet::basic::Type::INT96.to_string(),
+                },
+                "order_type_mismatch",
+            ),
             (
                 RefusalReason::KeyTooLong {
                     path: FILE_PATH.to_string(),

@@ -36,7 +36,7 @@ pub use keys::{
 pub use layout::{Bloom, Dictionary, Layout, Statistics};
 pub use merge_oracle::{MergeOracle, RowCopy};
 pub use ordered::{
-    DEFAULT_MAX_SCAN_ROWS, ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, ScanRows,
-    TestDirection, TestOrder, TestScan, order_value, row_value, scan_model,
+    ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, ScanRows, TestScan, order_value, row_value,
+    scan_model,
 };
 pub use s3::S3Fixture;

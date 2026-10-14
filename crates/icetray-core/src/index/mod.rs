@@ -68,8 +68,9 @@ pub(crate) struct RowPosition(pub(crate) u64);
 /// is closed; a fault outside it is a library error, not a file fault.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FileFault {
-    /// The file has no offset index on the key or a value column; page
-    /// locations are how a lookup names the one page it decodes.
+    /// The file has no offset index on the key, the order, or a value
+    /// column; page locations are how a lookup names the one page it
+    /// decodes, and how a Scan names the order pages it reads.
     #[error("no page index")]
     MissingPageIndex,
     /// The file has no rows, so it has no key range and cannot be routed to.
@@ -592,6 +593,29 @@ struct ValueColumn {
     shape: ValueShape,
 }
 
+/// How an ordered table's order column decodes, fixed at build from the
+/// order type and the column's physical type (RFD 025): an `INT32` holds
+/// an `int`, a `date`, or a `long` written before a promotion from `int`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderShape {
+    /// `INT32`, read as a long.
+    Int32,
+    /// `INT64`.
+    Int64,
+    /// `BYTE_ARRAY`.
+    Bytes,
+    /// `FIXED_LEN_BYTE_ARRAY` of this width.
+    Fixed(u32),
+}
+
+/// The column a file holds under an ordered table's order column: its leaf
+/// and how its values decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrderLeaf {
+    leaf: usize,
+    shape: OrderShape,
+}
+
 /// What the tier keeps of the key column (RFD 017).
 #[derive(Debug)]
 enum KeyResidency {
@@ -660,13 +684,15 @@ pub(crate) struct ValueRead {
 #[derive(Debug)]
 pub struct FileIndex {
     handle: Arc<FileHandle>,
-    /// The footer with the key column's page indexes and the offset index
-    /// of every value column the table serves; every other column index and
-    /// offset index is dropped at build (`kept_footer`).
+    /// The footer with the page indexes of the key column and of an
+    /// ordered table's order column, and the offset index of every value
+    /// column the table serves; every other column index and offset index
+    /// is dropped at build (`kept_footer`).
     metadata: Arc<ParquetMetaData>,
-    /// The key leaf, how the keys decode, and the value column the file
-    /// holds per column of the table's layout; `None` for one the file
-    /// was written before, whose rows answer that column's default.
+    /// The key leaf, how the keys decode, the value column the file holds
+    /// per column of the table's layout, `None` for one the file was
+    /// written before, whose rows answer that column's default, and an
+    /// ordered table's order column.
     layout: Layout,
     keys: KeyResidency,
     /// Per row group, the first key of every key page.
@@ -707,7 +733,12 @@ impl FileIndex {
     /// page can hold, a key page holding other rows than its offset index
     /// says, a footer, key page, or bloom filter parquet panics decoding
     /// (`FileFault::DecoderPanicked`). Footer checks run before any chunk is
-    /// fetched; `inspect` is that stage on its own. The Disk tier with no
+    /// fetched; `inspect` is that stage on its own. On an ordered table the
+    /// order column resolves as a value column does, a file without it is
+    /// refused (`ColumnMismatch::OrderAbsent`), one that stores it in a
+    /// Parquet type its order type does not admit is
+    /// `RefusalReason::OrderTypeMismatch`, and one without its offset index
+    /// is `FileFault::MissingPageIndex` (RFD 025). The Disk tier with no
     /// local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
     /// fetched.
@@ -719,11 +750,12 @@ impl FileIndex {
     /// decoded), or fetches the chunks, verifies them, and writes them with
     /// that record; it keeps no key bytes in memory. Bloom fetches and
     /// verifies the chunks, drops them, and keeps the filters. Every tier
-    /// keeps the footer, both page indexes of the key column, the offset
-    /// index of every value column the table serves, and the fences; the
-    /// column index of every column but the key, the value columns' above
-    /// all, and the offset index of every column the table does not serve,
-    /// are never resident (RFD 004, RFD 017, RFD 022).
+    /// keeps the footer, both page indexes of the key column and of an
+    /// ordered table's order column, the offset index of every value column
+    /// the table serves, and the fences; the column index of every other
+    /// column, the value columns' above all, and the offset index of every
+    /// column the table does not serve, are never resident (RFD 004, RFD
+    /// 017, RFD 022, RFD 025).
     ///
     /// Only tests call this: the loader runs `inspect` and
     /// `Inspected::build` apart, so its budget check sits between them.
@@ -755,11 +787,18 @@ impl FileIndex {
         let loaded = handle.load_metadata().await?;
         let layout = Layout::inspect(table, &handle, &loaded, layout)?;
         let value_leaves = layout.held_value_leaves();
-        let metadata = Arc::new(kept_footer(&loaded, layout.key_leaf, &value_leaves));
+        let order_leaf = layout.order_leaf();
+        let metadata = Arc::new(kept_footer(
+            &loaded,
+            layout.key_leaf,
+            order_leaf,
+            &value_leaves,
+        ));
         drop(loaded);
         let predicted = Self::predicted_resident_bytes(
             &metadata,
             layout.key_leaf,
+            order_leaf,
             &value_leaves,
             key_type,
             &handle,
@@ -785,8 +824,9 @@ impl FileIndex {
     /// Every tier's resident bytes for the file `handle` opens, from its
     /// footer alone (RFD 017), the same given the footer as loaded or as
     /// `FileIndex` keeps it (`metadata()`): the column index of every column
-    /// but the key, and the offset index of every column but the key and
-    /// `value_leaves`, are never resident and are not counted either way, so
+    /// but the key and `order_leaf`, and the offset index of every column
+    /// but the key, `order_leaf`, and `value_leaves`, are never resident and
+    /// are not counted either way, so
     /// a budget check at the footer stage predicts what `resident_bytes`
     /// will report. Exact: the footer and the page indexes kept
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
@@ -814,6 +854,7 @@ impl FileIndex {
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
+        order_leaf: Option<usize>,
         value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
@@ -821,6 +862,7 @@ impl FileIndex {
         tiers(&ResidentSet::from_footer(
             metadata,
             key_leaf,
+            order_leaf,
             value_leaves,
             key_type,
             handle,
@@ -851,9 +893,9 @@ impl FileIndex {
         &self.handle
     }
 
-    /// The footer as kept: both page indexes of the key column, the offset
-    /// index of every value column the table serves, and no other page
-    /// index.
+    /// The footer as kept: both page indexes of the key column and of an
+    /// ordered table's order column, the offset index of every value column
+    /// the table serves, and no other page index.
     pub fn metadata(&self) -> &Arc<ParquetMetaData> {
         &self.metadata
     }
@@ -891,19 +933,29 @@ impl FileIndex {
         self.layout.held_value_leaves()
     }
 
+    /// The order column's leaf, whose offset index and column index the
+    /// footer keeps; `None` on a key-value table.
+    pub(crate) fn order_leaf(&self) -> Option<usize> {
+        self.layout.order_leaf()
+    }
+
     /// Checks that the file still holds its columns as `layout`, a later
     /// snapshot's, means them, from the footer as kept with no read (RFD
     /// 023): a file reused from the previous generation was inspected
     /// under that generation's schema, and a schema that drops a column and
     /// adds another under its name changes what the file's column means.
-    /// Refuses as `column::resolve` does, and a key column the snapshot
+    /// Refuses as `column::resolve` does, a key column the snapshot
     /// types otherwise than the index decodes its keys as is
-    /// `RefusalReason::KeyTypeMismatch`. `Ok(true)` when the key and every
-    /// value column, by position, resolve to the leaves the index was built
-    /// over, so it holds no answer that changes; `Ok(false)` when they
-    /// resolve to others or `layout` names another count of columns, an
-    /// index that would answer a column from another's pages, which the
-    /// caller does not reuse.
+    /// `RefusalReason::KeyTypeMismatch`, and an order column whose type in
+    /// `layout` does not admit the file's (`inspect::order_leaf`)
+    /// `RefusalReason::OrderTypeMismatch`. `Ok(true)` when the key, the
+    /// order column, and every value column, by position, resolve to the
+    /// leaves the index was built over, the order column decoding as it was,
+    /// so it holds no answer that changes; `Ok(false)` when they resolve to
+    /// others, `layout` names another count of columns, or it sets an order
+    /// column where the index has none or the reverse, an index that would
+    /// answer a column from another's pages, which the caller does not
+    /// reuse.
     pub(crate) fn check_columns(&self, table: &str, layout: &TableLayout) -> Result<bool> {
         let path = self.handle.location.as_str();
         let schema = self.metadata.file_metadata().schema_descr();
@@ -918,8 +970,16 @@ impl FileIndex {
                 },
             ));
         }
+        let order = inspect::order_leaf(
+            table,
+            path,
+            schema,
+            layout.order.as_ref(),
+            columns.order_leaf,
+        )?;
         Ok(columns.key_leaf == self.layout.key_leaf
-            && columns.value_leaves == self.layout.value_leaves())
+            && columns.value_leaves == self.layout.value_leaves()
+            && order == self.layout.order)
     }
 
     /// The first key of every key page, per row group; a row group without
@@ -959,6 +1019,7 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.layout.key_leaf,
+            self.order_leaf(),
             &self.held_value_leaves(),
             self.key_type(),
             &self.handle,
@@ -1646,6 +1707,7 @@ mod tests {
         value_of_len, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
         with_pages,
     };
+    use crate::order::OrderType;
     use crate::storage::{HedgeWindow, IoStats};
     use std::time::Duration;
 
@@ -2458,6 +2520,63 @@ mod tests {
         };
         assert!(!index.check_columns(testing::TABLE, &more).unwrap());
         assert!(index.check_columns(testing::TABLE, &layout).unwrap());
+    }
+
+    /// A reused file is reused under a later snapshot's layout only when
+    /// its order column resolves to the leaf it was built over and decodes
+    /// as it did, and an order type that no longer admits the file's column
+    /// refuses it as the footer stage would (RFD 025): an index built for a
+    /// key-value table is not one for an ordered table, nor the reverse.
+    #[tokio::test]
+    async fn test_check_columns_compares_the_order_column_the_index_was_built_over() {
+        let mut fixture = Fixture::contract(KeyType::Long, FEW_ROWS);
+        fixture.value_column = ValueColumn::Int64;
+        let opened = store(&fixture).await;
+        let ordered = |order_type| TableLayout {
+            value_columns: Vec::new(),
+            order: Some(crate::order::OrderColumnLayout {
+                name: crate::manifest::testing::VALUE_COLUMN.to_string(),
+                field_id: crate::manifest::testing::VALUE_FIELD_ID,
+                order_type,
+            }),
+            ..crate::manifest::testing::layout(KeyType::Long, None)
+        };
+        let long = ordered(OrderType::Long);
+        let index = FileIndex::build(
+            testing::TABLE,
+            Arc::clone(&opened.handle),
+            &long,
+            Residency::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(index.check_columns(testing::TABLE, &long).unwrap());
+        let key_value = TableLayout {
+            order: None,
+            ..long.clone()
+        };
+        assert!(!index.check_columns(testing::TABLE, &key_value).unwrap());
+        let unordered = FileIndex::build(
+            testing::TABLE,
+            Arc::clone(&opened.handle),
+            &key_value,
+            Residency::Full,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(unordered.check_columns(testing::TABLE, &key_value).unwrap());
+        assert!(!unordered.check_columns(testing::TABLE, &long).unwrap());
+        assert!(matches!(
+            testing::refusal_of(
+                index.check_columns(testing::TABLE, &ordered(OrderType::Timestamp))
+            ),
+            RefusalReason::OrderTypeMismatch {
+                expected: OrderType::Timestamp,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

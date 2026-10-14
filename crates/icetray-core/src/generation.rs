@@ -2521,6 +2521,8 @@ pub(crate) mod testing {
                 } else {
                     vec![ValueColumnConfig::named(VALUE_COLUMN)]
                 },
+                order_column: None,
+                max_scan_rows: None,
                 strict: true,
                 lookups: None,
                 residency,
