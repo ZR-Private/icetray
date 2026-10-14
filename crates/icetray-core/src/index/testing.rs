@@ -222,6 +222,10 @@ pub(crate) struct Layout {
     pub(crate) write_batch: usize,
     pub(super) dictionary: Dictionary,
     pub(super) statistics: EnabledStatistics,
+    /// The statistics of an ordered fixture's order column where they
+    /// differ from `statistics`; below `Page`, the file holds no column
+    /// index for it.
+    pub(super) order_statistics: Option<EnabledStatistics>,
     pub(super) truncate: Option<usize>,
     pub(super) bloom: Bloom,
     pub(super) offset_index: bool,
@@ -242,6 +246,7 @@ impl Layout {
             write_batch: page_rows(),
             dictionary: Dictionary::Off,
             statistics: EnabledStatistics::Page,
+            order_statistics: None,
             truncate: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             bloom: Bloom::Sized,
             offset_index: true,
@@ -269,6 +274,12 @@ impl Layout {
             .set_writer_version(self.writer_version);
         let builder = match self.key_encoding {
             Some(encoding) => builder.set_column_encoding(ColumnPath::from(KEY_COLUMN), encoding),
+            None => builder,
+        };
+        let builder = match self.order_statistics {
+            Some(statistics) => {
+                builder.set_column_statistics_enabled(ColumnPath::from(ORDER_COLUMN), statistics)
+            }
             None => builder,
         };
         let builder = with_dictionary(builder, self.dictionary);

@@ -3656,4 +3656,43 @@ mod tests {
             assert_eq!((parts.order_column_index, parts.order_facts), (0, 0));
         }
     }
+
+    /// An ordered file whose writer left out the order column's column
+    /// index reports none of it, and its parts still sum to
+    /// `resident_bytes`, the order column's offset index among them.
+    #[tokio::test]
+    async fn test_resident_parts_of_a_file_without_an_order_column_index() {
+        const ROWS_PER_KEY: usize = 10;
+        let rows = contract_rows();
+        let long = |row: usize| i64::try_from(row).unwrap();
+        let keys: Vec<i64> = (0..rows).map(|row| long(row / ROWS_PER_KEY)).collect();
+        let orders: Vec<i64> = (0..rows).map(|row| long(row % ROWS_PER_KEY)).collect();
+        let mut fixture = Fixture::ordered(&keys, long_orders(&orders));
+        let indexed = store(&fixture).await;
+        fixture.layout.order_statistics = Some(EnabledStatistics::Chunk);
+        let unindexed = store(&fixture).await;
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let with = indexed
+                .build_ordered_in(OrderType::Long, residency, dir.path())
+                .await
+                .unwrap()
+                .resident_parts();
+            let dir = tempfile::tempdir().unwrap();
+            let index = unindexed
+                .build_ordered_in(OrderType::Long, residency, dir.path())
+                .await
+                .unwrap();
+            let without = index.resident_parts();
+            assert_eq!(
+                without.total(),
+                count(index.resident_bytes()),
+                "{residency}"
+            );
+            assert_eq!(without.order_column_index, 0, "{residency}");
+            assert!(with.order_column_index > 0, "{residency}");
+            assert_eq!(without.offset_indexes, with.offset_indexes, "{residency}");
+            assert!(without.key_column_index > 0 && without.order_facts > 0);
+        }
+    }
 }

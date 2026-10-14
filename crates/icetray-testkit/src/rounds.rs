@@ -151,6 +151,16 @@ mod tests {
     /// The bytes it holds.
     const CONTENT: &[u8] = b"0123456789";
 
+    /// One byte of `CONTENT`, the range a test reads alone.
+    const FIRST_BYTE: Range<u64> = 0..1;
+
+    /// Another byte of `CONTENT`, apart from `FIRST_BYTE`, so a ranged
+    /// read of both asks two ranges.
+    const THIRD_BYTE: Range<u64> = 2..3;
+
+    /// Bytes a one-byte range covers.
+    const ONE_BYTE: u64 = 1;
+
     /// A rounds store over an in-memory store holding `OBJECT`, which
     /// answers every GET inside the poll that issues it.
     async fn store() -> (RoundsStore, Path) {
@@ -166,7 +176,7 @@ mod tests {
         let (store, path) = store().await;
         let reads = (0..CONTENT.len()).map(|at| {
             let at = u64::try_from(at).unwrap();
-            store.get_range(&path, at..at + 1)
+            store.get_range(&path, at..at + ONE_BYTE)
         });
         futures::future::try_join_all(reads).await.unwrap();
         assert_eq!(store.rounds(), 1);
@@ -180,13 +190,15 @@ mod tests {
         assert_eq!(store.rounds(), 0);
         let one_after_another = 3;
         for _ in 0..one_after_another {
-            store.get_range(&path, 0..1).await.unwrap();
+            store.get_range(&path, FIRST_BYTE).await.unwrap();
         }
         assert_eq!(store.rounds(), one_after_another);
         store.restart();
         assert_eq!(store.rounds(), 0);
-        let (first, second) =
-            futures::join!(store.get_ranges(&path, &[0..1, 2..3]), store.get(&path));
+        let (first, second) = futures::join!(
+            store.get_ranges(&path, &[FIRST_BYTE, THIRD_BYTE]),
+            store.get(&path)
+        );
         first.unwrap();
         second.unwrap();
         assert_eq!(store.rounds(), 1, "a ranged read and a GET issued together");

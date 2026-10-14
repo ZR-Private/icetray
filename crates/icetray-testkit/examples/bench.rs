@@ -2859,10 +2859,13 @@ async fn lookups(
 /// The rounds of GETs a Scan op's operations wait on, from
 /// `served.rounds`: `ROUNDS_OPS` operations after the `VERIFIED_OPS` that
 /// `verify_scans` ran, one at a time, each counted on its own. `None` for
-/// a `Get` or `MultiGet` op, and for a table served without the store
-/// that counts them.
+/// a `Get` or `MultiGet` op, for a table served without the store that
+/// counts them, and for a `MultiScan`: its keys' reads run concurrently
+/// over one count, so a GET one key issues after another key's GET
+/// answered lands in a later round although it waits on nothing, and the
+/// count is no key's dependency depth.
 async fn count_rounds(served: &Served, op: &Op) -> BenchResult<Option<Rounds>> {
-    let (Some(store), Op::Scan { .. } | Op::MultiScan { .. }) = (&served.rounds, op) else {
+    let (Some(store), Op::Scan { .. }) = (&served.rounds, op) else {
         return Ok(None);
     };
     let mut rounds = Rounds::default();
@@ -2904,8 +2907,8 @@ async fn serve_loaded(
 }
 
 /// `op` over `served` measured in every selected mode, each row labeled
-/// `label` with that mode and its tasks and carrying `rounds`, a property
-/// of the operation that every mode shares.
+/// `label` with that mode and its tasks; the single-task row carries
+/// `rounds`, counted one operation at a time as that row runs them.
 async fn measure_modes(
     served: &Served,
     op: &Op,
@@ -2932,7 +2935,10 @@ async fn measure_modes(
             settings.windows,
         )
         .await?;
-        run.rounds = rounds;
+        run.rounds = match mode {
+            Mode::Single => rounds,
+            Mode::Multi => None,
+        };
         eprintln!("{}", row(&run));
         runs.push(run);
     }
