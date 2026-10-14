@@ -1032,8 +1032,8 @@ async fn test_a_fixed_value_column_at_another_width_is_refused() -> Result<()> {
     Ok(())
 }
 
-/// One row per key: an ordered fixture of this shape also holds under the
-/// key-value rules the load verifies with today.
+/// One row per id: the rows per key of the ordered fixtures the resolution
+/// tests write.
 fn one_row(_id: u64) -> u64 {
     1
 }

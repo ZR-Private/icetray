@@ -68,7 +68,9 @@ pub use manifest::{
     ValueType,
 };
 pub use open::{Applied, Opened, Refused, Tables, open};
-pub use order::{Direction, OrderColumnLayout, OrderType, OrderValue, OrderVariant, ScanBounds};
+pub use order::{
+    Direction, OrderColumnLayout, OrderFacts, OrderType, OrderValue, OrderVariant, ScanBounds,
+};
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{IoStats, LocationError, LocationFault, Storage};

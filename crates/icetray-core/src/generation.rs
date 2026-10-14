@@ -653,9 +653,9 @@ impl Generation {
             .filter_map(|(at, file)| file.index.page_of(key).map(|page| (at, file, page)))
     }
 
-    /// The identity of every file's key-value chunk file: the files
-    /// `LocalDir::chunks_for` finds. Meaningful for Disk residency, where
-    /// each file has a chunk file; the identities of a Full or Bloom
+    /// The identity of every file's chunk file: on a key-value table the
+    /// files `LocalDir::chunks_for` finds. Meaningful for Disk residency,
+    /// where each file has a chunk file; the identities of a Full or Bloom
     /// generation name files that were never written.
     pub fn identities(&self) -> HashSet<DataFileIdentity> {
         self.files
@@ -675,14 +675,14 @@ impl Generation {
         self.files.iter().map(|file| {
             (
                 index::identity_of(file.index.handle()),
-                ChunkRules::KeyValue,
+                file.index.chunk_rules(),
             )
         })
     }
 
-    /// Every file's chunk file, with where its key chunks lie in it; the
-    /// range ends at the file's length. A Full or Bloom generation has
-    /// none.
+    /// Every file's chunk file, with where its chunks, an ordered table's
+    /// order chunks among them, lie in it; the range ends at the file's
+    /// length. A Full or Bloom generation has none.
     pub fn chunk_files(&self) -> impl Iterator<Item = (&Path, Range<u64>)> {
         self.files
             .iter()
@@ -690,8 +690,9 @@ impl Generation {
             .map(|disk| (disk.path(), disk.chunks()))
     }
 
-    /// What the operating system's page cache holds of every file's key
-    /// chunks in their chunk files, summed in pages, so weighted by bytes
+    /// What the operating system's page cache holds of every file's chunks
+    /// in their chunk files, an ordered table's order chunks with its key
+    /// chunks (`DiskChunks::resident`), summed in pages, so weighted by bytes
     /// (RFD 020); `Err` names the first chunk file whose residency cannot be
     /// observed. A Full or Bloom generation has no chunk file and counts no
     /// page. One transient mapping and one `mincore` call per file, no byte

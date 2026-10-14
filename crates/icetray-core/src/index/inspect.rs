@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
-use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::column_index::{ByteArrayColumnIndex, ColumnIndexMetaData};
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
@@ -23,7 +23,7 @@ use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{ChunkRules, LocalDir, chunk_file_bytes};
 use crate::manifest::TableLayout;
-use crate::order::{self, Admit, OrderColumnLayout, OrderType};
+use crate::order::{self, Admit, OrderColumnLayout, OrderFacts, OrderType, OrderValue};
 use crate::parquet_io::FileHandle;
 
 /// A data file past the footer stage of `FileIndex::build`: its footer
@@ -68,7 +68,8 @@ impl Inspected {
 
     /// The bytes a Disk-tier `build` would add to `local`'s `index/`: zero
     /// when a chunk file with this file's identity and verification context
-    /// already stores exactly the key chunks, since `build` reuses it and
+    /// already stores exactly the chunks it verifies (`verified_ranges`),
+    /// under the rules it verifies them by, since `build` reuses it and
     /// writes nothing, otherwise the chunk file `build` would write
     /// (`predicted().disk_bytes`), which is what `LocalDir::index_bytes_in_use`
     /// counts for the file once written, its verification record estimated,
@@ -81,8 +82,10 @@ impl Inspected {
     /// its payload checksum at `build` counts zero here and is rewritten
     /// there over itself, at about the size `index/` already counts for it.
     pub(crate) fn disk_bytes_needed(&self, local: &LocalDir) -> Result<u64> {
-        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
-        let under = verified_under(self.layout.key_shape.key_type(), ChunkRules::KeyValue);
+        let ranges = self
+            .layout
+            .verified_ranges(&self.metadata, self.handle.size());
+        let under = verified_under(self.layout.key_shape.key_type(), self.layout.rules());
         Ok(
             match reusable_disk_chunks(&self.handle, local, &ranges, under)? {
                 OnDisk::Reusable(_) => 0,
@@ -127,6 +130,28 @@ impl Layout {
     /// The order column's leaf; `None` on a key-value table.
     pub(super) fn order_leaf(&self) -> Option<usize> {
         self.order.map(|order| order.leaf)
+    }
+
+    /// The rules the file's chunks are verified under, and its chunk file
+    /// named by: the ordered rules with the order column's field id on an
+    /// ordered table, the key-value rules otherwise (RFD 025, Load).
+    pub(super) fn rules(&self) -> ChunkRules {
+        rules_of(self.order)
+    }
+
+    /// The column chunks a build fetches and verifies, and a Disk-tier
+    /// chunk file stores: every key column chunk, then on an ordered table
+    /// every order column chunk, each in row group order (RFD 025, Load).
+    pub(super) fn verified_ranges(
+        &self,
+        metadata: &ParquetMetaData,
+        file_size: u64,
+    ) -> Vec<Range<u64>> {
+        let mut ranges = column_chunk_ranges(metadata, self.key_leaf, file_size);
+        if let Some(order) = self.order {
+            ranges.extend(column_chunk_ranges(metadata, order.leaf, file_size));
+        }
+        ranges
     }
 
     /// The checks `FileIndex::inspect` makes on the footer, in order: every
@@ -201,8 +226,13 @@ pub(super) fn order_leaf(
     order
         .zip(leaf)
         .map(|(order, leaf)| {
-            order_shape(table, path, order.order_type, &schema.column(leaf))
-                .map(|shape| OrderLeaf { leaf, shape })
+            order_shape(table, path, order.order_type, &schema.column(leaf)).map(|shape| {
+                OrderLeaf {
+                    leaf,
+                    shape,
+                    field_id: order.field_id,
+                }
+            })
         })
         .transpose()
 }
@@ -223,7 +253,8 @@ fn order_shape(
             | OrderType::TimestampTz
             | OrderType::TimestampNs
             | OrderType::TimestampTzNs => OrderShape::Int64,
-            OrderType::String | OrderType::Binary => OrderShape::Bytes,
+            OrderType::String => OrderShape::Str,
+            OrderType::Binary => OrderShape::Bin,
             OrderType::Fixed(width) => OrderShape::Fixed(width),
         }),
         Admit::PromotedFromInt => Ok(OrderShape::Int32),
@@ -445,22 +476,32 @@ fn chunk_range(chunk: &ColumnChunkMetaData, file_size: u64) -> Option<Range<u64>
     (end <= file_size).then_some(start..end)
 }
 
-/// The byte range of the key column chunk of every row group of a file of
-/// `file_size` bytes, in row group order; build checked every chunk's
-/// offset and size against that size.
-pub(super) fn key_chunk_ranges(
+/// The byte range of column `leaf`'s chunk in every row group of a file
+/// of `file_size` bytes, in row group order: the key column's, or an
+/// ordered table's order column's. `inspect` checked every such chunk's
+/// offset and size against that size (`check_offset_index`).
+pub(super) fn column_chunk_ranges(
     metadata: &ParquetMetaData,
-    key_leaf: usize,
+    leaf: usize,
     file_size: u64,
 ) -> Vec<Range<u64>> {
     metadata
         .row_groups()
         .iter()
         .map(|group| {
-            chunk_range(group.column(key_leaf), file_size)
+            chunk_range(group.column(leaf), file_size)
                 .expect("column chunk offsets and sizes were checked at build")
         })
         .collect()
+}
+
+/// The rules a file with order column `order` is verified under:
+/// `ChunkRules::Ordered` by its field id, or `ChunkRules::KeyValue` without
+/// one.
+pub(super) fn rules_of(order: Option<OrderLeaf>) -> ChunkRules {
+    order.map_or(ChunkRules::KeyValue, |order| ChunkRules::Ordered {
+        order_field_id: order.field_id,
+    })
 }
 
 /// The byte range of a bloom filter from its footer fields, `None` when the
@@ -520,27 +561,36 @@ pub(super) struct ResidentSet {
     key_chunks: u64,
     chunk_file: u64,
     fences: u64,
+    /// An ordered file's order facts (`OrderFacts`); zero for a key-value
+    /// file.
+    order_facts: u64,
     filters: Option<u64>,
     rows: u64,
 }
 
+/// What a built index holds exactly that the footer only estimates: its
+/// fences, and an ordered file's order facts.
+pub(super) type Built<'a> = (&'a [Vec<Key>], Option<&'a OrderFacts>);
+
 impl ResidentSet {
     /// From `metadata` of the file `handle` opens, keyed by `key_type`, its
-    /// footer as kept with `order_leaf` and `value_leaves` (`kept_footer`),
-    /// with the fences exact when `fences` is given and estimated from the
-    /// footer otherwise. A key chunk `chunk_range` cannot place counts as
-    /// zero and is left out of the chunk file, whose verification record is
-    /// estimated from the footer (`record::estimated_len`), and the filters
-    /// are `None` when any row group's filter is one `filter_range` cannot
-    /// place.
+    /// footer as kept with `order`'s leaf and `value_leaves` (`kept_footer`),
+    /// with the fences and the order facts exact when `built` gives them and
+    /// estimated from the footer otherwise. A key or order chunk
+    /// `chunk_range` cannot place counts as zero and is left out of the
+    /// chunk file, which an ordered file's order chunks are part of and
+    /// which is named by the rules it is verified under (`rules_of`), and
+    /// whose verification record is estimated from the footer
+    /// (`record::estimated_len`), and the filters are `None` when any row
+    /// group's filter is one `filter_range` cannot place.
     pub(super) fn from_footer(
         metadata: &ParquetMetaData,
         key_leaf: usize,
-        order_leaf: Option<usize>,
+        order: Option<OrderLeaf>,
         value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
-        fences: Option<&[Vec<Key>]>,
+        built: Option<Built<'_>>,
     ) -> Self {
         let file_size = handle.size();
         let key_columns = || {
@@ -560,35 +610,72 @@ impl ResidentSet {
         let placed: Vec<Range<u64>> = key_columns()
             .filter_map(|column| chunk_range(column, file_size))
             .collect();
-        let record = record::estimated_len(
+        let key_chunks = saturating_sum(placed.iter().map(|range| range.end - range.start));
+        let mut stored = placed;
+        let mut record = record::estimated_len(
             estimated_fence_keys(metadata, key_leaf)
                 .into_iter()
                 .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
         );
+        let mut order_facts = 0;
+        if let Some(order) = order {
+            stored.extend(
+                metadata
+                    .row_groups()
+                    .iter()
+                    .filter_map(|group| chunk_range(group.column(order.leaf), file_size)),
+            );
+            let values = estimated_order_bytes(metadata, order);
+            record = record.saturating_add(record::estimated_order_len(
+                metadata
+                    .row_groups()
+                    .iter()
+                    .map(|group| approx::measured(group.num_rows())),
+                values,
+            ));
+            order_facts = match built.and_then(|(_, facts)| facts) {
+                Some(facts) => exact_order_fact_bytes(facts),
+                None => order_fact_bytes(
+                    metadata.num_row_groups(),
+                    values.map(|bytes| order.shape.heap_bytes(bytes)),
+                ),
+            };
+        }
         Self {
             footer: approx::count(
-                kept_footer(metadata, key_leaf, order_leaf, value_leaves).memory_size(),
+                kept_footer(
+                    metadata,
+                    key_leaf,
+                    order.map(|order| order.leaf),
+                    value_leaves,
+                )
+                .memory_size(),
             ),
-            key_chunks: saturating_sum(placed.iter().map(|range| range.end - range.start)),
+            key_chunks,
             chunk_file: chunk_file_bytes(
                 &identity_of(handle),
-                verified_under(key_type, ChunkRules::KeyValue),
-                &placed,
+                verified_under(key_type, rules_of(order)),
+                &stored,
                 record,
             ),
-            fences: fences.map_or_else(
+            fences: built.map_or_else(
                 || estimated_fence_bytes(metadata, key_leaf),
-                exact_fence_bytes,
+                |(fences, _)| exact_fence_bytes(fences),
             ),
+            order_facts,
             filters,
             rows: approx::measured(metadata.file_metadata().num_rows()),
         }
     }
 }
 
-/// The tiers' totals from their parts, saturating as the parts do.
+/// The tiers' totals from their parts, saturating as the parts do. Every
+/// tier holds an ordered file's order facts with its fences.
 pub(super) fn tiers(set: &ResidentSet) -> ResidentBytes {
-    let footer_and_fences = set.footer.saturating_add(set.fences);
+    let footer_and_fences = set
+        .footer
+        .saturating_add(set.fences)
+        .saturating_add(set.order_facts);
     ResidentBytes {
         full: footer_and_fences.saturating_add(set.key_chunks),
         disk_memory: footer_and_fences,
@@ -599,6 +686,89 @@ pub(super) fn tiers(set: &ResidentSet) -> ResidentBytes {
         bloom_bits_per_key: set.filters.map(|filters| bits_per_key(filters, set.rows)),
         key_chunk_bytes: set.key_chunks,
         filter_bytes: set.filters,
+    }
+}
+
+/// The heap an ordered file's `OrderFacts` hold: a `u64` per row group of
+/// distinct keys, and what the least and greatest order value hold, `heap`
+/// (none for a long). The facts are built with exact allocations.
+fn order_fact_bytes(row_groups: usize, heap: [u64; 2]) -> u64 {
+    approx::count(row_groups * size_of::<u64>())
+        .saturating_add(heap[0])
+        .saturating_add(heap[1])
+}
+
+/// `order_fact_bytes` of facts already recorded.
+fn exact_order_fact_bytes(facts: &OrderFacts) -> u64 {
+    let heap = |value: &OrderValue| match value {
+        OrderValue::Long(_) => 0,
+        OrderValue::Str(text) => approx::count(text.len()),
+        OrderValue::Bytes(bytes) => approx::count(bytes.len()),
+    };
+    order_fact_bytes(
+        facts.distinct_keys.len(),
+        [heap(&facts.min), heap(&facts.max)],
+    )
+}
+
+/// The bytes of the least and greatest order value of the file `order` is
+/// the order column of, before any is decoded, as the fences of a
+/// byte-array key are estimated (`byte_array_fence_heap`): for a byte
+/// array the mean length of the column index's page minimums for the
+/// least and of its page maximums for the greatest, which a writer may
+/// truncate, and without a column index the chunks' mean encoded bytes
+/// per value for both; for a fixed-width column its width; for an integer
+/// the eight bytes of a long.
+fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 2] {
+    match order.shape {
+        OrderShape::Int32 | OrderShape::Int64 => [approx::count(size_of::<i64>()); 2],
+        OrderShape::Fixed(width) => [u64::from(width); 2],
+        OrderShape::Str | OrderShape::Bin => {
+            let indexes: Vec<&ByteArrayColumnIndex> = (0..metadata.num_row_groups())
+                .filter_map(|row_group| {
+                    match metadata.column_index()?.get(row_group)?.get(order.leaf)? {
+                        ColumnIndexMetaData::BYTE_ARRAY(index) => Some(index),
+                        ColumnIndexMetaData::NONE
+                        | ColumnIndexMetaData::BOOLEAN(_)
+                        | ColumnIndexMetaData::INT32(_)
+                        | ColumnIndexMetaData::INT64(_)
+                        | ColumnIndexMetaData::INT96(_)
+                        | ColumnIndexMetaData::FLOAT(_)
+                        | ColumnIndexMetaData::DOUBLE(_)
+                        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => None,
+                    }
+                })
+                .collect();
+            if indexes.len() == metadata.num_row_groups() {
+                let mean = |lengths: &mut dyn Iterator<Item = Option<&[u8]>>| {
+                    let (bytes, values) =
+                        lengths
+                            .flatten()
+                            .fold((0, 0), |(bytes, values): (u64, u64), value| {
+                                (bytes.saturating_add(approx::count(value.len())), values + 1)
+                            });
+                    bytes.checked_div(values).unwrap_or(0)
+                };
+                [
+                    mean(&mut indexes.iter().flat_map(|index| index.min_values_iter())),
+                    mean(&mut indexes.iter().flat_map(|index| index.max_values_iter())),
+                ]
+            } else {
+                let chunks = || {
+                    metadata
+                        .row_groups()
+                        .iter()
+                        .map(|group| group.column(order.leaf))
+                };
+                let encoded = saturating_sum(
+                    chunks().map(|chunk| approx::measured(chunk.uncompressed_size())),
+                );
+                let values =
+                    saturating_sum(chunks().map(|chunk| approx::measured(chunk.num_values())));
+                // A column of no values has no mean.
+                [encoded.checked_div(values).unwrap_or(0); 2]
+            }
+        }
     }
 }
 
@@ -1137,7 +1307,7 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
-            index.order_leaf(),
+            index.order_column(),
             &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
@@ -1182,7 +1352,7 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
-            index.order_leaf(),
+            index.order_column(),
             &[VALUE_LEAF],
             KeyType::Long,
             &opened.handle,
@@ -1293,7 +1463,7 @@ mod tests {
         let from_loaded = FileIndex::predicted_resident_bytes(
             &loaded,
             index.key_leaf(),
-            index.order_leaf(),
+            index.order_column(),
             &[],
             KeyType::Long,
             &opened.handle,

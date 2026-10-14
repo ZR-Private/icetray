@@ -26,7 +26,9 @@ use icetray_testkit::fixture::{
 };
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
-use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
+use icetray_testkit::{
+    Fixture, FixtureSpec, HandSnapshot, OrderKind, Ordered, Result, TestkitError, write_fixture,
+};
 
 /// The two tables sharing one local directory in the retain test.
 const TABLE_A: &str = "a";
@@ -394,5 +396,149 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
         (0, 1),
         "the page comes back from the disk level"
     );
+    Ok(())
+}
+
+/// One row per key: an ordered fixture of this shape also loads under a
+/// key-value entry, which refuses a repeated key.
+fn one_row(_id: u64) -> u64 {
+    1
+}
+
+/// The two entries of `fixture`, an ordered fixture whose root is
+/// followed, on one local directory under `dir`: `TABLE_A` a key-value
+/// entry over its key column, `TABLE_B` an ordered entry over its order
+/// column, both in the Disk tier.
+fn both_kinds(fixture: &Fixture, dir: &Path) -> Config {
+    let ordered = TableConfig {
+        name: TABLE_B.to_string(),
+        source: fixture.root_source(),
+        ..fixture.config(Residency::Disk, false)
+    };
+    let key_value = TableConfig {
+        name: TABLE_A.to_string(),
+        order_column: None,
+        ..ordered.clone()
+    };
+    Config {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            local: Some(LocalConfig {
+                dir: dir.to_path_buf(),
+                index_budget_bytes: None,
+                page_cache_disk_bytes: 0,
+            }),
+            ..verify::storage_config_for_tests()
+        },
+        tables: vec![key_value, ordered],
+    }
+}
+
+/// `config` opened over a fresh storage, every table loaded, and that
+/// storage.
+async fn open_loaded(config: &Config) -> Result<(icetray_core::Opened, Arc<Storage>)> {
+    let storage = Arc::new(Storage::new(config.storage.clone()));
+    let opened = open_with(config, None, Arc::clone(&storage), FindingLog::Events).await?;
+    for table in opened.tables().iter() {
+        table.load().await?;
+    }
+    Ok((opened, storage))
+}
+
+/// A key-value entry and an ordered entry over the same files, both under
+/// `disk` in one `open`, each keep their own chunk file per data file,
+/// named by the rules it was verified under, and neither trusts the
+/// other's (RFD 025, Load): retention keeps both, and a restart reuses
+/// each without fetching a chunk.
+#[tokio::test]
+async fn test_disk_entries_of_both_kinds_keep_their_own_chunk_files() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let ordered = Ordered {
+        kind: OrderKind::Long,
+        rows_per_key: one_row,
+        start: 0,
+        step: 1,
+    };
+    let spec = FixtureSpec {
+        ids: IDS_4K,
+        buckets: FOUR_BUCKETS,
+        ..FixtureSpec::ordered("kinds_disk", KeyType::Long, ordered)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture.write_hint().await?;
+    let config = both_kinds(&fixture, scratch.path());
+    let files = fixture.file_count();
+
+    let (opened, storage) = open_loaded(&config).await?;
+    let first_gets = storage.stats().gets();
+    let generations: Vec<_> = opened
+        .tables()
+        .iter()
+        .map(|table| table.current().expect("the table was loaded"))
+        .collect();
+    let paths_of = |at: usize| -> HashSet<std::path::PathBuf> {
+        generations[at]
+            .chunk_files()
+            .map(|(path, _)| path.to_path_buf())
+            .collect()
+    };
+    let (key_value, ordered) = (paths_of(0), paths_of(1));
+    assert_eq!((key_value.len(), ordered.len()), (files, files));
+    assert!(key_value.is_disjoint(&ordered), "one chunk file per kind");
+    let index_dir = key_value
+        .iter()
+        .next()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let on_disk = || -> Result<HashSet<std::path::PathBuf>> {
+        Ok(std::fs::read_dir(&index_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?)
+    };
+    let both: HashSet<_> = key_value.union(&ordered).cloned().collect();
+    assert_eq!(on_disk()?, both, "two chunk files per data file");
+    assert_eq!(opened.retain().await?, 0, "retention keeps both kinds");
+    assert_eq!(on_disk()?, both);
+    // One load GET per row group of the key column, and of the order
+    // column beside it for the ordered entry.
+    let row_groups: u64 = generations[1]
+        .files
+        .iter()
+        .map(|file| count(file.index.metadata().num_row_groups()))
+        .sum();
+    let chunk_gets = row_groups + 2 * row_groups;
+    assert!(row_groups > 0);
+    drop(generations);
+    drop(opened);
+
+    let (restarted, storage) = open_loaded(&config).await?;
+    assert_eq!(
+        storage.stats().gets(),
+        first_gets - chunk_gets,
+        "metadata and footers only: every chunk file of both kinds is reused"
+    );
+    let stats = storage.stats();
+    let reads = stats.local_reads();
+    let key = fixture.key(SAMPLE[0]);
+    let mut rows = Vec::new();
+    for table in restarted.tables().iter() {
+        rows.push(
+            table
+                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+                .await?
+                .row,
+        );
+    }
+    assert!(matches!(rows[0], Row::Present(_)), "{rows:?}");
+    assert_eq!(rows[0], rows[1], "both kinds read the key's one row");
+    assert_eq!(
+        stats.local_reads() - reads,
+        count(rows.len()),
+        "each kind finds its key in its own chunk file"
+    );
+    assert_eq!(on_disk()?, both, "nothing was rewritten under another name");
     Ok(())
 }

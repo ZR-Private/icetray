@@ -1259,6 +1259,47 @@ mod tests {
         (start, end, len)
     }
 
+    /// `chunk_file_bytes` is exact for a header naming ordered rules too,
+    /// whose field id the header encodes and the key-value rules' does not:
+    /// what the chunk-file budget reserves for an ordered table's file is
+    /// what `index_bytes_in_use` measures once it is written.
+    #[test]
+    fn test_chunk_file_bytes_is_exact_for_an_ordered_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = open(dir.path());
+        let ordered = VerifiedUnder {
+            rules: ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID,
+            },
+            ..UNDER
+        };
+        let disk = local
+            .write_chunks(&identity(), ordered, VERIFICATION, chunks().into_iter())
+            .unwrap();
+        let ranges = [FIRST_RANGE, SECOND_RANGE];
+        let predicted = chunk_file_bytes(
+            &identity(),
+            ordered,
+            &ranges,
+            approx::count(VERIFICATION.len()),
+        );
+        assert_eq!(
+            fs::metadata(disk.path()).unwrap().len(),
+            predicted,
+            "the written file is the predicted length"
+        );
+        assert!(
+            predicted
+                > chunk_file_bytes(
+                    &identity(),
+                    UNDER,
+                    &ranges,
+                    approx::count(VERIFICATION.len())
+                ),
+            "the ordered rules take header bytes the key-value rules do not"
+        );
+    }
+
     #[test]
     fn test_write_chunks_refuses_a_chunk_of_the_wrong_length() {
         let dir = tempfile::tempdir().unwrap();

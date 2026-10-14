@@ -18,7 +18,7 @@ use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::local::LocalFault;
 use crate::manifest::ColumnRequestFault;
-use crate::order::OrderType;
+use crate::order::{OrderType, OrderValue};
 use crate::projection::Malformed;
 use crate::storage::LocationError;
 
@@ -484,6 +484,7 @@ fn refusal_detail(reason: &RefusalReason) -> String {
     match reason {
         RefusalReason::Unsorted { path, row_group }
         | RefusalReason::NullKeys { path, row_group }
+        | RefusalReason::NullOrder { path, row_group }
         | RefusalReason::NoBloomFilter { path, row_group } => {
             format!("{reason} (file {path}, row group {row_group})")
         }
@@ -524,6 +525,9 @@ fn refusal_detail(reason: &RefusalReason) -> String {
         }
         RefusalReason::DuplicateKeys { path, key } => {
             format!("{reason} (file {path}, key {key})")
+        }
+        RefusalReason::DuplicateRows { path, key, order } => {
+            format!("{reason} (file {path}, key {key}, order value {order})")
         }
         RefusalReason::KeyOutsideBucket {
             path,
@@ -579,7 +583,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum RefusalReason {
     /// A data file's key column is not sorted: a key of a row group is below
     /// the one before it, or a row group's first key is below the previous
-    /// row group's last.
+    /// row group's last; in an ordered table, also a key's order value below
+    /// the one before it, within a row group or across a row-group boundary
+    /// (RFD 025).
     Unsorted {
         /// The data file's location.
         path: String,
@@ -600,6 +606,26 @@ pub enum RefusalReason {
         path: String,
         /// The repeated key.
         key: Key,
+    },
+    /// In an ordered table, one key and order value appear together in
+    /// more than one row (RFD 025, Uniqueness): twice within `path`,
+    /// deleted rows included, so a Scan would have no one correct response.
+    DuplicateRows {
+        /// The data file the pair appears in again.
+        path: String,
+        /// The repeated pair's key.
+        key: Key,
+        /// The repeated pair's order value, boxed so that the reason, which
+        /// every `Error` carries the room for, is no larger than its other
+        /// variants.
+        order: Box<OrderValue>,
+    },
+    /// An ordered table's data file has a null order value (RFD 025).
+    NullOrder {
+        /// The data file's location.
+        path: String,
+        /// The row group holding the null.
+        row_group: usize,
     },
     /// A key of a bucketed data file hashes to another bucket than the one
     /// its manifest entry records (RFD 007). Routing sends a key to no
@@ -776,6 +802,8 @@ impl Recurs for RefusalReason {
             Self::Unsorted { .. }
             | Self::NullKeys { .. }
             | Self::DuplicateKeys { .. }
+            | Self::DuplicateRows { .. }
+            | Self::NullOrder { .. }
             | Self::KeyOutsideBucket { .. }
             | Self::KeyTypeMismatch { .. }
             | Self::KeyTypeUnsupported
@@ -893,6 +921,8 @@ impl fmt::Display for RefusalReason {
             Self::Unsorted { .. } => "unsorted",
             Self::NullKeys { .. } => "null_keys",
             Self::DuplicateKeys { .. } => "duplicate_keys",
+            Self::DuplicateRows { .. } => "duplicate_rows",
+            Self::NullOrder { .. } => "null_order",
             Self::KeyOutsideBucket { .. } => "key_outside_bucket",
             Self::KeyTypeMismatch { .. } => "key_type_mismatch",
             Self::KeyTypeUnsupported => "key_type_unsupported",
@@ -976,21 +1006,6 @@ mod tests {
             ),
             (RefusalReason::KeyTypeUnsupported, "key_type_unsupported"),
             (
-                RefusalReason::OrderTypeUnsupported {
-                    column: "ts".to_string(),
-                    got: iceberg::spec::PrimitiveType::Double.to_string(),
-                },
-                "order_type_unsupported",
-            ),
-            (
-                RefusalReason::OrderTypeMismatch {
-                    path: FILE_PATH.to_string(),
-                    expected: OrderType::Timestamp,
-                    got: parquet::basic::Type::INT96.to_string(),
-                },
-                "order_type_mismatch",
-            ),
-            (
                 RefusalReason::KeyTooLong {
                     path: FILE_PATH.to_string(),
                     bytes: 1,
@@ -1026,9 +1041,47 @@ mod tests {
             ),
         ]
         .into_iter()
+        .chain(order_reason_cases())
         .chain(column_reason_cases())
         .chain(listing_reason_cases())
         .collect()
+    }
+
+    /// One refusal of an ordered table's order column or rows of every
+    /// reason, beside its label.
+    fn order_reason_cases() -> Vec<(RefusalReason, &'static str)> {
+        vec![
+            (
+                RefusalReason::DuplicateRows {
+                    path: FILE_PATH.to_string(),
+                    key: Key::Long(1),
+                    order: Box::new(OrderValue::Long(2)),
+                },
+                "duplicate_rows",
+            ),
+            (
+                RefusalReason::NullOrder {
+                    path: FILE_PATH.to_string(),
+                    row_group: 0,
+                },
+                "null_order",
+            ),
+            (
+                RefusalReason::OrderTypeUnsupported {
+                    column: "ts".to_string(),
+                    got: iceberg::spec::PrimitiveType::Double.to_string(),
+                },
+                "order_type_unsupported",
+            ),
+            (
+                RefusalReason::OrderTypeMismatch {
+                    path: FILE_PATH.to_string(),
+                    expected: OrderType::Timestamp,
+                    got: parquet::basic::Type::INT96.to_string(),
+                },
+                "order_type_mismatch",
+            ),
+        ]
     }
 
     /// One refusal of a configured column of every reason, beside its
@@ -1332,6 +1385,11 @@ mod tests {
                 Transient,
             ),
             (file(FileFault::KeyNotUtf8 { row_group }), Transient),
+            (file(FileFault::OrderNotUtf8 { row_group }), Transient),
+            (
+                file(FileFault::OrderIndexMismatch { row_group, page: 0 }),
+                Transient,
+            ),
             (
                 file(FileFault::PageOutOfRange { row: 1, row_group }),
                 Transient,

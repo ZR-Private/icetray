@@ -195,7 +195,7 @@ impl Deref for KeyBytes<'_> {
 }
 
 /// Lowercase hex, `HEX_DIGITS_PER_BYTE` per byte, no prefix.
-fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+pub(crate) fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     bytes
         .iter()
         .try_for_each(|byte| write!(f, "{byte:0HEX_DIGITS_PER_BYTE$x}"))

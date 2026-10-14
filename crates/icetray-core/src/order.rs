@@ -9,6 +9,8 @@ use iceberg::spec::PrimitiveType;
 use parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType};
 use parquet::schema::types::ColumnDescriptor;
 
+use crate::key::write_hex;
+
 /// The Iceberg type of an ordered table's order column (RFD 025, Order
 /// values). Integer and time types compare as signed 64-bit integers in
 /// Iceberg's unit (days, microseconds, nanoseconds); string, binary, and
@@ -289,6 +291,40 @@ pub enum OrderValue {
     Str(String),
     /// A `binary` or `fixed`.
     Bytes(Vec<u8>),
+}
+
+impl fmt::Display for OrderValue {
+    /// A long as the integer, a string quoted with `Debug` escaping, bytes
+    /// as `0x`-prefixed lowercase hex, as `Key` displays its variants.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Long(value) => write!(f, "{value}"),
+            Self::Str(text) => write!(f, "{text:?}"),
+            Self::Bytes(bytes) => {
+                f.write_str("0x")?;
+                write_hex(f, bytes)
+            }
+        }
+    }
+}
+
+/// What the load records of one ordered file's order column (RFD 025,
+/// Load), from every order value it decodes: the exact least and greatest
+/// order value over all the file's rows, deleted rows included, the
+/// distinct keys of each row group, in footer order, a key whose run
+/// crosses a row-group boundary counted in each row group it is in, and
+/// the most rows one key's run holds, across row groups included. A row
+/// group without rows has no distinct key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderFacts {
+    /// The least order value of the file.
+    pub min: OrderValue,
+    /// The greatest order value of the file.
+    pub max: OrderValue,
+    /// Per row group, the distinct keys it holds.
+    pub distinct_keys: Vec<u64>,
+    /// The rows of the file's longest run of one key.
+    pub longest_run: u64,
 }
 
 /// An ordered table's order column as a snapshot's schema gives it.

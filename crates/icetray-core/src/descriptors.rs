@@ -25,8 +25,9 @@ pub const DESCRIPTOR_MARGIN: u64 = 256;
 /// (`contract::PAGE_CACHE_DISK_BLOCK_BYTES`), one per file each load keeps
 /// in flight on this runtime (`generation::load_concurrency`, which every
 /// load runs on its own), and `DESCRIPTOR_MARGIN`. A disk-tier table's
-/// chunk files, one per data file, come on top and are not known before
-/// its load.
+/// chunk files, one per data file and the rules it is verified under, so
+/// two for a data file a key-value entry and an ordered entry both serve,
+/// come on top and are not known before its load.
 pub fn needed(page_cache_disk_bytes: u64, loads: usize) -> u64 {
     page_cache_disk_bytes / PAGE_CACHE_DISK_BLOCK_BYTES
         + approx::count(loads).saturating_mul(approx::count(load_concurrency()))

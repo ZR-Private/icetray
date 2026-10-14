@@ -302,7 +302,8 @@ impl LocalDir {
         )
     }
 
-    /// Writes verified key chunks with their verification record, the bytes
+    /// Writes verified key chunks, and an ordered table's order chunks with
+    /// them, with their verification record, the bytes
     /// the index encoded from what verifying them established `under`, and
     /// returns the handle the index keeps. The header names every span and
     /// the payload's checksum before the first payload byte, so the chunks

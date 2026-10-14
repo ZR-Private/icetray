@@ -37,7 +37,9 @@ use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, 
 use crate::key::testing::UUID_HALF_BYTES;
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::LocalDir;
+use crate::manifest::TableLayout;
 use crate::manifest::testing::{self as manifest_testing, KEY_COLUMN, VALUE_COLUMN};
+use crate::order::{OrderColumnLayout, OrderType};
 use crate::parquet_io::FileHandle;
 use crate::storage::testing::{MEM_PREFIX, MemStore};
 use crate::storage::{HedgeWindow, IoStats, Storage};
@@ -140,6 +142,66 @@ pub(super) fn value_for(i: usize) -> Vec<u8> {
 /// The name prefix of a fixture's extra columns (`Fixture::extra_columns`).
 pub(super) const EXTRA_COLUMN: &str = "extra";
 
+/// The order column of an ordered fixture (`Fixture::orders`), written
+/// after the value column and the extra columns.
+pub(super) const ORDER_COLUMN: &str = "ts";
+/// The order column's field id in `ordered_layout`, after the key's and
+/// the value's.
+pub(super) const ORDER_FIELD_ID: i32 = 3;
+
+/// What an ordered fixture's order column holds, a `None` a null, which
+/// makes the column nullable.
+#[derive(Clone)]
+pub(super) enum Orders {
+    /// An `INT64` column, which a `long` order column serves.
+    Long(Vec<Option<i64>>),
+    /// A `BYTE_ARRAY` column without annotation, which a `string` or a
+    /// `binary` order column serves; under `string` its bytes must be
+    /// UTF-8.
+    Bytes(Vec<Option<Vec<u8>>>),
+}
+
+impl Orders {
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::Long(_) => DataType::Int64,
+            Self::Bytes(_) => DataType::Binary,
+        }
+    }
+
+    fn nullable(&self) -> bool {
+        match self {
+            Self::Long(values) => values.iter().any(Option::is_none),
+            Self::Bytes(values) => values.iter().any(Option::is_none),
+        }
+    }
+
+    fn array(&self) -> ArrayRef {
+        match self {
+            Self::Long(values) => Arc::new(values.iter().copied().collect::<Int64Array>()),
+            Self::Bytes(values) => Arc::new(values.iter().cloned().collect::<BinaryArray>()),
+        }
+    }
+}
+
+/// `values` as a long order column.
+pub(super) fn long_orders(values: &[i64]) -> Orders {
+    Orders::Long(values.iter().copied().map(Some).collect())
+}
+
+/// The contract layout of `key_type` served as an ordered table whose
+/// order column is `ORDER_COLUMN` of `order_type`.
+pub(super) fn ordered_layout(key_type: KeyType, order_type: OrderType) -> TableLayout {
+    TableLayout {
+        order: Some(OrderColumnLayout {
+            name: ORDER_COLUMN.to_string(),
+            field_id: ORDER_FIELD_ID,
+            order_type,
+        }),
+        ..manifest_testing::layout(key_type, None)
+    }
+}
+
 /// How a fixture's value column is typed in arrow; `Int64` is the type
 /// the contract refuses.
 #[derive(Clone, Copy)]
@@ -226,6 +288,9 @@ pub(super) struct Fixture {
     pub(super) extra_columns: usize,
     keys: Vec<Option<Key>>,
     pub(super) values: Vec<Option<Vec<u8>>>,
+    /// The order column of an ordered fixture, as many values as keys;
+    /// `None` writes none.
+    pub(super) orders: Option<Orders>,
     pub(super) layout: Layout,
 }
 
@@ -248,7 +313,16 @@ impl Fixture {
             extra_columns: 0,
             keys,
             values,
+            orders: None,
             layout: Layout::contract(),
+        }
+    }
+
+    /// `with_keys` over long keys `keys` with `orders` as the order column.
+    pub(super) fn ordered(keys: &[i64], orders: Orders) -> Self {
+        Self {
+            orders: Some(orders),
+            ..Self::with_keys(KeyColumn::Int64, longs(keys))
         }
     }
 
@@ -274,6 +348,14 @@ impl Fixture {
                 value_nullable,
             ));
             arrays.push(value_array(ValueColumn::Binary, &self.values));
+        }
+        if let Some(orders) = &self.orders {
+            fields.push(Field::new(
+                ORDER_COLUMN,
+                orders.data_type(),
+                orders.nullable(),
+            ));
+            arrays.push(orders.array());
         }
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
@@ -351,14 +433,33 @@ impl Opened {
         residency: Residency,
         local: Option<&Arc<LocalDir>>,
     ) -> Result<FileIndex> {
-        FileIndex::build(
-            TABLE,
-            Arc::clone(&self.handle),
-            &manifest_testing::layout(key_type, None),
-            residency,
-            local,
-        )
-        .await
+        self.build_under(&manifest_testing::layout(key_type, None), residency, local)
+            .await
+    }
+
+    /// A build under `layout`.
+    pub(super) async fn build_under(
+        &self,
+        layout: &TableLayout,
+        residency: Residency,
+        local: Option<&Arc<LocalDir>>,
+    ) -> Result<FileIndex> {
+        FileIndex::build(TABLE, Arc::clone(&self.handle), layout, residency, local).await
+    }
+
+    /// A build of long keys under `ordered_layout` with an order column of
+    /// `order_type`, in `residency`, with a local directory under `dir` for
+    /// the Disk tier and none for the others.
+    pub(super) async fn build_ordered_in(
+        &self,
+        order_type: OrderType,
+        residency: Residency,
+        dir: &Path,
+    ) -> Result<FileIndex> {
+        let local = testing::local_dir(dir, self.stats(), None);
+        let local = (residency == Residency::Disk).then_some(&local);
+        self.build_under(&ordered_layout(KeyType::Long, order_type), residency, local)
+            .await
     }
 
     /// A build in `residency`, with a local directory under `dir` for
@@ -483,7 +584,7 @@ pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(
         index.metadata(),
         index.key_leaf(),
-        index.order_leaf(),
+        index.order_column(),
         &index.held_value_leaves(),
         index.key_type(),
         index.handle(),

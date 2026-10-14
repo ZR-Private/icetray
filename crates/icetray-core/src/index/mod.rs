@@ -11,6 +11,7 @@
 
 mod build;
 mod inspect;
+mod ordered;
 mod page_header;
 mod pages;
 mod plain;
@@ -38,12 +39,13 @@ use crate::config::Residency;
 use crate::deletes::DeleteFault;
 use crate::error::{Error, Recurrence, Recurs, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
-use crate::local::{DataFileIdentity, DiskChunks};
+use crate::local::{ChunkRules, DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
+use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one, read_rows};
 pub(crate) use inspect::Inspected;
-use inspect::{Layout, ResidentSet, kept_footer, key_chunk_ranges, tiers};
+use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
@@ -104,10 +106,11 @@ pub enum FileFault {
         /// The page, counted among the column's data pages in the row group.
         page: usize,
     },
-    /// A key page's header, or that of a value page or value dictionary
-    /// page a lookup fetched, does not decode as the compact-thrift
-    /// `PageHeader` parquet reads it as, or is not a header of the page its
-    /// place in the chunk holds; checked before parquet reads it (RFD 004).
+    /// A key page's header, an order page's at load, or that of a value
+    /// page or value dictionary page a lookup fetched, does not decode as
+    /// the compact-thrift `PageHeader` parquet reads it as, or is not a
+    /// header of the page its place in the chunk holds; checked before
+    /// parquet reads it (RFD 004).
     #[error("the header of {page} of row group {row_group} does not decode: {fault}")]
     MalformedPageHeader {
         /// The row group holding the page.
@@ -120,9 +123,10 @@ pub enum FileFault {
     /// A page's header declares more than its page can hold: for a key
     /// page, an uncompressed size above what its rows could encode to at
     /// the key cap or above the key page ceiling of 64 MiB; for a value
-    /// page or value dictionary page a lookup fetched, an uncompressed size
-    /// above the value page ceiling of 64 MiB; for either, a dictionary of
-    /// more values than the row group has rows or than the ceiling holds at
+    /// page or value dictionary page a lookup fetched, or an order page or
+    /// order dictionary page at load, an uncompressed size above the value
+    /// page ceiling of 64 MiB; for any, a dictionary of more values than
+    /// the row group has rows or than the ceiling holds at
     /// the larger of the fewest bytes an entry encodes to and the bytes
     /// parquet holds a decoded entry in, a compressed size past the page's
     /// place in the chunk, or v2 level lengths whose sum is above the
@@ -176,6 +180,31 @@ pub enum FileFault {
     KeyNotUtf8 {
         /// The row group holding the value.
         row_group: usize,
+    },
+    /// A `string` order column holds a value that is not UTF-8 (RFD 025),
+    /// as `KeyNotUtf8` is for a key: an `OrderValue::Str` is text.
+    #[error("an order value of row group {row_group} is not utf-8")]
+    OrderNotUtf8 {
+        /// The row group holding the value.
+        row_group: usize,
+    },
+    /// An order page holds a value outside its column index entry, below
+    /// the entry's minimum or above its maximum, or the order column's
+    /// column index of a row group describes another count of pages than
+    /// its offset index (RFD 025, Load): a Scan places its bounds by that
+    /// index, so an index that fails to bound its pages would place a
+    /// bound wrong. A truncated byte-array entry is still a bound, its
+    /// minimum a prefix of the least value and its maximum above the
+    /// greatest.
+    #[error(
+        "page {page} of row group {row_group} holds an order value outside its column index entry"
+    )]
+    OrderIndexMismatch {
+        /// The row group holding the page.
+        row_group: usize,
+        /// The page, counted among the order column's data pages in the
+        /// row group.
+        page: usize,
     },
     /// A value column's physical type is neither `BYTE_ARRAY` nor
     /// `FIXED_LEN_BYTE_ARRAY`. The snapshot's schema admitted the column as
@@ -247,6 +276,9 @@ impl Recurs for FileFault {
             | Self::MalformedPageHeader { .. }
             | Self::PageHeaderOverBound { .. }
             | Self::KeyNotUtf8 { .. }
+            | Self::OrderNotUtf8 { .. }
+            // Found decoding the order pages, which may be a local copy.
+            | Self::OrderIndexMismatch { .. }
             | Self::DecoderPanicked {
                 part: DecodedPart::Pages { .. },
                 ..
@@ -307,20 +339,26 @@ impl std::fmt::Display for DecodedPart {
 /// with these field names: the doctor's summary carries it.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct ResidentBytes {
-    /// Footer, page indexes, key chunks, and fences.
+    /// Footer, page indexes, key chunks, and fences, and an ordered
+    /// table's order facts.
     pub full: u64,
-    /// Footer, page indexes, and fences: the memory the disk tier keeps.
+    /// Footer, page indexes, and fences, and an ordered table's order
+    /// facts: the memory the disk tier keeps.
     pub disk_memory: u64,
-    /// The chunk file the disk tier writes, its envelope and header and the
-    /// key chunks: what `LocalConfig::index_budget_bytes` is charged for the
-    /// file, so a budget sized from this figure admits the load.
+    /// The chunk file the disk tier writes, its envelope and header, its
+    /// verification record, and the key chunks, with an ordered table's
+    /// order chunks beside them: what `LocalConfig::index_budget_bytes` is
+    /// charged for the file, so a budget sized from this figure admits the
+    /// load.
     pub disk_bytes: u64,
-    /// Footer, page indexes, filters, and fences.
+    /// Footer, page indexes, filters, and fences, and an ordered table's
+    /// order facts.
     pub bloom: Option<u64>,
     /// Filter bits per row of the file; the bloom tier's miss cost follows it.
     pub bloom_bits_per_key: Option<f64>,
     /// The key column's compressed chunk bytes: what the Full tier holds
-    /// beyond the Disk tier's memory, and the chunk file's payload.
+    /// beyond the Disk tier's memory, and the chunk file's payload beside
+    /// its record and an ordered table's order chunks.
     pub key_chunk_bytes: u64,
     /// The key column's bloom filter bytes as the footer bounds them: what
     /// the Bloom tier holds beyond the Disk tier's memory.
@@ -602,18 +640,34 @@ enum OrderShape {
     Int32,
     /// `INT64`.
     Int64,
-    /// `BYTE_ARRAY`.
-    Bytes,
+    /// `BYTE_ARRAY` holding UTF-8: a `string`.
+    Str,
+    /// `BYTE_ARRAY` holding opaque bytes: a `binary`.
+    Bin,
     /// `FIXED_LEN_BYTE_ARRAY` of this width.
     Fixed(u32),
 }
 
-/// The column a file holds under an ordered table's order column: its leaf
-/// and how its values decode.
+impl OrderShape {
+    /// The heap an `OrderValue` of this shape holds, given `bytes`, the
+    /// value's length: none for a long, which it holds inline.
+    fn heap_bytes(self, bytes: u64) -> u64 {
+        match self {
+            Self::Int32 | Self::Int64 => 0,
+            Self::Str | Self::Bin | Self::Fixed(_) => bytes,
+        }
+    }
+}
+
+/// The column a file holds under an ordered table's order column: its
+/// leaf, how its values decode, and the field id the snapshot's schema
+/// gives it, which names the rules its chunk file is verified under
+/// (`inspect::rules_of`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OrderLeaf {
+pub(crate) struct OrderLeaf {
     leaf: usize,
     shape: OrderShape,
+    field_id: i32,
 }
 
 /// What the tier keeps of the key column (RFD 017).
@@ -706,6 +760,10 @@ pub struct FileIndex {
     /// The exact first and last key of the file.
     key_range: (Key, Key),
     max_key_bytes: usize,
+    /// What verifying an ordered file's order column recorded (RFD 025);
+    /// `None` on a key-value table. The column's offset index and column
+    /// index stay in the kept footer.
+    order: Option<OrderFacts>,
     rows: i64,
 }
 
@@ -738,21 +796,32 @@ impl FileIndex {
     /// refused (`ColumnMismatch::OrderAbsent`), one that stores it in a
     /// Parquet type its order type does not admit is
     /// `RefusalReason::OrderTypeMismatch`, and one without its offset index
-    /// is `FileFault::MissingPageIndex` (RFD 025). The Disk tier with no
+    /// is `FileFault::MissingPageIndex`; once its chunks are decoded beside
+    /// the keys under the ordered rules (`verify_ordered`), a key may
+    /// repeat, and a key and order value together twice is
+    /// `RefusalReason::DuplicateRows`, one below the pair before it
+    /// `RefusalReason::Unsorted`, a null order value
+    /// `RefusalReason::NullOrder`, and a string order value that is not
+    /// UTF-8 or an order page outside its column index entry a file fault
+    /// (RFD 025). The Disk tier with no
     /// local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
     /// fetched.
     ///
-    /// Full keeps the chunks in memory. Disk trusts a chunk file in `local`
-    /// whose identity, verification context, and payload checksum match
-    /// and which stores exactly the key chunks, taking what verification
-    /// established from the record it stores (no GET, no chunk read, no key
-    /// decoded), or fetches the chunks, verifies them, and writes them with
-    /// that record; it keeps no key bytes in memory. Bloom fetches and
-    /// verifies the chunks, drops them, and keeps the filters. Every tier
-    /// keeps the footer, both page indexes of the key column and of an
-    /// ordered table's order column, the offset index of every value column
-    /// the table serves, and the fences; the column index of every other
+    /// An ordered table's order chunks are fetched with the key chunks, one
+    /// GET per row group per column. Full keeps the key chunks in memory
+    /// and drops the order chunks. Disk trusts a chunk file in `local`,
+    /// named by the rules the file is verified under, whose identity,
+    /// verification context, and payload checksum match and which stores
+    /// exactly the key chunks, and an ordered table's order chunks, taking
+    /// what verification established from the record it stores (no GET, no
+    /// chunk read, no key decoded), or fetches the chunks, verifies them,
+    /// and writes them with that record; it keeps no key bytes in memory.
+    /// Bloom fetches and verifies the chunks, drops them, and keeps the
+    /// filters. Every tier keeps the footer, both page indexes of the key
+    /// column and of an ordered table's order column, the offset index of
+    /// every value column the table serves, the fences, and an ordered
+    /// table's order facts; the column index of every other
     /// column, the value columns' above all, and the offset index of every
     /// column the table does not serve, are never resident (RFD 004, RFD
     /// 017, RFD 022, RFD 025).
@@ -798,7 +867,7 @@ impl FileIndex {
         let predicted = Self::predicted_resident_bytes(
             &metadata,
             layout.key_leaf,
-            order_leaf,
+            layout.order,
             &value_leaves,
             key_type,
             &handle,
@@ -824,9 +893,9 @@ impl FileIndex {
     /// Every tier's resident bytes for the file `handle` opens, from its
     /// footer alone (RFD 017), the same given the footer as loaded or as
     /// `FileIndex` keeps it (`metadata()`): the column index of every column
-    /// but the key and `order_leaf`, and the offset index of every column
-    /// but the key, `order_leaf`, and `value_leaves`, are never resident and
-    /// are not counted either way, so
+    /// but the key and `order`, an ordered table's order column, and the
+    /// offset index of every column but the key, `order`, and
+    /// `value_leaves`, are never resident and are not counted either way, so
     /// a budget check at the footer stage predicts what `resident_bytes`
     /// will report. Exact: the footer and the page indexes kept
     /// (`ParquetMetaData::memory_size` of the footer as kept), the key
@@ -839,22 +908,29 @@ impl FileIndex {
     /// row group's filter is absent or one a Bloom-tier `build` refuses as
     /// `FileFault::UnplaceableBloomFilter`), and the chunk file (the
     /// envelope and the header the Disk tier writes for the handle's
-    /// identity over the key chunks, the verification record, then the
-    /// chunks; the identity carries the footer digest, so `handle` has
-    /// loaded its footer), except that the record, a key per key page, is
-    /// exact only for keys of one width (longs, uuids, a fixed-width binary
-    /// column) and estimated as the fences are for string and binary keys,
-    /// `key_type` saying which. Every total saturates at `u64::MAX` rather
-    /// than wrapping. Estimated: the fences, one `Key` per key page plus, for
-    /// `BYTE_ARRAY` keys, the page's minimum from the column index when the
-    /// file has one, which a writer may truncate, else the chunk's mean
-    /// encoded bytes per value, and for `FIXED_LEN_BYTE_ARRAY` keys the
-    /// column's width, which over-counts a uuid key, held inline, by
-    /// `UUID_BYTES` per page. `resident_bytes` shares the definitions.
+    /// identity over the key chunks, and on an ordered table the order
+    /// chunks, under the rules it verifies them by, the verification record,
+    /// then the chunks; the identity carries the footer digest, so `handle`
+    /// has loaded its footer), except that the record, a key per key page,
+    /// is exact only for keys of one width (longs, uuids, a fixed-width
+    /// binary column) and estimated as the fences are for string and binary
+    /// keys, `key_type` saying which, and an ordered file's order facts in
+    /// it are estimated at most what they take: each row group's distinct
+    /// keys as its rows, the longest run as the file's rows. Every total
+    /// saturates at `u64::MAX` rather than wrapping. Estimated: the fences,
+    /// one `Key` per key page plus, for `BYTE_ARRAY` keys, the page's minimum
+    /// from the column index when the file has one, which a writer may
+    /// truncate, else the chunk's mean encoded bytes per value, and for
+    /// `FIXED_LEN_BYTE_ARRAY` keys the column's width, which over-counts a
+    /// uuid key, held inline, by `UUID_BYTES` per page; and an ordered
+    /// file's order facts, a `u64` per row group and the least and greatest
+    /// order value, exact for integer and fixed-width order values and
+    /// estimated for string and binary ones as the fences of such keys are
+    /// (RFD 025, Load). `resident_bytes` shares the definitions.
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
-        order_leaf: Option<usize>,
+        order: Option<OrderLeaf>,
         value_leaves: &[usize],
         key_type: KeyType,
         handle: &FileHandle,
@@ -862,7 +938,7 @@ impl FileIndex {
         tiers(&ResidentSet::from_footer(
             metadata,
             key_leaf,
-            order_leaf,
+            order,
             value_leaves,
             key_type,
             handle,
@@ -935,8 +1011,29 @@ impl FileIndex {
 
     /// The order column's leaf, whose offset index and column index the
     /// footer keeps; `None` on a key-value table.
-    pub(crate) fn order_leaf(&self) -> Option<usize> {
+    pub fn order_leaf(&self) -> Option<usize> {
         self.layout.order_leaf()
+    }
+
+    /// The order column as the index decodes it, for a prediction of the
+    /// file's resident bytes (`predicted_resident_bytes`); `None` on a
+    /// key-value table.
+    pub(crate) fn order_column(&self) -> Option<OrderLeaf> {
+        self.layout.order
+    }
+
+    /// What verifying the order column recorded: the least and greatest
+    /// order value, each row group's distinct keys, and the longest run
+    /// (RFD 025, Load); `None` on a key-value table.
+    pub fn order_facts(&self) -> Option<&OrderFacts> {
+        self.order.as_ref()
+    }
+
+    /// The rules the file was verified under, which name its Disk-tier
+    /// chunk file (RFD 025, Load): ordered by the order column's field id,
+    /// or key-value.
+    pub(crate) fn chunk_rules(&self) -> ChunkRules {
+        self.layout.rules()
     }
 
     /// Checks that the file still holds its columns as `layout`, a later
@@ -1019,11 +1116,11 @@ impl FileIndex {
         let all = tiers(&ResidentSet::from_footer(
             &self.metadata,
             self.layout.key_leaf,
-            self.order_leaf(),
+            self.layout.order,
             &self.held_value_leaves(),
             self.key_type(),
             &self.handle,
-            Some(&self.fences),
+            Some((&self.fences, self.order.as_ref())),
         ));
         let mine = all.in_tier(self.residency()).expect(
             "a bloom index has a bounded filter per row group; build refused the file otherwise",
@@ -1274,12 +1371,12 @@ impl FileIndex {
             KeyResidency::Chunks(chunks) => Ok(Arc::clone(chunks)),
             KeyResidency::Disk(disk) => {
                 let ranges =
-                    key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
+                    column_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
                 chunks_from_disk(disk, &ranges, self.handle.size()).await
             }
             KeyResidency::Filters(_) => {
                 let ranges =
-                    key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
+                    column_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
                 let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
                 Ok(Arc::new(Segments::new(parts, self.handle.size())))
             }

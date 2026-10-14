@@ -25,7 +25,7 @@ use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
     Budget, Capping, ColumnMismatch, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType,
-    Level, LocalDir, OrderType, RefusalReason, Row, Storage, TableSource, TableState,
+    Level, LocalDir, OrderType, OrderValue, RefusalReason, Row, Storage, TableSource, TableState,
     UnsupportedDelete, UnsupportedFormat, bucket,
 };
 use icetray_testkit::fixture::{
@@ -38,7 +38,8 @@ use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS};
 use icetray_testkit::{
     Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle,
-    ORDER_COLUMN, Order, RawFile, Result, TestkitError, value_for, write_fixture,
+    ORDER_COLUMN, Order, OrderKind, Ordered, RawFile, Result, TestkitError, value_for,
+    write_fixture,
 };
 
 /// The long keys of a raw file, ascending, and the same values as their
@@ -1177,5 +1178,120 @@ async fn test_file_written_before_the_order_column_is_refused_as_column_mismatch
         fixture.files().iter().any(|file| file.file_path() == path),
         "{path} is one of the files written before the column"
     );
+    Ok(())
+}
+
+/// Two rows per id: every key of an ordered fixture of this shape repeats.
+fn two_rows(_id: u64) -> u64 {
+    2
+}
+
+/// A one-bucket ordered fixture of `IDS_2K` named `name`, two `long` order
+/// values per key `step` apart from zero.
+async fn two_row_fixture(catalog: &Arc<dyn Catalog>, name: &str, step: i64) -> Result<Fixture> {
+    let ordered = Ordered {
+        kind: OrderKind::Long,
+        rows_per_key: two_rows,
+        start: 0,
+        step,
+    };
+    let spec = FixtureSpec {
+        ids: IDS_2K,
+        buckets: ONE_BUCKET,
+        ..FixtureSpec::ordered(name, KeyType::Long, ordered)
+    };
+    write_fixture(catalog.as_ref(), NAMESPACE, spec).await
+}
+
+/// The load verifies an ordered table's rows by key and then order value
+/// (RFD 025, Load): rows of one key rising by order value are served,
+/// where a key-value entry over the same table refuses the repeated key.
+#[tokio::test]
+async fn test_ordered_rows_rising_per_key_are_served_and_repeat_a_key_value_key() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = two_row_fixture(&catalog, "ord_rising", 1).await?;
+    verify::serve(
+        ordered_config(&fixture),
+        fixture.catalog_source(Arc::clone(&catalog)),
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    let key_value = TableConfig {
+        order_column: None,
+        ..fixture.config(Residency::Full, false)
+    };
+    let refused = refused_through_catalog(&fixture, &catalog, key_value).await?;
+    assert!(
+        matches!(refused.reason, RefusalReason::DuplicateKeys { .. }),
+        "{:?}",
+        refused.reason
+    );
+    Ok(())
+}
+
+/// A key and order value together twice is `duplicate_rows`, naming both
+/// (RFD 025, Uniqueness).
+#[tokio::test]
+async fn test_duplicate_rows_are_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = two_row_fixture(&catalog, "ord_duprows", 0).await?;
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    let RefusalReason::DuplicateRows { path, key, order } = &refused.reason else {
+        panic!("{:?}", refused.reason);
+    };
+    assert!(
+        fixture.files().iter().any(|file| file.file_path() == path),
+        "{path} is one of the fixture's files"
+    );
+    assert_eq!(
+        *key,
+        fixture.key(IDS_2K.start),
+        "the file's first key repeats first"
+    );
+    assert_eq!(**order, OrderValue::Long(0));
+    Ok(())
+}
+
+/// A key's order value falling is `unsorted`.
+#[tokio::test]
+async fn test_ordered_rows_falling_per_key_are_refused_as_unsorted() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = two_row_fixture(&catalog, "ord_falling", -1).await?;
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    assert!(
+        matches!(refused.reason, RefusalReason::Unsorted { .. }),
+        "{:?}",
+        refused.reason
+    );
+    Ok(())
+}
+
+/// A null order value is `null_order`.
+#[tokio::test]
+async fn test_null_order_is_refused() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let orders: Vec<Option<i64>> = RAW_ORDERS
+        .iter()
+        .enumerate()
+        .map(|(at, &order)| (at != NULL_KEY_AT).then_some(order))
+        .collect();
+    let raw = ordered_raw_file(Arc::new(Int64Array::from(orders)))?;
+    let fixture = write_ordered_table_of_types(
+        catalog.as_ref(),
+        NAMESPACE,
+        "ord_null",
+        PrimitiveType::Long,
+        raw,
+    )
+    .await?;
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    let RefusalReason::NullOrder { path, row_group } = &refused.reason else {
+        panic!("{:?}", refused.reason);
+    };
+    assert!(
+        fixture.files().iter().any(|file| file.file_path() == path),
+        "{path} is the raw file"
+    );
+    assert_eq!(*row_group, 0);
     Ok(())
 }

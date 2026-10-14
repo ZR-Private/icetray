@@ -17,7 +17,8 @@ use crate::blocking::on_blocking_pool;
 use crate::error::{Error, Result};
 use crate::storage::IoStats;
 
-/// The key chunks of one data file, read from its chunk file on demand.
+/// The key chunks of one data file, with an ordered table's order chunks
+/// beside them, read from its chunk file on demand.
 /// Clone-cheap: one handle is shared by the index and every read in
 /// flight. It is not a `ChunkReader`; the index wraps the bytes a page read
 /// returns in a `Segments`.
@@ -110,10 +111,11 @@ impl DiskChunks {
             .map_err(|canceled| self.shared.error(LocalFault::Join(canceled)))?
     }
 
-    /// What the operating system's page cache holds of the file's key
-    /// chunks, every page from the first chunk's to the file's end (RFD
-    /// 020): synchronous system calls, for the blocking pool, which read
-    /// no byte of the file.
+    /// What the operating system's page cache holds of the file's chunks,
+    /// every page from the first chunk's to the file's end (RFD 020): an
+    /// ordered table's order chunks with its key chunks, since every Scan
+    /// reads both (RFD 025). Synchronous system calls, for the blocking
+    /// pool, which read no byte of the file.
     pub(crate) fn resident(&self) -> std::result::Result<ResidentPages, Unobserved> {
         let shared = &self.shared;
         residency::resident(&shared.file, &shared.path, shared.chunks()).map_err(|why| Unobserved {
@@ -127,8 +129,8 @@ impl DiskChunks {
         &self.shared.path
     }
 
-    /// Where the key chunks lie in the chunk file; the range ends at the
-    /// file's length when it was parsed.
+    /// Where the chunks, key and order alike, lie in the chunk file; the
+    /// range ends at the file's length when it was parsed.
     pub(crate) fn chunks(&self) -> Range<u64> {
         self.shared.chunks()
     }
@@ -203,7 +205,7 @@ impl DiskChunks {
 }
 
 impl ChunkFile {
-    /// Where the key chunks lie in the chunk file: past the verification
+    /// Where the chunks lie in the chunk file: past the verification
     /// record, to the file's end.
     fn chunks(&self) -> Range<u64> {
         self.payload_offset + self.verification_length..self.end

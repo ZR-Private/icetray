@@ -38,7 +38,7 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::ChunkReader;
 
-use super::{ColumnChunk, FileFault, KeyShape, ValueShape, file_fault, row_index};
+use super::{ColumnChunk, FileFault, KeyShape, OrderShape, ValueShape, file_fault, row_index};
 use crate::approx;
 use crate::contract::MAX_KEY_BYTES;
 use crate::error::Result;
@@ -101,10 +101,13 @@ pub const MOST_VALUE_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// prefix alone.
 pub(super) const BYTE_ARRAY_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
-/// How one dictionary entry of a key or value column is encoded and held,
-/// by the column's physical type.
+/// How one dictionary entry of a key, value, or order column is encoded
+/// and held, by the column's physical type.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Entry {
+    /// `INT32`: an `int` or `date` order column, or a `long` one written
+    /// before a promotion from `int`.
+    Int32,
     /// `INT64`.
     Int64,
     /// `BYTE_ARRAY`.
@@ -131,13 +134,25 @@ impl Entry {
         }
     }
 
-    /// The fewest bytes the entry takes in a `PLAIN` dictionary: an `INT64`
-    /// is 8 bytes, a byte array its length prefix, a fixed-width value its
+    /// The entry of an order column of `shape` and descriptor width
+    /// `width`.
+    pub(super) fn of_order(shape: OrderShape, width: i32) -> Self {
+        match shape {
+            OrderShape::Int32 => Self::Int32,
+            OrderShape::Int64 => Self::Int64,
+            OrderShape::Str | OrderShape::Bin => Self::ByteArray,
+            OrderShape::Fixed(_) => Self::FixedLen(width),
+        }
+    }
+
+    /// The fewest bytes the entry takes in a `PLAIN` dictionary: an `INT32`
+    /// is 4 bytes, an `INT64` 8, a byte array its length prefix, a fixed-width value its
     /// width. `inspect` refuses a key width of 0 and parquet's schema
     /// reader a negative width; either counts as 0 here, and `most_in` then
     /// rests on the bytes the entry is held in.
     pub(super) fn fewest_bytes(self) -> u64 {
         match self {
+            Self::Int32 => approx::count(size_of::<i32>()),
             Self::Int64 => approx::count(size_of::<i64>()),
             Self::ByteArray => approx::count(BYTE_ARRAY_LENGTH_PREFIX_BYTES),
             Self::FixedLen(width) => u64::try_from(width).unwrap_or(0),
@@ -148,10 +163,11 @@ impl Entry {
     /// `DictDecoder::set_dict` (parquet 58.4.0, `encodings/decoding.rs`)
     /// resizes its `Vec<T::T>` to the dictionary page's value count before
     /// it decodes an entry, so each entry takes the physical type's value:
-    /// an `i64`, or a `ByteArray` or `FixedLenByteArray`, a handle onto the
+    /// an `i32` or `i64`, or a `ByteArray` or `FixedLenByteArray`, a handle onto the
     /// page buffer.
     pub(super) fn held_bytes(self) -> u64 {
         approx::count(match self {
+            Self::Int32 => size_of::<i32>(),
             Self::Int64 => size_of::<i64>(),
             Self::ByteArray => size_of::<ByteArray>(),
             Self::FixedLen(_) => size_of::<FixedLenByteArray>(),
@@ -957,7 +973,29 @@ pub(super) fn check_page_headers(
     shape: KeyShape,
     segments: &Segments,
 ) -> Result<()> {
-    let bounds = key_bounds(chunk, shape);
+    check_every_page(chunk, key_bounds(chunk, shape), segments)
+}
+
+/// Refuses, before parquet's page reader sees them, every page of the order
+/// column chunk `chunk` in `segments`, its dictionary page included, whose
+/// header does not decode as parquet reads it or declares more than its
+/// page can hold, as `check_value_page_headers` refuses a value page's,
+/// with `MOST_VALUE_PAGE_BYTES` as the ceiling (RFD 025, Load): the order
+/// pages get the value pages' checks, since the contract caps no order
+/// value's length, and are checked a chunk at a time, since a load
+/// decodes every one.
+pub(super) fn check_order_page_headers(
+    chunk: ColumnChunk<'_>,
+    shape: OrderShape,
+    segments: &Segments,
+) -> Result<()> {
+    let entry = Entry::of_order(shape, chunk.column.descriptor().type_length());
+    check_every_page(chunk, value_bounds(entry), segments)
+}
+
+/// Every page of `chunk` in `segments`, its dictionary page first, held to
+/// `bounds` (`check_page`).
+fn check_every_page(chunk: ColumnChunk<'_>, bounds: Bounds, segments: &Segments) -> Result<()> {
     if let Some(range) = chunk.dictionary_range() {
         check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
     }
@@ -1025,11 +1063,7 @@ pub(super) fn check_value_page_headers(
     segments: &Segments,
 ) -> Result<()> {
     let entry = Entry::of_value(shape, chunk.column.descriptor().type_length());
-    let bounds = Bounds {
-        page_bytes: MOST_VALUE_PAGE_BYTES,
-        value_bytes: None,
-        entries: entry.most_in(MOST_VALUE_PAGE_BYTES),
-    };
+    let bounds = value_bounds(entry);
     if let Some(range) = chunk.dictionary_range() {
         check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
     }
@@ -1040,6 +1074,18 @@ pub(super) fn check_value_page_headers(
         bounds,
         segments,
     )
+}
+
+/// What a page of a column whose values the contract does not cap, a
+/// value or an order column, may declare: `MOST_VALUE_PAGE_BYTES` as the
+/// ceiling, no bound per value, and the dictionary entries of `entry` the
+/// ceiling holds.
+fn value_bounds(entry: Entry) -> Bounds {
+    Bounds {
+        page_bytes: MOST_VALUE_PAGE_BYTES,
+        value_bytes: None,
+        entries: entry.most_in(MOST_VALUE_PAGE_BYTES),
+    }
 }
 
 /// What the page headers of one column chunk may declare.
@@ -1191,7 +1237,8 @@ fn check_header(
 /// is `PageHeaderFault::Truncated` at its first page. A data page's own
 /// count of values bounds nothing, as a value page's rows do not. A
 /// dictionary entry is held to the fewest bytes its physical type takes; a
-/// type `Entry` has no case for is held as a byte array, the tighter bound.
+/// type a position delete file does not store, any but `INT64` and the
+/// byte arrays, is held as a byte array, the tighter bound.
 pub(crate) fn check_chunk_page_headers(
     path: &str,
     bytes: &Bytes,
@@ -1211,11 +1258,7 @@ pub(crate) fn check_chunk_page_headers(
         | PhysicalType::FLOAT
         | PhysicalType::DOUBLE => Entry::ByteArray,
     };
-    let bounds = Bounds {
-        page_bytes: MOST_VALUE_PAGE_BYTES,
-        value_bytes: None,
-        entries: entry.most_in(MOST_VALUE_PAGE_BYTES),
-    };
+    let bounds = value_bounds(entry);
     let rows = metadata.row_group(row_group).num_rows();
     let (start, len) = chunk.byte_range();
     let Some(end) = start

@@ -1,7 +1,9 @@
-//! The chunk stage of the index: the key column chunks fetched once, kept
-//! in a chunk file, or dropped for their filters, and every key of the file
-//! decoded and checked against the contract (RFD 007, RFD 017), unless a
-//! chunk file already holds what that check established.
+//! The chunk stage of the index: the key column chunks, and an ordered
+//! table's order column chunks beside them, fetched once, kept in a chunk
+//! file, or dropped for their filters, and every key of the file decoded
+//! and checked against the contract (RFD 007, RFD 017), with every order
+//! value under the ordered rules (RFD 025, `ordered`), unless a chunk file
+//! already holds what that check established.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -19,14 +21,16 @@ use parquet::data_type::{
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
 
-use super::inspect::{bloom_ranges, key_chunk_ranges};
+use super::inspect::{bloom_ranges, column_chunk_ranges, rules_of};
+use super::ordered::PairCheck;
 use super::page_header::{check_key_page_headers, check_page_headers};
 use super::pages::{ChunkPages, PageTally};
 use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, file_fault, group_starts, identity_of, row_index, unless_panicked,
+    KeyShape, Keys, OrderLeaf, OrderShape, file_fault, group_starts, identity_of, row_index,
+    unless_panicked,
 };
 use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
@@ -37,17 +41,20 @@ use crate::local::{
     ChunkFileLookup, ChunkRules, DiskChunks, LocalDir, LocalFault, Rejection, Reservation,
     VerifiedUnder,
 };
+use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
 
 impl Inspected {
-    /// The chunk stage of `FileIndex::build`: streams the key chunks once
+    /// The chunk stage of `FileIndex::build`: streams the key chunks, and
+    /// an ordered table's order chunks in the same `read_ranges` call, once
     /// for verification and keeps what `residency` keeps, as `build`
-    /// documents. The Disk tier with no local directory is the one rule the
-    /// loader re-checks, since a configuration built in code may skip
-    /// `Config::validated`; it is raised here as the same
-    /// `ConfigViolation`, before any chunk is fetched. A Disk-tier chunk
-    /// file write holds `reservation`, the load's hold on `local`'s budget,
-    /// until the write ends.
+    /// documents: the Full tier the key chunks alone, the Disk tier both in
+    /// the chunk file named by the rules they were verified under. The Disk
+    /// tier with no local directory is the one rule the loader re-checks,
+    /// since a configuration built in code may skip `Config::validated`; it
+    /// is raised here as the same `ConfigViolation`, before any chunk is
+    /// fetched. A Disk-tier chunk file write holds `reservation`, the
+    /// load's hold on `local`'s budget, until the write ends.
     pub(crate) async fn build(
         self,
         residency: Residency,
@@ -62,11 +69,15 @@ impl Inspected {
             reuse,
             ..
         } = self;
-        let ranges = key_chunk_ranges(&metadata, layout.key_leaf, handle.size());
+        let ranges = layout.verified_ranges(&metadata, handle.size());
         let (keys, verified) = match residency {
             Residency::Full => {
                 let (chunks, verified) = fetch_verified(&to_verify, &ranges).await?;
-                (KeyResidency::Chunks(chunks), verified)
+                let key_ranges = column_chunk_ranges(&metadata, layout.key_leaf, handle.size());
+                (
+                    KeyResidency::Chunks(key_chunks_of(&chunks, &key_ranges, handle.size())),
+                    verified,
+                )
             }
             Residency::Disk => {
                 let local = local.ok_or_else(|| {
@@ -102,9 +113,23 @@ impl Inspected {
             group_starts,
             key_range: verified.key_range,
             max_key_bytes: verified.max_key_bytes,
+            order: verified.order,
             rows,
         })
     }
+}
+
+/// The parts of `chunks` that are the key column chunks `key_ranges`: what
+/// the Full tier keeps of the chunks an ordered table verified, the order
+/// chunks dropped (RFD 025, Load). No byte is copied.
+fn key_chunks_of(chunks: &Segments, key_ranges: &[Range<u64>], file_size: u64) -> Arc<Segments> {
+    let parts = chunks
+        .parts()
+        .iter()
+        .filter(|(range, _)| key_ranges.contains(range))
+        .cloned()
+        .collect();
+    Arc::new(Segments::new(parts, file_size))
 }
 
 impl Inspected {
@@ -182,7 +207,9 @@ impl Inspected {
         local: &LocalDir,
     ) -> Result<Option<(Key, Key)>> {
         let to_verify = KeysToVerify::of(self);
-        let ranges = key_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
+        let ranges = self
+            .layout
+            .verified_ranges(&self.metadata, self.handle.size());
         let found = reused(&to_verify, local, &ranges).await?;
         let range = found
             .as_ref()
@@ -209,18 +236,20 @@ fn edge_key(
     Ok(pick(&keys))
 }
 
-/// The key column of one file being built, owned, so that its
-/// verification can move to the blocking pool.
+/// The key column of one file being built, and an ordered table's order
+/// column, owned, so that their verification can move to the blocking
+/// pool.
 struct KeysToVerify {
     table: String,
     handle: Arc<FileHandle>,
     metadata: Arc<ParquetMetaData>,
     leaf: usize,
     shape: KeyShape,
+    order: Option<OrderLeaf>,
 }
 
 impl KeysToVerify {
-    /// The key column of `inspected`.
+    /// The key column of `inspected`, with its order column.
     fn of(inspected: &Inspected) -> Self {
         Self {
             table: inspected.table.clone(),
@@ -228,7 +257,20 @@ impl KeysToVerify {
             metadata: Arc::clone(&inspected.metadata),
             leaf: inspected.layout.key_leaf,
             shape: inspected.layout.key_shape,
+            order: inspected.layout.order,
         }
+    }
+
+    /// The context the file's chunks are verified under, which names its
+    /// chunk file (`verified_under`, `inspect::rules_of`).
+    fn under(&self) -> VerifiedUnder {
+        verified_under(self.shape.key_type(), rules_of(self.order))
+    }
+
+    /// The order column's shape, which the verification record's order
+    /// facts decode by; `None` on a key-value table.
+    fn order_shape(&self) -> Option<OrderShape> {
+        self.order.map(|order| order.shape)
     }
 
     /// `verify` of this column over `chunks`, run on the blocking pool
@@ -242,7 +284,7 @@ impl KeysToVerify {
         let table = self.table.clone();
         let handle = Arc::clone(&self.handle);
         let metadata = Arc::clone(&self.metadata);
-        let (leaf, shape) = (self.leaf, self.shape);
+        let (leaf, shape, order) = (self.leaf, self.shape, self.order);
         let chunks = Arc::clone(chunks);
         on_blocking_pool(move || {
             let column = Column {
@@ -250,16 +292,20 @@ impl KeysToVerify {
                 leaf,
                 path: &handle.location,
             };
-            verify(&table, &column, shape, &chunks)
+            match order {
+                None => verify(&table, &column, shape, &chunks),
+                Some(order) => verify_ordered(&table, &column, shape, order, &chunks),
+            }
         })
         .await
         .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?
     }
 }
 
-/// The key column chunks of `ranges`, fetched and verified: the chunks a
-/// tier keeps (Full), writes (Disk), or drops (Bloom), and what
-/// verification recorded.
+/// The column chunks of `ranges`, the key chunks and an ordered table's
+/// order chunks (`Layout::verified_ranges`), fetched and verified: the
+/// chunks a tier keeps (Full, the key chunks), writes (Disk), or drops
+/// (Bloom), and what verification recorded.
 async fn fetch_verified(
     to_verify: &KeysToVerify,
     ranges: &[Range<u64>],
@@ -271,10 +317,10 @@ async fn fetch_verified(
     Ok((chunks, verified))
 }
 
-/// Every key column chunk in one `read_ranges` call: one load GET per row
-/// group. Each chunk is copied out of the buffer the store returned: a
-/// store may serve neighboring ranges from one fetch and hand back slices
-/// of it, and a slice keeps the whole fetch alive, so the bytes held would
+/// Every column chunk of `ranges` in one `read_ranges` call: one load GET
+/// per row group per column. Each chunk is copied out of the buffer the
+/// store returned: a store may serve neighboring ranges from one fetch and
+/// hand back slices of it, and a slice keeps the whole fetch alive, so the bytes held would
 /// exceed the chunks by whatever lay between them. The copy is paid once at
 /// load.
 pub(super) async fn fetch_chunk_parts(
@@ -327,7 +373,7 @@ async fn disk_chunks(
 ) -> Result<(DiskChunks, Verified)> {
     let handle = &to_verify.handle;
     let identity = identity_of(handle);
-    let under = verified_under(to_verify.shape.key_type(), ChunkRules::KeyValue);
+    let under = to_verify.under();
     let path = local.chunk_path(&identity, under.rules);
     let found = match found {
         Some(found) => found,
@@ -371,17 +417,18 @@ async fn disk_chunks(
 /// why not, `None` for no file.
 pub(super) type Reuse = std::result::Result<(DiskChunks, Verified), Option<Stale>>;
 
-/// The chunk file in `local` for `to_verify`'s data file, whose key chunks
-/// are `ranges`, with what it stores of their verification, when a build
-/// may trust it: it is reusable by its header (`reusable_disk_chunks`) and
-/// by its payload (`trusted`). Otherwise why not, `None` for no file.
+/// The chunk file in `local` for `to_verify`'s data file, whose verified
+/// chunks are `ranges`, under the rules it verifies them by, with what it
+/// stores of their verification, when a build may trust it: it is reusable
+/// by its header (`reusable_disk_chunks`) and by its payload (`trusted`).
+/// Otherwise why not, `None` for no file.
 async fn reused(
     to_verify: &KeysToVerify,
     local: &LocalDir,
     ranges: &[Range<u64>],
 ) -> Result<Reuse> {
     let handle = &to_verify.handle;
-    let under = verified_under(to_verify.shape.key_type(), ChunkRules::KeyValue);
+    let under = to_verify.under();
     Ok(match reusable_disk_chunks(handle, local, ranges, under)? {
         OnDisk::Reusable(disk) => {
             let path = local.chunk_path(&identity_of(handle), under.rules);
@@ -405,18 +452,18 @@ async fn trusted(
 ) -> Result<std::result::Result<(DiskChunks, Verified), Stale>> {
     let handle = Arc::clone(&to_verify.handle);
     let metadata = Arc::clone(&to_verify.metadata);
-    let (leaf, shape) = (to_verify.leaf, to_verify.shape);
+    let (leaf, shape, order) = (to_verify.leaf, to_verify.shape, to_verify.order_shape());
     on_blocking_pool(move || {
         let column = Column {
             metadata: &metadata,
             leaf,
             path: &handle.location,
         };
-        let verification = match disk.checked_verification(record::most_bytes(&column))? {
+        let verification = match disk.checked_verification(record::most_bytes(&column, order))? {
             Ok(verification) => verification,
             Err(rejection) => return Ok(Err(Stale::Rejected(rejection))),
         };
-        Ok(record::decode(&verification, &column, shape)
+        Ok(record::decode(&verification, &column, shape, order)
             .map(|verified| (disk, verified))
             .map_err(Stale::Record))
     })
@@ -459,8 +506,9 @@ pub(super) enum Stale {
         /// The verifier version the header carries.
         stored: u32,
     },
-    /// The file does not store exactly the key column chunks the footer
-    /// names.
+    /// The file does not store exactly the column chunks the footer names
+    /// for the rules: the key chunks, with the order chunks beside them
+    /// under the ordered rules.
     Chunks,
     /// The verification record does not describe the file the footer does.
     Record(RecordFault),
@@ -482,8 +530,9 @@ impl fmt::Display for Stale {
 /// reuse, from its envelope and header alone: one whose identity (path,
 /// size, footer digest) matches, whose keys were verified `under` the
 /// build's key type and verifier version, and which stores exactly
-/// `ranges`, the key column chunks. `Stale` with the first check a file
-/// there fails, `Absent` when there is none.
+/// `ranges`, the key column chunks and under the ordered rules the order
+/// column chunks. `Stale` with the first check a file there fails, `Absent`
+/// when there is none.
 pub(super) fn reusable_disk_chunks(
     handle: &FileHandle,
     local: &LocalDir,
@@ -557,7 +606,9 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 /// or loosened, `contract::MAX_KEY_BYTES`, how a fence is chosen. A record
 /// of any other version is stale and the file is verified again from
 /// object storage, so a result computed under other rules is never trusted.
-pub(super) const VERIFIER_VERSION: u32 = 1;
+/// Version 2 verifies an ordered table's rows by key and order value and
+/// records its order facts (RFD 025).
+pub(super) const VERIFIER_VERSION: u32 = 2;
 
 /// The verification context of this build for keys of `key_type` under
 /// `rules`.
@@ -569,14 +620,16 @@ pub(super) fn verified_under(key_type: KeyType, rules: ChunkRules) -> VerifiedUn
     }
 }
 
-/// What verifying the key column establishes, and what a Disk-tier chunk
-/// file stores of it (`record`).
-#[derive(Debug, PartialEq)]
+/// What verifying the key column establishes, with an ordered table's
+/// order facts, and what a Disk-tier chunk file stores of it (`record`).
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Verified {
     pub(super) fences: Vec<Vec<Key>>,
     pub(super) groups: Vec<GroupRange>,
     pub(super) key_range: (Key, Key),
     pub(super) max_key_bytes: usize,
+    /// What the ordered rules recorded; `None` under the key-value rules.
+    pub(super) order: Option<OrderFacts>,
 }
 
 /// Decodes every key of every row group from `chunks` and checks what the
@@ -602,16 +655,50 @@ fn verify(
     shape: KeyShape,
     chunks: &Arc<Segments>,
 ) -> Result<Verified> {
-    verify_with(table, column, shape, chunks, KeyDecoder::Plain)
+    verify_with(table, column, shape, None, chunks, KeyDecoder::Plain)
 }
 
-/// `verify`, each row group decoded by `decoder` where it can be
-/// (`check_run`). The decoder is a parameter so that tests can hold the
-/// plain decoder to the column reader's answers.
+/// `verify` under the ordered rules (RFD 025, Load), the order column
+/// `order` decoded from `chunks` beside the keys a window at a time
+/// (`PairCheck`): a key may repeat, and every row's key and order value
+/// must be above the row's before it, within a row group and across row
+/// groups, deleted rows included, so an equal pair is
+/// `RefusalReason::DuplicateRows` naming the key and the order value and a
+/// falling one `RefusalReason::Unsorted`; a null order value is
+/// `RefusalReason::NullOrder`, a `string` order value that is not UTF-8
+/// `FileFault::OrderNotUtf8`, and an order page whose values its column
+/// index entry does not bound `FileFault::OrderIndexMismatch`. Every order
+/// page header is checked as a value page's is before its row group
+/// decodes. Within a row group, a decode fault stands before a null key, a
+/// null key before a null order value, that before a key and then an order
+/// value that is not UTF-8, those before an index mismatch, and that before
+/// a pair out of order. Records the order facts besides what `verify`
+/// records. The keys are read by parquet's column reader alone.
+fn verify_ordered(
+    table: &str,
+    column: &Column<'_>,
+    shape: KeyShape,
+    order: OrderLeaf,
+    chunks: &Arc<Segments>,
+) -> Result<Verified> {
+    verify_with(
+        table,
+        column,
+        shape,
+        Some(order),
+        chunks,
+        KeyDecoder::ColumnReader,
+    )
+}
+
+/// `verify`, or `verify_ordered` given `order`, each row group decoded by
+/// `decoder` where it can be (`check_run`). The decoder is a parameter so
+/// that tests can hold the plain decoder to the column reader's answers.
 fn verify_with(
     table: &str,
     column: &Column<'_>,
     shape: KeyShape,
+    order: Option<OrderLeaf>,
     chunks: &Arc<Segments>,
     decoder: KeyDecoder,
 ) -> Result<Verified> {
@@ -620,11 +707,21 @@ fn verify_with(
     let mut fences = Vec::with_capacity(total);
     let mut groups: Vec<GroupRange> = Vec::with_capacity(total);
     let mut longest = 0;
+    let mut pairs = order.map(|order| PairCheck::new(column, order));
     for row_group in 0..total {
         let chunk = column.group(row_group);
         let rows = chunk.rows();
         check_page_headers(chunk, shape, chunks)?;
-        let (run, _) = check_run(chunk, shape, Arc::clone(chunks), decoder)?;
+        let (run, outcome) = match &mut pairs {
+            None => (
+                check_run(chunk, shape, Arc::clone(chunks), decoder)?.0,
+                None,
+            ),
+            Some(pairs) => {
+                let (run, outcome) = pairs.check_group(chunk, shape, chunks)?;
+                (run, Some(outcome))
+            }
+        };
         if run.values < row_index(rows) {
             let reason = RefusalReason::NullKeys {
                 path: path.to_string(),
@@ -632,8 +729,14 @@ fn verify_with(
             };
             return Err(Error::refused(table, reason));
         }
+        if let Some(outcome) = &outcome {
+            outcome.check_nulls(table, chunk)?;
+        }
         if run.not_utf8 {
             return Err(not_utf8(chunk));
+        }
+        if let Some(outcome) = outcome {
+            outcome.check_values(table, chunk)?;
         }
         if let Some((order, key)) = run.disorder {
             return Err(Error::refused(table, not_above_previous(chunk, order, key)));
@@ -643,7 +746,9 @@ fn verify_with(
             fences.push(Vec::new());
             continue;
         };
-        if let Some(previous) = groups.last() {
+        if pairs.is_none()
+            && let Some(previous) = groups.last()
+        {
             let order = first.cmp(&previous.last);
             if order != Ordering::Greater {
                 return Err(Error::refused(
@@ -674,6 +779,7 @@ fn verify_with(
         fences,
         groups,
         max_key_bytes: longest,
+        order: pairs.map(PairCheck::facts),
     })
 }
 
@@ -732,8 +838,10 @@ impl KeyBatch for Keys {
 /// What `verify` learns of one row group's keys, batch by batch as they are
 /// decoded, so that no row group's keys are held at once: the keys
 /// decoded, the longest, the first and last, the key at each page's first
-/// row (the fences), whether every string key is UTF-8, and the first key
-/// not above the one before it. Nothing is decided here; `verify` applies
+/// row (the fences), whether every string key is UTF-8, and under the
+/// key-value rules the first key not above the one before it; under the
+/// ordered rules a key repeats and `PairCheck` orders the rows by key and
+/// order value instead. Nothing is decided here; `verify` applies
 /// what was found once the whole row group has decoded, in the order it
 /// checks a row group in, so a decode failure anywhere in it stands before
 /// a null, a null before a key that is not UTF-8, and that before a key
@@ -752,11 +860,16 @@ pub(super) struct RunCheck<'a> {
     fence_rows: &'a [PageLocation],
     fences_taken: usize,
     not_utf8: bool,
+    /// Whether the keys must strictly increase, as the key-value rules
+    /// require; under the ordered rules a key repeats, and `PairCheck`
+    /// orders the rows by key and order value instead.
+    strict: bool,
     /// The first key not above the one before it, and how it compares.
     disorder: Option<(Ordering, Key)>,
 }
 
 impl<'a> RunCheck<'a> {
+    /// A check of `chunk`'s keys under the key-value rules.
     pub(super) fn new(chunk: ColumnChunk<'a>) -> Self {
         let fence_rows = chunk.page_locations();
         Self {
@@ -768,8 +881,23 @@ impl<'a> RunCheck<'a> {
             fence_rows,
             fences_taken: 0,
             not_utf8: false,
+            strict: true,
             disorder: None,
         }
+    }
+
+    /// A check of `chunk`'s keys under the ordered rules, which leave
+    /// their order to `PairCheck`: no disorder is recorded.
+    pub(super) fn ordered(chunk: ColumnChunk<'a>) -> Self {
+        Self {
+            strict: false,
+            ..Self::new(chunk)
+        }
+    }
+
+    /// Whether a string key that is not UTF-8 has been found.
+    pub(super) fn not_utf8(&self) -> bool {
+        self.not_utf8
     }
 
     /// The next batch of the row group's keys, in file order.
@@ -788,16 +916,18 @@ impl<'a> RunCheck<'a> {
         }
         self.longest = self.longest.max(keys.max_len());
         let head = keys.key(0);
-        if let Some(previous) = &self.last {
-            let order = head.cmp(previous);
-            if order != Ordering::Greater {
-                self.disorder = Some((order, head));
+        if self.strict {
+            if let Some(previous) = &self.last {
+                let order = head.cmp(previous);
+                if order != Ordering::Greater {
+                    self.disorder = Some((order, head));
+                    return;
+                }
+            }
+            if let Some((at, order)) = keys.first_not_increasing() {
+                self.disorder = Some((order, keys.key(at)));
                 return;
             }
-        }
-        if let Some((at, order)) = keys.first_not_increasing() {
-            self.disorder = Some((order, keys.key(at)));
-            return;
         }
         while let Some(location) = self.fence_rows.get(self.fences_taken) {
             let row = row_index(location.first_row_index);
@@ -896,8 +1026,9 @@ fn read_run(
     }
 }
 
-/// `FIXED_LEN_BYTE_ARRAY` values as the binary keys they are.
-fn fixed_as_binary(values: Vec<FixedLenByteArray>) -> Vec<ByteArray> {
+/// `FIXED_LEN_BYTE_ARRAY` values as the binary keys, or binary order
+/// values, they are.
+pub(super) fn fixed_as_binary(values: Vec<FixedLenByteArray>) -> Vec<ByteArray> {
     values.into_iter().map(ByteArray::from).collect()
 }
 
@@ -1049,7 +1180,7 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// included, runs under `catch_unwind`, so a panic is
 /// `FileFault::DecoderPanicked` at the last page the page reader took up,
 /// and ends this load or lookup rather than the task running it.
-fn read_column<T: ParquetDataType>(
+pub(super) fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
     skip: usize,
@@ -1191,16 +1322,18 @@ mod tests {
     use crate::generation::testing::{
         self, KeyColumn, TABLE, cache, column_of, page_rows, refusal_of,
     };
+    use crate::index::identity_of;
     use crate::index::page_header::{
         BYTE_ARRAY_LENGTH_PREFIX_BYTES, MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK,
         PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader,
     };
     use crate::index::testing::{
-        FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened, PAGES_PER_GROUP,
-        ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows, fault_of, group_rows, header_at,
-        key_for, location, longs, moved_by_header, pages_of, predicted_of, row_of, stepped, store,
-        store_file, with_column_chunk, with_dictionary_one_entry_short, with_group_rows,
-        with_header_claims, with_pages,
+        FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
+        Opened, Orders, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows,
+        fault_of, group_rows, header_at, key_for, location, long_orders, longs, moved_by_header,
+        ordered_layout, pages_of, predicted_of, row_of, stepped, store, store_file,
+        with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
+        with_pages,
     };
     use crate::index::{
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
@@ -1208,7 +1341,10 @@ mod tests {
     };
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
+    use crate::manifest::testing::KEY_COLUMN;
+    use crate::order::{OrderFacts, OrderType, OrderValue};
     use parquet::basic::PageType;
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
     use parquet::file::properties::WriterVersion;
 
     /// Rows per row group in the hand-written fixtures with two row groups.
@@ -1501,7 +1637,7 @@ mod tests {
         metadata: &ParquetMetaData,
         key_leaf: usize,
     ) -> Arc<Segments> {
-        let ranges = key_chunk_ranges(metadata, key_leaf, opened.handle.size());
+        let ranges = column_chunk_ranges(metadata, key_leaf, opened.handle.size());
         let parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         Arc::new(Segments::new(parts, opened.handle.size()))
     }
@@ -1592,7 +1728,7 @@ mod tests {
         page: ChunkPage,
         claims: &[(HeaderField, i32)],
     ) -> (ParquetMetaData, Arc<Segments>) {
-        let ranges = key_chunk_ranges(loaded, key_leaf, opened.handle.size());
+        let ranges = column_chunk_ranges(loaded, key_leaf, opened.handle.size());
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let (range, bytes) = &parts[0];
         let patched = with_header_claims(bytes, header_at(loaded, key_leaf, page), claims);
@@ -2144,7 +2280,7 @@ mod tests {
                 "{field} {claimed}"
             );
         }
-        let ranges = key_chunk_ranges(&loaded, key_leaf, opened.handle.size());
+        let ranges = column_chunk_ranges(&loaded, key_leaf, opened.handle.size());
         let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
         let mut bytes = parts[0].1.to_vec();
         let past_known_wire_types = WireType::Struct.code() + 1;
@@ -2489,7 +2625,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let ranges = key_chunk_ranges(
+            let ranges = column_chunk_ranges(
                 &inspected.metadata,
                 inspected.layout.key_leaf,
                 inspected.handle.size(),
@@ -2528,10 +2664,6 @@ mod tests {
         }
     }
 
-    /// The order column's field id in the ordered rules a test verifies
-    /// under; any id.
-    const ORDER_FIELD_ID: i32 = 1;
-
     #[tokio::test]
     async fn test_reusable_disk_chunks_never_trusts_a_file_verified_under_other_rules() {
         let key_type = KeyType::Long;
@@ -2543,7 +2675,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let ranges = key_chunk_ranges(
+        let ranges = column_chunk_ranges(
             &inspected.metadata,
             inspected.layout.key_leaf,
             inspected.handle.size(),
@@ -2687,7 +2819,7 @@ mod tests {
     async fn test_disk_tier_rebuilds_a_chunk_file_whose_record_is_over_the_footer_bound() {
         let key_type = KeyType::Long;
         let written = written(key_type).await;
-        let most = record::most_bytes(&written.opened.index(key_type).await.key_column());
+        let most = record::most_bytes(&written.opened.index(key_type).await.key_column(), None);
         local_testing::edit_verification(&written.path, |bytes| {
             bytes.resize(approx::length(most + 1), 0);
         });
@@ -2813,6 +2945,7 @@ mod tests {
             TABLE,
             &column,
             shape,
+            None,
             chunks,
             KeyDecoder::Plain,
         ));
@@ -2820,6 +2953,7 @@ mod tests {
             TABLE,
             &column,
             shape,
+            None,
             chunks,
             KeyDecoder::ColumnReader,
         ));
@@ -3332,5 +3466,370 @@ mod tests {
         };
         assert_eq!(verified.key_range.1, key_for(FEW_ROWS - 1, KeyType::String));
         assert_eq!(taken, [KeyDecoder::ColumnReader]);
+    }
+
+    /// The long keys and orders of an ordered fixture as `(key, order)`
+    /// pairs, one row each.
+    fn ordered_of(pairs: &[(i64, i64)]) -> Fixture {
+        let keys: Vec<i64> = pairs.iter().map(|(key, _)| *key).collect();
+        let orders: Vec<i64> = pairs.iter().map(|(_, order)| *order).collect();
+        Fixture::ordered(&keys, long_orders(&orders))
+    }
+
+    /// The refusal a build of `opened` under a `long` order column ends in,
+    /// the same in every tier.
+    async fn ordered_refusal(opened: &Opened) -> RefusalReason {
+        let mut reasons = Vec::new();
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            reasons.push(refusal_of(
+                opened
+                    .build_ordered_in(OrderType::Long, residency, dir.path())
+                    .await,
+            ));
+        }
+        assert!(
+            reasons.windows(2).all(|pair| pair[0] == pair[1]),
+            "{reasons:?}"
+        );
+        reasons.pop().unwrap()
+    }
+
+    /// Under ordered rules a key repeats, its rows rising by order value
+    /// (RFD 025, Layout), in every tier; the same file under key-value
+    /// rules is still `duplicate_keys`.
+    #[tokio::test]
+    async fn test_verify_ordered_admits_a_key_repeated_with_rising_order() {
+        let opened = store(&ordered_of(&[(1, 1), (1, 2), (1, 3), (2, 1)])).await;
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let index = opened
+                .build_ordered_in(OrderType::Long, residency, dir.path())
+                .await
+                .unwrap();
+            assert_eq!(index.key_range(), (&Key::Long(1), &Key::Long(2)));
+            assert_eq!(index.fences(), [vec![Key::Long(1)]]);
+            assert!(index.order_facts().is_some(), "{residency}");
+        }
+        assert_eq!(
+            refusal_of(opened.build(KeyType::Long, Residency::Full, None).await),
+            RefusalReason::DuplicateKeys {
+                path: location(),
+                key: Key::Long(1),
+            }
+        );
+    }
+
+    /// A key and order value together twice is `duplicate_rows`, naming
+    /// both (RFD 025, Uniqueness).
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_an_equal_pair_as_duplicate_rows() {
+        let opened = store(&ordered_of(&[(1, 2), (1, 2)])).await;
+        assert_eq!(
+            ordered_refusal(&opened).await,
+            RefusalReason::DuplicateRows {
+                path: location(),
+                key: Key::Long(1),
+                order: Box::new(OrderValue::Long(2)),
+            }
+        );
+    }
+
+    /// A key's order value falling is `unsorted`, as a key falling is.
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_a_falling_order_as_unsorted() {
+        let falling = store(&ordered_of(&[(1, 3), (1, 2)])).await;
+        assert_eq!(
+            ordered_refusal(&falling).await,
+            RefusalReason::Unsorted {
+                path: location(),
+                row_group: 0,
+            }
+        );
+        let key_falling = store(&ordered_of(&[(2, 1), (1, 2)])).await;
+        assert_eq!(
+            ordered_refusal(&key_falling).await,
+            RefusalReason::Unsorted {
+                path: location(),
+                row_group: 0,
+            }
+        );
+    }
+
+    /// Pairs are compared across a row-group boundary, where a key's run
+    /// may continue: an equal pair across it is `duplicate_rows`, a fall
+    /// `unsorted` in the later row group, and a rise is served.
+    #[tokio::test]
+    async fn test_verify_ordered_checks_pairs_across_row_groups() {
+        let in_groups = |pairs: &[(i64, i64)]| {
+            let mut fixture = ordered_of(pairs);
+            fixture.layout.row_group_rows = TINY_GROUP_ROWS;
+            fixture
+        };
+        let equal = store(&in_groups(&[(1, 4), (1, 5), (1, 5), (2, 1)])).await;
+        assert_eq!(
+            equal.handle.load_metadata().await.unwrap().num_row_groups(),
+            2
+        );
+        assert_eq!(
+            ordered_refusal(&equal).await,
+            RefusalReason::DuplicateRows {
+                path: location(),
+                key: Key::Long(1),
+                order: Box::new(OrderValue::Long(5)),
+            }
+        );
+        let falling = store(&in_groups(&[(1, 4), (1, 5), (1, 3), (2, 1)])).await;
+        assert_eq!(
+            ordered_refusal(&falling).await,
+            RefusalReason::Unsorted {
+                path: location(),
+                row_group: 1,
+            }
+        );
+        let rising = store(&in_groups(&[(1, 4), (1, 5), (1, 6), (2, 1)])).await;
+        let dir = tempfile::tempdir().unwrap();
+        let index = rising
+            .build_ordered_in(OrderType::Long, Residency::Full, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(index.fences(), [vec![Key::Long(1)], vec![Key::Long(1)]]);
+    }
+
+    /// A null order value is `null_order`, in the row group holding it.
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_null_order() {
+        let mut fixture = ordered_of(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
+        fixture.layout.row_group_rows = TINY_GROUP_ROWS;
+        fixture.orders = Some(Orders::Long(vec![Some(1), Some(1), Some(1), None]));
+        let opened = store(&fixture).await;
+        assert_eq!(
+            ordered_refusal(&opened).await,
+            RefusalReason::NullOrder {
+                path: location(),
+                row_group: 1,
+            }
+        );
+    }
+
+    /// A `string` order value that is not UTF-8 is a file fault, as a
+    /// string key that is not is.
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_a_string_order_that_is_not_utf8() {
+        let mut fixture = ordered_of(&[(1, 0), (2, 0)]);
+        fixture.orders = Some(Orders::Bytes(vec![
+            Some(b"a".to_vec()),
+            Some(vec![u8::MAX]),
+        ]));
+        let opened = store(&fixture).await;
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            fault_of(
+                opened
+                    .build_ordered_in(OrderType::String, Residency::Full, dir.path())
+                    .await
+            ),
+            FileFault::OrderNotUtf8 { row_group: 0 }
+        );
+        let binary = opened
+            .build_ordered_in(OrderType::Binary, Residency::Full, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            binary.order_facts().unwrap().max,
+            OrderValue::Bytes(vec![u8::MAX])
+        );
+    }
+
+    /// `verify_ordered` of `opened`'s file over `metadata`, a footer edited
+    /// from its own, with the key and order chunks fetched.
+    async fn verify_ordered_over(
+        opened: &Opened,
+        metadata: &ParquetMetaData,
+        order_type: OrderType,
+    ) -> Result<Verified> {
+        let layout = ordered_layout(KeyType::Long, order_type);
+        let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
+            .await
+            .unwrap();
+        let order = inspected.layout.order.unwrap();
+        let ranges = inspected
+            .layout
+            .verified_ranges(metadata, opened.handle.size());
+        let parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
+        let chunks = Arc::new(Segments::new(parts, opened.handle.size()));
+        let path = location();
+        let column = Column {
+            metadata,
+            leaf: inspected.layout.key_leaf,
+            path: &path,
+        };
+        verify_ordered(TABLE, &column, KeyShape::Long, order, &chunks)
+    }
+
+    /// Each order page's values lie within its column index entry (RFD
+    /// 025, Load): the key column's index stood in for the order column's
+    /// fails to bound the order page, and the file's own index bounds it,
+    /// truncated or not.
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_a_column_index_that_fails_to_bound_its_page() {
+        let opened = store(&ordered_of(&[(1, 100), (1, 200), (2, 100)])).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let schema = loaded.file_metadata().schema_descr();
+        let leaf_of = |name: &str| {
+            (0..schema.num_columns())
+                .find(|&leaf| schema.column(leaf).name() == name)
+                .unwrap()
+        };
+        let (key_leaf, order_leaf) = (leaf_of(KEY_COLUMN), leaf_of(ORDER_COLUMN));
+        assert!(
+            verify_ordered_over(&opened, &loaded, OrderType::Long)
+                .await
+                .is_ok()
+        );
+        let mut builder = ParquetMetaData::clone(&loaded).into_builder();
+        let mut column_index = builder.take_column_index().unwrap();
+        column_index[0][order_leaf] = column_index[0][key_leaf].clone();
+        let key_index = builder.set_column_index(Some(column_index)).build();
+        assert_eq!(
+            fault_of(verify_ordered_over(&opened, &key_index, OrderType::Long).await),
+            FileFault::OrderIndexMismatch {
+                row_group: 0,
+                page: 0
+            }
+        );
+
+        let long_text =
+            |n: usize| Some(format!("{:a>len$}{n}", "", len = LONG_ORDER_BYTES).into_bytes());
+        let mut truncated = ordered_of(&[(1, 0), (1, 0), (2, 0)]);
+        truncated.orders = Some(Orders::Bytes(vec![
+            long_text(1),
+            long_text(2),
+            long_text(1),
+        ]));
+        truncated.layout.truncate = Some(TRUNCATED_INDEX_BYTES);
+        let truncated = store(&truncated).await;
+        let loaded = truncated.handle.load_metadata().await.unwrap();
+        let ColumnIndexMetaData::BYTE_ARRAY(index) = &loaded.column_index().unwrap()[0][order_leaf]
+        else {
+            panic!("a byte-array order column has a byte-array index");
+        };
+        assert!(
+            index.min_value(0).unwrap().len() < LONG_ORDER_BYTES,
+            "the index is truncated"
+        );
+        let verified = verify_ordered_over(&truncated, &loaded, OrderType::String)
+            .await
+            .unwrap();
+        assert_eq!(
+            verified.order.unwrap().max,
+            OrderValue::Str(String::from_utf8(long_text(2).unwrap()).unwrap())
+        );
+    }
+
+    /// The bytes of the long string order values of the truncation case,
+    /// past the column index's truncation, `TRUNCATED_INDEX_BYTES`.
+    const LONG_ORDER_BYTES: usize = 32;
+    const TRUNCATED_INDEX_BYTES: usize = 8;
+
+    /// The load records per file the exact least and greatest order value,
+    /// each row group's distinct keys, and the longest run, a run across a
+    /// row-group boundary counted whole (RFD 025, Load), in every tier and
+    /// from a reused Disk-tier chunk file alike.
+    #[tokio::test]
+    async fn test_verify_ordered_records_min_max_distinct_keys_and_longest_run() {
+        let mut fixture = ordered_of(&[(1, 5), (1, 6), (1, 7), (1, 8), (2, -3), (2, 9), (3, 0)]);
+        fixture.layout.row_group_rows = 3;
+        let opened = store(&fixture).await;
+        let expected = OrderFacts {
+            min: OrderValue::Long(-3),
+            max: OrderValue::Long(9),
+            distinct_keys: vec![1, 2, 1],
+            longest_run: 4,
+        };
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let index = opened
+                .build_ordered_in(OrderType::Long, residency, dir.path())
+                .await
+                .unwrap();
+            assert_eq!(index.order_facts(), Some(&expected), "{residency}");
+            assert_eq!(
+                count(index.resident_bytes()),
+                predicted_of(&index).in_tier(residency).unwrap(),
+                "{residency}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        opened
+            .build_ordered_in(OrderType::Long, Residency::Disk, dir.path())
+            .await
+            .unwrap();
+        let restarted = store_file(opened.file.clone()).await;
+        let reused = restarted
+            .build_ordered_in(OrderType::Long, Residency::Disk, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(restarted.stats().gets(), 1, "the footer only");
+        assert_eq!(reused.order_facts(), Some(&expected));
+    }
+
+    /// Under `disk` an ordered file's chunk file holds its key and order
+    /// chunks, fetched in one round with one GET per row group per column
+    /// and written under the ordered rules, beside the key-value file's
+    /// chunk file and not in place of it; the residency sample covers both
+    /// columns' chunks (RFD 025, Load, Consequences).
+    #[tokio::test]
+    async fn test_disk_tier_keeps_an_ordered_chunk_file_of_key_and_order_chunks() {
+        let pairs: Vec<(i64, i64)> = (0..i64::try_from(contract_rows()).unwrap())
+            .map(|i| (i / 2, i % 2))
+            .collect();
+        let mut fixture = ordered_of(&pairs);
+        fixture.layout.row_group_rows = group_rows();
+        let opened = store(&fixture).await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
+        let layout = ordered_layout(KeyType::Long, OrderType::Long);
+        let index = opened
+            .build_under(&layout, Residency::Disk, Some(&local))
+            .await
+            .unwrap();
+        assert_eq!(opened.stats().gets(), 1 + 2 * count(ROW_GROUPS));
+        let disk = index.disk_chunks().unwrap();
+        let metadata = index.metadata();
+        let key_ranges = column_chunk_ranges(metadata, index.key_leaf(), opened.handle.size());
+        let order_ranges =
+            column_chunk_ranges(metadata, index.order_leaf().unwrap(), opened.handle.size());
+        let all: Vec<Range<u64>> = key_ranges.iter().chain(&order_ranges).cloned().collect();
+        assert!(disk.stores_exactly(&all));
+        assert_eq!(
+            disk.verified_under().rules,
+            ChunkRules::Ordered {
+                order_field_id: ORDER_FIELD_ID
+            }
+        );
+        let span = |ranges: &[Range<u64>]| -> u64 { ranges.iter().map(|r| r.end - r.start).sum() };
+        let chunks = disk.chunks();
+        assert_eq!(
+            chunks.end - chunks.start,
+            span(&key_ranges) + span(&order_ranges)
+        );
+        assert!(disk.resident().unwrap().pages > 0);
+        assert!(
+            local.index_bytes_in_use().unwrap() <= predicted_of(&index).disk_bytes,
+            "the budget reserves at least the chunk file written"
+        );
+
+        opened
+            .build(KeyType::Long, Residency::Disk, Some(&local))
+            .await
+            .unwrap_err();
+        assert!(
+            local
+                .lookup(&identity_of(&opened.handle), index.chunk_rules())
+                .map(|found| matches!(found, ChunkFileLookup::Found(_)))
+                .unwrap(),
+            "a key-value build leaves the ordered chunk file"
+        );
     }
 }
