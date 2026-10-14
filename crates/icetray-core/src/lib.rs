@@ -41,9 +41,9 @@ pub use bucket::bucket;
 pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
-    Capping, ColumnCost, ColumnLevel, ColumnSummary, Examined, FileReport, Finding, FindingCode,
-    LookupCost, Penalty, TableReport, TableSummary, Unwalked, ValueColumnReport, WriterProperty,
-    diagnose, examine, judge,
+    Capping, ColumnCost, ColumnLevel, ColumnSummary, Examined, FileOrderReport, FileReport,
+    Finding, FindingCode, LookupCost, OrderSummary, Penalty, TableReport, TableSummary, Unwalked,
+    ValueColumnReport, WriterProperty, diagnose, examine, judge,
 };
 pub use column::ColumnMismatch;
 pub use config::{

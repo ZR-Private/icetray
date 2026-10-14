@@ -1807,7 +1807,7 @@ impl Table {
     /// generation.
     fn gate(&self, generation: &Generation, config: &TableConfig) -> Result<FindingCounts> {
         let declared = config.lookups();
-        let report = check::diagnose(generation, declared, &config.formats());
+        let report = check::diagnose(generation, declared, &config.formats(), config.scan_rows());
         let mut counts = FindingCounts::new();
         for finding in &report.findings {
             *counts.entry(finding.capping()).or_default() += 1;
@@ -3581,7 +3581,7 @@ mod tests {
         );
         assert_eq!(generation.level, Level::Balanced, "the dearest column's");
         assert_eq!(generation.lookup_cost.gets_per_hit, 2);
-        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         let dictionary: Vec<Option<&str>> = report
             .findings
             .iter()
@@ -3737,7 +3737,7 @@ mod tests {
                 ..
             })
         ));
-        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = check::diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert!(report.summary.value_columns.is_empty());
         assert!(
             report

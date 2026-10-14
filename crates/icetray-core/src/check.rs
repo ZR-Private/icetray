@@ -27,7 +27,7 @@ use crate::index::{
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::manifest::{DataFileEntry, TableLayout, ValueColumnLayout};
-use crate::order::{OrderFacts, OrderValue};
+use crate::order::{OrderFacts, OrderType, OrderValue};
 use crate::projection;
 use crate::snapshot::SnapshotId;
 
@@ -794,6 +794,39 @@ pub struct FileReport {
     pub bounds_present: bool,
     /// Bytes the file's index keeps resident in the tier it was built in.
     pub resident_bytes: usize,
+    /// What the load recorded of the file's order column; `None` for a
+    /// key-value table's file, whose line then carries no `order`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<FileOrderReport>,
+}
+
+/// What the load recorded of one ordered file's order column (RFD 025,
+/// Load), as `OrderFacts` holds it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FileOrderReport {
+    /// The least order value over all the file's rows, deleted rows
+    /// included.
+    pub min: OrderValue,
+    /// The greatest order value over all the file's rows, deleted rows
+    /// included.
+    pub max: OrderValue,
+    /// The rows of the file's longest run of one key.
+    pub longest_run: u64,
+    /// Per row group, in footer order, the distinct keys it holds: what
+    /// sizes its bloom filter.
+    pub distinct_keys: Vec<u64>,
+}
+
+impl FileOrderReport {
+    /// The report of a file whose load recorded `facts`.
+    fn of(facts: &OrderFacts) -> Self {
+        Self {
+            min: facts.min.clone(),
+            max: facts.max.clone(),
+            longest_run: facts.longest_run,
+            distinct_keys: facts.distinct_keys.clone(),
+        }
+    }
 }
 
 /// What the doctor measured about one value column of one data file (RFD
@@ -839,6 +872,22 @@ pub struct ColumnSummary {
     /// Data files written before the column was added, for whose rows a
     /// lookup returns the column's default (RFD 023).
     pub files_predating_column: usize,
+}
+
+/// An ordered table's order column in its summary (RFD 025, Doctor).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct OrderSummary {
+    /// The order column's configured name.
+    pub column: String,
+    /// The column's Iceberg type in the snapshot.
+    pub order_type: OrderType,
+    /// The most rows one Scan returns for a key: the table's configured
+    /// `max_scan_rows`, or the default.
+    pub max_scan_rows: u32,
+    /// The rows of the longest run of one key across every file: a caller
+    /// reads such a key's history in this many rows over
+    /// `ceil(longest_run / max_scan_rows)` Scans.
+    pub longest_run: u64,
 }
 
 /// The doctor's verdict on one generation and the numbers an owner chooses
@@ -895,6 +944,10 @@ pub struct TableSummary {
     pub capping: usize,
     /// Advice findings, the count of those whose `caps` is `None`.
     pub advice: usize,
+    /// An ordered table's order column and runs; `None` for a key-value
+    /// table, whose line then carries no `order`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<OrderSummary>,
 }
 
 impl TableSummary {
@@ -936,11 +989,14 @@ impl TableReport {
 /// file from what the generation holds, raises each finding of the finding
 /// table whose trigger the measurements meet, the capping ones through
 /// `layout_caps`, and sums every tier's predicted resident bytes from the
-/// footers. No I/O and no metrics.
+/// footers. `scan_rows` is the table's effective `max_scan_rows`
+/// (`TableConfig::scan_rows`), `Some` exactly on an ordered table, which
+/// reports its order column with it. No I/O and no metrics.
 pub fn diagnose(
     g: &Generation,
     lookups: Level,
     formats: &dyn Fn(&str) -> ValueFormat,
+    scan_rows: Option<u32>,
 ) -> TableReport {
     let caps = layout_caps(&LayoutView::of(g));
     let deletes = g.delete_summary();
@@ -999,6 +1055,22 @@ pub fn diagnose(
         deletes,
         capping,
         advice: findings.len() - capping,
+        order: g
+            .layout
+            .order
+            .as_ref()
+            .zip(scan_rows)
+            .map(|(order, max_scan_rows)| OrderSummary {
+                column: order.name.clone(),
+                order_type: order.order_type,
+                max_scan_rows,
+                longest_run: facts
+                    .iter()
+                    .filter_map(|file| file.report.order.as_ref())
+                    .map(|order| order.longest_run)
+                    .max()
+                    .unwrap_or(0),
+            }),
     };
     TableReport {
         summary,
@@ -1043,8 +1115,9 @@ pub async fn examine(
     g: &Generation,
     lookups: Level,
     formats: &dyn Fn(&str) -> ValueFormat,
+    scan_rows: Option<u32>,
 ) -> Examined {
-    let mut report = diagnose(g, lookups, formats);
+    let mut report = diagnose(g, lookups, formats, scan_rows);
     let mut unwalked = Vec::new();
     for (at, column) in g.layout.value_columns.iter().enumerate() {
         match formats(&column.name) {
@@ -1617,6 +1690,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf()),
             bounds_present: bounds_intact(&file.entry, index.key_range()),
             resident_bytes: index.resident_bytes(),
+            order: order_facts.map(FileOrderReport::of),
         },
         size: file.entry.size,
         rows: rows_of(index),
@@ -3004,7 +3078,7 @@ mod tests {
     async fn test_diagnose_contract_fixture_is_optimal_with_no_findings() {
         let mut table = contract_table().await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(&report, &[]);
         let summary = &report.summary;
         assert_eq!(summary.level, Level::Optimal);
@@ -3056,7 +3130,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3080,7 +3154,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].dictionary_columns, [KEY_COLUMN]);
     }
@@ -3100,6 +3174,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(
             &report,
@@ -3126,6 +3201,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(
             &report,
@@ -3159,6 +3235,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(
             &report,
@@ -3280,7 +3357,7 @@ mod tests {
         table.add_long_file("b", &interleaved, 0).await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 1);
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3305,7 +3382,7 @@ mod tests {
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.files[0].entry.key_min, None);
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3331,7 +3408,7 @@ mod tests {
         let entry = &generation.files[0].entry;
         assert!(entry.key_min.is_some() && entry.key_max.is_some());
         assert_eq!(generation.layout.key_type, KeyType::String);
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3354,7 +3431,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, whole) = one_string_file(&keys, Bounds::Exact, small_pages).await;
-        let report = diagnose(&whole, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&whole, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(&report, &[]);
         assert_eq!(report.files[0].key_pages, pages);
         assert_eq!(
@@ -3367,7 +3444,7 @@ mod tests {
             ..small_pages
         };
         let (table, generation) = one_string_file(&keys, Bounds::Exact, truncated).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3415,6 +3492,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(
             &report,
@@ -3448,7 +3526,7 @@ mod tests {
             })
             .await;
         let generation = load(&mut table, Residency::Full, None).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         let path = Some(table.path_of("f"));
         assert_findings(
             &report,
@@ -3498,7 +3576,7 @@ mod tests {
             .collect();
         let (table, generation) =
             one_string_file(&keys, Bounds::Exact, WriterLayout::contract()).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3546,7 +3624,7 @@ mod tests {
         }
         let generation = load(&mut table, Residency::Full, None).await;
         assert_eq!(generation.overlapping_buckets().len(), 0);
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(FindingCode::ManyFilesPerBucket, None, None, None, None)],
@@ -3565,7 +3643,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3589,7 +3667,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_findings(
             &report,
             &[(
@@ -3620,6 +3698,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(
             &report,
@@ -3653,7 +3732,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [a.clone(), b.clone()]
         );
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         let dictionary = Some(Penalty {
             extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
             ..Penalty::default()
@@ -3707,7 +3786,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(report.summary.level, Level::Optimal, "advice caps nothing");
         assert_eq!((report.summary.capping, report.summary.advice), (0, 1));
 
@@ -3716,7 +3795,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(dictionary).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(report.summary.level, Level::Balanced);
         assert_eq!((report.summary.capping, report.summary.advice), (1, 0));
 
@@ -3726,6 +3805,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Optimal,
             &ValueFormat::opaque,
+            None,
         );
         assert_eq!(
             codes(&report.capping()),
@@ -3748,6 +3828,7 @@ mod tests {
             &load(&mut table, Residency::Bloom, None).await,
             Level::Balanced,
             &ValueFormat::opaque,
+            None,
         );
         assert_findings(&report, &[]);
         assert_eq!(report.summary.level, Level::Balanced);
@@ -3777,7 +3858,8 @@ mod tests {
             diagnose(
                 &one_file(WriterLayout::contract()).await.1,
                 Level::Permissive,
-                &ValueFormat::opaque
+                &ValueFormat::opaque,
+                None
             )
             .summary
             .lookups,
@@ -3793,7 +3875,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(no_filter).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(report.summary.predicted.bloom, None);
         assert_eq!(
             report.summary.level_by_residency,
@@ -3858,7 +3940,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (_table, generation) = one_file(advice_only).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(report.summary.advice, 1);
         judge(
             TABLE,
@@ -3890,6 +3972,7 @@ mod tests {
             &load(&mut table, Residency::Full, None).await,
             Level::Balanced,
             &ValueFormat::opaque,
+            None,
         );
         assert_eq!(
             codes(&report.capping()),
@@ -3931,7 +4014,7 @@ mod tests {
             let local = testing::local_dir(scratch.path(), table.storage.stats(), None);
             let local = (residency == Residency::Disk).then_some(&local);
             let generation = load(&mut table, residency, local).await;
-            let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+            let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
             assert_eq!(report.summary.residency, residency);
             assert_eq!(report.summary.index_bytes, generation.index_bytes);
             let predicted = report.summary.predicted;
@@ -4006,7 +4089,7 @@ mod tests {
             ..WriterLayout::contract()
         };
         let (table, generation) = one_file(layout).await;
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         let json = serde_json::to_value(&report).unwrap();
         (table, report, json)
     }
@@ -4094,11 +4177,11 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let (_table, before, after) =
             deleted_file_table(Residency::Full, false, scratch.path()).await;
-        let clean = diagnose(&before, Level::Optimal, &ValueFormat::opaque);
+        let clean = diagnose(&before, Level::Optimal, &ValueFormat::opaque, None);
         assert!(pending(&clean).is_empty());
         assert_eq!(clean.summary.deletes, DeleteSummary::default());
 
-        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque, None);
         let findings = pending(&report);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].caps(), None);
@@ -4133,10 +4216,10 @@ mod tests {
             let bound = after.delete_bound();
             assert!(bound >= approx::count(after.delete_summary().state_bytes));
             assert_eq!(before.delete_bound(), 0);
-            let without = diagnose(&before, Level::Optimal, &ValueFormat::opaque)
+            let without = diagnose(&before, Level::Optimal, &ValueFormat::opaque, None)
                 .summary
                 .predicted;
-            let with = diagnose(&after, Level::Optimal, &ValueFormat::opaque)
+            let with = diagnose(&after, Level::Optimal, &ValueFormat::opaque, None)
                 .summary
                 .predicted;
             assert_eq!(with.full, without.full + bound, "{residency}");
@@ -4161,7 +4244,7 @@ mod tests {
         assert_eq!(caps.level, Level::Permissive);
         assert_eq!(codes(&caps.capping()), [FindingCode::OverlappingFiles]);
         assert_eq!(compacted_level(&after, &caps), Some(Level::Optimal));
-        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&after, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(pending(&report).len(), 1);
         assert_eq!(
             report.summary.deletes.rows,
@@ -4215,7 +4298,7 @@ mod tests {
             ]
         );
         assert_eq!(compacted_level(&generation, &caps), None);
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(pending(&report).len(), 1);
         assert_eq!(
             report.summary.deletes.rows,
@@ -4429,7 +4512,7 @@ mod tests {
 
         let (table, generation) = files_of_values(&[None, Some(malformed)]).await;
         let before = table.gets();
-        let examined = examine(&generation, Level::Optimal, &protobuf).await;
+        let examined = examine(&generation, Level::Optimal, &protobuf, None).await;
         assert!(examined.unwalked.is_empty());
         let second = table.path_of("f1");
         assert_eq!(
@@ -4443,7 +4526,7 @@ mod tests {
         pages.push(Some(malformed));
         let (table, generation) = files_of_values(&pages).await;
         let before = table.gets();
-        let examined = examine(&generation, Level::Optimal, &protobuf).await;
+        let examined = examine(&generation, Level::Optimal, &protobuf, None).await;
         assert!(malformed_files(&examined.report).is_empty());
         assert_eq!(
             table.gets() - before,
@@ -4453,7 +4536,7 @@ mod tests {
 
         let (table, generation) = files_of_values(&[Some(malformed)]).await;
         let before = table.gets();
-        let opaque = examine(&generation, Level::Optimal, &ValueFormat::opaque).await;
+        let opaque = examine(&generation, Level::Optimal, &ValueFormat::opaque, None).await;
         assert!(malformed_files(&opaque.report).is_empty());
         assert_eq!(table.gets(), before, "an opaque column is not walked");
     }
@@ -4463,13 +4546,19 @@ mod tests {
         let (table, generation) = files_of_values(&[Some(b"\x08\x01")]).await;
         let path = table.path_of("f0");
         std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
-        let examined = examine(&generation, Level::Optimal, &|_| ValueFormat::Protobuf).await;
+        let examined = examine(
+            &generation,
+            Level::Optimal,
+            &|_| ValueFormat::Protobuf,
+            None,
+        )
+        .await;
         let [unwalked] = &examined.unwalked[..] else {
             panic!("one column unwalked, got {:?}", examined.unwalked);
         };
         assert_eq!(unwalked.column, VALUE_COLUMN);
         assert_eq!(unwalked.error.kind(), crate::error::ErrorKind::ObjectStore);
-        let whole = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let whole = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         assert_eq!(examined.report.summary.level, whole.summary.level);
         assert_eq!(examined.report.findings.len(), whole.findings.len());
     }

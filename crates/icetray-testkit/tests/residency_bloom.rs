@@ -219,7 +219,7 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         bloom.index_bytes,
         full.index_bytes
     );
-    let predicted = diagnose(&full, Level::Optimal, &ValueFormat::opaque)
+    let predicted = diagnose(&full, Level::Optimal, &ValueFormat::opaque, None)
         .summary
         .predicted;
     assert_eq!(
@@ -232,7 +232,7 @@ async fn test_bloom_load_reads_filters_and_keeps_less_resident() -> Result<()> {
         Some(count(bloom.index_bytes)),
         "and the Bloom tier's: footers, indexes, filters, and fences, no chunk"
     );
-    let bloom_summary = diagnose(&bloom, Level::Balanced, &ValueFormat::opaque).summary;
+    let bloom_summary = diagnose(&bloom, Level::Balanced, &ValueFormat::opaque, None).summary;
     assert_eq!(bloom_summary.residency, Residency::Bloom);
     assert_eq!(
         bloom_summary.level,

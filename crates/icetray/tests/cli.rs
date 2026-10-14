@@ -18,6 +18,7 @@ use icetray::reload::ReloadResult;
 use icetray::serve::OVERALL_SERVICE;
 use icetray::{EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
 use icetray_core::approx;
+use icetray_core::config::DEFAULT_MAX_SCAN_ROWS;
 use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::metric::{
     ALLOCATOR_ALLOCATED_BYTES, ALLOCATOR_RESIDENT_BYTES, CONFIG_PENDING, CONFIG_RELOADS_TOTAL,
@@ -28,14 +29,15 @@ use icetray_core::{
 };
 use icetray_testkit::aws_catalog::{CatalogEntry, FakeAwsCatalog};
 use icetray_testkit::fixture::{
-    IDS_2K, IDS_4K, NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS, STRAY_IDS,
-    TWO_BUCKETS, UNPARTITIONED_FILE_BYTES,
+    IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, SAMPLE, SECOND_VALUE_COLUMN, SMALL_BUCKETS, SMALL_IDS,
+    STRAY_IDS, TWO_BUCKETS, UNPARTITIONED_FILE_BYTES,
 };
 use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::protobuf;
 use icetray_testkit::verify::{data_files, remove_data_files, series_value, zero_column_chunks};
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, Nulls, Order, ValueKind, memory_catalog_local, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, ValueKind,
+    memory_catalog_local, write_fixture,
 };
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -586,6 +588,173 @@ async fn test_doctor_reports_a_refusal_and_exits_1() -> TestResult {
     assert_eq!(report[0]["reason"], "unsorted");
     assert!(report[0].get("error_kind").is_none(), "{report:?}");
     assert!(report[0]["message"].is_string());
+    Ok(())
+}
+
+/// The rows every key of the ordered fixtures here has.
+const ORDER_ROWS_PER_KEY: u64 = 7;
+
+/// The raw order value of a key's first row, and the distance between
+/// consecutive rows.
+const ORDER_START: i64 = 1_000;
+const ORDER_STEP: i64 = 10;
+
+/// The `max_scan_rows` the info test configures: fewer than the default,
+/// and within `server.max_multi_scan_values`.
+const CONFIGURED_SCAN_ROWS: u32 = 50;
+
+/// The rows per key of an ordered fixture that repeats every pair.
+fn seven_rows(_id: u64) -> u64 {
+    ORDER_ROWS_PER_KEY
+}
+
+/// An ordered fixture of `IDS_2K` in `TWO_BUCKETS`, each key with
+/// `ORDER_ROWS_PER_KEY` timestamps `ORDER_STEP` apart from `ORDER_START`,
+/// or all at `ORDER_START` when `step` is zero, which repeats every pair.
+fn ordered_spec(name: &str, step: i64) -> FixtureSpec {
+    FixtureSpec {
+        ids: IDS_2K,
+        buckets: TWO_BUCKETS,
+        ..FixtureSpec::ordered(
+            name,
+            KeyType::Long,
+            Ordered {
+                kind: OrderKind::Timestamp,
+                rows_per_key: seven_rows,
+                start: ORDER_START,
+                step,
+            },
+        )
+    }
+}
+
+/// `toml_table` with the order column and, when set, `max_scan_rows`.
+fn toml_ordered_table(name: &str, fixture: &Fixture, max_scan_rows: Option<u32>) -> String {
+    let rows = max_scan_rows.map_or_else(String::new, |rows| format!("max_scan_rows = {rows}\n"));
+    format!(
+        "{}order_column = \"{ORDER_COLUMN}\"\n{rows}",
+        toml_table(name, fixture)
+    )
+}
+
+/// The doctor reports an ordered table's order column on its `table` line
+/// and each file's order facts on its `file` line (RFD 025, Doctor): the
+/// column, its type, the effective `max_scan_rows`, and the longest run
+/// across files; per file the least and greatest order value, the longest
+/// run, and the distinct keys of each row group. A key-value table's lines
+/// carry none of it.
+#[tokio::test]
+async fn test_doctor_reports_an_ordered_table_s_order_facts() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), ordered_spec("events_doctor", ORDER_STEP)).await?;
+    let config = write_file(
+        dir.path(),
+        "ordered.toml",
+        &toml_ordered_table(TABLE_A, &fixture, None),
+    )?;
+    let output = run(&["doctor", "--config", &config, "--files"], &[]);
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    let order = &report[0]["order"];
+    assert_eq!(report[0]["kind"], "table");
+    assert_eq!(order["column"], ORDER_COLUMN);
+    assert_eq!(order["order_type"], "timestamp");
+    assert_eq!(order["max_scan_rows"], Json::from(DEFAULT_MAX_SCAN_ROWS));
+    assert_eq!(order["longest_run"], Json::from(ORDER_ROWS_PER_KEY));
+    let files: Vec<&Json> = report
+        .iter()
+        .filter(|line| line["kind"] == "file")
+        .collect();
+    assert_eq!(files.len(), approx::length(TWO_BUCKETS));
+    let last = ORDER_START + ORDER_STEP * i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    let mut distinct = 0;
+    for file in files {
+        let facts = &file["order"];
+        assert_eq!(facts["min"], Json::from(ORDER_START));
+        assert_eq!(facts["max"], Json::from(last));
+        assert_eq!(facts["longest_run"], Json::from(ORDER_ROWS_PER_KEY));
+        let per_row_group = facts["distinct_keys"]
+            .as_array()
+            .expect("distinct keys by row group");
+        assert_eq!(
+            per_row_group.len(),
+            approx::length(file["row_groups"].as_u64().unwrap())
+        );
+        distinct += per_row_group
+            .iter()
+            .map(|keys| keys.as_u64().expect("a count"))
+            .sum::<u64>();
+    }
+    let keys = IDS_2K.end - IDS_2K.start;
+    assert!(
+        distinct >= keys,
+        "every key is in a row group: {distinct} of {keys}"
+    );
+    Ok(())
+}
+
+/// A key-value table's `table` and `file` lines carry no order field.
+#[tokio::test]
+async fn test_doctor_leaves_a_key_value_table_s_lines_without_order() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture =
+        local_fixture(dir.path(), FixtureSpec::small("kv_no_order", KeyType::Long)).await?;
+    let output = run(
+        &[&["doctor"][..], &location(&fixture), &["--files"]].concat(),
+        &[],
+    );
+    assert_exit(&output, EXIT_OK);
+    let report = lines(&output.stdout);
+    assert!(report.iter().any(|line| line["kind"] == "file"));
+    assert!(report.iter().all(|line| line.get("order").is_none()));
+    Ok(())
+}
+
+/// `info` reports the order column, its type, the configured
+/// `max_scan_rows`, and the longest run.
+#[tokio::test]
+async fn test_info_reports_the_order_column() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(dir.path(), ordered_spec("events_info", ORDER_STEP)).await?;
+    let config = write_file(
+        dir.path(),
+        "ordered.toml",
+        &toml_ordered_table(TABLE_A, &fixture, Some(CONFIGURED_SCAN_ROWS)),
+    )?;
+    let output = run(&["info", "--config", &config], &[]);
+    assert_exit(&output, EXIT_OK);
+    let info = lines(&output.stdout);
+    assert_eq!(info.len(), 1);
+    let order = &info[0]["order"];
+    assert_eq!(order["column"], ORDER_COLUMN);
+    assert_eq!(order["order_type"], "timestamp");
+    assert_eq!(order["max_scan_rows"], Json::from(CONFIGURED_SCAN_ROWS));
+    assert_eq!(order["longest_run"], Json::from(ORDER_ROWS_PER_KEY));
+    Ok(())
+}
+
+/// A key's pair written twice refuses the table as `duplicate_rows`, and
+/// the doctor exits 1 with the refusal as its only line.
+#[tokio::test]
+async fn test_doctor_reports_duplicate_rows_with_exit_failure() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let spec = FixtureSpec {
+        buckets: ONE_BUCKET,
+        ..ordered_spec("events_duplicate", 0)
+    };
+    let fixture = local_fixture(dir.path(), spec).await?;
+    let config = write_file(
+        dir.path(),
+        "ordered.toml",
+        &toml_ordered_table(TABLE_A, &fixture, None),
+    )?;
+    let output = run(&["doctor", "--config", &config], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    let report = lines(&output.stdout);
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert_eq!(report[0]["kind"], "refusal");
+    assert_eq!(report[0]["table"], TABLE_A);
+    assert_eq!(report[0]["reason"], "duplicate_rows");
     Ok(())
 }
 

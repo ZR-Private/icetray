@@ -244,7 +244,7 @@ async fn test_doctor_reports_each_column_of_each_file() -> Result<()> {
     let scratch = tempfile::tempdir()?;
     let served = verify::serve_in(fixture.config(Residency::Full, false), scratch.path()).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     let names: Vec<&str> = report
         .summary
         .value_columns

@@ -5332,7 +5332,7 @@ mod tests {
             let local = local_dir(scratch.path(), table.storage.stats(), None);
             let config = table.config(residency, None);
             let (caps, generation) = plan_stage_caps(&table, &config, Some(&local)).await;
-            let report = check::diagnose(&generation, config.lookups(), &ValueFormat::opaque);
+            let report = check::diagnose(&generation, config.lookups(), &ValueFormat::opaque, None);
             assert_eq!(caps.level, report.summary.level, "{name}");
             assert_eq!(caps.level, generation.level, "{name}");
             assert_eq!(caps.capping(), report.capping(), "{name}");
@@ -5497,7 +5497,7 @@ mod tests {
                 let generation = table.load(&config, Some(&local), None).await.unwrap();
                 assert_eq!(generation.lookup_cost, expected, "{name} {residency}");
                 assert_eq!(
-                    check::diagnose(&generation, config.lookups(), &ValueFormat::opaque)
+                    check::diagnose(&generation, config.lookups(), &ValueFormat::opaque, None)
                         .summary
                         .lookup_cost,
                     expected,

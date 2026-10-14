@@ -363,7 +363,7 @@ async fn test_doctor_walks_one_value_page_per_protobuf_column() -> Result<()> {
             let generation = served.current();
             let stats = served.storage.stats();
             let before = stats.gets();
-            let examined = examine(&generation, Level::Optimal, &config.formats()).await;
+            let examined = examine(&generation, Level::Optimal, &config.formats(), None).await;
             assert!(examined.unwalked.is_empty(), "{:?}", examined.unwalked);
             let report = examined.report;
             let walked = format == ValueFormat::Protobuf;

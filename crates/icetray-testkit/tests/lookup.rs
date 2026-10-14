@@ -520,7 +520,7 @@ async fn test_large_values_row_bounded_and_byte_bounded() -> Result<()> {
         assert!(gets >= 1);
         let bytes_per_get = (stats.bytes() - bytes_before) / gets;
         let generation = served.current();
-        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
         let flagged = report
             .findings
             .iter()

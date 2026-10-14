@@ -465,7 +465,7 @@ async fn build(
 /// state's bytes and the predicted memory that counts their bound.
 fn summary_of(served: &Served, fixture: &Fixture) -> TableSummary {
     let lookups = fixture.config(Residency::Full, false).lookups();
-    diagnose(&served.current(), lookups, &ValueFormat::opaque).summary
+    diagnose(&served.current(), lookups, &ValueFormat::opaque, None).summary
 }
 
 /// `rows` as a generation holds a data file's deleted rows (icetray-core's

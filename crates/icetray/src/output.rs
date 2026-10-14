@@ -379,8 +379,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use icetray_core::{
-        Capping, ColumnSummary, DeleteSummary, FindingCode, KeyType, Level, LookupCost, Residency,
-        ResidentBytes, TableFault, UnsupportedFormat, ValueColumnReport,
+        Capping, ColumnSummary, DeleteSummary, FileOrderReport, FindingCode, KeyType, Level,
+        LookupCost, OrderSummary, OrderType, OrderValue, Residency, ResidentBytes, TableFault,
+        UnsupportedFormat, ValueColumnReport,
     };
     use serde_json::Value as Json;
 
@@ -468,6 +469,7 @@ mod tests {
             },
             capping: 0,
             advice: 0,
+            order: None,
         }
     }
 
@@ -500,6 +502,7 @@ mod tests {
             distinct_page_mins_ratio: 1.0,
             bounds_present: true,
             resident_bytes: 1,
+            order: None,
         }
     }
 
@@ -608,6 +611,44 @@ mod tests {
             line["value_columns"][0]["column"],
             Json::String(COLUMN.to_string())
         );
+    }
+
+    /// The order facts an ordered table's sample lines carry.
+    const LONGEST_RUN: u64 = 7;
+    const SCAN_ROWS: u32 = 50;
+    const DISTINCT_KEYS: [u64; 2] = [3, 4];
+    const LEAST_ORDER: i64 = -5;
+
+    #[test]
+    fn test_serialize_order_facts_appear_only_on_an_ordered_table_s_lines() {
+        let mut summary = summary();
+        let mut file = file_report();
+        let line = serde_json::to_value(SummaryLine::new(&summary)).unwrap();
+        assert!(line.get("order").is_none(), "{line}");
+        let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
+        assert!(line.get("order").is_none(), "{line}");
+        summary.order = Some(OrderSummary {
+            column: COLUMN.to_string(),
+            order_type: OrderType::Binary,
+            max_scan_rows: SCAN_ROWS,
+            longest_run: LONGEST_RUN,
+        });
+        file.order = Some(FileOrderReport {
+            min: OrderValue::Long(LEAST_ORDER),
+            max: OrderValue::Bytes(vec![0x00, 0xab]),
+            longest_run: LONGEST_RUN,
+            distinct_keys: DISTINCT_KEYS.to_vec(),
+        });
+        let line = serde_json::to_value(SummaryLine::new(&summary)).unwrap();
+        assert_eq!(line["order"]["column"], Json::String(COLUMN.to_string()));
+        assert_eq!(line["order"]["order_type"], Json::String("binary".into()));
+        assert_eq!(line["order"]["max_scan_rows"], Json::from(SCAN_ROWS));
+        assert_eq!(line["order"]["longest_run"], Json::from(LONGEST_RUN));
+        let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
+        assert_eq!(line["order"]["min"], Json::from(LEAST_ORDER));
+        assert_eq!(line["order"]["max"], Json::String("0x00ab".to_string()));
+        assert_eq!(line["order"]["longest_run"], Json::from(LONGEST_RUN));
+        assert_eq!(line["order"]["distinct_keys"], Json::from(DISTINCT_KEYS));
     }
 
     #[test]

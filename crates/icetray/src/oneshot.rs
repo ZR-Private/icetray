@@ -90,8 +90,13 @@ pub async fn doctor(
                     continue;
                 }
                 let configured = configured(config, table.name());
-                let examined =
-                    examine(&generation, configured.lookups(), &configured.formats()).await;
+                let examined = examine(
+                    &generation,
+                    configured.lookups(),
+                    &configured.formats(),
+                    configured.scan_rows(),
+                )
+                .await;
                 let report = &examined.report;
                 emit(&SummaryLine::new(&report.summary))?;
                 for finding in &report.findings {
@@ -158,7 +163,12 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
     for table in loaded {
         let generation = table.serving()?;
         let entry = table.config();
-        let report = diagnose(&generation, entry.lookups(), &entry.formats());
+        let report = diagnose(
+            &generation,
+            entry.lookups(),
+            &entry.formats(),
+            entry.scan_rows(),
+        );
         emit(&SummaryLine::new(&report.summary))?;
     }
     Ok(())

@@ -308,6 +308,27 @@ impl fmt::Display for OrderValue {
     }
 }
 
+impl serde::Serialize for OrderType {
+    /// The Iceberg type name `Display` gives, as the doctor's lines carry
+    /// it.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl serde::Serialize for OrderValue {
+    /// A long as a JSON number, a string as a JSON string with nothing
+    /// added, bytes as a JSON string of `0x` and lowercase hex: the form a
+    /// reader who knows the order type reads back as the same value.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Long(value) => serializer.serialize_i64(*value),
+            Self::Str(text) => serializer.serialize_str(text),
+            Self::Bytes(_) => serializer.collect_str(self),
+        }
+    }
+}
+
 /// What the load records of one ordered file's order column (RFD 025,
 /// Load), from every order value it decodes: the exact least and greatest
 /// order value over all the file's rows, deleted rows included, the
@@ -422,6 +443,28 @@ mod tests {
         // UTF-8 bytes: a non-ASCII character is above every ASCII one.
         assert!(OrderValue::Str("z".to_string()) < OrderValue::Str("é".to_string()));
         assert!(OrderValue::Str("a".to_string()) < OrderValue::Str("ab".to_string()));
+    }
+
+    #[test]
+    fn test_serialize_renders_a_long_as_a_number_a_string_as_text_and_bytes_as_hex() {
+        let long = i64::MIN;
+        assert_eq!(
+            serde_json::to_value(OrderValue::Long(long)).unwrap(),
+            serde_json::json!(long)
+        );
+        let text = "a \"quoted\" caf\u{e9}";
+        assert_eq!(
+            serde_json::to_value(OrderValue::Str(text.to_string())).unwrap(),
+            serde_json::json!(text)
+        );
+        assert_eq!(
+            serde_json::to_value(OrderValue::Bytes(vec![0x00, 0xab, 0xff])).unwrap(),
+            serde_json::json!("0x00abff")
+        );
+        assert_eq!(
+            serde_json::to_value(OrderType::Fixed(WIDTH)).unwrap(),
+            serde_json::json!(OrderType::Fixed(WIDTH).to_string())
+        );
     }
 
     #[test]

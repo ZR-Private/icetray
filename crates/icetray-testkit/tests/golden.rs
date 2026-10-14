@@ -67,6 +67,7 @@ impl Golden {
             &self.current(),
             self.table.config().lookups(),
             &ValueFormat::opaque,
+            None,
         )
     }
 }

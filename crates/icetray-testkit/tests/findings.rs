@@ -192,7 +192,12 @@ async fn test_contract_fixture_is_optimal_with_no_findings() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let (_fixture, served) =
         write_and_serve(&catalog, FixtureSpec::small("kv_contract", KeyType::Long)).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_eq!(report.summary.level, Level::Optimal);
     assert!(report.findings.is_empty(), "{:?}", report.findings);
     assert_eq!((report.summary.capping, report.summary.advice), (0, 0));
@@ -213,7 +218,7 @@ async fn test_dictionary_encoded_value_caps_balanced_by_one_extra_get() -> Resul
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[FindingCode::DictionaryEncodedValue], &[]);
     assert_eq!(
         finding(&report, FindingCode::DictionaryEncodedValue)
@@ -255,7 +260,12 @@ async fn test_large_key_pages_penalty_is_the_rows_decoded() -> Result<()> {
         ..FixtureSpec::small("kv_bigpages", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[FindingCode::LargeKeyPages], &[]);
     assert_eq!(
         finding(&report, FindingCode::LargeKeyPages)
@@ -282,7 +292,7 @@ async fn test_no_bucket_partition_caps_permissive() -> Result<()> {
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
     assert!(generation.files.len() >= TWO_FILES);
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(
         &report,
         &[FindingCode::NoBucketPartition],
@@ -314,7 +324,12 @@ async fn test_overlapping_files_caps_permissive() -> Result<()> {
         .append(catalog.as_ref(), residue_class(SECOND_CLASS), "half")
         .await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[FindingCode::OverlappingFiles], &[]);
     assert_eq!(
         finding(&report, FindingCode::OverlappingFiles)
@@ -345,7 +360,7 @@ async fn test_bounds_missing_is_advice() -> Result<()> {
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[FindingCode::BoundsMissing]);
     assert!(BOUNDS_TRUNCATE < fixture.key(0).as_bytes().len());
     for file in &generation.files {
@@ -371,7 +386,12 @@ async fn test_column_index_truncated_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_cutindex", KeyType::String)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::ColumnIndexTruncated]);
     for file in &report.files {
         assert!(
@@ -394,7 +414,12 @@ async fn test_large_value_pages_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_widepages", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::LargeValuePages]);
     Ok(())
 }
@@ -418,7 +443,12 @@ async fn test_value_pages_over_ceiling_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_ceilingpages", KeyType::Long)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(
         &report,
         &[],
@@ -470,7 +500,12 @@ async fn test_long_keys_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_longkeys", KeyType::String)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::LongKeys]);
     assert!(
         report
@@ -505,7 +540,7 @@ async fn test_large_file_is_advice() -> Result<()> {
     let generation = served.current();
     assert_eq!(generation.files.len(), 1);
     assert!(generation.files[0].entry.size > FILE_BYTES_ADVICE);
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(
         &report,
         &[],
@@ -530,7 +565,12 @@ async fn test_many_files_per_bucket_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_manyfiles", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::ManyFilesPerBucket]);
     assert!(
         approx::count(report.summary.max_files_per_bucket) > FILES_PER_BUCKET_FACTOR,
@@ -553,7 +593,12 @@ async fn test_no_bloom_filter_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_nobloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::NoBloomFilter]);
     assert_eq!(report.summary.predicted.bloom, None);
     Ok(())
@@ -572,7 +617,12 @@ async fn test_bloom_oversized_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_bigbloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::BloomOversized]);
     for file in &report.files {
         let rows = u64::try_from(file.rows).unwrap();
@@ -599,7 +649,12 @@ async fn test_bloom_undersized_is_advice() -> Result<()> {
         ..FixtureSpec::small("kv_smallbloom", KeyType::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::BloomUndersized]);
     for file in &report.files {
         assert!(
@@ -797,7 +852,12 @@ async fn test_shared_edge_keys_caps_a_compaction_rolled_by_size_at_balanced() ->
     let (_dir, catalog) = local_catalog().await?;
     let (fixture, served) = write_and_serve(&catalog, rolled_spec("ord_rolled")).await?;
     assert_two_files_share_an_edge_key(&served);
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[FindingCode::SharedEdgeKeys], &[]);
     let shared = finding(&report, FindingCode::SharedEdgeKeys);
     assert_eq!(shared.caps(), Some(Level::Balanced));
@@ -842,7 +902,12 @@ async fn test_a_later_file_touching_an_edge_key_is_overlapping_files() -> Result
         .await?;
     let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
     assert_two_files_share_an_edge_key(&served);
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[FindingCode::OverlappingFiles], &[]);
     assert_eq!(
         finding(&report, FindingCode::OverlappingFiles)
@@ -867,7 +932,7 @@ async fn test_a_compacted_ordered_table_in_one_file_per_bucket_is_optimal() -> R
         write_and_serve(&catalog, ordered_spec("ord_compacted", OrderKind::Long)).await?;
     let generation = served.current();
     assert_eq!(generation.files.len(), approx::length(TWO_BUCKETS));
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[]);
     assert_eq!(report.summary.level, Level::Optimal);
     assert_eq!(report.summary.lookup_cost.files_probed, 1);
@@ -891,7 +956,12 @@ async fn test_dictionary_encoded_order_caps_at_balanced_under_full() -> Result<(
         },
     );
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[FindingCode::DictionaryEncodedOrder], &[]);
     let dictionary = finding(&report, FindingCode::DictionaryEncodedOrder);
     assert_eq!(dictionary.caps(), Some(Level::Balanced));
@@ -929,7 +999,12 @@ async fn test_dictionary_encoded_order_leaves_disk_optimal() -> Result<()> {
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let (served, _local, _scratch) =
         serve_on_disk(&fixture, &catalog, fixture.config(Residency::Disk, true)).await?;
-    let report = diagnose(&served?.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served?.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[]);
     assert_eq!(report.summary.level, Level::Optimal);
     assert_eq!(
@@ -970,7 +1045,7 @@ async fn test_order_index_missing_caps_at_balanced() -> Result<()> {
             file.entry.path
         );
     }
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[FindingCode::OrderIndexMissing], &[]);
     let missing = finding(&report, FindingCode::OrderIndexMissing);
     assert_eq!(missing.caps(), Some(Level::Balanced));
@@ -1006,7 +1081,12 @@ async fn test_order_index_truncated_is_advice() -> Result<()> {
         ..ordered_spec("ord_cutorderindex", OrderKind::Str)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::OrderIndexTruncated]);
     assert_eq!(
         finding(&report, FindingCode::OrderIndexTruncated).property(),
@@ -1074,7 +1154,12 @@ async fn test_order_index_truncated_is_not_raised_for_repeated_whole_minimums() 
         ratio < DISTINCT_MINS_RATIO_ADVICE,
         "the page minimums repeat: {ratio}"
     );
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[]);
     Ok(())
 }
@@ -1109,7 +1194,7 @@ async fn test_long_runs_is_advice_above_one_thousand_rows() -> Result<()> {
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[FindingCode::LongRuns]);
     let holding: Vec<&str> = generation
         .files
@@ -1161,7 +1246,12 @@ async fn test_large_runs_is_advice_above_four_mib() -> Result<()> {
         ..ordered_spec("ord_largeruns", OrderKind::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(
+        &served.current(),
+        Level::Optimal,
+        &ValueFormat::opaque,
+        None,
+    );
     assert_codes(&report, &[], &[FindingCode::LargeRuns]);
     let run_bytes = approx::count(LARGE_RUN_VALUE_BYTES) * u64::from(RUN_ROWS_ADVICE);
     assert!(run_bytes > RUN_BYTES_ADVICE);
@@ -1188,7 +1278,7 @@ async fn test_bloom_findings_divide_by_distinct_keys_for_an_ordered_table() -> R
     let (_fixture, served) =
         write_and_serve(&catalog, ordered_spec("ord_bloom", OrderKind::Long)).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[]);
     for (file, loaded) in report.files.iter().zip(&generation.files) {
         let per_row = file.bloom_bits_per_key.unwrap();

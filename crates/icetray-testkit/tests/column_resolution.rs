@@ -357,7 +357,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     .await?;
 
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     let defaults: Vec<_> = report
         .findings
         .iter()
@@ -641,6 +641,7 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
         &generation,
         Level::Optimal,
         &served.table.config().formats(),
+        None,
     )
     .await;
     assert_eq!(
@@ -704,6 +705,7 @@ async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
         &generation,
         Level::Optimal,
         &served.table.config().formats(),
+        None,
     )
     .await;
     assert!(
