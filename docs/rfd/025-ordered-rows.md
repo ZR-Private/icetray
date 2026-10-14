@@ -84,7 +84,8 @@ direction under a limit and optional bounds on the order value.
   is `INVALID_ARGUMENT`: an unspecified direction, a limit above
   `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
   above `before`, a MultiScan above `max_multi_scan_values`, or a call
-  of the wrong kind for the table.
+  of the wrong kind for the table. A response above
+  `server.max_scan_bytes` is `FAILED_PRECONDITION` (Limits).
 - **Paging.** A caller pages by order value: reading newest first, the
   next request sets `before` to the oldest order value of the previous
   response, and reading oldest first, `after` to the newest. Within one
@@ -100,9 +101,8 @@ direction under a limit and optional bounds on the order value.
   span key pages and row groups. Partitioning stays `bucket(N, key)`, so
   within a bucketing all of a key's rows share a bucket. Appends write
   files that overlap a bucket's existing ones, and a compaction merges
-  them. The order column carries an offset index and a column index, the
-  minimum and maximum of each page, which Iceberg's writers write by
-  default.
+  them. The order column carries an offset index, which Iceberg's
+  writers write by default; the server does not read its column index.
 - **Load.** The load verifies that each file's rows strictly increase by
   key and then order value, across row-group boundaries included: an
   equal pair is `duplicate_rows`, naming the key and the order value, a
@@ -111,27 +111,33 @@ direction under a limit and optional bounds on the order value.
   key that is not UTF-8 is. To verify, it reads the order column's
   chunks, one GET per row group, and records per file the exact minimum
   and maximum order value over all its rows, its distinct keys per row
-  group, and its longest run. Resident per file are those facts and the
-  order column's offset index and column index. A file without an order
-  column offset index is a file fault, as a key or value column without
-  one is. Since the load decodes every order value, it checks that each
-  order page's values lie within that page's column index entry, and a
-  file whose index fails to bound its pages is a file fault, so the
-  server places a bound only by an index it has checked. Order pages get
-  RFD 004's value-page header checks and its 64 MiB ceiling, at load and
-  in a Scan. Under `disk` every chunk file is named by its data file and
-  the rules it was verified under, the key-value rules or the ordered
-  rules with the order column's field id, and its verification record
-  names those rules. An ordered table's chunk file holds its key chunks,
-  its order chunks, and those facts. Entries that serve one table with
-  different order columns, or with none, therefore each keep their own
-  chunk file, and none trusts a file verified under other rules. The
+  group, its longest run, and the order fences: for each order page, the
+  shortest pair of key and order value that sorts above the last row of
+  the page before it and at or below the page's first row. Integer and
+  time values in a fence are exact, and string, binary, and fixed values
+  are cut to the shortest prefix that keeps that order. Rows are sorted
+  by key and then order value, so a page holds exactly the pairs from
+  its fence up to the next page's, and the fences place any pair on its
+  page whatever the writer's column index holds or leaves out. Resident
+  per file are those facts, the fences, and the order column's offset
+  index. A file without an order column offset index is a file fault, as
+  a key or value column without one is. Order pages get RFD 004's
+  value-page header checks and its 64 MiB ceiling, at load and in a
+  Scan. Under `disk` every chunk file is named by its data file and the
+  rules it was verified under, the key-value rules or the ordered rules
+  with the order column's field id, and its verification record names
+  those rules. An ordered table's chunk file holds its key chunks, its
+  order chunks, those facts, and the fences, so a restart that trusts it
+  restores them without decoding a value. Entries that serve one table
+  with different order columns, or with none, therefore each keep their
+  own chunk file, and none trusts a file verified under other rules. The
   chunk-file budget reserves an ordered chunk file from the footer's
-  sizes, estimating string and binary order values as it estimates
-  fences. Column resolution under RFD 023 (Column resolution) applies to
-  the order column, and a file written before the order column was added
-  is refused as `column_mismatch`, since its default would give every
-  row of the file one order value.
+  sizes, estimating string and binary order values, in the facts and the
+  order fences, as it estimates key fences. Column resolution under RFD
+  023 (Column resolution) applies to the order column, and a file
+  written before the order column was added is refused as
+  `column_mismatch`, since its default would give every row of the file
+  one order value.
 - **Refresh.** Across files, the load checks for a repeated live pair
   only among files where one can occur. A file is checked when it is
   new, or reused with deletes that shrank: deleted rows that are not a
@@ -142,20 +148,21 @@ direction under a limit and optional bounds on the order value.
   checked file that meets no other, as an append of later rows does,
   needs no merge and is read no further. In each overlap group that
   holds a checked file meeting another, the load runs one k-way merge by
-  key and order value over every such checked file, read whole, and over
-  only the order pages of the group's other files that can hold a
-  checked file's rows, judged by the key pages each order page's rows
-  span and by its checked column index, each page read once. A checked
-  file is read again for the merge: its order chunks by GET under
-  `full`, one GET per row group, its key chunks with them under `bloom`,
-  and its chunk file under `disk`. The other files' order pages are
-  fetched by GET under `full`, read from the ordered chunk file under
-  `disk`, and fetched with the key pages they span under `bloom`. The
-  load refuses a live pair present twice as `duplicate_rows`, naming the
-  later file in file order, as `duplicate_keys` does. A refresh that
-  appends later rows therefore reads only its new files, and an append
-  of rows inside an existing file's order range costs the new file's
-  order chunks again and the order pages those rows fall among.
+  key and order value over only the order pages that can hold a pair
+  another file of the group also holds, judged by the fences: a page's
+  pairs lie between its fence and the next page's. It takes the pages of
+  a checked file that meet a page of any other file of the group, and
+  the pages of any other file that meet a page of a checked file. It
+  reads each such page once, a row group of each file at a time as the
+  merge advances, so it holds at most one row group's chosen pages per
+  file: by GET under `full`, from the ordered chunk file under `disk`,
+  and with the key pages they span under `bloom`. The load refuses a
+  live pair present twice as `duplicate_rows`, naming the later file in
+  file order, as `duplicate_keys` does. A refresh that appends later
+  rows therefore reads only its new files, files a compaction rolled by
+  size cost the pages at the edge keys they share, and an append of rows
+  inside an existing file's order range costs the pages those rows fall
+  among, in the new file and the old.
 - **Cost.** Per file that holds the key, a Scan finds the run, then
   reads the order column and each requested column over the run's rows,
   in one round across all files:
@@ -172,13 +179,15 @@ direction under a limit and optional bounds on the order value.
   resident first and last key of each row group give the row groups a
   run spans. The server takes up to the limit of the run's newest or
   oldest live rows, counted against the resident deleted rows without
-  I/O. With a bound, the server selects from the order column's resident
-  column index the pages that can hold the bound and reads them with the
-  value pages in the same round, so with a full-length column index,
-  beyond the rows the limit selects, a bounded Scan reads in each
-  requested column at most the rest of the order page that holds the
-  bound and one run-edge page, whose minimum and maximum include a
-  neighbouring key's values. Across K files that hold the key, a Scan
+  I/O. With a bound, a binary search over the run's fences places the
+  bound on one order page, and the server reads that page with the value
+  pages in the same round, so beyond the rows the limit selects, a
+  bounded Scan reads in each requested column at most the rows of the
+  order page that holds the bound. Where that page is local, under
+  `disk`, or already cached, the server decodes it first and reads only
+  the value pages of the rows taken, at no more rounds to object
+  storage. A Scan's work follows its limit, not its run's length. Across
+  K files that hold the key, a Scan
   with limit L reads up to K·L rows and returns L; to set `more`
   exactly, the server reads the order value of one more live row in each
   file. A Scan of a key held in one file, with none of its pages cached,
@@ -208,8 +217,14 @@ direction under a limit and optional bounds on the order value.
   full limit over many columns uses Scan. `server.scan_deadline`, 5 s by
   default, bounds one Scan and each span GET, and
   `server.multi_scan_deadline`, 15 s by default, one MultiScan.
-  `server.max_in_flight` counts every Get, MultiGet, Scan, and MultiScan,
-  and TableInfo takes none of its slots.
+  `server.max_scan_bytes`, 4 MiB by default, a gRPC client's default
+  message limit, bounds the encoded size of one Scan or MultiScan
+  response. The server refuses a larger response as
+  `FAILED_PRECONDITION`, returning no rows and naming its size, the
+  bound, and the rows that would fit, and counts it as an error; a
+  caller lowers its limit, and an owner whose clients accept larger
+  messages raises the bound. `server.max_in_flight` counts every Get,
+  MultiGet, Scan, and MultiScan, and TableInfo takes none of its slots.
 - **Levels and findings.** RFD 020 (Lookup levels) applies, read for a
   Scan of one key. When no two files in a bucket have key ranges that
   intersect, ends included, every Scan reads one file, and the table can
@@ -230,24 +245,14 @@ direction under a limit and optional bounds on the order value.
   whose ordered table takes appends between compactions sets `lookups =
   "permissive"` to keep it from being reported below its level.
   `no_bucket_partition` and `large_key_pages` apply unchanged. Under
-  `full` and `bloom`, two more findings cap the table at `balanced`:
-  `dictionary_encoded_order`, for a dictionary-encoded order column,
-  whose dictionary page every Scan also fetches, and
-  `order_index_missing`, for a file without an order column index, where
-  a bounded Scan takes a second round; under `disk` the dictionary page
-  and the bound's order pages are local reads. A truncated order column
-  index draws the advice `order_index_truncated`, since long string
-  values sharing a prefix widen the pages a bound selects; where the
-  rows a bounded Scan walks to fill its limit lie on more than one page
-  that holds only the key's rows and lies across the same bound, in one
-  row group or several, the server reads in a first round the order
-  pages up to those where the column index places the limit's rows, and
-  in a second the value pages of exactly the rows taken, so the value
-  reads stay bounded by the limit. The advice `long_runs`
-  reports a file holding a run of more than 1,000 rows, and `large_runs`
-  a file where 1,000 rows of the configured value columns, at the
-  footer's uncompressed bytes per row, would exceed 4 MiB, a gRPC
-  client's default message limit. The bloom findings divide a row
+  `full` and `bloom`, `dictionary_encoded_order` caps the table at
+  `balanced`, for a dictionary-encoded order column, whose dictionary
+  page every Scan also fetches; under `disk` the dictionary page is a
+  local read. The advice `long_runs` reports a file holding a run of
+  more than 1,000 rows, and `large_runs` a file where `max_scan_rows`
+  rows of the configured value columns, at the footer's uncompressed
+  bytes per row, would exceed `server.max_scan_bytes`, so a Scan at the
+  full limit would be refused. The bloom findings divide a row
   group's filter bits by its distinct keys, which the load counts.
 - **Metrics.** `icetray_scans_total` by table and result (`rows`,
   `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
@@ -292,8 +297,16 @@ Rejected for the first version, because the response's snapshot id
 already shows a caller that a refresh came between two requests.
 
 The order column decoded and resident. Rejected because its memory grows
-with rows, which in an ordered table outnumber keys, while the column
-index already lets a bound select its pages.
+with rows, which in an ordered table outnumber keys, while one fence per
+order page places any bound on its page.
+
+Bounds placed by the writer's order column index, the minimum and
+maximum of each page. Rejected because a writer may truncate string
+entries or leave the index out, and either costs a bounded Scan a
+second round, because a page that holds several keys' rows mixes their
+order values, so the index prunes the uniqueness merge poorly where runs
+are short, and because the load already decodes every pair the fences
+need.
 
 A two-phase read across files, order values first and then values only
 for the rows returned. Not chosen for the first version, because it adds
@@ -321,8 +334,17 @@ filter covers a column's distinct values, so a key repeated across rows
 is one entry, and the fences bound the key pages a Scan needs.
 
 Truncation by response bytes. Rejected in favor of a row limit the owner
-sizes against value size and an advice finding for runs too large for a
-message.
+sizes against value size, a response bound above which the server
+refuses, and an advice finding for runs too large for that bound: a
+truncated response would hand a caller that does not check `more` fewer
+rows than it asked for, with no sign.
+
+Bounds per key in a MultiScan. Deferred: one set of bounds serves the
+common call, the newest rows of many keys after one order value, and a
+caller paging several keys' histories continues with a Scan per key
+whose result shows `more`, which costs the server what the MultiScan
+would. Optional bounds per key that replace the shared ones can be added
+later without changing a caller.
 
 One Scan across several tables that share a key type, merged by order
 value. Deferred: a caller can issue one Scan per table and merge by the
@@ -354,13 +376,17 @@ reads both. A long run costs bytes in proportion to the rows read, a run
 the cache holds in part costs one GET per uncached span, and under
 `bloom` a Scan waits on a key-page round before its row round. At the
 defaults, a MultiScan at the full limit with one value column covers two
-keys, so a caller reading many keys requests a smaller limit.
+keys, so a caller reading many keys requests a smaller limit. The span
+hedge window scales its delay with a span's pages; whether a span GET's
+latency on object storage follows its pages or a fixed first-byte time
+is to be measured by span size before the window changes.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,
-and the resident budget counts the order column's indexes and per-file
-facts. A table whose writer leaves files unsorted, as streaming appends
-often do, is refused as `unsorted` until a compaction sorts them.
+and the resident budget counts the order column's offset index, its
+fences, and per-file facts. A table whose writer leaves files unsorted,
+as streaming appends often do, is refused as `unsorted` until a
+compaction sorts them.
 
 Earlier RFDs are revised to match: RFD 002 (the optimal layout for an
 ordered table); RFD 004 and RFD 017 (Residency tiers) (the order
