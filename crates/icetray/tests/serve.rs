@@ -1365,6 +1365,33 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         Some(0.0)
     );
     assert_scan_series_exposed_at_zero(&scrape);
+    // The state label's values are spelled out: `StateName` is private to
+    // icetray-core.
+    for name in [FRESH_TABLE, FRESH_ORDERED_TABLE] {
+        let table = (metric::LABEL_TABLE, name);
+        for state in ["degraded", "held"] {
+            assert_eq!(
+                series_value(
+                    &scrape,
+                    metric::TABLE_STATE,
+                    &[table, (metric::LABEL_STATE, state)]
+                ),
+                Some(0.0),
+                "{name} {state}"
+            );
+        }
+        for gauge_name in [
+            metric::TABLE_BELOW_LEVEL,
+            metric::TABLE_LEVEL,
+            metric::TABLE_DECLARED_LEVEL,
+        ] {
+            assert_eq!(
+                series_value(&scrape, gauge_name, &[table]),
+                Some(0.0),
+                "{name} {gauge_name}"
+            );
+        }
+    }
     for call in Call::ALL {
         assert!(calls_exposed(&scrape, call, Code::Ok), "{call} in {scrape}");
     }
