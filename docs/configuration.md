@@ -584,8 +584,8 @@ value columns are the ones the `--value-column` flags list, or none, so
 the doctor checks only those columns' layout. A located table is a
 key-value table, and the command line has no flag for an order column,
 so `doctor` and `info` check an ordered table through a configuration
-file that sets its `order_column`. Opened with `--location`, an ordered
-table's repeated keys refuse it as `duplicate_keys`. Its
+file that sets its `order_column`. icetray refuses an ordered table
+opened with `--location` as `duplicate_keys`, since its keys repeat. Its
 `lookups` is the best level its `--residency` reaches, `optimal` for
 `full` and `balanced` for `bloom`, and it is never strict, so the doctor
 reports a located table below that level with exit 2 rather than refusing

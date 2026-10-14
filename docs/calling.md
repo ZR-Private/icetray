@@ -5,10 +5,11 @@ A service calls icetray over gRPC with a client generated from
 comments are the reference this page summarizes. There are five calls.
 `Get` looks up one key and `MultiGet` many keys from one snapshot, in a
 key-value table. `Scan` reads one key's rows in order and `MultiScan`
-many keys' rows from one snapshot, in an
-[ordered table](#reading-an-ordered-table). `TableInfo` describes a
-table the server serves, including which kind it is. The
-[glossary](glossary.md) defines terms such as snapshot and residency.
+many keys' rows from one snapshot, in an [ordered
+table](#reading-an-ordered-table). `TableInfo` describes a table the
+server serves, and a table whose `order_column` it reports set is an
+ordered table. The [glossary](glossary.md) defines terms such as
+snapshot and residency.
 
 The server rejects most malformed requests as `INVALID_ARGUMENT`, but a
 few rules are the caller's to keep, and the server cannot detect a break
@@ -239,9 +240,10 @@ The response carries the key's rows in the requested direction, each
 with its order value and one value per requested column, in the order
 requested, read as a `Get` response's values are. No two rows of one
 response share an order value. `more` is set when the key has rows
-within the bounds past the last row returned. A key with no rows returns
-no rows with `more` unset, and that is a successful call. A request that
-lists no columns returns the order values alone.
+within the bounds past the last row returned. For a key with no rows,
+the server returns no rows and leaves `more` unset, and that is a
+successful call. A request that lists no columns returns the order
+values alone.
 
 The same call in Go:
 
@@ -256,12 +258,15 @@ resp, err := client.Scan(ctx, &icetrayv1.ScanRequest{
 ```
 
 In each file that holds the key, a cold `Scan` costs a GET per
-contiguous span of uncached pages of the order column and of each
-requested column, so a caller requests only the columns it uses. A table
-that a compaction has merged holds each key in one file. A table that
-takes appends between compactions holds a key in up to one file per
-append, and a `Scan` reads every one of them
-([Performance and tuning](performance.md#what-a-scan-costs)).
+contiguous span of uncached pages of each requested column, and under
+`full` and `bloom` of the order column, which `disk` reads locally;
+under `bloom` the key-page GETs come first. A caller therefore requests
+only the columns it uses. A compaction that writes one file per bucket
+holds each key in one file; one that rolls files by size can split a key
+at a file boundary (`shared_edge_keys`), and a `Scan` of that key reads
+every file that holds it. A table that takes appends between compactions
+holds a key in up to one file per append, and a `Scan` reads every one
+of them ([Performance and tuning](performance.md#what-a-scan-costs)).
 
 ## Paging by order value
 
@@ -310,20 +315,22 @@ A `MultiScan` request carries a list of keys and one set of columns,
 direction, limit, and bounds, applied to every key. The server reads
 every key from one snapshot and returns one result per key in request
 order, each with its own rows and `more`, with one snapshot id for the
-call. A key listed twice is answered at each position. When the read of
-any key fails, the whole call fails, as for `MultiGet`.
+call. For a key listed twice, the server returns a result at each
+position. When the read of any key fails, the whole call fails, as for
+`MultiGet`.
 
 A `MultiScan` may request up to `server.max_multi_scan_values` values,
-4,000 by default, counted as its keys times its limit times one more than
-its columns, the one being the order value; a limit of 0 counts as the
-table's `max_scan_rows`. The server rejects a larger call as
+4,000 by default, counted as its keys times its limit times one more
+than its columns, the one being the order value; a limit of 0 counts as
+the table's `max_scan_rows`. The server rejects a larger call as
 `INVALID_ARGUMENT` before it reads any key. At the defaults, a
 `MultiScan` at the full limit of 1,000 rows with one column covers two
 keys, and one with a limit of 20 and one column covers 100. A caller
-reading many keys requests a smaller limit and pages each key that
-returns `more`, and a caller reading one key's full limit over several
-columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in flight
-are capped at `server.batch_fan_out`, 64 by default, as for `MultiGet`.
+reading many keys requests a smaller limit and pages each key whose
+result has `more` set, and a caller reading one key's full limit over
+several columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in
+flight are capped at `server.batch_fan_out`, 64 by default, as for
+`MultiGet`.
 
 ## Snapshots and consistency
 

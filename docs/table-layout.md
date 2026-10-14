@@ -342,8 +342,9 @@ ALTER TABLE db.events WRITE LOCALLY ORDERED BY key, ts;
 ### Requirements of an ordered table
 
 Every requirement of [the optimal layout](#requirements) applies to an
-ordered table, except the two that keep a key at most once and the sort
-by key alone, which the first three rows below replace.
+ordered table, except the two that keep a key at most once, the sort by
+key alone, and disjoint key ranges within a bucket, which the rows below
+replace.
 
 | Requirement | If missed | What fixes it |
 |---|---|---|
@@ -353,7 +354,7 @@ by key alone, which the first three rows below replace.
 | An order column of Iceberg type `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed` | Refused: `order_type_unsupported`. An order column stored in another Parquet type than Iceberg's, such as INT96 or millisecond timestamps, or promoted to a type of another unit, such as `date` to `timestamp`, is refused as `order_type_mismatch`. A file written before Iceberg promoted the column from `int` to `long` is served | Declare the order column with one of those types and write it through an Iceberg writer; rewrite files a migration left in another unit |
 | No null order values | Refused: `null_order` | Filter nulls before the write |
 | The order column in every data file | Refused: `column_mismatch`, for a file written before the order column was added, since a default would give every row of the file one order value | A compaction that rewrites those files with the column |
-| An offset index on the order column, and a column index that bounds each order page's values | Fails the load as a `file` fault. icetray checks every order page's values against that page's column index entry, so it places a bound only by an index it has checked | An Iceberg writer, which writes both |
+| An offset index on the order column, and, where present, a column index whose entries bound each order page's values | Fails the load as a `file` fault. icetray checks every order page's values against that page's column index entry, so it places a bound only by an index it has checked | An Iceberg writer, which writes both |
 | A column index on the order column | Under `full` and `bloom`, caps at `balanced`: `order_index_missing`, since a bounded `Scan` reads the run's order pages in a first round and its value pages in a second, with as many GETs as one round. Under `disk` the order pages are local reads | An Iceberg writer, which writes the column index by default |
 | Dictionary encoding off on the order column | Under `full` and `bloom`, caps at `balanced`: `dictionary_encoded_order`, one extra GET per `Scan` per file for the dictionary page. Under `disk` the dictionary page is a local read | `'parquet.enable.dictionary' = 'false'` |
 | A full-length column index on the order column | Advice: `order_index_truncated`, since long values sharing a prefix widen the pages a bound selects | `'parquet.columnindex.truncate.length'` at least the longest order value |

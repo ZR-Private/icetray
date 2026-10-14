@@ -215,9 +215,9 @@ The label values:
   `bloom_undersized`, `deletes_pending`, `column_default`, and the codes
   of [ordered tables](#ordered-tables), `shared_edge_keys`,
   `dictionary_encoded_order`, `order_index_missing`,
-  `order_index_truncated`, `long_runs`, and `large_runs`. Every table
-  publishes every code, so a key-value table carries a series of 0 for
-  each of the six ordered codes.
+  `order_index_truncated`, `long_runs`, and `large_runs`. icetray
+  publishes every load-time code for every table, so a key-value table
+  carries a series of 0 for each of the six ordered codes.
   `dictionary_encoded_value`, `large_value_pages`,
   `value_pages_over_ceiling`, and `column_default` are about one value
   column and carry the `column` label; the other codes carry none.
@@ -557,10 +557,10 @@ of one key ([Levels of an ordered
 table](table-layout.md#levels-of-an-ordered-table)). A table whose
 writer appends between compactions is `permissive` under
 `overlapping_files`, so its owner configures `lookups = "permissive"`;
-left at the default, such a table reads below its level after every
-append. `icetray_scan_files` shows how many files each `Scan` reads, and
-its rise between compactions measures what the appends cost. Six finding
-codes apply to ordered tables alone:
+left at the default, icetray reports such a table below its level after
+every append. `icetray_scan_files` shows how many files each `Scan`
+reads, and its rise between compactions measures what the appends cost.
+Six finding codes apply to ordered tables alone:
 
 - `shared_edge_keys` caps the level at `balanced`: files one snapshot
   added, as a compaction that rolls files by size writes them, meet
@@ -593,13 +593,13 @@ meets another whole, and only the order pages of the group's other files
 that can hold its rows, each page once. A checked file is read again for
 the merge: under `full` its order chunks, one GET per row group; under
 `bloom` its order and key chunks, two GETs per row group; and under
-`disk` its chunk file, locally. A refresh that appends later rows therefore reads only its new
-files, and an append of rows inside an existing file's order range costs
-the new file's order chunks again and the order pages its rows fall
-among. With `RUST_LOG=icetray_core=debug`, each load logs `assembled
-generation` with `overlap_groups_verified`, the overlap groups it
-merged, which on an ordered table counts the groups merged by key and
-order value.
+`disk` its chunk file, locally. A refresh that appends later rows
+therefore reads only its new files, and an append of rows inside an
+existing file's order range costs the new file's order chunks again and
+the order pages its rows fall among. With `RUST_LOG=icetray_core=debug`,
+each load logs `assembled generation` with `overlap_groups_verified`,
+the overlap groups it merged, which on an ordered table counts the
+groups merged by key and order value.
 
 ## Deploying
 

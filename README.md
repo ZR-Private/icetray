@@ -136,9 +136,9 @@ rows per key, written sorted by key and then order value: a time series
 by key, or the activity of each user. A `Scan` returns a key's rows
 newest or oldest first, up to a limit and between optional bounds on the
 order value, and a caller pages through a longer history by order value.
-A compacted table holds each key's rows in one file, so under `full` a
-cold `Scan` costs a GET per requested column and one for the order
-column, as in this `Scan` request:
+A compaction that writes one file per bucket holds each key's rows in
+one file, so under `full` a cold `Scan` costs a GET per requested column
+and one for the order column, as in this `Scan` request:
 
 ```json
 {

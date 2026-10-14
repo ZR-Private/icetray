@@ -103,8 +103,9 @@ of a key in one file makes at worst.
 Measured on local files, which leave out a GET's latency to object
 storage, a warm `Scan` of a key's 100 rows took about 20 µs under `full`
 and `bloom` and 38 µs under `disk`, where the order column is a local
-read, and a page of 10 of those rows took about 16 µs, so finding the
-run and decoding its pages make most of a warm `Scan`. A cold `Scan`
+read, and a page of 10 of those rows took about 16 µs. The analysis
+infers, without a profile, that finding the run and decoding its pages
+make most of a warm `Scan`. A cold `Scan`
 made the GETs in the table above. A `MultiScan` of 10 keys took about
 24 µs a key warm and 55 µs a key cold, where its keys' GETs overlap
 under `server.batch_fan_out`. Against S3, each cold figure is a GET's
