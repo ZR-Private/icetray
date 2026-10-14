@@ -445,11 +445,15 @@ pub enum ConfigViolation {
         index: usize,
     },
     /// An ordered table's `max_scan_rows` is zero, so every Scan would
-    /// return nothing.
-    #[error("tables[{index}].max_scan_rows 0 is not above zero")]
+    /// return nothing. Raised by validation, which names the setting by the
+    /// table's place in `tables`, and again by a load or a retune, which
+    /// knows the table by name alone.
+    #[error("{}", scan_rows_zero(table, *index))]
     MaxScanRowsZero {
-        /// The table's position in `tables`.
-        index: usize,
+        /// The table's name.
+        table: String,
+        /// The table's position in `tables`, when validation found it.
+        index: Option<usize>,
     },
     /// `server.max_multi_scan_values` is below twice an ordered table's
     /// `max_scan_rows`, so a `MultiScan` of one key at the full limit and one
@@ -763,6 +767,15 @@ fn disk_without_local_dir(table: &str, index: Option<usize>) -> String {
             "table {table}: {} residency needs a local directory under storage.local",
             Residency::Disk
         ),
+    }
+}
+
+/// `ConfigViolation::MaxScanRowsZero`'s message: the setting by its full
+/// path when the table's place is known, else the table by name.
+fn scan_rows_zero(table: &str, index: Option<usize>) -> String {
+    match index {
+        Some(index) => format!("tables[{index}].max_scan_rows 0 is not above zero"),
+        None => format!("table {table}: max_scan_rows 0 is not above zero"),
     }
 }
 
@@ -2015,9 +2028,7 @@ impl TableConfig {
                 None => Ok(()),
             };
         };
-        if max_scan_rows == 0 {
-            return Err(ConfigViolation::MaxScanRowsZero { index });
-        }
+        self.check_scan_rows_above_zero(Some(index))?;
         let needed = approx::length(max_scan_rows).saturating_mul(MULTI_SCAN_VALUES_PER_SCAN_ROW);
         if max_multi_scan_values < needed {
             return Err(ConfigViolation::MaxMultiScanValuesBelowScanRows {
@@ -2063,18 +2074,37 @@ impl TableConfig {
             .map(|_| self.max_scan_rows.unwrap_or(DEFAULT_MAX_SCAN_ROWS))
     }
 
-    /// `check_lookups` where the entry is used rather than validated, by a
-    /// load and by a retune: a configuration built by hand meets an
-    /// unreachable `lookups` here, as `Error::Config`.
-    pub(crate) fn check_reachable(&self) -> Result<()> {
+    /// `ConfigViolation::MaxScanRowsZero` for an ordered table whose
+    /// `max_scan_rows` is zero; `index` is the table's place in `tables`
+    /// when validation asks, `None` when a load or retune does
+    /// (`check_at_use`).
+    fn check_scan_rows_above_zero(
+        &self,
+        index: Option<usize>,
+    ) -> std::result::Result<(), ConfigViolation> {
+        match self.scan_rows() {
+            Some(0) => Err(ConfigViolation::MaxScanRowsZero {
+                table: self.name.clone(),
+                index,
+            }),
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// `check_lookups` and `check_scan_rows_above_zero` where the entry is
+    /// used rather than validated, by a load and by a retune: a
+    /// configuration built by hand meets an unreachable `lookups` or a zero
+    /// `max_scan_rows` here, as `Error::Config`.
+    pub(crate) fn check_at_use(&self) -> Result<()> {
         self.check_lookups(None)
+            .and_then(|()| self.check_scan_rows_above_zero(None))
             .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))
     }
 
     /// `ConfigViolation::LookupsUnreachable` when `lookups` is a level the
     /// residency cannot reach; `index` is the table's place in `tables`
     /// when validation asks, `None` when a load or retune does
-    /// (`check_reachable`).
+    /// (`check_at_use`).
     pub(crate) fn check_lookups(
         &self,
         index: Option<usize>,
@@ -3586,7 +3616,10 @@ locaton = "typo"
     fn test_parse_refuses_max_scan_rows_zero() {
         assert_eq!(
             violation(&ordered("max_scan_rows = 0")),
-            ConfigViolation::MaxScanRowsZero { index: 0 }
+            ConfigViolation::MaxScanRowsZero {
+                table: "kv".to_string(),
+                index: Some(0),
+            }
         );
     }
 

@@ -197,8 +197,10 @@ impl Generation {
     /// `load_concurrency()` at a time. No key chunk or delete is read and
     /// nothing is written; `Planned::build` does both. Raised before any
     /// read: a `lookups` level the residency cannot reach, as
-    /// `ConfigViolation::LookupsUnreachable` (a configuration built by hand
-    /// meets it here rather than at validation), and a snapshot timestamp
+    /// `ConfigViolation::LookupsUnreachable`, and an ordered table's zero
+    /// `max_scan_rows`, as `ConfigViolation::MaxScanRowsZero` (a
+    /// configuration built by hand meets both here rather than at
+    /// validation, `TableConfig::check_at_use`), and a snapshot timestamp
     /// jiff cannot represent, as `TableFault::SnapshotTimestampOutOfRange`.
     pub(crate) async fn plan_load(
         config: &TableConfig,
@@ -209,7 +211,7 @@ impl Generation {
         previous: Option<&Generation>,
     ) -> Result<Planned> {
         let table = config.name.as_str();
-        config.check_reachable()?;
+        config.check_at_use()?;
         let snapshot_timestamp = snapshot_timestamp(table, snapshot)?;
         let layout = TableLayout::for_entry(config, resolved, snapshot)?;
         let files =

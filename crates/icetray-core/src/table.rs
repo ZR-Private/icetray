@@ -1561,8 +1561,9 @@ impl Table {
     /// Whether `config`, an entry that differs from the table's in
     /// `lookups`, `strict`, value column formats, and `max_scan_rows` alone
     /// (`TableConfig::same_but_tuning`), can be applied in place: a
-    /// `lookups` the residency cannot reach is refused as a load refuses it
-    /// (`TableConfig::check_reachable`), a format the serving layout's type
+    /// `lookups` the residency cannot reach and an ordered table's zero
+    /// `max_scan_rows` are refused as a load refuses them
+    /// (`TableConfig::check_at_use`), a format the serving layout's type
     /// for its column does not take as `RefusalReason::ValueTypeUnsupported`
     /// (`TableLayout::check_formats`), and the serving generation is judged
     /// against the entry (`Generation::judge`), so a strict entry whose
@@ -1573,7 +1574,7 @@ impl Table {
     /// through `retune` decides: without it a build may swap another
     /// generation in after the judgement.
     pub(crate) fn judge_retune(&self, config: &TableConfig) -> Result<()> {
-        config.check_reachable()?;
+        config.check_at_use()?;
         match self.current() {
             Some(current) => {
                 current.layout.check_formats(config)?;
@@ -2426,8 +2427,8 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::config::{
-        DEFAULT_BATCH_FAN_OUT, DEFAULT_MAX_SCAN_ROWS, Residency, ServerConfig, ValueColumnConfig,
-        ValueFormat,
+        ConfigError, ConfigViolation, DEFAULT_BATCH_FAN_OUT, DEFAULT_MAX_SCAN_ROWS, Residency,
+        ServerConfig, ValueColumnConfig, ValueFormat,
     };
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
@@ -6717,6 +6718,47 @@ mod tests {
             approx::count(gets),
             "one GET per shared page"
         );
+    }
+
+    /// An ordered table's `max_scan_rows` of zero in a configuration built
+    /// by hand, which no validation saw, is refused as validation refuses
+    /// it, by the load and by a retune, so no Scan answers no rows with
+    /// `more` set.
+    #[tokio::test]
+    async fn test_load_and_retune_refuse_a_max_scan_rows_of_zero() {
+        let is_zero = |error: &Error| {
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::MaxScanRowsZero {
+                    index: None,
+                    ..
+                }))
+            )
+        };
+        let rows = ordered_rows(&keys_from(0, KEYS_IN_ONE_PAGE), SCAN_ROWS_PER_KEY);
+        let (serving, fixture, _gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let zero = TableConfig {
+            max_scan_rows: Some(0),
+            ..lenient(&fixture)
+        };
+        let refused = serving.judge_retune(&zero).unwrap_err();
+        assert!(is_zero(&refused), "{refused:?}");
+
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            &fixture,
+            zero,
+            handles_over(&fixture).await,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        let refused = table.load().await.unwrap_err();
+        assert!(is_zero(&refused), "{refused:?}");
+        let scanned = table
+            .scan(&Key::Long(KEY_STEP), &BOTH_READS, &oldest_first())
+            .await;
+        assert!(scanned.is_err(), "{scanned:?}");
     }
 
     /// A `MultiScan` that lists a key twice reads it once and answers it at
