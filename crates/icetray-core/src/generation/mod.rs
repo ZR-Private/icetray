@@ -30,7 +30,8 @@ use crate::blocking;
 use crate::cache::{Issue, PageCache};
 use crate::catalog::{Resolved, TableFault};
 use crate::check::{
-    self, Capping, Caps, ColumnCost, ColumnLevel, FileView, LayoutView, LookupCost,
+    self, Capping, Caps, ColumnCost, ColumnLevel, FILES_PROBED_ALONE, FileView, LayoutView,
+    LookupCost,
 };
 use crate::config::{Residency, TableConfig};
 use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
@@ -138,6 +139,12 @@ pub struct Generation {
     /// Each value column's level and cost, from the same measurement, in
     /// `layout`'s order (RFD 022); `level` is the dearest of them.
     pub column_costs: Vec<ColumnCost>,
+    /// On an ordered table, the GETs one cold Scan at `max_scan_rows` of a
+    /// key held in one file and one row group makes at worst, reading
+    /// every configured value column, from the same measurement
+    /// (`check::Caps::gets_per_scan`); `None` on a key-value table. What
+    /// `icetray_table_gets_per_scan` shows (RFD 025, Metrics).
+    pub gets_per_scan: Option<u64>,
     /// The distinct capping findings, by code and column, in the finding
     /// table's order.
     capping: Vec<Capping>,
@@ -146,8 +153,9 @@ pub struct Generation {
     /// (`ranked_routes`); how a key finds its candidates.
     probe_routes: RankedRoutes,
     /// Per bucket a member of an overlap group is in, how many files a
-    /// lookup there may probe (`widest_per_bucket`).
-    overlapping: BTreeMap<u32, usize>,
+    /// lookup there may probe, and on an ordered table how many files a
+    /// shared edge key spans (`probe_widths`).
+    widths: ProbeWidths,
     /// Overlap groups this load merged to prove key uniqueness, or on an
     /// ordered table pair uniqueness (`ordered::verify_rows`).
     verified_groups: usize,
@@ -299,12 +307,12 @@ impl Generation {
         let routes = routes(&spans);
         let probe_routes = ranked_routes(&files, &routes);
         let groups = overlap_groups(&spans, &routes);
-        let overlapping = widest_per_bucket(&spans, &groups);
+        let widths = probe_widths(&spans, &groups, Edges::of(&layout));
         let caps = check::layout_caps(&LayoutView {
             layout: &layout,
             residency,
             files: files.iter().map(|file| FileView::loaded(file)).collect(),
-            overlapping: &overlapping,
+            widths: &widths,
         });
         let verified_groups = match layout.order {
             Some(_) => {
@@ -354,10 +362,11 @@ impl Generation {
             oldest_delete_committed: None,
             level: caps.level,
             lookup_cost: caps.cost,
+            gets_per_scan: caps.gets_per_scan,
             capping: caps.capping(),
             column_costs: caps.columns,
             probe_routes,
-            overlapping,
+            widths,
             verified_groups,
             deletes,
             delete_reads: deletes::Known::default(),
@@ -447,14 +456,22 @@ impl Generation {
     /// that bucket may probe (RFD 007): the most of the group's files whose
     /// exact key ranges cover one key and whose buckets can hold it, which
     /// is fewer than the group holds where its files chain end to end
-    /// (`widest_per_bucket`). Files counted together across two bucketings
-    /// are recorded under every one's bucket.
+    /// (`probe_widths`). Files counted together across two bucketings
+    /// are recorded under every one's bucket. On an ordered table, a bucket
+    /// whose files one snapshot added meet only at edge keys is not
+    /// recorded here: such a key is a shared edge (RFD 025).
     /// Keyed by the bucket number alone, as the doctor reports it: after a
     /// spec evolution, buckets of two bucketings that share a number share
     /// one entry, and an unbucketed file's `manifest::UNBUCKETED` is bucket
     /// zero's number.
     pub fn overlapping_buckets(&self) -> &BTreeMap<u32, usize> {
-        &self.overlapping
+        &self.widths.overlapping
+    }
+
+    /// What the overlap sweep found (`probe_widths`): overlap, and on an
+    /// ordered table shared edge keys, per bucket.
+    pub(crate) fn probe_widths(&self) -> &ProbeWidths {
+        &self.widths
     }
 
     /// The doctor's full bucket check (RFD 016): decodes every key of every
@@ -828,8 +845,11 @@ impl Planned {
     /// refused snapshot writes nothing to the local directory. The caps the
     /// footers, the manifest entries, and the residency set are judged
     /// together with overlap, from the reused files' exact key ranges and
-    /// each new file's edge keys (`edge_ranges`), so a refused snapshot's
-    /// level and codes are the ones its build would measure. Overlap is
+    /// each new file's edge keys (`edge_ranges`), and on an ordered table
+    /// with shared edge keys, told from overlap by those keys and the
+    /// snapshot each manifest entry records as adding its file
+    /// (`probe_widths`), so a refused snapshot's level and codes are the
+    /// ones its build would measure. Overlap is
     /// left unread only where it cannot change the verdict or the level: a
     /// table declared `permissive`, which every layout meets, and footer
     /// caps that already reach `permissive`, the dearest level. A new file
@@ -843,10 +863,10 @@ impl Planned {
         if !strict {
             return Ok(());
         }
-        let mut caps = self.caps(&BTreeMap::new());
+        let mut caps = self.caps(&ProbeWidths::default());
         if declared < Level::Permissive && caps.level < Level::Permissive {
-            let overlapping = self.overlapping(local).await?;
-            caps = self.caps(&overlapping);
+            let widths = self.overlapping(local).await?;
+            caps = self.caps(&widths);
         }
         check::judge(
             &self.config.name,
@@ -859,9 +879,9 @@ impl Planned {
     }
 
     /// The level the snapshot's layout achieves in the configured residency
-    /// with `overlapping` as the most files a lookup probes per bucket
+    /// with `widths` as the most files a lookup probes per bucket
     /// (`check::layout_caps`), from the footers and manifest entries.
-    fn caps(&self, overlapping: &BTreeMap<u32, usize>) -> Caps {
+    fn caps(&self, widths: &ProbeWidths) -> Caps {
         let files = self
             .reused
             .iter()
@@ -876,15 +896,17 @@ impl Planned {
             layout: &self.layout,
             residency: self.config.residency,
             files,
-            overlapping,
+            widths,
         })
     }
 
     /// Per bucket an overlap group touches, the most files a lookup there
-    /// may probe (`widest_per_bucket`), from the reused files' exact key
-    /// ranges and the new files' edge keys. A new file with `Edge::Unknown`
-    /// has no span, so the groups are those of the other files alone.
-    async fn overlapping(&mut self, local: Option<&Arc<LocalDir>>) -> Result<BTreeMap<u32, usize>> {
+    /// may probe, and on an ordered table the most files a shared edge key
+    /// spans (`probe_widths`), from the reused files' exact key ranges, the
+    /// new files' edge keys, and the snapshot each file's manifest entry
+    /// records as adding it. A new file with `Edge::Unknown` has no span,
+    /// so the groups are those of the other files alone.
+    async fn overlapping(&mut self, local: Option<&Arc<LocalDir>>) -> Result<ProbeWidths> {
         let edges = self.edge_ranges(local).await?;
         let mut spans: Vec<Span<'_>> = self.reused.iter().map(|file| Span::of(file)).collect();
         for ((entry, _), edge) in self.inspected.iter().zip(&edges) {
@@ -894,6 +916,7 @@ impl Planned {
                     bucket: entry.bucket,
                     first,
                     last,
+                    added_by: entry.added_by,
                 }),
                 Edge::Alone | Edge::Unknown => {}
             }
@@ -902,7 +925,7 @@ impl Planned {
             (a.bucketing, a.bucket, a.first).cmp(&(b.bucketing, b.bucket, b.first))
         });
         let groups = overlap_groups(&spans, &routes(&spans));
-        Ok(widest_per_bucket(&spans, &groups))
+        Ok(probe_widths(&spans, &groups, Edges::of(&self.layout)))
     }
 
     /// Per new file, in plan order, where it stands in the overlap sweep
@@ -1147,14 +1170,18 @@ fn file_order(a: &LoadedFile, b: &LoadedFile) -> Ordering {
 }
 
 /// One file as the overlap sweep sees it: the bucket its manifest entry
-/// files it under and its exact first and last key. A span's position in
-/// its slice stands for the file's.
+/// files it under, its exact first and last key, and the snapshot that
+/// added it. A span's position in its slice stands for the file's.
 #[derive(Clone, Copy, Debug)]
 struct Span<'a> {
     bucketing: Option<Bucketing>,
     bucket: u32,
     first: &'a Key,
     last: &'a Key,
+    /// The snapshot the file's manifest entry records as adding it
+    /// (`DataFileEntry::added_by`), compared for equality alone: files one
+    /// snapshot added may share an edge key on an ordered table.
+    added_by: SnapshotId,
 }
 
 impl<'a> Span<'a> {
@@ -1166,7 +1193,13 @@ impl<'a> Span<'a> {
             bucket: file.entry.bucket,
             first,
             last,
+            added_by: file.entry.added_by,
         }
+    }
+
+    /// The bucket the span is filed under, with its bucketing.
+    fn place(&self) -> (Option<Bucketing>, u32) {
+        (self.bucketing, self.bucket)
     }
 }
 
@@ -1695,6 +1728,54 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// How the overlap sweep counts files that meet only at an edge key, one
+/// file's last key the other's first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edges {
+    /// A key-value table's: every intersection of two key ranges is
+    /// overlap.
+    Overlap,
+    /// An ordered table's (RFD 025, Levels and findings): files one snapshot
+    /// added that meet only at an edge key share it, which is not overlap;
+    /// any other intersection is.
+    Shared,
+}
+
+impl Edges {
+    /// The rule `layout`'s kind of table takes.
+    fn of(layout: &TableLayout) -> Self {
+        match layout.order {
+            Some(_) => Self::Shared,
+            None => Self::Overlap,
+        }
+    }
+}
+
+/// What the overlap sweep finds (`probe_widths`), per bucket number as
+/// `Generation::overlapping_buckets` keys it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeWidths {
+    /// Per bucket where files overlap, the most files one lookup or Scan
+    /// there may probe: what `overlapping_files` caps the level for.
+    pub(crate) overlapping: BTreeMap<u32, usize>,
+    /// On an ordered table, per bucket where files one snapshot added meet
+    /// only at edge keys, the most files one such key spans: what
+    /// `shared_edge_keys` caps the level for. Empty on a key-value table.
+    pub(crate) shared_edges: BTreeMap<u32, usize>,
+}
+
+impl ProbeWidths {
+    /// The most files any key's lookup or Scan probes, one where no files
+    /// overlap and no edge key is shared.
+    pub(crate) fn most_probed(&self) -> Option<usize> {
+        self.overlapping
+            .values()
+            .chain(self.shared_edges.values())
+            .copied()
+            .max()
+    }
+}
+
 /// Per bucket a group member is in, the most files one lookup there may
 /// probe: a lookup probes the candidates whose exact key range covers its
 /// key, so a group whose files chain end to end probes fewer files than it
@@ -1702,9 +1783,15 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 /// first key the members whose range still covers it are counted as
 /// `probed_together` counts them. Every key's candidates are open at the
 /// last-swept of them, so no lookup probes more than the sweep records.
-/// The work is the group's files times the files open at once.
-fn widest_per_bucket(spans: &[Span<'_>], groups: &[Vec<usize>]) -> BTreeMap<u32, usize> {
-    let mut widest = BTreeMap::new();
+/// Under `Edges::Shared`, the count at a key goes under `shared_edges`
+/// instead when the open members a key can reach there all share it as an
+/// edge key (`share_an_edge`), and a key one file alone reaches is not
+/// counted: a bucket appears under `overlapping` exactly when two of its
+/// files intersect other than at a shared edge key, since such a pair is
+/// open together at the later one's first key. The work is the group's
+/// files times the files open at once.
+fn probe_widths(spans: &[Span<'_>], groups: &[Vec<usize>], edges: Edges) -> ProbeWidths {
+    let mut widths = ProbeWidths::default();
     for group in groups {
         let mut members = group.clone();
         members.sort_by(|&a, &b| spans[a].first.cmp(spans[b].first));
@@ -1713,10 +1800,61 @@ fn widest_per_bucket(spans: &[Span<'_>], groups: &[Vec<usize>]) -> BTreeMap<u32,
             let first = spans[at].first;
             open.retain(|&member| spans[member].last >= first);
             open.push(at);
-            probed_together(spans, &open, at, &mut widest);
+            let widest = match edges {
+                Edges::Overlap => &mut widths.overlapping,
+                Edges::Shared => {
+                    let reached: Vec<usize> = open
+                        .iter()
+                        .copied()
+                        .filter(|&member| {
+                            buckets_may_share_a_key(spans[at].place(), spans[member].place())
+                        })
+                        .collect();
+                    if reached.len() <= FILES_PROBED_ALONE {
+                        continue;
+                    }
+                    if share_an_edge(spans, &reached, first) {
+                        &mut widths.shared_edges
+                    } else {
+                        &mut widths.overlapping
+                    }
+                }
+            };
+            probed_together(spans, &open, at, widest);
         }
     }
-    widest
+    widths
+}
+
+/// The files that may end at a shared edge key, and the files that may
+/// start at one: one each, since two that end at it, or two that start at
+/// it, share more keys than it.
+const ONE_SIDE_OF_AN_EDGE: usize = 1;
+
+/// Whether `members`, files whose key ranges all cover `key`, pairwise meet
+/// only at `key` as an edge key one snapshot wrote: every one added by one
+/// snapshot, none holding `key` inside its range, at most one ending at it
+/// and at most one starting at it, and any number holding it alone. Two
+/// that end at it, or two that start at it, share more keys than it.
+fn share_an_edge(spans: &[Span<'_>], members: &[usize], key: &Key) -> bool {
+    let Some(&head) = members.first() else {
+        return true;
+    };
+    let added_by = spans[head].added_by;
+    let (mut ending, mut starting) = (0_usize, 0_usize);
+    for &member in members {
+        let span = spans[member];
+        if span.added_by != added_by {
+            return false;
+        }
+        match (span.first < key, span.last > key) {
+            (true, true) => return false,
+            (true, false) => ending += 1,
+            (false, true) => starting += 1,
+            (false, false) => {}
+        }
+    }
+    ending <= ONE_SIDE_OF_AN_EDGE && starting <= ONE_SIDE_OF_AN_EDGE
 }
 
 /// Records in `widest`, per bucket, the files one key can reach among
@@ -4262,18 +4400,97 @@ mod tests {
         );
     }
 
+    /// A file of one bucket, (first key, last key, the snapshot that
+    /// added it), as the sweep tests describe one.
+    type Described = (i64, i64, i64);
+
+    /// What `probe_widths` finds over `files`, one group of one bucket,
+    /// under `edges`, in file order.
+    fn widths_of(files: &[Described], edges: Edges) -> ProbeWidths {
+        let keys: Vec<(Key, Key)> = files
+            .iter()
+            .map(|&(first, last, _)| (Key::Long(first), Key::Long(last)))
+            .collect();
+        let spans: Vec<Span<'_>> = keys
+            .iter()
+            .zip(files)
+            .map(|((first, last), &(_, _, added_by))| Span {
+                bucketing: Some(bucketing(1)),
+                bucket: 0,
+                first,
+                last,
+                added_by: SnapshotId(added_by),
+            })
+            .collect();
+        let groups = overlap_groups(&spans, &routes(&spans));
+        probe_widths(&spans, &groups, edges)
+    }
+
+    /// Per bucket zero, `files` files.
+    fn in_bucket_zero(files: usize) -> BTreeMap<u32, usize> {
+        BTreeMap::from([(0, files)])
+    }
+
+    /// Files one snapshot added that meet only at edge keys, as a
+    /// compaction rolling by size writes them, share those keys on an
+    /// ordered table, with the most files one key spans, a file holding
+    /// the key alone among them; on a key-value table they overlap.
+    #[test]
+    fn test_probe_widths_files_one_snapshot_added_share_edge_keys() {
+        let (s, rolled, held_alone) = (FIRST_SNAPSHOT, 2, 3);
+        for (files, spanned) in [
+            (vec![(0, 5, s), (5, 9, s), (9, 12, s)], rolled),
+            (vec![(0, 5, s), (5, 5, s), (5, 9, s)], held_alone),
+        ] {
+            let shared = widths_of(&files, Edges::Shared);
+            assert_eq!(shared.overlapping, BTreeMap::new(), "{files:?}");
+            assert_eq!(shared.shared_edges, in_bucket_zero(spanned), "{files:?}");
+            assert_eq!(shared.most_probed(), Some(spanned));
+            let overlap = widths_of(&files, Edges::Overlap);
+            assert_eq!(overlap.overlapping, in_bucket_zero(spanned), "{files:?}");
+            assert!(overlap.shared_edges.is_empty());
+        }
+    }
+
+    /// Any other intersection is overlap on an ordered table too: a file of
+    /// another snapshot touching an edge key alone, two files that end at
+    /// one key, two that start at one, and a one-key file inside another's
+    /// range. Where a bucket's edge key is shared and another of its keys
+    /// overlaps, both are recorded.
+    #[test]
+    fn test_probe_widths_any_other_intersection_is_overlap() {
+        let (s, t) = (FIRST_SNAPSHOT, SECOND_SNAPSHOT);
+        for files in [
+            vec![(0, 5, s), (5, 9, t)],
+            vec![(0, 5, s), (3, 5, s)],
+            vec![(5, 7, s), (5, 9, s)],
+            vec![(0, 9, s), (5, 5, s)],
+        ] {
+            let widths = widths_of(&files, Edges::Shared);
+            assert_eq!(widths.overlapping, in_bucket_zero(2), "{files:?}");
+            assert!(widths.shared_edges.is_empty(), "{files:?}");
+        }
+        let both = widths_of(&[(0, 5, s), (5, 9, s), (7, 8, t)], Edges::Shared);
+        assert_eq!(both.shared_edges, in_bucket_zero(2));
+        assert_eq!(both.overlapping, in_bucket_zero(2));
+        let disjoint = widths_of(&[(0, 4, s), (5, 9, t)], Edges::Shared);
+        assert_eq!(disjoint, ProbeWidths::default());
+        assert_eq!(disjoint.most_probed(), None);
+    }
+
     /// An unbucketed file and one file per bucket of a bucketing, all
     /// starting at one key and covering one range: a key reaches the
     /// unbucketed file and its own bucket's, two files, whichever of them
     /// the sweep reaches first.
     #[test]
-    fn test_widest_per_bucket_mixed_unbucketed_and_bucketed_counts_one_bucket() {
+    fn test_probe_widths_mixed_unbucketed_and_bucketed_counts_one_bucket() {
         let (first, last) = (Key::Long(0), Key::Long(KEYS_PER_FILE));
         let unbucketed = Span {
             bucketing: None,
             bucket: UNBUCKETED,
             first: &first,
             last: &last,
+            added_by: SnapshotId(FIRST_SNAPSHOT),
         };
         let bucketed: Vec<Span<'_>> = (0..FOUR)
             .map(|bucket| Span {
@@ -4281,6 +4498,7 @@ mod tests {
                 bucket,
                 first: &first,
                 last: &last,
+                added_by: SnapshotId(FIRST_SNAPSHOT),
             })
             .collect();
         let unbucketed_first: Vec<Span<'_>> = std::iter::once(unbucketed)
@@ -4295,7 +4513,11 @@ mod tests {
             (0..FOUR).map(|bucket| (bucket, one_key_reaches)).collect();
         for spans in [unbucketed_first, unbucketed_last] {
             let group: Vec<usize> = (0..spans.len()).collect();
-            assert_eq!(widest_per_bucket(&spans, &[group]), expected);
+            for edges in [Edges::Overlap, Edges::Shared] {
+                let widths = probe_widths(&spans, std::slice::from_ref(&group), edges);
+                assert_eq!(widths.overlapping, expected, "{edges:?}");
+                assert!(widths.shared_edges.is_empty(), "{edges:?}");
+            }
         }
     }
 

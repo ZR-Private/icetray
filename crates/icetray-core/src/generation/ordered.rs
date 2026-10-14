@@ -597,6 +597,7 @@ mod tests {
                 bucket: span.bucket,
                 first: span.keys.0,
                 last: span.keys.1,
+                added_by: SnapshotId(0),
             })
             .collect();
         overlap_groups(&swept, &routes(&swept))

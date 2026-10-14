@@ -61,6 +61,12 @@ impl Inspected {
         self.layout.value_leaves()
     }
 
+    /// The order column's leaf in the footer's schema; `None` on a
+    /// key-value table.
+    pub(crate) fn order_leaf(&self) -> Option<usize> {
+        self.layout.order_leaf()
+    }
+
     /// Every tier's resident bytes for the file, from its footer alone.
     pub(crate) fn predicted(&self) -> &ResidentBytes {
         &self.predicted

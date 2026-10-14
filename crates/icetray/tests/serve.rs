@@ -77,6 +77,10 @@ const FRESH_TABLE: &str = "kv_fresh";
 /// A table no other test serves, so its gauges are this test's alone.
 const SCRAPED_TABLE: &str = "kv_scraped";
 
+/// An ordered table no other test serves, so its gauges are this test's
+/// alone.
+const SCRAPED_ORDERED_TABLE: &str = "events_scraped";
+
 /// A disk table no other test serves, so its page-cache gauges are this
 /// test's alone.
 const SAMPLED_TABLE: &str = "kv_sampled";
@@ -1434,14 +1438,20 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
 /// series of a described gauge the first exposed, the second exposes too.
 /// The recorder drops a gauge no scrape wrote since the scrape before, so a
 /// gauge set once on an event instead of on the scrape path fails here. The
-/// server serves a disk table whose page cache it has sampled and follows
-/// its configuration, so the first scrape holds every described gauge, and
-/// the test checks that it does: a gauge this server does not expose would
-/// pass the comparison unheld.
+/// server serves a key-value and an ordered disk table whose page cache it
+/// has sampled and follows its configuration, so the first scrape holds
+/// every described gauge on the kind of table that publishes it, and the
+/// test checks that it does: a gauge this server does not expose would pass
+/// the comparison unheld. The per-hit and per-miss cost gauges are a
+/// key-value table's alone, and the per-Scan one an ordered table's alone
+/// (RFD 025, Metrics).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult {
     let mut stack = Stack::start_with(
-        vec![FixtureSpec::small(SCRAPED_TABLE, KeyType::Long)],
+        vec![
+            FixtureSpec::small(SCRAPED_TABLE, KeyType::Long),
+            ordered_spec(SCRAPED_ORDERED_TABLE),
+        ],
         async |setup| {
             setup.with_local_dir()?;
             setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
@@ -1454,21 +1464,38 @@ async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult
     let first = stack.scrape().await?;
     let second = stack.scrape().await?;
 
-    let first_series = gauge_series(&first, SCRAPED_TABLE);
-    for (name, kind, _) in metric::DESCRIPTIONS {
-        if kind == Kind::Gauge {
-            assert!(
-                first_series.iter().any(|series| series.name == name),
-                "{name} in {first}"
-            );
+    let key_value_only = [
+        metric::TABLE_GETS_PER_HIT,
+        metric::TABLE_GETS_PER_MISS,
+        metric::TABLE_COLUMN_GETS_PER_HIT,
+    ];
+    let ordered_only = [metric::TABLE_GETS_PER_SCAN];
+    for table in [SCRAPED_TABLE, SCRAPED_ORDERED_TABLE] {
+        let first_series = gauge_series(&first, table);
+        let (published, withheld): (&[&str], &[&str]) = if table == SCRAPED_TABLE {
+            (&key_value_only, &ordered_only)
+        } else {
+            (&ordered_only, &key_value_only)
+        };
+        let exposed = |name: &str| first_series.iter().any(|series| series.name == name);
+        for (name, kind, _) in metric::DESCRIPTIONS {
+            if kind == Kind::Gauge && !withheld.contains(&name) {
+                assert!(exposed(name), "{name} of {table} in {first}");
+            }
         }
+        for name in published {
+            assert!(exposed(name), "{name} of {table}");
+        }
+        for name in withheld {
+            assert!(!exposed(name), "{name} is not published for {table}");
+        }
+        let second_series = gauge_series(&second, table);
+        let dropped: Vec<_> = first_series.difference(&second_series).collect();
+        assert!(
+            dropped.is_empty(),
+            "gauges of {table} the second scrape dropped: {dropped:?}"
+        );
     }
-    let second_series = gauge_series(&second, SCRAPED_TABLE);
-    let dropped: Vec<_> = first_series.difference(&second_series).collect();
-    assert!(
-        dropped.is_empty(),
-        "gauges the second scrape dropped: {dropped:?}"
-    );
     Ok(())
 }
 

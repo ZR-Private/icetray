@@ -358,7 +358,10 @@ pub struct ResidentBytes {
     /// Footer, page indexes, filters, and fences, and an ordered table's
     /// order facts.
     pub bloom: Option<u64>,
-    /// Filter bits per row of the file; the bloom tier's miss cost follows it.
+    /// Filter bits per row of the file; the bloom tier's miss cost follows
+    /// it. Per row, not per distinct key, on an ordered table too: the
+    /// footer alone cannot count a row group's distinct keys, which the
+    /// load counts and the bloom findings divide by (RFD 025).
     pub bloom_bits_per_key: Option<f64>,
     /// The key column's compressed chunk bytes: what the Full tier holds
     /// beyond the Disk tier's memory, and the chunk file's payload beside

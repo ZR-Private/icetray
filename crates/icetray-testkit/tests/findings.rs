@@ -21,11 +21,12 @@ use icetray_core::approx;
 use icetray_core::check::thresholds::{
     BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
+    RUN_BYTES_ADVICE, RUN_ROWS_ADVICE,
 };
-use icetray_core::config::{Residency, ValueFormat};
+use icetray_core::config::{LocalConfig, Residency, TableConfig, ValueFormat};
 use icetray_core::{
-    Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, RefusalReason, Row,
-    TableReport, WriterProperty, diagnose,
+    Capping, Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, LocalDir,
+    RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -36,9 +37,11 @@ use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{
-    Bloom, Dictionary, Fixture, FixtureSpec, Layout, Result, Statistics, TestkitError,
-    write_fixture,
+    Bloom, Dictionary, Fixture, FixtureSpec, Layout, OrderKind, Ordered, Result, Statistics,
+    TestkitError, write_fixture,
 };
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use tempfile::TempDir;
 
 /// Rows per key page of the large-key-page fixture: twice the threshold, so
 /// the finding caps the level and is not the chosen margin.
@@ -678,5 +681,533 @@ async fn test_statistics_free_multi_row_group_file_loads_one_chunk_per_row_group
         before,
         "no false miss and no GET without statistics"
     );
+    Ok(())
+}
+
+/// The raw order value of a key's first row in the ordered fixtures, and
+/// the distance between a key's consecutive rows.
+const ORDER_START: i64 = 1_000;
+const ORDER_STEP: i64 = 10;
+
+/// Rows per key of the ordered fixtures: three, so a key filter sized to a
+/// file's distinct keys holds a third of its bits per row.
+const ROWS_PER_KEY: u64 = 3;
+
+fn three_rows(_: u64) -> u64 {
+    ROWS_PER_KEY
+}
+
+/// An ordered table named `name` of `IDS_2K` in `TWO_BUCKETS`, each key
+/// with `ROWS_PER_KEY` rows of a `kind` order column, in the contract
+/// layout: one file per bucket, one row group each.
+fn ordered_spec(name: &str, kind: OrderKind) -> FixtureSpec {
+    FixtureSpec {
+        ids: IDS_2K,
+        buckets: TWO_BUCKETS,
+        ..FixtureSpec::ordered(
+            name,
+            KeyType::Long,
+            Ordered {
+                kind,
+                rows_per_key: three_rows,
+                start: ORDER_START,
+                step: ORDER_STEP,
+            },
+        )
+    }
+}
+
+/// `ordered_spec` in `layout`.
+fn ordered_in(name: &str, layout: Layout) -> FixtureSpec {
+    FixtureSpec {
+        layout,
+        ..ordered_spec(name, OrderKind::Long)
+    }
+}
+
+/// Ids of the size-rolled fixture: 500 keys of `ROWS_PER_KEY` rows, 1,500
+/// rows in one bucket. Rolled at `SMALL_FILE_BYTES`, the writer closes a
+/// file after its first write batch of `contract::PAGE_ROWS` rows, so the
+/// snapshot holds two files, and row 1,000 is the second row of key 333:
+/// that key's run spans both.
+const ROLLED_IDS: Range<u64> = 0..500;
+
+/// The ordered table a compaction that rolls files by size writes: one
+/// bucket of `ROLLED_IDS` in two files of one snapshot, which meet where
+/// the first file's last key is the second's first.
+fn rolled_spec(name: &str) -> FixtureSpec {
+    FixtureSpec {
+        ids: ROLLED_IDS,
+        buckets: ONE_BUCKET,
+        layout: Layout {
+            target_file_bytes: SMALL_FILE_BYTES,
+            ..Layout::contract()
+        },
+        ..ordered_spec(name, OrderKind::Long)
+    }
+}
+
+/// Asserts `served` holds exactly two files, the first's last key the
+/// second's first.
+fn assert_two_files_share_an_edge_key(served: &Served) {
+    let generation = served.current();
+    let [first, second] = &generation.files[..] else {
+        panic!("two files, got {}", generation.files.len());
+    };
+    let (_, last) = first.index.key_range();
+    let (next, _) = second.index.key_range();
+    assert_eq!(last, next, "the files meet at one edge key");
+}
+
+/// `config` of `fixture` served through `catalog` over a fresh local
+/// directory, which the returned directory keeps alive; the local
+/// directory comes back beside the outcome, so a test reads what the load
+/// wrote there whether or not it was refused.
+async fn serve_on_disk(
+    fixture: &Fixture,
+    catalog: &Arc<dyn Catalog>,
+    config: TableConfig,
+) -> Result<(Result<Served>, Arc<LocalDir>, TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+    let local = Arc::new(LocalDir::open(
+        &LocalConfig {
+            dir: dir.path().to_path_buf(),
+            index_budget_bytes: None,
+            page_cache_disk_bytes: 0,
+        },
+        storage.stats(),
+    )?);
+    let served = verify::serve_over(
+        storage,
+        config,
+        fixture.catalog_source(Arc::clone(catalog)),
+        Some(Arc::clone(&local)),
+    )
+    .await;
+    Ok((served, local, dir))
+}
+
+/// Files one snapshot added that meet where one's last key is the next
+/// one's first, as a compaction that rolls files by size writes them, cap
+/// the table at `balanced` and name the most files one edge key spans;
+/// `strict` refuses the level and names only that code.
+#[tokio::test]
+async fn test_shared_edge_keys_caps_a_compaction_rolled_by_size_at_balanced() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let (fixture, served) = write_and_serve(&catalog, rolled_spec("ord_rolled")).await?;
+    assert_two_files_share_an_edge_key(&served);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[FindingCode::SharedEdgeKeys], &[]);
+    let shared = finding(&report, FindingCode::SharedEdgeKeys);
+    assert_eq!(shared.caps(), Some(Level::Balanced));
+    assert_eq!(
+        shared
+            .penalty()
+            .and_then(|penalty| penalty.files_probed_per_lookup),
+        Some(TWO_FILES)
+    );
+    assert_eq!(report.summary.lookup_cost.files_probed, TWO_FILES);
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::SharedEdgeKeys]
+    );
+    Ok(())
+}
+
+/// Ids an append of the edge-key fixture writes after the compacted file's
+/// last key: enough that the new file's filter draws no advice of its own.
+const LATER_IDS: u64 = 500;
+
+/// A file of a later snapshot whose first key is an earlier file's last,
+/// and which meets it nowhere else, overlaps it: a Scan of that key reads
+/// both, and the files of two snapshots are `overlapping_files`, not a
+/// shared edge.
+#[tokio::test]
+async fn test_a_later_file_touching_an_edge_key_is_overlapping_files() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: ROLLED_IDS,
+        buckets: ONE_BUCKET,
+        ..ordered_spec("ord_touched", OrderKind::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    assert_eq!(fixture.file_count(), 1);
+    let edge = ROLLED_IDS.end - 1;
+    let later_order = ORDER_START + ORDER_STEP * i64::try_from(ROWS_PER_KEY).unwrap();
+    let mut rows: Vec<(u64, i64)> = vec![(edge, later_order)];
+    rows.extend((ROLLED_IDS.end..ROLLED_IDS.end + LATER_IDS).map(|id| (id, ORDER_START)));
+    fixture
+        .append_ordered(catalog.as_ref(), &rows, "later")
+        .await?;
+    let served = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
+    assert_two_files_share_an_edge_key(&served);
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[FindingCode::OverlappingFiles], &[]);
+    assert_eq!(
+        finding(&report, FindingCode::OverlappingFiles)
+            .penalty()
+            .and_then(|penalty| penalty.files_probed_per_lookup),
+        Some(TWO_FILES)
+    );
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::OverlappingFiles]
+    );
+    Ok(())
+}
+
+/// One file per bucket, no two files' key ranges meeting, and runs that
+/// span key pages: every Scan reads one file, and the table is `optimal`
+/// with no finding, the bloom filter judged by its distinct keys.
+#[tokio::test]
+async fn test_a_compacted_ordered_table_in_one_file_per_bucket_is_optimal() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let (fixture, served) =
+        write_and_serve(&catalog, ordered_spec("ord_compacted", OrderKind::Long)).await?;
+    let generation = served.current();
+    assert_eq!(generation.files.len(), approx::length(TWO_BUCKETS));
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[]);
+    assert_eq!(report.summary.level, Level::Optimal);
+    assert_eq!(report.summary.lookup_cost.files_probed, 1);
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "an optimal table loads under strict"
+    );
+    Ok(())
+}
+
+/// A dictionary-encoded order column costs every Scan its dictionary page
+/// besides the order pages, one more GET per file under `full`.
+#[tokio::test]
+async fn test_dictionary_encoded_order_caps_at_balanced_under_full() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = ordered_in(
+        "ord_dictorder",
+        Layout {
+            order_dictionary: true,
+            ..Layout::contract()
+        },
+    );
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[FindingCode::DictionaryEncodedOrder], &[]);
+    let dictionary = finding(&report, FindingCode::DictionaryEncodedOrder);
+    assert_eq!(dictionary.caps(), Some(Level::Balanced));
+    assert_eq!(dictionary.column(), None, "a finding about the table");
+    assert_eq!(
+        dictionary
+            .penalty()
+            .and_then(|penalty| penalty.extra_gets_per_hit),
+        Some(1)
+    );
+    assert_eq!(
+        dictionary.property(),
+        Some(WriterProperty::EnableDictionary)
+    );
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::DictionaryEncodedOrder]
+    );
+    Ok(())
+}
+
+/// Under `disk` the order column's dictionary page is a read of the local
+/// chunk file, so a dictionary-encoded order column caps nothing there,
+/// while the report still names `full`'s level for the same layout.
+#[tokio::test]
+async fn test_dictionary_encoded_order_leaves_disk_optimal() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = ordered_in(
+        "ord_dictorder_disk",
+        Layout {
+            order_dictionary: true,
+            ..Layout::contract()
+        },
+    );
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let (served, _local, _scratch) =
+        serve_on_disk(&fixture, &catalog, fixture.config(Residency::Disk, true)).await?;
+    let report = diagnose(&served?.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[]);
+    assert_eq!(report.summary.level, Level::Optimal);
+    assert_eq!(
+        report.summary.level_by_residency.get(&Residency::Full),
+        Some(&Level::Balanced),
+        "under full the dictionary page is a GET"
+    );
+    assert_eq!(
+        report.summary.level_by_residency.get(&Residency::Disk),
+        Some(&Level::Optimal)
+    );
+    Ok(())
+}
+
+/// A file without an order column index makes a bounded Scan read its
+/// order pages before it knows which value pages its rows lie on: a
+/// second round, with no more GETs.
+#[tokio::test]
+async fn test_order_index_missing_caps_at_balanced() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = ordered_in(
+        "ord_noorderindex",
+        Layout {
+            order_statistics: Statistics::None,
+            ..Layout::contract()
+        },
+    );
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
+    let generation = served.current();
+    for file in &generation.files {
+        let order = file.index.order_leaf().unwrap();
+        let index = file.index.metadata().column_index();
+        assert!(
+            index.is_none_or(|groups| groups
+                .iter()
+                .all(|group| matches!(group[order], ColumnIndexMetaData::NONE))),
+            "{} has no order column index",
+            file.entry.path
+        );
+    }
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[FindingCode::OrderIndexMissing], &[]);
+    let missing = finding(&report, FindingCode::OrderIndexMissing);
+    assert_eq!(missing.caps(), Some(Level::Balanced));
+    assert_eq!(missing.column(), None, "a finding about the table");
+    assert_eq!(
+        strict_refusal(&fixture, &catalog).await?,
+        vec![FindingCode::OrderIndexMissing]
+    );
+    Ok(())
+}
+
+/// The column index truncation of the truncated-order-index fixture:
+/// inside the zeros every string order value of it starts with, so every
+/// cut page minimum is the same.
+const ORDER_INDEX_TRUNCATE: usize = 6;
+
+/// Rows per page of the truncated-order-index fixture: thirty order pages
+/// per file, so one shared cut minimum is far below the advice ratio.
+const ORDER_PAGE_ROWS: usize = 100;
+
+/// A truncated order column index widens the pages a bound selects, which
+/// is advice; the long key's index is never cut, so the key column draws
+/// none, and `strict` loads the table.
+#[tokio::test]
+async fn test_order_index_truncated_is_advice() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        layout: Layout {
+            page_rows: ORDER_PAGE_ROWS,
+            column_index_truncate: Some(ORDER_INDEX_TRUNCATE),
+            ..Layout::contract()
+        },
+        ..ordered_spec("ord_cutorderindex", OrderKind::Str)
+    };
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[FindingCode::OrderIndexTruncated]);
+    assert_eq!(
+        finding(&report, FindingCode::OrderIndexTruncated).property(),
+        Some(WriterProperty::ColumnIndexTruncateLength)
+    );
+    for file in &report.files {
+        assert!(
+            file.distinct_page_mins_ratio >= DISTINCT_MINS_RATIO_ADVICE,
+            "{}: the key column's index is whole",
+            file.path
+        );
+    }
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "an advice-only table loads under strict"
+    );
+    Ok(())
+}
+
+/// The id of the long-run fixture whose run is one row past the advice.
+const LONG_RUN_ID: u64 = 7;
+
+/// One run of `RUN_ROWS_ADVICE` and one more rows; every other key's run is
+/// one row.
+fn one_long_run(id: u64) -> u64 {
+    if id == LONG_RUN_ID {
+        u64::from(RUN_ROWS_ADVICE) + 1
+    } else {
+        1
+    }
+}
+
+/// A file holding a run of more than `RUN_ROWS_ADVICE` rows is advice: a
+/// caller reads the key's history in more than one Scan at the default
+/// `max_scan_rows`. Only the file holding the run draws it.
+#[tokio::test]
+async fn test_long_runs_is_advice_above_one_thousand_rows() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ordered: Some(Ordered {
+            kind: OrderKind::Long,
+            rows_per_key: one_long_run,
+            start: ORDER_START,
+            step: ORDER_STEP,
+        }),
+        ..ordered_spec("ord_longruns", OrderKind::Long)
+    };
+    let (fixture, served) = write_and_serve(&catalog, spec).await?;
+    let generation = served.current();
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[FindingCode::LongRuns]);
+    let holding: Vec<&str> = generation
+        .files
+        .iter()
+        .filter(|file| {
+            file.index
+                .order_facts()
+                .is_some_and(|facts| facts.longest_run > u64::from(RUN_ROWS_ADVICE))
+        })
+        .map(|file| file.entry.path.as_str())
+        .collect();
+    let long = report
+        .findings
+        .iter()
+        .filter(|finding| finding.code() == FindingCode::LongRuns)
+        .map(|finding| finding.file().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(holding.len(), 1, "one file holds the long run");
+    assert_eq!(long, holding);
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "an advice-only table loads under strict"
+    );
+    Ok(())
+}
+
+/// Bytes per value of the large-run fixture: `RUN_ROWS_ADVICE` rows of
+/// them, incompressible, are a fifth over `RUN_BYTES_ADVICE`.
+const LARGE_RUN_VALUE_BYTES: usize = 5_000;
+
+/// Rows per page of the large-run fixture: small enough that a value page
+/// stays under the large-value-page advice, so the fixture raises the one
+/// code it is designed for.
+const LARGE_RUN_PAGE_ROWS: usize = 100;
+
+/// A file where `RUN_ROWS_ADVICE` rows of the configured value columns, at
+/// the footer's uncompressed bytes per row, would exceed
+/// `RUN_BYTES_ADVICE` is advice: a Scan at the default `max_scan_rows`
+/// answers more than a gRPC client accepts by default.
+#[tokio::test]
+async fn test_large_runs_is_advice_above_four_mib() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        value_bytes: LARGE_RUN_VALUE_BYTES,
+        layout: Layout {
+            page_rows: LARGE_RUN_PAGE_ROWS,
+            ..Layout::contract()
+        },
+        ..ordered_spec("ord_largeruns", OrderKind::Long)
+    };
+    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[FindingCode::LargeRuns]);
+    let run_bytes = approx::count(LARGE_RUN_VALUE_BYTES) * u64::from(RUN_ROWS_ADVICE);
+    assert!(run_bytes > RUN_BYTES_ADVICE);
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.code() == FindingCode::LargeRuns)
+            .count(),
+        report.files.len(),
+        "every file draws it"
+    );
+    Ok(())
+}
+
+/// The bloom findings judge an ordered table's filter by the distinct keys
+/// of each row group, which the load counts: a filter the writer sized to
+/// the keys holds a third of its bits per row at three rows per key, below
+/// the minimum per row, and draws no advice; the report's per-row figure,
+/// from the footer alone, shows the difference.
+#[tokio::test]
+async fn test_bloom_findings_divide_by_distinct_keys_for_an_ordered_table() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let (_fixture, served) =
+        write_and_serve(&catalog, ordered_spec("ord_bloom", OrderKind::Long)).await?;
+    let generation = served.current();
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[]);
+    for (file, loaded) in report.files.iter().zip(&generation.files) {
+        let per_row = file.bloom_bits_per_key.unwrap();
+        assert!(
+            per_row < BLOOM_BITS_PER_KEY_MIN,
+            "{}: {per_row} bits per row",
+            file.path
+        );
+        let keys: u64 = loaded
+            .index
+            .order_facts()
+            .unwrap()
+            .distinct_keys
+            .iter()
+            .sum();
+        let bits = file.bloom_bytes.unwrap() * u64::from(u8::BITS);
+        assert!(
+            approx::ratio(bits, keys) >= BLOOM_BITS_PER_KEY_MIN,
+            "{}: {bits} bits over {keys} keys",
+            file.path
+        );
+        assert!(
+            approx::ratio(file.bloom_bytes.unwrap(), keys) <= BLOOM_BYTES_PER_KEY_ADVICE,
+            "{}",
+            file.path
+        );
+    }
+    Ok(())
+}
+
+/// The strict gate tells a shared edge key from overlap before any chunk
+/// is built (RFD 020, RFD 025): a strict Disk table of the size-rolled
+/// fixture declared `optimal` is refused at `balanced` naming
+/// `shared_edge_keys` and writes no chunk file, and the same table
+/// declared `balanced` loads, which overlap, `permissive`, would refuse.
+#[tokio::test]
+async fn test_strict_gate_judges_shared_edges_before_any_chunk() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture =
+        write_fixture(catalog.as_ref(), NAMESPACE, rolled_spec("ord_rolled_gate")).await?;
+    let (served, local, _scratch) =
+        serve_on_disk(&fixture, &catalog, fixture.config(Residency::Disk, true)).await?;
+    let Err(TestkitError::Core(Error::Refused {
+        reason:
+            RefusalReason::BelowLevel {
+                declared,
+                achieved,
+                findings,
+                ..
+            },
+        ..
+    })) = served
+    else {
+        panic!("expected a below_level refusal");
+    };
+    assert_eq!((declared, achieved), (Level::Optimal, Level::Balanced));
+    assert_eq!(
+        findings,
+        [Capping {
+            code: FindingCode::SharedEdgeKeys,
+            column: None,
+        }]
+    );
+    assert_eq!(local.index_bytes_in_use()?, 0, "no chunk file was written");
+
+    let balanced = TableConfig {
+        lookups: Some(Level::Balanced),
+        ..fixture.config(Residency::Disk, true)
+    };
+    let (served, _local, _scratch) = serve_on_disk(&fixture, &catalog, balanced).await?;
+    let served = served?;
+    assert_two_files_share_an_edge_key(&served);
+    assert_eq!(served.current().level, Level::Balanced);
     Ok(())
 }

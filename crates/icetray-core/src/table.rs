@@ -468,6 +468,9 @@ struct GenerationGauges {
     lookup_cost: LookupCost,
     /// Each value column's name and cost, in the layout's order.
     columns: Vec<(String, ColumnCost)>,
+    /// What a cold Scan costs on an ordered table; `None` on a key-value
+    /// table, which publishes the per-hit and per-miss costs instead.
+    gets_per_scan: Option<u64>,
     deletes: DeleteSummary,
 }
 
@@ -1817,8 +1820,9 @@ impl Table {
     /// Makes `generation` the serving one. The generation gauges it sets,
     /// `index_bytes`, `findings` from `findings`,
     /// `generation_sequence_number`, `generation_swapped_at_seconds` from
-    /// the clock, the lookup-cost gauges from its `lookup_cost`, and the
-    /// delete gauges from its `delete_summary`, are kept and written while
+    /// the clock, the cost gauges from its `lookup_cost` and, on an
+    /// ordered table, its `gets_per_scan`, and the delete gauges from its
+    /// `delete_summary`, are kept and written while
     /// the table shows them
     /// (`write_generation`), and the level gauges take the generation's
     /// level against `declared`, keeping the page cache's condition.
@@ -1859,6 +1863,7 @@ impl Table {
                 .map(|column| column.name.clone())
                 .zip(generation.column_costs.iter().copied())
                 .collect(),
+            gets_per_scan: generation.gets_per_scan,
             deletes: generation.delete_summary(),
         };
         let snapshot_id = generation.snapshot_id;
@@ -2067,7 +2072,10 @@ impl Table {
     /// a code that cleared on the swap reads zero:
     /// a code about the row or the table under `{table, code}`, and a code
     /// about one value column (`FindingCode::per_column`) under `{table,
-    /// code, column}` for every column the table serves (RFD 022).
+    /// code, column}` for every column the table serves (RFD 022). A
+    /// key-value table's cost gauges are per hit and per miss
+    /// (`write_lookup_costs`), an ordered table's per Scan; both publish the
+    /// files one call probes.
     fn write_generation(&self, generation: &GenerationGauges) {
         metrics::gauge!(
             metric::INDEX_BYTES,
@@ -2115,23 +2123,15 @@ impl Table {
         )
         .set(generation.swapped_at);
         let cost = generation.lookup_cost;
-        metrics::gauge!(
-            metric::TABLE_GETS_PER_HIT,
-            metric::LABEL_TABLE => self.name.clone()
-        )
-        .set(approx::gauge(cost.gets_per_hit));
-        metrics::gauge!(
-            metric::TABLE_GETS_PER_MISS,
-            metric::LABEL_TABLE => self.name.clone()
-        )
-        .set(approx::gauge(cost.gets_per_miss));
-        for (column, cost) in &generation.columns {
-            metrics::gauge!(
-                metric::TABLE_COLUMN_GETS_PER_HIT,
-                metric::LABEL_TABLE => self.name.clone(),
-                metric::LABEL_COLUMN => column.clone()
-            )
-            .set(approx::gauge(cost.gets_per_hit));
+        match generation.gets_per_scan {
+            None => self.write_lookup_costs(cost, &generation.columns),
+            Some(gets) => {
+                metrics::gauge!(
+                    metric::TABLE_GETS_PER_SCAN,
+                    metric::LABEL_TABLE => self.name.clone()
+                )
+                .set(approx::gauge(gets));
+            }
         }
         metrics::gauge!(
             metric::TABLE_FILES_PROBED_PER_LOOKUP,
@@ -2159,6 +2159,30 @@ impl Table {
             metric::LABEL_TABLE => self.name.clone()
         )
         .set(approx::gauge_len(deletes.state_bytes));
+    }
+
+    /// Writes a key-value table's per-hit and per-miss cost gauges from
+    /// `cost`, and each of `columns`' per-hit cost (RFD 020, RFD 022); an
+    /// ordered table serves no hit and publishes none of them (RFD 025).
+    fn write_lookup_costs(&self, cost: LookupCost, columns: &[(String, ColumnCost)]) {
+        metrics::gauge!(
+            metric::TABLE_GETS_PER_HIT,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(cost.gets_per_hit));
+        metrics::gauge!(
+            metric::TABLE_GETS_PER_MISS,
+            metric::LABEL_TABLE => self.name.clone()
+        )
+        .set(approx::gauge(cost.gets_per_miss));
+        for (column, cost) in columns {
+            metrics::gauge!(
+                metric::TABLE_COLUMN_GETS_PER_HIT,
+                metric::LABEL_TABLE => self.name.clone(),
+                metric::LABEL_COLUMN => column.clone()
+            )
+            .set(approx::gauge(cost.gets_per_hit));
+        }
     }
 
     /// Writes the level gauges from `level`, each value column's level
@@ -6902,6 +6926,40 @@ mod tests {
                 .is_ok(),
             "one key fewer is within max_multi_scan_values"
         );
+    }
+
+    /// `icetray_table_gets_per_scan` predicts what a cold Scan of every
+    /// value column costs for a key whose run lies in one file and one row
+    /// group (RFD 025, Metrics): under `full`, one span GET per column and
+    /// one for the order column, the GETs the Scan then makes. A key-value
+    /// table predicts no Scan.
+    #[tokio::test]
+    async fn test_gets_per_scan_is_what_a_cold_scan_of_one_file_costs() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (table, fixture, _gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let predicted = table
+            .current()
+            .unwrap()
+            .gets_per_scan
+            .expect("an ordered table predicts a Scan");
+        assert_eq!(
+            predicted,
+            approx::count(BOTH_READS.len() + 1),
+            "one span per column and one for the order column"
+        );
+        let before = fixture.gets();
+        let answered = table
+            .scan(&Key::Long(KEY_STEP), &BOTH_READS, &oldest_first())
+            .await
+            .unwrap();
+        assert_eq!(answered.scanned.rows, scanned_both(&rows));
+        assert_eq!(fixture.gets() - before, predicted);
+
+        let (key_value, _) = two_bucket_table().await;
+        let table = table_over(&key_value, key_value.config(Residency::Full, None)).await;
+        table.load().await.unwrap();
+        assert_eq!(table.current().unwrap().gets_per_scan, None);
     }
 
     /// A Scan counts in `scans_total` by result, `scan_rows` and

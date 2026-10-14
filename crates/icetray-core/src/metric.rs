@@ -136,16 +136,22 @@ pub const TABLE_COLUMN_LEVEL: &str = "icetray_table_column_level";
 pub const TABLE_CHUNK_RESIDENT_FRACTION: &str = "icetray_table_chunk_resident_fraction";
 /// GETs one cold hit makes at worst on the serving generation's layout and
 /// residency finding its row and reading the most expensive value column, by
-/// `table` (RFD 020, RFD 022, `LookupCost::gets_per_hit`).
+/// `table` (RFD 020, RFD 022, `LookupCost::gets_per_hit`); a key-value
+/// table's alone.
 pub const TABLE_GETS_PER_HIT: &str = "icetray_table_gets_per_hit";
 /// GETs one cold hit spends at worst on one value column, by `table` and
 /// `column` (RFD 022, `ColumnCost::gets_per_hit`): a hit naming several
 /// columns costs `TABLE_GETS_PER_MISS`, finding the row, and each named
-/// column's figure.
+/// column's figure. A key-value table's alone.
 pub const TABLE_COLUMN_GETS_PER_HIT: &str = "icetray_table_column_gets_per_hit";
 /// GETs one miss makes at worst on the serving generation, by `table`
-/// (`LookupCost::gets_per_miss`).
+/// (`LookupCost::gets_per_miss`); a key-value table's alone.
 pub const TABLE_GETS_PER_MISS: &str = "icetray_table_gets_per_miss";
+/// GETs one cold Scan at `max_scan_rows` of a key held in one file and one
+/// row group makes at worst on the serving generation's layout and
+/// residency, reading every configured value column, by `table` (RFD 025,
+/// `Generation::gets_per_scan`); an ordered table's alone.
+pub const TABLE_GETS_PER_SCAN: &str = "icetray_table_gets_per_scan";
 /// Files one lookup probes at most on the serving generation, by `table`
 /// (`LookupCost::files_probed`).
 pub const TABLE_FILES_PROBED_PER_LOOKUP: &str = "icetray_table_files_probed_per_lookup";
@@ -188,7 +194,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 52] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 53] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -403,6 +409,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 52] = [
         TABLE_GETS_PER_MISS,
         Kind::Gauge,
         "GETs one miss makes at worst on the serving generation's layout and residency, by table.",
+    ),
+    (
+        TABLE_GETS_PER_SCAN,
+        Kind::Gauge,
+        "GETs one cold Scan of every value column at max_scan_rows, of a key in one file and one row group, makes at worst on the serving generation, by table.",
     ),
     (
         TABLE_FILES_PROBED_PER_LOOKUP,

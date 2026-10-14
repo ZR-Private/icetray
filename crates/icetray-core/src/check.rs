@@ -20,7 +20,7 @@ use crate::config::{Residency, ValueFormat};
 use crate::contract;
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, RefusalReason, Result};
-use crate::generation::{Generation, LoadedFile};
+use crate::generation::{Generation, LoadedFile, ProbeWidths};
 use crate::index::{
     FileIndex, Inspected, ResidentBytes, bits_per_key, saturating_sum, saturating_sum_all,
 };
@@ -110,6 +110,22 @@ pub mod thresholds {
     /// but other readers of the same files cannot skip pages by such an
     /// index (RFD 002).
     pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5;
+
+    /// Rows of one key's run in one file above which `long_runs` is advice,
+    /// and the rows of the configured value columns `large_runs` sizes:
+    /// `DEFAULT_MAX_SCAN_ROWS`, the most rows one Scan returns at the
+    /// default, so a longer run takes a caller more than one Scan at the
+    /// default to read whole (RFD 025, Levels and findings). Fixed, as
+    /// every threshold is (RFD 016): a table's own `max_scan_rows` does not
+    /// move it.
+    pub const RUN_ROWS_ADVICE: u32 = crate::config::DEFAULT_MAX_SCAN_ROWS;
+
+    /// Uncompressed bytes of `RUN_ROWS_ADVICE` rows of a file's configured
+    /// value columns above which `large_runs` is advice: 4 MiB, a gRPC
+    /// client's default limit on a message it receives, so a Scan at the
+    /// default `max_scan_rows` can answer more than such a client accepts
+    /// (RFD 025, Levels and findings).
+    pub const RUN_BYTES_ADVICE: u64 = 4 * 1024 * 1024;
 }
 
 /// The GETs a cold lookup spends on a column chunk's dictionary page beside
@@ -136,9 +152,19 @@ const VALUE_PAGE_GETS: u64 = 1;
 /// `disk` reads it from a chunk file, neither with a GET.
 const KEY_PAGE_GETS: u64 = 1;
 
-/// The files a lookup probes where no files overlap: the one its key routes
-/// to.
-const FILES_PROBED_ALONE: usize = 1;
+/// The key pages a Scan decodes per row group its run spans at most: the
+/// run's first and last, since every page between them holds only the key
+/// (RFD 025, Cost).
+const RUN_EDGE_KEY_PAGES: u64 = 2;
+
+/// The GETs a cold Scan under `full` or `bloom` spends on the order column
+/// of a run in one row group: one span, the run's order pages being
+/// contiguous (RFD 025, Cost).
+const ORDER_SPAN_GETS: u64 = 1;
+
+/// The files a lookup or Scan probes where no files overlap: the one its
+/// key routes to.
+pub(crate) const FILES_PROBED_ALONE: usize = 1;
 
 /// The files a bucket's bytes explain at the least: one, however few bytes
 /// it holds, so a bucket of one small file is never many files.
@@ -193,8 +219,9 @@ pub struct LookupCost {
     pub gets_per_miss: u64,
     /// Files a lookup probes at most: the most in any bucket
     /// (`Generation::overlapping_buckets`, which takes unbucketed files as
-    /// one bucket), one where no files overlap; an upper bound where files
-    /// were written under two or more bucketings.
+    /// one bucket), or on an ordered table the most files a shared edge key
+    /// spans where that is more, one where no files overlap; an upper bound
+    /// where files were written under two or more bucketings.
     pub files_probed: usize,
 }
 
@@ -281,14 +308,32 @@ pub enum FindingCode {
     /// probes every file.
     NoBucketPartition,
     /// Files within one bucket have intersecting exact key ranges; a lookup
-    /// probes each of them whose range covers its key.
+    /// probes each of them whose range covers its key. On an ordered table,
+    /// files one snapshot added that meet only at an edge key are
+    /// `SharedEdgeKeys` instead (RFD 025).
     OverlappingFiles,
+    /// On an ordered table, files one snapshot added, as a compaction that
+    /// rolls files by size writes them, meet where one file's last key is
+    /// the next one's first; a Scan of such an edge key reads every file
+    /// that holds it (RFD 025).
+    SharedEdgeKeys,
+    /// On an ordered table, the order column is dictionary-encoded; every
+    /// Scan fetches its dictionary page besides the order pages.
+    DictionaryEncodedOrder,
+    /// On an ordered table, a file has no column index on the order
+    /// column; a bounded Scan reads its order pages before it knows which
+    /// value pages its rows lie on, a second round.
+    OrderIndexMissing,
     /// A manifest lacks key bounds, or its bounds are shorter than the
     /// file's exact first or last key.
     BoundsMissing,
     /// The key column's column index is truncated: too few page minimums
     /// are distinct.
     ColumnIndexTruncated,
+    /// On an ordered table, the order column's column index is truncated:
+    /// too few page minimums are distinct, so long values sharing a prefix
+    /// widen the pages a bound selects.
+    OrderIndexTruncated,
     /// A value column's mean uncompressed value page is above the advice
     /// threshold.
     LargeValuePages,
@@ -297,6 +342,13 @@ pub enum FindingCode {
     /// reads may declare; a lookup into a page over it is refused with a
     /// file fault.
     ValuePagesOverCeiling,
+    /// On an ordered table, a file holds a run of more than
+    /// `thresholds::RUN_ROWS_ADVICE` rows of one key.
+    LongRuns,
+    /// On an ordered table, `thresholds::RUN_ROWS_ADVICE` rows of a file's
+    /// configured value columns, at the footer's uncompressed bytes per
+    /// row, exceed `thresholds::RUN_BYTES_ADVICE`.
+    LargeRuns,
     /// A key is longer than `contract::KEY_BYTES_ADVICE`.
     LongKeys,
     /// A data file is larger than the advice threshold.
@@ -334,15 +386,21 @@ impl FindingCode {
     /// generation does not raise reads zero. Complete: a successor match
     /// over every variant, which a new variant fails to compile, is
     /// compared to this list in tests.
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 23] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
         Self::OverlappingFiles,
+        Self::SharedEdgeKeys,
+        Self::DictionaryEncodedOrder,
+        Self::OrderIndexMissing,
         Self::BoundsMissing,
         Self::ColumnIndexTruncated,
+        Self::OrderIndexTruncated,
         Self::LargeValuePages,
         Self::ValuePagesOverCeiling,
+        Self::LongRuns,
+        Self::LargeRuns,
         Self::LongKeys,
         Self::LargeFile,
         Self::ManyFilesPerBucket,
@@ -356,15 +414,25 @@ impl FindingCode {
 
     /// The level a finding of this code caps a table at (RFD 020), `None`
     /// for advice, which caps nothing. A cost within one file caps it at
-    /// `balanced`; more than one file probed, at `permissive`.
+    /// `balanced`; more than one file probed, at `permissive`, except for
+    /// the files a shared edge key spans, a cost fixed when one snapshot
+    /// wrote them that no later commit grows, which caps it at `balanced`
+    /// (RFD 025).
     pub fn cap(self) -> Option<Level> {
         match self {
-            Self::DictionaryEncodedValue | Self::LargeKeyPages => Some(Level::Balanced),
+            Self::DictionaryEncodedValue
+            | Self::LargeKeyPages
+            | Self::SharedEdgeKeys
+            | Self::DictionaryEncodedOrder
+            | Self::OrderIndexMissing => Some(Level::Balanced),
             Self::NoBucketPartition | Self::OverlappingFiles => Some(Level::Permissive),
             Self::BoundsMissing
             | Self::ColumnIndexTruncated
+            | Self::OrderIndexTruncated
             | Self::LargeValuePages
             | Self::ValuePagesOverCeiling
+            | Self::LongRuns
+            | Self::LargeRuns
             | Self::LongKeys
             | Self::LargeFile
             | Self::ManyFilesPerBucket
@@ -388,10 +456,16 @@ impl FindingCode {
             | Self::LargeKeyPages
             | Self::NoBucketPartition
             | Self::OverlappingFiles
+            | Self::SharedEdgeKeys
+            | Self::DictionaryEncodedOrder
+            | Self::OrderIndexMissing
             | Self::BoundsMissing
             | Self::ColumnIndexTruncated
+            | Self::OrderIndexTruncated
             | Self::LargeValuePages
             | Self::ValuePagesOverCeiling
+            | Self::LongRuns
+            | Self::LargeRuns
             | Self::LongKeys
             | Self::LargeFile
             | Self::ManyFilesPerBucket
@@ -406,6 +480,9 @@ impl FindingCode {
     /// Whether a finding of this code is about one value column, which it
     /// names (`Finding::column`), rather than about the row or the table
     /// (RFD 022): the codes `icetray_findings` carries a `column` label for.
+    /// The order column's findings are about the table, since every Scan
+    /// reads the order column, and so are the runs', which count a run's
+    /// rows and sum every value column's bytes.
     pub fn per_column(self) -> bool {
         match self {
             Self::DictionaryEncodedValue
@@ -416,8 +493,14 @@ impl FindingCode {
             Self::LargeKeyPages
             | Self::NoBucketPartition
             | Self::OverlappingFiles
+            | Self::SharedEdgeKeys
+            | Self::DictionaryEncodedOrder
+            | Self::OrderIndexMissing
             | Self::BoundsMissing
             | Self::ColumnIndexTruncated
+            | Self::OrderIndexTruncated
+            | Self::LongRuns
+            | Self::LargeRuns
             | Self::LongKeys
             | Self::LargeFile
             | Self::ManyFilesPerBucket
@@ -436,10 +519,16 @@ impl fmt::Display for FindingCode {
             Self::LargeKeyPages => "large_key_pages",
             Self::NoBucketPartition => "no_bucket_partition",
             Self::OverlappingFiles => "overlapping_files",
+            Self::SharedEdgeKeys => "shared_edge_keys",
+            Self::DictionaryEncodedOrder => "dictionary_encoded_order",
+            Self::OrderIndexMissing => "order_index_missing",
             Self::BoundsMissing => "bounds_missing",
             Self::ColumnIndexTruncated => "column_index_truncated",
+            Self::OrderIndexTruncated => "order_index_truncated",
             Self::LargeValuePages => "large_value_pages",
             Self::ValuePagesOverCeiling => "value_pages_over_ceiling",
+            Self::LongRuns => "long_runs",
+            Self::LargeRuns => "large_runs",
             Self::LongKeys => "long_keys",
             Self::LargeFile => "large_file",
             Self::ManyFilesPerBucket => "many_files_per_bucket",
@@ -685,7 +774,9 @@ pub struct FileReport {
     /// The key column's bloom filter bytes as the footer bounds them,
     /// summed over row groups; `None` when a row group lacks a filter.
     pub bloom_bytes: Option<u64>,
-    /// Filter bits per row of the file; `None` with `bloom_bytes`.
+    /// Filter bits per row of the file, from the footer alone, so per row
+    /// on an ordered table too, where the bloom findings judge a filter by
+    /// its row group's distinct keys; `None` with `bloom_bytes`.
     pub bloom_bits_per_key: Option<f64>,
     /// The key column's compressed chunk bytes: what the Full tier holds
     /// beyond the Disk tier's memory, and the payload of the chunk file the
@@ -785,10 +876,10 @@ pub struct TableSummary {
     /// `full` budget does.
     pub predicted: ResidentBytes,
     /// The level the layout achieves in every tier that can load the
-    /// table: its findings' dearest cap and the tier's best level together,
-    /// so an owner sees which tiers reach a level beside what each costs in
-    /// `predicted`. A tier that cannot load it is left out, as Bloom is
-    /// when `predicted.bloom` is `None`.
+    /// table: the dearest cap of the findings that tier raises and its best
+    /// level together, so an owner sees which tiers reach a level beside
+    /// what each costs in `predicted`. A tier that cannot load it is left
+    /// out, as Bloom is when `predicted.bloom` is `None`.
     pub level_by_residency: BTreeMap<Residency, Level>,
     /// What one cold lookup pays at worst in the loaded tier, from the same
     /// measurement as `level`.
@@ -900,7 +991,7 @@ pub fn diagnose(
         records: g.records,
         index_bytes: g.index_bytes,
         predicted,
-        level_by_residency: level_by_residency(caps.layout, &predicted),
+        level_by_residency: level_by_residency(g, &predicted),
         lookup_cost: caps.cost,
         value_columns,
         deletes,
@@ -1035,14 +1126,22 @@ async fn walk_protobuf_page(g: &Generation, at: usize, name: &str) -> Result<Opt
     Ok(None)
 }
 
-/// The level `layout` achieves in each tier that can load the table, with
-/// that tier's best level: a tier `predicted` holds no figure for (bloom,
-/// when a row group lacks a filter) is left out.
-fn level_by_residency(layout: Level, predicted: &ResidentBytes) -> BTreeMap<Residency, Level> {
+/// The level `g`'s layout achieves in each tier that can load the table:
+/// the caps the findings that tier raises set, with its best level, since
+/// an ordered table's order column findings cap `full` and `bloom` alone
+/// (RFD 025). A tier `predicted` holds no figure for (bloom, when a row
+/// group lacks a filter) is left out.
+fn level_by_residency(g: &Generation, predicted: &ResidentBytes) -> BTreeMap<Residency, Level> {
     Residency::ALL
         .into_iter()
         .filter(|residency| predicted.in_tier(*residency).is_some())
-        .map(|residency| (residency, layout.max(residency.best_level())))
+        .map(|residency| {
+            let caps = layout_caps(&LayoutView {
+                residency,
+                ..LayoutView::of(g)
+            });
+            (residency, caps.level)
+        })
         .collect()
 }
 
@@ -1106,20 +1205,23 @@ pub(crate) struct LayoutView<'a> {
     pub(crate) residency: Residency,
     pub(crate) files: Vec<FileView<'a>>,
     /// Per bucket an overlap group touches, the most files a lookup there
-    /// probes, as `Generation::overlapping_buckets` gives it.
-    pub(crate) overlapping: &'a BTreeMap<u32, usize>,
+    /// probes, as `Generation::overlapping_buckets` gives it, and on an
+    /// ordered table the most files a shared edge key spans.
+    pub(crate) widths: &'a ProbeWidths,
 }
 
 /// One file as a level is judged from it: its manifest entry and footer,
 /// with the key and value columns' leaf positions in the footer's schema,
-/// the value columns in the layout's order; no value leaf for a column the
-/// file was written before, for whose rows a lookup returns its default,
-/// and which makes no finding of that column (RFD 023).
+/// the value columns in the layout's order, and on an ordered table the
+/// order column's; no value leaf for a column the file was written before,
+/// for whose rows a lookup returns its default, and which makes no finding
+/// of that column (RFD 023).
 pub(crate) struct FileView<'a> {
     entry: &'a DataFileEntry,
     metadata: &'a ParquetMetaData,
     key_leaf: usize,
     value_leaves: Vec<Option<usize>>,
+    order_leaf: Option<usize>,
 }
 
 impl<'a> FileView<'a> {
@@ -1130,6 +1232,7 @@ impl<'a> FileView<'a> {
             metadata: file.index.metadata(),
             key_leaf: file.index.key_leaf(),
             value_leaves: file.index.value_leaves(),
+            order_leaf: file.index.order_leaf(),
         }
     }
 
@@ -1141,6 +1244,7 @@ impl<'a> FileView<'a> {
             metadata: inspected.metadata(),
             key_leaf: inspected.key_leaf(),
             value_leaves: inspected.value_leaves(),
+            order_leaf: inspected.order_leaf(),
         }
     }
 }
@@ -1152,7 +1256,7 @@ impl<'a> LayoutView<'a> {
             layout: &g.layout,
             residency: g.residency,
             files: g.files.iter().map(|file| FileView::loaded(file)).collect(),
-            overlapping: g.overlapping_buckets(),
+            widths: g.probe_widths(),
         }
     }
 }
@@ -1175,6 +1279,9 @@ pub(crate) struct Caps {
     /// Each value column's level and cost in the view's residency, in the
     /// layout's order.
     pub(crate) columns: Vec<ColumnCost>,
+    /// On an ordered table, what one cold Scan pays at worst in the view's
+    /// residency (`scan_gets`); `None` on a key-value table.
+    pub(crate) gets_per_scan: Option<u64>,
 }
 
 impl Caps {
@@ -1191,15 +1298,18 @@ impl Caps {
 /// lookup there (RFD 020, RFD 022): the one function the doctor's report,
 /// the load's level gate, and the cost gauges all measure a layout by, so
 /// none can disagree. Per file, a dictionary-encoded value column, named,
-/// and large key pages; per table, files written with no bucket partition
-/// and overlapping files. A column's level is its own findings' caps with
-/// those of finding the row, the findings that name no column, and the
-/// residency's best level; the table's is the dearest of them all. No
-/// `f64` enters.
+/// and large key pages, and on an ordered table under `full` and `bloom` a
+/// dictionary-encoded order column and a missing order column index; per
+/// table, files written with no bucket partition, overlapping files, and on
+/// an ordered table shared edge keys. A column's level is its own
+/// findings' caps with those of finding the row, the findings that name no
+/// column, and the residency's best level; the table's is the dearest of
+/// them all. On an ordered table, the cost of a cold Scan beside
+/// (`scan_gets`). No `f64` enters.
 pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     let mut findings = Vec::new();
     for file in &view.files {
-        file_capping_findings(file, view.layout, &mut findings);
+        file_capping_findings(file, view.layout, view.residency, &mut findings);
     }
     table_capping_findings(view, &mut findings);
     sort_findings(&mut findings);
@@ -1237,42 +1347,57 @@ pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
         .map(|column| column.gets_per_hit)
         .max()
         .unwrap_or(0);
+    let gets_per_scan = view
+        .layout
+        .order
+        .as_ref()
+        .map(|_| scan_gets(view.residency, &row_gets, &columns, &findings));
+    let key_pages = row_gets.per_file() * approx::count(row_gets.files_probed);
     Caps {
         level: layout.max(best),
         layout,
         cost: LookupCost {
-            gets_per_hit: row_gets.key_pages + dearest_column,
-            gets_per_miss: row_gets.key_pages,
+            gets_per_hit: key_pages + dearest_column,
+            gets_per_miss: key_pages,
             files_probed: row_gets.files_probed,
         },
         columns,
+        gets_per_scan,
         findings,
     }
 }
 
-/// What finding a row costs a cold lookup on `view`: the GETs under
-/// `bloom` for the key page of every file probed, each filter answering
-/// yes, with the key column's dictionary page when any file's is
-/// dictionary-encoded, and the files probed.
+/// What finding a row costs a cold lookup on `view`: under `bloom` the GET
+/// of a key page in every file probed, each filter answering yes, with the
+/// key column's dictionary page when any file's is dictionary-encoded, and
+/// the files probed.
 struct RowGets {
-    key_pages: u64,
+    /// The GETs of one key page: `KEY_PAGE_GETS` under `bloom`, none under
+    /// `full` and `disk`.
+    key_page: u64,
+    /// The GETs of the key column's dictionary page in one file: one under
+    /// `bloom` when any file's key column is dictionary-encoded, else none.
+    key_dictionary: u64,
     files_probed: usize,
+}
+
+impl RowGets {
+    /// The GETs finding the row spends in one file probed.
+    fn per_file(&self) -> u64 {
+        self.key_page + self.key_dictionary
+    }
 }
 
 /// The cost of finding a row on `view` (`RowGets`). The files probed are
 /// the most any bucket's lookup probes, the figure `overlapping_files`
-/// carries; `no_bucket_partition`'s figure counts every unbucketed file,
-/// while a lookup probes only those whose exact key range covers its key,
-/// which the overlap figure already narrows to.
+/// carries, or on an ordered table `shared_edge_keys` where it is more;
+/// `no_bucket_partition`'s figure counts every unbucketed file, while a
+/// lookup probes only those whose exact key range covers its key, which
+/// the overlap figure already narrows to.
 fn row_gets(view: &LayoutView<'_>) -> RowGets {
-    let files_probed = view
-        .overlapping
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(FILES_PROBED_ALONE);
-    let key_pages = match view.residency {
-        Residency::Full | Residency::Disk => 0,
+    let files_probed = view.widths.most_probed().unwrap_or(FILES_PROBED_ALONE);
+    let (key_page, key_dictionary) = match view.residency {
+        Residency::Full | Residency::Disk => (0, 0),
         Residency::Bloom => {
             let key_dictionary = view
                 .files
@@ -1283,13 +1408,45 @@ fn row_gets(view: &LayoutView<'_>) -> RowGets {
             } else {
                 0
             };
-            (KEY_PAGE_GETS + dictionary) * approx::count(files_probed)
+            (KEY_PAGE_GETS, dictionary)
         }
     };
     RowGets {
-        key_pages,
+        key_page,
+        key_dictionary,
         files_probed,
     }
+}
+
+/// The GETs one cold Scan of every configured value column at
+/// `max_scan_rows` makes at worst in `residency` on an ordered table, for
+/// a key held in one file and one row group (RFD 025, Cost and Metrics):
+/// under `bloom` the run's first and last key pages, `RUN_EDGE_KEY_PAGES`
+/// once the run crosses a page boundary, with the key column's dictionary
+/// page as `row` counts it; under `full` and `bloom` the order column's
+/// span and, under `dictionary_encoded_order` among `findings`, its
+/// dictionary page, which `disk` reads from the chunk file; and each value
+/// column's span with its dictionary page, as `columns` gives it. The rows
+/// one Scan takes within one row group are contiguous, so each column is
+/// one span however many rows `max_scan_rows` lets it take.
+fn scan_gets(
+    residency: Residency,
+    row: &RowGets,
+    columns: &[ColumnCost],
+    findings: &[Finding],
+) -> u64 {
+    let find_run = row.key_page * RUN_EDGE_KEY_PAGES + row.key_dictionary;
+    let order = match residency {
+        Residency::Full | Residency::Bloom => {
+            let dictionary = findings
+                .iter()
+                .any(|finding| finding.code() == FindingCode::DictionaryEncodedOrder);
+            ORDER_SPAN_GETS + if dictionary { DICTIONARY_PAGE_GETS } else { 0 }
+        }
+        Residency::Disk => 0,
+    };
+    let values: u64 = columns.iter().map(|column| column.gets_per_hit).sum();
+    find_run + order + values
 }
 
 /// Everything measured about one file: its report, and what the advice
@@ -1301,13 +1458,34 @@ struct FileFacts {
     rows: u64,
     predicted: ResidentBytes,
     bloom_by_row_group: Option<BloomExtremes>,
+    /// What an ordered table's advice needs of the file; `None` on a
+    /// key-value table.
+    order: Option<OrderAdviceFacts>,
+}
+
+/// What the advice on an ordered table's runs and order column index
+/// measures in one file (RFD 025, Levels and findings).
+struct OrderAdviceFacts {
+    /// The rows of the file's longest run of one key, as the load counted
+    /// them (`OrderFacts::longest_run`).
+    longest_run: u64,
+    /// The uncompressed bytes of the configured value columns the file
+    /// holds, from its footer.
+    value_bytes: u64,
+    /// The share of the order column's pages with a distinct byte-array
+    /// column-index minimum (`distinct_mins_ratio` under `Mins::Order`).
+    distinct_mins_ratio: f64,
 }
 
 /// The key column's bloom filter sizing at the row groups that size it
 /// worst. Filters are per row group and a miss consults only the row group
 /// the fences name, so the file's mean can hide one undersized filter beside
 /// well-sized ones (RFD 016 judges a filter by its row group's key count).
-/// `None` when any row group lacks a bounded filter.
+/// A row group's keys are its rows on a key-value table and its distinct
+/// keys on an ordered one, which the load counts
+/// (`OrderFacts::distinct_keys`), since a filter holds each key once
+/// however many rows repeat it (RFD 025). `None` when any row group lacks
+/// a bounded filter.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BloomExtremes {
     /// The most filter bytes per key over the row groups, and that row group.
@@ -1316,7 +1494,11 @@ struct BloomExtremes {
     fewest_bits_per_key: (f64, usize),
 }
 
-fn bloom_extremes(metadata: &ParquetMetaData, key_leaf: usize) -> Option<BloomExtremes> {
+fn bloom_extremes(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    distinct_keys: Option<&[u64]>,
+) -> Option<BloomExtremes> {
     let mut most: Option<(f64, usize)> = None;
     let mut fewest: Option<(f64, usize)> = None;
     for (row_group, group) in metadata.row_groups().iter().enumerate() {
@@ -1324,9 +1506,14 @@ fn bloom_extremes(metadata: &ParquetMetaData, key_leaf: usize) -> Option<BloomEx
         column.bloom_filter_offset()?;
         let length = column.bloom_filter_length()?;
         let bytes = approx::measured(length);
-        let rows = approx::measured(group.num_rows());
-        let bytes_per_key = approx::ratio(bytes, rows);
-        let bits_per_key = bits_per_key(bytes, rows);
+        let keys = match distinct_keys {
+            Some(distinct) => *distinct.get(row_group).expect(
+                "the order facts count one row group's distinct keys per row group of the footer",
+            ),
+            None => approx::measured(group.num_rows()),
+        };
+        let bytes_per_key = approx::ratio(bytes, keys);
+        let bits_per_key = bits_per_key(bytes, keys);
         if most.is_none_or(|(value, _)| bytes_per_key > value) {
             most = Some((bytes_per_key, row_group));
         }
@@ -1367,6 +1554,8 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
         index.handle(),
     );
     let pages = key_page_facts(metadata, index.key_leaf());
+    let order_facts = layout.order.as_ref().and(index.order_facts());
+    let mut value_bytes = 0;
     let mut dictionary_columns = Vec::new();
     if column_chunk_facts(metadata, index.key_leaf()).dictionary {
         dictionary_columns.push(layout.key_column.clone());
@@ -1390,6 +1579,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             if chunks.dictionary {
                 dictionary_columns.push(column.name.clone());
             }
+            value_bytes += chunks.uncompressed_bytes;
             let (value_pages, pages_aligned) = value_page_facts(metadata, index.key_leaf(), leaf);
             ValueColumnReport {
                 column: column.name.clone(),
@@ -1422,14 +1612,25 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             bloom_bytes: predicted.filter_bytes,
             bloom_bits_per_key: predicted.bloom_bits_per_key,
             key_chunk_bytes: predicted.key_chunk_bytes,
-            distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf()),
+            distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf(), Mins::Key),
             bounds_present: bounds_intact(&file.entry, index.key_range()),
             resident_bytes: index.resident_bytes(),
         },
         size: file.entry.size,
         rows: rows_of(index),
         predicted,
-        bloom_by_row_group: bloom_extremes(metadata, index.key_leaf()),
+        bloom_by_row_group: bloom_extremes(
+            metadata,
+            index.key_leaf(),
+            order_facts.map(|facts| facts.distinct_keys.as_slice()),
+        ),
+        order: order_facts
+            .zip(index.order_leaf())
+            .map(|(facts, leaf)| OrderAdviceFacts {
+                longest_run: facts.longest_run,
+                value_bytes,
+                distinct_mins_ratio: distinct_mins_ratio(metadata, leaf, Mins::Order),
+            }),
     }
 }
 
@@ -1523,26 +1724,42 @@ fn dictionary_encoded(chunk: &ColumnChunkMetaData) -> bool {
         || encodings.is_set(Encoding::PLAIN_DICTIONARY)
 }
 
-/// The share of the key column's pages whose column-index minimum is
-/// distinct: 1.0 when every page is addressable by it, lower when a writer
-/// cut the minimums to a shared prefix. The key column is `INT64`,
-/// `BYTE_ARRAY`, or `FIXED_LEN_BYTE_ARRAY` (`FileIndex::build` refused any
-/// other), and a page without a minimum (a null page, which a key column
-/// never has) is not counted. A file without a column index, or whose
-/// index lists no page, is `DISTINCT_MINS_UNOBSERVABLE`: truncation is not
+/// Which column-index entries `distinct_mins_ratio` counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mins {
+    /// The key column's: `INT64` and byte arrays, whose page minimums are
+    /// distinct in a file of sorted keys unless a writer cut them.
+    Key,
+    /// An ordered table's order column's: byte arrays alone. A writer never
+    /// cuts an integer entry, and an order column's page minimums repeat
+    /// across keys as its values do, which would only blur a cut.
+    Order,
+}
+
+/// The share of the pages of the column at `leaf` whose column-index
+/// minimum is distinct, counting the entries `counted` names: 1.0 when
+/// every page is addressable by it, lower when a writer cut the minimums to
+/// a shared prefix. The key column is `INT64`, `BYTE_ARRAY`, or
+/// `FIXED_LEN_BYTE_ARRAY` (`FileIndex::build` refused any other), and a
+/// page without a minimum (a null page, which a key or order column never
+/// has) is not counted. A file without a column index, or whose index
+/// lists no counted page, is `DISTINCT_MINS_UNOBSERVABLE`: truncation is not
 /// observable there, so it draws no finding.
-fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
+fn distinct_mins_ratio(metadata: &ParquetMetaData, leaf: usize, counted: Mins) -> f64 {
     let Some(index) = metadata.column_index() else {
         return DISTINCT_MINS_UNOBSERVABLE;
     };
     let (mut pages, mut distinct) = (0, 0);
     for columns in index {
-        match columns.get(key_leaf) {
-            Some(ColumnIndexMetaData::INT64(native)) => {
-                let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
-                pages += approx::count(mins.len());
-                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
-            }
+        match columns.get(leaf) {
+            Some(ColumnIndexMetaData::INT64(native)) => match counted {
+                Mins::Key => {
+                    let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
+                    pages += approx::count(mins.len());
+                    distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
+                }
+                Mins::Order => {}
+            },
             Some(
                 ColumnIndexMetaData::BYTE_ARRAY(bytes)
                 | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(bytes),
@@ -1594,9 +1811,15 @@ fn file_advice_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding>
 }
 
 /// The per-file capping findings, from the file's footer and manifest
-/// entry alone: each dictionary-encoded value column, named, and large key
-/// pages.
-fn file_capping_findings(file: &FileView<'_>, layout: &TableLayout, findings: &mut Vec<Finding>) {
+/// entry alone: each dictionary-encoded value column, named, large key
+/// pages, and on an ordered table in `residency` the order column's
+/// (`order_capping_findings`).
+fn file_capping_findings(
+    file: &FileView<'_>,
+    layout: &TableLayout,
+    residency: Residency,
+    findings: &mut Vec<Finding>,
+) {
     let path = &file.entry.path;
     for (column, leaf) in layout.value_columns.iter().zip(&file.value_leaves) {
         let Some(leaf) = *leaf else {
@@ -1624,6 +1847,78 @@ fn file_capping_findings(file: &FileView<'_>, layout: &TableLayout, findings: &m
             Some(WriterProperty::PageRowLimit),
         ));
     }
+    if let (Some(_), Some(order)) = (&layout.order, file.order_leaf) {
+        order_capping_findings(file, order, residency, findings);
+    }
+}
+
+/// An ordered table's per-file capping findings on the order column at
+/// leaf `order` (RFD 025, Levels and findings), under `full` and `bloom`
+/// alone: under `disk` the chunk file holds the order column's dictionary
+/// page and every order page a bound needs, so neither costs a GET or a
+/// round. A dictionary-encoded order column is `dictionary_encoded_order`,
+/// since every Scan fetches its dictionary page; a file without an order
+/// column index on some row group is `order_index_missing`, since a
+/// bounded Scan then reads the run's order pages in a first round and its
+/// value pages in a second, with as many GETs as one round takes.
+fn order_capping_findings(
+    file: &FileView<'_>,
+    order: usize,
+    residency: Residency,
+    findings: &mut Vec<Finding>,
+) {
+    match residency {
+        Residency::Full | Residency::Bloom => {}
+        Residency::Disk => return,
+    }
+    let path = &file.entry.path;
+    if column_chunk_facts(file.metadata, order).dictionary {
+        findings.push(Finding::cost(
+            FindingCode::DictionaryEncodedOrder,
+            Some(path),
+            format!(
+                "the order column is dictionary-encoded; every Scan fetches its dictionary page besides the order pages, {gets} extra GET per file ({property}=false)",
+                gets = DICTIONARY_PAGE_GETS,
+                property = WriterProperty::EnableDictionary,
+            ),
+            Penalty {
+                extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
+                ..Penalty::default()
+            },
+            Some(WriterProperty::EnableDictionary),
+        ));
+    }
+    if order_index_missing(file.metadata, order) {
+        findings.push(Finding::cost(
+            FindingCode::OrderIndexMissing,
+            Some(path),
+            "the order column has no column index in some row group; a bounded Scan reads the run's order pages before it knows which value pages its rows lie on, a second round with as many GETs (write page statistics on the order column)".to_string(),
+            Penalty::default(),
+            None,
+        ));
+    }
+}
+
+/// Whether some row group of the file `metadata` describes has no column
+/// index entry for the column at `leaf`: the file has no column index, or
+/// the row group's entry is missing or lists nothing.
+fn order_index_missing(metadata: &ParquetMetaData, leaf: usize) -> bool {
+    let Some(index) = metadata.column_index() else {
+        return true;
+    };
+    index.iter().any(|columns| match columns.get(leaf) {
+        None | Some(ColumnIndexMetaData::NONE) => true,
+        Some(
+            ColumnIndexMetaData::BOOLEAN(_)
+            | ColumnIndexMetaData::INT32(_)
+            | ColumnIndexMetaData::INT64(_)
+            | ColumnIndexMetaData::INT96(_)
+            | ColumnIndexMetaData::FLOAT(_)
+            | ColumnIndexMetaData::DOUBLE(_)
+            | ColumnIndexMetaData::BYTE_ARRAY(_)
+            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
+        ) => false,
+    })
 }
 
 /// `dictionary_encoded_value` on value column `column` of the file at
@@ -1649,9 +1944,10 @@ fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
 
 /// The per-file advice apart from the bloom filter: bounds, column index,
 /// each value column's pages (over the advice line, and over the lookup's
-/// ceiling), key length, file size. The one `f64` comparison is on
-/// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
-/// a zero denominator), so a plain comparison is total.
+/// ceiling), key length, file size, and on an ordered table the order
+/// column index and the runs (`order_advice`). The one `f64` comparison is
+/// on `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero
+/// for a zero denominator), so a plain comparison is total.
 fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if !report.bounds_present {
@@ -1682,6 +1978,9 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
     for column in &report.value_columns {
         value_page_advice(&report.path, column, findings);
     }
+    if let Some(order) = &facts.order {
+        order_advice(&report.path, order, facts.rows, findings);
+    }
     if report.max_key_bytes > contract::KEY_BYTES_ADVICE {
         findings.push(Finding::advice(
             FindingCode::LongKeys,
@@ -1707,6 +2006,58 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
                 max = contract::TARGET_FILE_BYTES_MAX,
             ),
             Some(WriterProperty::TargetFileSizeBytes),
+        ));
+    }
+}
+
+/// An ordered table's advice on one file (RFD 025, Levels and findings):
+/// `order_index_truncated` where too few of the order column's byte-array
+/// page minimums are distinct, as the key column's `column_index_truncated`
+/// judges it, since long values sharing a prefix widen the pages a bound
+/// selects; `long_runs` where a run is longer than
+/// `thresholds::RUN_ROWS_ADVICE`; and `large_runs` where that many rows of
+/// the configured value columns, at the footer's uncompressed bytes per
+/// row over the file's `rows`, are more than `thresholds::RUN_BYTES_ADVICE`,
+/// compared in integers. The ratio is `approx::ratio`'s, finite, so the
+/// plain comparison is total.
+fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut Vec<Finding>) {
+    if order.distinct_mins_ratio < thresholds::DISTINCT_MINS_RATIO_ADVICE {
+        findings.push(Finding::advice(
+            FindingCode::OrderIndexTruncated,
+            Some(path),
+            format!(
+                "{ratio:.2} of order pages have a distinct minimum in the column index, below {limit}; long order values sharing a prefix widen the pages a bounded Scan selects ({property}, at least the longest order value)",
+                ratio = order.distinct_mins_ratio,
+                limit = thresholds::DISTINCT_MINS_RATIO_ADVICE,
+                property = WriterProperty::ColumnIndexTruncateLength,
+            ),
+            Some(WriterProperty::ColumnIndexTruncateLength),
+        ));
+    }
+    let run_rows = u64::from(thresholds::RUN_ROWS_ADVICE);
+    if order.longest_run > run_rows {
+        findings.push(Finding::advice(
+            FindingCode::LongRuns,
+            Some(path),
+            format!(
+                "a key holds a run of {run} rows, above {run_rows}; a caller reads its whole history in more than one Scan at the default max_scan_rows, paging by order value",
+                run = order.longest_run,
+            ),
+            None,
+        ));
+    }
+    let run_bytes = order.value_bytes.saturating_mul(run_rows);
+    if rows > 0 && run_bytes > thresholds::RUN_BYTES_ADVICE.saturating_mul(rows) {
+        findings.push(Finding::advice(
+            FindingCode::LargeRuns,
+            Some(path),
+            format!(
+                "{run_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above {limit}, a gRPC client's default message limit; a Scan at the default max_scan_rows can answer more than such a client accepts (request fewer rows, or fewer columns)",
+                bytes = run_bytes / rows,
+                per_row = order.value_bytes / rows,
+                limit = thresholds::RUN_BYTES_ADVICE,
+            ),
+            None,
         ));
     }
 }
@@ -1754,7 +2105,8 @@ fn value_page_advice(path: &str, column: &ValueColumnReport, findings: &mut Vec<
 
 /// The bloom filter advice: none, oversized, or undersized. Sizing is
 /// judged at the row group that sizes worst, since a miss consults one row
-/// group's filter; the report keeps the file's figures. Bytes per key and
+/// group's filter, per key as `bloom_extremes` counts a row group's keys;
+/// the report keeps the file's figures, per row. Bytes per key and
 /// bits per key come from `approx::ratio` and are finite (zero for a zero
 /// denominator), so the plain comparisons are total.
 fn bloom_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
@@ -1778,7 +2130,7 @@ fn bloom_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Fi
             FindingCode::BloomOversized,
             Some(&report.path),
             format!(
-                "bloom filter of row group {largest} is {bytes_per_key:.1} bytes per key ({bytes} filter bytes over the file's {rows} rows), above {limit}; the bloom tier's memory follows it ({property}, Iceberg 1.11+)",
+                "bloom filter of row group {largest} is {bytes_per_key:.1} bytes per key ({bytes} filter bytes in the file of {rows} rows), above {limit}; the bloom tier's memory follows it ({property}, Iceberg 1.11+)",
                 rows = facts.rows,
                 limit = thresholds::BLOOM_BYTES_PER_KEY_ADVICE,
                 property = WriterProperty::BloomFilterMaxBytes,
@@ -1803,7 +2155,8 @@ fn bloom_findings(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Fi
 }
 
 /// The table-level capping findings: files written with no bucket
-/// partition, and overlapping files per bucket.
+/// partition, overlapping files per bucket, and on an ordered table shared
+/// edge keys per bucket.
 fn table_capping_findings(view: &LayoutView<'_>, findings: &mut Vec<Finding>) {
     let key = &view.layout.key_column;
     let total = view.files.len();
@@ -1828,7 +2181,7 @@ fn table_capping_findings(view: &LayoutView<'_>, findings: &mut Vec<Finding>) {
             None,
         ));
     }
-    for (&bucket, &probed) in view.overlapping {
+    for (&bucket, &probed) in &view.widths.overlapping {
         findings.push(Finding::cost(
             FindingCode::OverlappingFiles,
             None,
@@ -1838,6 +2191,17 @@ fn table_capping_findings(view: &LayoutView<'_>, findings: &mut Vec<Finding>) {
             ),
             Penalty::files_probed(probed),
             Some(WriterProperty::SkewSplitting),
+        ));
+    }
+    for (&bucket, &spanned) in &view.widths.shared_edges {
+        findings.push(Finding::cost(
+            FindingCode::SharedEdgeKeys,
+            None,
+            format!(
+                "bucket {bucket} holds files one snapshot added that meet where one file's last key is the next one's first, as a compaction that rolls files by size writes them; a Scan of such an edge key reads up to {spanned} files, a cost no later commit grows (a compaction that writes the bucket in one file removes it)",
+            ),
+            Penalty::files_probed(spanned),
+            None,
         ));
     }
 }
@@ -1903,14 +2267,19 @@ fn deletes_pending(g: &Generation, caps: &Caps, deletes: DeleteSummary) -> Optio
 /// `layout_caps` gives `g` in its residency with no files overlapping,
 /// which a compaction that rewrites the overlapping files restores, when it
 /// is better than `caps`' level; `None` where no files overlap or another
-/// cap holds the level where it is.
+/// cap holds the level where it is. Shared edge keys stay, as a compaction
+/// that rolls files by size writes them again.
 fn compacted_level(g: &Generation, caps: &Caps) -> Option<Level> {
     caps.findings
         .iter()
         .any(|finding| finding.code() == FindingCode::OverlappingFiles)
         .then(|| {
+            let compacted = ProbeWidths {
+                overlapping: BTreeMap::new(),
+                shared_edges: g.probe_widths().shared_edges.clone(),
+            };
             layout_caps(&LayoutView {
-                overlapping: &BTreeMap::new(),
+                widths: &compacted,
                 ..LayoutView::of(g)
             })
             .level
@@ -2022,7 +2391,7 @@ mod tests {
     use super::thresholds::{
         BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
         FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
-        VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
+        RUN_ROWS_ADVICE, VALUE_PAGE_ADVICE_FACTOR, VALUE_PAGE_BYTES_ADVICE,
     };
     use super::*;
     use crate::config::TableConfig;
@@ -2139,13 +2508,22 @@ mod tests {
         (FindingCode::LargeKeyPages, "large_key_pages"),
         (FindingCode::NoBucketPartition, "no_bucket_partition"),
         (FindingCode::OverlappingFiles, "overlapping_files"),
+        (FindingCode::SharedEdgeKeys, "shared_edge_keys"),
+        (
+            FindingCode::DictionaryEncodedOrder,
+            "dictionary_encoded_order",
+        ),
+        (FindingCode::OrderIndexMissing, "order_index_missing"),
         (FindingCode::BoundsMissing, "bounds_missing"),
         (FindingCode::ColumnIndexTruncated, "column_index_truncated"),
+        (FindingCode::OrderIndexTruncated, "order_index_truncated"),
         (FindingCode::LargeValuePages, "large_value_pages"),
         (
             FindingCode::ValuePagesOverCeiling,
             "value_pages_over_ceiling",
         ),
+        (FindingCode::LongRuns, "long_runs"),
+        (FindingCode::LargeRuns, "large_runs"),
         (FindingCode::LongKeys, "long_keys"),
         (FindingCode::LargeFile, "large_file"),
         (FindingCode::ManyFilesPerBucket, "many_files_per_bucket"),
@@ -2353,6 +2731,9 @@ mod tests {
                 (FindingCode::LargeKeyPages, Level::Balanced),
                 (FindingCode::NoBucketPartition, Level::Permissive),
                 (FindingCode::OverlappingFiles, Level::Permissive),
+                (FindingCode::SharedEdgeKeys, Level::Balanced),
+                (FindingCode::DictionaryEncodedOrder, Level::Balanced),
+                (FindingCode::OrderIndexMissing, Level::Balanced),
             ]
         );
     }
@@ -2372,6 +2753,80 @@ mod tests {
                 > BLOOM_BITS_PER_KEY_MIN
         );
         const { assert!(DISTINCT_MINS_RATIO_ADVICE < DISTINCT_MINS_UNOBSERVABLE) };
+        assert_eq!(RUN_ROWS_ADVICE, crate::config::DEFAULT_MAX_SCAN_ROWS);
+    }
+
+    /// A cold Scan of a key in one file and one row group (RFD 025, Cost):
+    /// under `full` the order column's span and each value column's, under
+    /// `disk` the value columns' alone, under `bloom` the run's two edge key
+    /// pages first; a dictionary page adds one GET where it is fetched, the
+    /// order column's only under `full` and `bloom`, where
+    /// `dictionary_encoded_order` is raised.
+    #[test]
+    fn test_scan_gets_per_tier_counts_spans_dictionaries_and_edge_key_pages() {
+        let columns = [
+            ColumnCost {
+                level: Level::Optimal,
+                gets_per_hit: VALUE_PAGE_GETS,
+            },
+            ColumnCost {
+                level: Level::Balanced,
+                gets_per_hit: VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
+            },
+        ];
+        let values = 2 * VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS;
+        let dictionary_order = [Finding::cost(
+            FindingCode::DictionaryEncodedOrder,
+            None,
+            String::new(),
+            Penalty::default(),
+            None,
+        )];
+        let row = |residency: Residency, key_dictionary: u64| RowGets {
+            key_page: match residency {
+                Residency::Bloom => KEY_PAGE_GETS,
+                Residency::Full | Residency::Disk => 0,
+            },
+            key_dictionary,
+            files_probed: FILES_PROBED_ALONE,
+        };
+        let cases = [
+            (Residency::Full, 0, &[][..], ORDER_SPAN_GETS + values),
+            (
+                Residency::Full,
+                0,
+                &dictionary_order[..],
+                ORDER_SPAN_GETS + DICTIONARY_PAGE_GETS + values,
+            ),
+            (Residency::Disk, 0, &[][..], values),
+            (
+                Residency::Bloom,
+                0,
+                &[][..],
+                RUN_EDGE_KEY_PAGES * KEY_PAGE_GETS + ORDER_SPAN_GETS + values,
+            ),
+            (
+                Residency::Bloom,
+                DICTIONARY_PAGE_GETS,
+                &dictionary_order[..],
+                RUN_EDGE_KEY_PAGES * KEY_PAGE_GETS
+                    + 2 * DICTIONARY_PAGE_GETS
+                    + ORDER_SPAN_GETS
+                    + values,
+            ),
+        ];
+        for (residency, key_dictionary, findings, expected) in cases {
+            assert_eq!(
+                scan_gets(
+                    residency,
+                    &row(residency, key_dictionary),
+                    &columns,
+                    findings
+                ),
+                expected,
+                "{residency}"
+            );
+        }
     }
 
     #[test]
@@ -2405,11 +2860,17 @@ mod tests {
             FindingCode::DictionaryEncodedValue => Some(FindingCode::LargeKeyPages),
             FindingCode::LargeKeyPages => Some(FindingCode::NoBucketPartition),
             FindingCode::NoBucketPartition => Some(FindingCode::OverlappingFiles),
-            FindingCode::OverlappingFiles => Some(FindingCode::BoundsMissing),
+            FindingCode::OverlappingFiles => Some(FindingCode::SharedEdgeKeys),
+            FindingCode::SharedEdgeKeys => Some(FindingCode::DictionaryEncodedOrder),
+            FindingCode::DictionaryEncodedOrder => Some(FindingCode::OrderIndexMissing),
+            FindingCode::OrderIndexMissing => Some(FindingCode::BoundsMissing),
             FindingCode::BoundsMissing => Some(FindingCode::ColumnIndexTruncated),
-            FindingCode::ColumnIndexTruncated => Some(FindingCode::LargeValuePages),
+            FindingCode::ColumnIndexTruncated => Some(FindingCode::OrderIndexTruncated),
+            FindingCode::OrderIndexTruncated => Some(FindingCode::LargeValuePages),
             FindingCode::LargeValuePages => Some(FindingCode::ValuePagesOverCeiling),
-            FindingCode::ValuePagesOverCeiling => Some(FindingCode::LongKeys),
+            FindingCode::ValuePagesOverCeiling => Some(FindingCode::LongRuns),
+            FindingCode::LongRuns => Some(FindingCode::LargeRuns),
+            FindingCode::LargeRuns => Some(FindingCode::LongKeys),
             FindingCode::LongKeys => Some(FindingCode::LargeFile),
             FindingCode::LargeFile => Some(FindingCode::ManyFilesPerBucket),
             FindingCode::ManyFilesPerBucket => Some(FindingCode::NoBloomFilter),
@@ -2893,7 +3354,7 @@ mod tests {
             .build();
         assert!(stripped.column_index().is_none());
         assert_eq!(
-            distinct_mins_ratio(&stripped, index.key_leaf()).to_bits(),
+            distinct_mins_ratio(&stripped, index.key_leaf(), Mins::Key).to_bits(),
             DISTINCT_MINS_UNOBSERVABLE.to_bits()
         );
     }
