@@ -103,7 +103,7 @@ pub enum Error {
     /// A call of the wrong kind for the table (RFD 025): a Get or `MultiGet`
     /// of an ordered table, or a Scan or `MultiScan` of a key-value table;
     /// checked before any read.
-    #[error("table {table} is a {kind} table, which the call does not serve")]
+    #[error("table {table} is {kind}, which the call does not serve")]
     WrongTableKind {
         /// The table's configured name.
         table: String,
