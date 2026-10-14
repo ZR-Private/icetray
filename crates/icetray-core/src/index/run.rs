@@ -3,7 +3,8 @@
 //! key of each row group and the fences, with at most two key pages
 //! decoded per row group; and the rows one Scan reads of it, the order
 //! column and the requested value columns over the candidate rows, in one
-//! round where the order column's column index places the bounds. A
+//! round where the order column's column index places each bound on one
+//! page. A
 //! key-value table never reaches this module.
 
 use std::collections::BTreeMap;
@@ -268,7 +269,11 @@ impl FileIndex {
     /// the rows exactly. Where a row group of the run has no column index
     /// on its order chunk and a bound is set, its order pages are read in a
     /// first round and the value pages of exactly the rows taken in a
-    /// second (`order_index_missing`).
+    /// second (`order_index_missing`). The same two rounds serve a read
+    /// whose rows across a bound lie on more than one page before the rows
+    /// inside or after them, as under a truncated byte-array entry that a
+    /// bound shares a prefix with: rows across a bound count nothing
+    /// toward `limit`, so one round would read the values of every one.
     ///
     /// Per column and row group, the pages are one span GET through
     /// `source`'s cache under its span window for every contiguous run the
@@ -309,8 +314,11 @@ impl FileIndex {
             || run.parts.iter().all(|part| {
                 order_column_index(self.order_values(order).group(part.row_group)).is_some()
             });
-        let (walked, orders, values) = if indexed {
-            let walked = walk.rows(|piece, _| piece.fit);
+        let one_round = indexed
+            .then(|| walk.rows(|piece, _| piece.fit))
+            .filter(|taken| !taken.spread)
+            .map(|taken| taken.rows);
+        let (walked, orders, values) = if let Some(walked) = one_round {
             let (order_spans, value_spans) = (spans_of(&walked, false), spans_of(&walked, true));
             let (orders, values) = futures::try_join!(
                 self.read_orders(order, &order_spans, source),
@@ -334,13 +342,15 @@ impl FileIndex {
             let orders = self
                 .read_orders(order, &spans_of(&all, false), source)
                 .await?;
-            let walked = walk.rows(|_, row| {
-                if cut.holds(&orders.value(row)) {
-                    PageFit::Inside
-                } else {
-                    PageFit::Outside
-                }
-            });
+            let walked = walk
+                .rows(|_, row| {
+                    if cut.holds(&orders.value(row)) {
+                        PageFit::Inside
+                    } else {
+                        PageFit::Outside
+                    }
+                })
+                .rows;
             let values = self
                 .read_values(columns, &spans_of(&walked, true), source)
                 .await?;
@@ -642,6 +652,14 @@ struct Walked {
     values: bool,
 }
 
+/// The rows a walk takes up, and whether the rows it takes up with their
+/// values across a bound lie on more than one page before the first row
+/// inside or after it (`Walk::rows`).
+struct Taken {
+    rows: Vec<Walked>,
+    spread: bool,
+}
+
 /// The rows of a run a read takes up (`Walk::rows`).
 struct Walk<'a> {
     index: &'a FileIndex,
@@ -656,19 +674,25 @@ impl Walk<'_> {
     /// bounds as `fit` judges the row, until `limit` rows judged inside
     /// are taken up with their values and one more such row without them;
     /// a row judged across a bound before then is taken up with its
-    /// values, and one after with its order value alone.
-    fn rows(&self, fit: impl Fn(&Piece, RowRef) -> PageFit) -> Vec<Walked> {
+    /// values, and one after with its order value alone. Rows across a
+    /// bound count nothing toward `limit`, so `Taken::spread` tells where
+    /// they lie on more than one page on either side of the rows inside.
+    fn rows(&self, fit: impl Fn(&Piece, RowRef) -> PageFit) -> Taken {
         let pieces: Box<dyn Iterator<Item = &Piece>> = match self.direction {
             Direction::OldestFirst => Box::new(self.pieces.iter()),
             Direction::NewestFirst => Box::new(self.pieces.iter().rev()),
         };
         let mut walked = Vec::new();
         let mut inside = 0;
+        // Pages across a bound read with values, before the first row
+        // inside and after it.
+        let mut straddling = [0_usize; 2];
         for piece in pieces.filter(|piece| piece.fit != PageFit::Outside) {
             let rows: Box<dyn Iterator<Item = i64>> = match self.direction {
                 Direction::OldestFirst => Box::new(piece.rows.clone()),
                 Direction::NewestFirst => Box::new(piece.rows.clone().rev()),
             };
+            let mut straddled = false;
             for row in rows {
                 let row = RowRef {
                     row_group: piece.row_group,
@@ -681,20 +705,34 @@ impl Walk<'_> {
                     PageFit::Outside => {}
                     PageFit::Inside if inside == self.limit => {
                         walked.push(Walked { row, values: false });
-                        return walked;
+                        return Taken::of(walked, straddling);
                     }
                     PageFit::Inside => {
                         inside += 1;
                         walked.push(Walked { row, values: true });
                     }
-                    PageFit::Straddles => walked.push(Walked {
-                        row,
-                        values: inside < self.limit,
-                    }),
+                    PageFit::Straddles => {
+                        let values = inside < self.limit;
+                        if values && !straddled {
+                            straddled = true;
+                            straddling[usize::from(inside > 0)] += 1;
+                        }
+                        walked.push(Walked { row, values });
+                    }
                 }
             }
         }
-        walked
+        Taken::of(walked, straddling)
+    }
+}
+
+impl Taken {
+    /// `rows`, spread where either count of `straddling` is above one.
+    fn of(rows: Vec<Walked>, straddling: [usize; 2]) -> Self {
+        Self {
+            rows,
+            spread: straddling.iter().any(|&pages| pages > 1),
+        }
     }
 }
 
@@ -1574,12 +1612,12 @@ mod tests {
         }
     }
 
-    /// Key 2's run of `PREFIXED_RUN_ROWS` rows between one row each of keys
-    /// 1 and 3, in pages of `PAGE` in one row group, every key's `j`th row
+    /// Key 2's run of `run_rows` rows between one row each of keys 1 and
+    /// 3, in pages of `PAGE` in one row group, every key's `j`th row
     /// ordered by `prefixed(j)`, with the column index truncated to
     /// `truncate` bytes, `None` leaving it whole.
-    fn prefixed_run(truncate: Option<usize>) -> Fixture {
-        let runs = [(1, 1), (2, PREFIXED_RUN_ROWS), (3, 1)];
+    fn prefixed_run(truncate: Option<usize>, run_rows: usize) -> Fixture {
+        let runs = [(1, 1), (2, run_rows), (3, 1)];
         let mut keys = Vec::new();
         let mut orders = Vec::new();
         for (key, rows) in runs {
@@ -1606,7 +1644,7 @@ mod tests {
         let limit = 3;
         let last = PREFIXED_RUN_ROWS - 1;
         for truncate in [Some(TRUNCATED_INDEX_BYTES), None] {
-            let opened = store(&prefixed_run(truncate)).await;
+            let opened = store(&prefixed_run(truncate, PREFIXED_RUN_ROWS)).await;
             for order_type in [OrderType::String, OrderType::Binary] {
                 let value = |j: usize| travelling(order_type, prefixed(j));
                 // Newest first below the run's last value, and oldest first
@@ -1655,6 +1693,91 @@ mod tests {
                         assert_eq!(got.rows, expected, "{case}");
                         assert_eq!(got.next, Some(value(*next)), "{case}");
                     }
+                }
+            }
+        }
+    }
+
+    /// Rows of the long run of the bounded reads under a truncated index:
+    /// many pages beyond the few a small limit's rows lie on.
+    const LONG_PREFIXED_RUN_ROWS: usize = 120;
+
+    /// Under a truncated index whose every entry is the one shared prefix,
+    /// every page of a long run lies across a bound that has that prefix,
+    /// so a bounded read takes the run's order pages first and then the
+    /// value pages of the rows it takes alone: the value bytes it reads
+    /// are those of the pages the limit's rows lie on, and the rows are the
+    /// model's.
+    #[tokio::test]
+    async fn test_read_run_under_a_truncated_index_reads_the_values_of_the_rows_taken() {
+        let limit = 3;
+        let last = LONG_PREFIXED_RUN_ROWS - 1;
+        let fixture = prefixed_run(Some(TRUNCATED_INDEX_BYTES), LONG_PREFIXED_RUN_ROWS);
+        let opened = store(&fixture).await;
+        let file_row = |j: usize| j + usize::try_from(FIRST_RUN_ROW).unwrap();
+        let run_pages = file_row(0) / PAGE..file_row(last) / PAGE + 1;
+        for order_type in [OrderType::String, OrderType::Binary] {
+            let value = |j: usize| travelling(order_type, prefixed(j));
+            let cases = [
+                (
+                    ScanBounds {
+                        after: Some(value(0)),
+                        ..bounds(Direction::OldestFirst)
+                    },
+                    vec![1, 2, 3],
+                    4,
+                ),
+                (
+                    ScanBounds {
+                        before: Some(value(last)),
+                        ..bounds(Direction::NewestFirst)
+                    },
+                    vec![last - 1, last - 2, last - 3],
+                    last - 4,
+                ),
+            ];
+            for residency in Residency::ALL {
+                let dir = tempfile::tempdir().unwrap();
+                let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
+                let stats = opened.stats();
+                let run = index
+                    .locate_run(&Key::Long(2), Reads::new().await.source())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                for (scan, taken, next) in &cases {
+                    let reads = Reads::new().await;
+                    let bytes_before = stats.bytes();
+                    let got = index
+                        .read_run(&run, scan, limit, &[0], &none_deleted, reads.source())
+                        .await
+                        .unwrap();
+                    let expected: Vec<_> = taken
+                        .iter()
+                        .map(|&j| {
+                            let value = Bytes::from(value_for(file_row(j)));
+                            (travelling(order_type, prefixed(j)), vec![Some(value)])
+                        })
+                        .collect();
+                    let case = format!("{residency} {order_type} {scan:?}");
+                    assert_eq!(got.rows, expected, "{case}");
+                    assert_eq!(got.next, Some(value(*next)), "{case}");
+                    let (first, last_taken) =
+                        (taken.iter().min().unwrap(), taken.iter().max().unwrap());
+                    let taken_pages = file_row(*first) / PAGE..file_row(*last_taken) / PAGE + 1;
+                    assert!(taken_pages.len() < run_pages.len() / 2, "{case}");
+                    let value_bytes = page_bytes(&index, index.value_leaf(0).unwrap(), taken_pages);
+                    assert!(value_bytes > 0, "{case}");
+                    let order_bytes = if residency == Residency::Disk {
+                        0
+                    } else {
+                        page_bytes(&index, index.order_leaf().unwrap(), run_pages.clone())
+                    };
+                    assert_eq!(
+                        stats.bytes() - bytes_before,
+                        value_bytes + order_bytes,
+                        "{case}"
+                    );
                 }
             }
         }

@@ -334,7 +334,8 @@ pub enum FindingCode {
     /// On an ordered table, the order column's column index is truncated,
     /// as its extremes against the file's exact least and greatest order
     /// value prove; long values sharing a prefix widen the pages a bound
-    /// selects.
+    /// selects, and a bound across more than one of them takes a second
+    /// round.
     OrderIndexTruncated,
     /// A value column's mean uncompressed value page is above the advice
     /// threshold.
