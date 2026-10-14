@@ -1431,11 +1431,27 @@ impl Table {
             .buffered(self.lookups.batch_fan_out)
             .try_collect()
             .await?;
+        // Each answer moves to the last position that lists its key and is
+        // cloned only for the positions before it.
+        let mut last_at = vec![0; answered.len()];
+        for (position, &at) in positions.iter().enumerate() {
+            last_at[at] = position;
+        }
+        let mut answered: Vec<Option<Scanned>> = answered.into_iter().map(Some).collect();
+        let results = positions
+            .iter()
+            .enumerate()
+            .map(|(position, &at)| {
+                let answer = if last_at[at] == position {
+                    answered[at].take()
+                } else {
+                    answered[at].clone()
+                };
+                answer.expect("an answer moves out at its key's last position alone")
+            })
+            .collect();
         Ok(MultiScanLookup {
-            results: positions
-                .into_iter()
-                .map(|at| answered[at].clone())
-                .collect(),
+            results,
             snapshot_id: generation.snapshot_id,
         })
     }
