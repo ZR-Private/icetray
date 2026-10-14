@@ -1,28 +1,40 @@
 # Ordered scan costs and the key-value path beside them
 
-Measured 2026-10-13 on one Apple M3 Pro. The measurement answers two
-questions RFD 025 (Ordered rows per key) raises. First, whether the
-key-value path keeps its costs per call after the ordered-rows work: warm
-and cold Get, MultiGet, and misses, in every residency tier, on a process
-serving key-value tables alone and on one that also serves an ordered
-table. Second, what a Scan and a MultiScan of an ordered table cost in
-each tier, warm and cold.
+Measured 2026-10-13 on one Apple M3 Pro, with an allocation fix measured
+again on 2026-10-14. The measurement answers two questions RFD 025
+(Ordered rows per key) raises. First, whether the key-value path keeps
+its costs per call after the ordered-rows work: warm and cold Get,
+MultiGet, and misses, in every residency tier, on a process serving
+key-value tables alone and on one that also serves an ordered table.
+Second, what a Scan and a MultiScan of an ordered table cost in each
+tier, warm and cold.
 
-The key-value path keeps its latency and throughput in all but one of 30
-comparisons. In 27 the two binaries' ranges overlap, with medians that
-move by 5% or less, and in a 28th, the Full-tier warm hit on one task,
-the after runs are faster by 1 ns (12.541 against 12.542 µs). Two fall
-outside the spread on the slow side, and were run again. A 1,000-key
-MultiGet in the Bloom tier on one task takes 0.4% longer (10 µs on
-2.64 ms), and the second set reproduced it at 0.8%. Cold-hit throughput
-in the Bloom tier on eleven tasks fell 3.8% in the first set, and the
-second set did not reproduce it (0.6% lower, within its spread).
+The key-value path was compared in 30 cells, p50 on one task and
+throughput on eleven, for five scenarios in three tiers. In 27 the two
+binaries' ranges overlap, and the medians move by at most 5.3%, the
+throughput of a 100-key MultiGet in the Disk tier on eleven tasks, which
+rose. Three fall outside the spread, and the two on the slow side were
+run again:
 
-The allocation counter shows a change the timings do not. Every
-key-value call makes the same number of allocations as before and
-requests more bytes: 96 bytes more per hit, about 290 bytes more per key
+- The Full-tier warm hit on one task: every after run is faster than
+  every before run, by 1 ns at the closest (12.541 against 12.542 µs).
+- A 1,000-key MultiGet in the Bloom tier on one task takes 0.4% longer
+  (10 µs on 2.64 ms). The second set reproduced it at 0.8%, and after the
+  allocation fix three more sets measured it 0.6% slower over nine runs
+  per binary, outside the spread in one of the three. It is the one
+  slowdown that reproduced.
+- Cold-hit throughput in the Bloom tier on eleven tasks fell 3.8% in the
+  first set. The second set did not reproduce it (0.6% lower, within its
+  spread).
+
+The allocation counter showed a change the timings did not. At `a126a1c`
+every key-value call made the same number of allocations as before and
+requested more bytes: 96 bytes more per hit, about 290 bytes more per key
 of a MultiGet, and about 8 KiB more per page a cold read fetches, the
-same in every run. Serving an idle ordered table beside the key-value one
+same in every run. Two `async fn` wrappers in the read path had grown
+the futures those allocations hold. `22b04dc` returns the inner futures
+from both, and the bytes per call match the baseline's again in every
+scenario measured. Serving an idle ordered table beside the key-value one
 moves no figure outside the spread of the key-value runs alone, except
 the Full-tier warm hit on one task, 0.7% slower and inside the spread of
 the runs before the change.
@@ -92,6 +104,43 @@ as well, 123.4 µs. A MultiScan of 10 keys costs 24 µs a key warm, and
   reading as fast.
 - **Loads.** Three loads per run of each table and tier; the figure is the
   median of rounds 2 and 3 of the three runs.
+- **Re-measurement.** The allocation fix, `22b04dc`, against a new build
+  of `97f39af`, on 2026-10-14 with the load average at 2 to 8:
+  `warm-hit`, `cold-hit`, `multi-get-100`, and `multi-get-1000` on the
+  long table in every tier on one task, three runs per binary,
+  alternating; then `multi-get-1000` on one task in the Bloom tier, and
+  again in the Full and Bloom tiers, three runs per binary each,
+  alternating.
+
+The runs are reproduced from a checkout of the after commit. The before
+binary is built in a worktree of `97f39af`, and runs from there, so its
+results record that commit:
+
+```sh
+cargo build --release --locked -p icetray-testkit --example bench
+git worktree add --detach ../bench-before 97f39af
+(cd ../bench-before && CARGO_TARGET_DIR=target \
+  cargo build --release --locked -p icetray-testkit --example bench)
+
+DATA=$PWD/target/bench/tables OUT=$PWD/target/bench/results
+target/release/examples/bench --prepare --table long,ordered --values random --data-dir $DATA
+
+KV=warm-hit,cold-hit,miss,multi-get-100,multi-get-1000
+RUN="--table long --values random --tier full,disk,bloom --tasks 11 --duration 5 --warmup 1 --data-dir $DATA"
+for n in 1 2 3; do
+  (cd ../bench-before && target/release/examples/bench --scenario $KV $RUN --out-dir $OUT/before-$n)
+  target/release/examples/bench --scenario $KV,kv-beside-ordered $RUN --out-dir $OUT/after-$n
+done
+for n in 1 2 3; do
+  target/release/examples/bench --scenario scan-warm,scan-cold,scan-bounded,multi-scan-10,multi-scan-10-cold,load \
+    --table long,ordered --values random --tier full,disk,bloom --tasks 11 --duration 5 --warmup 1 \
+    --data-dir $DATA --out-dir $OUT/scan-$n
+done
+```
+
+The re-measurement runs the key-value loop with `--mode single` and
+`--scenario warm-hit,cold-hit,multi-get-100,multi-get-1000`, then with
+`--scenario multi-get-1000` and `--tier bloom`, then `--tier full,bloom`.
 
 ## The key-value path
 
@@ -150,30 +199,77 @@ batch, 10 to 20 ns a key. The same batch in the Full tier did not move
 the spread once and inside it the second time, so the evidence does not
 separate it from the machine's other load.
 
-Allocations per operation on one task, the median of the three runs. The
-counts are unchanged; the requested bytes rose, by the same amount in
-every run:
+The Bloom-tier MultiGet of 1,000 keys on one task, measured again after
+the allocation fix, p50 in ms:
 
-| scenario | allocations, before and after | bytes before | bytes after | difference |
+| set | before (`97f39af`) | after (`22b04dc`) | difference |
+|---|--:|--:|--:|
+| among the other key-value scenarios | 2.641 (2.637–2.654) | 2.653 (2.642–3.143) | +0.5%, ranges overlap |
+| alone | 2.632 (2.630–2.638) | 2.649 (2.648–2.669) | +0.7%, outside the spread |
+| beside the Full-tier batch | 2.659 (2.632–2.661) | 2.656 (2.644–2.672) | −0.1%, ranges overlap |
+| all nine runs | 2.638 (2.630–2.661) | 2.653 (2.642–3.143) | +0.6% |
+
+Every after run takes longer than 2.641 ms, and six of the nine before
+runs take 2.641 ms or less, so the slowdown of about 15 ns a key remains
+with the allocated bytes restored. The larger futures do not account for
+it, and these runs do not identify its cause. The Full-tier batch stays
+within the spread: 2.548 ms before and 2.543 after among the other
+scenarios, and 2.559 before and 2.544 after beside the Bloom-tier batch.
+
+Allocations per operation on one task, the median of three runs. The
+counts are the same in all three builds. The bytes and counts are from
+the re-measurement; the `a126a1c` column is the first set's difference
+against its own before runs, the `22b04dc` column the re-measurement's:
+
+| scenario | allocations | bytes, `97f39af` | `a126a1c` | `22b04dc` |
 |---|--:|--:|--:|--:|
-| warm hit, Full | 34.0 | 138,466 | 138,562 | +96 |
-| warm hit, Disk | 39.0 | 140,077 | 140,173 | +96 |
-| warm hit, Bloom | 36.0 | 138,610 | 138,705 | +96 |
-| cold hit, Full | 72.7 | 363,129 | 371,153 | +8,023 (0.99 page fetches) |
-| cold hit, Disk | 77.7 | 364,762 | 372,795 | +8,033 (0.99 page fetches) |
-| cold hit, Bloom | 113.1 | 385,003 | 400,983 | +15,980 (1.99 page fetches) |
-| miss, every tier | 3.0 to 18.1 | | | 0 |
-| MultiGet 100, Full | 3,313 | 15,079,609 | 15,109,350 | +29,741 |
-| MultiGet 1,000, Full | 32,197 | 150,213,609 | 150,502,585 | +288,976 |
+| warm hit, Full | 34.0 | 138,465 | +96 | +0 |
+| warm hit, Disk | 39.2 | 140,094 | +96 | −1 |
+| warm hit, Bloom | 36.0 | 138,609 | +96 | +0 |
+| cold hit, Full | 72.8 | 363,145 | +8,023 | +5 |
+| cold hit, Disk | 77.7 | 364,749 | +8,033 | +2 |
+| cold hit, Bloom | 113.3 | 385,027 | +15,980 | +9 |
+| MultiGet 100, Full | 3,304 | 15,078,607 | +29,741 | +4 |
+| MultiGet 100, Disk | 3,815 | 15,243,654 | +29,748 | +102 |
+| MultiGet 100, Bloom | 3,504 | 15,093,014 | +29,679 | −5 |
+| MultiGet 1,000, Full | 32,181 | 150,211,661 | +288,976 | +195 |
+| MultiGet 1,000, Disk | 37,191 | 151,859,381 | +288,020 | −445 |
+| MultiGet 1,000, Bloom | 34,184 | 150,355,458 | +288,954 | +0 |
 
-So a warm hit requests 96 bytes more, a key of a MultiGet about 290
-bytes more, and each page a cold read fetches about 8 KiB more, in
+At `a126a1c` a warm hit requested 96 bytes more, a key of a MultiGet
+about 290 bytes more, and each page a cold read fetches about 8 KiB
+more (0.99 page fetches per cold hit, 1.99 in the Bloom tier), in
 allocations that already existed. A miss, which reads only the key page,
-is unchanged. GETs and local reads per operation are unchanged in every
-scenario. The bench does not say which allocations grew. Equal counts
-with larger sizes are the mark of a type that grew, such as a future the
-runtime boxes when a task is spawned, which grows with the state an
-`async fn` holds across an await.
+was unchanged then and was not measured again. At `22b04dc` the
+differences are at most 9 bytes for a one-key call and under a byte per
+key of a MultiGet, the size of the variation between runs of one binary,
+which the rare allocations inside a window move. GETs and local reads
+per operation are the same in every scenario and build.
+
+A bisection of the branch, with an exact-size histogram of the
+allocations, located the growth in two `async fn` wrappers. An `async
+fn` keeps its arguments in its state beside the state of the future it
+awaits, so a wrapper that only awaits another future holds that
+future's inputs a second time:
+
+- `Run::fetch`, the page cache's run of a caller's fetch, became an
+  `async fn` awaiting `Run::run`, so its future held one more copy of
+  the caller's fetch future, about 2.4 KiB for a hedged read. foyer
+  stores that future three times for each page it fetches, once in the
+  boxed fetch builder and twice in the boxed fetch, which is the 8 KiB a
+  cold page fetch gained.
+- `Storage::read_range_hedged` became an `async fn` around
+  `read_span_hedged`, 48 bytes more in the read future. Every lookup
+  future lays out two of them, for the value page and the dictionary
+  page, warm hits included, which is the 96 bytes a hit gained. A
+  batched key's future is stored three times, in the batch's buffer, its
+  `FuturesUnordered` node, and the generation's vector of per-file
+  lookups, which is the 290 bytes a key gained.
+
+`22b04dc` makes both plain functions that return the inner future. Two
+unit tests in `icetray-core` pin the shapes: `Run::fetch`'s future holds
+at most two copies of the caller's fetch future, and
+`read_range_hedged`'s future is no larger than `read_span_hedged`'s.
 
 Beside an idle ordered table, the key-value figures stay within the spread
 of the after runs alone in 23 of 24 comparisons. The exception is the
@@ -209,22 +305,31 @@ Disk. Medians of three runs.
 A cold Scan's reads are the ones RFD 025 counts for a compacted table: in
 the Full tier one GET for the value page and one for the order page, in
 the Disk tier the value page's GET with the order column read from the
-local directory, and in the Bloom tier the key page's GET besides. A
-Disk-tier Scan makes about two local reads warm or cold, and that sets
-its cost: 38.4 µs warm against 20.5 µs in the Full tier, and on eleven
-tasks about 49,000 Scans a second, some 100,000 local reads, the same
-blocking-pool handoff ceiling that holds a Disk-tier Get near 135,000 a
-second ([the performance sweep](2026-09-26-performance-sweep.md)).
+local directory, and in the Bloom tier the key page's GET besides.
+
+A Disk-tier Scan makes about two local reads warm or cold and takes
+38.4 µs warm against 20.5 µs in the Full tier; the inference, without a
+profile, is that the local reads make most of the difference. On eleven
+tasks the Disk tier serves about 49,000 Scans a second, about 102,000
+local reads, against 130,000 to 135,000 local reads a second for a
+Disk-tier Get, which makes one (the warm hit and the miss above). The
+performance sweep traced a Disk-tier Get's ceiling near 135,000 a second
+to the handoff of each local read to the blocking pool
+([the performance sweep](2026-09-26-performance-sweep.md)). The Scan's
+rate is consistent with a handoff limit as well; these runs do not
+establish that it is the same one.
 
 A page of 10 rows costs 78% of a whole run of 100 (16.1 against
-20.5 µs warm), so most of a warm Scan is finding the run and decoding its
-pages, and little is the rows returned.
+20.5 µs warm). The inference, without a profile, is that finding the run
+and decoding its pages take most of a warm Scan, and the rows returned
+little.
 
 A warm MultiScan of 10 keys takes 243.9 µs, 24.4 µs a key, more than 10
-Scans one after another would (10 × 20.5 µs). It reads its keys
-concurrently on the calling task, which overlaps their reads but spreads
-no decoding across cores, so warm it gains nothing over sequential Scans
-and pays for the concurrency. Cold, the overlap pays: 550.5 µs for 10
+Scans one after another would (10 × 20.5 µs). A MultiScan reads its keys
+concurrently on the calling task, which overlaps their reads and keeps
+their decoding on one core. The inference from that design, without a
+profile, is that warm it gains nothing over sequential Scans and pays
+for the concurrency. Cold, the overlap pays: 550.5 µs for 10
 keys against 10 × 79.2 µs one after another, with about two GETs a key in
 flight together under `server.batch_fan_out`.
 
@@ -244,7 +349,8 @@ The same 2,000,000 rows as the long key-value table, in 4 files:
 Loading the ordered table makes one more read per file than the
 key-value table, the order column, as RFD 025 counts for a file of one
 row group. It takes about 1.8 times the wall and CPU time and five times
-the allocated bytes, for the order checks across 2,000,000 rows. Its
+the allocated bytes; the inference, without a profile, is that the order
+checks across 2,000,000 rows account for the difference. Its
 resident index is smaller, because it holds 20,000 distinct keys rather
 than 2,000,000. A Disk-tier load that reuses the chunk files takes
 1.12 ms for the ordered table and 0.98 ms for the key-value one.
@@ -253,13 +359,15 @@ than 2,000,000. A Disk-tier load that reuses the chunk files takes
 
 The key-value path keeps its latency and throughput within the run-to-run
 spread of this host in every comparison but one, the Bloom-tier MultiGet
-of 1,000 keys on one task, 0.4 to 0.8% slower in two alternating sets.
-It keeps its allocation counts, GETs, and local reads exactly. It does
-not keep its allocated bytes: 96 bytes more per hit, about 290 per batched
-key, and about 8 KiB per page fetched. Those are findings for the
-maintainer to weigh against RFD 025's statement that a key-value table
-keeps its cost per call. The bytes are deterministic, so any build can
-reproduce them with the bench's allocation counter.
+of 1,000 keys on one task: 0.4 to 0.8% slower in the first two sets, and
+0.6% slower over nine runs per binary after the allocation fix. Its cause
+is not identified; it is a finding for the maintainer to weigh against
+RFD 025's statement that a key-value table keeps its cost per call. The
+path keeps its allocation counts, GETs, and local reads exactly, and at
+`22b04dc` its allocated bytes per call as well. The bytes are
+deterministic, so any build can check them with the bench's allocation
+counter, and the two size tests fail on a wrapper of the kind that grew
+them.
 
 An idle ordered table beside the key-value one costs the key-value calls
 nothing these runs resolve. A Scan load running beside them would share
