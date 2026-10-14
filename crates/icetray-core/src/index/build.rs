@@ -1324,8 +1324,8 @@ mod tests {
     };
     use crate::index::identity_of;
     use crate::index::page_header::{
-        BYTE_ARRAY_LENGTH_PREFIX_BYTES, MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES, NIBBLE_MASK,
-        PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader,
+        BYTE_ARRAY_LENGTH_PREFIX_BYTES, MOST_BYTES_PER_VALUE, MOST_KEY_PAGE_BYTES,
+        MOST_VALUE_PAGE_BYTES, NIBBLE_MASK, PAGE_ENCODING_ALLOWANCE_BYTES, PageBody, PageHeader,
     };
     use crate::index::testing::{
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
@@ -3724,6 +3724,66 @@ mod tests {
         assert_eq!(
             verified.order.unwrap().max,
             OrderValue::Str(String::from_utf8(long_text(2).unwrap()).unwrap())
+        );
+    }
+
+    /// Order pages get the value pages' header checks and their 64 MiB
+    /// ceiling at load (RFD 025, Load; RFD 004): an order page whose header
+    /// declares more uncompressed bytes than `MOST_VALUE_PAGE_BYTES` is
+    /// refused before parquet reserves them, naming the order page.
+    #[tokio::test]
+    async fn test_verify_ordered_refuses_an_order_page_header_over_the_ceiling() {
+        let opened = store(&ordered_of(&[(1, 1), (1, 2), (2, 1)])).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let layout = ordered_layout(KeyType::Long, OrderType::Long);
+        let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
+            .await
+            .unwrap();
+        let order = inspected.layout.order.unwrap();
+        let order_leaf = inspected.layout.order_leaf().unwrap();
+        let page = ChunkPage::Data(0);
+        let claimed = i32::try_from(MOST_VALUE_PAGE_BYTES + 1).unwrap();
+        let ranges = inspected
+            .layout
+            .verified_ranges(&loaded, opened.handle.size());
+        let mut parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
+        let at = ranges
+            .iter()
+            .position(|range| {
+                *range == column_chunk_ranges(&loaded, order_leaf, opened.handle.size())[0]
+            })
+            .unwrap();
+        let (range, bytes) = &parts[at];
+        let patched = with_header_claims(
+            bytes,
+            header_at(&loaded, order_leaf, page),
+            &[(HeaderField::UncompressedPageSize, claimed)],
+        );
+        let grown = i64::try_from(patched.len() - bytes.len()).unwrap();
+        let start = range.start;
+        parts[at] = (start..start + count(patched.len()), Bytes::from(patched));
+        let metadata = moved_by_header(&loaded, order_leaf, page, grown);
+        let chunks = Arc::new(Segments::new(parts, opened.handle.size()));
+        let path = location();
+        let column = Column {
+            metadata: &metadata,
+            leaf: inspected.layout.key_leaf,
+            path: &path,
+        };
+        assert_eq!(
+            fault_of(verify_ordered(
+                TABLE,
+                &column,
+                KeyShape::Long,
+                order,
+                &chunks
+            )),
+            over_bound(
+                page,
+                HeaderField::UncompressedPageSize,
+                claimed,
+                MOST_VALUE_PAGE_BYTES
+            )
         );
     }
 
