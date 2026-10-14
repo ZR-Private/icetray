@@ -884,9 +884,9 @@ pub struct OrderSummary {
     /// The most rows one Scan returns for a key: the table's configured
     /// `max_scan_rows`, or the default.
     pub max_scan_rows: u32,
-    /// The rows of the longest run of one key across every file: a caller
-    /// reads such a key's history in this many rows over
-    /// `ceil(longest_run / max_scan_rows)` Scans.
+    /// The rows of the longest run of one key in any one file. A key that
+    /// several files hold, as appends between compactions leave it, has
+    /// more rows than its longest run, so this is a floor on its history.
     pub longest_run: u64,
 }
 
@@ -1064,12 +1064,9 @@ pub fn diagnose(
                 column: order.name.clone(),
                 order_type: order.order_type,
                 max_scan_rows,
-                longest_run: facts
-                    .iter()
-                    .filter_map(|file| file.report.order.as_ref())
-                    .map(|order| order.longest_run)
-                    .max()
-                    .unwrap_or(0),
+                longest_run: longest_run_of(
+                    facts.iter().filter_map(|file| file.report.order.as_ref()),
+                ),
             }),
     };
     TableReport {
@@ -1077,6 +1074,15 @@ pub fn diagnose(
         findings,
         files: facts.into_iter().map(|file| file.report).collect(),
     }
+}
+
+/// The most rows one key's run holds in any one of `files`; 0 for none.
+fn longest_run_of<'a>(files: impl IntoIterator<Item = &'a FileOrderReport>) -> u64 {
+    files
+        .into_iter()
+        .map(|file| file.longest_run)
+        .max()
+        .unwrap_or(0)
 }
 
 /// What the `doctor` command reports of a table (`examine`): the report,
@@ -3658,6 +3664,30 @@ mod tests {
         assert_eq!(report.files[0].bloom_bits_per_key, None);
         assert_eq!(report.summary.predicted.bloom, None);
         assert_eq!(report.summary.predicted.bloom_bits_per_key, None);
+    }
+
+    /// The order report of a file whose longest run is `longest_run`.
+    fn order_report(longest_run: u64) -> FileOrderReport {
+        FileOrderReport {
+            min: OrderValue::Long(0),
+            max: OrderValue::Long(1),
+            longest_run,
+            distinct_keys: vec![1],
+        }
+    }
+
+    #[test]
+    fn test_longest_run_of_is_the_maximum_over_files_in_any_order() {
+        let (long, short) = (7, 3);
+        let both = [order_report(long), order_report(short)];
+        assert_eq!(longest_run_of(&both), long);
+        assert_eq!(longest_run_of(both.iter().rev()), long);
+        assert_eq!(longest_run_of(&[order_report(short)]), short);
+    }
+
+    #[test]
+    fn test_longest_run_of_no_files_is_zero() {
+        assert_eq!(longest_run_of(&[]), 0);
     }
 
     #[tokio::test]
