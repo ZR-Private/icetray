@@ -402,9 +402,12 @@ stated in what a lookup costs, so it means the same on every table:
 - `optimal`: a hit costs one GET for each column it reads and a miss
   none, and a lookup probes one file and decodes one key page of ordinary
   size.
-- `balanced`: a lookup still probes one file, with a fixed extra cost: an
-  extra GET per hit, a GET for a miss that passes the bloom filter, larger
-  key pages, or key pages read from the device instead of the page cache.
+- `balanced`: a lookup or `Scan` still probes one file, with a fixed
+  extra cost: an extra GET per hit, a GET for a miss that passes the
+  bloom filter, larger key pages, or key pages read from the device
+  instead of the page cache. The exception is a `Scan` of an edge key
+  shared by files one snapshot added, as a compaction that rolls files
+  by size writes them, which reads every file that holds the key.
 - `permissive`: any snapshot icetray serves correctly, including one where
   a lookup probes more than one file.
 
@@ -431,7 +434,9 @@ The line between `balanced` and `permissive` is the one that matters for
 operations. A cost within one file follows from how the files are written
 and stays constant. Extra files probed follow from how writers commit to
 the table, and their number grows with every append until a compaction
-merges the files.
+merges the files. The files that share an edge key were written by one
+snapshot, so how many a `Scan` of that key reads is fixed when they are
+written, and that cost stays `balanced`.
 
 Choose the level from the latency the table's readers need and the
 layout its writer can produce:

@@ -43,9 +43,11 @@ pub enum Level {
     /// one key page of ordinary size, and reads its key chunks from memory
     /// or the page cache.
     Optimal,
-    /// A lookup probes one file, with a fixed extra cost: extra GETs per
-    /// hit, GETs on a miss, larger key pages, or device reads of key
-    /// chunks.
+    /// A lookup or Scan probes one file, with a fixed extra cost: extra
+    /// GETs per hit, GETs on a miss, larger key pages, or device reads of
+    /// key chunks; except a Scan of an edge key shared by files one
+    /// snapshot added, as a compaction that rolls files by size writes
+    /// them, which reads every file that holds the key.
     Balanced,
     /// Any snapshot icetray serves correctly, including one where a lookup
     /// probes more than one file.

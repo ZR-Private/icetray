@@ -49,8 +49,9 @@ pub const SCAN_ROWS_BUCKETS: [f64; 14] = [
 ];
 
 /// Histogram bucket bounds for `scan_files`: 0 for a key no file holds, 1
-/// for a compacted table, and then the counts appends and overlap reach,
-/// up to the 64 files past which a table is far from any level.
+/// for a key held in one file, and then the counts shared edge keys,
+/// appends, and overlap reach, up to the 64 files past which a table is
+/// far from any level.
 pub const SCAN_FILES_BUCKETS: [f64; 11] =
     [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0];
 

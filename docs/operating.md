@@ -111,7 +111,7 @@ Counters and histograms:
 | `icetray_lookup_seconds` (histogram) | `table`, `result` | every table and result | Lookup latency. |
 | `icetray_object_get_seconds` (histogram) | `kind` | every kind | Object-store GET latency. |
 | `icetray_scan_rows` (histogram) | `table` | every ordered table | Rows each answered Scan of one key returned. |
-| `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 on a compacted table, more where appends overlap. |
+| `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 for a key held in one file, as on a table compacted to one file per bucket; more for an edge key that a compaction rolling files by size split across files, and for a key in files that appends overlap. |
 | `icetray_scan_seconds` (histogram) | `table`, `temperature` | every ordered table and temperature | Latency of each answered Scan of one key. |
 
 The latency histograms' buckets run from 100 microseconds to 2 seconds,

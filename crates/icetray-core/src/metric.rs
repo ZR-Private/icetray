@@ -65,7 +65,10 @@ pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
 /// Rows each answered Scan of one key returned, by `table` (RFD 025).
 pub const SCAN_ROWS: &str = "icetray_scan_rows";
 /// Files holding the key each answered Scan of one key read, by `table`
-/// (RFD 025): one on a compacted table, more where appends overlap.
+/// (RFD 025): one for a key held in one file, as on a table compacted to
+/// one file per bucket; more for an edge key that a compaction rolling
+/// files by size split across files, and for a key in files that appends
+/// overlap.
 pub const SCAN_FILES: &str = "icetray_scan_files";
 /// Latency in seconds of each answered Scan of one key, by `table` and
 /// `temperature` (`Temperature`, RFD 025).
