@@ -215,7 +215,10 @@ fn pick<T: Copy>(rng: &mut StdRng, items: &[T]) -> T {
 /// column, nulls, and a small `max_scan_rows`, each drawn by `rng`.
 fn random_ordered_spec(rng: &mut StdRng, name: &str) -> (FixtureSpec, u32) {
     let kind = pick(rng, &ORDER_KINDS);
-    let bytewise = matches!(kind, OrderKind::Str | OrderKind::Bin | OrderKind::Fixed(_));
+    let bytewise = matches!(
+        kind,
+        OrderKind::Str | OrderKind::PaddedStr(_) | OrderKind::Bin | OrderKind::Fixed(_)
+    );
     let layout = Layout {
         page_rows: rng.random_range(PAGE_ROWS),
         row_group_rows: rng
@@ -810,6 +813,7 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
             | OrderKind::TimestampNs
             | OrderKind::TimestampTzNs
             | OrderKind::Str
+            | OrderKind::PaddedStr(_)
             | OrderKind::Bin
             | OrderKind::Fixed(_) => None,
         };

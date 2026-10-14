@@ -14,11 +14,12 @@ use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
 use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
 use super::{
-    FileFault, KeyShape, OrderLeaf, OrderShape, ResidentBytes, ValueColumn, ValueShape,
-    bits_per_key, file_fault, identity_of, record, saturating_sum, saturating_sum_all,
+    FileFault, KeyShape, OrderLeaf, OrderShape, ResidentBytes, ResidentParts, ValueColumn,
+    ValueShape, bits_per_key, file_fault, identity_of, record, saturating_sum, saturating_sum_all,
 };
 use crate::approx;
 use crate::column;
+use crate::config::Residency;
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{ChunkRules, LocalDir, chunk_file_bytes};
@@ -672,6 +673,56 @@ impl ResidentSet {
             filters,
             rows: approx::measured(metadata.file_metadata().num_rows()),
         }
+    }
+
+    /// The parts `residency` holds (`ResidentParts`), with the footer split
+    /// over `kept`, the footer as kept that `footer` measures, whose order
+    /// column is at `order_leaf`; `None` only for Bloom when the filters
+    /// are. Each footer part is what `kept` loses without it, removed in
+    /// turn: the order column's column index, then the key column's, then
+    /// the offset indexes, so the footer parts sum to `footer`.
+    pub(super) fn parts(
+        &self,
+        kept: &ParquetMetaData,
+        order_leaf: Option<usize>,
+        residency: Residency,
+    ) -> Option<ResidentParts> {
+        let size = |metadata: ParquetMetaData| approx::count(metadata.memory_size());
+        let mut builder = kept.clone().into_builder();
+        if let (Some(mut column_index), Some(leaf)) = (builder.take_column_index(), order_leaf) {
+            for row_group in &mut column_index {
+                if let Some(entry) = row_group.get_mut(leaf) {
+                    *entry = ColumnIndexMetaData::NONE;
+                }
+            }
+            builder = builder.set_column_index(Some(column_index));
+        } else {
+            builder = builder.set_column_index(kept.column_index().cloned());
+        }
+        let without_order_index = size(builder.build());
+        let without_column_index = size(kept.clone().into_builder().set_column_index(None).build());
+        let without_page_index = size(
+            kept.clone()
+                .into_builder()
+                .set_column_index(None)
+                .set_offset_index(None)
+                .build(),
+        );
+        let (key_chunks, filters) = match residency {
+            Residency::Full => (self.key_chunks, 0),
+            Residency::Disk => (0, 0),
+            Residency::Bloom => (0, self.filters?),
+        };
+        Some(ResidentParts {
+            footer: without_page_index,
+            key_column_index: without_order_index.saturating_sub(without_column_index),
+            order_column_index: self.footer.saturating_sub(without_order_index),
+            offset_indexes: without_column_index.saturating_sub(without_page_index),
+            key_fences: self.fences,
+            order_facts: self.order_facts,
+            key_chunks,
+            filters,
+        })
     }
 }
 

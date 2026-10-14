@@ -64,6 +64,12 @@ pub enum OrderKind {
     /// Iceberg `string`: the raw value as zero-padded decimal, so bytewise
     /// order is numeric order. Raw values must not be negative.
     Str,
+    /// Iceberg `string`: the raw value as decimal zero-padded to this many
+    /// digits, or to `Str`'s when that is more, so bytewise order is
+    /// numeric order and every value starts with the zeros the width adds
+    /// past its digits: a long prefix all values share, inside which a
+    /// truncated column index cuts. Raw values must not be negative.
+    PaddedStr(u32),
     /// Iceberg `binary`: the raw value as eight big-endian bytes. Raw
     /// values must not be negative.
     Bin,
@@ -83,7 +89,7 @@ impl OrderKind {
             Self::TimestampTz => PrimitiveType::Timestamptz,
             Self::TimestampNs => PrimitiveType::TimestampNs,
             Self::TimestampTzNs => PrimitiveType::TimestamptzNs,
-            Self::Str => PrimitiveType::String,
+            Self::Str | Self::PaddedStr(_) => PrimitiveType::String,
             Self::Bin => PrimitiveType::Binary,
             Self::Fixed(width) => PrimitiveType::Fixed(u64::from(width)),
         }
@@ -102,7 +108,8 @@ impl OrderKind {
             Self::Int | Self::Date => i32::try_from(raw)
                 .ok()
                 .map(|narrow| OrderValue::Long(i64::from(narrow))),
-            Self::Str => string_of(raw).map(OrderValue::Str),
+            Self::Str => string_of(raw, ORDER_STRING_DIGITS).map(OrderValue::Str),
+            Self::PaddedStr(width) => string_of(raw, padded_digits(width)).map(OrderValue::Str),
             Self::Bin => bytes_of(raw, ORDER_LONG_BYTES).map(OrderValue::Bytes),
             Self::Fixed(width) => bytes_of(raw, width_of(width)).map(OrderValue::Bytes),
         }
@@ -118,9 +125,9 @@ impl OrderKind {
                 .map(|&raw| i32::try_from(raw).map_err(|_| unencodable(raw).into()))
                 .collect()
         };
-        let strings = || -> Result<Vec<String>> {
+        let strings = |digits: usize| -> Result<Vec<String>> {
             raws.iter()
-                .map(|&raw| string_of(raw).ok_or_else(|| unencodable(raw).into()))
+                .map(|&raw| string_of(raw, digits).ok_or_else(|| unencodable(raw).into()))
                 .collect()
         };
         let bytes = |width: usize| -> Result<Vec<Vec<u8>>> {
@@ -140,7 +147,8 @@ impl OrderKind {
             Self::TimestampTzNs => {
                 Arc::new(TimestampNanosecondArray::from(raws.to_vec()).with_timezone(UTC))
             }
-            Self::Str => Arc::new(StringArray::from(strings()?)),
+            Self::Str => Arc::new(StringArray::from(strings(ORDER_STRING_DIGITS)?)),
+            Self::PaddedStr(width) => Arc::new(StringArray::from(strings(padded_digits(width))?)),
             Self::Bin => Arc::new(BinaryArray::from_iter_values(bytes(ORDER_LONG_BYTES)?)),
             Self::Fixed(width) => Arc::new(FixedSizeBinaryArray::new(
                 i32::try_from(width).map_err(|_| SpecFault::OrderUnencodable {
@@ -159,11 +167,18 @@ fn width_of(width: u32) -> usize {
     usize::try_from(width).expect("a fixed width fits usize")
 }
 
-/// `raw` as zero-padded decimal, or `None` when negative.
-fn string_of(raw: i64) -> Option<String> {
+/// `raw` as decimal zero-padded to `digits`, or `None` when negative.
+fn string_of(raw: i64, digits: usize) -> Option<String> {
     u64::try_from(raw)
         .ok()
-        .map(|value| format!("{value:0ORDER_STRING_DIGITS$}"))
+        .map(|value| format!("{value:0digits$}"))
+}
+
+/// The digits a `PaddedStr` of `width` pads to: `width`, or
+/// `ORDER_STRING_DIGITS` when that is more, so every non-negative long
+/// fits and bytewise order stays numeric order.
+fn padded_digits(width: u32) -> usize {
+    width_of(width).max(ORDER_STRING_DIGITS)
 }
 
 /// `raw` as `width` big-endian bytes, or `None` when negative or when it
@@ -414,6 +429,9 @@ mod tests {
     /// A fixed width wider than a long.
     const WIDE_WIDTH: u32 = 16;
 
+    /// A padded string width far past a long's digits.
+    const WIDE_DIGITS: u32 = 80;
+
     /// A raw value past 32 bits.
     const PAST_32_BITS: i64 = 1 << 33;
 
@@ -523,6 +541,8 @@ mod tests {
             OrderKind::TimestampNs,
             OrderKind::TimestampTzNs,
             OrderKind::Str,
+            OrderKind::PaddedStr(WIDE_DIGITS),
+            OrderKind::PaddedStr(NARROW_WIDTH),
             OrderKind::Bin,
             OrderKind::Fixed(NARROW_WIDTH),
             OrderKind::Fixed(WIDE_WIDTH),
@@ -537,6 +557,29 @@ mod tests {
         }
     }
 
+    /// A padded string is as wide as its width asks, or as `Str`'s when
+    /// that is wider, and the zeros past a value's digits are a prefix
+    /// every value of the width shares.
+    #[test]
+    fn test_encode_pads_a_string_to_its_width() {
+        let wide = |raw| {
+            let encoded = order_value(OrderKind::PaddedStr(WIDE_DIGITS), raw);
+            let OrderValue::Str(text) = encoded else {
+                panic!("a string kind encodes {encoded:?}");
+            };
+            text
+        };
+        let (low, high) = (wide(0), wide(LARGE_RAW));
+        assert_eq!(low.len(), width_of(WIDE_DIGITS));
+        assert_eq!(high.len(), width_of(WIDE_DIGITS));
+        let shared = width_of(WIDE_DIGITS) - ORDER_STRING_DIGITS;
+        assert_eq!(low[..shared], high[..shared]);
+        assert_eq!(
+            order_value(OrderKind::PaddedStr(NARROW_WIDTH), LARGE_RAW),
+            order_value(OrderKind::Str, LARGE_RAW)
+        );
+    }
+
     #[test]
     fn test_encode_refuses_what_a_kind_cannot_hold() {
         assert_eq!(OrderKind::Int.encode(PAST_32_BITS), None);
@@ -545,7 +588,12 @@ mod tests {
             OrderKind::Long.encode(PAST_32_BITS),
             Some(OrderValue::Long(PAST_32_BITS))
         );
-        for kind in [OrderKind::Str, OrderKind::Bin, OrderKind::Fixed(WIDE_WIDTH)] {
+        for kind in [
+            OrderKind::Str,
+            OrderKind::PaddedStr(WIDE_DIGITS),
+            OrderKind::Bin,
+            OrderKind::Fixed(WIDE_WIDTH),
+        ] {
             assert_eq!(kind.encode(-1), None, "{kind:?}");
         }
         assert_eq!(OrderKind::Fixed(NARROW_WIDTH).encode(PAST_32_BITS), None);

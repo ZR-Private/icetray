@@ -386,6 +386,77 @@ impl ResidentBytes {
     }
 }
 
+/// One built file's resident memory by part (`FileIndex::resident_parts`),
+/// under the definitions of `FileIndex::predicted_resident_bytes` with the
+/// fences and the order facts exact. The parts sum to
+/// `FileIndex::resident_bytes`, and a part the index's tier does not hold
+/// is zero. Each page index part is the memory the kept footer loses
+/// without it, the order column's column index taken out first, then the
+/// key column's, then the offset indexes, and `footer` is what remains.
+/// Serializes with these field names, for a reader that reports sizes by
+/// part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ResidentParts {
+    /// The footer as kept, without its page indexes.
+    pub footer: u64,
+    /// The key column's column index.
+    pub key_column_index: u64,
+    /// An ordered table's order column's column index; zero on a
+    /// key-value table.
+    pub order_column_index: u64,
+    /// Every offset index the footer keeps: the key column's, an ordered
+    /// table's order column's, and each served value column's.
+    pub offset_indexes: u64,
+    /// The key fences, the first key of every key page.
+    pub key_fences: u64,
+    /// An ordered file's order facts; zero on a key-value table.
+    pub order_facts: u64,
+    /// The key column's chunks, which Full holds; zero in the other tiers.
+    pub key_chunks: u64,
+    /// The key column's bloom filters, which Bloom holds; zero in the
+    /// other tiers.
+    pub filters: u64,
+}
+
+impl ResidentParts {
+    /// Every part summed, saturating: `FileIndex::resident_bytes`.
+    pub fn total(&self) -> u64 {
+        saturating_sum([
+            self.footer,
+            self.key_column_index,
+            self.order_column_index,
+            self.offset_indexes,
+            self.key_fences,
+            self.order_facts,
+            self.key_chunks,
+            self.filters,
+        ])
+    }
+
+    /// The parts of `self` and `other` added, saturating: two files'
+    /// parts, or a table's over its files.
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            footer: self.footer.saturating_add(other.footer),
+            key_column_index: self.key_column_index.saturating_add(other.key_column_index),
+            order_column_index: self
+                .order_column_index
+                .saturating_add(other.order_column_index),
+            offset_indexes: self.offset_indexes.saturating_add(other.offset_indexes),
+            key_fences: self.key_fences.saturating_add(other.key_fences),
+            order_facts: self.order_facts.saturating_add(other.order_facts),
+            key_chunks: self.key_chunks.saturating_add(other.key_chunks),
+            filters: self.filters.saturating_add(other.filters),
+        }
+    }
+}
+
+/// Why a built index's tier always has a figure: a Bloom-tier build
+/// refuses a file whose footer does not bound every row group's filter.
+const BOUNDED_FILTERS: &str =
+    "a bloom index has a bounded filter per row group; build refused the file otherwise";
+
 /// Filter bits per key: `bytes` of filter over `rows` keys, the unit RFD
 /// 016 judges a filter's size by and `ResidentBytes::bloom_bits_per_key`
 /// reports. Finite, zero for no rows.
@@ -1146,7 +1217,33 @@ impl FileIndex {
     /// and the fences, under the definitions of `predicted_resident_bytes`
     /// with the fences exact.
     pub(crate) fn resident_bytes(&self) -> usize {
-        let all = tiers(&ResidentSet::from_footer(
+        let mine = tiers(&self.resident_set())
+            .in_tier(self.residency())
+            .expect(BOUNDED_FILTERS);
+        approx::length(mine)
+    }
+
+    /// `resident_bytes` by part (`ResidentParts`), for a reader that
+    /// reports where an index's memory goes. Computes the footer parts
+    /// from copies of the kept footer, so it costs a few footer copies:
+    /// for reporting, not for a lookup.
+    pub fn resident_parts(&self) -> ResidentParts {
+        let leaves = self.held_value_leaves();
+        let kept = kept_footer(
+            &self.metadata,
+            self.layout.key_leaf,
+            self.order_leaf(),
+            &leaves,
+        );
+        self.resident_set()
+            .parts(&kept, self.order_leaf(), self.residency())
+            .expect(BOUNDED_FILTERS)
+    }
+
+    /// The parts `resident_bytes` and `resident_parts` are made of, with
+    /// the fences and the order facts exact.
+    fn resident_set(&self) -> ResidentSet {
+        ResidentSet::from_footer(
             &self.metadata,
             self.layout.key_leaf,
             self.layout.order,
@@ -1154,11 +1251,7 @@ impl FileIndex {
             self.key_type(),
             &self.handle,
             Some((&self.fences, self.order.as_ref())),
-        ));
-        let mine = all.in_tier(self.residency()).expect(
-            "a bloom index has a bounded filter per row group; build refused the file otherwise",
-        );
-        approx::length(mine)
+        )
     }
 
     /// The exact position of `key`, or `None` for a key the file does not
@@ -1832,10 +1925,10 @@ mod tests {
     use crate::index::testing::{
         BINARY_KEY_TAG, FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, Opened,
         PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, VALUE_BYTES, ValueColumn, absent_after,
-        contract_rows, fault_of, group_rows, header_at, key_for, location, moved_by_header,
-        pages_of, predicted_of, row_of, stepped, store, store_file, store_hedged_by, value_for,
-        value_of_len, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
-        with_pages,
+        contract_rows, fault_of, group_rows, header_at, key_for, location, long_orders,
+        moved_by_header, pages_of, predicted_of, row_of, stepped, store, store_file,
+        store_hedged_by, value_for, value_of_len, with_dictionary_one_entry_short, with_group_rows,
+        with_header_claims, with_pages,
     };
     use crate::order::OrderType;
     use crate::storage::{HedgeWindow, IoStats};
@@ -3516,5 +3609,51 @@ mod tests {
         let chunks = index.key_chunks_for_verification();
         assert_send(&chunks);
         chunks.await.unwrap();
+    }
+
+    /// The parts `resident_parts` reports sum to `resident_bytes` in every
+    /// tier, an ordered file's order column index and order facts among
+    /// them and a key-value file's zero; each tier holds only its own key
+    /// structure, the chunks under Full and the filters under Bloom.
+    #[tokio::test]
+    async fn test_resident_parts_sum_to_resident_bytes_in_every_tier() {
+        const ROWS_PER_KEY: usize = 10;
+        let rows = contract_rows();
+        let long = |row: usize| i64::try_from(row).unwrap();
+        let keys: Vec<i64> = (0..rows).map(|row| long(row / ROWS_PER_KEY)).collect();
+        let orders: Vec<i64> = (0..rows).map(|row| long(row % ROWS_PER_KEY)).collect();
+        let ordered = store(&Fixture::ordered(&keys, long_orders(&orders))).await;
+        let keyed = store(&Fixture::contract(KeyType::Long, rows)).await;
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let index = ordered
+                .build_ordered_in(OrderType::Long, residency, dir.path())
+                .await
+                .unwrap();
+            let parts = index.resident_parts();
+            assert_eq!(parts.total(), count(index.resident_bytes()), "{residency}");
+            for (part, bytes) in [
+                ("footer", parts.footer),
+                ("key column index", parts.key_column_index),
+                ("order column index", parts.order_column_index),
+                ("offset indexes", parts.offset_indexes),
+                ("key fences", parts.key_fences),
+                ("order facts", parts.order_facts),
+            ] {
+                assert!(bytes > 0, "{residency}: {part}");
+            }
+            assert_eq!(parts.key_chunks > 0, residency == Residency::Full);
+            assert_eq!(parts.filters > 0, residency == Residency::Bloom);
+
+            let dir = tempfile::tempdir().unwrap();
+            let index = keyed
+                .build_in(KeyType::Long, residency, dir.path())
+                .await
+                .unwrap();
+            let parts = index.resident_parts();
+            assert_eq!(parts.total(), count(index.resident_bytes()), "{residency}");
+            assert!(parts.key_column_index > 0 && parts.key_fences > 0);
+            assert_eq!((parts.order_column_index, parts.order_facts), (0, 0));
+        }
     }
 }

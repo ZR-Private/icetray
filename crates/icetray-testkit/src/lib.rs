@@ -2,9 +2,9 @@
 //! a stand-in for the AWS catalogs, the fixture writer and its delete file
 //! writers, the ordered fixtures and their scan model (RFD 025), the
 //! brute-force merge-on-read oracle, the deterministic simulation
-//! transport, a store that counts GETs per object, shared assertions, the
-//! golden-table locator (RFD 014), and the truth file a check replays
-//! against a running server.
+//! transport, a store that counts GETs per object and one that counts the
+//! rounds a read's GETs take, shared assertions, the golden-table locator
+//! (RFD 014), and the truth file a check replays against a running server.
 
 pub mod aws_catalog;
 pub mod counting;
@@ -18,6 +18,7 @@ pub mod layout;
 pub mod merge_oracle;
 pub mod ordered;
 pub mod protobuf;
+pub mod rounds;
 pub mod s3;
 pub mod sim;
 pub mod truth;
@@ -43,4 +44,5 @@ pub use ordered::{
     ORDER_COLUMN, ORDER_FIELD_ID, OrderKind, Ordered, ScanRows, TestScan, order_value, row_value,
     scan_model,
 };
+pub use rounds::RoundsStore;
 pub use s3::S3Fixture;
