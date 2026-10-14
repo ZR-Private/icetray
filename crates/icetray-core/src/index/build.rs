@@ -1208,6 +1208,26 @@ fn read_column_batches<T: ParquetDataType>(
     take: usize,
     sink: &mut dyn FnMut(&mut Vec<T::T>),
 ) -> Result<()> {
+    read_batches_with_levels::<T>(chunk, segments, skip, take, &mut |batch, _levels| {
+        sink(batch);
+    })
+}
+
+/// What a decode hands each batch of values to, with the batch's
+/// definition levels (`read_batches_with_levels`).
+type LevelledSink<'a, V> = dyn FnMut(&mut Vec<V>, &[i16]) + 'a;
+
+/// `read_column_batches`, with each batch's definition levels handed to
+/// `sink` beside its values: one level per record, empty for a column that
+/// is not nullable, a record whose level is below the column's greatest
+/// one a null that holds no value.
+fn read_batches_with_levels<T: ParquetDataType>(
+    chunk: ColumnChunk<'_>,
+    segments: Arc<Segments>,
+    skip: usize,
+    take: usize,
+    sink: &mut LevelledSink<'_, T::T>,
+) -> Result<()> {
     let tally = Arc::new(Mutex::new(PageTally::default()));
     // Unwind-safe: the page reader, the column reader, and the buffers are
     // built inside `decode` and dropped with a panic; the footer `chunk`
@@ -1238,7 +1258,7 @@ fn decode_records<T: ParquetDataType>(
     skip: usize,
     take: usize,
     tally: &Arc<Mutex<PageTally>>,
-    sink: &mut dyn FnMut(&mut Vec<T::T>),
+    sink: &mut LevelledSink<'_, T::T>,
 ) -> Result<parquet::errors::Result<usize>> {
     let descr = chunk.column.descriptor();
     let nullable = descr.max_def_level() > 0;
@@ -1266,7 +1286,7 @@ fn decode_records<T: ParquetDataType>(
                 None,
                 &mut batch,
             )?;
-            sink(&mut batch);
+            sink(&mut batch, &def_levels);
             if read == 0 {
                 break;
             }
@@ -1305,6 +1325,46 @@ pub(super) fn read_rows<T: ParquetDataType>(
         row_index(rows.start),
         row_index(rows.end - rows.start),
     )
+}
+
+/// Rows `rows` of the value column chunk `chunk` from `segments`, one
+/// entry per row, `None` for a null: the values of a span of value pages a
+/// Scan reads (RFD 025), which the caller has fetched with the chunk's
+/// dictionary page and whose headers it has checked, as for `read_one`.
+/// Exactly those rows decode, from exactly the pages the offset index names
+/// for them, as `read_column` guarantees; a column whose levels and values
+/// disagree is `FileFault::PageRowsMismatch` at the rows' first page.
+pub(super) fn read_optional<T: ParquetDataType>(
+    chunk: ColumnChunk<'_>,
+    rows: Range<i64>,
+    segments: Arc<Segments>,
+) -> Result<Vec<Option<T::T>>> {
+    let skip = row_index(rows.start);
+    let take = row_index(rows.end - rows.start);
+    let present = chunk.column.descriptor().max_def_level();
+    let mut values = Vec::with_capacity(take);
+    let mut aligned = true;
+    read_batches_with_levels::<T>(chunk, segments, skip, take, &mut |batch, levels| {
+        if levels.is_empty() {
+            values.extend(batch.drain(..).map(Some));
+            return;
+        }
+        let mut held = batch.drain(..);
+        for &level in levels {
+            if level == present {
+                let value = held.next();
+                aligned &= value.is_some();
+                values.push(value);
+            } else {
+                values.push(None);
+            }
+        }
+        aligned &= held.next().is_none();
+    })?;
+    if !aligned || values.len() != take {
+        return Err(chunk.page_rows_mismatch(chunk.page_holding(skip)));
+    }
+    Ok(values)
 }
 
 #[cfg(test)]

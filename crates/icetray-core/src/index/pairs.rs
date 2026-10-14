@@ -103,14 +103,14 @@ impl Pairs {
 
 impl FileIndex {
     /// The order column of an ordered file.
-    fn order_leaf_of(&self) -> OrderLeaf {
+    pub(super) fn order_leaf_of(&self) -> OrderLeaf {
         self.layout
             .order
             .expect("only an ordered table's files are read as pairs")
     }
 
     /// The order column as the decoders see it.
-    fn order_values(&self, order: OrderLeaf) -> Column<'_> {
+    pub(super) fn order_values(&self, order: OrderLeaf) -> Column<'_> {
         Column {
             metadata: &self.metadata,
             leaf: order.leaf,

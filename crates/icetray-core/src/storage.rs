@@ -946,7 +946,7 @@ const HEDGE_RECOMPUTE_SHARE: usize = 16;
 /// they are. `config` has passed `Config::parse`'s validation: `window` is
 /// at least one, `percentile` is in `(0, 1]`, and `max_rate` in `[0, 1]`.
 #[derive(Debug)]
-pub(crate) struct HedgeWindow {
+pub struct HedgeWindow {
     config: HedgeConfig,
     /// Samples between two computations of the percentile: at least one.
     recompute_every: usize,

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
+use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::bloom_filter::Sbbf;
@@ -41,7 +43,7 @@ use crate::manifest::TableLayout;
 use crate::manifest::testing::{self as manifest_testing, KEY_COLUMN, VALUE_COLUMN};
 use crate::order::{OrderColumnLayout, OrderType};
 use crate::parquet_io::FileHandle;
-use crate::storage::testing::{MEM_PREFIX, MemStore};
+use crate::storage::testing::{Gauged, MEM_PREFIX, MemStore};
 use crate::storage::{HedgeWindow, IoStats, Storage};
 use crate::varint::{CONTINUES, PAYLOAD, PAYLOAD_BITS};
 
@@ -410,6 +412,25 @@ pub(super) async fn store_file(file: Bytes) -> Opened {
 /// `store` with the file's lookup reads hedged against `window`.
 pub(super) async fn store_hedged_by(fixture: &Fixture, window: Arc<HedgeWindow>) -> Opened {
     store_file_hedged_by(fixture.write(), window).await
+}
+
+/// `store` through a `Gauged` store over the in-memory one, so a test
+/// sees how many GETs a read runs together.
+pub(super) async fn store_gauged(fixture: &Fixture) -> (Opened, Arc<Gauged>) {
+    let mem = MemStore::new();
+    let inner: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&mem.store);
+    let gauged = Arc::new(Gauged::new(inner));
+    mem.storage
+        .register(MEM_PREFIX, Arc::<Gauged>::clone(&gauged));
+    let file = fixture.write();
+    let window = Arc::new(HedgeWindow::new(&HedgeConfig::default()));
+    let handle = mem.open(&location(), file.clone(), window).await;
+    let opened = Opened {
+        storage: mem.storage,
+        handle,
+        file,
+    };
+    (opened, gauged)
 }
 
 async fn store_file_hedged_by(file: Bytes, window: Arc<HedgeWindow>) -> Opened {

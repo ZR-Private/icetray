@@ -17,6 +17,7 @@ mod pages;
 mod pairs;
 mod plain;
 mod record;
+mod run;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -66,7 +67,7 @@ pub(crate) struct RowRef {
 /// vectors name a row (RFD 021). A newtype, so that it is never taken for a
 /// row within one row group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct RowPosition(pub(crate) u64);
+pub struct RowPosition(pub(crate) u64);
 
 /// What makes a data file unservable beyond the contract's refusals. The set
 /// is closed; a fault outside it is a library error, not a file fault.
@@ -508,6 +509,31 @@ impl Keys {
                 Self::Long(_) | Self::Str(_) | Self::Bin(_) | Self::Uuid(_),
                 Key::Long(_) | Key::Str(_) | Key::Bytes(_) | Key::Uuid(_),
             ) => Err(0),
+        }
+    }
+
+    /// The positions holding `key` in a run in served order where a key may
+    /// repeat, as an ordered file's runs do: from the first key not below
+    /// `key` to the first above it, empty where the run does not hold it. A
+    /// key of another type than the run's is held nowhere, at position zero.
+    pub(crate) fn equal_range(&self, key: &Key) -> Range<usize> {
+        fn around<T>(run: &[T], cmp: impl Fn(&T) -> Ordering) -> Range<usize> {
+            run.partition_point(|held| cmp(held).is_lt())
+                ..run.partition_point(|held| cmp(held).is_le())
+        }
+        match (self, key) {
+            (Self::Long(run), Key::Long(wanted)) => around(run, |held| held.cmp(wanted)),
+            (Self::Str(run), Key::Str(wanted)) => {
+                around(run, |held| held.data().cmp(wanted.as_bytes()))
+            }
+            (Self::Bin(run), Key::Bytes(wanted)) => {
+                around(run, |held| held.data().cmp(wanted.as_slice()))
+            }
+            (Self::Uuid(run), Key::Uuid(wanted)) => around(run, |held| held.cmp(wanted)),
+            (
+                Self::Long(_) | Self::Str(_) | Self::Bin(_) | Self::Uuid(_),
+                Key::Long(_) | Key::Str(_) | Key::Bytes(_) | Key::Uuid(_),
+            ) => 0..0,
         }
     }
 

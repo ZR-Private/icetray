@@ -9,6 +9,7 @@ use std::fmt;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -427,6 +428,95 @@ impl PageCache {
         Ok((page, origin_of(source)))
     }
 
+    /// The pages at `pages`, ranges of the file `file` in ascending order
+    /// that do not overlap, each page's bytes in that order, and whether any
+    /// came from outside. A page in memory is served from it, counted as a
+    /// hit; every maximal run of the others whose ranges meet end to start
+    /// is one call of `fetch` over the run's whole range, its bytes split by
+    /// page and each page inserted as its own entry, keyed by `file` and the
+    /// page's offset as `get_or_fetch` keys a page, so that a later read of
+    /// any one of them finds it alone (RFD 025, Caching and hedging). The
+    /// runs are fetched together. Each takes one permit of `issue` before it
+    /// starts and holds it until it ends, so none waits for a permit while
+    /// it holds one (RFD 022); counts once in `fetches` and in `issue`'s
+    /// counter as it starts, a run that then fails included; and ends at
+    /// the handle's fetch deadline from its start, its future dropped, as
+    /// `CacheError::FetchDeadline` at the run's first offset. A failed run is
+    /// `CacheError::Fetch` and caches nothing of it. The disk level is not
+    /// read, since the Scan cache has none, and a run is not coalesced
+    /// with another caller's fetch of the same pages, which fetches them
+    /// again. A run whose bytes come back shorter than its range is
+    /// `CacheError::Fetch` of a parquet end-of-file error.
+    pub(crate) async fn get_span<F, Fut>(
+        &self,
+        file: &Arc<str>,
+        pages: &[Range<u64>],
+        issue: Issue<'_>,
+        fetch: F,
+    ) -> Result<(Vec<Bytes>, PageOrigin)>
+    where
+        F: Fn(Range<u64>) -> Fut,
+        Fut: Future<Output = Result<Bytes>>,
+    {
+        let mut served: Vec<Option<Bytes>> = pages
+            .iter()
+            .map(|page| {
+                let held = self.in_memory(&PageKey(Arc::clone(file), page.start));
+                if held.is_some() {
+                    self.record_hit();
+                }
+                held
+            })
+            .collect();
+        let runs = uncached_runs(pages, &served);
+        let fetched = futures::future::try_join_all(runs.iter().map(|run| {
+            let span = pages[run.start].start..pages[run.end - 1].end;
+            let fetched = fetch(span.clone());
+            async move {
+                let run = Run {
+                    page: PageKey(Arc::clone(file), span.start),
+                    fetches: Arc::clone(&self.fetches),
+                    deadline: self.fetch_deadline,
+                    permit: issue.permit().await,
+                    counted: issue.counted.cloned(),
+                };
+                run.run(fetched).await.map_err(fetch_failed)
+            }
+        }))
+        .await?;
+        for (run, bytes) in runs.iter().zip(fetched) {
+            let base = pages[run.start].start;
+            for at in run.clone() {
+                let page = &pages[at];
+                let start = approx::length(page.start - base);
+                let end = approx::length(page.end - base);
+                let body = bytes.get(start..end).ok_or_else(|| {
+                    Error::Cache(CacheError::Fetch(Arc::new(Error::Parquet(
+                        parquet::errors::ParquetError::EOF(format!(
+                            "a span fetch of {file} from offset {base} returned {} bytes, short of page {}..{}",
+                            bytes.len(),
+                            page.start,
+                            page.end
+                        )),
+                    ))))
+                })?;
+                let page_bytes = Bytes::copy_from_slice(body);
+                self.insert(PageKey(Arc::clone(file), page.start), page_bytes.clone());
+                served[at] = Some(page_bytes);
+            }
+        }
+        let origin = if runs.is_empty() {
+            PageOrigin::Cached
+        } else {
+            PageOrigin::Fetched
+        };
+        let pages = served
+            .into_iter()
+            .map(|page| page.expect("every page is served from memory or from its run's fetch"))
+            .collect();
+        Ok((pages, origin))
+    }
+
     /// Lookups served without running a fetch: from memory, or from the
     /// disk level with a local read. Counted per lookup served, so several
     /// lookups coalesced onto one disk read each count one; a lookup that
@@ -512,10 +602,38 @@ impl PageCache {
         }
     }
 
+    /// Holds `page` at `key` in memory, as a fetch's page is held.
+    fn insert(&self, key: PageKey, page: Bytes) {
+        match self.level.as_ref() {
+            Level::Memory(cache) => {
+                cache.insert(key, PageValue(page));
+            }
+            Level::Hybrid { cache, .. } => {
+                cache.insert(key, PageValue(page));
+            }
+        }
+    }
+
     /// One page served without a fetch.
     fn record_hit(&self) {
         self.hits.shards.mine().fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The positions in `pages` of every maximal run of pages `served` does not
+/// hold whose ranges meet end to start, in order.
+fn uncached_runs(pages: &[Range<u64>], served: &[Option<Bytes>]) -> Vec<Range<usize>> {
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for (at, page) in pages.iter().enumerate() {
+        if served[at].is_some() {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run) if run.end == at && pages[at - 1].end == page.start => run.end = at + 1,
+            Some(_) | None => runs.push(at..at + 1),
+        }
+    }
+    runs
 }
 
 /// A cache's fetch runs, counted in `count` for `PageCache::fetches` and in
@@ -748,6 +866,21 @@ impl Run {
     where
         Fut: Future<Output = Result<Bytes>>,
     {
+        // Copied into an allocation of its own: the store can hand back a
+        // slice of a larger buffer, such as the HTTP connection's read
+        // buffer, which the entry would keep alive while `weigh` charges
+        // only the slice.
+        self.run(fut)
+            .await
+            .map(|page| PageValue(Bytes::copy_from_slice(&page)))
+    }
+
+    /// `fetch`'s run, the bytes as `fut` returned them: counted, bounded by
+    /// the deadline, and holding the permit until it ends.
+    async fn run<Fut>(self, fut: Fut) -> std::result::Result<Bytes, FetchFailed>
+    where
+        Fut: Future<Output = Result<Bytes>>,
+    {
         let Self {
             page,
             fetches,
@@ -765,13 +898,7 @@ impl Run {
                 .await
                 .map_err(|_elapsed| FetchFailed::Deadline { page, after })?,
         };
-        // Copied into an allocation of its own: the store can hand back a
-        // slice of a larger buffer, such as the HTTP connection's read
-        // buffer, which the entry would keep alive while `weigh` charges
-        // only the slice.
-        fetched
-            .map(|page| PageValue(Bytes::copy_from_slice(&page)))
-            .map_err(|error| FetchFailed::Failed(Arc::new(error)))
+        fetched.map_err(|error| FetchFailed::Failed(Arc::new(error)))
     }
 }
 
@@ -779,13 +906,20 @@ impl Run {
 /// its deadline when that is what foyer carries, otherwise the backend's.
 fn cache_error(error: foyer::Error) -> Error {
     match error.downcast_ref::<FetchFailed>() {
-        Some(FetchFailed::Failed(failed)) => Error::Cache(CacheError::Fetch(Arc::clone(failed))),
-        Some(FetchFailed::Deadline { page, after }) => Error::Cache(CacheError::FetchDeadline {
+        Some(failed) => fetch_failed(failed.clone()),
+        None => backend(error),
+    }
+}
+
+/// A fetch the cache ran that produced no page, as the crate's error.
+fn fetch_failed(failed: FetchFailed) -> Error {
+    match failed {
+        FetchFailed::Failed(failed) => Error::Cache(CacheError::Fetch(failed)),
+        FetchFailed::Deadline { page, after } => Error::Cache(CacheError::FetchDeadline {
             path: page.0.to_string(),
             offset: page.1,
-            after: *after,
+            after,
         }),
-        None => backend(error),
     }
 }
 
@@ -1303,6 +1437,69 @@ mod tests {
         assert_eq!(&again[..], PAGE);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
+    }
+
+    /// A span read fetches each maximal run of uncached pages that meet
+    /// end to start with one call, splits it, and caches every page as its
+    /// own entry at its offset: each is then served alone, and a second
+    /// span read runs no fetch.
+    #[tokio::test]
+    async fn test_get_span_fetches_contiguous_uncached_pages_once_and_caches_each() {
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+        let file: Bytes = (0..=u8::MAX).collect();
+        let pages = [0..10, 10..26, 26..30, 30..40, 100..110];
+        let cached = 1;
+        let cached_page = file.slice(10..26);
+        cache
+            .get_or_fetch(key(pages[cached].start), Issue::default(), || {
+                std::future::ready(Ok(cached_page))
+            })
+            .await
+            .unwrap();
+        let fetches = cache.fetches();
+        let spans = std::sync::Mutex::new(Vec::new());
+        let fetch = |span: Range<u64>| {
+            spans.lock().unwrap().push(span.clone());
+            let bytes = file.slice(approx::length(span.start)..approx::length(span.end));
+            std::future::ready(Ok(bytes))
+        };
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let (served, origin) = cache
+            .get_span(&id, &pages, Issue::default(), fetch)
+            .await
+            .unwrap();
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(*spans.lock().unwrap(), [0..10, 26..40, 100..110]);
+        assert_eq!(
+            cache.fetches() - fetches,
+            3,
+            "one fetch per run of uncached pages"
+        );
+        for (page, bytes) in pages.iter().zip(&served) {
+            let start = approx::length(page.start);
+            let end = approx::length(page.end);
+            assert_eq!(bytes, &file.slice(start..end));
+        }
+        let fetches = cache.fetches();
+        for (page, bytes) in pages.iter().zip(&served) {
+            let (alone, origin) = cache
+                .get_or_fetch(key(page.start), Issue::default(), never)
+                .await
+                .unwrap();
+            assert_eq!(&alone, bytes);
+            assert_eq!(origin, PageOrigin::Cached);
+        }
+        let (again, origin) = cache
+            .get_span(&id, &pages, Issue::default(), |_| never())
+            .await
+            .unwrap();
+        assert_eq!(again, served);
+        assert_eq!(origin, PageOrigin::Cached);
+        assert_eq!(
+            cache.fetches(),
+            fetches,
+            "every page is served alone or again"
+        );
     }
 
     #[tokio::test]

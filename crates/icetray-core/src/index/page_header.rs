@@ -996,10 +996,22 @@ pub(super) fn check_order_page_headers(
 /// Every page of `chunk` in `segments`, its dictionary page first, held to
 /// `bounds` (`check_page`).
 fn check_every_page(chunk: ColumnChunk<'_>, bounds: Bounds, segments: &Segments) -> Result<()> {
+    check_pages(chunk, bounds, 0..chunk.page_locations().len(), segments)
+}
+
+/// Data pages `pages` of `chunk` in `segments` and, ahead of them, the
+/// chunk's dictionary page when it has one, held to `bounds`
+/// (`check_page`).
+fn check_pages(
+    chunk: ColumnChunk<'_>,
+    bounds: Bounds,
+    pages: Range<usize>,
+    segments: &Segments,
+) -> Result<()> {
     if let Some(range) = chunk.dictionary_range() {
         check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
     }
-    for page in 0..chunk.page_locations().len() {
+    for page in pages {
         check_page(
             chunk,
             ChunkPage::Data(page),
@@ -1011,6 +1023,19 @@ fn check_every_page(chunk: ColumnChunk<'_>, bounds: Bounds, segments: &Segments)
     Ok(())
 }
 
+/// `check_order_page_headers` for data pages `pages` of the order column
+/// chunk `chunk` alone and the chunk's dictionary page when it has one,
+/// all in `segments`: the order pages a Scan decodes (RFD 025, Load).
+pub(super) fn check_order_pages(
+    chunk: ColumnChunk<'_>,
+    shape: OrderShape,
+    pages: Range<usize>,
+    segments: &Segments,
+) -> Result<()> {
+    let entry = Entry::of_order(shape, chunk.column.descriptor().type_length());
+    check_pages(chunk, value_bounds(entry), pages, segments)
+}
+
 /// `check_page_headers` for key page `page` of `chunk` alone and the
 /// chunk's dictionary page when it has one, both in `segments`: the pages
 /// a reader of the file's edge keys decodes before the chunk is verified.
@@ -1020,17 +1045,7 @@ pub(super) fn check_key_page_headers(
     page: usize,
     segments: &Segments,
 ) -> Result<()> {
-    let bounds = key_bounds(chunk, shape);
-    if let Some(range) = chunk.dictionary_range() {
-        check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
-    }
-    check_page(
-        chunk,
-        ChunkPage::Data(page),
-        chunk.page_range(page),
-        bounds,
-        segments,
-    )
+    check_pages(chunk, key_bounds(chunk, shape), page..page + 1, segments)
 }
 
 /// What a key page of `chunk` may declare: `MOST_KEY_PAGE_BYTES` as the
@@ -1062,18 +1077,20 @@ pub(super) fn check_value_page_headers(
     page: usize,
     segments: &Segments,
 ) -> Result<()> {
+    check_value_pages(chunk, shape, page..page + 1, segments)
+}
+
+/// `check_value_page_headers` for data pages `pages` of `chunk`, the value
+/// pages a Scan decodes over a span of rows (RFD 025), and the chunk's
+/// dictionary page when it has one, all in `segments`.
+pub(super) fn check_value_pages(
+    chunk: ColumnChunk<'_>,
+    shape: ValueShape,
+    pages: Range<usize>,
+    segments: &Segments,
+) -> Result<()> {
     let entry = Entry::of_value(shape, chunk.column.descriptor().type_length());
-    let bounds = value_bounds(entry);
-    if let Some(range) = chunk.dictionary_range() {
-        check_page(chunk, ChunkPage::Dictionary, range, bounds, segments)?;
-    }
-    check_page(
-        chunk,
-        ChunkPage::Data(page),
-        chunk.page_range(page),
-        bounds,
-        segments,
-    )
+    check_pages(chunk, value_bounds(entry), pages, segments)
 }
 
 /// What a page of a column whose values the contract does not cap, a
