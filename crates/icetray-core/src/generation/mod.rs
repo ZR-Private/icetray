@@ -754,8 +754,9 @@ impl Generation {
     /// Every file's chunk file as `LocalDir::retain` names it, by identity
     /// and the rules this generation verified the file under: the union
     /// over every table sharing the directory is the live set (RFD 017).
-    /// Like `identities`, a Full or Bloom generation's name files that were
-    /// never written and retain nothing.
+    /// As with `identities`, a Full or Bloom generation writes no chunk
+    /// files, so the names it gives refer to files that do not exist and
+    /// keep nothing in the directory.
     pub(crate) fn live_chunk_files(
         &self,
     ) -> impl Iterator<Item = (DataFileIdentity, ChunkRules)> + '_ {

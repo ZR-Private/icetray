@@ -68,9 +68,9 @@ When a table misses a requirement, icetray responds in one of three ways:
   lookup, and the [level](configuration.md#choosing-a-level) it caps the
   table at: `balanced` for a cost within one file, and for the files of
   one snapshot that share an edge key of an ordered table; `permissive`
-  for any other extra files probed. icetray serves a table capped below its `lookups` level
-  and flags it; under `strict`, icetray refuses the snapshot as
-  `below_level`.
+  for any other extra files probed. icetray serves a table capped below
+  its `lookups` level and flags it; under `strict`, icetray refuses the
+  snapshot as `below_level`.
 - **Advice**: the doctor names the writer property to change. Advice
   never affects whether icetray serves the table.
 

@@ -947,18 +947,19 @@ impl FileIndex {
     /// is exact only for keys of one width (longs, uuids, a fixed-width
     /// binary column) and estimated as the fences are for string and binary
     /// keys, `key_type` saying which, and an ordered file's order facts in
-    /// it are estimated at most what they take: each row group's distinct
-    /// keys as its rows, the longest run as the file's rows. Every total
-    /// saturates at `u64::MAX` rather than wrapping. Estimated: the fences,
-    /// one `Key` per key page plus, for `BYTE_ARRAY` keys, the page's minimum
-    /// from the column index when the file has one, which a writer may
-    /// truncate, else the chunk's mean encoded bytes per value, and for
-    /// `FIXED_LEN_BYTE_ARRAY` keys the column's width, which over-counts a
-    /// uuid key, held inline, by `UUID_BYTES` per page; and an ordered
-    /// file's order facts, a `u64` per row group and the least and greatest
-    /// order value, exact for integer and fixed-width order values and
-    /// estimated for string and binary ones as the fences of such keys are
-    /// (RFD 025, Load). `resident_bytes` shares the definitions.
+    /// it are estimated at no less than what they take: each row group's
+    /// distinct keys as its rows, the longest run as the file's rows. Every
+    /// total saturates at `u64::MAX` rather than wrapping. Estimated: the
+    /// fences, one `Key` per key page plus, for `BYTE_ARRAY` keys, the
+    /// page's minimum from the column index when the file has one, which a
+    /// writer may truncate, else the chunk's mean encoded bytes per value,
+    /// and for `FIXED_LEN_BYTE_ARRAY` keys the column's width, which
+    /// over-counts a uuid key, held inline, by `UUID_BYTES` per page; and
+    /// an ordered file's order facts, a `u64` per row group and the least
+    /// and greatest order value, exact for integer and fixed-width order
+    /// values and estimated for string and binary ones as the fences of
+    /// such keys are (RFD 025, Load). `resident_bytes` shares the
+    /// definitions.
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
