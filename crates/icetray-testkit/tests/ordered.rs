@@ -6,6 +6,7 @@
 //! reads; the calls each table kind refuses; and the cache a Scan's pages
 //! stay in.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ use icetray_testkit::fixture::{
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{
-    DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, Nulls, OrderKind, Ordered, Result,
-    Statistics, TestScan, order_value, write_fixture,
+    DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MergeOracle, Nulls, OrderKind, Ordered,
+    Result, Statistics, TestScan, order_value, write_fixture,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
@@ -157,6 +158,8 @@ struct Drawn {
     _dir: TempDir,
     kind: OrderKind,
     max_scan_rows: u32,
+    /// Whether a delete or an update landed on the table.
+    changed: bool,
 }
 
 /// One table served in every tier, each over storage and caches of its
@@ -345,9 +348,11 @@ async fn draw_table(rng: &mut StdRng, instance: usize) -> Result<Drawn> {
     // vector already covers is masked by the vector (RFD 021), which no
     // writer leaves.
     let form = pick(rng, &FORMS);
+    let mut changed = false;
     for at in 0..rng.random_range(0..=MOST_DELETES) {
         let rows = some_live(&fixture, rng, MOST_ROWS_PER_CHANGE);
         if !rows.is_empty() {
+            changed = true;
             fixture
                 .delete_rows(&rows, form, &format!("delete_{at}"))
                 .await?;
@@ -356,6 +361,7 @@ async fn draw_table(rng: &mut StdRng, instance: usize) -> Result<Drawn> {
     for at in 0..rng.random_range(0..=MOST_UPDATES) {
         let rows = some_live(&fixture, rng, MOST_ROWS_PER_CHANGE);
         if !rows.is_empty() {
+            changed = true;
             fixture
                 .update_rows(&rows, form, &format!("update_{at}"))
                 .await?;
@@ -366,6 +372,7 @@ async fn draw_table(rng: &mut StdRng, instance: usize) -> Result<Drawn> {
         _dir: dir,
         kind: ordered.kind,
         max_scan_rows,
+        changed,
     })
 }
 
@@ -499,8 +506,13 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
     let mut more_set = 0;
     let mut kinds = Vec::new();
     let (mut truncated, mut unindexed) = (false, false);
+    // Scans whose key's live rows lie in two or more data files, scans of
+    // a table a delete or an update landed on, and scans of a key with a
+    // deleted copy, which the files themselves tell (`MergeOracle`).
+    let (mut across_files, mut of_changed, mut past_deleted) = (0, 0, 0);
     for instance in 0..INSTANCES {
         let drawn = draw_table(&mut rng, instance).await?;
+        let oracle = MergeOracle::read(&drawn.fixture).await?;
         if !kinds.contains(&drawn.kind) {
             kinds.push(drawn.kind);
         }
@@ -523,8 +535,26 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
             }
             rows_compared += want.rows.len();
             more_set += usize::from(want.more);
+            let copies = oracle.copies(&key);
+            let files: HashSet<&str> = copies
+                .iter()
+                .filter(|copy| !copy.deleted)
+                .map(|copy| copy.path.as_str())
+                .collect();
+            across_files += usize::from(files.len() >= 2);
+            of_changed += usize::from(drawn.changed);
+            past_deleted += usize::from(copies.iter().any(|copy| copy.deleted));
         }
     }
+    assert!(across_files > 0, "some scans read a key from several files");
+    assert!(
+        of_changed > 0,
+        "some scans read a table with deletes or updates"
+    );
+    assert!(
+        past_deleted > 0,
+        "some scans read a key with a deleted copy"
+    );
     assert!(rows_compared > 0, "the scans compared rows");
     assert!(more_set > 0, "some scans left rows past the limit");
     assert_eq!(

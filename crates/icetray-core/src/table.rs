@@ -1393,7 +1393,8 @@ impl Table {
     /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. The keys
     /// share one bound of `TableHandles::batch_fan_out` GETs in flight, at
     /// most that many keys read at once on this task; any failure fails the
-    /// whole call (RFD 010).
+    /// whole call (RFD 010). A key listed more than once is read once and
+    /// its answer given at each position.
     pub async fn multi_scan(
         &self,
         keys: &[Key],
@@ -1404,18 +1405,34 @@ impl Table {
         let generation = self.serving()?;
         let checked = self.check_scan(&generation, keys, columns, bounds, true)?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
+        // Each distinct key is read once, and every position that lists it
+        // takes that answer.
+        let mut distinct: Vec<&Key> = Vec::with_capacity(keys.len());
+        let mut first_at: HashMap<&Key, usize> = HashMap::with_capacity(keys.len());
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| {
+                *first_at.entry(key).or_insert_with(|| {
+                    distinct.push(key);
+                    distinct.len() - 1
+                })
+            })
+            .collect();
         // Built before the stream, unpolled, as `Lookups::run` builds its
         // lookups, so the returned future stays provably `Send`.
-        let scans: Vec<_> = keys
+        let scans: Vec<_> = distinct
             .iter()
             .map(|key| self.scan_key(&generation, key, &checked, bounds, &fan_out))
             .collect();
-        let results = stream::iter(scans)
+        let answered: Vec<Scanned> = stream::iter(scans)
             .buffered(self.lookups.batch_fan_out)
             .try_collect()
             .await?;
         Ok(MultiScanLookup {
-            results,
+            results: positions
+                .into_iter()
+                .map(|at| answered[at].clone())
+                .collect(),
             snapshot_id: generation.snapshot_id,
         })
     }
@@ -6409,10 +6426,22 @@ mod tests {
         layout: WriterLayout,
         fan_out: usize,
     ) -> (Table, Fixture, Arc<Gauged>) {
+        ordered_table_over(&[rows], layout, fan_out).await
+    }
+
+    /// `ordered_table_of` over one file per entry of `files`, each in the
+    /// one bucket, in that order.
+    async fn ordered_table_over(
+        files: &[&[(i64, i64)]],
+        layout: WriterLayout,
+        fan_out: usize,
+    ) -> (Table, Fixture, Arc<Gauged>) {
         let mut fixture = Fixture::ordered(1);
-        fixture
-            .add_ordered_file("f", rows, Partition::Bucket(0), layout)
-            .await;
+        for (at, rows) in files.iter().enumerate() {
+            fixture
+                .add_ordered_file(&format!("f{at}"), rows, Partition::Bucket(0), layout)
+                .await;
+        }
         fixture
             .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
             .await;
@@ -6543,6 +6572,193 @@ mod tests {
             SCAN_FAN_OUT,
             "the keys fill the bound together and never pass it"
         );
+    }
+
+    /// Keys of the coalescing tests, all in one page of each column of
+    /// one row group, so every key's Scan reads the same pages.
+    const KEYS_IN_ONE_PAGE: i64 = 4;
+
+    /// The GETs one cold Scan of a key in one file and one page costs in
+    /// the Full tier: one span per column it names and one for the order
+    /// column.
+    fn gets_per_cold_scan() -> usize {
+        BOTH_READS.len() + 1
+    }
+
+    /// Waits, under `DEADLINE_GUARD`, until two span reads of the same
+    /// `gets` pages have both reached them while `gauged` holds every GET:
+    /// the second waits on the first's fetches, which `cache` counts as
+    /// joins, or, were nothing coalesced, holds GETs of its own beside the
+    /// first's.
+    async fn both_reached(gauged: &Gauged, cache: &PageCache, gets: usize) {
+        tokio::time::timeout(DEADLINE_GUARD, async {
+            loop {
+                let joined =
+                    gauged.high_water() >= gets && cache.span_joins() >= approx::count(gets);
+                if joined || gauged.high_water() >= 2 * gets {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both reads reach their pages");
+    }
+
+    /// Two Scans of one cold key at once fetch each page once between them
+    /// (RFD 025, Caching and hedging): the second waits on the first's
+    /// span fetches rather than issuing its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_scans_of_one_cold_key_fetch_each_page_once() {
+        let rows = ordered_rows(&keys_from(0, KEYS_IN_ONE_PAGE), SCAN_ROWS_PER_KEY);
+        let (table, fixture, gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let cache = &table.scans.as_ref().unwrap().cache;
+        let key = Key::Long(KEY_STEP);
+        let gets = gets_per_cold_scan();
+        let bounds = oldest_first();
+        gauged.hold();
+        let before = fixture.gets();
+        let (first, second, ()) = tokio::join!(
+            table.scan(&key, &BOTH_READS, &bounds),
+            table.scan(&key, &BOTH_READS, &bounds),
+            async {
+                both_reached(&gauged, cache, gets).await;
+                gauged.release();
+            }
+        );
+        let expected = scanned_both(&ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY));
+        assert_eq!(first.unwrap().scanned.rows, expected);
+        assert_eq!(second.unwrap().scanned.rows, expected);
+        assert_eq!(
+            fixture.gets() - before,
+            approx::count(gets),
+            "one GET per page between the two Scans"
+        );
+        assert_eq!(gauged.high_water(), gets);
+    }
+
+    /// A `MultiScan` of two keys whose runs share every page fetches each
+    /// page once: the second key's read waits on the first's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_of_keys_sharing_a_page_fetches_it_once() {
+        let rows = ordered_rows(&keys_from(0, KEYS_IN_ONE_PAGE), SCAN_ROWS_PER_KEY);
+        let (table, fixture, gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let cache = &table.scans.as_ref().unwrap().cache;
+        let keys = [Key::Long(KEY_STEP), Key::Long(2 * KEY_STEP)];
+        let every_row = ScanBounds {
+            limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+            ..oldest_first()
+        };
+        let gets = gets_per_cold_scan();
+        gauged.hold();
+        let before = fixture.gets();
+        let (answered, ()) =
+            tokio::join!(table.multi_scan(&keys, &BOTH_READS, &every_row), async {
+                both_reached(&gauged, cache, gets).await;
+                gauged.release();
+            });
+        let got: Vec<Vec<ScanRow>> = answered
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|scanned| scanned.rows)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                scanned_both(&ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY)),
+                scanned_both(&ordered_rows(&[2 * KEY_STEP], SCAN_ROWS_PER_KEY)),
+            ]
+        );
+        assert_eq!(
+            fixture.gets() - before,
+            approx::count(gets),
+            "one GET per shared page"
+        );
+    }
+
+    /// A `MultiScan` that lists a key twice reads it once and answers it at
+    /// both positions: one Scan counted, one cold Scan's GETs.
+    #[test]
+    fn test_multi_scan_answers_a_repeated_key_from_one_read() {
+        let rows = ordered_rows(&keys_from(0, KEYS_IN_ONE_PAGE), SCAN_ROWS_PER_KEY);
+        let ((gets, results), series) = recorded(async {
+            let (table, fixture, _gauged) =
+                ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+            let key = Key::Long(KEY_STEP);
+            let every_row = ScanBounds {
+                limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+                ..oldest_first()
+            };
+            let before = fixture.gets();
+            let answered = table
+                .multi_scan(&[key.clone(), key], &BOTH_READS, &every_row)
+                .await
+                .unwrap();
+            (fixture.gets() - before, answered.results)
+        });
+        let expected = scanned_both(&ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY));
+        assert_eq!(results.len(), 2);
+        for scanned in &results {
+            assert_eq!(scanned.rows, expected);
+        }
+        assert_eq!(gets, approx::count(gets_per_cold_scan()));
+        assert_eq!(
+            series.counter(
+                metric::SCANS_TOTAL,
+                &[
+                    table_label(),
+                    (metric::LABEL_RESULT, ScanResult::Rows.to_string())
+                ],
+            ),
+            1,
+            "one read of the repeated key"
+        );
+    }
+
+    /// A Scan of a key two files hold reads both files in one round (RFD
+    /// 025, Cost): the store holds every GET until both files' order and
+    /// value spans are in flight together, which a file-by-file read never
+    /// reaches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_reads_every_file_holding_the_key_in_one_round() {
+        let keys = keys_from(0, KEYS_IN_ONE_PAGE);
+        let first = ordered_rows(&keys, SCAN_ROWS_PER_KEY);
+        let later_start = ORDER_START + SCAN_ROWS_PER_KEY * ORDER_STEP;
+        let second: Vec<(i64, i64)> = keys
+            .iter()
+            .flat_map(|&key| {
+                (0..SCAN_ROWS_PER_KEY).map(move |at| (key, later_start + at * ORDER_STEP))
+            })
+            .collect();
+        let (table, _fixture, gauged) = ordered_table_over(
+            &[&first, &second],
+            WriterLayout::contract(),
+            DEFAULT_BATCH_FAN_OUT,
+        )
+        .await;
+        let files = 2;
+        let both_rounds = files * gets_per_cold_scan();
+        gauged.fill_to(both_rounds);
+        let answered = tokio::time::timeout(
+            DEADLINE_GUARD,
+            table.scan(&Key::Long(KEY_STEP), &BOTH_READS, &oldest_first()),
+        )
+        .await
+        .expect("both files' GETs are in flight together")
+        .unwrap();
+        let mut expected = scanned_both(&ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY));
+        expected.extend(scanned_both(
+            &second
+                .iter()
+                .copied()
+                .filter(|&(key, _)| key == KEY_STEP)
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(answered.scanned.rows, expected);
+        assert_eq!(gauged.high_water(), both_rounds);
     }
 
     /// A Get or `MultiGet` of an ordered table, and a Scan or `MultiScan` of a
