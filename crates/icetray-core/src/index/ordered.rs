@@ -552,8 +552,10 @@ fn bytes_meet(
 /// its column index entry tells (RFD 025, Cost).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PageFit {
-    /// No value of the page is inside the bounds.
-    Outside,
+    /// Every value of the page is at or below `after`.
+    Below,
+    /// Every value of the page is at or above `before`.
+    Above,
     /// Every value of the page is inside the bounds.
     Inside,
     /// Some may be, or nothing known says: the page is decoded to tell.
@@ -666,10 +668,10 @@ impl<'a> ValueRange<'a> {
 
     /// Where the values this range bounds lie against `after` and
     /// `before`, both exclusive: `Inside` when there is neither bound;
-    /// otherwise `Outside` when the greatest is at or below `after` or the
-    /// least at or above `before`, `Inside` when the least is above
-    /// `after` and the greatest below `before`, and `Straddles` for any
-    /// other range, one with a side unknown, and one whose sides bound
+    /// otherwise `Below` when the greatest is at or below `after`, `Above`
+    /// when the least is at or above `before`, `Inside` when the least is
+    /// above `after` and the greatest below `before`, and `Straddles` for
+    /// any other range, one with a side unknown, and one whose sides bound
     /// nothing for these values.
     pub(super) fn fit(self, after: Option<&OrderValue>, before: Option<&OrderValue>) -> PageFit {
         let at_or_below_after = after.is_some_and(|after| {
@@ -680,8 +682,11 @@ impl<'a> ValueRange<'a> {
             self.low
                 .is_some_and(|low| low.value.cmp_value(before).is_some_and(Ordering::is_ge))
         });
-        if at_or_below_after || at_or_above_before {
-            return PageFit::Outside;
+        if at_or_below_after {
+            return PageFit::Below;
+        }
+        if at_or_above_before {
+            return PageFit::Above;
         }
         let above_after = after.is_none_or(|after| {
             self.low.is_some_and(|low| {

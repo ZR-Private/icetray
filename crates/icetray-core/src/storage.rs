@@ -1245,6 +1245,7 @@ pub(crate) mod testing {
     use std::future::Future;
     use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::ops::Range;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1258,8 +1259,8 @@ pub(crate) mod testing {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use tokio::sync::watch;
 
@@ -1328,12 +1329,16 @@ pub(crate) mod testing {
     /// many reads a caller runs together. After `fill_to(n)` every GET
     /// waits until `n` GETs are in flight at once, and from then on every
     /// GET passes: a caller that runs `n` reads together is seen to on any
-    /// machine, however slow, and one that runs fewer never gets past.
+    /// machine, however slow, and one that runs fewer never gets past. It
+    /// keeps the byte range of every GET, so a test sees what a read
+    /// fetched.
     #[derive(Debug)]
     pub(crate) struct Gauged {
         inner: Arc<dyn ObjectStore>,
         in_flight: AtomicUsize,
         high_water: AtomicUsize,
+        /// The byte range of every GET since the last `take_ranges`.
+        ranges: Mutex<Vec<Range<u64>>>,
         /// How many GETs must be in flight at once before the gate opens.
         fill: AtomicUsize,
         /// Whether GETs pass: false from `fill_to` until `fill` GETs are in
@@ -1348,6 +1353,7 @@ pub(crate) mod testing {
                 inner,
                 in_flight: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
+                ranges: Mutex::new(Vec::new()),
                 fill: AtomicUsize::new(0),
                 open: watch::Sender::new(true),
             }
@@ -1376,6 +1382,12 @@ pub(crate) mod testing {
         /// Lets the GETs `hold` holds pass.
         pub(crate) fn release(&self) {
             self.open.send_replace(true);
+        }
+
+        /// The byte ranges the GETs since the last call asked for, in the
+        /// order they were issued.
+        pub(crate) fn take_ranges(&self) -> Vec<Range<u64>> {
+            std::mem::take(&mut *self.ranges.lock().unwrap())
         }
     }
 
@@ -1430,6 +1442,9 @@ pub(crate) mod testing {
             Self: 'async_trait,
         {
             Box::pin(async move {
+                if let Some(GetRange::Bounded(range)) = &options.range {
+                    self.ranges.lock().unwrap().push(range.clone());
+                }
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.high_water.fetch_max(now, Ordering::SeqCst);
                 if now >= self.fill.load(Ordering::SeqCst) {
