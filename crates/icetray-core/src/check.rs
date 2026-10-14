@@ -27,6 +27,7 @@ use crate::index::{
 use crate::key::{Key, KeyType};
 use crate::level::Level;
 use crate::manifest::{DataFileEntry, TableLayout, ValueColumnLayout};
+use crate::order::{OrderFacts, OrderValue};
 use crate::projection;
 use crate::snapshot::SnapshotId;
 
@@ -330,9 +331,10 @@ pub enum FindingCode {
     /// The key column's column index is truncated: too few page minimums
     /// are distinct.
     ColumnIndexTruncated,
-    /// On an ordered table, the order column's column index is truncated:
-    /// too few page minimums are distinct, so long values sharing a prefix
-    /// widen the pages a bound selects.
+    /// On an ordered table, the order column's column index is truncated,
+    /// as its extremes against the file's exact least and greatest order
+    /// value prove; long values sharing a prefix widen the pages a bound
+    /// selects.
     OrderIndexTruncated,
     /// A value column's mean uncompressed value page is above the advice
     /// threshold.
@@ -1472,9 +1474,9 @@ struct OrderAdviceFacts {
     /// The uncompressed bytes of the configured value columns the file
     /// holds, from its footer.
     value_bytes: u64,
-    /// The share of the order column's pages with a distinct byte-array
-    /// column-index minimum (`distinct_mins_ratio` under `Mins::Order`).
-    distinct_mins_ratio: f64,
+    /// Whether the order column's column index proves a writer cut it
+    /// (`order_index_cut`).
+    index_cut: bool,
 }
 
 /// The key column's bloom filter sizing at the row groups that size it
@@ -1612,7 +1614,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             bloom_bytes: predicted.filter_bytes,
             bloom_bits_per_key: predicted.bloom_bits_per_key,
             key_chunk_bytes: predicted.key_chunk_bytes,
-            distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf(), Mins::Key),
+            distinct_page_mins_ratio: distinct_mins_ratio(metadata, index.key_leaf()),
             bounds_present: bounds_intact(&file.entry, index.key_range()),
             resident_bytes: index.resident_bytes(),
         },
@@ -1629,7 +1631,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             .map(|(facts, leaf)| OrderAdviceFacts {
                 longest_run: facts.longest_run,
                 value_bytes,
-                distinct_mins_ratio: distinct_mins_ratio(metadata, leaf, Mins::Order),
+                index_cut: order_index_cut(metadata, leaf, facts),
             }),
     }
 }
@@ -1724,42 +1726,26 @@ fn dictionary_encoded(chunk: &ColumnChunkMetaData) -> bool {
         || encodings.is_set(Encoding::PLAIN_DICTIONARY)
 }
 
-/// Which column-index entries `distinct_mins_ratio` counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mins {
-    /// The key column's: `INT64` and byte arrays, whose page minimums are
-    /// distinct in a file of sorted keys unless a writer cut them.
-    Key,
-    /// An ordered table's order column's: byte arrays alone. A writer never
-    /// cuts an integer entry, and an order column's page minimums repeat
-    /// across keys as its values do, which would only blur a cut.
-    Order,
-}
-
-/// The share of the pages of the column at `leaf` whose column-index
-/// minimum is distinct, counting the entries `counted` names: 1.0 when
-/// every page is addressable by it, lower when a writer cut the minimums to
-/// a shared prefix. The key column is `INT64`, `BYTE_ARRAY`, or
-/// `FIXED_LEN_BYTE_ARRAY` (`FileIndex::build` refused any other), and a
-/// page without a minimum (a null page, which a key or order column never
-/// has) is not counted. A file without a column index, or whose index
-/// lists no counted page, is `DISTINCT_MINS_UNOBSERVABLE`: truncation is not
+/// The share of the key column's pages whose column-index minimum is
+/// distinct: 1.0 when every page is addressable by it, lower when a writer
+/// cut the minimums to a shared prefix. The key column is `INT64`,
+/// `BYTE_ARRAY`, or `FIXED_LEN_BYTE_ARRAY` (`FileIndex::build` refused any
+/// other), and a page without a minimum (a null page, which a key column
+/// never has) is not counted. A file without a column index, or whose
+/// index lists no page, is `DISTINCT_MINS_UNOBSERVABLE`: truncation is not
 /// observable there, so it draws no finding.
-fn distinct_mins_ratio(metadata: &ParquetMetaData, leaf: usize, counted: Mins) -> f64 {
+fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
     let Some(index) = metadata.column_index() else {
         return DISTINCT_MINS_UNOBSERVABLE;
     };
     let (mut pages, mut distinct) = (0, 0);
     for columns in index {
-        match columns.get(leaf) {
-            Some(ColumnIndexMetaData::INT64(native)) => match counted {
-                Mins::Key => {
-                    let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
-                    pages += approx::count(mins.len());
-                    distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
-                }
-                Mins::Order => {}
-            },
+        match columns.get(key_leaf) {
+            Some(ColumnIndexMetaData::INT64(native)) => {
+                let mins: Vec<i64> = native.min_values_iter().flatten().copied().collect();
+                pages += approx::count(mins.len());
+                distinct += approx::count(mins.iter().collect::<BTreeSet<_>>().len());
+            }
             Some(
                 ColumnIndexMetaData::BYTE_ARRAY(bytes)
                 | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(bytes),
@@ -1783,6 +1769,66 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, leaf: usize, counted: Mins) -
         DISTINCT_MINS_UNOBSERVABLE
     } else {
         approx::ratio(distinct, pages)
+    }
+}
+
+/// Whether the column index of the order column at `leaf` proves that a
+/// writer cut its entries, against `facts`, the exact least and greatest
+/// order value the load decoded. Whole, an index's least page minimum is
+/// the least value and its greatest page maximum the greatest; a cut
+/// leaves the minimum a strict prefix of the value it stands for and the
+/// maximum a prefix with its last byte incremented, above every value.
+/// Only a byte-array entry is ever cut, so an integer order column proves
+/// nothing. Neither does a repeated page minimum, which pages of keys whose
+/// histories start alike report whole, so no ratio of distinct minimums is
+/// consulted. A cut that leaves both extremes whole, as order values no
+/// longer than the cut at both ends do, goes unseen.
+fn order_index_cut(metadata: &ParquetMetaData, leaf: usize, facts: &OrderFacts) -> bool {
+    let (Some(least), Some(greatest)) = (order_bytes(&facts.min), order_bytes(&facts.max)) else {
+        return false;
+    };
+    let Some(index) = metadata.column_index() else {
+        return false;
+    };
+    let mut lowest: Option<&[u8]> = None;
+    let mut highest: Option<&[u8]> = None;
+    for columns in index {
+        match columns.get(leaf) {
+            Some(
+                ColumnIndexMetaData::BYTE_ARRAY(entries)
+                | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(entries),
+            ) => {
+                for min in entries.min_values_iter().flatten() {
+                    lowest = Some(lowest.map_or(min, |held| held.min(min)));
+                }
+                for max in entries.max_values_iter().flatten() {
+                    highest = Some(highest.map_or(max, |held| held.max(max)));
+                }
+            }
+            Some(
+                ColumnIndexMetaData::NONE
+                | ColumnIndexMetaData::BOOLEAN(_)
+                | ColumnIndexMetaData::INT32(_)
+                | ColumnIndexMetaData::INT64(_)
+                | ColumnIndexMetaData::INT96(_)
+                | ColumnIndexMetaData::FLOAT(_)
+                | ColumnIndexMetaData::DOUBLE(_),
+            )
+            | None => {}
+        }
+    }
+    let cut_min = lowest.is_some_and(|min| min.len() < least.len() && least.starts_with(min));
+    let cut_max = highest.is_some_and(|max| max > greatest);
+    cut_min || cut_max
+}
+
+/// An order value's bytes as a byte-array column index compares them;
+/// `None` for an integer value, whose entries are never cut.
+fn order_bytes(value: &OrderValue) -> Option<&[u8]> {
+    match value {
+        OrderValue::Long(_) => None,
+        OrderValue::Str(text) => Some(text.as_bytes()),
+        OrderValue::Bytes(bytes) => Some(bytes),
     }
 }
 
@@ -2011,24 +2057,20 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 }
 
 /// An ordered table's advice on one file (RFD 025, Levels and findings):
-/// `order_index_truncated` where too few of the order column's byte-array
-/// page minimums are distinct, as the key column's `column_index_truncated`
-/// judges it, since long values sharing a prefix widen the pages a bound
-/// selects; `long_runs` where a run is longer than
+/// `order_index_truncated` where the order column's column index proves a
+/// cut (`order_index_cut`), since long values sharing a prefix widen the
+/// pages a bound selects; `long_runs` where a run is longer than
 /// `thresholds::RUN_ROWS_ADVICE`; and `large_runs` where that many rows of
 /// the configured value columns, at the footer's uncompressed bytes per
 /// row over the file's `rows`, are more than `thresholds::RUN_BYTES_ADVICE`,
-/// compared in integers. The ratio is `approx::ratio`'s, finite, so the
-/// plain comparison is total.
+/// compared in integers.
 fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut Vec<Finding>) {
-    if order.distinct_mins_ratio < thresholds::DISTINCT_MINS_RATIO_ADVICE {
+    if order.index_cut {
         findings.push(Finding::advice(
             FindingCode::OrderIndexTruncated,
             Some(path),
             format!(
-                "{ratio:.2} of order pages have a distinct minimum in the column index, below {limit}; long order values sharing a prefix widen the pages a bounded Scan selects ({property}, at least the longest order value)",
-                ratio = order.distinct_mins_ratio,
-                limit = thresholds::DISTINCT_MINS_RATIO_ADVICE,
+                "the order column's column index is cut: its least page minimum is a prefix of the least order value, or its greatest page maximum lies above the greatest; long order values sharing a prefix widen the pages a bounded Scan selects ({property}, at least the longest order value)",
                 property = WriterProperty::ColumnIndexTruncateLength,
             ),
             Some(WriterProperty::ColumnIndexTruncateLength),
@@ -3354,7 +3396,7 @@ mod tests {
             .build();
         assert!(stripped.column_index().is_none());
         assert_eq!(
-            distinct_mins_ratio(&stripped, index.key_leaf(), Mins::Key).to_bits(),
+            distinct_mins_ratio(&stripped, index.key_leaf()).to_bits(),
             DISTINCT_MINS_UNOBSERVABLE.to_bits()
         );
     }

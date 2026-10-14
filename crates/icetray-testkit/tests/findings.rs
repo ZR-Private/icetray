@@ -1026,6 +1026,59 @@ async fn test_order_index_truncated_is_advice() -> Result<()> {
     Ok(())
 }
 
+/// The share of the order column's pages in `served`'s files whose
+/// column-index minimum is distinct, over every file.
+fn order_mins_ratio(served: &Served) -> f64 {
+    let generation = served.current();
+    let (mut pages, mut distinct) = (0, 0);
+    for file in &generation.files {
+        let order = file
+            .index
+            .order_leaf()
+            .expect("an ordered table's file has an order column");
+        let index = file
+            .index
+            .metadata()
+            .column_index()
+            .expect("the fixture writes a column index");
+        for group in index {
+            let ColumnIndexMetaData::BYTE_ARRAY(entries) = &group[order] else {
+                panic!("a string order column's index lists byte arrays");
+            };
+            let mins: Vec<&[u8]> = entries.min_values_iter().flatten().collect();
+            pages += mins.len();
+            distinct += mins.iter().collect::<BTreeSet<_>>().len();
+        }
+    }
+    approx::ratio(approx::count(distinct), approx::count(pages))
+}
+
+/// An untruncated string order column whose page minimums repeat, as a
+/// history that starts at the same time for every key writes them, draws
+/// no `order_index_truncated`: only a cut the order facts prove is
+/// advised on, and a repeated minimum proves none. One key's rows per page,
+/// so every page's minimum is that key's first order value.
+#[tokio::test]
+async fn test_order_index_truncated_is_not_raised_for_repeated_whole_minimums() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        layout: Layout {
+            page_rows: approx::length(ROWS_PER_KEY),
+            ..Layout::contract()
+        },
+        ..ordered_spec("ord_repeatedmins", OrderKind::Str)
+    };
+    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
+    let ratio = order_mins_ratio(&served);
+    assert!(
+        ratio < DISTINCT_MINS_RATIO_ADVICE,
+        "the page minimums repeat: {ratio}"
+    );
+    let report = diagnose(&served.current(), Level::Optimal, &ValueFormat::opaque);
+    assert_codes(&report, &[], &[]);
+    Ok(())
+}
+
 /// The id of the long-run fixture whose run is one row past the advice.
 const LONG_RUN_ID: u64 = 7;
 
