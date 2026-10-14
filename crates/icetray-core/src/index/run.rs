@@ -271,16 +271,17 @@ impl FileIndex {
     /// entry, an integer one or a byte-array one no writer truncated, they
     /// lie on the page that holds the bound and on the run-edge pages,
     /// since the run ascends and so at most one page that holds the run
-    /// alone lies across each bound (`PAGES_ACROSS_A_BOUND`). Where more
-    /// lie across either bound, as under a truncated byte-array entry that
-    /// a bound shares a prefix with, those order pages are read in a first
-    /// round and the value pages of exactly the rows taken in a second; so
-    /// are they where a row group of the run has no column index on its
-    /// order chunk and a bound is set (`order_index_missing`). The pages
-    /// are counted per bound over the whole run, not per row group, so
-    /// under a truncated entry a bound with one such page on each side of
-    /// a row group boundary takes two rounds: a round more, never a byte
-    /// more, and never under an exact entry.
+    /// alone lies across each bound (`PAGES_ACROSS_A_BOUND`). Where the
+    /// walk meets more across either bound before the limit is met, as
+    /// under a truncated byte-array entry that a bound shares a prefix
+    /// with, those order pages are read in a first round and the value
+    /// pages of exactly the rows taken in a second; so are they where a row
+    /// group of the run has no column index on its order chunk and a bound
+    /// is set (`order_index_missing`). The pages the walk meets are counted
+    /// per bound, not per row group, so under a truncated entry a bound
+    /// with one such page on each side of a row group boundary takes two
+    /// rounds: a round more, never a byte more, and never under an exact
+    /// entry.
     ///
     /// Per column and row group, the pages are one span GET through
     /// `source`'s cache under its span window for every contiguous run the
