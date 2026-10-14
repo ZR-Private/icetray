@@ -14,6 +14,7 @@ mod inspect;
 mod ordered;
 mod page_header;
 mod pages;
+mod pairs;
 mod plain;
 mod record;
 #[cfg(test)]
@@ -49,6 +50,7 @@ use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
+pub(crate) use pairs::{PairChunks, Pairs, RowSpan};
 
 /// A row's position in a file: its row group and its row within that group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -43,8 +43,9 @@ use crate::time;
 
 /// The prefix of the local filesystem store. A `file://` URI and a bare
 /// absolute path both resolve to it, so a table written by a local job and
-/// one whose metadata records URIs read the same way.
-pub(crate) const FILE_PREFIX: &str = "file://";
+/// one whose metadata records URIs read the same way; a store registered
+/// under it (`Storage::register`) serves every local location.
+pub const FILE_PREFIX: &str = "file://";
 
 /// The local filesystem scheme, which every `file:` URI starts with
 /// (RFC 8089): `file:///path` with an empty authority, `file://localhost/path`,

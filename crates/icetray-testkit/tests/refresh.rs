@@ -3,7 +3,9 @@
 //! files, the table advances on refresh reusing every unchanged file, a
 //! duplicate key and an Avro data file are each refused while the last
 //! generation keeps serving, a strict table below its level is held until a compaction, and
-//! overlapping files are verified once per group that gained a file.
+//! overlapping files are verified once per group that gained a file. An
+//! ordered table checks a repeated pair only where one can occur, and a
+//! refresh costs its delta (RFD 025).
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -12,22 +14,27 @@ use std::sync::Arc;
 use iceberg::spec::{DataFileFormat, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx;
-use icetray_core::config::Residency;
+use icetray_core::config::{LocalConfig, Residency, TableConfig};
 use icetray_core::metric;
 use icetray_core::{
-    Capping, Error, ErrorKind, FindingCode, KeyType, Level, RefusalReason, Row, TableSource,
-    TableState, UnsupportedFormat,
+    Capping, Error, ErrorKind, FILE_PREFIX, FindingCode, Generation, KeyType, Level, LoadedFile,
+    LocalDir, OrderValue, RefusalReason, Row, Storage, TableSource, TableState, UnsupportedFormat,
 };
 use icetray_testkit::fixture::{
     APPENDED_4K_6K, DATA_DIR, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
-    THREE_FILES, TWO_FILES, data_file_entry, local_catalog, residue_class,
+    THREE_FILES, TWO_BUCKETS, TWO_FILES, data_file_entry, local_catalog, residue_class,
 };
+use icetray_testkit::keys::FIRST_VERSION;
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{
     self, HINT_POLL_GETS, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served,
 };
-use icetray_testkit::{Fixture, FixtureSpec, HandSnapshot, Result, TestkitError, write_fixture};
+use icetray_testkit::{
+    CountingStore, DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, OrderKind,
+    Ordered, Result, Statistics, TestkitError, write_fixture,
+};
+use object_store::ObjectStore;
 
 /// The first build of the reuse fixture and the range its second appends.
 const IDS_8K: Range<u64> = 0..8_000;
@@ -56,7 +63,7 @@ const INTERLEAVED_WRITTEN: usize = 4_000;
 async fn serve_root(fixture: &Fixture, strict: bool) -> Result<Served> {
     let source = fixture.root_source();
     verify::serve(
-        icetray_core::config::TableConfig {
+        TableConfig {
             source: source.clone(),
             ..fixture.config(Residency::Full, strict)
         },
@@ -562,5 +569,390 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
             .row,
         fixture.expected(&held_key)
     );
+    Ok(())
+}
+
+/// Rows per key of the ordered refresh fixtures.
+const ORDERED_ROWS_PER_KEY: u64 = 3;
+
+/// The first raw order value of every key, and the distance between a
+/// key's rows.
+const ORDER_START: i64 = 1_000;
+const ORDER_STEP: i64 = 10;
+
+/// Ids of the ordered refresh fixtures: forty keys over two buckets.
+const ORDERED_IDS: Range<u64> = 0..40;
+
+/// Rows per page of the ordered fixtures: far fewer than a file holds, so
+/// every file's order column has many pages.
+const ORDERED_PAGE_ROWS: usize = 4;
+
+/// The id the ordered tests append beside, update, and repeat.
+const AN_ID: u64 = 17;
+
+/// Every residency, each of which an ordered refresh is checked in.
+const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
+
+fn ordered_rows_per_key(_id: u64) -> u64 {
+    ORDERED_ROWS_PER_KEY
+}
+
+/// Rows per key of the late-row fixture: a run of many pages, each page's
+/// order values a narrow slice of it, so the column index rules out every
+/// page of the run but those a late row can fall among.
+const LONG_RUN_ROWS: u64 = 40;
+
+fn long_runs(_id: u64) -> u64 {
+    LONG_RUN_ROWS
+}
+
+/// The raw order value of a key's `index`-th row.
+fn order_of(index: u64) -> i64 {
+    ORDER_START + ORDER_STEP * i64::try_from(index).expect("a row index fits i64")
+}
+
+/// `ORDERED_IDS` over two buckets, `rows_per_key` long order values per
+/// key, in pages of `ORDERED_PAGE_ROWS` rows.
+fn ordered_spec(name: &str, rows_per_key: fn(u64) -> u64) -> FixtureSpec {
+    let ordered = Ordered {
+        kind: OrderKind::Long,
+        rows_per_key,
+        start: ORDER_START,
+        step: ORDER_STEP,
+    };
+    FixtureSpec {
+        ids: ORDERED_IDS,
+        buckets: TWO_BUCKETS,
+        layout: Layout {
+            page_rows: ORDERED_PAGE_ROWS,
+            ..Layout::contract()
+        },
+        ..FixtureSpec::ordered(name, KeyType::Long, ordered)
+    }
+}
+
+/// An ordered fixture written through `catalog` with its hint, served in
+/// `residency` from its root over storage whose local filesystem store
+/// counts GETs per object, with a local directory under `dir` in the Disk
+/// tier.
+async fn serve_counted(
+    fixture: &Fixture,
+    residency: Residency,
+    dir: &std::path::Path,
+) -> Result<(Served, Arc<CountingStore>)> {
+    let counting = Arc::new(CountingStore::local());
+    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+    let store: Arc<dyn ObjectStore> = Arc::<CountingStore>::clone(&counting);
+    storage.register(FILE_PREFIX, store);
+    let local = match residency {
+        Residency::Disk => Some(Arc::new(LocalDir::open(
+            &LocalConfig {
+                dir: dir.to_path_buf(),
+                index_budget_bytes: None,
+                page_cache_disk_bytes: 0,
+            },
+            storage.stats(),
+        )?)),
+        Residency::Full | Residency::Bloom => None,
+    };
+    let source = fixture.root_source();
+    let config = TableConfig {
+        source: source.clone(),
+        ..fixture.config(residency, false)
+    };
+    let served = verify::serve_over(
+        storage,
+        config,
+        TableSource::from_config(&source).await?,
+        local,
+    )
+    .await?;
+    Ok((served, counting))
+}
+
+/// GETs so far of every file of `generation`, by path.
+fn gets_by_path(generation: &Generation, counting: &CountingStore) -> Vec<(String, u64)> {
+    generation
+        .files
+        .iter()
+        .map(|file| (file.entry.path.clone(), counting.gets_to(&file.entry.path)))
+        .collect()
+}
+
+/// A refresh that appends rows later than every row the table holds reads
+/// only its new files (RFD 025, Refresh): no new file's order range meets a
+/// reused one's, so no merge runs and no reused file is read again.
+#[tokio::test]
+async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let spec = ordered_spec(&format!("ord_later_{at}"), ordered_rows_per_key);
+        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        fixture.write_hint().await?;
+        let local = tempfile::tempdir()?;
+        let (served, counting) = serve_counted(&fixture, residency, local.path()).await?;
+        let before = gets_by_path(&served.current(), &counting);
+
+        let later = order_of(ORDERED_ROWS_PER_KEY);
+        let rows: Vec<(u64, i64)> = ORDERED_IDS.map(|id| (id, later)).collect();
+        fixture
+            .append_ordered(catalog.as_ref(), &rows, "later")
+            .await?;
+        fixture.write_hint().await?;
+        assert!(served.table.refresh().await?, "{residency:?}");
+        let generation = served.current();
+        for (path, gets) in &before {
+            assert_eq!(
+                counting.gets_to(path),
+                *gets,
+                "{residency:?}: {path} is not read again"
+            );
+        }
+        let new: Vec<&Arc<LoadedFile>> = generation
+            .files
+            .iter()
+            .filter(|file| !before.iter().any(|(path, _)| *path == file.entry.path))
+            .collect();
+        assert_eq!(new.len(), approx::length(TWO_BUCKETS), "{residency:?}");
+        for file in new {
+            assert!(
+                counting.gets_to(&file.entry.path) > 0,
+                "{residency:?}: the new file {} is read",
+                file.entry.path
+            );
+        }
+        assert_eq!(generation.overlap_groups_verified(), 0, "{residency:?}");
+    }
+    Ok(())
+}
+
+/// A row appended inside an existing file's order range costs that file's
+/// order pages the row falls among (RFD 025, Refresh): under `full` a GET
+/// of each, fewer than the pages its key's run spans, which the column
+/// index rules out but for those; under `bloom` those and the key pages
+/// they span; under `disk` none, the pages read from the chunk file. The
+/// file of the other bucket, which cannot share the key, is not read.
+#[tokio::test]
+async fn test_refresh_reads_only_the_order_pages_late_rows_fall_among() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let spec = ordered_spec(&format!("ord_late_{at}"), long_runs);
+        let late = refresh_with_a_late_row(spec, residency).await?;
+        assert_eq!(
+            late.other_gets, 0,
+            "{residency:?}: no other bucket shares the key"
+        );
+        let run_pages = long_run_pages();
+        match residency {
+            Residency::Full => assert!(
+                late.holding_gets > 0 && late.holding_gets < run_pages,
+                "{residency:?}: {} order pages of a run of {run_pages}",
+                late.holding_gets
+            ),
+            Residency::Bloom => assert!(
+                late.holding_gets > 0 && late.holding_gets < run_pages,
+                "{residency:?}: {} order and key pages of a run of {run_pages}",
+                late.holding_gets
+            ),
+            Residency::Disk => {
+                assert_eq!(
+                    late.holding_gets, 0,
+                    "{residency:?}: the chunk file serves the pages"
+                );
+                assert!(late.local_reads > 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Without a column index on the order column, a row appended inside an
+/// existing file's order range costs every order page of that file its key
+/// can be in (RFD 025, Refresh): at least the pages of its key's run.
+#[tokio::test]
+async fn test_refresh_reads_every_order_page_of_the_key_without_a_column_index() -> Result<()> {
+    let spec = ordered_spec("ord_unindexed", long_runs);
+    let spec = FixtureSpec {
+        layout: Layout {
+            order_statistics: Statistics::None,
+            ..spec.layout
+        },
+        ..spec
+    };
+    let late = refresh_with_a_late_row(spec, Residency::Full).await?;
+    assert_eq!(late.other_gets, 0);
+    assert!(
+        late.holding_gets >= long_run_pages(),
+        "{} order pages",
+        late.holding_gets
+    );
+    Ok(())
+}
+
+/// A dictionary-encoded order column's pages decode with the chunk's
+/// dictionary page, which the refresh fetches beside them in every tier
+/// that fetches pages: under `full` at least one order page and the
+/// dictionary page, still fewer than the key's run fills.
+#[tokio::test]
+async fn test_refresh_reads_the_order_dictionary_with_the_pages_late_rows_fall_among() -> Result<()>
+{
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let spec = ordered_spec(&format!("ord_dictionary_{at}"), long_runs);
+        let spec = FixtureSpec {
+            layout: Layout {
+                order_dictionary: true,
+                ..spec.layout
+            },
+            ..spec
+        };
+        let late = refresh_with_a_late_row(spec, residency).await?;
+        assert_eq!(late.other_gets, 0);
+        match residency {
+            Residency::Full | Residency::Bloom => assert!(
+                late.holding_gets > 1 && late.holding_gets < long_run_pages(),
+                "{residency:?}: {} pages",
+                late.holding_gets
+            ),
+            Residency::Disk => assert_eq!(late.holding_gets, 0),
+        }
+    }
+    Ok(())
+}
+
+/// The order pages a run of `LONG_RUN_ROWS` rows fills, at least.
+fn long_run_pages() -> u64 {
+    approx::count(
+        usize::try_from(LONG_RUN_ROWS).expect("a run's rows fit usize") / ORDERED_PAGE_ROWS,
+    )
+}
+
+/// What a refresh that appends one row inside `AN_ID`'s run read.
+struct LateRead {
+    /// GETs of the file holding the key.
+    holding_gets: u64,
+    /// GETs of every other file the table held before.
+    other_gets: u64,
+    /// Local reads across the refresh.
+    local_reads: u64,
+}
+
+/// `spec` written and served in `residency`, then a row of `AN_ID` between
+/// its second and third appended and the table refreshed; what the refresh
+/// read of the files it held before.
+async fn refresh_with_a_late_row(spec: FixtureSpec, residency: Residency) -> Result<LateRead> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture.write_hint().await?;
+    let local = tempfile::tempdir()?;
+    let (served, counting) = serve_counted(&fixture, residency, local.path()).await?;
+    let before = gets_by_path(&served.current(), &counting);
+    let holding = MergeOracle::read(&fixture)
+        .await?
+        .copies(&fixture.key(AN_ID))[0]
+        .path
+        .clone();
+    assert!(before.iter().any(|(path, _)| *path == holding));
+    let local_reads = served.storage.stats().local_reads();
+    fixture
+        .append_ordered(catalog.as_ref(), &[(AN_ID, order_of(1) + 1)], "late")
+        .await?;
+    fixture.write_hint().await?;
+    assert!(served.table.refresh().await?, "{residency:?}");
+    assert_eq!(served.current().overlap_groups_verified(), 1);
+    let read = |(path, gets): &(String, u64)| counting.gets_to(path) - gets;
+    Ok(LateRead {
+        holding_gets: before
+            .iter()
+            .filter(|(path, _)| *path == holding)
+            .map(read)
+            .sum(),
+        other_gets: before
+            .iter()
+            .filter(|(path, _)| *path != holding)
+            .map(read)
+            .sum(),
+        local_reads: served.storage.stats().local_reads() - local_reads,
+    })
+}
+
+/// Two files a refresh adds that repeat a pair the table did not hold are
+/// checked against each other (RFD 025, Refresh), and the refusal names the
+/// later of them in file order; the last generation keeps serving.
+#[tokio::test]
+async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let spec = ordered_spec(&format!("ord_twice_{at}"), ordered_rows_per_key);
+        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        fixture.write_hint().await?;
+        let local = tempfile::tempdir()?;
+        let (served, _counting) = serve_counted(&fixture, residency, local.path()).await?;
+        let v1 = served.current().snapshot_id;
+
+        let id = ORDERED_IDS.end;
+        let first = fixture.write_rows(&[id], FIRST_VERSION, "first").await?;
+        let second = fixture.write_rows(&[id], FIRST_VERSION, "second").await?;
+        let later = [&first, &second]
+            .map(|files| files[0].file_path().to_string())
+            .into_iter()
+            .max()
+            .expect("two files");
+        let mut data = fixture.files().to_vec();
+        data.extend(first);
+        data.extend(second);
+        fixture
+            .commit_by_hand(HandSnapshot {
+                data,
+                deletes: fixture.deletes().to_vec(),
+            })
+            .await?;
+        let error = served.table.refresh().await.unwrap_err();
+        let Error::Refused {
+            reason: RefusalReason::DuplicateRows { path, key, order },
+            ..
+        } = error
+        else {
+            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
+        };
+        assert_eq!(
+            path, later,
+            "{residency:?}: both start at the key, so by path"
+        );
+        assert_eq!(key, fixture.key(id));
+        assert_eq!(*order, OrderValue::Long(order_of(0)));
+        assert_eq!(
+            served.current().snapshot_id,
+            v1,
+            "the last generation serves"
+        );
+    }
+    Ok(())
+}
+
+/// An update's new copy of a pair, beside its older copy deleted by a
+/// deletion vector, is no repeat (RFD 021, RFD 025): the refresh serves.
+#[tokio::test]
+async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let spec = ordered_spec(&format!("ord_updated_{at}"), ordered_rows_per_key);
+        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        fixture.write_hint().await?;
+        let local = tempfile::tempdir()?;
+        let (served, _counting) = serve_counted(&fixture, residency, local.path()).await?;
+        let v1 = served.current();
+
+        fixture
+            .update_rows(&[(AN_ID, order_of(1))], DeleteForm::Vectors, "update")
+            .await?;
+        assert!(served.table.refresh().await?, "{residency:?}");
+        assert!(matches!(served.table.state(), TableState::Serving { .. }));
+        let generation = served.current();
+        assert_eq!(generation.files.len(), v1.files.len() + 1, "{residency:?}");
+        assert_eq!(
+            generation.overlap_groups_verified(),
+            1,
+            "{residency:?}: the new file is merged against the file it shares a pair with"
+        );
+    }
     Ok(())
 }

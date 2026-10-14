@@ -2,8 +2,9 @@
 //! order column decoded beside its key column, every row's key and order
 //! value strictly above the row's before it, across pages and row groups
 //! alike, each order page's values within its column index entry, and the
-//! order facts recorded on the way. A key-value table never reaches this
-//! module.
+//! order facts recorded on the way; and, since the entries are then checked
+//! bounds, which pages an entry rules out of a range of order values. A
+//! key-value table never reaches this module.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -40,7 +41,7 @@ pub(super) enum OrderRun {
 
 impl OrderRun {
     /// The number of values.
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         match self {
             Self::Long(run) => run.len(),
             Self::Str(run) | Self::Bin(run) => run.len(),
@@ -49,7 +50,7 @@ impl OrderRun {
 
     /// Whether every value is UTF-8, in a run of strings; true in any
     /// other.
-    fn is_utf8(&self) -> bool {
+    pub(super) fn is_utf8(&self) -> bool {
         match self {
             Self::Str(run) => run.iter().all(|value| is_utf8(value.data())),
             Self::Long(_) | Self::Bin(_) => true,
@@ -58,7 +59,7 @@ impl OrderRun {
 
     /// The value at `at`, which is below `len`; a run of strings is read
     /// back only once `is_utf8` holds for it.
-    fn value(&self, at: usize) -> OrderValue {
+    pub(super) fn value(&self, at: usize) -> OrderValue {
         match self {
             Self::Long(run) => OrderValue::Long(run[at]),
             Self::Str(run) => OrderValue::Str(
@@ -74,6 +75,23 @@ impl OrderRun {
         match self {
             Self::Long(run) => run[at].cmp(&run[other_at]),
             Self::Str(run) | Self::Bin(run) => run[at].data().cmp(run[other_at].data()),
+        }
+    }
+
+    /// Value `at` against value `other_at` of `other`, a run of the same
+    /// column in another file. Runs of different variants never meet
+    /// within one table; when they do, the order is `OrderValue`'s derived
+    /// order across variants.
+    pub(super) fn cmp_run(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
+        match (self, other) {
+            (Self::Long(mine), Self::Long(theirs)) => mine[at].cmp(&theirs[other_at]),
+            (Self::Str(mine), Self::Str(theirs)) | (Self::Bin(mine), Self::Bin(theirs)) => {
+                mine[at].data().cmp(theirs[other_at].data())
+            }
+            (
+                Self::Long(_) | Self::Str(_) | Self::Bin(_),
+                Self::Long(_) | Self::Str(_) | Self::Bin(_),
+            ) => self.value(at).cmp(&other.value(other_at)),
         }
     }
 
@@ -277,7 +295,7 @@ impl<'a> PairCheck<'a> {
         check_order_page_headers(order_chunk, self.shape, chunks)?;
         self.group = GroupState::default();
         let pages = order_chunk.page_locations().len();
-        if let Some(index) = self.column_index(order_chunk) {
+        if let Some(index) = order_column_index(order_chunk) {
             let described = usize::try_from(index.num_pages()).unwrap_or(usize::MAX);
             if described != pages {
                 self.group.index_mismatch = Some(described.min(pages));
@@ -325,28 +343,6 @@ impl<'a> PairCheck<'a> {
         }
     }
 
-    /// The order column's column index entry for `chunk`; `None` when the
-    /// file has none for it, which a Scan reads around.
-    fn column_index(&self, chunk: ColumnChunk<'a>) -> Option<&'a ColumnIndexMetaData> {
-        let entry = self
-            .column
-            .metadata
-            .column_index()?
-            .get(chunk.row_group())?
-            .get(self.column.leaf)?;
-        match entry {
-            ColumnIndexMetaData::NONE => None,
-            ColumnIndexMetaData::BOOLEAN(_)
-            | ColumnIndexMetaData::INT32(_)
-            | ColumnIndexMetaData::INT64(_)
-            | ColumnIndexMetaData::INT96(_)
-            | ColumnIndexMetaData::FLOAT(_)
-            | ColumnIndexMetaData::DOUBLE(_)
-            | ColumnIndexMetaData::BYTE_ARRAY(_)
-            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => Some(entry),
-        }
-    }
-
     /// The next window of the row group: its `rows` rows from row `base`
     /// on, their `keys` and `orders`. Nothing more is compared once a window
     /// holds a null in either column, a key that is not UTF-8
@@ -387,7 +383,7 @@ impl<'a> PairCheck<'a> {
         if self.group.index_mismatch.is_some() {
             return;
         }
-        let Some(entry) = self.column_index(chunk) else {
+        let Some(entry) = order_column_index(chunk) else {
             return;
         };
         let locations = chunk.page_locations();
@@ -467,6 +463,97 @@ impl<'a> PairCheck<'a> {
                 self.max = Some(greatest);
             }
         }
+    }
+}
+
+/// The column index entry of `chunk`, an order column chunk; `None` when
+/// the file has none for it, which a Scan reads around and the check across
+/// files reads every page of.
+pub(super) fn order_column_index(chunk: ColumnChunk<'_>) -> Option<&ColumnIndexMetaData> {
+    let entry = chunk
+        .column
+        .metadata
+        .column_index()?
+        .get(chunk.row_group())?
+        .get(chunk.column.leaf)?;
+    match entry {
+        ColumnIndexMetaData::NONE => None,
+        ColumnIndexMetaData::BOOLEAN(_)
+        | ColumnIndexMetaData::INT32(_)
+        | ColumnIndexMetaData::INT64(_)
+        | ColumnIndexMetaData::INT96(_)
+        | ColumnIndexMetaData::FLOAT(_)
+        | ColumnIndexMetaData::DOUBLE(_)
+        | ColumnIndexMetaData::BYTE_ARRAY(_)
+        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => Some(entry),
+    }
+}
+
+/// Whether page `page`'s entry of the column index `entry` meets the
+/// closed range `orders`: its minimum at or below the range's top and its
+/// maximum at or above its bottom, an integer entry against longs and a
+/// byte-array entry against bytes. Verification checked that every value
+/// of a page lies within its entry (`within`), so a page that does not
+/// meet the range holds no value in it. An entry that bounds nothing for
+/// these values, of another type or with a bound missing, meets every
+/// range.
+pub(super) fn page_meets(
+    entry: &ColumnIndexMetaData,
+    page: usize,
+    orders: (&OrderValue, &OrderValue),
+) -> bool {
+    match entry {
+        ColumnIndexMetaData::INT32(index) => primitive_meets(index, page, orders, i64::from),
+        ColumnIndexMetaData::INT64(index) => primitive_meets(index, page, orders, |value| value),
+        ColumnIndexMetaData::BYTE_ARRAY(index)
+        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index) => bytes_meet(index, page, orders),
+        ColumnIndexMetaData::NONE
+        | ColumnIndexMetaData::BOOLEAN(_)
+        | ColumnIndexMetaData::INT96(_)
+        | ColumnIndexMetaData::FLOAT(_)
+        | ColumnIndexMetaData::DOUBLE(_) => true,
+    }
+}
+
+/// `page_meets` for an integer entry, its values widened to longs by
+/// `widen`.
+fn primitive_meets<T: Copy>(
+    index: &PrimitiveColumnIndex<T>,
+    page: usize,
+    orders: (&OrderValue, &OrderValue),
+    widen: fn(T) -> i64,
+) -> bool {
+    match (index.min_value(page), index.max_value(page), orders) {
+        (Some(&min), Some(&max), (OrderValue::Long(low), OrderValue::Long(high))) => {
+            widen(min) <= *high && *low <= widen(max)
+        }
+        (None | Some(_), None | Some(_), _) => true,
+    }
+}
+
+/// `page_meets` for a byte-array entry.
+fn bytes_meet(
+    index: &ByteArrayColumnIndex,
+    page: usize,
+    (low, high): (&OrderValue, &OrderValue),
+) -> bool {
+    match (
+        index.min_value(page),
+        index.max_value(page),
+        order_bytes(low),
+        order_bytes(high),
+    ) {
+        (Some(min), Some(max), Some(low), Some(high)) => min <= high && low <= max,
+        (None | Some(_), None | Some(_), None | Some(_), None | Some(_)) => true,
+    }
+}
+
+/// The bytes a string or binary order value compares by; `None` for a long.
+fn order_bytes(value: &OrderValue) -> Option<&[u8]> {
+    match value {
+        OrderValue::Str(text) => Some(text.as_bytes()),
+        OrderValue::Bytes(bytes) => Some(bytes),
+        OrderValue::Long(_) => None,
     }
 }
 

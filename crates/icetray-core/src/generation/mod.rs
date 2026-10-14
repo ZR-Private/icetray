@@ -1,12 +1,15 @@
 //! A generation (RFD 005, RFD 017, RFD 020, RFD 021): one snapshot of one
 //! table, every live data file indexed with the rows its deletes remove,
 //! the files in a deterministic order, the overlap groups among them
-//! checked for a live key two files share, and the lookup level and the
+//! checked for a live key two files share (in an ordered table, the files
+//! that can share a live key and order value), and the lookup level and the
 //! resident-bytes budget checked at the footer stage before any key chunk
 //! or delete is fetched. Immutable once built; a `Table` builds the next
 //! one beside it, reusing every file whose path, size, and data sequence
 //! number are unchanged and every applied delete whose sources are, and
 //! swaps atomically.
+
+mod ordered;
 
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
@@ -143,7 +146,9 @@ pub struct Generation {
     /// Per bucket a member of an overlap group is in, how many files a
     /// lookup there may probe (`widest_per_bucket`).
     overlapping: BTreeMap<u32, usize>,
-    /// Overlap groups this load merged to prove key uniqueness.
+    /// Overlap groups this load merged to prove key uniqueness; on an
+    /// ordered table, the files it checked that merged with another to
+    /// prove pair uniqueness (`ordered::verify_rows`).
     verified_groups: usize,
     /// Per file of `files`, the rows its deletes remove (RFD 021); `None`
     /// where no delete applies.
@@ -259,22 +264,16 @@ impl Generation {
     }
 
     /// Everything after the files are indexed: sorts them, builds the
-    /// routes, finds the overlap groups, and merges every group that a
-    /// non-reused file belongs to, or a member whose deletes shrank,
-    /// refusing a live key two files share; a row a file's deletes remove
-    /// is not live (RFD 021). A data file with deletes whose manifest
-    /// records another row count than its footer is
+    /// routes, finds the overlap groups, and proves uniqueness across
+    /// files where the snapshot changed it: a key-value table merges every
+    /// group that a non-reused file belongs to, or a member whose deletes
+    /// shrank, refusing a live key two files share (`verify_groups`); an
+    /// ordered table checks each such file against the files that can
+    /// share a live pair with it, refusing one (`ordered::verify_rows`). A
+    /// row a file's deletes remove is not live (RFD 021). A data file with
+    /// deletes whose manifest records another row count than its footer is
     /// `DeleteFault::RecordCountMismatch`, since its deletes' positions
-    /// were checked against the manifest's. The groups are merged one at a
-    /// time, each one's key chunks gathered before its merge and dropped
-    /// after, so the load holds one group's chunks at once and not the
-    /// table's (RFD 017: the Disk tier reads them back from the chunk
-    /// files, the Bloom tier fetches them again).
-    /// Each merge runs on the blocking pool (`blocking::on_blocking_pool`),
-    /// one at a time for this load; while it runs, the async worker goes on
-    /// polling other tasks, and the task goes on polling the other loads it
-    /// joins. A canceled merge is `Error::VerifyCanceled` for the group's
-    /// first file.
+    /// were checked against the manifest's.
     async fn assemble(
         table: &str,
         snapshot: &Snapshot,
@@ -305,30 +304,10 @@ impl Generation {
             files: files.iter().map(|file| FileView::loaded(file)).collect(),
             overlapping: &overlapping,
         });
-        let to_verify: Vec<Vec<usize>> = groups
-            .into_iter()
-            .filter(|group| {
-                group
-                    .iter()
-                    .any(|&at| !members[at].reused || members[at].shrank)
-            })
-            .collect();
-        for group in &to_verify {
-            let members = gather_members(&files, group).await?;
-            let first = files[group[0]].index.handle().location.clone();
-            let owned_table = table.to_string();
-            let removed = Arc::clone(&deletes);
-            blocking::on_blocking_pool(move || {
-                let gone = move |at: usize, position: RowPosition| {
-                    removed[at]
-                        .as_ref()
-                        .is_some_and(|rows| rows.contains(position))
-                };
-                refuse_duplicates(&owned_table, &members, Some(&gone))
-            })
-            .await
-            .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
-        }
+        let verified_groups = match layout.order {
+            Some(_) => ordered::verify_rows(table, &members, &files, &deletes).await?,
+            None => verify_groups(table, &members, &files, groups, &deletes).await?,
+        };
         let records = files.iter().map(|file| file.entry.records).sum();
         let delete_bytes = deletes
             .iter()
@@ -345,7 +324,7 @@ impl Generation {
             snapshot_id = %snapshot.snapshot_id(),
             files = files.len(),
             index_bytes,
-            overlap_groups_verified = to_verify.len(),
+            overlap_groups_verified = verified_groups,
             "assembled generation"
         );
         Ok(Self {
@@ -367,7 +346,7 @@ impl Generation {
             column_costs: caps.columns,
             probe_routes,
             overlapping,
-            verified_groups: to_verify.len(),
+            verified_groups,
             deletes,
             delete_reads: deletes::Known::default(),
             delete_bound: 0,
@@ -507,6 +486,9 @@ impl Generation {
 
     /// Overlap groups this load merged to prove key uniqueness: the groups
     /// that gained a file since `previous`, or every group on a first load.
+    /// On an ordered table, the files this load checked, new or reused
+    /// with deletes that shrank, that merged with another (RFD 025,
+    /// Refresh).
     pub fn overlap_groups_verified(&self) -> usize {
         self.verified_groups
     }
@@ -883,7 +865,8 @@ impl Planned {
     /// (`deletes::load`), the first failure of either stopping the other,
     /// then assembles the generation: files sorted, overlap groups found,
     /// and every group that gained a file or whose deletes shrank merged to
-    /// refuse a duplicate live key. `Err` leaves nothing behind; the caller
+    /// refuse a duplicate live key, or on an ordered table every such file
+    /// checked to refuse a repeated live pair. `Err` leaves nothing behind; the caller
     /// keeps serving the previous generation.
     pub(crate) async fn build(self, local: Option<&Arc<LocalDir>>) -> Result<Generation> {
         let table = self.config.name.as_str();
@@ -1889,6 +1872,53 @@ fn refuse_duplicates(
         }
     }
     Ok(())
+}
+
+/// Merges every overlap group of `groups` that a member of `members` not
+/// reused, or reused with deletes that shrank, belongs to, refusing a live
+/// key two files share (`refuse_duplicates`); `deletes` are the rows each
+/// file's deletes remove. The groups are merged one at a time, each one's
+/// key chunks gathered before its merge and dropped after, so the load
+/// holds one group's chunks at once and not the table's (RFD 017: the Disk
+/// tier reads them back from the chunk files, the Bloom tier fetches them
+/// again). Each merge runs on the blocking pool
+/// (`blocking::on_blocking_pool`), one at a time for this load; while it
+/// runs, the async worker goes on polling other tasks, and the task goes on
+/// polling the other loads it joins. A canceled merge is
+/// `Error::VerifyCanceled` for the group's first file. How many groups were
+/// merged.
+async fn verify_groups(
+    table: &str,
+    members: &[Member],
+    files: &[Arc<LoadedFile>],
+    groups: Vec<Vec<usize>>,
+    deletes: &Arc<[Option<Arc<FileDeletes>>]>,
+) -> Result<usize> {
+    let to_verify: Vec<Vec<usize>> = groups
+        .into_iter()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|&at| !members[at].reused || members[at].shrank)
+        })
+        .collect();
+    for group in &to_verify {
+        let members = gather_members(files, group).await?;
+        let first = files[group[0]].index.handle().location.clone();
+        let owned_table = table.to_string();
+        let removed = Arc::clone(deletes);
+        blocking::on_blocking_pool(move || {
+            let gone = move |at: usize, position: RowPosition| {
+                removed[at]
+                    .as_ref()
+                    .is_some_and(|rows| rows.contains(position))
+            };
+            refuse_duplicates(&owned_table, &members, Some(&gone))
+        })
+        .await
+        .map_err(|canceled| Error::verify_canceled(&first, canceled))??;
+    }
+    Ok(to_verify.len())
 }
 
 /// What a lookup answers for one key; the wire carries the same answer

@@ -1,10 +1,13 @@
 //! Test infrastructure shared across the workspace: an in-process S3 server,
 //! a stand-in for the AWS catalogs, the fixture writer and its delete file
 //! writers, the ordered fixtures and their scan model (RFD 025), the
-//! brute-force merge-on-read oracle, the deterministic simulation transport, shared assertions, the golden-table locator (RFD
-//! 014), and the truth file a check replays against a running server.
+//! brute-force merge-on-read oracle, the deterministic simulation
+//! transport, a store that counts GETs per object, shared assertions, the
+//! golden-table locator (RFD 014), and the truth file a check replays
+//! against a running server.
 
 pub mod aws_catalog;
+pub mod counting;
 pub mod delete_files;
 pub mod error;
 pub mod fixture;
@@ -20,6 +23,7 @@ pub mod sim;
 pub mod truth;
 pub mod verify;
 
+pub use counting::CountingStore;
 pub use error::{Result, TestkitError};
 pub use fixture::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, Nulls, Order, RawFile, memory_catalog_local,

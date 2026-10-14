@@ -2697,6 +2697,7 @@ dependencies = [
  "bytes",
  "clap",
  "crc32fast",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-util",

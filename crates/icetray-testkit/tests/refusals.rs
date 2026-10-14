@@ -1295,3 +1295,101 @@ async fn test_null_order_is_refused() -> Result<()> {
     assert_eq!(*row_group, 0);
     Ok(())
 }
+
+/// The id the cross-file tests repeat a pair of: not the first of the
+/// one-bucket fixture, so a file of its rows alone is later in file order
+/// than the fixture's.
+const REPEATED_ID: u64 = 17;
+
+/// The order value of `two_row_fixture`'s second row of every key, at a
+/// step of one.
+const SECOND_ORDER: i64 = 1;
+
+/// A pair a later file repeats is `duplicate_rows` across files (RFD 025,
+/// Uniqueness), naming the later file in file order: the appended file,
+/// whose first key is past the fixture's.
+#[tokio::test]
+async fn test_duplicate_rows_across_files_are_refused_naming_the_later_file() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = two_row_fixture(&catalog, "ord_dup_files", 1).await?;
+    assert_eq!(fixture.file_count(), 1, "one bucket, one file");
+    let written = fixture.files()[0].file_path().to_string();
+    fixture
+        .append_ordered(catalog.as_ref(), &[(REPEATED_ID, SECOND_ORDER)], "again")
+        .await?;
+    let appended = fixture
+        .files()
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .find(|path| *path != written)
+        .expect("the append adds a file");
+    let refused = refused_through_catalog(&fixture, &catalog, ordered_config(&fixture)).await?;
+    let RefusalReason::DuplicateRows { path, key, order } = &refused.reason else {
+        panic!("{:?}", refused.reason);
+    };
+    assert_eq!(*path, appended);
+    assert_eq!(*key, fixture.key(REPEATED_ID));
+    assert_eq!(**order, OrderValue::Long(SECOND_ORDER));
+    Ok(())
+}
+
+/// A ref moved back to a snapshot that lists both copies of an updated pair
+/// but not the deletion vector that hid the older one revives it (RFD 021):
+/// the reused file whose deletes shrank is checked again, and the refresh is
+/// `duplicate_rows`, naming the later file in file order, while the last
+/// generation keeps serving.
+#[tokio::test]
+async fn test_refresh_refuses_a_pair_revived_by_dropped_deletes() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = two_row_fixture(&catalog, "ord_revived", 1).await?;
+    fixture
+        .update_rows(
+            &[(REPEATED_ID, SECOND_ORDER)],
+            DeleteForm::Vectors,
+            "update",
+        )
+        .await?;
+    let vector = fixture.deletes().to_vec();
+    assert_eq!(vector.len(), 1, "one deletion vector hides the older copy");
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data: fixture.files().to_vec(),
+            deletes: Vec::new(),
+        })
+        .await?;
+    let without_vector = fixture.snapshot_id().expect("a snapshot was committed");
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data: fixture.files().to_vec(),
+            deletes: vector,
+        })
+        .await?;
+    let source = fixture.root_source();
+    let served = verify::serve(
+        TableConfig {
+            source: source.clone(),
+            ..ordered_config(&fixture)
+        },
+        TableSource::from_config(&source).await?,
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    let generation = served.current();
+    assert_eq!(generation.files.len(), 2, "both copies' files serve");
+    let later = generation.files[1].entry.path.clone();
+
+    fixture.move_ref(without_vector).await?;
+    let error = served.table.refresh().await.unwrap_err();
+    let Error::Refused {
+        reason: RefusalReason::DuplicateRows { path, key, order },
+        ..
+    } = error
+    else {
+        panic!("expected duplicate_rows, got {error:?}");
+    };
+    assert_eq!(path, later);
+    assert_eq!(key, fixture.key(REPEATED_ID));
+    assert_eq!(*order, OrderValue::Long(SECOND_ORDER));
+    assert_eq!(served.current().snapshot_id, generation.snapshot_id);
+    Ok(())
+}

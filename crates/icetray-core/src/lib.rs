@@ -73,5 +73,5 @@ pub use order::{
 };
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use snapshot::{SequenceNumber, SnapshotId};
-pub use storage::{IoStats, LocationError, LocationFault, Storage};
+pub use storage::{FILE_PREFIX, IoStats, LocationError, LocationFault, Storage};
 pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};
