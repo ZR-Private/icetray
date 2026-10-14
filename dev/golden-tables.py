@@ -5,7 +5,9 @@ One contract-shaped table per key type, one more in table format version 3,
 the off-contract layouts whose serving cost RFD 007 prices and whose
 findings RFD 016 reports, and contract tables Spark then changes with
 merge-on-read (RFD 021): position deletes in format version 2, deletion
-vectors in version 3. Run it against any object store or local
+vectors in version 3, and ordered tables (RFD 025): many rows per key,
+each with an order value, written by appends, skew-split writes, a MERGE,
+and a sorting compaction. Run it against any object store or local
 directory; the tests locate the result through ICETRAY_GOLDEN_WAREHOUSE.
 
     pip install 'pyspark==4.1.*'
@@ -133,6 +135,38 @@ MOR_UPDATED_IDS = range(50_000, 60_000)
 MOR_FIRST_VERSION = 1
 MOR_UPDATE_VERSION = 2
 
+# An ordered table holds this many keys of this many rows each, so ROWS_100K
+# rows. A key's rows are written at order values ORDER_START + j * ORDER_STEP
+# for j below the row count, and the step leaves room between two rows for
+# the rows a MERGE inserts there.
+ORDERED_KEYS = 1_000
+ORDERED_ROWS_PER_KEY = 100
+ORDER_START = 1_000
+ORDER_STEP = 10
+# The order column's name; the table is sorted by the key and then by it.
+ORDER_COLUMN = "ts"
+# Rows per key the append adds, at the order values after the key's last.
+APPEND_ROWS_PER_KEY = 10
+# The ids whose keys a MERGE changes, half-open: for each, every second row
+# is matched and updated, and one row in ten is inserted between two rows,
+# MERGE_INSERT_OFFSET above the row before it.
+MERGE_KEY_IDS = range(300, 400)
+MERGE_UPDATE_EVERY = 2
+MERGE_INSERT_EVERY = 10
+MERGE_INSERT_OFFSET = 5
+# The bytes of a string order value's prefix, derived from its key and above
+# Iceberg 1.11's default `parquet.columnindex.truncate.length`, so the
+# writer cuts the order column's column index; the prefix is followed by the
+# row's order value zero-padded to ORDER_STRING_DIGITS.
+ORDER_PREFIX_LEN = 64
+ORDER_STRING_DIGITS = 16
+COLUMN_INDEX_TRUNCATE_DEFAULT = 64
+# The bytes of shuffled data past which a skew-splitting write cuts a bucket's
+# partition into another sorted task: Iceberg's own default is sized for
+# files of a target size, far above what a hundred thousand small rows
+# amount to, so the overlap table lowers it to a few tasks per bucket.
+SPLIT_PARTITION_BYTES = 1_048_576
+
 LONG_KEY = f"id * {KEY_STEP}"
 STRING_KEY = (
     f"concat(repeat('p', {STRING_PREFIX_LEN}), 'user:', "
@@ -147,14 +181,17 @@ PERMUTED_KEY = f"pmod(id * {PERMUTATION_MULTIPLIER}, {PERMUTATION_MODULUS})"
 BIN16_KEY = "unhex(md5(CAST(id AS STRING)))"
 
 
-def value_expr(key_expr, repeats, incompressible=False, version=None):
+def value_expr(key_expr, repeats, incompressible=False, version=None, order_expr=None):
     """64 bytes per repeat, derived from the key, or with a version from
-    the text "v<version>:<key>".
+    the text "v<version>:<key>"; in an ordered table from
+    "v<version>:<key>:<order>".
 
     The compressible form repeats one digest; the incompressible form
     concatenates distinct digests, which zstd reduces about twofold.
     """
     text = f"CAST({key_expr} AS STRING)"
+    if order_expr is not None:
+        text = f"concat({text}, ':', CAST({order_expr} AS STRING))"
     if version is not None:
         text = f"concat('v{version}:', {text})"
     if not incompressible:
@@ -170,18 +207,21 @@ def properties(extra=None):
     return ", ".join(f"'{k}' = '{v}'" for k, v in props.items())
 
 
-def create(spark, table, key_type, buckets, extra=None, sorted_by_key=True):
+def create(spark, table, key_type, buckets, extra=None, sorted_by_key=True, order_type=None):
     name = f"{CATALOG}.db.{table}"
     spark.sql(f"DROP TABLE IF EXISTS {name}")
     partition = f"PARTITIONED BY (bucket({buckets}, key))" if buckets else ""
+    order = f"{ORDER_COLUMN} {order_type}, " if order_type else ""
     spark.sql(
-        f"CREATE TABLE {name} (key {key_type}, value BINARY) USING iceberg "
+        f"CREATE TABLE {name} (key {key_type}, {order}value BINARY) USING iceberg "
         f"{partition} TBLPROPERTIES ({properties(extra)})"
     )
     if sorted_by_key:
         # Sorted within each file, which is what a reader needs; a global sort
-        # is not required and costs a shuffle.
-        spark.sql(f"ALTER TABLE {name} WRITE LOCALLY ORDERED BY key")
+        # is not required and costs a shuffle. An ordered table sorts by the
+        # order column after the key.
+        by = f"key, {ORDER_COLUMN}" if order_type else "key"
+        spark.sql(f"ALTER TABLE {name} WRITE LOCALLY ORDERED BY {by}")
     return name
 
 
@@ -190,6 +230,52 @@ def fill(spark, name, rows, key_expr, repeats, incompressible=False, version=Non
         f"INSERT INTO {name} SELECT {key_expr} AS key, "
         f"{value_expr(key_expr, repeats, incompressible, version)} AS value FROM range({rows})"
     )
+
+
+class OrderShape(NamedTuple):
+    """How an ordered table's keys and order values are derived."""
+
+    # Keys are the permutation of the key's index, uncorrelated with the
+    # order rows are written in, instead of spaced by `KEY_STEP`.
+    permuted: bool = False
+    # The order column is a string: a prefix derived from the key, then the
+    # raw order value zero-padded.
+    string: bool = False
+
+
+def ordered_exprs(shape, key_index, row_index, offset=0):
+    """The key and order expressions of row `row_index` of the key at
+    `key_index`, its raw order value `offset` above the row's own."""
+    if shape.permuted:
+        key = f"pmod(({key_index}) * {PERMUTATION_MULTIPLIER}, {PERMUTATION_MODULUS})"
+    else:
+        key = f"({key_index}) * {KEY_STEP}"
+    raw = f"({ORDER_START} + ({row_index}) * {ORDER_STEP} + {offset})"
+    if not shape.string:
+        return key, raw
+    prefix = f"lpad(CAST({key} AS STRING), {ORDER_PREFIX_LEN}, 'k')"
+    return key, f"concat({prefix}, lpad(CAST({raw} AS STRING), {ORDER_STRING_DIGITS}, '0'))"
+
+
+def ordered_select(table, key_index, row_index, rows, version, offset=0):
+    """The rows of an ordered table: `rows` ids, each with the key index and
+    row index the expressions of `id` give, at `version`."""
+    key, order = ordered_exprs(table.order, key_index, row_index, offset)
+    value = value_expr(key, table.repeats, table.incompressible, version, order_expr=order)
+    return f"SELECT {key} AS key, {order} AS {ORDER_COLUMN}, {value} AS value FROM range({rows})"
+
+
+def fill_ordered(spark, name, table):
+    """The table's first rows: `ORDERED_ROWS_PER_KEY` per key, at
+    `MOR_FIRST_VERSION`."""
+    select = ordered_select(
+        table,
+        f"id DIV {ORDERED_ROWS_PER_KEY}",
+        f"id % {ORDERED_ROWS_PER_KEY}",
+        table.rows,
+        MOR_FIRST_VERSION,
+    )
+    spark.sql(f"INSERT INTO {name} {select}")
 
 
 def summarize(spark, name, started):
@@ -247,6 +333,62 @@ def rewrite_deletes(spark, name, table):
     )
 
 
+def append_later(spark, name, table):
+    """An INSERT of `APPEND_ROWS_PER_KEY` more rows for every key, at the
+    order values after its last: a file per bucket over the older file's key
+    range, whose rows come after the older file's."""
+    select = ordered_select(
+        table,
+        f"id DIV {APPEND_ROWS_PER_KEY}",
+        f"{ORDERED_ROWS_PER_KEY} + id % {APPEND_ROWS_PER_KEY}",
+        ORDERED_KEYS * APPEND_ROWS_PER_KEY,
+        MOR_FIRST_VERSION,
+    )
+    spark.sql(f"INSERT INTO {name} {select}")
+
+
+def merge_rows(spark, name, table):
+    """A MERGE on the key and the order value over `MERGE_KEY_IDS`: every
+    `MERGE_UPDATE_EVERY`-th row of each key is matched and takes
+    `MOR_UPDATE_VERSION`'s value, and a row at `MERGE_INSERT_OFFSET` above
+    every `MERGE_INSERT_EVERY`-th row is inserted at that version."""
+    keys = len(MERGE_KEY_IDS)
+    updated = ORDERED_ROWS_PER_KEY // MERGE_UPDATE_EVERY
+    inserted = ORDERED_ROWS_PER_KEY // MERGE_INSERT_EVERY
+    matched = ordered_select(
+        table,
+        f"{MERGE_KEY_IDS.start} + id DIV {updated}",
+        f"(id % {updated}) * {MERGE_UPDATE_EVERY}",
+        keys * updated,
+        MOR_UPDATE_VERSION,
+    )
+    new = ordered_select(
+        table,
+        f"{MERGE_KEY_IDS.start} + id DIV {inserted}",
+        f"(id % {inserted}) * {MERGE_INSERT_EVERY}",
+        keys * inserted,
+        MOR_UPDATE_VERSION,
+        offset=MERGE_INSERT_OFFSET,
+    )
+    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW merge_source AS {matched} UNION ALL {new}")
+    spark.sql(
+        f"MERGE INTO {name} t USING merge_source s "
+        f"ON t.key = s.key AND t.{ORDER_COLUMN} = s.{ORDER_COLUMN} "
+        f"WHEN MATCHED THEN UPDATE SET value = s.value "
+        f"WHEN NOT MATCHED THEN INSERT *"
+    )
+
+
+def rewrite_sorted(spark, name, table):
+    """Rewrites every data file sorted by the key and then the order value,
+    as an owner's compaction job does."""
+    spark.sql(
+        f"CALL {CATALOG}.system.rewrite_data_files(table => '{qualified(name)}', "
+        f"strategy => 'sort', sort_order => 'key ASC, {ORDER_COLUMN} ASC', "
+        f"options => map('rewrite-all', 'true'))"
+    )
+
+
 def qualified(name):
     """The table's name within the catalog, as a procedure takes it."""
     return name.removeprefix(f"{CATALOG}.")
@@ -265,11 +407,12 @@ def skew_splitting(spark, enabled):
 
 
 # Which group a table belongs to: the contract-shaped tables, the
-# off-contract layouts, or the contract tables merge-on-read changes.
-# `--only` takes a group or one table's name.
+# off-contract layouts, the contract tables merge-on-read changes, or the
+# ordered tables. `--only` takes a group or one table's name.
 CONTRACT_GROUP = "contract"
 OFF_CONTRACT_GROUP = "off-contract"
 MOR_GROUP = "mor"
+ORDERED_GROUP = "ordered"
 
 
 class Golden(NamedTuple):
@@ -280,7 +423,7 @@ class Golden(NamedTuple):
     key_type: str
     buckets: int
     rows: int
-    key_expr: str
+    key_expr: Optional[str]
     repeats: int
     extra: Optional[dict] = None
     incompressible: bool = False
@@ -288,6 +431,9 @@ class Golden(NamedTuple):
     # The commands run after the fill, in order; a table with any is filled
     # at `MOR_FIRST_VERSION`.
     changes: tuple = ()
+    # Set on an ordered table, whose `key_expr` is unused: how its keys and
+    # order values are derived, and so the order column's type.
+    order: Optional[OrderShape] = None
 
 
 # Every golden table, in the order a full run writes them.
@@ -407,23 +553,125 @@ TABLES = [
         extra=dict(FORMAT_V3, **MERGE_ON_READ),
         changes=(delete_ids, update_ids, rewrite_data, rewrite_deletes),
     ),
+    # Ordered tables: ORDERED_ROWS_PER_KEY rows per key, sorted by the key and
+    # then the order value. One file per bucket after a sorting compaction.
+    Golden(
+        "ordered_compacted_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        changes=(rewrite_sorted,),
+        order=OrderShape(),
+    ),
+    # Rows appended after the order values already written: a second file per
+    # bucket over the first file's key range.
+    Golden(
+        "ordered_appended_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        changes=(append_later,),
+        order=OrderShape(),
+    ),
+    # Keys uncorrelated with the write order, split across sorted tasks.
+    Golden(
+        "ordered_overlap_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        TWO_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        extra={"write.spark.advisory-partition-size-bytes": str(SPLIT_PARTITION_BYTES)},
+        skew=True,
+        order=OrderShape(permuted=True),
+    ),
+    # A MERGE on the key and the order value, recorded as Parquet position
+    # deletes.
+    Golden(
+        "ordered_merge_v2_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        extra=dict(FORMAT_V2, **MERGE_ON_READ),
+        changes=(merge_rows,),
+        order=OrderShape(),
+    ),
+    # The same MERGE recorded as deletion vectors.
+    Golden(
+        "ordered_merge_v3_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        extra=dict(FORMAT_V3, **MERGE_ON_READ),
+        changes=(merge_rows,),
+        order=OrderShape(),
+    ),
+    # The version 3 table compacted as an owner's job does it.
+    Golden(
+        "ordered_merge_v3_compacted_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        extra=dict(FORMAT_V3, **MERGE_ON_READ),
+        changes=(merge_rows, rewrite_sorted, rewrite_deletes),
+        order=OrderShape(),
+    ),
+    # A string order column whose values share a long prefix per key, under
+    # the writer's default column index truncation, so the column index cuts
+    # them.
+    Golden(
+        "ordered_string_100k",
+        ORDERED_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        None,
+        CONTRACT_REPEATS,
+        extra={"parquet.columnindex.truncate.length": str(COLUMN_INDEX_TRUNCATE_DEFAULT)},
+        changes=(rewrite_sorted,),
+        order=OrderShape(string=True),
+    ),
 ]
 
 
 def write(spark, table):
     skew_splitting(spark, table.skew)
     started = time.monotonic()
-    name = create(spark, table.name, table.key_type, table.buckets, extra=table.extra)
-    version = MOR_FIRST_VERSION if table.changes else None
-    fill(
-        spark,
-        name,
-        table.rows,
-        table.key_expr,
-        table.repeats,
-        incompressible=table.incompressible,
-        version=version,
+    order_type = None
+    if table.order:
+        order_type = "STRING" if table.order.string else "BIGINT"
+    name = create(
+        spark, table.name, table.key_type, table.buckets, extra=table.extra, order_type=order_type
     )
+    if table.order:
+        fill_ordered(spark, name, table)
+    else:
+        version = MOR_FIRST_VERSION if table.changes else None
+        fill(
+            spark,
+            name,
+            table.rows,
+            table.key_expr,
+            table.repeats,
+            incompressible=table.incompressible,
+            version=version,
+        )
     for change in table.changes:
         change(spark, name, table)
     summarize(spark, name, started)
@@ -434,7 +682,7 @@ def main():
     parser.add_argument("--warehouse", required=True, help="s3a://bucket/prefix/warehouse or file:///path")
     parser.add_argument(
         "--only",
-        choices=[CONTRACT_GROUP, OFF_CONTRACT_GROUP, MOR_GROUP, *(table.name for table in TABLES)],
+        choices=[CONTRACT_GROUP, OFF_CONTRACT_GROUP, MOR_GROUP, ORDERED_GROUP, *(table.name for table in TABLES)],
         help="write one group, or one table by name, instead of every table",
     )
     parser.add_argument("--packages", default=ICEBERG_PACKAGE, help="Maven coordinates for the Iceberg runtime; empty if it is already on the classpath")

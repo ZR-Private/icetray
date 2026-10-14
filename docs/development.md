@@ -52,8 +52,10 @@ Two suites need fixtures and show as ignored under a plain `cargo test`.
 - `dev/test-golden.sh` runs the layout tests against the golden tables
   `dev/golden-tables.py` writes: one table per key type in the optimal
   layout, one in table format version 3 (the rest are version 2, the
-  writer's default), and the other layouts whose capping and advice
-  findings the doctor reports.
+  writer's default), the other layouts whose capping and advice
+  findings the doctor reports, the contract tables Spark then changes with
+  merge-on-read, and the ordered tables (many rows per key, each with an
+  order value) that Spark appends to, MERGEs into, and compacts.
 
 ```sh
 dev/golden-tables.sh
@@ -64,8 +66,9 @@ ICETRAY_GOLDEN_WAREHOUSE=file://$PWD/target/golden-warehouse dev/test-golden.sh
 (`iceberg-spark-runtime-4.1_2.13`) in the `apache/spark:4.1.3-python3`
 image, which carries Java 21, so the host needs a container runtime
 (`dev/runtime.sh up`) and `python3`. `--only contract` (the tables in the
-optimal layout) or `--only off-contract` (the other layouts) writes one
-group, and `--only` with a table's name writes
+optimal layout), `--only off-contract` (the other layouts), `--only mor`
+(the merge-on-read tables), or `--only ordered` (the ordered tables, about
+100 MB together) writes one group, and `--only` with a table's name writes
 that table alone: `--only long_2m` writes about 80 MB. The recipe also
 runs on the host with PySpark 4.1 and Java 17 or later, and writes to any
 object store or local directory:
@@ -76,7 +79,7 @@ python3 dev/golden-tables.py --warehouse "file://$PWD/target/golden-warehouse"
 ```
 
 The first run of either downloads the Iceberg runtime from Maven
-Central. Both groups together are about 4.3 GB, most of it the two
+Central. The groups together are about 4.4 GB, most of it the two
 tables of 16 KiB values. The tables are also the quickest way to try the
 binary: `icetray get --location target/golden-warehouse/db/long_2m
 --value-column value --column value 42` answers from one of them, and

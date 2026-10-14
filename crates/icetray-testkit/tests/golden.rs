@@ -4,8 +4,11 @@
 //! run by `dev/test-golden.sh`; forced without the variable, each fails on
 //! `Precondition::GoldenUnset` rather than passing.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestList, TableMetadata,
@@ -14,16 +17,17 @@ use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{Config, LocalConfig, StorageConfig, ValueFormat};
 use icetray_core::{
-    Error, Finding, FindingCode, FindingLog, Generation, Key, Level, LookupCost, RefusalReason,
-    Residency, Row, Storage, Table, TableReport, diagnose, open,
+    DEFAULT_MAX_SCAN_ROWS, Direction, Error, Finding, FindingCode, FindingLog, Generation, Key,
+    Level, LookupCost, OrderType, RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned,
+    Storage, Table, TableReport, diagnose, open,
 };
 use icetray_testkit::golden::{
-    self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MOR_DELETED_IDS, MOR_UPDATED_IDS,
-    WIDE_REPEATS,
+    self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MERGE_KEY_IDS, MOR_DELETED_IDS,
+    MOR_UPDATED_IDS, ORDERED_KEYS, ORDERED_ROWS_PER_KEY, OrderedRow, WIDE_REPEATS,
 };
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, SeenPages};
-use icetray_testkit::{Result, absent_key_from};
+use icetray_testkit::{Result, TestScan, absent_key_from, scan_model};
 
 /// Ids looked up on the two-million-row tables: the ends and the middle.
 const IDS_2M: [u64; 5] = [0, 1, 12_345, 999_999, 1_999_999];
@@ -67,7 +71,7 @@ impl Golden {
             &self.current(),
             self.table.config().lookups(),
             &ValueFormat::opaque,
-            None,
+            self.table.config().scan_rows(),
         )
     }
 }
@@ -793,5 +797,427 @@ async fn test_golden_merge_on_read_deletes_summary_matches_the_manifests() -> Re
             assert_eq!(summary.records, table.rows() - deleted_rows, "{table}");
         }
     }
+    Ok(())
+}
+
+/// Every ordered table the recipe writes, and the tiers each is served in.
+const ORDERED_TIERS: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
+
+/// Between two sampled key indexes of an ordered table: prime, so the
+/// sampled keys land at varied offsets in the pages and buckets.
+const ORDERED_SAMPLE_STRIDE: usize = 37;
+
+/// The key no ordered golden table holds: below every key the recipe writes.
+const ABSENT_ORDERED_KEY: i64 = -1;
+
+/// The limit of a Scan that cuts a key's run short.
+const SHORT_LIMIT: u32 = 7;
+
+/// The limit of a Scan that reads a page past a bound.
+const PAGE_LIMIT: u32 = 5;
+
+/// The key indexes whose Scans an ordered table is checked on: a stride
+/// through the table, its last key, and the ends and just beyond of the
+/// keys a MERGE changes.
+fn ordered_sample() -> BTreeSet<u64> {
+    let mut ids: BTreeSet<u64> = (0..ORDERED_KEYS).step_by(ORDERED_SAMPLE_STRIDE).collect();
+    ids.insert(ORDERED_KEYS - 1);
+    ids.extend([
+        MERGE_KEY_IDS.start - 1,
+        MERGE_KEY_IDS.start,
+        MERGE_KEY_IDS.end - 1,
+        MERGE_KEY_IDS.end,
+    ]);
+    ids
+}
+
+/// The Scans checked on a key holding `rows`, in both directions: its whole
+/// run, a cut one, bounds on rows and beside them, a page past a bound, and
+/// bounds that leave nothing.
+fn ordered_scans(rows: &[OrderedRow]) -> Vec<TestScan> {
+    let orders: Vec<i64> = rows.iter().map(|row| row.order).collect();
+    let (first, last) = (orders[0], orders[orders.len() - 1]);
+    let (quarter, middle, three_quarters) = (
+        orders[orders.len() / 4],
+        orders[orders.len() / 2],
+        orders[orders.len() * 3 / 4],
+    );
+    let mut scans = Vec::new();
+    for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+        let scan = |limit, after, before| TestScan {
+            direction,
+            limit,
+            after,
+            before,
+            max_scan_rows: DEFAULT_MAX_SCAN_ROWS,
+        };
+        scans.extend([
+            scan(0, None, None),
+            scan(SHORT_LIMIT, None, None),
+            scan(0, Some(quarter), Some(three_quarters)),
+            scan(SHORT_LIMIT, Some(quarter), Some(three_quarters)),
+            scan(PAGE_LIMIT, Some(middle), None),
+            scan(PAGE_LIMIT, None, Some(middle + 1)),
+            scan(0, Some(middle - 1), Some(middle + 1)),
+            scan(0, Some(last), None),
+            scan(0, None, Some(first)),
+            scan(0, Some(first - 1), Some(last + 1)),
+        ]);
+    }
+    scans
+}
+
+/// What a Scan of key index `id` answers under `scan`, from the recipe's
+/// derivation of the key's rows.
+fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestScan) -> Scanned {
+    let live = rows.iter().map(|row| (row.order, row.version));
+    let (answer, more) = scan_model(live, scan);
+    Scanned {
+        rows: answer
+            .into_iter()
+            .map(|(order, version)| ScanRow {
+                order: golden::ordered_order_value(table, id, order),
+                values: vec![Some(Bytes::from(golden::ordered_value(
+                    table, id, order, version,
+                )))],
+            })
+            .collect(),
+        more,
+    }
+}
+
+/// `scan` as the bounds a Scan of key index `id` states.
+fn ordered_bounds(table: GoldenTable, id: u64, scan: &TestScan) -> ScanBounds {
+    ScanBounds {
+        direction: scan.direction,
+        limit: scan.limit,
+        after: scan
+            .after
+            .map(|order| golden::ordered_order_value(table, id, order)),
+        before: scan
+            .before
+            .map(|order| golden::ordered_order_value(table, id, order)),
+    }
+}
+
+/// Every sampled key of `table` answers every Scan of `ordered_scans` in
+/// every tier as the derivation says, and a key the table lacks answers
+/// nothing.
+async fn assert_ordered_scans_match_the_derivation(table: GoldenTable) -> Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let mut compared = 0_u64;
+    let (mut cut, mut empty) = (0_u64, 0_u64);
+    for residency in ORDERED_TIERS {
+        let served = open_in(table, residency, scratch.path()).await?;
+        for id in ordered_sample() {
+            let key = golden::ordered_key(table, id);
+            let rows = golden::ordered_rows(table, id);
+            for scan in ordered_scans(&rows) {
+                let want = derived_scan(table, id, &rows, &scan);
+                let got = served
+                    .table
+                    .scan(
+                        &key,
+                        &[ColumnRead::whole(VALUE_COLUMN)],
+                        &ordered_bounds(table, id, &scan),
+                    )
+                    .await?
+                    .scanned;
+                assert_eq!(got, want, "{table} {residency} {key} {scan:?}");
+                compared += count(want.rows.len());
+                cut += u64::from(want.more);
+                empty += u64::from(want.rows.is_empty());
+            }
+        }
+        let absent = Key::Long(ABSENT_ORDERED_KEY);
+        let none = served
+            .table
+            .scan(
+                &absent,
+                &[ColumnRead::whole(VALUE_COLUMN)],
+                &ScanBounds {
+                    direction: Direction::NewestFirst,
+                    limit: 0,
+                    after: None,
+                    before: None,
+                },
+            )
+            .await?
+            .scanned;
+        assert!(none.rows.is_empty() && !none.more, "{table} {residency}");
+    }
+    assert!(compared > 0, "{table}: the scans compared rows");
+    assert!(cut > 0, "{table}: some scans left rows past their limit");
+    assert!(
+        empty > 0,
+        "{table}: some scans left nothing inside their bounds"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_compacted_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedCompacted100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_appended_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedAppended100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_overlap_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedOverlap100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_merge_v2_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV2_100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_merge_v3_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV3_100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_merge_v3_compacted_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedMergeV3Compacted100k).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_string_scans_match_the_derived_rows() -> Result<()> {
+    assert_ordered_scans_match_the_derivation(GoldenTable::OrderedString100k).await
+}
+
+/// The ordered tables a sorting compaction rewrote last, one file a bucket.
+const ORDERED_COMPACTED: [GoldenTable; 3] = [
+    GoldenTable::OrderedCompacted100k,
+    GoldenTable::OrderedMergeV3Compacted100k,
+    GoldenTable::OrderedString100k,
+];
+
+/// The ordered tables Spark left with a second file over a bucket's key
+/// range, the append's and the MERGE's.
+const ORDERED_OVERLAPPING: [GoldenTable; 3] = [
+    GoldenTable::OrderedAppended100k,
+    GoldenTable::OrderedMergeV2_100k,
+    GoldenTable::OrderedMergeV3_100k,
+];
+
+/// The most rows any key of `table` holds, as the derivation says.
+fn longest_derived_run(table: GoldenTable) -> u64 {
+    (0..ORDERED_KEYS)
+        .map(|id| count(golden::ordered_rows(table, id).len()))
+        .max()
+        .expect("an ordered table has keys")
+}
+
+/// What the doctor reports of every ordered table: it is read as an ordered
+/// table of the order column's type, its longest run is a run the recipe
+/// wrote, and only the string table's column index is cut.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<()> {
+    for table in GoldenTable::ORDERED {
+        let golden = open_golden(table, false).await?;
+        let summary = golden.report().summary;
+        let order = summary
+            .order
+            .expect("an ordered table reports its order column");
+        let expected_type = if table == GoldenTable::OrderedString100k {
+            OrderType::String
+        } else {
+            OrderType::Long
+        };
+        assert_eq!(order.order_type, expected_type, "{table}");
+        assert_eq!(order.max_scan_rows, DEFAULT_MAX_SCAN_ROWS, "{table}");
+        assert!(order.longest_run > 0, "{table}");
+        let derived = longest_derived_run(table);
+        if ORDERED_COMPACTED.contains(&table) {
+            assert_eq!(order.longest_run, derived, "{table}");
+        } else {
+            assert!(order.longest_run <= derived, "{table}");
+        }
+        let advice = advice_codes(&golden);
+        assert_eq!(
+            advice.contains(&FindingCode::OrderIndexTruncated),
+            table == GoldenTable::OrderedString100k,
+            "{table} {advice:?}"
+        );
+        assert!(
+            !advice.contains(&FindingCode::LongRuns),
+            "{table} {advice:?}"
+        );
+        assert!(
+            !golden.report().files.is_empty()
+                && golden
+                    .report()
+                    .files
+                    .iter()
+                    .all(|file| file.row_groups == 1),
+            "{table}: Spark writes one row group a file at this size"
+        );
+    }
+    Ok(())
+}
+
+/// A sorting compaction leaves one file in each bucket, as Spark sizes the
+/// output for the target file size, so a Scan reads one file: `optimal`
+/// with no capping finding, whatever the run length. The string table's
+/// order column index is cut, which the doctor advises on, and it stays
+/// `optimal`.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_compacted_is_optimal_with_one_file_per_bucket() -> Result<()> {
+    for table in ORDERED_COMPACTED {
+        let golden = open_golden(table, false).await?;
+        let report = golden.report();
+        assert_eq!(report.summary.level, Level::Optimal, "{table}");
+        assert!(report.capping().is_empty(), "{table} {:?}", report.findings);
+        assert_eq!(report.summary.max_files_per_bucket, 1, "{table}");
+        assert_eq!(
+            report.summary.buckets_with_files,
+            usize::try_from(table.buckets()).unwrap(),
+            "{table}"
+        );
+        assert!(golden.current().overlapping_buckets().is_empty(), "{table}");
+        assert_eq!(
+            report.summary.lookup_cost,
+            LookupCost {
+                gets_per_hit: 1,
+                gets_per_miss: 0,
+                files_probed: 1,
+            },
+            "{table}"
+        );
+        let advice = advice_codes(&golden);
+        assert!(!advice.contains(&FindingCode::DeletesPending), "{table}");
+    }
+    Ok(())
+}
+
+/// Appends and a MERGE add a file over each bucket's key range, so a Scan
+/// reads two files for a key both hold: `permissive` under
+/// `overlapping_files`, and the MERGE's deletes are pending until a
+/// compaction. A MERGE's deletes are the rows it matched, recorded once per
+/// bucket whichever the table's format version.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_files() -> Result<()>
+{
+    let merged_keys = MERGE_KEY_IDS.end - MERGE_KEY_IDS.start;
+    let matched_rows = merged_keys * (ORDERED_ROWS_PER_KEY / golden::MERGE_UPDATE_EVERY);
+    let inserted_rows = merged_keys * (ORDERED_ROWS_PER_KEY / golden::MERGE_INSERT_EVERY);
+    for table in ORDERED_OVERLAPPING {
+        let golden = open_golden(table, false).await?;
+        let report = golden.report();
+        let buckets = usize::try_from(table.buckets()).unwrap();
+        assert_eq!(report.summary.level, Level::Permissive, "{table}");
+        let capping = codes_of(&report);
+        assert!(
+            capping.contains(&FindingCode::OverlappingFiles),
+            "{table} {capping:?}"
+        );
+        assert_eq!(
+            golden.current().overlapping_buckets().len(),
+            buckets,
+            "{table}"
+        );
+        let two_files = 2;
+        assert_eq!(report.summary.max_files_per_bucket, two_files, "{table}");
+        assert_eq!(
+            report.summary.lookup_cost,
+            LookupCost {
+                gets_per_hit: 1,
+                gets_per_miss: 0,
+                files_probed: two_files,
+            },
+            "{table}"
+        );
+        let advice = advice_codes(&golden);
+        if table == GoldenTable::OrderedAppended100k {
+            assert!(!advice.contains(&FindingCode::DeletesPending), "{table}");
+            let appended = ORDERED_KEYS * golden::APPEND_ROWS_PER_KEY;
+            assert_eq!(report.summary.records, table.rows() + appended, "{table}");
+            assert_eq!(report.summary.deletes.rows, 0, "{table}");
+        } else {
+            assert!(
+                advice.contains(&FindingCode::DeletesPending),
+                "{table} {advice:?}"
+            );
+            assert_eq!(report.summary.deletes.rows, matched_rows, "{table}");
+            assert_eq!(report.summary.deletes.files, count(buckets), "{table}");
+            assert_eq!(
+                report.summary.records,
+                table.rows() + inserted_rows + matched_rows,
+                "{table}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A compaction after the MERGE leaves the merged rows, the deletes applied
+/// and none listed.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_merge_compaction_applies_the_deletes() -> Result<()> {
+    let table = GoldenTable::OrderedMergeV3Compacted100k;
+    let golden = open_golden(table, false).await?;
+    let summary = golden.report().summary;
+    let merged_keys = MERGE_KEY_IDS.end - MERGE_KEY_IDS.start;
+    let inserted_rows = merged_keys * (ORDERED_ROWS_PER_KEY / golden::MERGE_INSERT_EVERY);
+    assert_eq!(summary.deletes.rows, 0);
+    assert_eq!(summary.deletes.files, 0);
+    assert_eq!(summary.records, table.rows() + inserted_rows);
+    Ok(())
+}
+
+/// Skew splitting cuts each bucket's write into several sorted tasks over
+/// keys uncorrelated with the order they arrive in, so a bucket holds
+/// several files whose key ranges overlap: `permissive` under
+/// `overlapping_files`, and a Scan probes every file whose range holds its
+/// key.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Result<()> {
+    let table = GoldenTable::OrderedOverlap100k;
+    let golden = open_golden(table, false).await?;
+    let report = golden.report();
+    let generation = golden.current();
+    assert_eq!(report.summary.level, Level::Permissive);
+    let capping = codes_of(&report);
+    assert!(
+        capping.contains(&FindingCode::OverlappingFiles),
+        "{capping:?}"
+    );
+    assert!(
+        report.summary.max_files_per_bucket > 1,
+        "dev/golden-tables.py writes ordered_overlap_100k with skew splitting and a \
+         small write.spark.advisory-partition-size-bytes, so each bucket is split across \
+         several sorted tasks; regenerate the table"
+    );
+    assert!(!generation.overlapping_buckets().is_empty());
+    assert_eq!(
+        report.summary.records,
+        table.rows(),
+        "no key is repeated across files with the same order value"
+    );
+    let deepest = generation
+        .files
+        .iter()
+        .map(|file| generation.candidates(file.index.key_range().0).count())
+        .max()
+        .expect("the table has files");
+    assert!(deepest > 1, "overlapping files share a key range");
+    assert_eq!(report.summary.lookup_cost.files_probed, deepest);
     Ok(())
 }
