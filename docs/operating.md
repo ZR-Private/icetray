@@ -96,7 +96,7 @@ Counters and histograms:
 | `icetray_object_bytes_total` | `kind` | every kind | Bytes those GETs requested. |
 | `icetray_local_reads_total` | | yes | Reads from the local directory. |
 | `icetray_local_bytes_total` | | yes | Bytes of those reads. |
-| `icetray_hedges_total` | | yes | Second GETs issued because a lookup GET was slow. |
+| `icetray_hedges_total` | | yes | Second GETs issued because a lookup GET or a `Scan`'s span GET was slow. |
 | `icetray_page_cache_hits_total` | `cache` | every cache | Pages served from the page cache without a fetch. |
 | `icetray_page_cache_fetches_total` | `cache` | every cache | Page fetches the page cache ran, after coalescing. The scan cache counts a span GET once, however many pages it holds. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups that completed. |
@@ -139,10 +139,11 @@ Gauges, written at each scrape:
 | `icetray_table_column_level` | `table`, `column` | The level a lookup that requests the column achieves on the snapshot `icetray_table_level` measures, with the same kernel page-cache cap, in the same numbers. |
 | `icetray_table_declared_level` | `table` | The table's `lookups`, in the same numbers. |
 | `icetray_table_chunk_resident_fraction` | `table` | The fraction of a `disk` table's chunk-file pages, in its serving generation, that the kernel's page cache held at the last sample. icetray caps the table's level at `balanced` when the fraction drops below 0.95, and lifts the cap when it rises above 0.99. Absent while icetray cannot observe the residency. |
-| `icetray_table_gets_per_hit` | `table` | GETs one cold hit makes at worst on the serving generation's layout and residency, to find the row and read the most expensive value column: that column's value page, and its dictionary page when it is dictionary-encoded, and under `bloom` the key page of every file probed, with a dictionary-encoded key column's dictionary page. For a table with no value columns, only the GETs that find the row. Counted before hedges, unlike `icetray_object_gets_total`. The observed GETs are in `icetray_lookups_total` and `icetray_value_page_gets_total`, where warm hits bring the rate below this prediction. |
-| `icetray_table_column_gets_per_hit` | `table`, `column` | The value-page GETs one cold hit spends on the column alone: 1, or 2 when any file's chunk of it is dictionary-encoded. A request's cold cost is `icetray_table_gets_per_miss`, the GETs that find the row, plus this figure for each column it requests. |
-| `icetray_table_gets_per_miss` | `table` | GETs one miss makes at worst on the serving generation's layout and residency: 0 under `full` and `disk`, and under `bloom` the key page of every file probed whose Bloom filter does not exclude the key, with a dictionary-encoded key column's dictionary page. Counted before hedges, unlike `icetray_object_gets_total`. |
-| `icetray_table_files_probed_per_lookup` | `table` | Files one cold lookup probes at worst on the serving generation: the files its key routes to whose exact ranges cover it, 1 where no files overlap. On a table whose files were written under two or more bucketings it is an upper bound. |
+| `icetray_table_gets_per_hit` | `table` | A key-value table's alone: GETs one cold hit makes at worst on the serving generation's layout and residency, to find the row and read the most expensive value column: that column's value page, and its dictionary page when it is dictionary-encoded, and under `bloom` the key page of every file probed, with a dictionary-encoded key column's dictionary page. For a table with no value columns, only the GETs that find the row. Counted before hedges, unlike `icetray_object_gets_total`. The observed GETs are in `icetray_lookups_total` and `icetray_value_page_gets_total`, where warm hits bring the rate below this prediction. |
+| `icetray_table_column_gets_per_hit` | `table`, `column` | A key-value table's alone: the value-page GETs one cold hit spends on the column alone: 1, or 2 when any file's chunk of it is dictionary-encoded. A request's cold cost is `icetray_table_gets_per_miss`, the GETs that find the row, plus this figure for each column it requests. |
+| `icetray_table_gets_per_miss` | `table` | A key-value table's alone: GETs one miss makes at worst on the serving generation's layout and residency: 0 under `full` and `disk`, and under `bloom` the key page of every file probed whose Bloom filter does not exclude the key, with a dictionary-encoded key column's dictionary page. Counted before hedges, unlike `icetray_object_gets_total`. |
+| `icetray_table_gets_per_scan` | `table` | An ordered table's alone: GETs one cold `Scan` at `max_scan_rows`, of a key held in one file and one row group, makes at worst on the serving generation's layout and residency, reading every configured value column. It counts each column's span and its dictionary page when it is dictionary-encoded, the order column's span and dictionary page under `full` and `bloom`, and under `bloom` the run's first and last key pages with the key column's dictionary page. A key held in several files costs this in each. |
+| `icetray_table_files_probed_per_lookup` | `table` | Files one cold lookup, or one `Scan` of an ordered table, probes at worst on the serving generation: the files its key routes to whose exact ranges cover it, 1 where no files overlap. On a table whose files were written under two or more bucketings it is an upper bound. |
 | `icetray_table_deleted_rows` | `table` | Rows the serving generation's [deletes](table-layout.md) remove, counting only deletes that apply to a data file it holds, so the dangling deletes a compaction leaves behind are excluded. |
 | `icetray_table_deleted_fraction` | `table` | Those rows over the rows of the serving snapshot's data files, so one threshold fits tables of any size. |
 | `icetray_table_delete_files` | `table` | Live position delete files and deletion vectors whose rows the serving generation applies. A position delete file that a deletion vector masks is not counted. |
@@ -186,9 +187,9 @@ The label values:
   `failed_precondition`, `deadline_exceeded`, `not_found`,
   `resource_exhausted`, `unavailable`, and `internal`; the gRPC layer adds
   `cancelled`, `out_of_range`, `unimplemented`, and `unknown`, as above.
-- `kind`: `load` (footers, key chunks, and metadata read while a
-  generation is built) and `lookup` (value pages, and key pages under
-  `bloom` residency).
+- `kind`: `load` (footers, key chunks, order chunks, and metadata read
+  while a generation is built) and `lookup` (value pages, a `Scan`'s span
+  GETs, and key pages under `bloom` residency).
 - `result` of `icetray_lookups_total` and `icetray_lookup_seconds`:
   `cold_hit` (a value or dictionary page of a requested column came from
   object storage, including through a fetch that another lookup started),
@@ -211,7 +212,12 @@ The label values:
   `bounds_missing`, `column_index_truncated`, `large_value_pages`,
   `value_pages_over_ceiling`, `long_keys`, `large_file`,
   `many_files_per_bucket`, `no_bloom_filter`, `bloom_oversized`,
-  `bloom_undersized`, `deletes_pending`, `column_default`.
+  `bloom_undersized`, `deletes_pending`, `column_default`, and the codes
+  of [ordered tables](#ordered-tables), `shared_edge_keys`,
+  `dictionary_encoded_order`, `order_index_missing`,
+  `order_index_truncated`, `long_runs`, and `large_runs`. Every table
+  publishes every code, so a key-value table carries a series of 0 for
+  each of the six ordered codes.
   `dictionary_encoded_value`, `large_value_pages`,
   `value_pages_over_ceiling`, and `column_default` are about one value
   column and carry the `column` label; the other codes carry none.
@@ -223,9 +229,11 @@ The label values:
   series: a load reads no values, so only the `doctor` command raises it.
 - `column`: a configured value column's name.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
-  (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`,
-  `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`,
-  `value_type_unsupported`, `data_format_unsupported`, `equality_deletes`,
+  (`unsorted`, `null_keys`, `duplicate_keys`, `duplicate_rows`,
+  `null_order`, `key_outside_bucket`, `key_type_mismatch`,
+  `key_type_unsupported`, `order_type_unsupported`,
+  `order_type_mismatch`, `column_mismatch`, `value_type_unsupported`,
+  `data_format_unsupported`, `equality_deletes`,
   `delete_kind_unsupported`, `key_too_long`, `over_budget`,
   `no_bloom_filter`, `below_level`), or an
   error kind (`iceberg`, `parquet`, `object_store`, `object_store_path`,
@@ -300,8 +308,11 @@ level.
 `storage.local.dir` sets an optional local directory. It holds:
 
 - The chunk files of tables with `residency = "disk"`: each data file's
-  key chunks, while its footer, page indexes, and fence array stay in
-  memory.
+  key chunks, and for an ordered table its order chunks too, while its
+  footer, page indexes, and fence array stay in memory. A key-value entry
+  and an ordered entry over the same data file, or two ordered entries
+  with different order columns, each keep a chunk file of their own,
+  named by the rules it was verified under.
 - The disk level of the value-page cache, bounded by
   `storage.local.page_cache_disk_bytes`. Zero turns the level off; any
   other value must be at least one 4 MiB block.
@@ -523,6 +534,73 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
 - Replace the file atomically, by a rename. A read during an in-place
   write can see a truncated file that still parses.
 
+## Ordered tables
+
+An [ordered table](table-layout.md#ordered-tables) serves `Scan` and
+`MultiScan` beside the key-value tables of the same process. It shares
+`server.max_in_flight`, `server.batch_fan_out`, the process's GET
+throughput, and its resident memory with them, and reads its pages
+through a cache of its own.
+
+**The scan cache.** Each page a `Scan`'s span GET fetches is cached as
+its own entry, keyed by file and offset, in a memory cache bounded by
+`server.scan_page_cache_bytes`, 256 MiB by default. It has no disk level,
+and no key-value lookup reads it, so a `Scan` of a long run evicts only
+other scans' pages. The page-cache metrics carry the `cache` label:
+`icetray_page_cache_hits_total{cache="scan"}` against
+`icetray_page_cache_fetches_total{cache="scan"}` gives its hit rate, where
+a span GET counts one fetch however many pages it holds, and
+`icetray_page_cache_bytes{cache="scan"}` its fill.
+
+**Levels and findings.** An ordered table's level is read for a `Scan`
+of one key ([Levels of an ordered
+table](table-layout.md#levels-of-an-ordered-table)). A table whose
+writer appends between compactions is `permissive` under
+`overlapping_files`, so its owner configures `lookups = "permissive"`;
+left at the default, such a table reads below its level after every
+append. `icetray_scan_files` shows how many files each `Scan` reads, and
+its rise between compactions measures what the appends cost. Six finding
+codes apply to ordered tables alone:
+
+- `shared_edge_keys` caps the level at `balanced`: files one snapshot
+  added, as a compaction that rolls files by size writes them, meet
+  where one file's last key is the next file's first, and a `Scan` of
+  such an edge key reads every file that holds it. Its penalty is in
+  `files_probed_per_lookup`, the most files one edge key spans.
+- `dictionary_encoded_order` caps the level at `balanced` under `full`
+  and `bloom`: every `Scan` fetches the order column's dictionary page.
+  Its penalty is in `extra_gets_per_hit`, which on an ordered table
+  counts the extra GETs of one `Scan` in each file it reads, here one.
+- `order_index_missing` caps the level at `balanced` under `full` and
+  `bloom`: a file has no column index on the order column, so a bounded
+  `Scan` reads the run's order pages in one round and its value pages in
+  a second, with as many GETs as one round. Its penalty is that second
+  round, which none of the penalty units counts, so each of its penalty
+  fields is `null`.
+- `order_index_truncated`, `long_runs`, and `large_runs` are advice.
+
+Under `disk` the order column's dictionary page and the order pages a
+bound reaches are local reads, so the two order findings apply under
+`full` and `bloom` alone.
+
+**Refresh.** A refresh checks a key and order value for repeats only
+where they can occur: a new file, or a reused one whose deletes shrank,
+against the files of its overlap group whose key ranges and order ranges
+both meet its own. A file that meets none, as an append of later rows
+does, is merged with nothing and read no further. Within an overlap
+group that holds a file to check, one merge reads each checked file that
+meets another whole, and only the order pages of the group's other files
+that can hold its rows, each page once. A checked file is read again for
+the merge: under `full` its order chunks, one GET per row group; under
+`bloom` its order and key chunks, two GETs per row group; and under
+`disk` its chunk file, locally. A refresh that appends later rows therefore reads only its new
+files, and an append of rows inside an existing file's order range costs
+the new file's order chunks again and the order pages its rows fall
+among. With `RUST_LOG=icetray_core=debug`, each load logs `assembled
+generation` with `overlap_groups_verified`, the overlap groups it
+merged, which on an ordered table counts the groups merged by key and
+order value.
+
 ## Deploying
 
 Every deployment runs the same icetray build and configures it only
@@ -570,7 +648,9 @@ through settings, mounted files, and environment variables.
   over the tables the replica serves, of the doctor's `predicted` bytes
   for each table's residency (`predicted.full`, `predicted.disk_memory`,
   or `predicted.bloom`), doubled for a table a refresh can rewrite
-  wholesale or a reload can change; plus `server.page_cache_bytes`; plus a
+  wholesale or a reload can change; plus `server.page_cache_bytes`, and
+  `server.scan_page_cache_bytes` on a replica that serves an ordered
+  table; plus a
   third of that total for the process, requests in flight, a load's
   transient chunks, and the allocator's fragmentation and bookkeeping. The
   `icetray_allocator_*` gauges show how much of the resident set the

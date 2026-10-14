@@ -2,9 +2,12 @@
 
 A service calls icetray over gRPC with a client generated from
 [`icetray.proto`](../crates/icetray-proto/proto/icetray.proto), whose
-comments are the reference this page summarizes. There are three calls:
-`Get` looks up one key, `MultiGet` looks up many keys from one snapshot,
-and `TableInfo` describes a table the server serves. The
+comments are the reference this page summarizes. There are five calls.
+`Get` looks up one key and `MultiGet` many keys from one snapshot, in a
+key-value table. `Scan` reads one key's rows in order and `MultiScan`
+many keys' rows from one snapshot, in an
+[ordered table](#reading-an-ordered-table). `TableInfo` describes a
+table the server serves, including which kind it is. The
 [glossary](glossary.md) defines terms such as snapshot and residency.
 
 The server rejects most malformed requests as `INVALID_ARGUMENT`, but a
@@ -184,10 +187,149 @@ values splits them across batches. The server caps the GETs a batch holds
 in flight at `server.batch_fan_out`, 64 by default, so a large batch
 takes longer and its load on object storage stays within that cap.
 
+## Reading an ordered table
+
+An ordered table holds many rows per key, each with an order value, such
+as a time series by key and timestamp or the activity of each user. The
+table's owner configures its order column, and `TableInfo` reports it in
+`order_column`, its type in `order_type`, and the most rows one `Scan`
+returns in `max_scan_rows`. A key-value table reports an empty
+`order_column` and a `max_scan_rows` of 0. The server rejects a `Get` or
+`MultiGet` of an ordered table, and a `Scan` or `MultiScan` of a
+key-value table, as `INVALID_ARGUMENT`.
+
+A `Scan` request carries the table, the key, the value columns to read
+as `Get` reads them, a direction, a limit, and optional bounds:
+
+```sh
+grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
+  -d '{"table": "events", "key": {"long": "42"}, "columns": [{"name": "payload"}], "direction": "DIRECTION_NEWEST_FIRST", "limit": 2}' \
+  127.0.0.1:7433 icetray.v1.Icetray/Scan
+```
+
+```json
+{
+  "rows": [
+    {"order": {"long": "1760400060000000"}, "values": [{"value": "CgVjbGljaw…"}]},
+    {"order": {"long": "1760400000000000"}, "values": [{"value": "CgR2aWV3…"}]}
+  ],
+  "more": true,
+  "snapshotId": "7128216514704790069"
+}
+```
+
+- **Direction.** `DIRECTION_NEWEST_FIRST` returns the highest order
+  values first, `DIRECTION_OLDEST_FIRST` the lowest. The request must set
+  one.
+- **Limit.** The most rows to return, at most the table's
+  `max_scan_rows`. A limit of 0 reads up to `max_scan_rows`.
+- **Bounds.** `after` and `before` are exclusive: a row is returned only
+  when its order value is above `after` and below `before`. Either may
+  be left unset, and when both are set `after` must be below `before`.
+- **Order values.** An order value is an `OrderValue` whose variant
+  follows the order type: `long` for `int`, `long`, `date`, and the
+  timestamp types, `str` for `string`, and `bin` for `binary` and
+  `fixed`. A date travels as days since the epoch, a `timestamp` or
+  `timestamptz` as microseconds, and a `timestamp_ns` or
+  `timestamptz_ns` as nanoseconds. Integer and time values compare as
+  signed 64-bit integers, and strings and bytes as their bytes. A bound
+  outside an `int` or `date` column's range admits every row on its side.
+
+The response carries the key's rows in the requested direction, each
+with its order value and one value per requested column, in the order
+requested, read as a `Get` response's values are. No two rows of one
+response share an order value. `more` is set when the key has rows
+within the bounds past the last row returned. A key with no rows returns
+no rows with `more` unset, and that is a successful call. A request that
+lists no columns returns the order values alone.
+
+The same call in Go:
+
+```go
+resp, err := client.Scan(ctx, &icetrayv1.ScanRequest{
+	Table:     "events",
+	Key:       &icetrayv1.Key{Key: &icetrayv1.Key_Long{Long: 42}},
+	Columns:   []*icetrayv1.ColumnRead{{Name: "payload"}},
+	Direction: icetrayv1.Direction_DIRECTION_NEWEST_FIRST,
+	Limit:     100,
+})
+```
+
+In each file that holds the key, a cold `Scan` costs a GET per
+contiguous span of uncached pages of the order column and of each
+requested column, so a caller requests only the columns it uses. A table
+that a compaction has merged holds each key in one file. A table that
+takes appends between compactions holds a key in up to one file per
+append, and a `Scan` reads every one of them
+([Performance and tuning](performance.md#what-a-scan-costs)).
+
+## Paging by order value
+
+A caller reads a history longer than one response by paging on the order
+value. Reading newest first, the next request sets `before` to the order
+value of the last row of the previous response; reading oldest first, it
+sets `after` to it. Every other field stays the same. The caller stops
+when a response has `more` unset:
+
+```go
+req := &icetrayv1.ScanRequest{
+	Table:     "events",
+	Key:       &icetrayv1.Key{Key: &icetrayv1.Key_Long{Long: 42}},
+	Columns:   []*icetrayv1.ColumnRead{{Name: "payload"}},
+	Direction: icetrayv1.Direction_DIRECTION_NEWEST_FIRST,
+}
+for {
+	resp, err := client.Scan(ctx, req)
+	if err != nil {
+		return err
+	}
+	rows := resp.GetRows()
+	for _, row := range rows {
+		use(row.GetOrder().GetLong(), row.GetValues()[0])
+	}
+	if !resp.GetMore() {
+		return nil
+	}
+	req.Before = rows[len(rows)-1].GetOrder()
+}
+```
+
+A key and order value appear together at most once among a snapshot's
+live rows, so within one snapshot the order value is an exact cursor: the
+next page starts at the next row, with no row repeated or skipped, and
+the server keeps no state between requests. A refresh between two
+requests moves the next page to the new snapshot, whose id the response
+carries. A row the writer committed on the side the caller has already
+read appears only to a `Scan` that starts over, so a caller that needs
+every row of one snapshot compares the ids and starts over when they
+differ.
+
+## Scanning many keys
+
+A `MultiScan` request carries a list of keys and one set of columns,
+direction, limit, and bounds, applied to every key. The server reads
+every key from one snapshot and returns one result per key in request
+order, each with its own rows and `more`, with one snapshot id for the
+call. A key listed twice is answered at each position. When the read of
+any key fails, the whole call fails, as for `MultiGet`.
+
+A `MultiScan` may request up to `server.max_multi_scan_values` values,
+4,000 by default, counted as its keys times its limit times one more than
+its columns, the one being the order value; a limit of 0 counts as the
+table's `max_scan_rows`. The server rejects a larger call as
+`INVALID_ARGUMENT` before it reads any key. At the defaults, a
+`MultiScan` at the full limit of 1,000 rows with one column covers two
+keys, and one with a limit of 20 and one column covers 100. A caller
+reading many keys requests a smaller limit and pages each key that
+returns `more`, and a caller reading one key's full limit over several
+columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in flight
+are capped at `server.batch_fan_out`, 64 by default, as for `MultiGet`.
+
 ## Snapshots and consistency
 
-Every `Get` response carries the id of the snapshot the server read it
-from, and every `MultiGet` response carries one for the batch. A table
+Every `Get` and `Scan` response carries the id of the snapshot the server
+read it from, and every `MultiGet` and `MultiScan` response carries one
+for the call. A table
 advances when its writer publishes a new snapshot, and icetray swaps the
 new one in at once, so two calls made a moment apart can read from
 different snapshots. A caller that combines responses from several calls
@@ -205,11 +347,11 @@ or the snapshot changes.
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
-| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a batch over the values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` of an ordered table, `Scan` of a key-value table). | No; fix the request |
+| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
-| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan` ran past `server.scan_deadline` (5 seconds), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds). | Yes, if the caller's own deadline allows |
+| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a span GET within any `Scan` or `MultiScan`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |
 
 The gRPC layer enforces a deadline the client sends and reports its
@@ -217,5 +359,5 @@ expiry to the client (a tonic client sees `CANCELLED`), and the server
 drops the call at that moment.
 
 By default the server hedges a slow GET to object storage with a second
-one to cut tail latency, so a caller can leave hedging a `Get` to the
-server.
+one to cut tail latency, so a caller can leave hedging a `Get` or a
+`Scan` to the server.

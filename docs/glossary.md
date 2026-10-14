@@ -79,6 +79,21 @@ key, among other requirements. A table in the optimal layout reaches the
 layouts at a cost the doctor reports, and refuses a layout it would serve
 incorrectly. See [the optimal layout](table-layout.md).
 
+**Order column.** The column of an ordered table by which each key's
+rows are sorted after the key, configured as `order_column`: an Iceberg
+`int`, `long`, `date`, timestamp, `string`, `binary`, or `fixed` column,
+such as a timestamp, a sequence number, or a version. A key and order
+value appear together at most once among a table's live rows, so a
+caller pages by order value. See
+[Reading an ordered table](calling.md#reading-an-ordered-table).
+
+**Ordered table.** A table configured with an order column, which holds
+many rows per key and which `Scan` and `MultiScan` read, newest or oldest
+first, under a limit and optional bounds on the order value. Its writer
+sorts each file by key and then order value. Every other table is a
+key-value table, which holds at most one row per key and which `Get` and
+`MultiGet` read. See [Ordered tables](table-layout.md#ordered-tables).
+
 **Projection.** The trimming of a value in a column declared protobuf to
 the top-level field numbers a request lists, which icetray performs after
 the page cache. It saves the bytes on the wire and the caller's decode,
@@ -96,6 +111,16 @@ memory), `disk` (in a chunk file in the local directory, with footers,
 page indexes, and the fence array in memory), or `bloom` (the key
 column's bloom filters in memory in place of the key chunks). See
 [Choosing a residency](configuration.md#choosing-a-residency).
+
+**Run.** The consecutive rows of one key in one data file of an ordered
+table, sorted by order value. A run may span key pages and row groups,
+and a `Scan` reads one run in each file that holds its key.
+
+**Shared edge key.** In an ordered table, a key that is one file's last
+key and the next file's first, among files of one bucket that one
+snapshot added, as a compaction that rolls files by size writes them. A
+`Scan` of such a key reads every file that holds it, and the doctor
+reports it as `shared_edge_keys`, which caps the table at `balanced`.
 
 **Strict.** A per-table setting, off by default, under which icetray
 refuses a snapshot whose layout is below the table's level; without it,

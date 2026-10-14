@@ -198,7 +198,9 @@ the first rule whose `from` matches.
 
 When a lookup GET has no response after the delay, icetray sends it a
 second time and uses whichever response arrives first. Load reads are
-never hedged.
+never hedged. A `Scan`'s span GETs are hedged under the same settings in
+a window of their own per table, which records each span's latency per
+page, so a span's delay is the window's percentile times its pages.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -233,11 +235,31 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `ref` | string | required | The Iceberg branch or tag to serve, such as `"main"`. |
 | `key_column` | string | required | The key column: a top-level field of the snapshot's schema, which icetray matches in each data file by its name and field id ([Changing the schema](table-layout.md#changing-the-schema)). The name is a valid Avro name: ASCII letters, digits, and underscores, not starting with a digit. Iceberg's Java writers store a column of any other name under an escaped name, so such a name makes the file invalid, as `tables[0].key_column names "user-id", which icetray does not serve: a column name is ASCII letters, digits, and underscores, and does not start with a digit`. |
 | `value_columns` | list of strings or tables | required | The value columns icetray serves for the table. Each is a top-level field matched the same way, and icetray reads it only when a request lists it ([Value columns](table-layout.md#value-columns)). An entry is the column's name, `"payload"`, or a table of its `name` and its `format`, `{ name = "detail", format = "protobuf" }`; in JSON, `"payload"` or `{"name": "detail", "format": "protobuf"}`. `format` is `"opaque"`, the default, for bytes icetray returns as stored, or `"protobuf"`, for a serialized protobuf message that icetray can trim to the top-level fields a request lists ([Protobuf columns](table-layout.md#protobuf-columns)). An unknown key in the table form is a schema error reported at its path, as ``tables[0].value_columns[1].fromat: unknown field `fromat`, expected `name` or `format` ``, and so is an unknown format, as ``tables[0].value_columns[1].format: unknown variant `json`, expected `opaque` or `protobuf` ``. The list may be empty, `value_columns = []`, for a table served for key presence only. Each column must be of Iceberg type `binary`, `fixed`, or `string`, and a protobuf column of type `binary`; icetray refuses a snapshot that breaks this as `value_type_unsupported`, naming the column. Each name follows `key_column`'s rule, and a name outside it makes the file invalid, as `tables[0].value_columns names "user-id", ...`. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. The order of the list is not significant: a reload that only reorders it changes nothing, one that changes only formats applies to the serving snapshot in place, and one that changes the set of columns loads the table anew. |
+| `order_column` | string | none | The order column of an [ordered table](table-layout.md#ordered-tables): a top-level field of Iceberg type `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed`, matched as `key_column` is and following its name rule, by which each key's rows are sorted after the key. A table that sets it is an ordered table, which `Scan` and `MultiScan` read; a table without it is a key-value table, which `Get` and `MultiGet` read. Naming the key column makes the file invalid, as `tables[0].order_column names the key column`, and so does listing it in `value_columns`, as `tables[0].value_columns lists the order column "ts"`. Setting, changing, or removing it loads the table anew. |
+| `max_scan_rows` | count | `1000` on an ordered table | The most rows one `Scan` returns, and what a limit of 0 reads. Set only on an ordered table: on a key-value table it makes the file invalid, as `tables[0].max_scan_rows is set, but the table sets no order_column, and only an ordered table is scanned`. Zero is invalid, and so is a value above half of `server.max_multi_scan_values`, so a `MultiScan` of one key at the full limit and one column is always valid. A change applies to the serving table in place. |
 | `source` | table | required | Where icetray reads the table's metadata from, below. |
 | `lookups` | string | the best level `residency` reaches | The lookup cost the owner accepts for the table: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Whether icetray refuses a snapshot whose layout falls below the table's `lookups` level. When a strict table's first snapshot is below its level, the start fails; icetray refuses a later one and [holds](glossary.md) the table, and the last snapshot that met the level keeps serving. With `strict` off, icetray serves the snapshot and flags the table below its level. |
 | `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` requires `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
 | `resident_budget_bytes` | bytes | unbounded | For `full` residency only: the most resident bytes a load may hold, its delete state counted at a bound taken from the manifests. icetray refuses a load that would exceed it as `over_budget` once the footers are read, before it fetches any key chunk or delete. Set on a `disk` or `bloom` table, it makes the file invalid. |
+
+An ordered table of each user's activity, read by user and timestamp,
+whose writer appends between compactions:
+
+```toml
+[[tables]]
+name = "events"
+ref = "main"
+key_column = "user_id"
+value_columns = ["payload"]
+order_column = "ts"
+max_scan_rows = 500
+lookups = "permissive"
+
+[tables.source]
+type = "static"
+location = "s3://warehouse/db/events"
+```
 
 ### `[tables.source]`
 
@@ -363,6 +385,13 @@ in hand.
   the load exceeds what it retains. Use it when the keys do not fit in
   memory and no local volume can be mounted.
 
+On an ordered table the residency also sets where a `Scan` reads the
+order column. `full` and `bloom` fetch its pages by GET beside the value
+columns', and `disk` stores its chunks in the chunk file beside the key
+chunks, so a cold `Scan` reads it locally and `predicted.disk_bytes`
+counts it. Under `bloom` a `Scan` fetches the key pages that bound the
+key's run before it reads the rows.
+
 The decision is recorded in [RFD 017](rfd/017-residency-tiers.md).
 
 ## Choosing a level
@@ -416,6 +445,13 @@ layout its writer can produce:
   ([What to alert on](operating.md#what-to-alert-on)).
 - Declare `permissive` for a table that receives appends with no
   compaction schedule, whose lookups slow down until a compaction runs.
+
+An ordered table's levels are read for a `Scan` of one key, and its
+owner chooses them by how the writer commits: `permissive` for a table
+that takes appends between compactions, `balanced` for one whose
+compaction writes more than one file per bucket, and the default for one
+file per bucket ([Levels of an ordered
+table](table-layout.md#levels-of-an-ordered-table)).
 
 `strict` sets what icetray does when a snapshot falls below the level.
 With `strict` off, the default, icetray serves the snapshot and flags the
@@ -484,7 +520,9 @@ icetray get --location s3://warehouse/db/kv --value-column payload --column payl
   not declared protobuf, a number outside 1 to 536870911, or one given
   twice exits 64 before the table loads, and so does a field list that is
   not numbers. A value that does not parse as protobuf fails the run with
-  exit 1, and the error names the table, column, and key.
+  exit 1, and the error names the table, column, and key. `get` reads a
+  key-value table; on an ordered table it loads the table and fails with
+  exit 1, since only `Scan` reads one.
 
 ### Choosing the tables
 
@@ -543,7 +581,11 @@ table named `table`.
 
 A located table runs with every `[server]` and `[storage]` default. Its
 value columns are the ones the `--value-column` flags list, or none, so
-the doctor checks only those columns' layout. Its
+the doctor checks only those columns' layout. A located table is a
+key-value table, and the command line has no flag for an order column,
+so `doctor` and `info` check an ordered table through a configuration
+file that sets its `order_column`. Opened with `--location`, an ordered
+table's repeated keys refuse it as `duplicate_keys`. Its
 `lookups` is the best level its `--residency` reaches, `optimal` for
 `full` and `balanced` for `bloom`, and it is never strict, so the doctor
 reports a located table below that level with exit 2 rather than refusing
@@ -615,6 +657,13 @@ Two conventions hold for every line:
   id above 2^53 loses digits as a JSON number in most readers.
 - A key that does not apply is `null` rather than absent, except where a
   line kind below says otherwise.
+- An order value is a JSON number for an order type that travels as a
+  long (`int`, `long`, `date`, and the timestamp types), in the type's
+  unit; a JSON string for a `string` order column; and a string of `0x`
+  and lowercase hex for `binary` and `fixed`. The number is exact as
+  text, and a reader that parses JSON numbers as doubles loses precision
+  above 2^53, as `timestamp_ns` and `timestamptz_ns` values are, so such
+  a reader parses these keys as 64-bit integers.
 
 #### `table`
 
@@ -659,6 +708,11 @@ One per table, from `info` and from `doctor`:
 | `deletes.state_bytes` | Bytes the delete state holds, counted in `index_bytes`, as `icetray_table_delete_state_bytes` reports it. |
 | `capping` | The number of findings that cap the level. |
 | `advice` | The number of advice findings. |
+| `order` | Present only on an ordered table: an object of the keys below. |
+| `order.column` | The order column's name. |
+| `order.order_type` | The order column's Iceberg type in the snapshot: `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed(N)` with its width. |
+| `order.max_scan_rows` | The table's `max_scan_rows`, configured or the default. |
+| `order.longest_run` | The rows of the longest run of one key in any one file. A key that several files hold, as appends between compactions leave it, has more rows than its longest run in one file. |
 
 #### `finding`
 
@@ -671,7 +725,7 @@ One per finding, from `doctor`, capping findings first:
 | `message` | What was measured, for a person. |
 | `file` | The data file's location, or `null` for a table-level finding. |
 | `column` | The value column the finding is about, for `dictionary_encoded_value`, `large_value_pages`, `value_pages_over_ceiling`, `column_default`, and `malformed_protobuf`; `null` for a finding about the row or the table. |
-| `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. |
+| `penalty` | `null` for advice. For a capping finding, an object of `extra_gets_per_hit`, `keys_decoded_per_lookup`, and `files_probed_per_lookup`, each a number or `null` when the finding does not affect it. On an ordered table, `extra_gets_per_hit` counts the extra GETs one `Scan` makes in each file it reads, and `files_probed_per_lookup` the files one `Scan` reads. |
 | `property` | The writer property that corrects the layout, or `null`. A per-column property is printed up to the column name, such as `write.metadata.metrics.column.`. |
 
 #### `file`
@@ -700,6 +754,10 @@ One per data file, from `doctor --files`:
 | `distinct_page_mins_ratio` | The share of key pages whose column-index minimum is distinct; low when the column index is truncated. |
 | `bounds_present` | Whether the manifest carries full-length key bounds. |
 | `resident_bytes` | The bytes this file's index holds in the loaded residency. |
+| `order` | Present only on an ordered table: an object of the keys below, which the load recorded from every order value in the file. |
+| `order.min`, `order.max` | The least and greatest order value over all the file's rows, deleted rows included, in the form [above](#the-output-contract-version-1). |
+| `order.longest_run` | The rows of the file's longest run of one key. |
+| `order.distinct_keys` | Per row group, in the footer's order, the distinct keys it holds: what the bloom findings divide its filter bits by. |
 
 #### `refusal`
 
@@ -712,8 +770,8 @@ for it:
 
 | Key | Value |
 |---|---|
-| `reason` | A refusal reason from [the optimal layout's requirements](table-layout.md#requirements) (`unsorted`, `null_keys`, `duplicate_keys`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `column_mismatch`, `value_type_unsupported`, `data_format_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
-| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
+| `reason` | A refusal reason from [the optimal layout's requirements](table-layout.md#requirements) and [an ordered table's](table-layout.md#requirements-of-an-ordered-table) (`unsorted`, `null_keys`, `duplicate_keys`, `duplicate_rows`, `null_order`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `order_type_unsupported`, `order_type_mismatch`, `column_mismatch`, `value_type_unsupported`, `data_format_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
+| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `scan_request`, `wrong_table_kind`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
 `reason` and `error_kind` use the same names as the `reason` label of

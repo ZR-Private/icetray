@@ -68,6 +68,66 @@ concurrent batch callers can raise it toward 128; above that, the
 process's throughput is the limit
 ([the measurements](analysis/2026-10-08-multi-get-fan-out.md)).
 
+## What a Scan costs
+
+A `Scan` of an [ordered table](table-layout.md#ordered-tables) finds the
+key's run in each file that holds the key, then reads the order column
+and each requested column over the run's rows, in one round across every
+file. For a key held in one file, with its run in one row group and none
+of its pages cached, a cold `Scan` of one value column costs:
+
+| Residency | Finding the run | Reading the rows |
+|---|---|---|
+| `full` | a decode of the run's first and last key pages in the row group, in memory | 2 GETs: the value column's span and the order column's |
+| `disk` | the same decode, from the local chunk file | 1 GET for the value column's span; the order column is read from the chunk file |
+| `bloom` | the filter screens the file, then a GET of each of those key pages | 2 GETs, as under `full`, after the key-page round |
+
+Within a row group, a column's rows for one `Scan` are contiguous, so
+icetray fetches each column's uncached pages over the run as one span
+GET, however many rows the limit takes, and a dictionary-encoded column
+adds its dictionary page. A `Scan` therefore costs about what a cold
+`Get` with one more column does, and its bytes grow with the rows it
+returns and their values' size. A run that spans row groups costs a span
+per row group, and a run the cache holds in part costs one GET per
+uncached span. With a bound, icetray selects from the order column's
+resident column index the pages that can hold the bound, and reads them
+in the same round as the value pages.
+
+The files that hold the key multiply the cost. A cold `Scan` of a key in
+K files costs K times the GETs of a compacted one and waits on the
+slowest of them, so an ordered table's latency follows its compaction
+cadence. `icetray_scan_files` reports the files each `Scan` read, and
+`icetray_table_gets_per_scan` the GETs a cold `Scan` at `max_scan_rows`
+of a key in one file makes at worst.
+
+Measured on local files, which leave out a GET's latency to object
+storage, a warm `Scan` of a key's 100 rows took about 20 µs under `full`
+and `bloom` and 38 µs under `disk`, where the order column is a local
+read, and a page of 10 of those rows took about 16 µs, so finding the
+run and decoding its pages make most of a warm `Scan`. A cold `Scan`
+made the GETs in the table above. A `MultiScan` of 10 keys took about
+24 µs a key warm and 55 µs a key cold, where its keys' GETs overlap
+under `server.batch_fan_out`. Against S3, each cold figure is a GET's
+latency, tens of milliseconds
+([the measurements](analysis/2026-10-13-ordered-rows-costs.md)).
+
+A load of an ordered table reads each file's order column once per row
+group to verify it, one more GET per row group than a key-value table's
+load. Resident memory adds the order column's offset index and column
+index and a few facts per file, and a `Scan` reads the order values from
+their pages.
+
+### The scan cache
+
+icetray caches each page a span GET fetches as its own entry, keyed by
+file and offset, in a memory cache of its own, bounded by
+`server.scan_page_cache_bytes`, 256 MiB by default. A later `Scan` of the
+same key reads those pages from memory, and one that reaches past them
+fetches only its uncached spans. The scan cache has no disk level, and
+key-value lookups read through the page cache alone, so a long run evicts
+only other scans' pages. The `cache` label of the page-cache metrics
+separates the two ([Metrics](operating.md#metrics)).
+
 ## Packing or splitting a row
 
 A table can be configured with several [value columns](glossary.md), and
@@ -244,7 +304,9 @@ high percentile of the table's recent lookup GET latencies, by default
 the 95th percentile of the last 256, so it tracks the object store's
 latency as it drifts. A ceiling, by default 5 percent, caps the share of
 the window's lookup GETs that icetray hedges. icetray never hedges load
-reads.
+reads. A `Scan`'s span GETs are hedged under the same settings in a
+window of their own per table, whose delay scales with a span's pages,
+since a span's latency grows with its size.
 
 - A lower percentile hedges sooner and cuts more of the tail, at the
   cost of more GETs. A higher one sends fewer redundant GETs and lets a
@@ -393,3 +455,5 @@ read without blocking, so every local read there moves to another thread
   row across them.
 - [RFD 024](rfd/024-field-projection.md): field projection, and when to
   project within a column rather than split.
+- [RFD 025](rfd/025-ordered-rows.md): ordered tables, what a `Scan`
+  reads in each residency, and the scan cache.

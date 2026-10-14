@@ -6,7 +6,9 @@ none. A table written to the optimal layout reaches the `optimal` lookup
 level under `full` and `disk` residency. icetray serves other layouts
 less efficiently and refuses a layout it would serve incorrectly. It
 checks the files a writer produced, whatever properties the writer was
-given, at every load and in `icetray doctor`.
+given, at every load and in `icetray doctor`. An
+[ordered table](#ordered-tables), which holds many rows per key, uses
+this layout with each file sorted by key and then order value.
 
 ## The recipe
 
@@ -261,6 +263,129 @@ changing it requires rewriting every file.
   a date, splits one bucket's keys across files whose key ranges
   intersect, which the doctor reports as `overlapping_files`.
 
+## Ordered tables
+
+An ordered table holds many rows per key, each with an order value, such
+as a time series by key and timestamp or the activity of each user. The
+owner configures its [`order_column`](configuration.md#tables), and
+callers read a key's rows newest or oldest first with `Scan` and
+`MultiScan` ([Calling icetray](calling.md#reading-an-ordered-table)). Its
+layout is the optimal layout above with two changes: each file is sorted
+by key and then by order value, ascending, and a key repeats within a
+file. A key's rows in one file are therefore consecutive, a run sorted by
+order value, which may span key pages and row groups. Partitioning stays
+`bucket(N, key)`, so all of a key's rows share a bucket.
+
+### The recipe for an ordered table
+
+The table properties of [the recipe](#the-recipe) apply unchanged, with
+the order column after the key in the local sort order:
+
+```sql
+CREATE TABLE db.events (key BIGINT, ts TIMESTAMP, payload BINARY) USING iceberg
+PARTITIONED BY (bucket(16, key))
+TBLPROPERTIES (
+  'parquet.enable.dictionary' = 'false',
+  'parquet.columnindex.truncate.length' = '256',
+  'write.parquet.page-row-limit' = '1000',
+  'write.parquet.page-size-bytes' = '8388608',
+  'write.parquet.row-group-size-bytes' = '134217728',
+  'write.parquet.compression-codec' = 'zstd',
+  'write.parquet.bloom-filter-enabled.column.key' = 'true',
+  'write.parquet.bloom-filter-fpp.column.key' = '0.01',
+  'write.metadata.metrics.column.key' = 'full',
+  'write.distribution-mode' = 'hash',
+  'write.target-file-size-bytes' = '67108864'
+);
+ALTER TABLE db.events WRITE LOCALLY ORDERED BY key, ts;
+```
+
+- **Uniqueness.** A key and order value appear together at most once in
+  the table's live rows. The writer deduplicates before the write, or
+  upserts with `MERGE` on the key and the order value, whose deletes
+  icetray applies like any other
+  ([RFD 021](rfd/021-merge-on-read.md)):
+
+  ```sql
+  MERGE INTO db.events t
+  USING updates s
+  ON t.key = s.key AND t.ts = s.ts
+  WHEN MATCHED THEN UPDATE SET *
+  WHEN NOT MATCHED THEN INSERT *;
+  ```
+
+- **Ties.** Rows of one key that share a timestamp need a tiebreak
+  inside the order value, such as a `timestamp_ns` with a counter in its
+  low digits, or a `long` sequence number in place of the timestamp.
+- **Compaction.** A compaction sorts by the same order and keeps the
+  file-size target:
+
+  ```sql
+  CALL catalog.system.rewrite_data_files(
+    table => 'db.events',
+    strategy => 'sort',
+    sort_order => 'key ASC, ts ASC',
+    options => map('target-file-size-bytes', '67108864')
+  );
+  ```
+
+- **Streaming writers.** A writer that leaves its files unsorted, as
+  streaming appends often do, writes snapshots icetray refuses as
+  `unsorted`. Serve a tag or branch that the compaction job moves after
+  it sorts the files, so icetray serves only sorted snapshots.
+- **Page indexes.** icetray locates the order column's pages through
+  its offset index and selects the pages a bound reaches from its column
+  index, both of which Iceberg's writers write by default. With the
+  recipe's `'parquet.columnindex.truncate.length' = '256'`, the column
+  index of a string order column holds values of up to 256 bytes whole.
+
+### Requirements of an ordered table
+
+Every requirement of [the optimal layout](#requirements) applies to an
+ordered table, except the two that keep a key at most once and the sort
+by key alone, which the first three rows below replace.
+
+| Requirement | If missed | What fixes it |
+|---|---|---|
+| Each data file sorted by key and then order value, ascending, across row-group boundaries | Refused: `unsorted` | `ALTER TABLE ... WRITE LOCALLY ORDERED BY key, ts`, and the same sort order in compaction |
+| A key and order value at most once within a data file, deleted rows included | Refused: `duplicate_rows`, naming the key and the order value | Deduplicate before the write, with a tiebreak inside the order value for rows that share a timestamp |
+| A live key and order value in at most one data file, where a row removed by a delete is not live | Refused: `duplicate_rows`, naming the later file | Deduplicate before the write, or upsert with `MERGE` on the key and the order value |
+| An order column of Iceberg type `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed` | Refused: `order_type_unsupported`. An order column stored in another Parquet type than Iceberg's, such as INT96 or millisecond timestamps, or promoted to a type of another unit, such as `date` to `timestamp`, is refused as `order_type_mismatch`. A file written before Iceberg promoted the column from `int` to `long` is served | Declare the order column with one of those types and write it through an Iceberg writer; rewrite files a migration left in another unit |
+| No null order values | Refused: `null_order` | Filter nulls before the write |
+| The order column in every data file | Refused: `column_mismatch`, for a file written before the order column was added, since a default would give every row of the file one order value | A compaction that rewrites those files with the column |
+| An offset index on the order column, and a column index that bounds each order page's values | Fails the load as a `file` fault. icetray checks every order page's values against that page's column index entry, so it places a bound only by an index it has checked | An Iceberg writer, which writes both |
+| A column index on the order column | Under `full` and `bloom`, caps at `balanced`: `order_index_missing`, since a bounded `Scan` reads the run's order pages in a first round and its value pages in a second, with as many GETs as one round. Under `disk` the order pages are local reads | An Iceberg writer, which writes the column index by default |
+| Dictionary encoding off on the order column | Under `full` and `bloom`, caps at `balanced`: `dictionary_encoded_order`, one extra GET per `Scan` per file for the dictionary page. Under `disk` the dictionary page is a local read | `'parquet.enable.dictionary' = 'false'` |
+| A full-length column index on the order column | Advice: `order_index_truncated`, since long values sharing a prefix widen the pages a bound selects | `'parquet.columnindex.truncate.length'` at least the longest order value |
+| Within a bucket, files with disjoint key ranges | Caps at `balanced`: `shared_edge_keys`, for files one snapshot added that meet only where one file's last key is the next file's first, as a compaction that rolls files by size writes them; a `Scan` of such an edge key reads every file that holds it. Caps at `permissive`: `overlapping_files`, for any other overlap, as appends write it | A compaction, which merges the appended files; a bucket compacted into one file has no edge keys |
+| Runs of at most 1,000 rows | Advice: `long_runs`, naming the longest run; a caller reads a longer history in more than one `Scan` at the default `max_scan_rows` | Nothing in the layout: callers page by order value ([Calling icetray](calling.md#paging-by-order-value)) |
+| 1,000 rows of the configured value columns within 4 MiB, a gRPC client's default message limit | Advice: `large_runs`, from the footer's uncompressed bytes per row | A lower `max_scan_rows`, or callers that request fewer rows or columns |
+
+The bloom findings `bloom_oversized` and `bloom_undersized` divide a row
+group's filter bits by the distinct keys it holds, which the load counts,
+so a repeated key counts once.
+
+### Levels of an ordered table
+
+The [levels](configuration.md#choosing-a-level) of an ordered table are
+read for a `Scan` of one key. A table where every `Scan` reads one file
+can reach `optimal`, whatever the length of its runs: decoding a run's
+edge key pages, and a run that spans row groups, leave it there. How the
+writer commits to the table sets the level it reaches:
+
+- One file per bucket, or files with disjoint key ranges, reaches
+  `optimal`.
+- A compaction that rolls a bucket's files by size writes files that may
+  share an edge key, which reaches `balanced` under `shared_edge_keys`.
+  That cost is fixed when the compaction writes the files and grows with
+  no later commit. An owner whose buckets hold more than one
+  target-sized file configures `lookups = "balanced"`.
+- Appends between compactions write files that overlap a bucket's
+  existing ones, and a `Scan` reads one file per append that holds the
+  key until a compaction merges them. Such a table is `permissive` under
+  `overlapping_files`, so its owner configures `lookups = "permissive"`,
+  and `icetray_scan_files` shows the files each `Scan` reads.
+
 ## The checks
 
 `icetray doctor` runs the check and prints the findings;
@@ -273,7 +398,8 @@ between builds), [RFD 016](rfd/016-doctor.md) (the doctor), [RFD
 020](rfd/020-lookup-levels.md) (lookup levels), [RFD
 021](rfd/021-merge-on-read.md) (delete files), [RFD
 022](rfd/022-value-columns.md) (value columns), [RFD
-023](rfd/023-column-resolution.md) (column resolution), and [RFD
-024](rfd/024-field-projection.md) (field projection). The
+023](rfd/023-column-resolution.md) (column resolution), [RFD
+024](rfd/024-field-projection.md) (field projection), and [RFD
+025](rfd/025-ordered-rows.md) (ordered tables). The
 [glossary](glossary.md) defines terms such as residency, level, and
 strict.

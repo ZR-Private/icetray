@@ -12,7 +12,8 @@ Batch-frozen data, served one cube at a time.
 icetray is a Rust server for key lookups on Apache Iceberg tables in object
 storage. A batch job writes a table and publishes it by moving an Iceberg
 ref, and icetray serves `Get` and `MultiGet` over gRPC from the table's
-Parquet files.
+Parquet files, and `Scan` and `MultiScan` for a table of many rows per
+key.
 
 It is built for data that is computed in batch and read by key. Tables
 with a hot working set and a long, rarely read tail suit it best: hot
@@ -128,6 +129,31 @@ the whole value, as in this `Get` request:
 errors, including the rules for projecting a oneof or a message with
 required fields.
 
+### An ordered table serves each key's rows in order
+
+A table configured with an order column, such as a timestamp, holds many
+rows per key, written sorted by key and then order value: a time series
+by key, or the activity of each user. A `Scan` returns a key's rows
+newest or oldest first, up to a limit and between optional bounds on the
+order value, and a caller pages through a longer history by order value.
+A compacted table holds each key's rows in one file, so under `full` a
+cold `Scan` costs a GET per requested column and one for the order
+column, as in this `Scan` request:
+
+```json
+{
+  "table": "events",
+  "key": {"long": "42"},
+  "columns": [{"name": "payload"}],
+  "direction": "DIRECTION_NEWEST_FIRST",
+  "limit": 100
+}
+```
+
+[Ordered tables](docs/table-layout.md#ordered-tables) covers the writer
+recipe, and [Calling icetray](docs/calling.md#reading-an-ordered-table)
+the calls and paging.
+
 ### Every response comes from one published snapshot
 
 When a writer moves the ref, icetray loads the new snapshot alongside the
@@ -171,8 +197,9 @@ a table's metadata and file footers, before deployment.
 
 ## Limits and workarounds
 
-icetray serves exact-key lookups on tables a batch job writes, so writes,
-scans, and range queries need another tool. Each limit below has a
+icetray serves exact-key lookups, and reads of one key's rows in order,
+on tables a batch job writes, so writes, scans across keys, and range
+queries over keys need another tool. Each limit below has a
 workaround at write time or in the platform:
 
 - **Data files in ORC or Avro.** icetray reads data files in Parquet and
