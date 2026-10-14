@@ -56,6 +56,10 @@ pub struct Served {
     pub storage: Arc<Storage>,
     /// The table's page cache; its counters say whether it is cold.
     pub cache: PageCache,
+    /// The table's scan cache (RFD 025), of the same budget, which an
+    /// ordered table's Scans read through and a key-value table never
+    /// touches.
+    pub scan_cache: PageCache,
     /// The table.
     pub table: Table,
 }
@@ -79,7 +83,8 @@ impl Served {
 }
 
 /// `config` from `source` over `storage`, not yet loaded: a `cache_bytes`
-/// page cache on `local`'s disk level when there is one, a count of calls
+/// page cache on `local`'s disk level when there is one, a scan cache of
+/// `cache_bytes` in memory, a count of calls
 /// in flight of its own, and the table in `Loading`. A test that asserts on a refused table's state or needs a
 /// cache of another size builds here and calls `Served::load` itself. The
 /// disk-tier tests build the storage first and open their `LocalDir` over
@@ -96,6 +101,7 @@ pub async fn build(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let scan_cache = PageCache::for_scans(cache_bytes);
     let server = ServerConfig::default();
     let handles = TableHandles {
         storage: Arc::clone(&storage),
@@ -104,6 +110,8 @@ pub async fn build(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: server.batch_fan_out,
+        scan_cache: scan_cache.clone(),
+        max_multi_scan_values: server.max_multi_scan_values,
     };
     let table = Table::new(
         config,
@@ -112,10 +120,12 @@ pub async fn build(
         server.load_deadline,
         server.refresh_deadline,
         server.get_deadline,
+        server.scan_deadline,
     );
     Ok(Served {
         storage,
         cache,
+        scan_cache,
         table,
     })
 }

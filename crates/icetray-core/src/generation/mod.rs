@@ -35,7 +35,7 @@ use crate::check::{
 use crate::config::{Residency, TableConfig};
 use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
-use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition};
+use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition, RunSource};
 use crate::key::Key;
 use crate::level::Level;
 use crate::local::{
@@ -43,7 +43,9 @@ use crate::local::{
 };
 use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayout};
 use crate::metric::LookupResult;
+use crate::order::ScanBounds;
 use crate::parquet_io::{FileHandle, Segments};
+use crate::scan::{self, FileAnswer, ScanRow, Scanned};
 use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
@@ -576,6 +578,82 @@ impl Generation {
             }
         }
         Ok((Row::Absent, LookupResult::Miss))
+    }
+
+    /// One Scan of `key` (RFD 025, Cost): its live rows inside `bounds`'
+    /// exclusive `after` and `before`, in `bounds.direction`, at most
+    /// `limit` of them (the table resolved a limit of 0 to its
+    /// `max_scan_rows`; `bounds.limit` is not read), each with one value per
+    /// position of `columns` in the layout, and `more` set when live rows
+    /// remain inside the bounds past the last returned. Every candidate
+    /// file whose exact key range covers the key (`candidates`) finds the
+    /// key's run (`FileIndex::locate_run`), and each file that holds it
+    /// reads its candidate rows (`FileIndex::read_run`), up to `limit` live
+    /// ones from the direction's end and the order value of one more, its
+    /// rows counted live against the file's deletes with no I/O (RFD 021);
+    /// the files are read together, each reading as soon as its run is
+    /// found, so the read is one round across them, and under Bloom one
+    /// round of key pages before it. Every GET holds one permit of
+    /// `source.fan_out`, goes through `source.cache`, and counts in its
+    /// column's counter. The files' rows are merged by order value, live
+    /// pairs being unique across files (RFD 025, Uniqueness), and cut to
+    /// `limit` (`scan::merge`). A file written before a column was added
+    /// answers that column's default (RFD 023). A key no file holds
+    /// answers no rows, `more` unset, with no read beyond finding that.
+    pub(crate) async fn scan(
+        &self,
+        key: &Key,
+        columns: &[usize],
+        bounds: &ScanBounds,
+        limit: u32,
+        source: RunSource<'_>,
+    ) -> Result<(Scanned, ScanRead)> {
+        let reads = self.ranked_candidates(key).map(|(at, file)| async move {
+            let Some(run) = file.index.locate_run(key, source).await? else {
+                return Ok::<_, Error>(None);
+            };
+            let deleted = |position: RowPosition| self.is_deleted(at, position);
+            let rows = file
+                .index
+                .read_run(&run, bounds, limit, columns, &deleted, source)
+                .await?;
+            Ok(Some((file, rows)))
+        });
+        let read = futures::future::try_join_all(reads).await?;
+        let mut answers = Vec::new();
+        let mut from_store = false;
+        for (file, rows) in read.into_iter().flatten() {
+            from_store |= rows.from_store;
+            let defaults: Vec<Option<Option<Bytes>>> = columns
+                .iter()
+                .map(|&column| {
+                    file.index
+                        .value_leaf(column)
+                        .is_none()
+                        .then(|| self.layout.value_columns[column].default.clone())
+                })
+                .collect();
+            answers.push(FileAnswer {
+                rows: rows
+                    .rows
+                    .into_iter()
+                    .map(|(order, values)| ScanRow {
+                        order,
+                        values: values
+                            .into_iter()
+                            .zip(&defaults)
+                            .map(|(value, default)| default.clone().unwrap_or(value))
+                            .collect(),
+                    })
+                    .collect(),
+                next: rows.next,
+            });
+        }
+        let files = answers.len();
+        Ok((
+            scan::merge(answers, bounds.direction, limit),
+            ScanRead { files, from_store },
+        ))
     }
 
     /// `lookup` naming the layout's first value column, alone and
@@ -1944,6 +2022,18 @@ pub enum Row {
     Absent,
 }
 
+/// What one Scan of a key read beside its answer (`Generation::scan`): the
+/// files holding the key whose run it read, and whether any order or value
+/// page came from object storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScanRead {
+    /// Files holding the key.
+    pub(crate) files: usize,
+    /// Whether any order or value page came from object storage, a fetch
+    /// the Scan ran or joined.
+    pub(crate) from_store: bool,
+}
+
 /// One lookup's answer and the snapshot it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lookup {
@@ -2393,6 +2483,55 @@ pub(crate) mod testing {
         Bytes::from(out)
     }
 
+    /// The order column of a table `Table::ordered` makes, a long.
+    pub(crate) const ORDER_COLUMN: &str = "ts";
+    /// Its field id, after the key's, the value's, and the detail's.
+    const ORDER_FIELD_ID: i32 = 4;
+    /// The mixer that makes an ordered row's value a function of its key
+    /// and its order value, distinct for a key's neighboring rows.
+    const ROW_KEY_MIX: i64 = 1_009;
+
+    /// The value of an ordered fixture's row at (`key`, `order`).
+    pub(crate) fn row_value_for(key: i64, order: i64) -> Vec<u8> {
+        value_of_len(key * ROW_KEY_MIX + order, VALUE_BYTES)
+    }
+
+    /// A Parquet file of an ordered table holding `rows`, (key, order
+    /// value) pairs: the long key, the value `row_value_for`, its
+    /// `detail_of`, and the long order column, laid out as `layout` says.
+    pub(crate) fn ordered_parquet(rows: &[(i64, i64)], layout: &WriterLayout) -> Bytes {
+        let fields = vec![
+            Field::new(KEY_COLUMN, DataType::Int64, false),
+            Field::new(VALUE_COLUMN, DataType::Binary, true),
+            Field::new(DETAIL_COLUMN, DataType::Binary, true),
+            Field::new(ORDER_COLUMN, DataType::Int64, false),
+        ];
+        let values: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|&(key, order)| row_value_for(key, order))
+            .collect();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|&(key, _)| key),
+            )),
+            Arc::new(BinaryArray::from_iter_values(values.iter())),
+            Arc::new(BinaryArray::from_iter_values(
+                values.iter().map(|value| detail_of(value)),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|&(_, order)| order),
+            )),
+        ];
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+        let mut out = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut out, schema, Some(layout.properties(rows.len()))).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(out)
+    }
+
     /// The Iceberg schema of a table keyed by `key_type` with binary values.
     pub(crate) fn schema_for(key_type: KeyType) -> Schema {
         let key = match key_type {
@@ -2474,6 +2613,8 @@ pub(crate) mod testing {
         key_type: KeyType,
         /// Whether the table has `DETAIL_COLUMN` beside the value column.
         detail: bool,
+        /// Whether the table is ordered by `ORDER_COLUMN` (`ordered`).
+        ordered: bool,
         md: TableMetadata,
         /// The default spec, which `add_file` writes under.
         spec_id: i32,
@@ -2489,30 +2630,51 @@ pub(crate) mod testing {
     impl Table {
         /// A table keyed by `key_type` under `spec`, with no snapshot yet.
         pub(crate) fn new(key_type: KeyType, spec: UnboundPartitionSpec) -> Self {
-            Self::of(key_type, spec, false)
+            Self::of(key_type, spec, false, false)
         }
 
         /// `new` with `DETAIL_COLUMN` beside the value column, in the
         /// schema, in every file `add_file` writes, and in `config`'s
         /// value columns (RFD 022).
         pub(crate) fn with_detail(key_type: KeyType, spec: UnboundPartitionSpec) -> Self {
-            Self::of(key_type, spec, true)
+            Self::of(key_type, spec, true, false)
         }
 
-        fn of(key_type: KeyType, spec: UnboundPartitionSpec, detail: bool) -> Self {
+        /// A long-keyed ordered table (RFD 025) bucketed `buckets` ways,
+        /// with `DETAIL_COLUMN` beside the value column and the long
+        /// `ORDER_COLUMN` after them, as `config` serves it; its files are
+        /// written by `add_ordered_file`.
+        pub(crate) fn ordered(buckets: u32) -> Self {
+            Self::of(
+                KeyType::Long,
+                manifest_testing::bucket_spec(buckets),
+                true,
+                true,
+            )
+        }
+
+        fn of(key_type: KeyType, spec: UnboundPartitionSpec, detail: bool, ordered: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = manifest_testing::file_root(dir.path());
             let mut schema = schema_for(key_type);
+            let mut added = Vec::new();
             if detail {
+                added.push(NestedField::optional(
+                    DETAIL_FIELD_ID,
+                    DETAIL_COLUMN,
+                    Type::Primitive(PrimitiveType::Binary),
+                ));
+            }
+            if ordered {
+                added.push(NestedField::required(
+                    ORDER_FIELD_ID,
+                    ORDER_COLUMN,
+                    Type::Primitive(PrimitiveType::Long),
+                ));
+            }
+            if !added.is_empty() {
                 let mut fields: Vec<_> = schema.as_struct().fields().to_vec();
-                fields.push(
-                    NestedField::optional(
-                        DETAIL_FIELD_ID,
-                        DETAIL_COLUMN,
-                        Type::Primitive(PrimitiveType::Binary),
-                    )
-                    .into(),
-                );
+                fields.extend(added.into_iter().map(Arc::new));
                 schema = Schema::builder().with_fields(fields).build().unwrap();
             }
             let md = manifest_testing::metadata(&root, schema, spec);
@@ -2522,6 +2684,7 @@ pub(crate) mod testing {
                 hedge: Arc::new(HedgeWindow::new(&HedgeConfig::default())),
                 key_type,
                 detail,
+                ordered,
                 spec_id: md.default_partition_spec_id(),
                 md,
                 files: Vec::new(),
@@ -2562,13 +2725,47 @@ pub(crate) mod testing {
                 } else {
                     vec![ValueColumnConfig::named(VALUE_COLUMN)]
                 },
-                order_column: None,
+                order_column: self.ordered.then(|| ORDER_COLUMN.to_string()),
                 max_scan_rows: None,
                 strict: true,
                 lookups: None,
                 residency,
                 resident_budget_bytes: budget,
             }
+        }
+
+        /// Writes file `name` of an ordered table holding `rows`, (key,
+        /// order value) pairs ascending, each row's value `row_value_for`
+        /// and its detail that value's `detail_of`, in `partition`, laid
+        /// out as `layout` says with exact key bounds, and records it for
+        /// the next snapshot.
+        pub(crate) async fn add_ordered_file(
+            &mut self,
+            name: &str,
+            rows: &[(i64, i64)],
+            partition: Partition,
+            layout: WriterLayout,
+        ) {
+            assert!(self.ordered, "an ordered table's file");
+            let path = self.path_of(name);
+            let bytes = ordered_parquet(rows, &layout);
+            let size = count(bytes.len());
+            manifest_testing::write_file(&FileIO::new_with_fs(), &path, bytes).await;
+            let keys: Vec<Key> = rows.iter().map(|&(key, _)| Key::Long(key)).collect();
+            let min = keys.iter().min().unwrap();
+            let max = keys.iter().max().unwrap();
+            self.files.push((
+                manifest_testing::data_file(
+                    &path,
+                    self.spec_id,
+                    manifest_testing::partition(partition),
+                    count(rows.len()),
+                    size,
+                    Some((min, max)),
+                    DataContentType::Data,
+                ),
+                self.spec_id,
+            ));
         }
 
         /// Writes `spec`'s file and records it for the next snapshot.

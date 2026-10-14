@@ -32,37 +32,37 @@ use crate::storage::HedgeWindow;
 
 /// The rows of a key's run in one row group.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunPart {
+pub(crate) struct RunPart {
     /// The row group.
-    pub row_group: usize,
+    pub(crate) row_group: usize,
     /// The run's rows within the row group, ascending by order value;
     /// never empty.
-    pub rows: Range<i64>,
+    pub(crate) rows: Range<i64>,
 }
 
 /// A key's run in one file: its rows in each row group it spans, in file
 /// order, so ascending by order value; at least one part.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Run {
+pub(crate) struct Run {
     /// The run's rows per row group.
-    pub parts: Vec<RunPart>,
+    pub(crate) parts: Vec<RunPart>,
 }
 
 /// What one file answers a Scan of one key (`FileIndex::read_run`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileRows {
+pub(crate) struct FileRows {
     /// The rows taken, in the Scan's direction: each its order value and
     /// one value per requested column, `None` for a null and for a column
     /// the file does not hold (`FileIndex::value_leaf`), whose default the
     /// caller answers.
-    pub rows: Vec<(OrderValue, Vec<Option<Bytes>>)>,
+    pub(crate) rows: Vec<(OrderValue, Vec<Option<Bytes>>)>,
     /// The order value of the next live row inside the bounds past the
     /// last row taken, in the Scan's direction; `None` when no live row
     /// remains there.
-    pub next: Option<OrderValue>,
+    pub(crate) next: Option<OrderValue>,
     /// Whether any order or value page the read took came from object
     /// storage, a fetch it ran or joined.
-    pub from_store: bool,
+    pub(crate) from_store: bool,
 }
 
 /// Where a run's pages come from beyond what the tier holds (RFD 025,
@@ -74,19 +74,19 @@ pub struct FileRows {
 /// fetched through the cache under the file's lookup window and counted
 /// nowhere.
 #[derive(Clone, Copy)]
-pub struct RunSource<'a> {
+pub(crate) struct RunSource<'a> {
     /// The Scan cache.
-    pub cache: &'a PageCache,
+    pub(crate) cache: &'a PageCache,
     /// The Scan's fan-out (`TableHandles::batch_fan_out`); `None` bounds
     /// nothing.
-    pub fan_out: Option<&'a Arc<Semaphore>>,
+    pub(crate) fan_out: Option<&'a Arc<Semaphore>>,
     /// The table's span hedge window.
-    pub window: &'a HedgeWindow,
+    pub(crate) window: &'a HedgeWindow,
     /// Per value column, by position in the layout, the counter its GETs
     /// count in; a position past the end counts nowhere.
-    pub value_gets: &'a [Counter],
+    pub(crate) value_gets: &'a [Counter],
     /// The counter the order column's GETs count in.
-    pub order_gets: Option<&'a Counter>,
+    pub(crate) order_gets: Option<&'a Counter>,
 }
 
 impl FileIndex {
@@ -110,7 +110,7 @@ impl FileIndex {
     /// costs nothing in any tier; one inside a row group that the file does
     /// not hold costs one key-page decode in Full, one local read in Disk,
     /// and in Bloom a key-page GET at the filter's false-positive rate.
-    pub async fn locate_run(&self, key: &Key, source: RunSource<'_>) -> Result<Option<Run>> {
+    pub(crate) async fn locate_run(&self, key: &Key, source: RunSource<'_>) -> Result<Option<Run>> {
         if !self.may_contain(key) {
             return Ok(None);
         }
@@ -282,7 +282,7 @@ impl FileIndex {
     /// span that decodes to fewer order values than rows is
     /// `FileFault::PageRowsMismatch`, and a string order value that is not
     /// UTF-8 `FileFault::OrderNotUtf8`.
-    pub async fn read_run(
+    pub(crate) async fn read_run(
         &self,
         run: &Run,
         bounds: &ScanBounds,

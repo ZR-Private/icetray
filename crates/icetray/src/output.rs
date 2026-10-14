@@ -186,6 +186,8 @@ impl RefusalCode {
             | ErrorKind::Cache
             | ErrorKind::KeyType
             | ErrorKind::ColumnRequest
+            | ErrorKind::ScanRequest
+            | ErrorKind::WrongTableKind
             | ErrorKind::MalformedValue
             | ErrorKind::Table
             | ErrorKind::File

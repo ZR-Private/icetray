@@ -96,18 +96,22 @@ Counters and histograms:
 | `icetray_local_reads_total` | | yes | Reads from the local directory. |
 | `icetray_local_bytes_total` | | yes | Bytes of those reads. |
 | `icetray_hedges_total` | | yes | Second GETs issued because a lookup GET was slow. |
-| `icetray_page_cache_hits_total` | | yes | Value pages served from the page cache. |
-| `icetray_page_cache_fetches_total` | | yes | Value-page fetches the page cache ran, after coalescing. |
+| `icetray_page_cache_hits_total` | `cache` | every cache | Pages served from the page cache without a fetch. |
+| `icetray_page_cache_fetches_total` | `cache` | every cache | Page fetches the page cache ran, after coalescing. The scan cache counts a span GET once, however many pages it holds. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups that completed. |
-| `icetray_value_page_gets_total` | `table`, `column` | every table and value column | Value-page and dictionary-page GETs issued for the column, each counted once when it is issued, whether or not its lookup succeeds. A fetch another lookup joins is not counted again, and hedges are counted in `icetray_hedges_total`. A caller budgets a column's GETs by this counter. |
+| `icetray_value_page_gets_total` | `table`, `column` | every table and value column, and an ordered table's order column | Value-page, dictionary-page, and span GETs issued for the column by lookups and Scans, each counted once when it is issued, whether or not its call succeeds. An ordered table's order column counts its GETs under its own name. A fetch another lookup joins is not counted again, and hedges are counted in `icetray_hedges_total`. A caller budgets a column's GETs, and a Scan's, by this counter. |
 | `icetray_value_bytes_read_total` | `table`, `column` | every table and value column | Bytes of the column's values that each completed lookup read: a present value as its page stores it, a default as its bytes, and a null or a miss as zero. A lookup that fails counts nothing; a failed `MultiGet` counts the keys it completed before the failure, as `icetray_lookups_total` does. |
 | `icetray_value_bytes_returned_total` | `table`, `column` | every table and value column | Bytes of those values that the same lookups returned: a value read whole counts its bytes as read, a projected value its trimmed bytes. Its ratio to `icetray_value_bytes_read_total` measures what projection saves. |
 | `icetray_projection_errors_total` | `table`, `column` | every table and value column | Values that did not parse as protobuf when a lookup requested fields of their column; each fails its call with `FAILED_PRECONDITION`. A rise means the column is declared protobuf and its writer stored values that are not. |
 | `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. icetray counts a failure it remembers for a snapshot once, when it first meets it ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
+| `icetray_scans_total` | `table`, `result` | every ordered table and result | Scans of one key that an ordered table read; each key of a `MultiScan` counts one. A request refused before any read is not counted. |
 | `icetray_lookup_seconds` (histogram) | `table`, `result` | every table and result | Lookup latency. |
 | `icetray_object_get_seconds` (histogram) | `kind` | every kind | Object-store GET latency. |
+| `icetray_scan_rows` (histogram) | `table` | every ordered table | Rows each answered Scan of one key returned. |
+| `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 on a compacted table, more where appends overlap. |
+| `icetray_scan_seconds` (histogram) | `table`, `temperature` | every ordered table and temperature | Latency of each answered Scan of one key. |
 
 The histograms' buckets run from 100 microseconds to 2 seconds.
 
@@ -146,7 +150,7 @@ Gauges, written at each scrape:
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
 | `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The number of findings of each code that icetray raised on the serving generation, 0 for a code not raised. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
-| `icetray_page_cache_bytes` | | Bytes the page cache's memory level holds against `server.page_cache_bytes`, after evictions. |
+| `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against `server.page_cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the operating system; `retained` is address space only. |
@@ -189,6 +193,14 @@ The label values:
   returned a column's default with no page read, or the lookup requested
   no column), `miss` (the key is absent).
 - `result` of `icetray_config_reloads_total`: `applied`, `refused`.
+- `result` of `icetray_scans_total`: `rows` (the Scan returned at least
+  one row), `empty` (it returned none), `error` (its read failed).
+- `temperature`: `cold` (an order or value page of the Scan came from
+  object storage, including through a fetch another call started),
+  `warm` (otherwise).
+- `cache`: `lookup` (the value-page cache key-value lookups read
+  through), `scan` (the memory cache of ordered tables' pages, which no
+  key-value table reads).
 - `state`: `loading`, `serving`, `degraded`, `held` ([Refresh and
   reload](#refresh-and-reload)).
 - `code` of `icetray_findings`: `dictionary_encoded_value`,

@@ -33,12 +33,15 @@ use crate::config::{Residency, TableConfig};
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Row};
+use crate::index::RunSource;
 use crate::key::{Key, KeyType};
 use crate::level::{Level, PageCacheCondition};
 use crate::local::{LocalDir, ResidentPages, Unobserved};
 use crate::manifest::{ColumnRead, Selection, TableLayout};
-use crate::metric::{self, LookupResult};
+use crate::metric::{self, LookupResult, ScanResult, Temperature};
+use crate::order::ScanBounds;
 use crate::projection;
+use crate::scan::{self, MultiScanLookup, ScanLookup, Scanned};
 use crate::shard::{self, Line, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
@@ -188,7 +191,38 @@ pub struct TableHandles {
     /// one hedge beside it, so a batch holds at most twice this many GETs
     /// open on the store however many keys and columns it carries. The
     /// wait for a permit is not charged against a fetch's `get_deadline`.
+    /// One `scan` or `multi_scan` holds the same bound across every file
+    /// and key it reads (RFD 025, Limits).
     pub batch_fan_out: usize,
+    /// The scan cache (`PageCache::for_scans`, RFD 025): every page an
+    /// ordered table's Scan reads, a Bloom-tier key page included, goes
+    /// through it, so a long run evicts only other scans' pages. A
+    /// key-value table never reads it.
+    pub scan_cache: PageCache,
+    /// `server.max_multi_scan_values`: the values one `multi_scan` may ask
+    /// for, its keys times its limit times one more than its columns.
+    pub max_multi_scan_values: usize,
+}
+
+/// Which calls a table serves (RFD 025, Configuration): a table entry that
+/// sets `order_column` is ordered, every other is key-value. Display gives
+/// the kind as a message names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TableKind {
+    /// At most one row per key, served by `get` and `multi_get`.
+    KeyValue,
+    /// Many rows per key in order, served by `scan` and `multi_scan`.
+    Ordered,
+}
+
+impl fmt::Display for TableKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::KeyValue => "key-value",
+            Self::Ordered => "ordered",
+        };
+        f.write_str(name)
+    }
 }
 
 /// What a table does with the doctor's findings on each generation it
@@ -258,6 +292,17 @@ pub struct Table {
     storage: Arc<Storage>,
     local: Option<Arc<LocalDir>>,
     hedge: Arc<HedgeWindow>,
+    /// The window a Scan's span GETs are hedged in (RFD 025, Caching and
+    /// hedging), apart from `hedge`, which the lookups and a Bloom-tier
+    /// Scan's key pages use: a span's latency grows with its pages, so the
+    /// window holds per-page latencies and a span's delay scales with its
+    /// pages (`Storage::read_span_hedged`).
+    span_hedge: HedgeWindow,
+    /// What a Scan needs beside its generation, on an ordered table;
+    /// `None` on a key-value table, which no Scan reads.
+    scans: Option<Scans>,
+    /// `TableHandles::max_multi_scan_values`.
+    max_multi_scan_values: usize,
     /// The serving generation. A `get` borrows it through one `load` guard
     /// for the lookup's whole duration, so the lookup does not see a swap,
     /// and a swap meanwhile keeps the borrowed generation alive until the
@@ -530,6 +575,28 @@ impl Lookups {
         let read: Option<Vec<usize>> = selection
             .projects()
             .then(|| values.iter().map(length).collect());
+        self.project(generation, key, selection, values)?;
+        let counts = self.metrics.counts.mine();
+        for (at, (value, &column)) in values.iter().zip(&selection.positions).enumerate() {
+            let returned = length(value);
+            let read = read.as_ref().map_or(returned, |read| read[at]);
+            counts.columns[column].0.add(read, returned);
+        }
+        Ok(row)
+    }
+
+    /// `values`, one per read of `selection` in its order, each trimmed to
+    /// the fields its read names (RFD 024), a null staying null: what a
+    /// lookup's row and each row a Scan returns are trimmed by. A malformed
+    /// value is `Error::MalformedValue` for `key` and counts one
+    /// `projection_errors_total` for its column.
+    fn project(
+        &self,
+        generation: &Generation,
+        key: &Key,
+        selection: &Selection,
+        values: &mut [Option<bytes::Bytes>],
+    ) -> Result<()> {
         for ((value, &column), fields) in values
             .iter_mut()
             .zip(&selection.positions)
@@ -547,13 +614,7 @@ impl Lookups {
                 })?;
             }
         }
-        let counts = self.metrics.counts.mine();
-        for (at, (value, &column)) in values.iter().zip(&selection.positions).enumerate() {
-            let returned = length(value);
-            let read = read.as_ref().map_or(returned, |read| read[at]);
-            counts.columns[column].0.add(read, returned);
-        }
-        Ok(row)
+        Ok(())
     }
 
     /// `keys` looked up through `generation`, each reading the value
@@ -767,6 +828,96 @@ impl Drop for LookupMetrics {
     }
 }
 
+/// What an ordered table's Scan needs beside its generation (RFD 025): the
+/// scan cache, through a handle whose fetches end at `scan_deadline`, and
+/// the scan metrics.
+struct Scans {
+    cache: PageCache,
+    metrics: ScanMetrics,
+}
+
+/// An ordered table's scan metric handles under its name, registered once
+/// when the table is built, at zero, with the recorder current then: each
+/// `ScanResult`'s `scans_total`, the rows and files histograms, each
+/// `Temperature`'s `scan_seconds`, and the order column's
+/// `value_page_gets_total`, under the order column's name, so a caller
+/// budgets a Scan's GETs from that series as from the value columns' (RFD
+/// 025, Metrics). A Scan is far rarer and dearer than a lookup, so each is
+/// counted on the shared series as it ends.
+struct ScanMetrics {
+    rows: Counter,
+    empty: Counter,
+    error: Counter,
+    returned: Histogram,
+    files: Histogram,
+    cold: Histogram,
+    warm: Histogram,
+    order_gets: Counter,
+}
+
+impl ScanMetrics {
+    /// The handles of `table`, whose order column is `order_column`.
+    fn new(table: &str, order_column: &str) -> Self {
+        let total = |result: ScanResult| {
+            metrics::counter!(
+                metric::SCANS_TOTAL,
+                metric::LABEL_TABLE => table.to_string(),
+                metric::LABEL_RESULT => result.to_string()
+            )
+        };
+        let seconds = |temperature: Temperature| {
+            metrics::histogram!(
+                metric::SCAN_SECONDS,
+                metric::LABEL_TABLE => table.to_string(),
+                metric::LABEL_TEMPERATURE => temperature.to_string()
+            )
+        };
+        Self {
+            rows: total(ScanResult::Rows),
+            empty: total(ScanResult::Empty),
+            error: total(ScanResult::Error),
+            returned: metrics::histogram!(
+                metric::SCAN_ROWS,
+                metric::LABEL_TABLE => table.to_string()
+            ),
+            files: metrics::histogram!(
+                metric::SCAN_FILES,
+                metric::LABEL_TABLE => table.to_string()
+            ),
+            cold: seconds(Temperature::Cold),
+            warm: seconds(Temperature::Warm),
+            order_gets: metrics::counter!(
+                metric::VALUE_PAGE_GETS_TOTAL,
+                metric::LABEL_TABLE => table.to_string(),
+                metric::LABEL_COLUMN => order_column.to_string()
+            ),
+        }
+    }
+
+    /// One Scan of one key answered with `scanned` after reading `files`
+    /// files, cold when a page came from object storage, in `elapsed`.
+    fn record(&self, scanned: &Scanned, files: usize, cold: bool, elapsed: Duration) {
+        if scanned.rows.is_empty() {
+            self.empty.increment(1);
+        } else {
+            self.rows.increment(1);
+        }
+        self.returned.record(approx::gauge_len(scanned.rows.len()));
+        self.files.record(approx::gauge_len(files));
+        let seconds = if cold { &self.cold } else { &self.warm };
+        seconds.record(time::seconds(elapsed));
+    }
+}
+
+/// A Scan request checked against the generation and the table's entry
+/// before any read (`Table::check_scan`): the columns it reads and its
+/// limit, resolved.
+struct CheckedScan<'a> {
+    scans: &'a Scans,
+    selection: Selection,
+    limit: u32,
+}
+
 impl Table {
     /// Constructs in `Loading`; nothing is read until `load`. Every `load`
     /// and `refresh` with no generation serving runs within
@@ -778,8 +929,11 @@ impl Table {
     /// bounded by it. Every `get` and `multi_get` counts among `handles`'
     /// calls in flight while it runs. The lookup metrics and
     /// `generation_swaps_total` are registered here, at zero, with the
-    /// recorder current then: a process installs its recorder first. The
-    /// table shows its gauges from here on.
+    /// recorder current then: a process installs its recorder first. On an
+    /// ordered table every page fetch a Scan runs through
+    /// `handles.scan_cache` ends at `scan_deadline` from its start, and the
+    /// scan metrics are registered here too. The table shows its gauges
+    /// from here on.
     pub fn new(
         config: TableConfig,
         source: TableSource,
@@ -787,6 +941,7 @@ impl Table {
         load_deadline: Duration,
         refresh_deadline: Duration,
         get_deadline: Duration,
+        scan_deadline: Duration,
     ) -> Self {
         let table = Self::hidden(
             config,
@@ -795,6 +950,7 @@ impl Table {
             load_deadline,
             refresh_deadline,
             get_deadline,
+            scan_deadline,
         );
         table.show();
         table
@@ -810,6 +966,7 @@ impl Table {
         load_deadline: Duration,
         refresh_deadline: Duration,
         get_deadline: Duration,
+        scan_deadline: Duration,
     ) -> Self {
         let TableHandles {
             storage,
@@ -818,8 +975,15 @@ impl Table {
             calls,
             findings,
             batch_fan_out,
+            scan_cache,
+            max_multi_scan_values,
         } = handles;
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
+        let span_hedge = HedgeWindow::new(storage.hedge_config());
+        let scans = config.order_column.as_deref().map(|order_column| Scans {
+            cache: scan_cache.with_fetch_deadline(scan_deadline),
+            metrics: ScanMetrics::new(&config.name, order_column),
+        });
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
             metrics: LookupMetrics::new(&config.name, &config.value_column_names()),
@@ -837,6 +1001,9 @@ impl Table {
             storage,
             local,
             hedge,
+            span_hedge,
+            scans,
+            max_multi_scan_values,
             current: ArcSwapOption::empty(),
             state: Mutex::new(TableState::Loading),
             known: Mutex::new(None),
@@ -1088,7 +1255,9 @@ impl Table {
     /// One lookup against the serving generation, reading the value
     /// columns `columns` names, answered in that order, each value trimmed
     /// to the fields its read names (RFD 024); none answers presence alone
-    /// (RFD 022). `Error::NotReady` with no generation; `Error::KeyType` for
+    /// (RFD 022). `Error::NotReady` with no generation;
+    /// `Error::WrongTableKind` on an ordered table, which `scan` serves
+    /// (RFD 025); `Error::KeyType` for
     /// a key of another type than the table's and `Error::ColumnRequest` for
     /// a column the generation does not serve, one named twice, or a field
     /// list the entry's format for it does not take, each before any read
@@ -1103,6 +1272,7 @@ impl Table {
         // about what `load_full` costs.
         let current = self.current.load();
         let generation = current.as_deref().ok_or_else(|| self.not_ready())?;
+        self.check_key_value(generation)?;
         self.check_key_type(generation, key)?;
         let selection = generation.layout.select(&self.config.load(), columns)?;
         let row = self.lookups.one(generation, key, &selection, None).await?;
@@ -1129,8 +1299,9 @@ impl Table {
 
     /// Several lookups against one generation, each reading the value
     /// columns `columns` names, trimmed as `get` trims them, answered in
-    /// key order (RFD 022). Every key's type and the columns are checked
-    /// before any read, as `get` checks them, so a mismatch anywhere fails
+    /// key order (RFD 022). The table's kind, every key's type, and the
+    /// columns are checked before any read, as `get` checks them, so a
+    /// mismatch anywhere fails
     /// the whole call and issues nothing; any failure fails the whole call
     /// (RFD 010), a malformed value of any key included (RFD 024). While
     /// fewer `get` and `multi_get` calls than worker threads are in flight
@@ -1152,6 +1323,7 @@ impl Table {
     pub async fn multi_get(&self, keys: &[Key], columns: &[ColumnRead<'_>]) -> Result<MultiLookup> {
         let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
+        self.check_key_value(&generation)?;
         for key in keys {
             self.check_key_type(&generation, key)?;
         }
@@ -1170,6 +1342,134 @@ impl Table {
             rows,
             snapshot_id: generation.snapshot_id,
         })
+    }
+
+    /// One Scan of `key` against the serving generation (RFD 025): its live
+    /// rows inside `bounds`' exclusive `after` and `before`, in the
+    /// direction asked, at most the limit, a limit of 0 reading up to the
+    /// table's `max_scan_rows`, each its order value and one value per
+    /// column of `columns`, trimmed to the fields its read names as `get`
+    /// trims them, and `more` set when live rows remain inside the bounds
+    /// past the last returned. Raised before any read: `Error::NotReady`
+    /// with no generation, and the faults `check_scan` names, among them
+    /// `Error::WrongTableKind` on a key-value table. Every file holding the
+    /// key is read in one round (`Generation::scan`) through the scan cache,
+    /// each fetch ending at `scan_deadline`, its span GETs hedged in the
+    /// table's span window, and every GET holding one of
+    /// `TableHandles::batch_fan_out` permits while it runs. Counted under
+    /// `scans_total` by result, `scan_rows`, `scan_files`, and
+    /// `scan_seconds` by temperature.
+    pub async fn scan(
+        &self,
+        key: &Key,
+        columns: &[ColumnRead<'_>],
+        bounds: &ScanBounds,
+    ) -> Result<ScanLookup> {
+        let _in_flight = self.lookups.enter();
+        let generation = self.serving()?;
+        let checked = self.check_scan(
+            &generation,
+            std::slice::from_ref(key),
+            columns,
+            bounds,
+            false,
+        )?;
+        let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
+        let scanned = self
+            .scan_key(&generation, key, &checked, bounds, &fan_out)
+            .await?;
+        Ok(ScanLookup {
+            scanned,
+            snapshot_id: generation.snapshot_id,
+        })
+    }
+
+    /// Scans of `keys` from one generation, each answered as `scan`
+    /// answers it, in key order, a key listed twice at each position (RFD
+    /// 025). Every key's type, the columns, the limit, and the bounds are
+    /// checked before any read, as `scan` checks them, and so is the
+    /// request's size: keys times the resolved limit times one more than
+    /// the columns above `server.max_multi_scan_values` is
+    /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. The keys
+    /// share one bound of `TableHandles::batch_fan_out` GETs in flight, at
+    /// most that many keys read at once on this task; any failure fails the
+    /// whole call (RFD 010).
+    pub async fn multi_scan(
+        &self,
+        keys: &[Key],
+        columns: &[ColumnRead<'_>],
+        bounds: &ScanBounds,
+    ) -> Result<MultiScanLookup> {
+        let _in_flight = self.lookups.enter();
+        let generation = self.serving()?;
+        let checked = self.check_scan(&generation, keys, columns, bounds, true)?;
+        let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
+        // Built before the stream, unpolled, as `Lookups::run` builds its
+        // lookups, so the returned future stays provably `Send`.
+        let scans: Vec<_> = keys
+            .iter()
+            .map(|key| self.scan_key(&generation, key, &checked, bounds, &fan_out))
+            .collect();
+        let results = stream::iter(scans)
+            .buffered(self.lookups.batch_fan_out)
+            .try_collect()
+            .await?;
+        Ok(MultiScanLookup {
+            results,
+            snapshot_id: generation.snapshot_id,
+        })
+    }
+
+    /// One checked Scan of `key` through `generation` under `fan_out`, its
+    /// rows trimmed (`Lookups::project`) and the Scan counted: the one path
+    /// `scan` and `multi_scan` share. A failed read counts under
+    /// `ScanResult::Error`; an answered one under its rows, files, and
+    /// temperature, cold when any order or value page came from object
+    /// storage.
+    async fn scan_key(
+        &self,
+        generation: &Generation,
+        key: &Key,
+        checked: &CheckedScan<'_>,
+        bounds: &ScanBounds,
+        fan_out: &Arc<Semaphore>,
+    ) -> Result<Scanned> {
+        let started = Instant::now();
+        let metrics = &checked.scans.metrics;
+        let source = RunSource {
+            cache: &checked.scans.cache,
+            fan_out: Some(fan_out),
+            window: &self.span_hedge,
+            value_gets: &self.lookups.metrics.value_page_gets,
+            order_gets: Some(&metrics.order_gets),
+        };
+        let answered = async {
+            let (mut scanned, read) = generation
+                .scan(
+                    key,
+                    &checked.selection.positions,
+                    bounds,
+                    checked.limit,
+                    source,
+                )
+                .await?;
+            for row in &mut scanned.rows {
+                self.lookups
+                    .project(generation, key, &checked.selection, &mut row.values)?;
+            }
+            Ok::<_, Error>((scanned, read))
+        }
+        .await;
+        match answered {
+            Ok((scanned, read)) => {
+                metrics.record(&scanned, read.files, read.from_store, started.elapsed());
+                Ok(scanned)
+            }
+            Err(error) => {
+                metrics.error.increment(1);
+                Err(error)
+            }
+        }
     }
 
     /// `keys` split in order into `runs` runs of nearly equal length, each
@@ -1892,6 +2192,70 @@ impl Table {
         }
     }
 
+    /// `Error::WrongTableKind` for a `get` or `multi_get` of an ordered
+    /// table (RFD 025); a key-value table passes.
+    fn check_key_value(&self, generation: &Generation) -> Result<()> {
+        match generation.layout.order {
+            None => Ok(()),
+            Some(_) => Err(Error::WrongTableKind {
+                table: self.name.clone(),
+                kind: TableKind::Ordered,
+            }),
+        }
+    }
+
+    /// A Scan of `keys` reading `columns` under `bounds` checked against
+    /// `generation` and the table's entry before any read (RFD 025, Wire):
+    /// `Error::WrongTableKind` on a key-value table; `Error::KeyType` for a
+    /// key of another type; `Error::ColumnRequest` as `get` checks the
+    /// columns; and `Error::ScanRequest` for a limit above `max_scan_rows`,
+    /// a bound of another variant than the order type's, an `after` at or
+    /// above `before`, and, for a `MultiScan` (`multi`), keys times the
+    /// resolved limit times one more than the columns above
+    /// `max_multi_scan_values`, in that order. Every position the selection
+    /// holds is one of the generation's columns, which every file's index
+    /// holds a slot for.
+    fn check_scan(
+        &self,
+        generation: &Generation,
+        keys: &[Key],
+        columns: &[ColumnRead<'_>],
+        bounds: &ScanBounds,
+        multi: bool,
+    ) -> Result<CheckedScan<'_>> {
+        let config = self.config.load();
+        let (Some(scans), Some(order), Some(max_scan_rows)) = (
+            self.scans.as_ref(),
+            generation.layout.order.as_ref(),
+            config.scan_rows(),
+        ) else {
+            return Err(Error::WrongTableKind {
+                table: self.name.clone(),
+                kind: TableKind::KeyValue,
+            });
+        };
+        for key in keys {
+            self.check_key_type(generation, key)?;
+        }
+        let selection = generation.layout.select(&config, columns)?;
+        let limit = scan::resolve_limit(bounds, max_scan_rows).map_err(Error::ScanRequest)?;
+        scan::check_bounds(bounds, order.order_type.variant()).map_err(Error::ScanRequest)?;
+        if multi {
+            scan::check_multi_scan_values(
+                keys.len(),
+                limit,
+                selection.positions.len(),
+                self.max_multi_scan_values,
+            )
+            .map_err(Error::ScanRequest)?;
+        }
+        Ok(CheckedScan {
+            scans,
+            selection,
+            limit,
+        })
+    }
+
     /// `Error::KeyType` for a key of another type than the generation's.
     fn check_key_type(&self, generation: &Generation, key: &Key) -> Result<()> {
         let expected = generation.layout.key_type;
@@ -2005,7 +2369,8 @@ mod tests {
     use super::*;
     use crate::catalog::TableFault;
     use crate::config::{
-        DEFAULT_BATCH_FAN_OUT, Residency, ServerConfig, ValueColumnConfig, ValueFormat,
+        DEFAULT_BATCH_FAN_OUT, DEFAULT_MAX_SCAN_ROWS, Residency, ServerConfig, ValueColumnConfig,
+        ValueFormat,
     };
     use crate::error::{Budget, ErrorKind, UnsupportedDelete};
     use crate::generation::testing::{self, DETAIL_COLUMN, detail_of};
@@ -2028,7 +2393,9 @@ mod tests {
     use crate::manifest::ColumnRequestFault;
     use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN, whole};
     use crate::metric::LookupResult;
+    use crate::order::{Direction, OrderValue, OrderVariant};
     use crate::projection::MAX_FIELD_NUMBER;
+    use crate::scan::{ScanRequestFault, ScanRow};
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
 
@@ -2103,7 +2470,15 @@ mod tests {
             calls: CallsInFlight::new(),
             findings: FindingLog::Events,
             batch_fan_out: DEFAULT_BATCH_FAN_OUT,
+            scan_cache: scan_cache(),
+            max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
         }
+    }
+
+    /// A scan cache of `testing::CACHE_BYTES`, roomy enough that a test
+    /// sees no eviction it did not ask for.
+    fn scan_cache() -> PageCache {
+        PageCache::for_scans(testing::CACHE_BYTES)
     }
 
     /// A table following `fixture`'s main branch under `config`, built over
@@ -2124,6 +2499,7 @@ mod tests {
             load_deadline,
             refresh_deadline,
             ServerConfig::default().get_deadline,
+            ServerConfig::default().scan_deadline,
         )
     }
 
@@ -2287,6 +2663,7 @@ mod tests {
             defaults.load_deadline,
             defaults.refresh_deadline,
             defaults.get_deadline,
+            defaults.scan_deadline,
         );
         let error = table.load().await.unwrap_err();
         assert!(
@@ -4296,6 +4673,18 @@ mod tests {
             }
         }
 
+        /// The samples a histogram recorded, in order.
+        fn histogram(&self, name: &str, labels: &[(&str, String)]) -> Vec<f64> {
+            match self.find(name, labels) {
+                DebugValue::Histogram(samples) => {
+                    samples.iter().map(|sample| sample.into_inner()).collect()
+                }
+                DebugValue::Counter(_) | DebugValue::Gauge(_) => {
+                    panic!("{name} is a histogram")
+                }
+            }
+        }
+
         /// The series named `name`, of any labels.
         fn named(&self, name: &str) -> usize {
             self.0
@@ -5848,6 +6237,7 @@ mod tests {
             defaults.load_deadline,
             defaults.refresh_deadline,
             defaults.get_deadline,
+            defaults.scan_deadline,
         )
     }
 
@@ -5986,6 +6376,432 @@ mod tests {
         for (state, name) in cases {
             assert_eq!(state.to_string(), name);
         }
+    }
+
+    // Scans of an ordered table (RFD 025).
+
+    /// The fan-out the scan fan-out tests build their tables under: small,
+    /// so a few files' worth of row groups outnumber it several times.
+    const SCAN_FAN_OUT: usize = 4;
+
+    /// Rows per key of the scan fan-out tests, each in a row group of its
+    /// own, so each costs one GET per column and one for the order column.
+    const SCAN_ROWS_PER_KEY: i64 = 6;
+
+    /// The first order value of a key's run, and the step between its
+    /// rows.
+    const ORDER_START: i64 = 100;
+    const ORDER_STEP: i64 = 10;
+
+    /// The rows of `keys`, each `rows` rows ascending by order value from
+    /// `ORDER_START`, in file order.
+    fn ordered_rows(keys: &[i64], rows: i64) -> Vec<(i64, i64)> {
+        keys.iter()
+            .flat_map(|&key| (0..rows).map(move |at| (key, ORDER_START + at * ORDER_STEP)))
+            .collect()
+    }
+
+    /// A loaded ordered table of one file holding `rows`, written under
+    /// `layout`, built under a fan-out of `fan_out`, its file read through
+    /// a `Gauged` store, which passes every GET until a test gates it.
+    async fn ordered_table_of(
+        rows: &[(i64, i64)],
+        layout: WriterLayout,
+        fan_out: usize,
+    ) -> (Table, Fixture, Arc<Gauged>) {
+        let mut fixture = Fixture::ordered(1);
+        fixture
+            .add_ordered_file("f", rows, Partition::Bucket(0), layout)
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        let gauged = Arc::new(Gauged::new(Arc::new(LocalFileSystem::new())));
+        fixture
+            .storage
+            .register(FILE_PREFIX, Arc::<Gauged>::clone(&gauged));
+        let handles = TableHandles {
+            batch_fan_out: fan_out,
+            ..handles_over(&fixture).await
+        };
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            &fixture,
+            lenient(&fixture),
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        table.load().await.unwrap();
+        (table, fixture, gauged)
+    }
+
+    /// One row a row group of its own, one row a page.
+    fn row_per_row_group() -> WriterLayout {
+        WriterLayout {
+            page_rows: 1,
+            row_group_rows: Some(1),
+            ..WriterLayout::contract()
+        }
+    }
+
+    /// Every row, oldest first, at the table's `max_scan_rows`.
+    fn oldest_first() -> ScanBounds {
+        ScanBounds {
+            direction: Direction::OldestFirst,
+            limit: 0,
+            after: None,
+            before: None,
+        }
+    }
+
+    /// What a Scan naming `DETAIL_COLUMN` and then the value column
+    /// answers for `rows`, (key, order value) pairs of one key, in that
+    /// order.
+    fn scanned_both(rows: &[(i64, i64)]) -> Vec<ScanRow> {
+        rows.iter()
+            .map(|&(key, order)| {
+                let value = testing::row_value_for(key, order);
+                ScanRow {
+                    order: OrderValue::Long(order),
+                    values: vec![
+                        Some(Bytes::from(detail_of(&value))),
+                        Some(Bytes::from(value)),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    /// A Scan of a key whose run spans many row groups holds at most
+    /// `batch_fan_out` GETs in flight across them, and fills it: every row
+    /// group's order span and each column's span are GETs of their own,
+    /// three times the bound's worth (RFD 025, Limits).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_holds_at_most_batch_fan_out_gets() {
+        let rows = ordered_rows(&[KEY_STEP], i64::try_from(SCAN_FAN_OUT).unwrap());
+        let (table, fixture, gauged) =
+            ordered_table_of(&rows, row_per_row_group(), SCAN_FAN_OUT).await;
+        let gets_per_row_group = BOTH_READS.len() + 1;
+        gauged.fill_to(SCAN_FAN_OUT);
+        let before = fixture.gets();
+        let answered = table
+            .scan(&Key::Long(KEY_STEP), &BOTH_READS, &oldest_first())
+            .await
+            .unwrap();
+        assert_eq!(answered.scanned.rows, scanned_both(&rows));
+        assert!(!answered.scanned.more);
+        assert_eq!(
+            fixture.gets() - before,
+            approx::count(rows.len() * gets_per_row_group),
+            "one GET per row group for each column and the order column"
+        );
+        assert_eq!(
+            gauged.high_water(),
+            SCAN_FAN_OUT,
+            "the Scan fills the bound and never passes it"
+        );
+    }
+
+    /// A `MultiScan`'s keys share one bound of `batch_fan_out` GETs in
+    /// flight, which they fill, and answer in key order, a key listed
+    /// twice at each position (RFD 025, Limits).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_holds_at_most_batch_fan_out_gets() {
+        let keys = keys_from(0, i64::try_from(SCAN_FAN_OUT).unwrap());
+        let rows = ordered_rows(&keys, SCAN_ROWS_PER_KEY);
+        let (table, _fixture, gauged) =
+            ordered_table_of(&rows, row_per_row_group(), SCAN_FAN_OUT).await;
+        let mut asked = long_keys(&keys);
+        asked.push(Key::Long(keys[0]));
+        gauged.fill_to(SCAN_FAN_OUT);
+        let every_row = ScanBounds {
+            limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+            ..oldest_first()
+        };
+        let answered = table
+            .multi_scan(&asked, &BOTH_READS, &every_row)
+            .await
+            .unwrap();
+        let expected: Vec<Vec<ScanRow>> = asked
+            .iter()
+            .map(|key| {
+                let Key::Long(key) = key else {
+                    unreachable!("long keys")
+                };
+                scanned_both(&ordered_rows(&[*key], SCAN_ROWS_PER_KEY))
+            })
+            .collect();
+        let got: Vec<Vec<ScanRow>> = answered
+            .results
+            .iter()
+            .map(|scanned| scanned.rows.clone())
+            .collect();
+        assert_eq!(got, expected, "every key in order, the repeat again");
+        assert_eq!(
+            gauged.high_water(),
+            SCAN_FAN_OUT,
+            "the keys fill the bound together and never pass it"
+        );
+    }
+
+    /// A Get or `MultiGet` of an ordered table, and a Scan or `MultiScan` of a
+    /// key-value one, is `Error::WrongTableKind` naming the table's kind,
+    /// before any read (RFD 025, Wire).
+    #[tokio::test]
+    async fn test_calls_of_the_wrong_kind_are_refused_before_any_read() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (ordered, fixture, _gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let key = Key::Long(KEY_STEP);
+        let before = fixture.gets();
+        let wrong = |error: Error, expected: TableKind| {
+            assert!(
+                matches!(&error, Error::WrongTableKind { table, kind } if table == TABLE && *kind == expected),
+                "{error:?}"
+            );
+        };
+        wrong(
+            ordered.get(&key, &BOTH_READS).await.unwrap_err(),
+            TableKind::Ordered,
+        );
+        wrong(
+            ordered
+                .multi_get(std::slice::from_ref(&key), &BOTH_READS)
+                .await
+                .unwrap_err(),
+            TableKind::Ordered,
+        );
+        assert_eq!(fixture.gets(), before, "no read");
+        let (kv, all) = two_bucket_table().await;
+        let plain = table_over(&kv, lenient(&kv)).await;
+        plain.load().await.unwrap();
+        let before = kv.gets();
+        let key = Key::Long(all[0]);
+        let reads = [ColumnRead::whole(VALUE_COLUMN)];
+        wrong(
+            plain.scan(&key, &reads, &oldest_first()).await.unwrap_err(),
+            TableKind::KeyValue,
+        );
+        wrong(
+            plain
+                .multi_scan(std::slice::from_ref(&key), &reads, &oldest_first())
+                .await
+                .unwrap_err(),
+            TableKind::KeyValue,
+        );
+        assert_eq!(kv.gets(), before, "no read");
+    }
+
+    /// A malformed Scan request is refused before any read, as
+    /// `Error::ScanRequest` for its fault, after the key and the columns
+    /// are checked as `get` checks them (RFD 025, Wire, Limits).
+    #[tokio::test]
+    async fn test_scan_refuses_a_malformed_request_before_any_read() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (table, fixture, _gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let key = Key::Long(KEY_STEP);
+        let max = DEFAULT_MAX_SCAN_ROWS;
+        let before = fixture.gets();
+        let fault = |error: Error| {
+            let Error::ScanRequest(fault) = error else {
+                panic!("expected a scan request fault, got {error:?}");
+            };
+            fault
+        };
+        let above = ScanBounds {
+            limit: max + 1,
+            ..oldest_first()
+        };
+        assert_eq!(
+            fault(table.scan(&key, &BOTH_READS, &above).await.unwrap_err()),
+            ScanRequestFault::LimitAboveMax {
+                limit: max + 1,
+                max
+            }
+        );
+        let wrong_variant = ScanBounds {
+            after: Some(OrderValue::Str("a".to_string())),
+            ..oldest_first()
+        };
+        assert_eq!(
+            fault(
+                table
+                    .scan(&key, &BOTH_READS, &wrong_variant)
+                    .await
+                    .unwrap_err()
+            ),
+            ScanRequestFault::BoundVariant {
+                expected: OrderVariant::Long
+            }
+        );
+        let inverted = ScanBounds {
+            after: Some(OrderValue::Long(ORDER_START)),
+            before: Some(OrderValue::Long(ORDER_START)),
+            ..oldest_first()
+        };
+        assert_eq!(
+            fault(table.scan(&key, &BOTH_READS, &inverted).await.unwrap_err()),
+            ScanRequestFault::BoundsInverted
+        );
+        let max_values = ServerConfig::default().max_multi_scan_values;
+        let keys_at_the_full_limit = max_values / (2 * approx::length(max)) + 1;
+        let keys = vec![key.clone(); keys_at_the_full_limit];
+        let reads = [ColumnRead::whole(VALUE_COLUMN)];
+        assert_eq!(
+            fault(
+                table
+                    .multi_scan(&keys, &reads, &oldest_first())
+                    .await
+                    .unwrap_err()
+            ),
+            ScanRequestFault::TooManyValues {
+                keys: keys_at_the_full_limit,
+                limit: max,
+                columns: reads.len(),
+                max: max_values
+            }
+        );
+        assert!(matches!(
+            table
+                .scan(&Key::Str("a".to_string()), &reads, &oldest_first())
+                .await,
+            Err(Error::KeyType { .. })
+        ));
+        assert!(matches!(
+            table
+                .scan(&key, &[ColumnRead::whole("absent")], &oldest_first())
+                .await,
+            Err(Error::ColumnRequest {
+                fault: ColumnRequestFault::NotServed,
+                ..
+            })
+        ));
+        assert_eq!(fixture.gets(), before, "no request read anything");
+        assert!(
+            table
+                .multi_scan(&keys[1..], &reads, &oldest_first())
+                .await
+                .is_ok(),
+            "one key fewer is within max_multi_scan_values"
+        );
+    }
+
+    /// A Scan counts in `scans_total` by result, `scan_rows` and
+    /// `scan_files`, and `scan_seconds` by temperature: cold while a page
+    /// came from object storage, warm once the scan cache holds them. Its
+    /// GETs count in `value_page_gets_total` under each column's name and
+    /// the order column's; the lookup cache sees none of its pages (RFD
+    /// 025, Metrics).
+    #[test]
+    fn test_scan_counts_result_rows_files_temperature_and_gets_per_column() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let ((lookup_pages, scan_fetches), series) = recorded(async {
+            let (table, _fixture, _gauged) =
+                ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+            let key = Key::Long(KEY_STEP);
+            for _ in 0..2 {
+                let answered = table
+                    .scan(&key, &BOTH_READS, &oldest_first())
+                    .await
+                    .unwrap();
+                assert_eq!(answered.scanned.rows, scanned_both(&rows));
+            }
+            let absent = table
+                .scan(&Key::Long(KEY_STEP + 1), &BOTH_READS, &oldest_first())
+                .await
+                .unwrap();
+            assert!(absent.scanned.rows.is_empty() && !absent.scanned.more);
+            let lookup = &table.lookups.cache;
+            let scan_cache = &table.scans.as_ref().unwrap().cache;
+            (lookup.fetches() + lookup.hits(), scan_cache.fetches())
+        });
+        assert_eq!(
+            lookup_pages, 0,
+            "no Scan page goes through the lookup cache"
+        );
+        assert_eq!(
+            scan_fetches,
+            approx::count(BOTH_READS.len() + 1),
+            "one span fetch per column and one for the order column, once"
+        );
+        let result = |result: ScanResult| {
+            series.counter(
+                metric::SCANS_TOTAL,
+                &[table_label(), (metric::LABEL_RESULT, result.to_string())],
+            )
+        };
+        assert_eq!(result(ScanResult::Rows), 2);
+        assert_eq!(result(ScanResult::Empty), 1);
+        assert_eq!(result(ScanResult::Error), 0);
+        let seconds = |temperature: Temperature| {
+            series
+                .histogram(
+                    metric::SCAN_SECONDS,
+                    &[
+                        table_label(),
+                        (metric::LABEL_TEMPERATURE, temperature.to_string()),
+                    ],
+                )
+                .len()
+        };
+        assert_eq!(seconds(Temperature::Cold), 1, "the first Scan");
+        assert_eq!(seconds(Temperature::Warm), 2, "the repeat and the miss");
+        let row_counts = series.histogram(metric::SCAN_ROWS, &[table_label()]);
+        let held = approx::gauge_len(rows.len());
+        assert_eq!(row_counts, [held, held, 0.0]);
+        assert_eq!(
+            series.histogram(metric::SCAN_FILES, &[table_label()]),
+            [1.0, 1.0, 0.0]
+        );
+        for column in [VALUE_COLUMN, DETAIL_COLUMN, testing::ORDER_COLUMN] {
+            assert_eq!(
+                series.counter(
+                    metric::VALUE_PAGE_GETS_TOTAL,
+                    &[table_label(), (metric::LABEL_COLUMN, column.to_string())]
+                ),
+                1,
+                "{column}: one span GET, cold, and none warm"
+            );
+        }
+    }
+
+    /// A key-value table registers no scan series: every ordered-only rule
+    /// is gated on the order column.
+    #[test]
+    fn test_a_key_value_table_registers_no_scan_series() {
+        let ((), series) = recorded(async {
+            let (fixture, _) = two_bucket_table().await;
+            let table = table_over(&fixture, lenient(&fixture)).await;
+            table.load().await.unwrap();
+        });
+        for name in [
+            metric::SCANS_TOTAL,
+            metric::SCAN_ROWS,
+            metric::SCAN_FILES,
+            metric::SCAN_SECONDS,
+        ] {
+            assert_eq!(series.named(name), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_scan_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let table: Option<&Table> = None;
+        if let Some(table) = table {
+            let key = Key::Long(0);
+            let bounds = oldest_first();
+            assert_send(&table.scan(&key, &BOTH_READS, &bounds));
+            assert_send(&table.multi_scan(std::slice::from_ref(&key), &BOTH_READS, &bounds));
+        }
+    }
+
+    #[test]
+    fn test_fmt_table_kind_names_each_kind() {
+        assert_eq!(TableKind::KeyValue.to_string(), "key-value");
+        assert_eq!(TableKind::Ordered.to_string(), "ordered");
     }
 
     #[test]

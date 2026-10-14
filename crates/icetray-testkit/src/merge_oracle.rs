@@ -298,8 +298,9 @@ async fn read_rows(file_io: &FileIO, path: &str) -> Result<Vec<FileRow>> {
     Ok(rows)
 }
 
-/// The key at `row` of a key column, which holds longs, strings, bytes,
-/// or uuids as fixed bytes.
+/// The key at `row` of a key column, which holds longs, strings, bytes
+/// (as the library's writer stores a binary column, large), or uuids as
+/// fixed bytes.
 fn key_at(keys: &dyn Array, row: usize, path: &str) -> Result<Key> {
     let any = keys.as_any();
     if let Some(longs) = any.downcast_ref::<Int64Array>() {
@@ -309,6 +310,9 @@ fn key_at(keys: &dyn Array, row: usize, path: &str) -> Result<Key> {
         return Ok(Key::Str(strings.value(row).to_string()));
     }
     if let Some(bytes) = any.downcast_ref::<BinaryArray>() {
+        return Ok(Key::Bytes(bytes.value(row).to_vec()));
+    }
+    if let Some(bytes) = any.downcast_ref::<LargeBinaryArray>() {
         return Ok(Key::Bytes(bytes.value(row).to_vec()));
     }
     if let Some(fixed) = any.downcast_ref::<FixedSizeBinaryArray>()

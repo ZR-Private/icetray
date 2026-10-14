@@ -19,7 +19,8 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, DataFileIdentity, Error, FindingLog, KeyType, LocalDir, RefusalReason, Row, Storage,
+    Budget, DataFileIdentity, Direction, Error, FindingLog, KeyType, LocalDir, RefusalReason, Row,
+    ScanBounds, Storage,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
@@ -523,20 +524,31 @@ async fn test_disk_entries_of_both_kinds_keep_their_own_chunk_files() -> Result<
     let stats = storage.stats();
     let reads = stats.local_reads();
     let key = fixture.key(SAMPLE[0]);
-    let mut rows = Vec::new();
-    for table in restarted.tables().iter() {
-        rows.push(
-            table
-                .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
-                .await?
-                .row,
-        );
-    }
-    assert!(matches!(rows[0], Row::Present(_)), "{rows:?}");
-    assert_eq!(rows[0], rows[1], "both kinds read the key's one row");
+    let reads_of = [ColumnRead::whole(VALUE_COLUMN)];
+    let tables = restarted.tables();
+    let Row::Present(values) = tables[0].get(&key, &reads_of).await?.row else {
+        panic!("the key-value entry holds the key");
+    };
+    let every_row = ScanBounds {
+        direction: Direction::NewestFirst,
+        limit: 0,
+        after: None,
+        before: None,
+    };
+    let scanned = tables[1].scan(&key, &reads_of, &every_row).await?.scanned;
+    let scanned_values: Vec<_> = scanned.rows.into_iter().map(|row| row.values).collect();
+    assert_eq!(
+        scanned_values,
+        [values],
+        "both kinds read the key's one row"
+    );
+    // The key-value entry's key page; the ordered entry's key page and its
+    // order column's span, each one read of its own chunk file.
+    let key_value_reads = 1;
+    let ordered_reads = 2;
     assert_eq!(
         stats.local_reads() - reads,
-        count(rows.len()),
+        key_value_reads + ordered_reads,
         "each kind finds its key in its own chunk file"
     );
     assert_eq!(on_disk()?, both, "nothing was rewritten under another name");

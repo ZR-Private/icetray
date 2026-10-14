@@ -19,17 +19,19 @@ pub const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
 pub const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
 /// Second requests issued because a lookup GET was slow (RFD 013).
 pub const HEDGES_TOTAL: &str = "icetray_hedges_total";
-/// Value pages served from the page cache without a fetch.
+/// Pages served from a page cache without a fetch, by `cache`.
 pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
-/// Value-page fetches the page cache ran, after coalescing.
+/// Page fetches a page cache ran, after coalescing, by `cache`: a span
+/// fetch of the scan cache counts once however many pages it holds.
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
-/// Value-page GETs lookups issued to object storage, by `table` and
-/// `column` (RFD 022): each GET of a column's value page or dictionary
-/// page, counted once where it is issued, whether or not its lookup then
-/// succeeds; a fetch another lookup joins is not counted again, and hedges
-/// are `HEDGES_TOTAL`'s.
+/// Value-page GETs lookups and Scans issued to object storage, by `table`
+/// and `column` (RFD 022, RFD 025): each GET of a column's value page or
+/// dictionary page, or a span of its pages, counted once where it is
+/// issued, whether or not its call then succeeds; a fetch another lookup
+/// joins is not counted again, and hedges are `HEDGES_TOTAL`'s. An ordered
+/// table's order column counts its GETs under its own name.
 pub const VALUE_PAGE_GETS_TOTAL: &str = "icetray_value_page_gets_total";
 /// Bytes of the values each lookup the core answered read, by `table` and
 /// `column` (RFD 024): a present value's bytes as the page held them, a
@@ -52,11 +54,22 @@ pub const GENERATION_SWAPS_TOTAL: &str = "icetray_generation_swaps_total";
 /// Configuration reloads that read a changed file, by `result`: applied or
 /// refused (RFD 018).
 pub const CONFIG_RELOADS_TOTAL: &str = "icetray_config_reloads_total";
+/// Scans of one key an ordered table read, by `table` and `result`
+/// (`ScanResult`): each key of a `MultiScan` counts one (RFD 025).
+pub const SCANS_TOTAL: &str = "icetray_scans_total";
 
 /// Lookup latency in seconds, by `table` and `result`.
 pub const LOOKUP_SECONDS: &str = "icetray_lookup_seconds";
 /// Object-store GET latency in seconds, by `kind`.
 pub const OBJECT_GET_SECONDS: &str = "icetray_object_get_seconds";
+/// Rows each answered Scan of one key returned, by `table` (RFD 025).
+pub const SCAN_ROWS: &str = "icetray_scan_rows";
+/// Files holding the key each answered Scan of one key read, by `table`
+/// (RFD 025): one on a compacted table, more where appends overlap.
+pub const SCAN_FILES: &str = "icetray_scan_files";
+/// Latency in seconds of each answered Scan of one key, by `table` and
+/// `temperature` (`Temperature`, RFD 025).
+pub const SCAN_SECONDS: &str = "icetray_scan_seconds";
 
 // Every gauge below is written on the scrape path (the binary's
 // `Scrape::publish`, through `Table::publish_gauges` and the like), never
@@ -83,7 +96,7 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 /// Bytes of address space jemalloc keeps mapped for reuse after returning
 /// its pages: virtual, not resident.
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
-/// Bytes the page cache holds.
+/// Bytes a page cache holds in memory, by `cache`.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and
 /// `code`, and by `column` for a code about one value column (RFD 022,
@@ -175,7 +188,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 52] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -209,12 +222,12 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
     (
         PAGE_CACHE_HITS_TOTAL,
         Kind::Counter,
-        "Value pages served from the page cache without a fetch.",
+        "Pages served from a page cache without a fetch, by cache.",
     ),
     (
         PAGE_CACHE_FETCHES_TOTAL,
         Kind::Counter,
-        "Value-page fetches the page cache ran, after coalescing.",
+        "Page fetches a page cache ran, after coalescing, by cache.",
     ),
     (
         LOOKUPS_TOTAL,
@@ -224,7 +237,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
     (
         VALUE_PAGE_GETS_TOTAL,
         Kind::Counter,
-        "Value-page and dictionary-page GETs issued, hedges excluded, by table and column.",
+        "Value-page, dictionary-page, and span GETs issued, hedges excluded, by table and column, an order column under its own name.",
     ),
     (
         VALUE_BYTES_READ_TOTAL,
@@ -257,6 +270,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
         "Configuration reloads that read a changed file, by result.",
     ),
     (
+        SCANS_TOTAL,
+        Kind::Counter,
+        "Scans of one key an ordered table read, each key of a MultiScan one, by table and result.",
+    ),
+    (
         LOOKUP_SECONDS,
         Kind::Histogram,
         "Lookup latency in seconds, by table and result.",
@@ -265,6 +283,21 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
         OBJECT_GET_SECONDS,
         Kind::Histogram,
         "Object-store GET latency in seconds, by read kind.",
+    ),
+    (
+        SCAN_ROWS,
+        Kind::Histogram,
+        "Rows each answered Scan of one key returned, by table.",
+    ),
+    (
+        SCAN_FILES,
+        Kind::Histogram,
+        "Files holding the key each answered Scan of one key read, by table.",
+    ),
+    (
+        SCAN_SECONDS,
+        Kind::Histogram,
+        "Latency in seconds of each answered Scan of one key, by table and temperature.",
     ),
     (
         INDEX_BYTES,
@@ -304,7 +337,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 48] = [
     (
         PAGE_CACHE_BYTES,
         Kind::Gauge,
-        "Bytes the page cache holds in memory against its budget.",
+        "Bytes a page cache holds in memory against its budget, by cache.",
     ),
     (
         FINDINGS,
@@ -450,6 +483,11 @@ pub const LABEL_REASON: &str = "reason";
 pub const LABEL_CODE: &str = "code";
 /// The `state` label: the table's lifecycle state, from `TableState`.
 pub const LABEL_STATE: &str = "state";
+/// The `temperature` label: whether a Scan read a page from object
+/// storage, from `Temperature`.
+pub const LABEL_TEMPERATURE: &str = "temperature";
+/// The `cache` label: which page cache a series counts, from `CacheName`.
+pub const LABEL_CACHE: &str = "cache";
 
 /// Which path a GET serves; the `kind` label. Load reads (footers, key
 /// chunks, metadata) are bulk work nobody waits on and are never hedged;
@@ -506,6 +544,82 @@ impl fmt::Display for LookupResult {
     }
 }
 
+/// The three outcomes of a Scan of one key as the `result` label of
+/// `SCANS_TOTAL` sees them. Display gives the label value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScanResult {
+    /// The Scan returned at least one row.
+    Rows,
+    /// The Scan returned no row: the key has none inside the bounds.
+    Empty,
+    /// The Scan's read failed.
+    Error,
+}
+
+impl ScanResult {
+    /// Every outcome, for the per-result series of a table.
+    pub const ALL: [Self; 3] = [Self::Rows, Self::Empty, Self::Error];
+}
+
+impl fmt::Display for ScanResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Rows => "rows",
+            Self::Empty => "empty",
+            Self::Error => "error",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Whether a Scan read any order or value page from object storage, a
+/// fetch it ran or joined: the `temperature` label of `SCAN_SECONDS`.
+/// Display gives the label value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Temperature {
+    /// Some page came from object storage.
+    Cold,
+    /// Every page came from the cache or, under `disk`, the chunk file.
+    Warm,
+}
+
+impl Temperature {
+    /// Every temperature, for the per-temperature series of a table.
+    pub const ALL: [Self; 2] = [Self::Cold, Self::Warm];
+}
+
+impl fmt::Display for Temperature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Cold => "cold",
+            Self::Warm => "warm",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Which page cache a series counts: the `cache` label. Display gives the
+/// label value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CacheName {
+    /// The value-page cache key-value lookups read through,
+    /// `server.page_cache_bytes`.
+    Lookup,
+    /// The memory cache of ordered tables' pages,
+    /// `server.scan_page_cache_bytes` (RFD 025).
+    Scan,
+}
+
+impl fmt::Display for CacheName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Lookup => "lookup",
+            Self::Scan => "scan",
+        };
+        f.write_str(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -534,6 +648,24 @@ mod tests {
         ];
         for (result, name) in cases {
             assert_eq!(result.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn test_fmt_scan_labels_snake_case_names() {
+        let results = [
+            (ScanResult::Rows, "rows"),
+            (ScanResult::Empty, "empty"),
+            (ScanResult::Error, "error"),
+        ];
+        for (result, name) in results {
+            assert_eq!(result.to_string(), name);
+        }
+        for (temperature, name) in [(Temperature::Cold, "cold"), (Temperature::Warm, "warm")] {
+            assert_eq!(temperature.to_string(), name);
+        }
+        for (cache, name) in [(CacheName::Lookup, "lookup"), (CacheName::Scan, "scan")] {
+            assert_eq!(cache.to_string(), name);
         }
     }
 

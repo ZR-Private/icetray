@@ -278,8 +278,10 @@ impl Scrape {
             table.publish_lookup_counts();
             table.publish_gauges();
         }
-        self.opened.cache.publish_hit_counts();
-        self.opened.cache.publish_usage();
+        for cache in [&self.opened.cache, &self.opened.scan_cache] {
+            cache.publish_hit_counts();
+            cache.publish_usage();
+        }
         metrics::gauge!(metric::REQUESTS_IN_FLIGHT).set(approx::gauge_len(self.slots.admitted()));
         metrics::gauge!(metric::MAX_IN_FLIGHT).set(approx::gauge_len(self.slots.limit()));
         if let Some(pending) = &self.pending {

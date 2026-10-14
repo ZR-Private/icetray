@@ -535,6 +535,21 @@ pub enum ConfigViolation {
         /// The shards the minimum is for.
         shards: usize,
     },
+    /// The memory budget of the scan cache, `scan_page_cache_bytes`, cannot
+    /// hold one value page in every shard, as `PageCacheTooSmall` for the
+    /// lookup cache: checked against one shard at parse and against the
+    /// runtime's shards when the cache opens (RFD 025).
+    #[error(
+        "server.scan_page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
+    )]
+    ScanPageCacheTooSmall {
+        /// The configured budget.
+        bytes: u64,
+        /// The smallest budget that holds a value page in every shard.
+        minimum: u64,
+        /// The shards the minimum is for.
+        shards: usize,
+    },
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
     #[error(
@@ -1013,6 +1028,13 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
             shards: PARSE_CACHE_SHARDS,
         });
     }
+    if config.server.scan_page_cache_bytes < minimum {
+        return Err(ConfigViolation::ScanPageCacheTooSmall {
+            bytes: config.server.scan_page_cache_bytes,
+            minimum,
+            shards: PARSE_CACHE_SHARDS,
+        });
+    }
     if let Some(local) = &config.storage.local
         && local.page_cache_disk_bytes > 0
         && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
@@ -1353,7 +1375,9 @@ pub struct ServerConfig {
     pub multi_scan_deadline: Duration,
     /// The budget in bytes of the memory cache for the pages ordered
     /// tables' span GETs fetch, kept out of the disk level so a scan evicts
-    /// only other scans' pages (RFD 025).
+    /// only other scans' pages (RFD 025); held to the same minimum as
+    /// `page_cache_bytes`, one contract value page with its entry overhead
+    /// per shard.
     pub scan_page_cache_bytes: u64,
     /// How long a build from no serving generation, a table's first load
     /// or a retry after one failed, may run before it fails and the table
@@ -3686,6 +3710,30 @@ locaton = "typo"
         }
         let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
         assert_eq!(approx::count(at_minimum.server.page_cache_bytes), minimum);
+    }
+
+    #[test]
+    fn test_parse_refuses_scan_page_cache_below_a_value_page_per_shard() {
+        let with_budget = |bytes: u64| {
+            format!(
+                "[server]\nscan_page_cache_bytes = {bytes}\n{}",
+                TOML_MINIMAL.trim_start()
+            )
+        };
+        let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
+        for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
+            assert_eq!(
+                violation(&with_budget(bytes)),
+                ConfigViolation::ScanPageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards: PARSE_CACHE_SHARDS
+                },
+                "{bytes} bytes"
+            );
+        }
+        let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
+        assert_eq!(at_minimum.server.scan_page_cache_bytes, minimum);
     }
 
     #[test]

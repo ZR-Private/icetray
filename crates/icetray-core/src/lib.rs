@@ -28,6 +28,7 @@ pub mod open;
 pub mod order;
 mod parquet_io;
 mod projection;
+mod scan;
 mod shard;
 mod snapshot;
 mod storage;
@@ -72,6 +73,7 @@ pub use order::{
     Direction, OrderColumnLayout, OrderFacts, OrderType, OrderValue, OrderVariant, ScanBounds,
 };
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
+pub use scan::{MultiScanLookup, ScanLookup, ScanRequestFault, ScanRow, Scanned};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{FILE_PREFIX, IoStats, LocationError, LocationFault, Storage};
-pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableState};
+pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableKind, TableState};

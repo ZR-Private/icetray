@@ -52,6 +52,7 @@ pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
 pub(crate) use pairs::{Bounds, PairChunks, Pairs, RowSpan};
+pub(crate) use run::RunSource;
 
 /// A row's position in a file: its row group and its row within that group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,7 +68,7 @@ pub(crate) struct RowRef {
 /// vectors name a row (RFD 021). A newtype, so that it is never taken for a
 /// row within one row group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RowPosition(pub(crate) u64);
+pub(crate) struct RowPosition(pub(crate) u64);
 
 /// What makes a data file unservable beyond the contract's refusals. The set
 /// is closed; a fault outside it is a library error, not a file fault.

@@ -24,9 +24,9 @@ use icetray_core::config::{
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, Capping, ColumnMismatch, Error, ErrorKind, FindingCode, FindingLog, Key, KeyType,
-    Level, LocalDir, OrderType, OrderValue, RefusalReason, Row, Storage, TableSource, TableState,
-    UnsupportedDelete, UnsupportedFormat, bucket,
+    Budget, Capping, ColumnMismatch, Direction, Error, ErrorKind, FindingCode, FindingLog, Key,
+    KeyType, Level, LocalDir, OrderType, OrderValue, RefusalReason, Row, ScanBounds, ScanRow,
+    Storage, TableSource, TableState, UnsupportedDelete, UnsupportedFormat, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -1124,16 +1124,27 @@ async fn test_int_order_promoted_to_long_is_served() -> Result<()> {
         verify::storage_config_for_tests(),
     )
     .await?;
-    for (&key, value) in RAW_KEYS.iter().zip(raw_values()) {
+    let every_row = ScanBounds {
+        direction: Direction::OldestFirst,
+        limit: 0,
+        after: None,
+        before: None,
+    };
+    for ((&key, value), &order) in RAW_KEYS.iter().zip(raw_values()).zip(&RAW_INT_ORDERS) {
+        let scanned = served
+            .table
+            .scan(&Key::Long(key), &verify::whole(&[VALUE_COLUMN]), &every_row)
+            .await?
+            .scanned;
         assert_eq!(
-            served
-                .table
-                .get(&Key::Long(key), &verify::whole(&[VALUE_COLUMN]))
-                .await?
-                .row,
-            Row::Present(vec![Some(value.into())]),
+            scanned.rows,
+            [ScanRow {
+                order: OrderValue::Long(i64::from(order)),
+                values: vec![Some(value.into())],
+            }],
             "{key}"
         );
+        assert!(!scanned.more);
     }
     Ok(())
 }

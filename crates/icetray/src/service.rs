@@ -242,9 +242,11 @@ async fn within<T>(
         .map_err(|_elapsed| CallFault::DeadlineExceeded { after })?
 }
 
-/// Core's error as a status (RFD 010): a key of the wrong type, and a
-/// column the table does not serve, named twice (RFD 022), or read with a
-/// field list its format does not take (RFD 024), is `INVALID_ARGUMENT`; a
+/// Core's error as a status (RFD 010): a key of the wrong type, a column
+/// the table does not serve, named twice (RFD 022), or read with a field
+/// list its format does not take (RFD 024), a malformed Scan or `MultiScan`
+/// request, and a call of the wrong kind for the table (RFD 025), is
+/// `INVALID_ARGUMENT`; a
 /// value a field list trims that is not the protobuf its column declares is
 /// `FAILED_PRECONDITION`, which a retry meets again (RFD 024); a page
 /// fetch that ran past `server.get_deadline` is
@@ -261,7 +263,10 @@ async fn within<T>(
 pub fn status_from(error: &Error) -> Status {
     let message = error.to_string();
     match error {
-        Error::KeyType { .. } | Error::ColumnRequest { .. } => Status::invalid_argument(message),
+        Error::KeyType { .. }
+        | Error::ColumnRequest { .. }
+        | Error::ScanRequest(_)
+        | Error::WrongTableKind { .. } => Status::invalid_argument(message),
         Error::MalformedValue { .. } => Status::failed_precondition(message),
         Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }

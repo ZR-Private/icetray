@@ -30,6 +30,9 @@ pub struct Opened {
     pub storage: Arc<Storage>,
     /// The page cache every table shares.
     pub cache: PageCache,
+    /// The scan cache every ordered table shares (RFD 025), memory alone;
+    /// no key-value table reads it.
+    pub scan_cache: PageCache,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
     /// The tables served, each in `Loading` until the caller loads it.
@@ -100,6 +103,7 @@ struct Deadlines {
     load: Duration,
     refresh: Duration,
     get: Duration,
+    scan: Duration,
 }
 
 /// What `Opened::apply` changed: the tables it loaded and swapped in, the
@@ -420,7 +424,11 @@ pub async fn open(config: &Config, only: Option<&str>, findings: FindingLog) -> 
 /// anything is opened, `page_cache_bytes` is checked against the minimum
 /// of the shards the cache has on the calling runtime, which parsing could
 /// not know: less is `Error::Config` with
-/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`).
+/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`), and the
+/// same for `scan_page_cache_bytes` with
+/// `ConfigViolation::ScanPageCacheTooSmall` (`cache::check_scan_capacity`).
+/// The scan cache is memory alone, whether or not the lookup cache has a
+/// disk level (RFD 025).
 pub async fn open_with(
     config: &Config,
     only: Option<&str>,
@@ -428,6 +436,7 @@ pub async fn open_with(
     findings: FindingLog,
 ) -> Result<Opened> {
     cache::check_capacity(config.server.page_cache_bytes)
+        .and_then(|()| cache::check_scan_capacity(config.server.scan_page_cache_bytes))
         .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
     let local = match &config.storage.local {
         Some(local) => Some(Arc::new(LocalDir::open(local, storage.stats())?)),
@@ -438,6 +447,9 @@ pub async fn open_with(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let scan_cache = PageCache::for_scans(
+        usize::try_from(config.server.scan_page_cache_bytes).unwrap_or(usize::MAX),
+    );
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
@@ -445,11 +457,14 @@ pub async fn open_with(
         calls: CallsInFlight::new(),
         findings,
         batch_fan_out: config.server.batch_fan_out,
+        scan_cache: scan_cache.clone(),
+        max_multi_scan_values: config.server.max_multi_scan_values,
     };
     let deadlines = Deadlines {
         load: config.server.load_deadline,
         refresh: config.server.refresh_deadline,
         get: config.server.get_deadline,
+        scan: config.server.scan_deadline,
     };
     let mut tables = Vec::with_capacity(config.tables.len());
     for table in config
@@ -465,6 +480,7 @@ pub async fn open_with(
     Ok(Opened {
         storage,
         cache,
+        scan_cache,
         local,
         tables: ArcSwap::from_pointee(Tables::new(tables)),
         pending: Mutex::new(Vec::new()),
@@ -491,6 +507,7 @@ async fn build(
         deadlines.load,
         deadlines.refresh,
         deadlines.get,
+        deadlines.scan,
     ))
 }
 
@@ -632,6 +649,39 @@ mod tests {
             "{error}"
         );
         config.server.page_cache_bytes = approx::length(two_shards);
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .unwrap();
+        assert_eq!(names(&opened), [FIRST_TABLE]);
+    }
+
+    /// The scan cache's budget is held to the runtime's shards as the
+    /// lookup cache's is (RFD 025): one shard's minimum is refused on two
+    /// workers, before any table is opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_with_refuses_a_scan_page_cache_below_the_runtime_shards_minimum() {
+        let workers = 2;
+        let fixture = two_file_fixture().await;
+        let one_shard = cache::min_memory_bytes(1);
+        let two_shards = cache::min_memory_bytes(workers);
+        let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
+        config.server.scan_page_cache_bytes = one_shard;
+        let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .err()
+            .expect("a scan budget below two shards' minimum");
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::ScanPageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards,
+                })) if bytes == one_shard && minimum == two_shards && shards == workers
+            ),
+            "{error}"
+        );
+        config.server.scan_page_cache_bytes = two_shards;
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();

@@ -108,7 +108,7 @@ table = "profiles"
 | `max_multi_scan_values` | count | `4000` | The most values one `MultiScan` may request: its keys times its limit times one more than its requested columns, a limit of 0 counting as the table's `max_scan_rows`. icetray rejects a larger call with `INVALID_ARGUMENT` before it reads any key. Zero is invalid, as `server.max_multi_scan_values 0 is not above zero`. |
 | `scan_deadline` | duration | `"5s"` | The longest a `Scan` may run, and the longest each span GET of it may run. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_scan_deadline` | duration | `"15s"` | The longest a whole `MultiScan` may run, whatever its size. |
-| `scan_page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the cache for the pages an ordered table's span GETs fetch. It is separate from `page_cache_bytes` and never spills to the disk level, so a scan evicts only other scans' pages. |
+| `scan_page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the cache for the pages an ordered table's span GETs fetch. It is separate from `page_cache_bytes` and never spills to the disk level, so a scan evicts only other scans' pages. Its minimum is `page_cache_bytes`'s, as the note below states it. |
 | `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table is serving: a first load, or a retry after one failed. |
 | `refresh_deadline` | duration | `"5m"` | The longest one refresh over a serving generation may run. Past it the table is [degraded](glossary.md) and the next poll retries. |
 | `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls to finish. |
@@ -123,6 +123,8 @@ power of two, and each shard must hold one 64 KiB value page plus its
 one shard's minimum when it parses the file, and one under the total for
 the machine's shards (1,049,600 bytes for the 16 shards of an 11-core
 machine) when it opens the cache, with exit 1, before any table loads.
+The scan cache has as many shards, and `scan_page_cache_bytes` is held
+to the same minimum.
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.
 

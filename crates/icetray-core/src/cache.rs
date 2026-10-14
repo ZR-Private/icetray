@@ -28,7 +28,7 @@ use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::descriptors;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::local::DiskLevel;
-use crate::metric;
+use crate::metric::{self, CacheName};
 use crate::shard::{self, Sharded};
 use crate::storage::IoStats;
 
@@ -72,17 +72,37 @@ pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
 /// runtime has; `open_with` calls it before it opens the cache, since the
 /// worker count is not known when the configuration is parsed.
 pub(crate) fn check_capacity(capacity_bytes: usize) -> std::result::Result<(), ConfigViolation> {
-    let shards = memory_shards();
-    let minimum = min_memory_bytes(shards);
-    let bytes = approx::count(capacity_bytes);
-    if bytes < minimum {
-        return Err(ConfigViolation::PageCacheTooSmall {
-            bytes,
+    match shortfall(approx::count(capacity_bytes)) {
+        Some((minimum, shards)) => Err(ConfigViolation::PageCacheTooSmall {
+            bytes: approx::count(capacity_bytes),
             minimum,
             shards,
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// `check_capacity` for the scan cache's budget, `scan_page_cache_bytes`
+/// (RFD 025), which is split over the same shards:
+/// `ConfigViolation::ScanPageCacheTooSmall` below their minimum.
+pub(crate) fn check_scan_capacity(capacity_bytes: u64) -> std::result::Result<(), ConfigViolation> {
+    match shortfall(capacity_bytes) {
+        Some((minimum, shards)) => Err(ConfigViolation::ScanPageCacheTooSmall {
+            bytes: capacity_bytes,
+            minimum,
+            shards,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The minimum and the shards it is for when `bytes` is below
+/// `min_memory_bytes` of the shards a cache opened on the caller's runtime
+/// has; `None` when it is not.
+fn shortfall(bytes: u64) -> Option<(u64, usize)> {
+    let shards = memory_shards();
+    let minimum = min_memory_bytes(shards);
+    (bytes < minimum).then_some((minimum, shards))
 }
 
 /// The width of the length prefix on an encoded file id: a `u32`, since a
@@ -296,9 +316,13 @@ fn origin_of(source: Source) -> PageOrigin {
 /// The shared value-page cache. Clones share one cache and one set of
 /// counters: every table of a process holds a clone of the same cache. A
 /// clone may carry a fetch deadline of its own (`with_fetch_deadline`),
-/// which bounds the fetches that clone runs.
+/// which bounds the fetches that clone runs. A process opens two: the
+/// lookup cache (`new`) and the scan cache of ordered tables' pages
+/// (`for_scans`, RFD 025), whose series the `cache` label tells apart.
 #[derive(Clone, Debug)]
 pub struct PageCache {
+    /// Which cache this is, the `cache` label of its series.
+    name: CacheName,
     level: Arc<Level>,
     hits: Arc<Hits>,
     fetches: Arc<Fetches>,
@@ -320,15 +344,10 @@ impl PageCache {
     /// why this is async and can fail: running out of descriptors is
     /// `CacheError::DescriptorLimit`, any other failure
     /// `CacheError::Backend`.
+    /// Its series carry `cache = "lookup"`.
     pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self> {
         let level = match disk {
-            None => Level::Memory(
-                CacheBuilder::new(capacity_bytes)
-                    .with_name(CACHE_NAME)
-                    .with_shards(memory_shards())
-                    .with_weighter(weigh)
-                    .build(),
-            ),
+            None => memory_level(capacity_bytes),
             Some(disk) => Level::Hybrid {
                 cache: open_hybrid(capacity_bytes, &disk)
                     .await
@@ -336,12 +355,27 @@ impl PageCache {
                 stats: Arc::clone(disk.stats()),
             },
         };
-        Ok(Self {
+        Ok(Self::over(CacheName::Lookup, level))
+    }
+
+    /// The scan cache (RFD 025, Caching and hedging): `capacity_bytes` of
+    /// ordered tables' pages in memory alone, with no disk level, so a scan
+    /// evicts only other scans' pages and never a lookup's; `open_with`
+    /// checks the budget first (`check_scan_capacity`). Its series carry
+    /// `cache = "scan"`.
+    pub fn for_scans(capacity_bytes: usize) -> Self {
+        Self::over(CacheName::Scan, memory_level(capacity_bytes))
+    }
+
+    /// A cache named `name` over `level`, its counters registered.
+    fn over(name: CacheName, level: Level) -> Self {
+        Self {
+            name,
             level: Arc::new(level),
-            hits: Arc::new(Hits::new()),
-            fetches: Arc::new(Fetches::new()),
+            hits: Arc::new(Hits::new(name)),
+            fetches: Arc::new(Fetches::new(name)),
             fetch_deadline: None,
-        })
+        }
     }
 
     /// This handle on the same cache and counters, its fetches ending at
@@ -432,7 +466,8 @@ impl PageCache {
     /// that do not overlap, each page's bytes in that order, and whether any
     /// came from outside. A page in memory is served from it, counted as a
     /// hit; every maximal run of the others whose ranges meet end to start
-    /// is one call of `fetch` over the run's whole range, its bytes split by
+    /// is one call of `fetch` over the run's whole range and the count of
+    /// pages it holds, its bytes split by
     /// page and each page inserted as its own entry, keyed by `file` and the
     /// page's offset as `get_or_fetch` keys a page, so that a later read of
     /// any one of them finds it alone (RFD 025, Caching and hedging). The
@@ -455,7 +490,7 @@ impl PageCache {
         fetch: F,
     ) -> Result<(Vec<Bytes>, PageOrigin)>
     where
-        F: Fn(Range<u64>) -> Fut,
+        F: Fn(Range<u64>, u32) -> Fut,
         Fut: Future<Output = Result<Bytes>>,
     {
         let mut served: Vec<Option<Bytes>> = pages
@@ -471,7 +506,7 @@ impl PageCache {
         let runs = uncached_runs(pages, &served);
         let fetched = futures::future::try_join_all(runs.iter().map(|run| {
             let span = pages[run.start].start..pages[run.end - 1].end;
-            let fetched = fetch(span.clone());
+            let fetched = fetch(span.clone(), u32::try_from(run.len()).unwrap_or(u32::MAX));
             async move {
                 let run = Run {
                     page: PageKey(Arc::clone(file), span.start),
@@ -544,7 +579,11 @@ impl PageCache {
     /// (`usage`); a scrape calls this, so the gauge reads evictions as well
     /// as inserts.
     pub fn publish_usage(&self) {
-        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
+        metrics::gauge!(
+            metric::PAGE_CACHE_BYTES,
+            metric::LABEL_CACHE => self.name.to_string()
+        )
+        .set(approx::gauge_len(self.usage()));
     }
 
     /// Bytes charged against the memory budget: each page in memory at its
@@ -647,10 +686,13 @@ struct Fetches {
 }
 
 impl Fetches {
-    fn new() -> Self {
+    fn new(name: CacheName) -> Self {
         Self {
             count: AtomicU64::new(0),
-            total: metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL),
+            total: metrics::counter!(
+                metric::PAGE_CACHE_FETCHES_TOTAL,
+                metric::LABEL_CACHE => name.to_string()
+            ),
         }
     }
 
@@ -676,11 +718,14 @@ struct Hits {
 }
 
 impl Hits {
-    fn new() -> Self {
+    fn new(name: CacheName) -> Self {
         Self {
             shards: Sharded::new(),
             published: AtomicU64::new(0),
-            total: metrics::counter!(metric::PAGE_CACHE_HITS_TOTAL),
+            total: metrics::counter!(
+                metric::PAGE_CACHE_HITS_TOTAL,
+                metric::LABEL_CACHE => name.to_string()
+            ),
         }
     }
 
@@ -719,6 +764,18 @@ impl fmt::Debug for Hits {
             .field("counted", &self.counted())
             .finish_non_exhaustive()
     }
+}
+
+/// A memory level of `capacity_bytes`, split over `memory_shards()`, each
+/// page weighed as its bytes plus the entry overhead.
+fn memory_level(capacity_bytes: usize) -> Level {
+    Level::Memory(
+        CacheBuilder::new(capacity_bytes)
+            .with_name(CACHE_NAME)
+            .with_shards(memory_shards())
+            .with_weighter(weigh)
+            .build(),
+    )
 }
 
 /// The hybrid cache over `disk`: memory of `capacity_bytes`, a block engine
@@ -1297,6 +1354,52 @@ mod tests {
         });
     }
 
+    /// The lookup cache's and the scan cache's series are their own, told
+    /// apart by the `cache` label, so a Scan's fetch counts under the scan
+    /// cache alone (RFD 025).
+    #[test]
+    fn test_each_cache_counts_under_its_own_cache_label() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let series = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let lookup = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+                let scan = PageCache::for_scans(ROOMY_BYTES);
+                let runs = Arc::new(AtomicU64::new(0));
+                scan.get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                    answering(PAGE, &runs)
+                })
+                .await
+                .unwrap();
+                lookup.publish_usage();
+                scan.publish_usage();
+                snapshotter.snapshot().into_vec()
+            })
+        });
+        let fetched = |cache: CacheName| {
+            series
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == metric::PAGE_CACHE_FETCHES_TOTAL
+                        && key.key().labels().any(|label| {
+                            label.key() == metric::LABEL_CACHE && label.value() == cache.to_string()
+                        })
+                })
+                .map(|(.., value)| value)
+        };
+        assert_eq!(fetched(CacheName::Lookup), Some(&DebugValue::Counter(0)));
+        assert_eq!(fetched(CacheName::Scan), Some(&DebugValue::Counter(1)));
+        let gauges = series
+            .iter()
+            .filter(|(key, ..)| key.key().name() == metric::PAGE_CACHE_BYTES)
+            .count();
+        assert_eq!(gauges, 2, "one bytes gauge per cache");
+    }
+
     /// Hits spread over a multi-thread runtime's workers reach
     /// `page_cache_hits_total` at `publish_hit_counts`, each once, and the
     /// last clone of the cache dropped publishes the rest, while `hits`
@@ -1458,8 +1561,8 @@ mod tests {
             .unwrap();
         let fetches = cache.fetches();
         let spans = std::sync::Mutex::new(Vec::new());
-        let fetch = |span: Range<u64>| {
-            spans.lock().unwrap().push(span.clone());
+        let fetch = |span: Range<u64>, held: u32| {
+            spans.lock().unwrap().push((span.clone(), held));
             let bytes = file.slice(approx::length(span.start)..approx::length(span.end));
             std::future::ready(Ok(bytes))
         };
@@ -1469,7 +1572,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(origin, PageOrigin::Fetched);
-        assert_eq!(*spans.lock().unwrap(), [0..10, 26..40, 100..110]);
+        assert_eq!(
+            *spans.lock().unwrap(),
+            [(0..10, 1), (26..40, 2), (100..110, 1)],
+            "each run with the pages it holds"
+        );
         assert_eq!(
             cache.fetches() - fetches,
             3,
@@ -1490,7 +1597,7 @@ mod tests {
             assert_eq!(origin, PageOrigin::Cached);
         }
         let (again, origin) = cache
-            .get_span(&id, &pages, Issue::default(), |_| never())
+            .get_span(&id, &pages, Issue::default(), |_, _| never())
             .await
             .unwrap();
         assert_eq!(again, served);

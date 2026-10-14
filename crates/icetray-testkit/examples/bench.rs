@@ -1258,6 +1258,8 @@ async fn serve(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: serving.batch_fan_out,
+        scan_cache: scan_cache(),
+        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
     };
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
@@ -1326,7 +1328,17 @@ async fn table_over(
         server.load_deadline,
         server.refresh_deadline,
         server.get_deadline,
+        server.scan_deadline,
     ))
+}
+
+/// The scan cache of a benchmark process at the default budget; the
+/// key-value tables it serves never read it.
+fn scan_cache() -> PageCache {
+    PageCache::for_scans(
+        usize::try_from(ServerConfig::default().scan_page_cache_bytes)
+            .expect("the default scan cache budget fits usize"),
+    )
 }
 
 /// The first build's metadata file, which never advances.
@@ -1971,6 +1983,8 @@ async fn serve_together(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: serving.batch_fan_out,
+        scan_cache: scan_cache(),
+        max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
     };
     let mut tables = Vec::with_capacity(prepared.len());
     for table in prepared {

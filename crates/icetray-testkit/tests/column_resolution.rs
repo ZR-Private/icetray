@@ -18,8 +18,8 @@ use icetray_core::approx::{self, count};
 use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::metric::{self, LookupResult};
 use icetray_core::{
-    ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
-    TableFault, TableSource, TableState, diagnose, examine,
+    ColumnMismatch, Direction, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason,
+    Row, ScanBounds, TableFault, TableSource, TableState, diagnose, examine,
 };
 use icetray_testkit::fixture::{
     IDS_2K, KEY_FIELD_ID, NAMESPACE, OLD_ID, SECOND_VALUE_COLUMN, SECOND_VALUE_FIELD_ID, STRAY_IDS,
@@ -1085,21 +1085,32 @@ async fn test_the_order_column_resolves_by_name_and_field_id_like_a_value_column
             panic!("one row per key, got {rows:?}");
         };
         assert!(!more);
+        let scanned = served
+            .table
+            .scan(
+                &key,
+                &verify::whole(&[VALUE_COLUMN]),
+                &ScanBounds {
+                    direction: Direction::NewestFirst,
+                    limit: 0,
+                    after: None,
+                    before: None,
+                },
+            )
+            .await?
+            .scanned;
+        let got: Vec<Vec<Option<bytes::Bytes>>> =
+            scanned.rows.into_iter().map(|row| row.values).collect();
         assert_eq!(
-            served
-                .table
-                .get(&key, &verify::whole(&[VALUE_COLUMN]))
-                .await?
-                .row,
-            Row::Present(
-                values
-                    .iter()
-                    .cloned()
-                    .map(|value| value.map(Into::into))
-                    .collect()
-            ),
+            got,
+            [values
+                .iter()
+                .cloned()
+                .map(|value| value.map(Into::into))
+                .collect::<Vec<_>>()],
             "{id}"
         );
+        assert!(!scanned.more);
     }
     let order_field_id = fixture
         .order_field_id()

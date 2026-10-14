@@ -982,6 +982,10 @@ mod tests {
             calls: CallsInFlight::new(),
             findings: FindingLog::Debug,
             batch_fan_out: server.batch_fan_out,
+            scan_cache: PageCache::for_scans(
+                usize::try_from(server.scan_page_cache_bytes).unwrap(),
+            ),
+            max_multi_scan_values: server.max_multi_scan_values,
         };
         Arc::new(Table::new(
             config,
@@ -990,6 +994,7 @@ mod tests {
             server.load_deadline,
             server.refresh_deadline,
             server.get_deadline,
+            server.scan_deadline,
         ))
     }
 

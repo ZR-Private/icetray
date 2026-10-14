@@ -20,7 +20,9 @@ use crate::local::LocalFault;
 use crate::manifest::ColumnRequestFault;
 use crate::order::{OrderType, OrderValue};
 use crate::projection::Malformed;
+use crate::scan::ScanRequestFault;
 use crate::storage::LocationError;
+use crate::table::TableKind;
 
 /// Every failure a caller of this crate can observe. A caller decides what
 /// to do by matching the variant; the message is for a person reading a log.
@@ -91,6 +93,22 @@ pub enum Error {
         column: String,
         /// What is wrong with naming it.
         fault: ColumnRequestFault,
+    },
+    /// A Scan or `MultiScan` request is malformed (RFD 025, Wire): a limit
+    /// above `max_scan_rows`, a bound of the wrong variant, an `after` at or
+    /// above `before`, or a `MultiScan` asking for more than
+    /// `max_multi_scan_values`; checked before any read.
+    #[error("scan request: {0}")]
+    ScanRequest(ScanRequestFault),
+    /// A call of the wrong kind for the table (RFD 025): a Get or `MultiGet`
+    /// of an ordered table, or a Scan or `MultiScan` of a key-value table;
+    /// checked before any read.
+    #[error("table {table} is a {kind} table, which the call does not serve")]
+    WrongTableKind {
+        /// The table's configured name.
+        table: String,
+        /// The table's kind.
+        kind: TableKind,
     },
     /// A value a lookup trims to the fields it names is not protobuf as the
     /// column declares (RFD 024): the bytes are the writer's, so every
@@ -253,6 +271,8 @@ impl Error {
             | Self::Refused { .. }
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
+            | Self::ScanRequest(_)
+            | Self::WrongTableKind { .. }
             | Self::MalformedValue { .. }
             | Self::Table { .. }
             | Self::File { .. }
@@ -290,6 +310,8 @@ impl Error {
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
             Self::KeyType { .. } => ErrorKind::KeyType,
             Self::ColumnRequest { .. } => ErrorKind::ColumnRequest,
+            Self::ScanRequest(_) => ErrorKind::ScanRequest,
+            Self::WrongTableKind { .. } => ErrorKind::WrongTableKind,
             Self::MalformedValue { .. } => ErrorKind::MalformedValue,
             Self::Table { .. } => ErrorKind::Table,
             Self::File { .. } => ErrorKind::File,
@@ -334,6 +356,10 @@ pub enum ErrorKind {
     KeyType,
     /// `Error::ColumnRequest`.
     ColumnRequest,
+    /// `Error::ScanRequest`.
+    ScanRequest,
+    /// `Error::WrongTableKind`.
+    WrongTableKind,
     /// `Error::MalformedValue`.
     MalformedValue,
     /// `Error::Table`.
@@ -412,9 +438,11 @@ impl Recurs for Error {
             // The configuration document and the process's settings, which
             // a reload or a restart reads again.
             | Self::Config(_)
-            // A lookup's own key and columns, never a build's.
+            // A lookup's own key, columns, and request, never a build's.
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
+            | Self::ScanRequest(_)
+            | Self::WrongTableKind { .. }
             | Self::ObjectStore(_)
             | Self::NotReady { .. }
             | Self::CatalogTimeout { .. }
@@ -441,6 +469,8 @@ impl fmt::Display for ErrorKind {
             Self::Cache => "cache",
             Self::KeyType => "key_type",
             Self::ColumnRequest => "column_request",
+            Self::ScanRequest => "scan_request",
+            Self::WrongTableKind => "wrong_table_kind",
             Self::MalformedValue => "malformed_value",
             Self::Table => "table",
             Self::File => "file",
@@ -1641,6 +1671,8 @@ mod tests {
             | Error::Location { .. }
             | Error::KeyType { .. }
             | Error::ColumnRequest { .. }
+            | Error::ScanRequest(_)
+            | Error::WrongTableKind { .. }
             | Error::NotReady { .. }
             | Error::CatalogTimeout { .. }
             | Error::Catalog { .. }
@@ -1846,6 +1878,17 @@ mod tests {
                     fault: ColumnRequestFault::NotServed,
                 },
                 "column_request",
+            ),
+            (
+                Error::ScanRequest(crate::scan::ScanRequestFault::BoundsInverted),
+                "scan_request",
+            ),
+            (
+                Error::WrongTableKind {
+                    table: TABLE.to_string(),
+                    kind: crate::table::TableKind::Ordered,
+                },
+                "wrong_table_kind",
             ),
             (
                 Error::MalformedValue {
