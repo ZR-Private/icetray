@@ -574,6 +574,7 @@ mod tests {
     use rand::{RngExt as _, SeedableRng as _};
 
     use super::*;
+    use crate::error::Error;
     use crate::generation::testing::Dictionary;
     use crate::index::build::{ValueRows, decode_values, read_optional};
     use crate::index::testing::{Fixture, Layout, location};
@@ -1238,9 +1239,9 @@ mod tests {
         let segments = Arc::new(Segments::new(vec![(0..size, edited)], size));
         let rows = chunk.page_rows(0);
         assert!(value_rows(chunk, rows.clone(), &segments).is_none());
-        assert!(
-            decode_values(chunk, ValueShape::Variable, rows, &segments).is_err(),
-            "the column reader meets the fault"
-        );
+        let error = decode_values(chunk, ValueShape::Variable, rows, &segments)
+            .err()
+            .expect("the column reader meets the fault");
+        assert!(matches!(error, Error::Parquet(_)), "{error:?}");
     }
 }

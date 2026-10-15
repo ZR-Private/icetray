@@ -1793,21 +1793,37 @@ mod tests {
         assert!(!FileDeletes::of_rows([2]).holds(&before));
     }
 
+    /// The rows deleted in `test_deleted_rows_answers_a_range_whole_or_not_at_all`.
+    const DELETED_ROWS: Range<u64> = 3..6;
+
     #[test]
     fn test_deleted_rows_answers_a_range_whole_or_not_at_all() {
-        let rows = FileDeletes::of_rows([3, 4, 5]);
+        let rows = FileDeletes::of_rows(DELETED_ROWS);
         let deleted = Some(&rows);
-        let range = |start, end| RowPosition(start)..RowPosition(end);
-        assert!(deleted.deleted(RowPosition(4)));
-        assert!(!deleted.deleted(RowPosition(6)));
-        assert!(deleted.all_deleted(range(3, 6)));
-        assert!(deleted.all_deleted(range(4, 5)));
-        assert!(!deleted.all_deleted(range(3, 7)), "a live row after");
-        assert!(!deleted.all_deleted(range(2, 6)), "a live row before");
-        assert!(deleted.all_deleted(range(9, 9)), "no row");
+        let range =
+            |positions: Range<u64>| RowPosition(positions.start)..RowPosition(positions.end);
+        let (first, end) = (DELETED_ROWS.start, DELETED_ROWS.end);
+        let inner = first + 1;
+        assert!(deleted.deleted(RowPosition(inner)));
+        assert!(!deleted.deleted(RowPosition(end)), "the row past them");
+        assert!(deleted.all_deleted(range(DELETED_ROWS)));
+        assert!(
+            deleted.all_deleted(range(inner..end - 1)),
+            "rows among them"
+        );
+        assert!(
+            !deleted.all_deleted(range(first..end + 1)),
+            "a live row after"
+        );
+        assert!(
+            !deleted.all_deleted(range(first - 1..end)),
+            "a live row before"
+        );
+        let past = end + (end - first);
+        assert!(deleted.all_deleted(range(past..past)), "no row");
         let none: Option<&FileDeletes> = None;
-        assert!(!none.deleted(RowPosition(4)));
-        assert!(!none.all_deleted(range(3, 6)));
-        assert!(none.all_deleted(range(3, 3)), "no row");
+        assert!(!none.deleted(RowPosition(inner)));
+        assert!(!none.all_deleted(range(DELETED_ROWS)));
+        assert!(none.all_deleted(range(first..first)), "no row");
     }
 }

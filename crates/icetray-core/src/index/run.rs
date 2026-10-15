@@ -287,7 +287,10 @@ impl FileIndex {
     /// Per column, the rows read are spans by its pages (`spans_of`), a
     /// row group's split where whole pages between two rows hold none of
     /// those read, as pages whose rows are all deleted do, so no such page
-    /// is read. Per column and span, the pages are one span GET through
+    /// is decoded; it is fetched with its neighbours where the pages
+    /// between two spans take at most `SPAN_GAP_BRIDGE_BYTES` (`bridged`),
+    /// and not at all otherwise. Per column and fetch, the pages are one
+    /// span GET through
     /// `source`'s cache under its span window for every contiguous run the
     /// cache does not hold, and one GET for the chunk's dictionary page when
     /// it has one, each holding a permit of the fan-out and counted in the
@@ -324,7 +327,9 @@ impl FileIndex {
             deleted,
         };
         let placed = walk.rows(&Orders::default());
-        let known = self.known(order, &pieces, &placed, source).await?;
+        let known = self
+            .known(order, &pieces, &placed, bounds.direction, source)
+            .await?;
         let walked = if known.spans.is_empty() {
             placed
         } else {
@@ -335,12 +340,14 @@ impl FileIndex {
                 .iter()
                 .filter(|walked| !known.holds(walked.row))
                 .map(|walked| walked.row),
+            bounds.direction,
         );
         let value_rows = in_file_order(
             walked
                 .iter()
                 .filter(|walked| walked.values)
                 .map(|walked| walked.row),
+            bounds.direction,
         );
         let (read, values) = futures::try_join!(
             self.read_orders(order, &order_rows, source),
@@ -469,7 +476,7 @@ impl FileIndex {
     }
 
     /// The order values a read knows before its round: none where `placed`,
-    /// the walk the fences alone place, takes up no row on a page that
+    /// the walk in `direction` the fences alone place, takes up no row on a page that
     /// holds a bound, since every row it takes up is then placed; under
     /// Disk, those of every row `placed` takes up, read from the chunk
     /// file, which cover every row a walk with them takes up, since such a
@@ -483,6 +490,7 @@ impl FileIndex {
         order: OrderLeaf,
         pieces: &[Piece],
         placed: &[Walked],
+        direction: Direction,
         source: RunSource<'_>,
     ) -> Result<Orders> {
         let reached = |at: usize| placed.iter().any(|walked| walked.piece == at);
@@ -493,7 +501,7 @@ impl FileIndex {
             return Ok(Orders::default());
         }
         if self.disk_chunks().is_some() {
-            let rows = in_file_order(placed.iter().map(|walked| walked.row));
+            let rows = in_file_order(placed.iter().map(|walked| walked.row), direction);
             return self.read_orders(order, &rows, source).await;
         }
         let mut spans = Vec::new();
@@ -514,8 +522,9 @@ impl FileIndex {
     }
 
     /// The order values of the spans of `rows`, rows in file order, by the
-    /// order column's pages (`spans_of`), read with their pages' headers
-    /// checked: from the chunk file under Disk, through `source` otherwise.
+    /// order column's pages (`spans_of`), fetched as `bridged` joins them
+    /// and decoded span by span, each span's pages' headers checked: from
+    /// the chunk file under Disk, through `source` otherwise.
     async fn read_orders(
         &self,
         order: OrderLeaf,
@@ -523,20 +532,29 @@ impl FileIndex {
         source: RunSource<'_>,
     ) -> Result<Orders> {
         let local = self.disk_chunks();
-        let spans = spans_of(rows, |row_group| self.order_values(order).group(row_group));
-        let read = spans.iter().map(|(row_group, rows)| async move {
-            let chunk = self.order_values(order).group(*row_group);
-            let pages = pages_holding(chunk, rows);
+        let chunk_of = |row_group| self.order_values(order).group(row_group);
+        let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
+        let read = fetches.iter().map(|fetch| async move {
+            let chunk = chunk_of(fetch.row_group);
             let (segments, from_store) = self
-                .span_pages(chunk, pages.clone(), local, source, source.order_gets)
+                .span_pages(chunk, fetch.pages.clone(), local, source, source.order_gets)
                 .await?;
-            let values = self.decode_order_span(chunk, order, pages, rows, segments)?;
-            Ok::<_, Error>(((*row_group, rows.start, values), from_store))
+            let spans = fetch
+                .spans
+                .iter()
+                .map(|rows| {
+                    let pages = pages_holding(chunk, rows);
+                    let values =
+                        self.decode_order_span(chunk, order, pages, rows, Arc::clone(&segments))?;
+                    Ok((fetch.row_group, rows.start, values))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok::<_, Error>((spans, from_store))
         });
         let read = futures::future::try_join_all(read).await?;
         let from_store = read.iter().any(|(_, from_store)| *from_store);
         Ok(Orders {
-            spans: read.into_iter().map(|(span, _)| span).collect(),
+            spans: read.into_iter().flat_map(|(spans, _)| spans).collect(),
             from_store,
         })
     }
@@ -573,8 +591,10 @@ impl FileIndex {
 
     /// The values of each column of `columns`, positions in the layout,
     /// at `rows`, rows in file order, over the spans of them by each
-    /// column's pages (`spans_of`), every column's and span's pages read
-    /// together; `None` for a column the file does not hold.
+    /// column's pages (`spans_of`), fetched as `bridged` joins them and
+    /// decoded span by span, each span's pages' headers checked, every
+    /// column's fetches read together; `None` for a column the file does
+    /// not hold.
     async fn read_values(
         &self,
         columns: &[usize],
@@ -586,21 +606,32 @@ impl FileIndex {
                 return Ok::<_, Error>((None, false));
             };
             let counted = source.value_gets.get(column);
-            let spans = spans_of(rows, |row_group| self.value_column(value).group(row_group));
-            let spans =
-                futures::future::try_join_all(spans.iter().map(|(row_group, rows)| async move {
-                    let chunk = self.value_column(value).group(*row_group);
-                    let pages = pages_holding(chunk, rows);
-                    let (segments, from_store) = self
-                        .span_pages(chunk, pages.clone(), None, source, counted)
-                        .await?;
-                    check_value_pages(chunk, value.shape, pages, &segments)?;
-                    let values = decode_values(chunk, value.shape, rows.clone(), &segments)?;
-                    Ok::<_, Error>(((*row_group, rows.start, values), from_store))
-                }))
-                .await?;
+            let chunk_of = |row_group| self.value_column(value).group(row_group);
+            let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
+            let read = fetches.iter().map(|fetch| async move {
+                let chunk = chunk_of(fetch.row_group);
+                let (segments, from_store) = self
+                    .span_pages(chunk, fetch.pages.clone(), None, source, counted)
+                    .await?;
+                let spans = fetch
+                    .spans
+                    .iter()
+                    .map(|rows| {
+                        check_value_pages(
+                            chunk,
+                            value.shape,
+                            pages_holding(chunk, rows),
+                            &segments,
+                        )?;
+                        let values = decode_values(chunk, value.shape, rows.clone(), &segments)?;
+                        Ok((fetch.row_group, rows.start, values))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<_, Error>((spans, from_store))
+            });
+            let spans = futures::future::try_join_all(read).await?;
             let from_store = spans.iter().any(|(_, from_store)| *from_store);
-            let spans = spans.into_iter().map(|(span, _)| span).collect();
+            let spans = spans.into_iter().flat_map(|(spans, _)| spans).collect();
             Ok((Some(ColumnValues { spans }), from_store))
         });
         let read = futures::future::try_join_all(read).await?;
@@ -987,10 +1018,20 @@ impl Taking {
     }
 }
 
-/// `rows` in file order: by row group, then by row.
-fn in_file_order(rows: impl Iterator<Item = RowRef>) -> Vec<RowRef> {
+/// `rows`, which a walk took up in `direction` (`Walk::rows`), in file
+/// order, by row group and then by row: as taken oldest first, and
+/// reversed newest first, since a walk steps through its pieces, in file
+/// order, and each piece's rows in its direction.
+fn in_file_order(rows: impl Iterator<Item = RowRef>, direction: Direction) -> Vec<RowRef> {
     let mut rows: Vec<RowRef> = rows.collect();
-    rows.sort_unstable_by_key(|row| (row.row_group, row.row));
+    match direction {
+        Direction::OldestFirst => {}
+        Direction::NewestFirst => rows.reverse(),
+    }
+    debug_assert!(
+        rows.is_sorted_by_key(|row| (row.row_group, row.row)),
+        "a walk takes rows up in its direction"
+    );
     rows
 }
 
@@ -1034,6 +1075,63 @@ fn spans_of<'c>(
         last = Some((page, page_end));
     }
     spans
+}
+
+/// The most bytes of whole pages between two spans of one column chunk
+/// that a read fetches with them, in one GET, rather than leaving them out
+/// at the cost of a GET more (`bridged`): 256 KiB, what a span GET moves in
+/// well under its round trip, so bridging a gap of deleted rows up to it
+/// costs less than the request it saves, and a wider gap, as a long stretch
+/// of deleted rows makes, is not fetched.
+const SPAN_GAP_BRIDGE_BYTES: u64 = 256 * 1024;
+
+/// One fetch of a read in one column chunk: the row group, the data pages
+/// fetched together, and the spans of rows decoded from them, which hold
+/// every page fetched but those between two spans.
+struct Fetch {
+    row_group: usize,
+    pages: Range<usize>,
+    spans: Vec<Range<i64>>,
+}
+
+/// `spans`, per row group in row group order (`spans_of`), as the fetches
+/// that read them, by the pages of the column whose chunk in each row group
+/// `chunk_of` gives: two neighbouring spans of a row group in one fetch
+/// where the whole pages between them take at most
+/// `SPAN_GAP_BRIDGE_BYTES`, by the compressed sizes the offset index gives
+/// them, and in fetches of their own otherwise. The pages between are
+/// fetched and cached, never checked or decoded.
+fn bridged<'c>(
+    spans: Vec<(usize, Range<i64>)>,
+    chunk_of: impl Fn(usize) -> ColumnChunk<'c>,
+) -> Vec<Fetch> {
+    let mut fetches: Vec<Fetch> = Vec::new();
+    for (row_group, rows) in spans {
+        let chunk = chunk_of(row_group);
+        let pages = pages_holding(chunk, &rows);
+        if let Some(fetch) = fetches
+            .last_mut()
+            .filter(|fetch| fetch.row_group == row_group)
+        {
+            let gap: u64 = (fetch.pages.end..pages.start)
+                .map(|page| {
+                    let range = chunk.page_range(page);
+                    range.end - range.start
+                })
+                .sum();
+            if gap <= SPAN_GAP_BRIDGE_BYTES {
+                fetch.pages.end = pages.end;
+                fetch.spans.push(rows);
+                continue;
+            }
+        }
+        fetches.push(Fetch {
+            row_group,
+            pages,
+            spans: vec![rows],
+        });
+    }
+    fetches
 }
 
 /// The order values a read decoded: spans of rows, each its row group, its
@@ -1121,6 +1219,9 @@ mod tests {
     use crate::approx::count;
     use crate::config::{HedgeConfig, Residency};
     use crate::generation::testing::{self as generation_testing, cache};
+    use rand::{RngExt as _, SeedableRng as _};
+
+    use crate::deletes::FileDeletes;
     use crate::index::RowPosition;
     use crate::index::order_fences::take_steps;
     use crate::index::testing::{
@@ -1478,7 +1579,8 @@ mod tests {
     async fn test_read_run_newest_first_takes_the_last_live_rows() {
         let opened = store(&one_long_run(0)).await;
         let deleted: BTreeSet<u64> = [14, 12].into_iter().collect();
-        let is_deleted = |position: RowPosition| deleted.contains(&position.0);
+        let file_deletes = FileDeletes::of_rows(deleted.iter().copied());
+        let is_deleted = Some(&file_deletes);
         let limit = 3;
         for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
@@ -1541,7 +1643,8 @@ mod tests {
     async fn test_read_run_reports_the_next_live_row_for_more() {
         let opened = store(&one_long_run(0)).await;
         let deleted: BTreeSet<u64> = (8..=12).collect();
-        let is_deleted = |position: RowPosition| deleted.contains(&position.0);
+        let file_deletes = FileDeletes::of_rows(deleted.iter().copied());
+        let is_deleted = Some(&file_deletes);
         let live = 14 - deleted.len();
         for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
@@ -1566,11 +1669,12 @@ mod tests {
             assert_eq!(got.rows, expected, "{residency}");
             assert_eq!(got.next, Some(order_at(7 - FIRST_RUN_ROW)), "{residency}");
             // Order pages 1 and 3 are two spans, page 2 between them all
-            // deleted and not read; the value page is page 3's.
+            // deleted and not decoded, but under the bridge, so fetched
+            // with them in one span; the value page is page 3's.
             let (gets, local) = since(&stats, before);
             match residency {
-                Residency::Full | Residency::Bloom => assert_eq!((gets, local), (3, 0)),
-                Residency::Disk => assert_eq!((gets, local), (1, 2)),
+                Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
+                Residency::Disk => assert_eq!((gets, local), (1, 1)),
             }
             let before = costs(&stats);
             let again = index
@@ -1609,23 +1713,76 @@ mod tests {
     /// The last row of the deleted-pages read's run below its deleted rows.
     const BELOW_DELETED_ROW: i64 = 8;
 
-    /// Newest first at limit 2 over a run of `DELETED_RUN_PAGES` pages whose
-    /// rows are all deleted from the one after `BELOW_DELETED_ROW` to the
-    /// one before the last: the read takes the last row and
-    /// `BELOW_DELETED_ROW`, and reads in every tier only the value pages
-    /// holding those two and the order pages holding them and the next live
-    /// row, the whole pages of deleted rows between them passed over by the
-    /// walk in one step each and read in no column.
-    #[tokio::test]
-    async fn test_read_run_passes_over_whole_pages_of_deleted_rows() {
+    /// The bytes of each value of the deleted-pages read whose gap of
+    /// deleted value pages is above `SPAN_GAP_BRIDGE_BYTES`: drawn at
+    /// random, so zstd leaves them their size, and four rows a page put
+    /// the gap's pages well above the bridge.
+    const WIDE_VALUE_BYTES: usize = 4096;
+    /// The seed of those values.
+    const WIDE_VALUE_SEED: u64 = 25;
+
+    /// The GETs of `ranges` that fetched a page of leaf `leaf`.
+    fn gets_of(index: &FileIndex, leaf: usize, ranges: &[Range<u64>]) -> usize {
+        ranges
+            .iter()
+            .filter(|range| !fetched(index, leaf, std::slice::from_ref(range)).is_empty())
+            .count()
+    }
+
+    /// The pages of leaf `leaf` of row group 0 from the one holding the
+    /// first of `rows` to the one holding the last.
+    fn pages_from_first_to_last(index: &FileIndex, leaf: usize, rows: &[i64]) -> BTreeSet<PageAt> {
+        let at = |row| page_of(index, leaf, RowRef { row_group: 0, row }).1;
+        (at(rows[0])..=at(rows[rows.len() - 1]))
+            .map(|page| (0, page))
+            .collect()
+    }
+
+    /// The data pages this thread's decodes have taken up so far.
+    fn data_pages_decoded() -> usize {
+        crate::index::pages::HANDED.with(std::cell::Cell::get).data
+    }
+
+    /// Key 2's run of `DELETED_RUN_PAGES` pages, file rows 1 on, between one
+    /// row of key 1 and one of key 3 in one row group, with values of
+    /// `value_bytes` drawn at random, or `runs_of`'s own when `None`.
+    fn deleted_pages_run(value_bytes: Option<usize>) -> Fixture {
         let rows = DELETED_RUN_PAGES * PAGE;
-        let last = i64::try_from(rows).unwrap();
-        let (opened, gauged) = store_gauged(&runs_of(&[(1, 1), (2, rows), (3, 1)], rows + 2)).await;
+        let mut fixture = runs_of(&[(1, 1), (2, rows), (3, 1)], rows + 2);
+        if let Some(len) = value_bytes {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(WIDE_VALUE_SEED);
+            for value in &mut fixture.values {
+                *value = Some((0..len).map(|_| rng.random::<u8>()).collect());
+            }
+        }
+        fixture
+    }
+
+    /// Newest first at limit 2 over a run of `DELETED_RUN_PAGES` pages whose
+    /// rows are all deleted, by the file's resident deletes, from the one
+    /// after `BELOW_DELETED_ROW` to the one before the last; with values of
+    /// `value_bytes` drawn at random, or the fixtures' own when `None`. The
+    /// read takes the last row and `BELOW_DELETED_ROW` and, in every tier,
+    /// decodes only the value pages holding those two and the order pages
+    /// holding them and the next live row, the whole pages of deleted rows
+    /// between them passed over by the walk in one step each and decoded in
+    /// no column. Per column, the pages between are fetched with the rest
+    /// in one GET where their bytes are at most `SPAN_GAP_BRIDGE_BYTES`,
+    /// and left out where they are above it, as `bridged` says of the value
+    /// column; the order column's gap is always under it. Every read's
+    /// GETs run in one round.
+    async fn assert_reads_across_deleted_pages(value_bytes: Option<usize>, bridged: bool) {
+        let fixture = deleted_pages_run(value_bytes);
+        let last = i64::try_from(DELETED_RUN_PAGES * PAGE).unwrap();
+        let written = fixture.values.clone();
+        let (opened, gauged) = store_gauged(&fixture).await;
         let position = |row: i64| u64::try_from(row).unwrap();
-        let deleted: BTreeSet<u64> = (position(BELOW_DELETED_ROW + 1)..position(last)).collect();
-        let is_deleted = |position: RowPosition| deleted.contains(&position.0);
+        let file_deletes = FileDeletes::of_rows(position(BELOW_DELETED_ROW + 1)..position(last));
+        let deleted = Some(&file_deletes);
         let row = |row| RowRef { row_group: 0, row };
+        let newest = bounds(Direction::NewestFirst);
         for residency in Residency::ALL {
+            let case = format!("{residency}, value bytes {value_bytes:?}");
             let dir = tempfile::tempdir().unwrap();
             let index = index_in(&opened, residency, dir.path(), 0).await;
             let run = index
@@ -1639,47 +1796,95 @@ mod tests {
                 run: &run,
             };
             testing::take_pages();
-            let (got, ranges) = probe
-                .read(&bounds(Direction::NewestFirst), 2, &is_deleted)
-                .await;
+            let decoded_before = data_pages_decoded();
+            let local_before = opened.stats().local_reads();
+            let (got, ranges) = probe.read(&newest, 2, &deleted).await;
+            let decoded = data_pages_decoded() - decoded_before;
+            let local_reads = opened.stats().local_reads() - local_before;
             let walked = testing::take_pages();
             let expected: Vec<_> = [last, BELOW_DELETED_ROW]
                 .into_iter()
-                .map(|at| row_answer(at, at - FIRST_RUN_ROW, 1))
+                .map(|at| {
+                    let value = written[row_index(at)].clone().map(Bytes::from);
+                    (order_at(at - FIRST_RUN_ROW), vec![value])
+                })
                 .collect();
-            assert_eq!(got.rows, expected, "{residency}");
+            assert_eq!(got.rows, expected, "{case}");
             assert_eq!(
                 got.next,
-                Some(order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW))
+                Some(order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW)),
+                "{case}"
             );
             let value_leaf = index.value_leaf(0).unwrap();
             let order_leaf = index.order_leaf().unwrap();
-            let values = fetched(&index, value_leaf, &ranges);
-            let orders = fetched(&index, order_leaf, &ranges);
             let pages = |leaf, rows: &[i64]| -> BTreeSet<PageAt> {
                 rows.iter()
                     .map(|&at| page_of(&index, leaf, row(at)))
                     .collect()
             };
+            let value_rows = [BELOW_DELETED_ROW, last];
+            let order_rows = [BELOW_DELETED_ROW - 1, BELOW_DELETED_ROW, last];
+            let value_decoded = pages(value_leaf, &value_rows);
+            let order_decoded = pages(order_leaf, &order_rows);
             assert_eq!(
-                values,
-                pages(value_leaf, &[BELOW_DELETED_ROW, last]),
-                "{residency}: value pages"
+                decoded,
+                value_decoded.len() + order_decoded.len(),
+                "{case}: the pages decoded, those of the rows taken up alone"
             );
-            let order_pages = match residency {
-                Residency::Disk => BTreeSet::new(),
-                Residency::Full | Residency::Bloom => pages(
-                    order_leaf,
-                    &[BELOW_DELETED_ROW - 1, BELOW_DELETED_ROW, last],
+            assert_eq!(walked, order_decoded.len(), "{case}: pages walked");
+            let (value_pages, value_gets) = if bridged {
+                (pages_from_first_to_last(&index, value_leaf, &value_rows), 1)
+            } else {
+                (value_decoded, 2)
+            };
+            assert_eq!(
+                fetched(&index, value_leaf, &ranges),
+                value_pages,
+                "{case}: value pages fetched"
+            );
+            assert_eq!(
+                gets_of(&index, value_leaf, &ranges),
+                value_gets,
+                "{case}: value GETs"
+            );
+            let (order_pages, order_gets, order_local) = match residency {
+                Residency::Disk => (BTreeSet::new(), 0, 1),
+                Residency::Full | Residency::Bloom => (
+                    pages_from_first_to_last(&index, order_leaf, &order_rows),
+                    1,
+                    0,
                 ),
             };
-            assert_eq!(orders, order_pages, "{residency}: order pages");
-            let walked_pages = pages(
-                order_leaf,
-                &[BELOW_DELETED_ROW - 1, BELOW_DELETED_ROW, last],
+            assert_eq!(
+                fetched(&index, order_leaf, &ranges),
+                order_pages,
+                "{case}: order pages fetched"
             );
-            assert_eq!(walked, walked_pages.len(), "{residency}: pages walked");
+            assert_eq!(
+                gets_of(&index, order_leaf, &ranges),
+                order_gets,
+                "{case}: order GETs"
+            );
+            assert_eq!(local_reads, order_local, "{case}: local reads");
+            probe
+                .assert_one_round(&newest, 2, &deleted, ranges.len(), &case)
+                .await;
         }
+    }
+
+    /// A gap of deleted pages whose bytes are under the bridge is fetched
+    /// with the pages around it, one GET per column, and never decoded.
+    #[tokio::test]
+    async fn test_read_run_bridges_a_small_gap_of_deleted_pages_in_one_get() {
+        assert_reads_across_deleted_pages(None, true).await;
+    }
+
+    /// A gap of deleted value pages whose bytes are above the bridge is
+    /// left out of the fetch, two value GETs, while the order column's
+    /// small gap is still bridged.
+    #[tokio::test]
+    async fn test_read_run_leaves_a_wide_gap_of_deleted_pages_unfetched() {
+        assert_reads_across_deleted_pages(Some(WIDE_VALUE_BYTES), false).await;
     }
 
     /// The fixture of the bounded reads: key 2's run of 30 rows, file rows
@@ -2531,7 +2736,8 @@ mod tests {
                     .iter()
                     .map(|&at| index.position(rows[at]).0)
                     .collect();
-                let is_deleted = |position: RowPosition| positions.contains(&position.0);
+                let file_deletes = FileDeletes::of_rows(positions.iter().copied());
+                let is_deleted = Some(&file_deletes);
                 for scan in bounded_scans(&cost.points) {
                     for limit in COST_LIMITS {
                         let case = format!(
