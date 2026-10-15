@@ -27,7 +27,8 @@
 //! rounds of GETs it waited on (`RoundsStore`); plus the wall time, CPU
 //! time, allocations, reads, and peak resident set of a load, of a load
 //! over the chunk files a Disk load left (a restart), and of a refresh,
-//! with the resident index's bytes by part and the chunk files' bytes.
+//! with an ordered table's rounds of GETs, the resident index's bytes by
+//! part, and the chunk files' bytes.
 //! Results print as a table and are written as JSON under `--out-dir`. Run
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
@@ -3403,6 +3404,9 @@ struct Loaded {
     local_reads: u64,
     /// The bytes those local reads read.
     local_bytes: u64,
+    /// The rounds of GETs the load or refresh waited on, counted through
+    /// `served.rounds`; `None` where that store is not in place.
+    get_rounds: Option<u64>,
     files: usize,
     index_bytes: usize,
     /// The resident memory of the generation's file indexes by part, summed
@@ -3432,6 +3436,7 @@ impl Loaded {
             "get_bytes": self.get_bytes,
             "local_reads": self.local_reads,
             "local_bytes": self.local_bytes,
+            "get_rounds": self.get_rounds,
             "files": self.files,
             "index_bytes": self.index_bytes,
             "resident_parts": self.parts,
@@ -3442,9 +3447,9 @@ impl Loaded {
 }
 
 /// Times `work` against `served`: wall and CPU time, allocations, the
-/// resident set before and at its sampled peak, and the storage reads;
-/// then, outside the timing, the generation's resident parts and under
-/// Disk its chunk files' bytes.
+/// resident set before and at its sampled peak, the storage reads, and for
+/// an ordered table the rounds of GETs; then, outside the timing, the
+/// generation's resident parts and under Disk its chunk files' bytes.
 async fn timed<F: Future<Output = BenchResult<()>>>(
     served: &Served,
     what: &'static str,
@@ -3452,6 +3457,9 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     work: F,
 ) -> BenchResult<Loaded> {
     let rss_before = resident_bytes();
+    if let Some(store) = &served.rounds {
+        store.restart();
+    }
     let before = Counters::read(served);
     let usage = Usage::now();
     let sampler = RssSampler::start();
@@ -3461,6 +3469,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     let rss_peak = sampler.peak();
     let after = Usage::now();
     let counters = Counters::read(served).since(before);
+    let get_rounds = served.rounds.as_ref().map(|store| store.rounds());
     let generation = served.table.serving()?;
     let parts = generation
         .files
@@ -3488,6 +3497,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         get_bytes: counters.get_bytes,
         local_reads: counters.local_reads,
         local_bytes: counters.local_bytes,
+        get_rounds,
         files: generation.files.len(),
         index_bytes: generation.index_bytes,
         parts,
