@@ -3,10 +3,11 @@
 //! longest key) and, on an ordered table, of its order column (the order
 //! facts and the order fences, RFD 025), encoded into the Disk tier's
 //! chunk file so that a restart rebuilds the index's view of the file
-//! without decoding a key or an order value. The chunk file's payload checksum covers the record, so
-//! a torn or changed one is never read; what is read is still checked
-//! against the footer before it is trusted, since every lookup indexes the
-//! footer's pages with the fences (`decode`).
+//! without decoding a key or an order value. The chunk file's payload
+//! checksum covers the record, so a torn or changed one is never read;
+//! what is read is still checked against the footer before it is
+//! trusted, since every lookup indexes the footer's pages with the
+//! fences (`decode`).
 
 use std::fmt;
 use std::mem::size_of;
