@@ -49,7 +49,7 @@ use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one, read_rows};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
-pub use order_fences::{Fence, FencePart, OrderFences};
+pub use order_fences::{OrderFences, Pair, PairPart};
 use ordered::OrderVerified;
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
@@ -195,6 +195,15 @@ pub enum FileFault {
         /// The row group holding the value.
         row_group: usize,
     },
+    /// The order fences of a row group hold more bytes together than the
+    /// `u32` offsets the index addresses them by reach (RFD 025, Load): a
+    /// row group of more than a million order pages of long keys, or of
+    /// dozens of pages whose first order values share tens of mebibytes.
+    #[error("the order fences of row group {row_group} hold more than 4 GiB")]
+    OrderFencesOverflow {
+        /// The row group whose fences overflow.
+        row_group: usize,
+    },
     /// An order page holds a value outside its column index entry, below
     /// the entry's minimum or above its maximum, or the order column's
     /// column index of a row group describes another count of pages than
@@ -285,6 +294,7 @@ impl Recurs for FileFault {
             | Self::KeyNotUtf8 { .. }
             | Self::OrderNotUtf8 { .. }
             // Found decoding the order pages, which may be a local copy.
+            | Self::OrderFencesOverflow { .. }
             | Self::OrderIndexMismatch { .. }
             | Self::DecoderPanicked {
                 part: DecodedPart::Pages { .. },
@@ -576,11 +586,11 @@ impl Keys {
     }
 
     /// Key `at`, which is below `len`, as fences compare it.
-    pub(crate) fn part(&self, at: usize) -> FencePart<'_> {
+    pub(crate) fn part(&self, at: usize) -> PairPart<'_> {
         match self {
-            Self::Long(run) => FencePart::Long(run[at]),
-            Self::Str(run) | Self::Bin(run) => FencePart::Bytes(run[at].data()),
-            Self::Uuid(run) => FencePart::Bytes(&run[at]),
+            Self::Long(run) => PairPart::Long(run[at]),
+            Self::Str(run) | Self::Bin(run) => PairPart::Bytes(run[at].data()),
+            Self::Uuid(run) => PairPart::Bytes(&run[at]),
         }
     }
 
@@ -1051,9 +1061,12 @@ impl FileIndex {
     /// such keys are; and an ordered file's order fences, one per order
     /// page from the offset index, a key at the mean bytes the row group's
     /// key fences take per key page and an order value exact for an integer,
-    /// at the column's width for a fixed-width value, and estimated for a
-    /// string or binary one as the fences of such keys are (RFD 025, Load).
-    /// `resident_bytes` shares the definitions.
+    /// at the column's width for a fixed-width value, and for a string or
+    /// binary one at the larger of its page's minimum in the column index
+    /// and the order chunk's uncompressed bytes per value; no footer number
+    /// bounds a dictionary-encoded column's, so a load charges an ordered
+    /// file's built fences exactly (RFD 025, Load). `resident_bytes` shares
+    /// the definitions.
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,

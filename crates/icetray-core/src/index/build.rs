@@ -31,6 +31,7 @@ use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
     KeyShape, Keys, OrderLeaf, file_fault, group_starts, identity_of, row_index, unless_panicked,
 };
+use crate::approx;
 use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
 use crate::contract::{MAX_KEY_BYTES, PAGE_ROWS};
@@ -38,7 +39,7 @@ use crate::error::{Error, RefusalReason, Result};
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::{
     ChunkFileLookup, ChunkRules, DiskChunks, LocalDir, LocalFault, Rejection, Reservation,
-    VerifiedUnder,
+    VerifiedUnder, chunk_file_bytes,
 };
 use crate::parquet_io::{FileHandle, Segments};
 
@@ -65,6 +66,7 @@ impl Inspected {
             metadata,
             layout,
             reuse,
+            predicted,
             ..
         } = self;
         let ranges = layout.verified_ranges(&metadata, handle.size());
@@ -86,8 +88,12 @@ impl Inspected {
                         },
                     ))
                 })?;
-                let (disk, verified) =
-                    disk_chunks(&to_verify, local, reservation, &ranges, reuse).await?;
+                let target = ChunkFileTarget {
+                    local,
+                    reservation,
+                    estimated: predicted.disk_bytes,
+                };
+                let (disk, verified) = disk_chunks(&to_verify, &target, &ranges, reuse).await?;
                 (KeyResidency::Disk(disk), verified)
             }
             Residency::Bloom => {
@@ -343,6 +349,15 @@ pub(super) async fn chunks_from_disk(
     Ok(Arc::new(Segments::new(parts, file_size)))
 }
 
+/// Where a Disk-tier build writes its chunk file: the local directory, the
+/// load's hold on its budget, and the chunk file's length the footer
+/// predicted, which the hold covers.
+struct ChunkFileTarget<'a> {
+    local: &'a Arc<LocalDir>,
+    reservation: Option<&'a Arc<Reservation>>,
+    estimated: u64,
+}
+
 /// The disk tier's key chunks. A chunk file in `local` that is reusable
 /// (`reusable_disk_chunks`) and whose payload checksum matches is trusted
 /// with the verification record it stores: no GET, no chunk read back, no
@@ -354,15 +369,20 @@ pub(super) async fn chunks_from_disk(
 /// file is checked twice; `None` looks now. The write runs on the blocking
 /// pool (`on_blocking_pool`) and holds `reservation` until it ends, so
 /// bytes it lands after its caller stopped waiting stay reserved until
-/// they are on disk. A canceled write or checksum pass is `Error::Local` on
-/// the chunk file's path with `LocalFault::Join`.
+/// they are on disk. An ordered file's chunk file, whose order fences no
+/// footer number bounds, is charged its exact length before it is written:
+/// beyond the `estimated` length the load reserved, the rest is reserved
+/// too (`LocalDir::reserve`) and held with the load's hold, or the build is
+/// `RefusalReason::OverBudget` (RFD 025, Load). A canceled write or
+/// checksum pass is `Error::Local` on the chunk file's path with
+/// `LocalFault::Join`.
 async fn disk_chunks(
     to_verify: &KeysToVerify,
-    local: &Arc<LocalDir>,
-    reservation: Option<&Arc<Reservation>>,
+    target: &ChunkFileTarget<'_>,
     ranges: &[Range<u64>],
     found: Option<Reuse>,
 ) -> Result<(DiskChunks, Verified)> {
+    let (local, reservation) = (target.local, target.reservation);
     let handle = &to_verify.handle;
     let identity = identity_of(handle);
     let under = to_verify.under();
@@ -384,6 +404,13 @@ async fn disk_chunks(
     }
     let (chunks, verified) = fetch_verified(to_verify, ranges).await?;
     let verification = record::encode(&verified);
+    let exact = chunk_file_bytes(&identity, under, ranges, approx::count(verification.len()));
+    let rest = match to_verify.order {
+        Some(_) if exact > target.estimated => {
+            Some(local.reserve(&to_verify.table, exact - target.estimated)?)
+        }
+        Some(_) | None => None,
+    };
     let (local, reservation, written_path) =
         (Arc::clone(local), reservation.cloned(), path.clone());
     let disk = on_blocking_pool(move || {
@@ -393,7 +420,7 @@ async fn disk_chunks(
             &verification,
             chunks.parts().iter().cloned(),
         );
-        drop(reservation);
+        drop((reservation, rest));
         written
     })
     .await
@@ -1577,7 +1604,7 @@ mod tests {
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
         WireType,
     };
-    use crate::index::{Fence, FencePart};
+    use crate::index::{Pair, PairPart};
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
     use crate::manifest::TableLayout;
@@ -4156,15 +4183,64 @@ mod tests {
     /// The seeds the fence property test draws from, one table each.
     const FENCE_SEEDS: u64 = 12;
 
+    /// The bytes a drawn binary order value's suffix is spelled in, the
+    /// least and the greatest byte, and the byte its shared prefix repeats.
+    const BINARY_SUFFIX_BYTES: &[u8] = &[0x00, 0xff];
+    const BINARY_PREFIX_BYTE: u8 = 0xa5;
+    /// The width of a drawn fixed order value: the shared prefix and a
+    /// suffix of `LONGEST_SUFFIX` letters.
+    const FIXED_ORDER_BYTES: usize = SHARED_PREFIX_BYTES + LONGEST_SUFFIX;
+
+    /// The order column a fence fixture draws.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DrawnOrder {
+        Long,
+        Str,
+        Bin,
+        Fixed,
+    }
+
+    impl DrawnOrder {
+        /// The order type a table serves the column as.
+        fn order_type(self) -> OrderType {
+            match self {
+                Self::Long => OrderType::Long,
+                Self::Str => OrderType::String,
+                Self::Bin => OrderType::Binary,
+                Self::Fixed => OrderType::Fixed(u32::try_from(FIXED_ORDER_BYTES).unwrap()),
+            }
+        }
+
+        /// `run` distinct byte values ascending, fewer when draws repeat:
+        /// the shared prefix and a short suffix, so one value is often a
+        /// prefix of the next, or of one width for a fixed column.
+        fn values(self, rng: &mut StdRng, run: usize) -> Vec<Vec<u8>> {
+            let (prefix, letters, lengths) = match self {
+                Self::Bin => (BINARY_PREFIX_BYTE, BINARY_SUFFIX_BYTES, 0..=LONGEST_SUFFIX),
+                Self::Fixed => (b'p', SUFFIX_LETTERS, LONGEST_SUFFIX..=LONGEST_SUFFIX),
+                Self::Long | Self::Str => (b'p', SUFFIX_LETTERS, 0..=LONGEST_SUFFIX),
+            };
+            let mut values: Vec<Vec<u8>> = (0..run)
+                .map(|_| {
+                    let len = rng.random_range(lengths.clone());
+                    let mut value = vec![prefix; SHARED_PREFIX_BYTES];
+                    value.extend((0..len).map(|_| letters[rng.random_range(0..letters.len())]));
+                    value
+                })
+                .collect();
+            values.sort();
+            values.dedup();
+            values
+        }
+    }
+
     /// A fence fixture's pairs, sorted by key and then order value: runs
     /// of random lengths, long keys or string keys sharing
-    /// `SHARED_PREFIX_BYTES`, and long order values or string ones sharing
-    /// as many, each run's strings drawn from short suffixes so that one
-    /// is often a prefix of the next.
+    /// `SHARED_PREFIX_BYTES`, and `order` values, byte ones sharing as many.
     fn drawn_pairs(
         rng: &mut StdRng,
         string_keys: bool,
-        string_orders: bool,
+        order: DrawnOrder,
     ) -> Vec<(Key, OrderValue)> {
         let prefix = "p".repeat(SHARED_PREFIX_BYTES);
         let mut pairs = Vec::with_capacity(FENCE_ROWS);
@@ -4174,33 +4250,26 @@ mod tests {
             let run = rng
                 .random_range(1..=LONGEST_DRAWN_RUN)
                 .min(FENCE_ROWS - pairs.len());
-            let orders: Vec<OrderValue> = if string_orders {
-                let mut suffixes: Vec<String> = (0..run)
-                    .map(|_| {
-                        let len = rng.random_range(0..=LONGEST_SUFFIX);
-                        (0..len)
-                            .map(|_| {
-                                char::from(
-                                    SUFFIX_LETTERS[rng.random_range(0..SUFFIX_LETTERS.len())],
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect();
-                suffixes.sort();
-                suffixes.dedup();
-                suffixes
+            let orders: Vec<OrderValue> = match order {
+                DrawnOrder::Long => {
+                    let mut value = rng.random_range(-MOST_DRAWN_STEP..=MOST_DRAWN_STEP);
+                    (0..run)
+                        .map(|_| {
+                            value += rng.random_range(1..=MOST_DRAWN_STEP);
+                            OrderValue::Long(value)
+                        })
+                        .collect()
+                }
+                DrawnOrder::Str => order
+                    .values(rng, run)
                     .into_iter()
-                    .map(|suffix| OrderValue::Str(format!("{prefix}{suffix}")))
-                    .collect()
-            } else {
-                let mut order = rng.random_range(-MOST_DRAWN_STEP..=MOST_DRAWN_STEP);
-                (0..run)
-                    .map(|_| {
-                        order += rng.random_range(1..=MOST_DRAWN_STEP);
-                        OrderValue::Long(order)
-                    })
-                    .collect()
+                    .map(|value| OrderValue::Str(String::from_utf8(value).unwrap()))
+                    .collect(),
+                DrawnOrder::Bin | DrawnOrder::Fixed => order
+                    .values(rng, run)
+                    .into_iter()
+                    .map(OrderValue::Bytes)
+                    .collect(),
             };
             let key = if string_keys {
                 Key::Str(format!("{prefix}{key:06}"))
@@ -4212,9 +4281,10 @@ mod tests {
         pairs
     }
 
-    /// `pairs` as an ordered fixture of `FENCE_PAGE_ROWS` rows a page and
-    /// `FENCE_GROUP_ROWS` a row group, with the layout to build it under.
-    fn fence_fixture(pairs: &[(Key, OrderValue)]) -> (Fixture, TableLayout) {
+    /// `pairs`, of `order` values, as an ordered fixture of
+    /// `FENCE_PAGE_ROWS` rows a page and `FENCE_GROUP_ROWS` a row group,
+    /// with the layout to build it under.
+    fn fence_fixture(pairs: &[(Key, OrderValue)], order: DrawnOrder) -> (Fixture, TableLayout) {
         let (key_type, column) = match &pairs[0].0 {
             Key::Str(_) => (KeyType::String, KeyColumn::Utf8),
             Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => (KeyType::Long, KeyColumn::Int64),
@@ -4223,47 +4293,45 @@ mod tests {
             column,
             pairs.iter().map(|(key, _)| Some(key.clone())).collect(),
         );
-        let order_type = match &pairs[0].1 {
-            OrderValue::Long(_) => {
-                fixture.orders = Some(Orders::Long(
-                    pairs
-                        .iter()
-                        .map(|(_, order)| match order {
-                            OrderValue::Long(value) => Some(*value),
-                            OrderValue::Str(_) | OrderValue::Bytes(_) => None,
-                        })
-                        .collect(),
-                ));
-                OrderType::Long
-            }
-            OrderValue::Str(_) | OrderValue::Bytes(_) => {
-                fixture.orders = Some(Orders::Bytes(
-                    pairs
-                        .iter()
-                        .map(|(_, order)| match order {
-                            OrderValue::Str(text) => Some(text.clone().into_bytes()),
-                            OrderValue::Long(_) | OrderValue::Bytes(_) => None,
-                        })
-                        .collect(),
-                ));
-                OrderType::String
-            }
+        let bytes = || {
+            pairs
+                .iter()
+                .map(|(_, value)| match value {
+                    OrderValue::Str(text) => Some(text.clone().into_bytes()),
+                    OrderValue::Bytes(bytes) => Some(bytes.clone()),
+                    OrderValue::Long(_) => None,
+                })
+                .collect()
         };
+        fixture.orders = Some(match order {
+            DrawnOrder::Long => Orders::Long(
+                pairs
+                    .iter()
+                    .map(|(_, value)| match value {
+                        OrderValue::Long(value) => Some(*value),
+                        OrderValue::Str(_) | OrderValue::Bytes(_) => None,
+                    })
+                    .collect(),
+            ),
+            DrawnOrder::Str | DrawnOrder::Bin => Orders::Bytes(bytes()),
+            DrawnOrder::Fixed => Orders::Fixed(i32::try_from(FIXED_ORDER_BYTES).unwrap(), bytes()),
+        });
         fixture.layout.page_rows = FENCE_PAGE_ROWS;
         fixture.layout.write_batch = FENCE_PAGE_ROWS;
         fixture.layout.row_group_rows = FENCE_GROUP_ROWS;
-        (fixture, ordered_layout(key_type, order_type))
+        (fixture, ordered_layout(key_type, order.order_type()))
     }
 
     /// What the fence property test saw across its fixtures: order pages,
     /// pages whose first row starts a key, pages whose first row continues
-    /// the key before it, and byte fences cut short of the page's first
-    /// value and cut past the shared prefix.
-    #[derive(Default)]
+    /// the key before it, row groups whose first page does, and byte fences
+    /// cut short of the page's first value and cut past the shared prefix.
+    #[derive(Debug, Default, PartialEq, Eq)]
     struct FencesSeen {
         pages: usize,
         new_keys: usize,
         continued: usize,
+        groups_continued: usize,
         cut_short: usize,
         past_prefix: usize,
     }
@@ -4279,7 +4347,7 @@ mod tests {
         let fences = index.order_fences().unwrap();
         let metadata = index.metadata();
         let order_leaf = index.order_leaf().unwrap();
-        let pair = |row: usize| Fence::of(&pairs[row].0, &pairs[row].1);
+        let pair = |row: usize| Pair::of(&pairs[row].0, &pairs[row].1);
         let path = location();
         assert_eq!(fences.row_groups(), metadata.num_row_groups());
         let mut start = 0;
@@ -4301,14 +4369,15 @@ mod tests {
                 seen.pages += 1;
                 seen.new_keys += usize::from(!continues);
                 seen.continued += usize::from(continues);
+                seen.groups_continued += usize::from(continues && page == 0);
                 match (fence.order, first.order) {
-                    (FencePart::Long(kept), FencePart::Long(exact)) => assert_eq!(kept, exact),
-                    (FencePart::Bytes(cut), FencePart::Bytes(whole)) => {
+                    (PairPart::Long(kept), PairPart::Long(exact)) => assert_eq!(kept, exact),
+                    (PairPart::Bytes(cut), PairPart::Bytes(whole)) => {
                         assert!(whole.starts_with(cut), "row {row}");
                         if let Some(shorter) = cut.len().checked_sub(1) {
                             let previous = previous.expect("a cut value follows a row on its key");
-                            let shorter = Fence {
-                                order: FencePart::Bytes(&cut[..shorter]),
+                            let shorter = Pair {
+                                order: PairPart::Bytes(&cut[..shorter]),
                                 ..fence
                             };
                             assert!(
@@ -4332,52 +4401,65 @@ mod tests {
             }
             .group(row_group);
             for row in 0..rows {
+                let page = order_chunk.page_holding(row);
                 assert_eq!(
                     fences.page_of(row_group, pair(start + row)),
-                    Some(order_chunk.page_holding(row)),
+                    Some(page),
                     "row {row} of row group {row_group}"
                 );
+                assert_eq!(fences.place(pair(start + row)), Some((row_group, page)));
             }
             start += rows;
         }
     }
 
     /// Every order fence of random runs (RFD 025, Load; Review Focus 3),
-    /// over long and string keys and long and string order values that
-    /// share a long prefix, sorts above the last pair of the page before
+    /// over long and string keys and long, string, binary, and fixed order
+    /// values, the byte ones sharing a long prefix, sorts above the last pair of the page before
     /// its page and at or below its page's first pair, is the shortest such
     /// pair, and places every row on its page.
     #[tokio::test]
     async fn test_verify_ordered_fences_bound_every_order_page_with_the_shortest_pair() {
-        let mut seen = FencesSeen::default();
-        for seed in 0..FENCE_SEEDS {
-            for (string_keys, string_orders) in
-                [(false, false), (false, true), (true, false), (true, true)]
-            {
-                let mut rng = StdRng::seed_from_u64(seed);
-                let pairs = drawn_pairs(&mut rng, string_keys, string_orders);
-                let (fixture, layout) = fence_fixture(&pairs);
-                let opened = store(&fixture).await;
-                let index = opened
-                    .build_under(&layout, Residency::Full, None)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    index.metadata().num_row_groups(),
-                    FENCE_ROWS / FENCE_GROUP_ROWS
-                );
-                assert_fences_fence(&index, &pairs, &mut seen);
+        // The shapes the fixed seeds draw, per order column: pages, pages
+        // starting a key, pages continuing one, row groups whose first page
+        // continues the last key of the row group before, byte fences cut
+        // short of their row's value, and cut past the shared prefix.
+        let drawn =
+            |pages, new_keys, continued, groups_continued, cut_short, past_prefix| FencesSeen {
+                pages,
+                new_keys,
+                continued,
+                groups_continued,
+                cut_short,
+                past_prefix,
+            };
+        let expected = [
+            (DrawnOrder::Long, drawn(576, 114, 462, 44, 0, 0)),
+            (DrawnOrder::Str, drawn(576, 128, 448, 42, 256, 448)),
+            (DrawnOrder::Bin, drawn(576, 128, 448, 42, 256, 448)),
+            (DrawnOrder::Fixed, drawn(576, 178, 398, 30, 426, 398)),
+        ];
+        for (order, expected) in expected {
+            let mut seen = FencesSeen::default();
+            for seed in 0..FENCE_SEEDS {
+                for string_keys in [false, true] {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    let pairs = drawn_pairs(&mut rng, string_keys, order);
+                    let (fixture, layout) = fence_fixture(&pairs, order);
+                    let opened = store(&fixture).await;
+                    let index = opened
+                        .build_under(&layout, Residency::Full, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        index.metadata().num_row_groups(),
+                        FENCE_ROWS / FENCE_GROUP_ROWS
+                    );
+                    assert_fences_fence(&index, &pairs, &mut seen);
+                }
             }
+            assert_eq!(seen, expected, "{order:?}");
         }
-        assert!(seen.pages > 0 && seen.new_keys > 0 && seen.continued > 0);
-        assert!(
-            seen.cut_short > 0,
-            "some byte fence is cut short of its row's value"
-        );
-        assert!(
-            seen.past_prefix > 0,
-            "some byte fence is cut past the shared prefix"
-        );
     }
 
     /// Verification decodes each column's dictionary once per row group,
@@ -4461,8 +4543,13 @@ mod tests {
     async fn test_build_ordered_without_an_order_column_index_gets_its_fences_from_the_rows() {
         let mut rng = StdRng::seed_from_u64(FENCE_SEEDS);
         for string_orders in [false, true] {
-            let pairs = drawn_pairs(&mut rng, false, string_orders);
-            let (mut fixture, layout) = fence_fixture(&pairs);
+            let order = if string_orders {
+                DrawnOrder::Str
+            } else {
+                DrawnOrder::Long
+            };
+            let pairs = drawn_pairs(&mut rng, false, order);
+            let (mut fixture, layout) = fence_fixture(&pairs, order);
             let indexed = store(&fixture).await;
             fixture.layout.order_statistics = Some(EnabledStatistics::Chunk);
             let unindexed = store(&fixture).await;
@@ -4500,8 +4587,13 @@ mod tests {
     async fn test_disk_tier_restart_restores_identical_order_fences_without_a_get_or_a_decode() {
         let mut rng = StdRng::seed_from_u64(FENCE_SEEDS + 1);
         for (string_keys, string_orders) in [(false, false), (true, true)] {
-            let pairs = drawn_pairs(&mut rng, string_keys, string_orders);
-            let (fixture, layout) = fence_fixture(&pairs);
+            let order = if string_orders {
+                DrawnOrder::Str
+            } else {
+                DrawnOrder::Long
+            };
+            let pairs = drawn_pairs(&mut rng, string_keys, order);
+            let (fixture, layout) = fence_fixture(&pairs, order);
             let opened = store(&fixture).await;
             let dir = tempfile::tempdir().unwrap();
             let local = testing::local_dir(dir.path(), opened.stats(), None);
@@ -4615,5 +4707,190 @@ mod tests {
             );
             assert_eq!(reused.order_fences(), oracle.order_fences(), "{case}");
         }
+    }
+
+    /// Rows in each budget fixture: two row groups.
+    const BUDGET_ROWS: usize = 4_000;
+    /// Rows per key in the budget fixtures, so most order pages continue a
+    /// key and their fences keep the shared prefix.
+    const BUDGET_RUN_ROWS: usize = 100;
+    /// The bytes every order value of a budget fixture starts with.
+    const BUDGET_PREFIX_BYTES: usize = 1_000;
+    /// The bytes a truncated order column index keeps of each value.
+    const BUDGET_TRUNCATE_BYTES: usize = 16;
+    /// Rows per page in the plain budget fixtures.
+    const PLAIN_PAGE_ROWS: usize = 2;
+    /// The prefix, rows per page, rows, and rows per key of the
+    /// dictionary-encoded budget fixture, whose keys share their order
+    /// values, so its dictionary is small beside its fences.
+    const DICTIONARY_PREFIX_BYTES: usize = 2_000;
+    const DICTIONARY_PAGE_ROWS: usize = 3;
+    const DICTIONARY_ROWS: usize = 3_000;
+    const DICTIONARY_RUN_ROWS: usize = 30;
+
+    /// An ordered file of `rows` rows, `run` per long key, whose string
+    /// order values are `prefix` bytes and the row's place in its run,
+    /// written `page_rows` to a page, `BUDGET_ROWS / 2` to a row group, with
+    /// `edit` applied to its layout.
+    fn budget_fixture(
+        rows: usize,
+        run: usize,
+        prefix: usize,
+        page_rows: usize,
+        edit: impl FnOnce(&mut crate::index::testing::Layout),
+    ) -> Fixture {
+        let shared = "p".repeat(prefix);
+        let keys: Vec<i64> = (0..rows).map(|i| i64::try_from(i / run).unwrap()).collect();
+        let orders = (0..rows)
+            .map(|i| Some(format!("{shared}{:06}", i % run).into_bytes()))
+            .collect();
+        let mut fixture = Fixture::ordered(&keys, Orders::Bytes(orders));
+        fixture.layout.page_rows = page_rows;
+        fixture.layout.write_batch = page_rows;
+        fixture.layout.row_group_rows = BUDGET_ROWS / 2;
+        edit(&mut fixture.layout);
+        fixture
+    }
+
+    /// The Full tier's resident bytes and the Disk tier's chunk file of
+    /// `opened`, built under a `string` order column, beside what the
+    /// footer predicted for each.
+    async fn budget_of(opened: &Opened) -> ([u64; 2], [u64; 2]) {
+        let layout = ordered_layout(KeyType::Long, OrderType::String);
+        let full = opened
+            .build_under(&layout, Residency::Full, None)
+            .await
+            .unwrap();
+        let predicted = predicted_of(&full);
+        let dir = tempfile::tempdir().unwrap();
+        let local = testing::local_dir(dir.path(), opened.stats(), None);
+        opened
+            .build_under(&layout, Residency::Disk, Some(&local))
+            .await
+            .unwrap();
+        let written = local.index_bytes_in_use().unwrap();
+        (
+            [predicted.full, count(full.resident_bytes())],
+            [predicted.disk_bytes, written],
+        )
+    }
+
+    /// The footer stage's estimate of string order fences covers them
+    /// where the footer bounds them, a page's fence at no less than the
+    /// order chunk's uncompressed bytes per value (review 1, Important 1):
+    /// under a truncated column index, whose page minimums keep 16 of each
+    /// value's thousand bytes, under a full one, and without one. Each case
+    /// gives the Full tier's predicted and resident bytes and the Disk
+    /// tier's predicted and written chunk file; the truncated case's
+    /// prediction was 558,176 bytes before the estimate took the chunk's
+    /// bytes per value.
+    #[tokio::test]
+    async fn test_predicted_bytes_cover_string_order_fences_whatever_the_column_index() {
+        type Edit = fn(&mut crate::index::testing::Layout);
+        let cases: [(&str, Edit, [u64; 2], [u64; 2]); 3] = [
+            (
+                "truncated",
+                |layout| layout.truncate = Some(BUDGET_TRUNCATE_BYTES),
+                [2_556_112, 2_491_492],
+                [2_269_697, 2_205_036],
+            ),
+            (
+                "full",
+                |_| {},
+                [2_748_592, 2_683_876],
+                [2_269_793, 2_205_036],
+            ),
+            (
+                "absent",
+                |layout| layout.order_statistics = Some(EnabledStatistics::Chunk),
+                [2_444_470, 2_377_844],
+                [2_271_705, 2_205_036],
+            ),
+        ];
+        for (case, edit, full, disk) in cases {
+            let fixture = budget_fixture(
+                BUDGET_ROWS,
+                BUDGET_RUN_ROWS,
+                BUDGET_PREFIX_BYTES,
+                PLAIN_PAGE_ROWS,
+                edit,
+            );
+            let opened = store(&fixture).await;
+            let ([predicted, resident], [predicted_disk, written]) = budget_of(&opened).await;
+            assert_eq!(
+                ([predicted, resident], [predicted_disk, written]),
+                (full, disk),
+                "{case}"
+            );
+            assert!(
+                predicted >= resident,
+                "{case}: {predicted} predicted, {resident} resident"
+            );
+            assert!(
+                predicted_disk >= written,
+                "{case}: {predicted_disk} predicted, {written} written"
+            );
+        }
+    }
+
+    /// No footer number bounds a dictionary-encoded order column's fences,
+    /// so the Disk tier charges a chunk file's exact length before writing
+    /// it (review 1, Important 1): beyond the footer's estimate, the
+    /// reservation grows by the rest, refused as `OverBudget` where the
+    /// budget does not hold it though it held the estimate. The Full tier's
+    /// prediction falls as far short, 412,025 bytes for 2,224,079 resident,
+    /// which the load charges once built (`generation::check_built_budget`).
+    #[tokio::test]
+    async fn test_disk_tier_charges_the_exact_ordered_chunk_file_before_writing_it() {
+        let fixture = budget_fixture(
+            DICTIONARY_ROWS,
+            DICTIONARY_RUN_ROWS,
+            DICTIONARY_PREFIX_BYTES,
+            DICTIONARY_PAGE_ROWS,
+            |layout| layout.dictionary = Dictionary::All,
+        );
+        let opened = store(&fixture).await;
+        let (full, [estimate, exact]) = budget_of(&opened).await;
+        assert_eq!(full, [412_025, 2_224_079], "predicted and resident");
+        assert_eq!(
+            [estimate, exact],
+            [150_385, 1_963_372],
+            "predicted and written"
+        );
+        let layout = ordered_layout(KeyType::Long, OrderType::String);
+        let build_within = |budget: u64| {
+            let opened = &opened;
+            let layout = &layout;
+            async move {
+                let dir = tempfile::tempdir().unwrap();
+                let local = testing::local_dir(dir.path(), opened.stats(), Some(budget));
+                let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), layout)
+                    .await
+                    .unwrap();
+                let reservation = Arc::new(
+                    local
+                        .reserve(TABLE, inspected.predicted().disk_bytes)
+                        .unwrap(),
+                );
+                let built = inspected
+                    .build(Residency::Disk, Some(&local), Some(&reservation))
+                    .await;
+                drop(reservation);
+                (built.map(|_| ()), local.index_bytes_in_use().unwrap())
+            }
+        };
+        let (refused, written) = build_within(exact - 1).await;
+        assert_eq!(
+            refusal_of(refused),
+            RefusalReason::OverBudget {
+                of: crate::error::Budget::Index,
+                needed: exact,
+                budget: exact - 1,
+            }
+        );
+        assert_eq!(written, 0, "nothing was written");
+        let (built, written) = build_within(exact).await;
+        built.unwrap();
+        assert_eq!(written, exact);
     }
 }

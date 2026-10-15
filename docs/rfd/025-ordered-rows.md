@@ -131,13 +131,19 @@ direction under a limit and optional bounds on the order value.
   restores them without decoding a value. Entries that serve one table
   with different order columns, or with none, therefore each keep their
   own chunk file, and none trusts a file verified under other rules. The
-  chunk-file budget reserves an ordered chunk file from the footer's
-  sizes, estimating string and binary order values, in the facts and the
-  order fences, as it estimates key fences. Column resolution under RFD
-  023 (Column resolution) applies to the order column, and a file
-  written before the order column was added is refused as
-  `column_mismatch`, since its default would give every row of the file
-  one order value.
+  chunk-file budget and the resident budget reserve an ordered file from
+  the footer's sizes, estimating string and binary order values in the
+  facts as they estimate key fences, and in each order fence at the larger
+  of its page's minimum in the column index and the order chunk's
+  uncompressed bytes per value. No footer number bounds the fences of a
+  dictionary-encoded order column, so the exact fences are charged once a
+  file is built: the chunk file's exact length is reserved before it is
+  written, a `full` table's exact resident bytes are checked against its
+  budget, and a load over either is refused as `over_budget`. Column
+  resolution under RFD 023 (Column resolution) applies to the order
+  column, and a file written before the order column was added is
+  refused as `column_mismatch`, since its default would give every row
+  of the file one order value.
 - **Refresh.** Across files, the load checks for a repeated live pair
   only among files where one can occur. A file is checked when it is
   new, or reused with deletes that shrank: deleted rows that are not a

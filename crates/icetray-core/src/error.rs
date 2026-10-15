@@ -1417,6 +1417,10 @@ mod tests {
             (file(FileFault::KeyNotUtf8 { row_group }), Transient),
             (file(FileFault::OrderNotUtf8 { row_group }), Transient),
             (
+                file(FileFault::OrderFencesOverflow { row_group }),
+                Transient,
+            ),
+            (
                 file(FileFault::OrderIndexMismatch { row_group, page: 0 }),
                 Transient,
             ),

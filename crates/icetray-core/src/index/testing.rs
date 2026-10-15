@@ -161,6 +161,9 @@ pub(crate) enum Orders {
     /// `binary` order column serves; under `string` its bytes must be
     /// UTF-8.
     Bytes(Vec<Option<Vec<u8>>>),
+    /// A `FIXED_LEN_BYTE_ARRAY` column of this width, which a `fixed`
+    /// order column of the width serves.
+    Fixed(i32, Vec<Option<Vec<u8>>>),
 }
 
 impl Orders {
@@ -168,13 +171,14 @@ impl Orders {
         match self {
             Self::Long(_) => DataType::Int64,
             Self::Bytes(_) => DataType::Binary,
+            Self::Fixed(width, _) => DataType::FixedSizeBinary(*width),
         }
     }
 
     fn nullable(&self) -> bool {
         match self {
             Self::Long(values) => values.iter().any(Option::is_none),
-            Self::Bytes(values) => values.iter().any(Option::is_none),
+            Self::Bytes(values) | Self::Fixed(_, values) => values.iter().any(Option::is_none),
         }
     }
 
@@ -182,6 +186,13 @@ impl Orders {
         match self {
             Self::Long(values) => Arc::new(values.iter().copied().collect::<Int64Array>()),
             Self::Bytes(values) => Arc::new(values.iter().cloned().collect::<BinaryArray>()),
+            Self::Fixed(width, values) => Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    values.iter().cloned(),
+                    *width,
+                )
+                .unwrap(),
+            ),
         }
     }
 }

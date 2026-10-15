@@ -782,6 +782,144 @@ async fn test_full_tier_over_budget_is_refused_at_the_footer_stage() -> Result<(
     Ok(())
 }
 
+/// The digits the fence budget fixture pads its string order values to: a
+/// prefix every value shares and a continued page's fence keeps.
+const FENCE_BUDGET_DIGITS: u32 = 2_000;
+/// Rows per page of the fence budget fixture: few, so it has many fences.
+const FENCE_BUDGET_PAGE_ROWS: usize = 3;
+/// Keys of the fence budget fixture, in one bucket.
+const FENCE_BUDGET_IDS: Range<u64> = 0..300;
+/// The bytes the fence budget fixture's writer keeps of each column index
+/// entry, far short of its order values.
+const FENCE_BUDGET_TRUNCATE: usize = 16;
+
+/// Rows per key of the fence budget fixture; every key holds the same
+/// order values, so the order column's dictionary is small.
+fn thirty_rows(_id: u64) -> u64 {
+    30
+}
+
+/// An ordered table whose order column is dictionary-encoded, its values
+/// long strings repeated across keys, under a truncated column index: no
+/// footer number bounds its fences, which are many times its chunk's bytes
+/// per value and its index's page minimums (review 1, Important 1).
+async fn fence_budget_fixture(catalog: &Arc<dyn Catalog>, name: &str) -> Result<Fixture> {
+    let spec = FixtureSpec {
+        ids: FENCE_BUDGET_IDS,
+        buckets: ONE_BUCKET,
+        layout: Layout {
+            page_rows: FENCE_BUDGET_PAGE_ROWS,
+            order_dictionary: true,
+            column_index_truncate: Some(FENCE_BUDGET_TRUNCATE),
+            ..Layout::contract()
+        },
+        ..FixtureSpec::ordered(
+            name,
+            KeyType::Long,
+            Ordered {
+                kind: OrderKind::PaddedStr(FENCE_BUDGET_DIGITS),
+                rows_per_key: thirty_rows,
+                start: 0,
+                step: 1,
+            },
+        )
+    };
+    write_fixture(catalog.as_ref(), NAMESPACE, spec).await
+}
+
+/// A Full-tier ordered table is charged its exact resident bytes once
+/// built: a budget the footer's estimate fits but the built fences do not
+/// is `OverBudget` naming the exact bytes, after the chunks were fetched,
+/// and that exact budget loads.
+#[tokio::test]
+async fn test_full_tier_charges_the_exact_order_fences_once_built() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = fence_budget_fixture(&catalog, "fence_budget_full").await?;
+    let source = || fixture.catalog_source(Arc::clone(&catalog));
+    let config = |budget| fixture.config_with_budget(Residency::Full, false, budget);
+    let unbounded =
+        verify::serve(config(None), source(), verify::storage_config_for_tests()).await?;
+    let exact = count(unbounded.current().index_bytes);
+    drop(unbounded);
+    let refused = load_refused(config(Some(exact - 1)), source()).await?;
+    assert_eq!(
+        refused.reason,
+        RefusalReason::OverBudget {
+            of: Budget::Resident,
+            needed: exact,
+            budget: exact - 1,
+        }
+    );
+    assert!(
+        refused.storage.stats().gets()
+            > METADATA_FILE_GETS + LOAD_METADATA_GETS + count(fixture.file_count()),
+        "refused after the chunks were fetched, not at the footer stage"
+    );
+    let fits = verify::serve(
+        config(Some(exact)),
+        source(),
+        verify::storage_config_for_tests(),
+    )
+    .await?;
+    assert_eq!(count(fits.current().index_bytes), exact);
+    Ok(())
+}
+
+/// A Disk-tier ordered table is charged its chunk file's exact length
+/// before it is written: an index budget the footer's estimate fits but
+/// the chunk file does not is `OverBudget` with nothing written, and that
+/// exact budget loads.
+#[tokio::test]
+async fn test_disk_tier_charges_the_exact_ordered_chunk_file_once_built() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = fence_budget_fixture(&catalog, "fence_budget_disk").await?;
+    assert_eq!(fixture.file_count(), 1, "one file, one reservation");
+    let serve = |budget: Option<u64>| {
+        let fixture = &fixture;
+        let catalog = &catalog;
+        async move {
+            let scratch = tempfile::tempdir()?;
+            let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+            let local = Arc::new(LocalDir::open(
+                &LocalConfig {
+                    dir: scratch.path().to_path_buf(),
+                    index_budget_bytes: budget,
+                    page_cache_disk_bytes: 0,
+                },
+                storage.stats(),
+            )?);
+            let served = verify::serve_over(
+                storage,
+                fixture.config(Residency::Disk, false),
+                fixture.catalog_source(Arc::clone(catalog)),
+                Some(Arc::clone(&local)),
+            )
+            .await;
+            Ok::<_, TestkitError>((served, local.index_bytes_in_use()?, scratch))
+        }
+    };
+    let (served, exact, _scratch) = serve(None).await?;
+    served?;
+    assert!(exact > 0);
+    let (refused, written, _scratch) = serve(Some(exact - 1)).await?;
+    let Err(TestkitError::Core(Error::Refused { reason, .. })) = refused else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(
+        reason,
+        RefusalReason::OverBudget {
+            of: Budget::Index,
+            needed: exact,
+            budget: exact - 1,
+        }
+    );
+    assert_eq!(written, 0, "no chunk file was written");
+    let (fits, written, _scratch) = serve(Some(exact)).await?;
+    fits?;
+    assert_eq!(written, exact);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_bloom_tier_without_a_filter_is_refused() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;

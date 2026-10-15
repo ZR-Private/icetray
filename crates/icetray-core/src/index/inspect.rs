@@ -853,9 +853,11 @@ fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 
 /// fence per order page from the offset index, its key at the mean bytes
 /// the row group's key fences are estimated at per key page
 /// (`estimated_fence_keys`), and its order value at eight bytes for an
-/// integer, the width for a fixed-width value, and for a byte array as the
-/// fences of a byte-array key are estimated (`byte_array_fence_heap`), from
-/// the order column's index or its chunk.
+/// integer, the width for a fixed-width value, and for a byte array at the
+/// larger of its page's minimum in the order column's index and the chunk's
+/// uncompressed bytes per value (`byte_array_order_fence_heap`). The built
+/// fences are charged exactly (RFD 025, Load), since no footer number
+/// bounds a dictionary-encoded column's.
 fn estimated_order_fences(
     metadata: &ParquetMetaData,
     key_leaf: usize,
@@ -885,7 +887,7 @@ fn estimated_order_fences(
                         .column_index()
                         .and_then(|index| index.get(row_group))
                         .and_then(|columns| columns.get(order.leaf));
-                    byte_array_fence_heap(column_index, group.column(order.leaf), pages)
+                    byte_array_order_fence_heap(column_index, group.column(order.leaf), pages)
                 }
             };
             FenceBytes {
@@ -908,6 +910,43 @@ fn order_fence_bytes(groups: &[FenceBytes], long_keys: bool, long_orders: bool) 
                 .saturating_add(parts_heap(long_keys, group.pages, group.keys))
                 .saturating_add(parts_heap(long_orders, group.pages, group.orders))
         })
+}
+
+/// The heap the order values of the fences of one row group of a
+/// `BYTE_ARRAY` order column would hold, `pages` of them: per page the
+/// larger of its minimum's length in the column index, when the file has
+/// one, and the chunk's uncompressed bytes per value. A fence keeps a prefix
+/// of its page's first value, which a writer's truncated minimum, or the
+/// minimum of a page that holds several keys, can fall far short of; the
+/// chunk's bytes per value covers a plain chunk's values on average, and a
+/// dictionary-encoded chunk's values only as far as its dictionary holds
+/// them.
+fn byte_array_order_fence_heap(
+    column_index: Option<&ColumnIndexMetaData>,
+    chunk: &ColumnChunkMetaData,
+    pages: usize,
+) -> u64 {
+    let encoded = approx::measured(chunk.uncompressed_size());
+    let values = approx::measured(chunk.num_values());
+    // A chunk of no values has no mean.
+    let mean = encoded.checked_div(values).unwrap_or(0);
+    match column_index {
+        Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => index
+            .min_values_iter()
+            .map(|min| approx::count(min.map_or(0, <[u8]>::len)).max(mean))
+            .fold(0, u64::saturating_add),
+        None
+        | Some(
+            ColumnIndexMetaData::NONE
+            | ColumnIndexMetaData::BOOLEAN(_)
+            | ColumnIndexMetaData::INT32(_)
+            | ColumnIndexMetaData::INT64(_)
+            | ColumnIndexMetaData::INT96(_)
+            | ColumnIndexMetaData::FLOAT(_)
+            | ColumnIndexMetaData::DOUBLE(_)
+            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
+        ) => approx::count(pages).saturating_mul(mean),
+    }
 }
 
 /// The fence array's bytes: one `Key` per key page plus what each key holds

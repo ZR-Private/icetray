@@ -16,7 +16,7 @@ use iceberg::spec::{FormatVersion, Literal, PrimitiveType};
 use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
-    ColumnRead, Direction, Error, Fence, Key, KeyType, LoadedFile, OrderValue, ScanBounds, ScanRow,
+    ColumnRead, Direction, Error, Key, KeyType, LoadedFile, OrderValue, Pair, ScanBounds, ScanRow,
     Scanned, TableKind, bucket,
 };
 use icetray_testkit::fixture::{
@@ -629,7 +629,7 @@ fn assert_fences_bound(file: &LoadedFile, rows: &[FileRow]) -> (usize, usize) {
     let leaf = index
         .order_leaf()
         .expect("an ordered file has an order column");
-    let pair = |row: usize| Fence::of(&rows[row].key, &rows[row].order);
+    let pair = |row: usize| Pair::of(&rows[row].key, &rows[row].order);
     let (mut pages, mut at_deleted, mut start) = (0, 0, 0);
     for row_group in 0..metadata.num_row_groups() {
         let locations = metadata

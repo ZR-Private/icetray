@@ -14,7 +14,7 @@ use std::mem::size_of;
 use prost::Message as _;
 
 use super::build::Verified;
-use super::order_fences::{Fence, FencePart, GroupFences, OrderFences, Parts};
+use super::order_fences::{GroupFencesBuilder, OrderFences, Pair, PairPart};
 use super::ordered::OrderVerified;
 use super::page_header::MOST_VALUE_PAGE_BYTES;
 use super::{Column, ColumnChunk, GroupRange, KeyShape, OrderLeaf, OrderShape};
@@ -213,10 +213,10 @@ pub(super) fn encode(verified: &Verified) -> Vec<u8> {
 /// A fence's key or order value as the record stores it: a long's eight
 /// little-endian bytes, as `Key::as_bytes` and `order_bytes` store one, and
 /// bytes as they are.
-fn part_bytes(part: FencePart<'_>) -> Vec<u8> {
+fn part_bytes(part: PairPart<'_>) -> Vec<u8> {
     match part {
-        FencePart::Long(value) => value.to_le_bytes().to_vec(),
-        FencePart::Bytes(bytes) => bytes.to_vec(),
+        PairPart::Long(value) => value.to_le_bytes().to_vec(),
+        PairPart::Bytes(bytes) => bytes.to_vec(),
     }
 }
 
@@ -394,10 +394,7 @@ fn order_fences(
             return Err(fault);
         }
         let range = ranges.next_if(|range| range.row_group == row_group);
-        let mut group = GroupFences::new(
-            Parts::for_key(keys.shape, pages),
-            Parts::for_order(order.shape, pages),
-        );
+        let mut group = GroupFencesBuilder::new(keys.shape, order.shape, pages);
         for (page, (key, value)) in stored.keys.into_iter().zip(stored.orders).enumerate() {
             let key = key_of(keys.shape, key, keys.longest, keys.width).ok_or(fault)?;
             let within =
@@ -405,13 +402,13 @@ fn order_fences(
             if !within || !fence_order(order.shape, &value) {
                 return Err(fault);
             }
-            let fence = Fence {
-                key: FencePart::of_key(&key),
+            let fence = Pair {
+                key: PairPart::of_key(&key),
                 order: order_part(order.shape, &value),
             };
             let ascending = previous.as_ref().is_none_or(|(key, value)| {
-                let before = Fence {
-                    key: FencePart::of_key(key),
+                let before = Pair {
+                    key: PairPart::of_key(key),
                     order: order_part(order.shape, value),
                 };
                 before < fence
@@ -419,10 +416,10 @@ fn order_fences(
             if !ascending {
                 return Err(fault);
             }
-            group.push(fence);
+            group.push(fence).map_err(|_| fault)?;
             previous = Some((key, value));
         }
-        groups.push(group.shrunk());
+        groups.push(group.finish());
     }
     Ok(OrderFences::new(groups))
 }
@@ -441,14 +438,14 @@ fn fence_order(shape: OrderShape, bytes: &[u8]) -> bool {
 
 /// A fence's order value, `bytes`, which `fence_order` admits for `shape`,
 /// as fences compare it.
-fn order_part(shape: OrderShape, bytes: &[u8]) -> FencePart<'_> {
+fn order_part(shape: OrderShape, bytes: &[u8]) -> PairPart<'_> {
     match shape {
-        OrderShape::Int32 | OrderShape::Int64 => FencePart::Long(i64::from_le_bytes(
+        OrderShape::Int32 | OrderShape::Int64 => PairPart::Long(i64::from_le_bytes(
             bytes
                 .try_into()
                 .expect("fence_order admits eight bytes alone for an integer"),
         )),
-        OrderShape::Str | OrderShape::Bin | OrderShape::Fixed(_) => FencePart::Bytes(bytes),
+        OrderShape::Str | OrderShape::Bin | OrderShape::Fixed(_) => PairPart::Bytes(bytes),
     }
 }
 
@@ -546,6 +543,10 @@ fn fence_count(chunk: ColumnChunk<'_>) -> usize {
 /// fence's prefix of one, lies in one page of one chunk, its dictionary
 /// page or a data page, and an order page over that ceiling is refused
 /// (`check_order_page_headers`), so the bound follows the footer's chunks.
+/// A chunk without a dictionary page holds each page's first value in that
+/// page, so its fences' values together are at most its uncompressed
+/// bytes; a dictionary-encoded chunk's pages may each start at its longest
+/// dictionary entry, so each of its fences is bounded alone.
 /// `DiskChunks::checked_verification` refuses a stored record longer than
 /// this before reading it, so a record's claimed length cannot ask for
 /// more than the footer's pages, chunks, and order type allow; a footer
@@ -578,9 +579,21 @@ pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
             .fold(0, u64::saturating_add)
             .saturating_add(approx::count(groups).saturating_mul(MOST_VARINT_BYTES));
         let fence = |chunk: ColumnChunk<'_>| {
-            let pair = (approx::count(MAX_KEY_BYTES) + field).saturating_add(value(chunk) + field);
-            approx::count(chunk.page_locations().len())
-                .saturating_mul(pair)
+            let pages = approx::count(chunk.page_locations().len());
+            let framing = (approx::count(MAX_KEY_BYTES) + field).saturating_add(field);
+            let values = match (order.shape, chunk.dictionary_range()) {
+                (OrderShape::Str | OrderShape::Bin, None) => {
+                    let chunk_bytes = approx::measured(chunk.metadata().uncompressed_size());
+                    chunk_bytes.min(pages.saturating_mul(MOST_VALUE_PAGE_BYTES))
+                }
+                (OrderShape::Str | OrderShape::Bin, Some(_))
+                | (OrderShape::Int32 | OrderShape::Int64 | OrderShape::Fixed(_), _) => {
+                    pages.saturating_mul(value(chunk))
+                }
+            };
+            pages
+                .saturating_mul(framing)
+                .saturating_add(values)
                 .saturating_add(field)
         };
         chunks().map(fence).fold(facts, u64::saturating_add)
@@ -1104,7 +1117,7 @@ mod tests {
         let index = string_ordered_index().await;
         let verified = verified_of(&index);
         let cut = verified.order.as_ref().unwrap().fences.fence(0, 1).order;
-        let FencePart::Bytes(cut) = cut else {
+        let PairPart::Bytes(cut) = cut else {
             panic!("a string order value's fence is bytes");
         };
         assert_eq!(

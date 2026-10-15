@@ -19,7 +19,7 @@ use parquet::file::page_index::column_index::{
 use super::build::{
     ChunkBatches, DECODE_BATCH_RECORDS, KeyBatches, RunCheck, fixed_as_binary, is_utf8, read_column,
 };
-use super::order_fences::{Fence, FencePart, GroupFences, OrderFences, Parts};
+use super::order_fences::{GroupFences, GroupFencesBuilder, OrderFences, Pair, PairPart};
 use super::page_header::check_order_page_headers;
 use super::{
     Column, ColumnChunk, FileFault, KeyShape, Keys, OrderLeaf, OrderShape, file_fault, row_index,
@@ -73,10 +73,10 @@ impl OrderRun {
     }
 
     /// Value `at`, which is below `len`, as fences compare it.
-    fn part(&self, at: usize) -> FencePart<'_> {
+    fn part(&self, at: usize) -> PairPart<'_> {
         match self {
-            Self::Long(run) => FencePart::Long(run[at]),
-            Self::Str(run) | Self::Bin(run) => FencePart::Bytes(run[at].data()),
+            Self::Long(run) => PairPart::Long(run[at]),
+            Self::Str(run) | Self::Bin(run) => PairPart::Bytes(run[at].data()),
         }
     }
 
@@ -251,6 +251,8 @@ pub(super) struct GroupOutcome {
     /// The order values decoded fall short of the row group's rows.
     null_order: bool,
     not_utf8: bool,
+    /// The row group's order fences outgrew what they are addressed by.
+    fences_overflow: bool,
     /// The first order page a value of lies outside its column index entry.
     index_mismatch: Option<usize>,
     disorder: Option<Disorder>,
@@ -271,8 +273,10 @@ impl GroupOutcome {
     }
 
     /// The rest of what the row group `chunk` found, in order: a string
-    /// order value that is not UTF-8 (`FileFault::OrderNotUtf8`), an order
-    /// page outside its column index entry (`FileFault::OrderIndexMismatch`),
+    /// order value that is not UTF-8 (`FileFault::OrderNotUtf8`), order
+    /// fences past what they are addressed by
+    /// (`FileFault::OrderFencesOverflow`), an order page outside its column
+    /// index entry (`FileFault::OrderIndexMismatch`),
     /// then a pair not above the one before it under `table`, an equal one
     /// `RefusalReason::DuplicateRows` and a falling one
     /// `RefusalReason::Unsorted`.
@@ -281,6 +285,12 @@ impl GroupOutcome {
         let row_group = chunk.row_group();
         if self.not_utf8 {
             return Err(file_fault(path, FileFault::OrderNotUtf8 { row_group }));
+        }
+        if self.fences_overflow {
+            return Err(file_fault(
+                path,
+                FileFault::OrderFencesOverflow { row_group },
+            ));
         }
         if let Some(page) = self.index_mismatch {
             return Err(file_fault(
@@ -400,10 +410,7 @@ impl<'a> PairCheck<'a> {
         let rows = row_index(chunk.rows());
         let window = row_index(DECODE_BATCH_RECORDS);
         let mut run = RunCheck::ordered(chunk);
-        let mut fences = GroupFences::new(
-            Parts::for_key(shape, pages),
-            Parts::for_order(self.shape, pages),
-        );
+        let mut fences = GroupFencesBuilder::new(shape, self.shape, pages);
         let mut key_batches = KeyBatches::open(chunk, shape, chunks)?;
         let mut order_batches = OrderBatches::open(order_chunk, self.shape, chunks)?;
         let mut start = 0;
@@ -430,12 +437,24 @@ impl<'a> PairCheck<'a> {
         }
         key_batches.finish()?;
         order_batches.finish()?;
-        self.fences.push(fences.shrunk());
+        let group = &self.group;
+        debug_assert!(
+            group.misaligned
+                || group.not_utf8
+                || run.not_utf8()
+                || group.disorder.is_some()
+                || fences.overflowed()
+                || fences.len() == pages,
+            "a row group that passes the check has a fence per order page"
+        );
+        let fences_overflow = fences.overflowed();
+        self.fences.push(fences.finish());
         let group = std::mem::take(&mut self.group);
         self.distinct_keys.push(group.distinct);
         let outcome = GroupOutcome {
             null_order: group.values < rows,
             not_utf8: group.not_utf8,
+            fences_overflow,
             index_mismatch: group.index_mismatch,
             disorder: group.disorder,
         };
@@ -469,7 +488,7 @@ impl<'a> PairCheck<'a> {
         order_chunk: ColumnChunk<'a>,
         window: &Window<'_>,
         keys_not_utf8: bool,
-        fences: &mut GroupFences,
+        fences: &mut GroupFencesBuilder,
     ) {
         let Window {
             base,
@@ -498,16 +517,19 @@ impl<'a> PairCheck<'a> {
     /// The fence of each order page of `chunk` whose first row lies in
     /// `window`, after the pair before that row: the window's row before
     /// it, or for the window's first row the last pair compared, of the
-    /// window, row group, or file before (`Fence::between`). Every row
+    /// window, row group, or file before (`Pair::fence`). Every row
     /// counts, a row a delete names included, since fences bound positions.
     fn record_fences(
         &mut self,
         chunk: ColumnChunk<'a>,
         window: &Window<'_>,
-        fences: &mut GroupFences,
+        fences: &mut GroupFencesBuilder,
     ) {
+        if fences.overflowed() {
+            return;
+        }
         let locations = chunk.page_locations();
-        let pair = |at: usize| Fence {
+        let pair = |at: usize| Pair {
             key: window.keys.part(at),
             order: window.orders.part(at),
         };
@@ -520,9 +542,11 @@ impl<'a> PairCheck<'a> {
             };
             let previous = match at.checked_sub(1) {
                 Some(before) => Some(pair(before)),
-                None => self.last.as_ref().map(|(key, order)| Fence::of(key, order)),
+                None => self.last.as_ref().map(|(key, order)| Pair::of(key, order)),
             };
-            fences.push(Fence::between(previous, pair(at)));
+            if fences.push(Pair::fence(previous, pair(at))).is_err() {
+                return;
+            }
             self.group.fence_page += 1;
         }
     }

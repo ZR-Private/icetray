@@ -977,7 +977,9 @@ impl Planned {
     /// checked when it was built, and every key is `verify_buckets`'s to
     /// check), and beside the builds applies the snapshot's deletes
     /// (`deletes::load`), the first failure of either stopping the other,
-    /// then assembles the generation: files sorted, overlap groups found,
+    /// on an ordered table checks the Full tier's budget again against the
+    /// built files' exact resident bytes (`check_built_budget`), then
+    /// assembles the generation: files sorted, overlap groups found,
     /// and every group that gained a file or whose deletes shrank merged to
     /// refuse a duplicate live key, or on an ordered table to refuse a
     /// repeated live pair. `Err` leaves nothing behind; the caller keeps
@@ -1009,6 +1011,9 @@ impl Planned {
             ),
         )?;
         drop(reservation);
+        if self.layout.order.is_some() {
+            check_built_budget(table, &self.config, &self.reused, &built, self.delete_bound)?;
+        }
         let mut rows = applied.rows.into_iter();
         let mut shrank = applied.shrank.into_iter();
         let members: Vec<Member> = self
@@ -1491,29 +1496,10 @@ fn check_budget(
 ) -> Result<Option<Arc<Reservation>>> {
     match config.residency {
         Residency::Full => {
-            if let Some(budget) = config.resident_budget_bytes {
-                let needed = index::saturating_sum(
-                    reused
-                        .iter()
-                        .map(|file| approx::count(file.index.resident_bytes()))
-                        .chain(
-                            inspected
-                                .iter()
-                                .map(|(_, inspected)| inspected.predicted().full),
-                        )
-                        .chain([deletes]),
-                );
-                if needed > budget {
-                    return Err(Error::refused(
-                        table,
-                        RefusalReason::OverBudget {
-                            of: Budget::Resident,
-                            needed,
-                            budget,
-                        },
-                    ));
-                }
-            }
+            let new = inspected
+                .iter()
+                .map(|(_, inspected)| inspected.predicted().full);
+            check_resident(table, config, reused, new, deletes)?;
             Ok(None)
         }
         Residency::Disk => match local {
@@ -1526,6 +1512,66 @@ fn check_budget(
             Some(_) | None => Ok(None),
         },
         Residency::Bloom => Ok(None),
+    }
+}
+
+/// `config.resident_budget_bytes` of a Full-tier load, when it sets one,
+/// against the resident bytes of the `reused` files, `new`, the new files'
+/// resident bytes, and `deletes`, the bound on the applied deletes;
+/// `RefusalReason::OverBudget` carrying both numbers over it, the sum
+/// saturating (`check_budget`).
+fn check_resident(
+    table: &str,
+    config: &TableConfig,
+    reused: &[Arc<LoadedFile>],
+    new: impl IntoIterator<Item = u64>,
+    deletes: u64,
+) -> Result<()> {
+    let Some(budget) = config.resident_budget_bytes else {
+        return Ok(());
+    };
+    let needed = index::saturating_sum(
+        reused
+            .iter()
+            .map(|file| approx::count(file.index.resident_bytes()))
+            .chain(new)
+            .chain([deletes]),
+    );
+    if needed > budget {
+        return Err(Error::refused(
+            table,
+            RefusalReason::OverBudget {
+                of: Budget::Resident,
+                needed,
+                budget,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The Full tier's budget checked again once an ordered table's new files
+/// are built, with their exact resident bytes in place of the footer's
+/// prediction (RFD 025, Load): an order fence of a string or binary value
+/// keeps a prefix of its page's first value, which no footer number bounds
+/// under a dictionary-encoded column, so the prediction can fall short of
+/// the fences built. Over the budget is `RefusalReason::OverBudget` with
+/// the exact bytes; the other tiers' memory takes no budget.
+fn check_built_budget(
+    table: &str,
+    config: &TableConfig,
+    reused: &[Arc<LoadedFile>],
+    built: &[Arc<LoadedFile>],
+    deletes: u64,
+) -> Result<()> {
+    match config.residency {
+        Residency::Full => {
+            let new = built
+                .iter()
+                .map(|file| approx::count(file.index.resident_bytes()));
+            check_resident(table, config, reused, new, deletes)
+        }
+        Residency::Disk | Residency::Bloom => Ok(()),
     }
 }
 
