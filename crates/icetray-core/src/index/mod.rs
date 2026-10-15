@@ -210,12 +210,11 @@ pub enum FileFault {
     /// An order page holds a value outside its column index entry, below
     /// the entry's minimum or above its maximum, or the order column's
     /// column index of a row group describes another count of pages than
-    /// its offset index (RFD 025, Load): the check across files rules
-    /// pages out of its merge by that index, so an index that fails to
-    /// bound its pages would leave a repeated pair unread. A truncated
-    /// byte-array entry is still a bound, its
-    /// minimum a prefix of the least value and its maximum above the
-    /// greatest.
+    /// its offset index (RFD 025, Load): the check across files rules pages
+    /// out of its merge by that index, so an index that fails to bound its
+    /// pages would leave a repeated pair unread. A truncated byte-array
+    /// entry is still a bound, its minimum a prefix of the least value and
+    /// its maximum above the greatest.
     #[error(
         "page {page} of row group {row_group} holds an order value outside its column index entry"
     )]

@@ -1356,17 +1356,17 @@ impl Caps {
 }
 
 /// The capping findings `view` raises, the level they and its residency
-/// allow, per value column and for the table, and the cost of a cold
-/// lookup there (RFD 020, RFD 022): the one function the doctor's report,
-/// the load's level gate, and the cost gauges all measure a layout by, so
-/// none can disagree. Per file, a dictionary-encoded value column, named,
-/// and large key pages, and on an ordered table under `full` and `bloom` a
-/// dictionary-encoded order column; per table, files written with no bucket partition, overlapping files, and on
-/// an ordered table shared edge keys. A column's level is its own
-/// findings' caps with those of finding the row, the findings that name no
-/// column, and the residency's best level; the table's is the dearest of
-/// them all. On an ordered table, the cost of a cold Scan beside
-/// (`scan_gets`). No `f64` enters.
+/// allow, per value column and for the table, and the cost of a cold lookup
+/// there (RFD 020, RFD 022): the one function the doctor's report, the
+/// load's level gate, and the cost gauges all measure a layout by, so none
+/// can disagree. Per file, a dictionary-encoded value column, named, and
+/// large key pages, and on an ordered table under `full` and `bloom` a
+/// dictionary-encoded order column; per table, files written with no bucket
+/// partition, overlapping files, and on an ordered table shared edge keys.
+/// A column's level is its own findings' caps with those of finding the
+/// row, the findings that name no column, and the residency's best level;
+/// the table's is the dearest of them all. On an ordered table, the cost of
+/// a cold Scan beside (`scan_gets`). No `f64` enters.
 pub(crate) fn layout_caps(view: &LayoutView<'_>) -> Caps {
     let mut findings = Vec::new();
     for file in &view.files {
@@ -1951,9 +1951,9 @@ fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
 /// The per-file advice apart from the bloom filter: bounds, column index,
 /// each value column's pages (over the advice line, and over the lookup's
 /// ceiling), key length, file size, and on an ordered table the runs
-/// (`order_advice`). The one `f64` comparison is
-/// on `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero
-/// for a zero denominator), so a plain comparison is total.
+/// (`order_advice`). The one `f64` comparison is on
+/// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
+/// a zero denominator), so a plain comparison is total.
 fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
     let report = &facts.report;
     if !report.bounds_present {
@@ -2017,11 +2017,10 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 }
 
 /// An ordered table's advice on one file (RFD 025, Levels and findings):
-/// `long_runs` where a run is longer than
-/// `thresholds::RUN_ROWS_ADVICE`; and `large_runs` where that many rows of
-/// the configured value columns, at the footer's uncompressed bytes per
-/// row over the file's `rows`, are more than `thresholds::RUN_BYTES_ADVICE`,
-/// compared in integers.
+/// `long_runs` where a run is longer than `thresholds::RUN_ROWS_ADVICE`;
+/// and `large_runs` where that many rows of the configured value columns,
+/// at the footer's uncompressed bytes per row over the file's `rows`, are
+/// more than `thresholds::RUN_BYTES_ADVICE`, compared in integers.
 fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut Vec<Finding>) {
     let run_rows = u64::from(thresholds::RUN_ROWS_ADVICE);
     if order.longest_run > run_rows {
