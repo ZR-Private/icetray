@@ -1134,8 +1134,29 @@ fn bridged<'c>(
     fetches
 }
 
+/// The span of `spans` that holds `row`, and `row`'s position in it, where
+/// one does, `of` giving a span's row group, first row, and row count:
+/// spans in file order, by row group and then first row, no two holding
+/// one row, so one binary search finds it, and a lookup visits a number of
+/// spans logarithmic in theirs, however many spans a read decoded.
+fn span_holding<S>(
+    spans: &[S],
+    row: RowRef,
+    of: impl Fn(&S) -> (usize, i64, usize),
+) -> Option<(&S, usize)> {
+    let past = spans.partition_point(|span| {
+        let (row_group, start, _) = of(span);
+        (row_group, start) <= (row.row_group, row.row)
+    });
+    let span = &spans[past.checked_sub(1)?];
+    let (row_group, start, rows) = of(span);
+    let at = (row_group == row.row_group).then(|| row_index(row.row - start))?;
+    (at < rows).then_some((span, at))
+}
+
 /// The order values a read decoded: spans of rows, each its row group, its
-/// first row, and the values from it on.
+/// first row, and the values from it on, in file order, as `span_holding`
+/// finds them.
 #[derive(Default)]
 struct Orders {
     spans: Vec<(usize, i64, OrderRun)>,
@@ -1146,12 +1167,10 @@ impl Orders {
     /// The decoded values holding `row` and its position among them, where
     /// a span holds it.
     fn find(&self, row: RowRef) -> Option<(&OrderRun, usize)> {
-        self.spans.iter().find_map(|(row_group, start, values)| {
-            (*row_group == row.row_group
-                && *start <= row.row
-                && row.row - start < row_offset(values.len()))
-            .then(|| (values, row_index(row.row - start)))
+        span_holding(&self.spans, row, |(row_group, start, values)| {
+            (*row_group, *start, values.len())
         })
+        .map(|((_, _, values), at)| (values, at))
     }
 
     /// The decoded values holding `row`, which the read decoded, and its
@@ -1171,9 +1190,17 @@ impl Orders {
         self.find(row).map(|(values, at)| cut.fit_at(values, at))
     }
 
-    /// These spans and `other`'s together.
+    /// These spans and `other`'s together, in file order: the spans a read
+    /// knew before its round and those it read in it, each in file order
+    /// and holding rows the other does not.
     fn and(mut self, other: Self) -> Self {
+        let file_order = |(row_group, start, _): &(usize, i64, OrderRun)| (*row_group, *start);
+        debug_assert!(
+            self.spans.is_sorted_by_key(file_order) && other.spans.is_sorted_by_key(file_order),
+            "a read decodes spans in file order"
+        );
         self.spans.extend(other.spans);
+        self.spans.sort_unstable_by_key(file_order);
         self.from_store |= other.from_store;
         self
     }
@@ -1187,7 +1214,8 @@ struct Values {
 }
 
 /// One column's values a read decoded: spans of rows, each its row
-/// group, its first row, and the values from it on.
+/// group, its first row, and the values from it on, in file order, as
+/// `span_holding` finds them.
 struct ColumnValues {
     spans: Vec<(usize, i64, ValueRows)>,
 }
@@ -1195,16 +1223,10 @@ struct ColumnValues {
 impl ColumnValues {
     /// The value of `row`, `None` for a null; the read decoded it.
     fn value(&self, row: RowRef) -> Option<Bytes> {
-        let (at, values) = self
-            .spans
-            .iter()
-            .find_map(|(row_group, start, values)| {
-                let held = *row_group == row.row_group
-                    && *start <= row.row
-                    && row_index(row.row - start) < values.len();
-                held.then(|| (row_index(row.row - start), values))
-            })
-            .expect("the values of every row taken are read");
+        let ((_, _, values), at) = span_holding(&self.spans, row, |(row_group, start, values)| {
+            (*row_group, *start, values.len())
+        })
+        .expect("the values of every row taken are read");
         values.value(at)
     }
 }
@@ -1706,6 +1728,65 @@ mod tests {
             assert_eq!(none.rows, []);
             assert_eq!(none.next, Some(order_at(14 - FIRST_RUN_ROW)));
         }
+    }
+
+    /// Spans per row group of the span lookup test, and its row groups:
+    /// enough that a scan through them would visit far more than a binary
+    /// search does.
+    const LOOKUP_SPANS: usize = 128;
+    const LOOKUP_ROW_GROUPS: usize = 3;
+    /// Rows each span of the span lookup test holds, and rows before each
+    /// that no span holds.
+    const LOOKUP_SPAN_ROWS: i64 = 3;
+    const LOOKUP_GAP_ROWS: i64 = 2;
+
+    /// Among many spans across row groups, `span_holding` finds every row a
+    /// span holds, at its position in that span, and no row before a span,
+    /// and each lookup visits at most the spans a binary search over them
+    /// probes and the one it ends on.
+    #[test]
+    fn test_span_holding_finds_every_row_among_many_spans_in_a_binary_search() {
+        let stride = LOOKUP_SPAN_ROWS + LOOKUP_GAP_ROWS;
+        let spans: Vec<(usize, i64, usize)> = (0..LOOKUP_ROW_GROUPS)
+            .flat_map(|row_group| {
+                (0..LOOKUP_SPANS).map(move |at| {
+                    let start = i64::try_from(at).unwrap() * stride + LOOKUP_GAP_ROWS;
+                    (row_group, start, row_index(LOOKUP_SPAN_ROWS))
+                })
+            })
+            .collect();
+        // A binary search over n spans probes at most ceil(log2 n) + 1 of
+        // them, and the lookup then reads the one before where it ended.
+        let most_visits = usize::try_from(spans.len().next_power_of_two().ilog2()).unwrap() + 2;
+        let visited = std::cell::Cell::new(0);
+        let of = |span: &(usize, i64, usize)| {
+            visited.set(visited.get() + 1);
+            *span
+        };
+        let rows = i64::try_from(LOOKUP_SPANS).unwrap() * stride + LOOKUP_GAP_ROWS;
+        let mut found = 0;
+        for row_group in 0..LOOKUP_ROW_GROUPS {
+            for row in 0..rows {
+                visited.set(0);
+                let got = span_holding(&spans, RowRef { row_group, row }, of);
+                let offset = row % stride - LOOKUP_GAP_ROWS;
+                let expected = (offset >= 0).then(|| {
+                    let span = &spans[row_group * LOOKUP_SPANS + row_index(row / stride)];
+                    (span, row_index(offset))
+                });
+                assert_eq!(got, expected, "row group {row_group}, row {row}");
+                assert!(
+                    visited.get() <= most_visits,
+                    "row group {row_group}, row {row}: {} spans visited, above {most_visits}",
+                    visited.get()
+                );
+                found += usize::from(got.is_some());
+            }
+        }
+        assert_eq!(
+            found,
+            LOOKUP_ROW_GROUPS * LOOKUP_SPANS * row_index(LOOKUP_SPAN_ROWS)
+        );
     }
 
     /// Order pages of the run of the deleted-pages read, `PAGE` rows each.
