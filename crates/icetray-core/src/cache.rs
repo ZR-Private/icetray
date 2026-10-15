@@ -1594,6 +1594,28 @@ mod tests {
         (0..=u8::MAX).collect()
     }
 
+    /// The bytes `span` covers of `file`, as a store answers a span GET.
+    fn span_bytes(file: &Bytes, span: &Range<u64>) -> Bytes {
+        file.slice(approx::length(span.start)..approx::length(span.end))
+    }
+
+    /// Each page of `pages` as `span_bytes` of `file` answers it.
+    fn pages_of(file: &Bytes, pages: &[Range<u64>]) -> Vec<Bytes> {
+        pages.iter().map(|page| span_bytes(file, page)).collect()
+    }
+
+    /// Waits until span reads of `cache` have joined `joins` pages in
+    /// flight, failing past `DEADLINE_GUARD`.
+    async fn joined(cache: &PageCache, joins: u64) {
+        tokio::time::timeout(crate::storage::testing::DEADLINE_GUARD, async {
+            while cache.span_joins() < joins {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a read joins the pages another read is fetching");
+    }
+
     /// A span read that needs pages another span read is fetching waits on
     /// that fetch and runs none of its own (RFD 025, Caching and hedging):
     /// one fetch serves both reads.
@@ -1604,7 +1626,7 @@ mod tests {
         let file = span_file();
         let gate = Notify::new();
         let slow = |span: Range<u64>, _| {
-            let bytes = file.slice(approx::length(span.start)..approx::length(span.end));
+            let bytes = span_bytes(&file, &span);
             let gate = &gate;
             async move {
                 gate.notified().await;
@@ -1615,13 +1637,7 @@ mod tests {
             cache.get_span(&id, &SPAN, Issue::default(), slow),
             cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
             async {
-                tokio::time::timeout(crate::storage::testing::DEADLINE_GUARD, async {
-                    while cache.span_joins() < count(SPAN.len()) {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("the second read joins the first's pages");
+                joined(&cache, count(SPAN.len())).await;
                 gate.notify_one();
             }
         );
@@ -1650,11 +1666,7 @@ mod tests {
             futures::poll!(dropped.as_mut()).is_pending(),
             "it claims the pages"
         );
-        let answering = |span: Range<u64>, _| {
-            std::future::ready(Ok(
-                file.slice(approx::length(span.start)..approx::length(span.end))
-            ))
-        };
+        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
         let mut waiting = Box::pin(cache.get_span(&id, &SPAN, Issue::default(), answering));
         assert!(
             futures::poll!(waiting.as_mut()).is_pending(),
@@ -1663,17 +1675,134 @@ mod tests {
         assert_eq!(cache.span_joins(), count(SPAN.len()));
         drop(dropped);
         let (served, origin) = waiting.await.unwrap();
-        let expected: Vec<Bytes> = SPAN
-            .iter()
-            .map(|page| file.slice(approx::length(page.start)..approx::length(page.end)))
-            .collect();
-        assert_eq!(served, expected);
+        assert_eq!(served, pages_of(&file, &SPAN));
         assert_eq!(origin, PageOrigin::Fetched);
         assert_eq!(
             cache.fetches(),
             2,
             "the dropped read's run, and the waiter's own"
         );
+    }
+
+    /// A read reads `SPAN` of `file` through `cache` with a fetch that
+    /// answers every span whole, and returns what it served; the pages a
+    /// failure left uncached are fetched again.
+    async fn read_again(cache: &PageCache, id: &Arc<str>, file: &Bytes) -> Vec<Bytes> {
+        let fetches = cache.fetches();
+        let (served, origin) = cache
+            .get_span(id, &SPAN, Issue::default(), |span, _| {
+                std::future::ready(Ok(span_bytes(file, &span)))
+            })
+            .await
+            .unwrap();
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(
+            cache.fetches() - fetches,
+            1,
+            "nothing was cached, so the next read fetches the span again"
+        );
+        served
+    }
+
+    /// A failed run's error reaches a read that joined its pages, the one
+    /// `Arc<Error>` both receive, and caches none of them.
+    #[tokio::test]
+    async fn test_get_span_fetch_error_reaches_a_joined_read_and_caches_nothing() {
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let runs = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(Notify::new());
+        let (claimer, joiner, ()) = tokio::join!(
+            cache.get_span(&id, &SPAN, Issue::default(), |_, _| failing(&runs, &gate)),
+            cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
+            async {
+                joined(&cache, count(SPAN.len())).await;
+                gate.notify_one();
+            }
+        );
+        let Err(Error::Cache(CacheError::Fetch(failure))) = claimer else {
+            panic!("the claimer receives its fetch's failure: {claimer:?}");
+        };
+        let Err(Error::Cache(CacheError::Fetch(shared))) = joiner else {
+            panic!("the joined read receives the claimer's failure: {joiner:?}");
+        };
+        assert!(matches!(*failure, Error::NotReady { .. }));
+        assert!(Arc::ptr_eq(&failure, &shared), "one failure for both");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(read_again(&cache, &id, &file).await, pages_of(&file, &SPAN));
+    }
+
+    /// A run that outlasts its handle's fetch deadline is dropped at it, and
+    /// a read that joined its pages receives the deadline at the run's first
+    /// offset as the claimer does; nothing is cached.
+    #[tokio::test]
+    async fn test_get_span_ends_a_run_at_its_deadline_for_a_joined_read() {
+        let cache = PageCache::for_scans(ROOMY_BYTES).with_fetch_deadline(FETCH_DEADLINE);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let runs = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (claimer, joiner) = tokio::time::timeout(FETCH_GUARD, async {
+            tokio::join!(
+                cache.get_span(&id, &SPAN, Issue::default(), |_, _| stalled(
+                    &runs, &dropped
+                )),
+                cache.get_span(&id, &SPAN, Issue::default(), |_, _| never()),
+            )
+        })
+        .await
+        .expect("the run ends at its deadline, before the guard");
+        assert_eq!(
+            cache.span_joins(),
+            count(SPAN.len()),
+            "the second read joined"
+        );
+        for answer in [claimer, joiner] {
+            let Err(Error::Cache(CacheError::FetchDeadline {
+                path,
+                offset,
+                after,
+            })) = answer
+            else {
+                panic!("both reads receive the deadline: {answer:?}");
+            };
+            assert_eq!((path.as_str(), offset), (FILE_ID, SPAN[0].start));
+            assert_eq!(after, FETCH_DEADLINE);
+        }
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "the run's fetch was dropped"
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(read_again(&cache, &id, &file).await, pages_of(&file, &SPAN));
+    }
+
+    /// A run answered with fewer bytes than its range fails as a parquet
+    /// end-of-file error and caches none of its pages, the ones its bytes
+    /// cover included.
+    #[tokio::test]
+    async fn test_get_span_of_a_run_answered_short_fails_and_caches_nothing() {
+        let short_by = 5;
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let short = |span: Range<u64>, _| {
+            let whole = span_bytes(&file, &span);
+            std::future::ready(Ok(whole.slice(..whole.len() - short_by)))
+        };
+        let answer = cache.get_span(&id, &SPAN, Issue::default(), short).await;
+        let Err(Error::Cache(CacheError::Fetch(error))) = answer else {
+            panic!("a short run is a fetch failure: {answer:?}");
+        };
+        assert!(matches!(
+            *error,
+            Error::Parquet(parquet::errors::ParquetError::EOF(_))
+        ));
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(read_again(&cache, &id, &file).await, pages_of(&file, &SPAN));
     }
 
     /// The lookup cache's and the scan cache's series are their own, told
