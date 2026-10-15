@@ -281,6 +281,22 @@ enum Scenario {
     /// table only.
     #[value(name = "multi-scan-10-cold")]
     MultiScan10Cold,
+    /// A `MultiScan` of `MULTI_SCAN_100_KEYS` keys at a limit of
+    /// `MULTI_SCAN_HEAD_ROWS`, warm: each key's newest row, at the scale a
+    /// call's keys are spread over workers. Ordered table only.
+    #[value(name = "multi-scan-100")]
+    MultiScan100,
+    /// `multi-scan-100` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// table only.
+    #[value(name = "multi-scan-100-cold")]
+    MultiScan100Cold,
+    /// `multi-scan-100` of `MULTI_SCAN_1000_KEYS` keys. Ordered table only.
+    #[value(name = "multi-scan-1000")]
+    MultiScan1000,
+    /// `multi-scan-1000` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// table only.
+    #[value(name = "multi-scan-1000-cold")]
+    MultiScan1000Cold,
     /// The key-value scenarios of `BESIDE_ORDERED` on the long table of
     /// random values, in a process that also serves the ordered table over
     /// the same handles, the ordered table loaded, primed, and idle. Serves
@@ -307,7 +323,7 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 33] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -331,6 +347,10 @@ impl Scenario {
         Self::ScanBounded,
         Self::MultiScan10,
         Self::MultiScan10Cold,
+        Self::MultiScan100,
+        Self::MultiScan100Cold,
+        Self::MultiScan1000,
+        Self::MultiScan1000Cold,
         Self::KvBesideOrdered,
         Self::ScanBoundedLong,
         Self::ScanBoundedLongCold,
@@ -339,7 +359,7 @@ impl Scenario {
         Self::ScanBoundedStringCold,
     ];
 
-    const LOOKUPS: [Self; 25] = [
+    const LOOKUPS: [Self; 29] = [
         Self::WarmHit,
         Self::ColdHit,
         Self::Miss,
@@ -360,6 +380,10 @@ impl Scenario {
         Self::ScanBounded,
         Self::MultiScan10,
         Self::MultiScan10Cold,
+        Self::MultiScan100,
+        Self::MultiScan100Cold,
+        Self::MultiScan1000,
+        Self::MultiScan1000Cold,
         Self::ScanBoundedLong,
         Self::ScanBoundedLongCold,
         Self::ScanHeadLong,
@@ -388,6 +412,8 @@ impl Scenario {
             | Self::ScanWarm
             | Self::ScanBounded
             | Self::MultiScan10
+            | Self::MultiScan100
+            | Self::MultiScan1000
             | Self::KvBesideOrdered
             | Self::ScanBoundedLong
             | Self::ScanHeadLong
@@ -402,6 +428,8 @@ impl Scenario {
             | Self::MultiGet100ColdBoth
             | Self::ScanCold
             | Self::MultiScan10Cold
+            | Self::MultiScan100Cold
+            | Self::MultiScan1000Cold
             | Self::ScanBoundedLongCold
             | Self::ScanBoundedStringCold => false,
         }
@@ -420,9 +448,20 @@ impl Scenario {
                 | Self::MultiGet100ColdBoth
                 | Self::ScanCold
                 | Self::MultiScan10Cold
+                | Self::MultiScan100Cold
+                | Self::MultiScan1000Cold
                 | Self::ScanBoundedLongCold
                 | Self::ScanBoundedStringCold
         )
+    }
+
+    /// A `MultiScan` scenario's request and keys per batch
+    /// (`MULTI_SCAN_BATCHES`); `None` for any other scenario.
+    fn multi_scan_batch(self) -> Option<(TestScan, usize)> {
+        MULTI_SCAN_BATCHES
+            .iter()
+            .find(|(scenario, ..)| *scenario == self)
+            .map(|&(_, request, keys)| (request(), keys))
     }
 
     /// Whether the scenario reads `SECOND_VALUE_COLUMN` or projects
@@ -451,7 +490,11 @@ impl Scenario {
             | Self::ScanCold
             | Self::ScanBounded
             | Self::MultiScan10
+            | Self::MultiScan100
+            | Self::MultiScan1000
             | Self::MultiScan10Cold
+            | Self::MultiScan100Cold
+            | Self::MultiScan1000Cold
             | Self::KvBesideOrdered
             | Self::ScanBoundedLong
             | Self::ScanBoundedLongCold
@@ -487,7 +530,11 @@ impl Scenario {
             | Self::ScanCold
             | Self::ScanBounded
             | Self::MultiScan10
+            | Self::MultiScan100
+            | Self::MultiScan1000
             | Self::MultiScan10Cold
+            | Self::MultiScan100Cold
+            | Self::MultiScan1000Cold
             | Self::KvBesideOrdered
             | Self::ScanBoundedLong
             | Self::ScanBoundedLongCold
@@ -506,7 +553,11 @@ impl Scenario {
             | Self::ScanCold
             | Self::ScanBounded
             | Self::MultiScan10
-            | Self::MultiScan10Cold => Some(TableName::Ordered),
+            | Self::MultiScan100
+            | Self::MultiScan1000
+            | Self::MultiScan10Cold
+            | Self::MultiScan100Cold
+            | Self::MultiScan1000Cold => Some(TableName::Ordered),
             Self::ScanBoundedLong | Self::ScanBoundedLongCold | Self::ScanHeadLong => {
                 Some(TableName::OrderedLong)
             }
@@ -558,6 +609,10 @@ impl Scenario {
             Self::ScanBounded => "scan-bounded",
             Self::MultiScan10 => "multi-scan-10",
             Self::MultiScan10Cold => "multi-scan-10-cold",
+            Self::MultiScan100 => "multi-scan-100",
+            Self::MultiScan100Cold => "multi-scan-100-cold",
+            Self::MultiScan1000 => "multi-scan-1000",
+            Self::MultiScan1000Cold => "multi-scan-1000-cold",
             Self::KvBesideOrdered => "kv-beside-ordered",
             Self::ScanBoundedLong => "scan-bounded-long",
             Self::ScanBoundedLongCold => "scan-bounded-long-cold",
@@ -2089,6 +2144,58 @@ fn returned_bytes(row: &Row, columns: usize) -> Option<usize> {
 /// Keys of a `MultiScan` scenario's batch.
 const MULTI_SCAN_KEYS: usize = 10;
 
+/// A `MultiScan` scenario, the request it makes, and its keys per batch.
+type MultiScanBatch = (Scenario, fn() -> TestScan, usize);
+
+/// Each `MultiScan` scenario's request and keys per batch: whole runs of
+/// `MULTI_SCAN_KEYS` keys, or the newest row of `MULTI_SCAN_100_KEYS` or
+/// `MULTI_SCAN_1000_KEYS`, warm and cold alike.
+const MULTI_SCAN_BATCHES: [MultiScanBatch; 6] = [
+    (
+        Scenario::MultiScan10,
+        multi_scan_whole_runs,
+        MULTI_SCAN_KEYS,
+    ),
+    (
+        Scenario::MultiScan10Cold,
+        multi_scan_whole_runs,
+        MULTI_SCAN_KEYS,
+    ),
+    (
+        Scenario::MultiScan100,
+        multi_scan_heads,
+        MULTI_SCAN_100_KEYS,
+    ),
+    (
+        Scenario::MultiScan100Cold,
+        multi_scan_heads,
+        MULTI_SCAN_100_KEYS,
+    ),
+    (
+        Scenario::MultiScan1000,
+        multi_scan_heads,
+        MULTI_SCAN_1000_KEYS,
+    ),
+    (
+        Scenario::MultiScan1000Cold,
+        multi_scan_heads,
+        MULTI_SCAN_1000_KEYS,
+    ),
+];
+
+/// Keys of the `multi-scan-100` scenarios' batch: a batch of heads a
+/// caller pages through, spread over several workers' runs.
+const MULTI_SCAN_100_KEYS: usize = 100;
+
+/// Keys of the `multi-scan-1000` scenarios' batch: ten times as many, the
+/// order of the most `server.max_multi_scan_values` admits at a limit of
+/// one row.
+const MULTI_SCAN_1000_KEYS: usize = 1_000;
+
+/// Rows per key of the `multi-scan-100` and `multi-scan-1000` scenarios:
+/// each key's newest row.
+const MULTI_SCAN_HEAD_ROWS: u32 = 1;
+
 /// Rows of the bounded Scan's page: a page of a read paged by order value.
 const SCAN_PAGE_ROWS: u32 = 10;
 
@@ -2797,8 +2904,8 @@ async fn lookups(
     let scan_pool =
         |tests: &[TestScan]| ScanCase::pool(shape, tests).map(|cases| scan(&hits, cases, shape));
     let scan_one = |test| scan_pool(&[test]);
-    let scan_batch = |test| {
-        ScanCase::pool(shape, &[test]).map(|cases| multi_scan(&hits, MULTI_SCAN_KEYS, cases, shape))
+    let scan_batch = |test, keys| {
+        ScanCase::pool(shape, &[test]).map(|cases| multi_scan(&hits, keys, cases, shape))
     };
     let mut results = Vec::new();
     for &scenario in scenarios {
@@ -2825,8 +2932,18 @@ async fn lookups(
             Scenario::ScanWarm => (&warm, scan_one(TestScan::default())?),
             Scenario::ScanCold => (&cold, scan_one(TestScan::default())?),
             Scenario::ScanBounded => (&warm, scan_one(bounded_page()?)?),
-            Scenario::MultiScan10 => (&warm, scan_batch(multi_scan_whole_runs())?),
-            Scenario::MultiScan10Cold => (&cold, scan_batch(multi_scan_whole_runs())?),
+            Scenario::MultiScan10
+            | Scenario::MultiScan10Cold
+            | Scenario::MultiScan100
+            | Scenario::MultiScan100Cold
+            | Scenario::MultiScan1000
+            | Scenario::MultiScan1000Cold => {
+                let served = if scenario.is_cold() { &cold } else { &warm };
+                let (test, keys) = scenario
+                    .multi_scan_batch()
+                    .expect("a MultiScan scenario has a batch");
+                (served, scan_batch(test, keys)?)
+            }
             Scenario::ScanBoundedLong | Scenario::ScanBoundedString => {
                 (&warm, scan_pool(&bounded_in_run(shape)?)?)
             }
@@ -3003,6 +3120,16 @@ fn multi_scan_whole_runs() -> TestScan {
     let limit = ServerConfig::default().max_multi_scan_values / (MULTI_SCAN_KEYS * values_per_row);
     TestScan {
         limit: u32::try_from(limit).expect("the default limit fits u32"),
+        ..TestScan::default()
+    }
+}
+
+/// The request of the `multi-scan-100` and `multi-scan-1000` scenarios:
+/// each key's newest `MULTI_SCAN_HEAD_ROWS` rows.
+fn multi_scan_heads() -> TestScan {
+    TestScan {
+        direction: Direction::NewestFirst,
+        limit: MULTI_SCAN_HEAD_ROWS,
         ..TestScan::default()
     }
 }
@@ -3773,6 +3900,9 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "rounds_ops": ROUNDS_OPS,
         "scan_page_rows": SCAN_PAGE_ROWS,
         "multi_scan_keys": MULTI_SCAN_KEYS,
+        "multi_scan_100_keys": MULTI_SCAN_100_KEYS,
+        "multi_scan_1000_keys": MULTI_SCAN_1000_KEYS,
+        "multi_scan_head_rows": MULTI_SCAN_HEAD_ROWS,
         "multi_scan_limit": multi_scan_whole_runs().limit,
         "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
         "compression": compression,
