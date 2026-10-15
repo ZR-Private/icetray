@@ -13,6 +13,9 @@ use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
 use super::build::{OnDisk, Reuse, reusable_disk_chunks, verified_under};
+use super::order_fences::{groups_heap, long_keys, long_orders, parts_heap};
+use super::ordered::OrderVerified;
+use super::record::FenceBytes;
 use super::{
     FileFault, KeyShape, OrderLeaf, OrderShape, ResidentBytes, ResidentParts, ValueColumn,
     ValueShape, bits_per_key, file_fault, identity_of, record, saturating_sum, saturating_sum_all,
@@ -571,19 +574,23 @@ pub(super) struct ResidentSet {
     /// An ordered file's order facts (`OrderFacts`); zero for a key-value
     /// file.
     order_facts: u64,
+    /// An ordered file's order fences (`OrderFences`); zero for a
+    /// key-value file.
+    order_fences: u64,
     filters: Option<u64>,
     rows: u64,
 }
 
 /// What a built index holds exactly that the footer only estimates: its
-/// fences, and an ordered file's order facts.
-pub(super) type Built<'a> = (&'a [Vec<Key>], Option<&'a OrderFacts>);
+/// fences, and an ordered file's order facts and order fences.
+pub(super) type Built<'a> = (&'a [Vec<Key>], Option<&'a OrderVerified>);
 
 impl ResidentSet {
     /// From `metadata` of the file `handle` opens, keyed by `key_type`, its
     /// footer as kept with `order`'s leaf and `value_leaves` (`kept_footer`),
     /// with the fences and the order facts exact when `built` gives them and
-    /// estimated from the footer otherwise. A key or order chunk
+    /// estimated from the footer otherwise, the order fences as the key
+    /// fences are (`estimated_order_fences`). A key or order chunk
     /// `chunk_range` cannot place counts as zero and is left out of the
     /// chunk file, which an ordered file's order chunks are part of and
     /// which is named by the rules it is verified under (`rules_of`), and
@@ -624,7 +631,7 @@ impl ResidentSet {
                 .into_iter()
                 .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
         );
-        let mut order_facts = 0;
+        let (mut order_facts, mut order_fences) = (0, 0);
         if let Some(order) = order {
             stored.extend(
                 metadata
@@ -633,18 +640,26 @@ impl ResidentSet {
                     .filter_map(|group| chunk_range(group.column(order.leaf), file_size)),
             );
             let values = estimated_order_bytes(metadata, order);
+            let fences = estimated_order_fences(metadata, key_leaf, order);
             record = record.saturating_add(record::estimated_order_len(
                 metadata
                     .row_groups()
                     .iter()
                     .map(|group| approx::measured(group.num_rows())),
                 values,
+                fences.iter().copied(),
             ));
-            order_facts = match built.and_then(|(_, facts)| facts) {
-                Some(facts) => exact_order_fact_bytes(facts),
-                None => order_fact_bytes(
-                    metadata.num_row_groups(),
-                    values.map(|bytes| order.shape.heap_bytes(bytes)),
+            (order_facts, order_fences) = match built.and_then(|(_, order)| order) {
+                Some(order) => (
+                    exact_order_fact_bytes(&order.facts),
+                    order.fences.heap_bytes(),
+                ),
+                None => (
+                    order_fact_bytes(
+                        metadata.num_row_groups(),
+                        values.map(|bytes| order.shape.heap_bytes(bytes)),
+                    ),
+                    order_fence_bytes(&fences, long_keys(key_type), long_orders(order.shape)),
                 ),
             };
         }
@@ -670,6 +685,7 @@ impl ResidentSet {
                 |(fences, _)| exact_fence_bytes(fences),
             ),
             order_facts,
+            order_fences,
             filters,
             rows: approx::measured(metadata.file_metadata().num_rows()),
         }
@@ -720,6 +736,7 @@ impl ResidentSet {
             offset_indexes: without_column_index.saturating_sub(without_page_index),
             key_fences: self.fences,
             order_facts: self.order_facts,
+            order_fences: self.order_fences,
             key_chunks,
             filters,
         })
@@ -727,12 +744,14 @@ impl ResidentSet {
 }
 
 /// The tiers' totals from their parts, saturating as the parts do. Every
-/// tier holds an ordered file's order facts with its fences.
+/// tier holds an ordered file's order facts and order fences with its key
+/// fences.
 pub(super) fn tiers(set: &ResidentSet) -> ResidentBytes {
     let footer_and_fences = set
         .footer
         .saturating_add(set.fences)
-        .saturating_add(set.order_facts);
+        .saturating_add(set.order_facts)
+        .saturating_add(set.order_fences);
     ResidentBytes {
         full: footer_and_fences.saturating_add(set.key_chunks),
         disk_memory: footer_and_fences,
@@ -827,6 +846,68 @@ fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 
             }
         }
     }
+}
+
+/// Per row group, the order fences of the file `order` is the order column
+/// of, before any is decoded, as the record stores them (`FenceBytes`): a
+/// fence per order page from the offset index, its key at the mean bytes
+/// the row group's key fences are estimated at per key page
+/// (`estimated_fence_keys`), and its order value at eight bytes for an
+/// integer, the width for a fixed-width value, and for a byte array as the
+/// fences of a byte-array key are estimated (`byte_array_fence_heap`), from
+/// the order column's index or its chunk.
+fn estimated_order_fences(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    order: OrderLeaf,
+) -> Vec<FenceBytes> {
+    let key_fences = estimated_fence_keys(metadata, key_leaf);
+    metadata
+        .row_groups()
+        .iter()
+        .zip(key_fences)
+        .enumerate()
+        .map(|(row_group, (group, (key_pages, key_bytes)))| {
+            let pages = metadata
+                .offset_index()
+                .and_then(|index| index.get(row_group))
+                .and_then(|columns| columns.get(order.leaf))
+                .map_or(0, |column| column.page_locations().len());
+            let count = approx::count(pages);
+            let key_mean = key_bytes.checked_div(approx::count(key_pages)).unwrap_or(0);
+            let orders = match order.shape {
+                OrderShape::Int32 | OrderShape::Int64 => {
+                    count.saturating_mul(approx::count(size_of::<i64>()))
+                }
+                OrderShape::Fixed(width) => count.saturating_mul(u64::from(width)),
+                OrderShape::Str | OrderShape::Bin => {
+                    let column_index = metadata
+                        .column_index()
+                        .and_then(|index| index.get(row_group))
+                        .and_then(|columns| columns.get(order.leaf));
+                    byte_array_fence_heap(column_index, group.column(order.leaf), pages)
+                }
+            };
+            FenceBytes {
+                pages: count,
+                keys: count.saturating_mul(key_mean),
+                orders,
+            }
+        })
+        .collect()
+}
+
+/// The heap order fences of `groups` hold (`OrderFences::heap_bytes`):
+/// each row group's entry, and its parts, longs for long keys and integer
+/// order values (`long_keys`, `long_orders`) and bytes otherwise.
+fn order_fence_bytes(groups: &[FenceBytes], long_keys: bool, long_orders: bool) -> u64 {
+    groups
+        .iter()
+        .fold(groups_heap(groups.len()), |total, group| {
+            total
+                .saturating_add(parts_heap(long_keys, group.pages, group.keys))
+                .saturating_add(parts_heap(long_orders, group.pages, group.orders))
+        })
 }
 
 /// The fence array's bytes: one `Key` per key page plus what each key holds

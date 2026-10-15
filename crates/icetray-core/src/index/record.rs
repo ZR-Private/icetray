@@ -1,9 +1,9 @@
 //! The verification record (RFD 017): what `verify` established of a data
 //! file's keys (the fences, every row group's first and last key, the
 //! longest key) and, on an ordered table, of its order column (the order
-//! facts, RFD 025), encoded into the Disk tier's chunk file so that a
-//! restart rebuilds the index's view of the file without decoding a key or
-//! an order value. The chunk file's payload checksum covers the record, so
+//! facts and the order fences, RFD 025), encoded into the Disk tier's
+//! chunk file so that a restart rebuilds the index's view of the file
+//! without decoding a key or an order value. The chunk file's payload checksum covers the record, so
 //! a torn or changed one is never read; what is read is still checked
 //! against the footer before it is trusted, since every lookup indexes the
 //! footer's pages with the fences (`decode`).
@@ -14,8 +14,10 @@ use std::mem::size_of;
 use prost::Message as _;
 
 use super::build::Verified;
+use super::order_fences::{Fence, FencePart, GroupFences, OrderFences, Parts};
+use super::ordered::OrderVerified;
 use super::page_header::MOST_VALUE_PAGE_BYTES;
-use super::{Column, ColumnChunk, GroupRange, KeyShape, OrderShape};
+use super::{Column, ColumnChunk, GroupRange, KeyShape, OrderLeaf, OrderShape};
 use crate::approx;
 use crate::contract::MAX_KEY_BYTES;
 use crate::key::Key;
@@ -64,6 +66,22 @@ struct OrderRecord {
     /// The rows of the file's longest run of one key.
     #[prost(uint64, tag = "4")]
     longest_run: u64,
+    /// Per row group of the footer, in footer order, the fence of each of
+    /// its order pages.
+    #[prost(message, repeated, tag = "5")]
+    fences: Vec<FenceGroupRecord>,
+}
+
+/// One row group's order fences, in page order, as two lists of one entry
+/// per order page: each fence's key in `Key::as_bytes` form, as the row
+/// groups' keys, and its order value as the order facts hold one, a byte
+/// value the prefix the fence keeps of the page's first value.
+#[derive(Clone, PartialEq, prost::Message)]
+struct FenceGroupRecord {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    keys: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    orders: Vec<Vec<u8>>,
 }
 
 /// One row group of the record.
@@ -127,6 +145,17 @@ pub(super) enum RecordFault {
     /// holds, an order value not of the order column's type, or a least
     /// value above the greatest.
     OrderFacts,
+    /// The order fences do not describe the file: another count of row
+    /// groups, or of fences in a row group than its order pages, a key not
+    /// one of the key type or an order value not one of the order column's
+    /// or a prefix of one, a fence at or below the one before it, or one
+    /// outside its row group's keys, the first on another key than the row
+    /// group's first.
+    OrderFences {
+        /// The row group where the fences fail, or the footer's row group
+        /// count when the record holds another number of them.
+        row_group: usize,
+    },
 }
 
 impl fmt::Display for RecordFault {
@@ -139,6 +168,7 @@ impl fmt::Display for RecordFault {
             Self::Key { .. } => "key",
             Self::Order { .. } => "order",
             Self::OrderFacts => "order_facts",
+            Self::OrderFences { .. } => "order_fences",
         };
         f.write_str(name)
     }
@@ -161,14 +191,33 @@ pub(super) fn encode(verified: &Verified) -> Vec<u8> {
     VerificationRecord {
         row_groups,
         max_key_bytes: approx::count(verified.max_key_bytes),
-        order: verified.order.as_ref().map(|facts| OrderRecord {
-            min: order_bytes(&facts.min),
-            max: order_bytes(&facts.max),
-            distinct_keys: facts.distinct_keys.clone(),
-            longest_run: facts.longest_run,
+        order: verified.order.as_ref().map(|order| OrderRecord {
+            min: order_bytes(&order.facts.min),
+            max: order_bytes(&order.facts.max),
+            distinct_keys: order.facts.distinct_keys.clone(),
+            longest_run: order.facts.longest_run,
+            fences: order
+                .fences
+                .groups()
+                .iter()
+                .map(|group| FenceGroupRecord {
+                    keys: group.iter().map(|fence| part_bytes(fence.key)).collect(),
+                    orders: group.iter().map(|fence| part_bytes(fence.order)).collect(),
+                })
+                .collect(),
         }),
     }
     .encode_to_vec()
+}
+
+/// A fence's key or order value as the record stores it: a long's eight
+/// little-endian bytes, as `Key::as_bytes` and `order_bytes` store one, and
+/// bytes as they are.
+fn part_bytes(part: FencePart<'_>) -> Vec<u8> {
+    match part {
+        FencePart::Long(value) => value.to_le_bytes().to_vec(),
+        FencePart::Bytes(bytes) => bytes.to_vec(),
+    }
 }
 
 /// A key as the record stores it.
@@ -187,28 +236,32 @@ fn order_bytes(value: &OrderValue) -> Vec<u8> {
 
 /// The record in `bytes` as what `verify` of `column`, whose keys decode as
 /// `shape`, would establish under the rules `order` names, the ordered
-/// rules over an order column of that shape or the key-value rules for
-/// `None`, once it describes the file the footer does: order facts under
-/// the ordered rules alone (`order_facts`), one row group per footer row
-/// group, as many fences in each as `verify` records for the footer's key
-/// pages (`fence_count`), every key one of the key type and no longer than
-/// the longest key, which is no longer than `contract::MAX_KEY_BYTES`, and
-/// the keys in the order `verify` checks under those rules. A record that
-/// does not is the `RecordFault` it fails. The checks cost one comparison
-/// per key page and per row group, not per row.
+/// rules over that order column or the key-value rules for `None`, once it
+/// describes the file the footer does: order facts and order fences under
+/// the ordered rules alone (`order_facts`, `order_fences`), one row group
+/// per footer row group, as many fences in each as `verify` records for the
+/// footer's key pages (`fence_count`), every key one of the key type and no
+/// longer than the longest key, which is no longer than
+/// `contract::MAX_KEY_BYTES`, and the keys in the order `verify` checks
+/// under those rules. A record that does not is the `RecordFault` it fails.
+/// The checks cost one comparison per key page, per order page, and per
+/// row group, not per row.
 pub(super) fn decode(
     bytes: &[u8],
     column: &Column<'_>,
     shape: KeyShape,
-    order: Option<OrderShape>,
+    order: Option<OrderLeaf>,
 ) -> Result<Verified, RecordFault> {
     let record = VerificationRecord::decode(bytes).map_err(|error| {
         tracing::debug!(%error, path = column.path, "verification record does not decode");
         RecordFault::Undecodable
     })?;
-    let facts = match (order, record.order) {
+    let stored_order = match (order, record.order) {
         (None, None) => None,
-        (Some(shape), Some(stored)) => Some(order_facts(stored, shape, column)?),
+        (Some(order), Some(mut stored)) => {
+            let fences = std::mem::take(&mut stored.fences);
+            Some((order, order_facts(stored, order.shape, column)?, fences))
+        }
         (None, Some(_)) | (Some(_), None) => return Err(RecordFault::OrderFacts),
     };
     // Under the ordered rules a key's run may cross a page or a row-group
@@ -275,13 +328,128 @@ pub(super) fn decode(
     let has_keys = "inspect checked that the row groups sum to the file's rows, which are above zero, and that each chunk's first page starts at row zero, so a row group has a fence";
     let head = groups.first().expect(has_keys);
     let tail = groups.last().expect(has_keys);
+    let key_range = (head.first.clone(), tail.last.clone());
+    let order = match stored_order {
+        None => None,
+        Some((order, facts, stored)) => {
+            let keys = Keyed {
+                shape,
+                longest,
+                width,
+                groups: &groups,
+            };
+            let fences = order_fences(stored, column, order, &keys)?;
+            Some(OrderVerified { facts, fences })
+        }
+    };
     Ok(Verified {
-        key_range: (head.first.clone(), tail.last.clone()),
+        key_range,
         fences,
         groups,
         max_key_bytes: longest,
-        order: facts,
+        order,
     })
+}
+
+/// What a fence's key is checked against: the key column's shape, the
+/// longest key, a fixed-width column's width (`key_of`), and the row
+/// groups' first and last keys.
+struct Keyed<'a> {
+    shape: KeyShape,
+    longest: usize,
+    width: Option<usize>,
+    groups: &'a [GroupRange],
+}
+
+/// The order fences `stored` holds of `column`'s file, whose order column
+/// is `order`, once they describe it: one list per footer row group, as
+/// many fences in each as the order column's offset index gives it pages,
+/// every key one of the key type (`key_of`) and every order value one of
+/// the column's type or, for a byte value, a prefix of one (`fence_order`),
+/// the fences strictly ascending through the file, and each row group's
+/// fences within its keys, the first on its first key. Each fence's key is
+/// that of its page's first row, so these are what `verify` records.
+/// `RecordFault::OrderFences` otherwise.
+fn order_fences(
+    stored: Vec<FenceGroupRecord>,
+    column: &Column<'_>,
+    order: OrderLeaf,
+    keys: &Keyed<'_>,
+) -> Result<OrderFences, RecordFault> {
+    let total = column.metadata.num_row_groups();
+    if stored.len() != total {
+        return Err(RecordFault::OrderFences { row_group: total });
+    }
+    let order_column = Column {
+        leaf: order.leaf,
+        ..*column
+    };
+    let mut ranges = keys.groups.iter().peekable();
+    let mut groups = Vec::with_capacity(total);
+    let mut previous: Option<(Key, Vec<u8>)> = None;
+    for (row_group, stored) in stored.into_iter().enumerate() {
+        let fault = RecordFault::OrderFences { row_group };
+        let pages = order_column.group(row_group).page_locations().len();
+        if stored.keys.len() != pages || stored.orders.len() != pages {
+            return Err(fault);
+        }
+        let range = ranges.next_if(|range| range.row_group == row_group);
+        let mut group = GroupFences::new(
+            Parts::for_key(keys.shape, pages),
+            Parts::for_order(order.shape, pages),
+        );
+        for (page, (key, value)) in stored.keys.into_iter().zip(stored.orders).enumerate() {
+            let key = key_of(keys.shape, key, keys.longest, keys.width).ok_or(fault)?;
+            let within =
+                range.is_some_and(|range| (page > 0 || key == range.first) && key <= range.last);
+            if !within || !fence_order(order.shape, &value) {
+                return Err(fault);
+            }
+            let fence = Fence {
+                key: FencePart::of_key(&key),
+                order: order_part(order.shape, &value),
+            };
+            let ascending = previous.as_ref().is_none_or(|(key, value)| {
+                let before = Fence {
+                    key: FencePart::of_key(key),
+                    order: order_part(order.shape, value),
+                };
+                before < fence
+            });
+            if !ascending {
+                return Err(fault);
+            }
+            group.push(fence);
+            previous = Some((key, value));
+        }
+        groups.push(group.shrunk());
+    }
+    Ok(OrderFences::new(groups))
+}
+
+/// Whether `bytes` are a fence's order value for an order column of
+/// `shape`: eight bytes for an integer, which the record stores as a long,
+/// at most the column's width for a fixed-width value, and any bytes for a
+/// string or binary one, whose prefix may end inside a character.
+fn fence_order(shape: OrderShape, bytes: &[u8]) -> bool {
+    match shape {
+        OrderShape::Int32 | OrderShape::Int64 => bytes.len() == size_of::<i64>(),
+        OrderShape::Fixed(width) => u32::try_from(bytes.len()).is_ok_and(|len| len <= width),
+        OrderShape::Str | OrderShape::Bin => true,
+    }
+}
+
+/// A fence's order value, `bytes`, which `fence_order` admits for `shape`,
+/// as fences compare it.
+fn order_part(shape: OrderShape, bytes: &[u8]) -> FencePart<'_> {
+    match shape {
+        OrderShape::Int32 | OrderShape::Int64 => FencePart::Long(i64::from_le_bytes(
+            bytes
+                .try_into()
+                .expect("fence_order admits eight bytes alone for an integer"),
+        )),
+        OrderShape::Str | OrderShape::Bin | OrderShape::Fixed(_) => FencePart::Bytes(bytes),
+    }
 }
 
 /// The order facts `stored` holds of `column`'s file, whose order column
@@ -369,33 +537,53 @@ fn fence_count(chunk: ColumnChunk<'_>) -> usize {
 /// The longest record `encode` can write for the file `column` is in,
 /// under the rules `order` names as for `decode`: every fence and every row
 /// group's last key at `contract::MAX_KEY_BYTES`, every field at its widest
-/// framing, and under the ordered rules the order facts with each order
-/// value at the most its type holds, eight bytes for an integer, a fixed
-/// value's width, and for a string or binary value `MOST_VALUE_PAGE_BYTES`,
-/// since a value lies in one order page and an order page over that
-/// ceiling is refused (`check_order_page_headers`).
+/// framing, and under the ordered rules the order facts and an order fence
+/// per order page, each fence's key at `contract::MAX_KEY_BYTES` and each
+/// order value at the most its type holds: eight bytes for an integer, a
+/// fixed value's width, and for a string or binary value the uncompressed
+/// bytes of the column chunk it lies in, at most `MOST_VALUE_PAGE_BYTES`,
+/// the least and greatest value at the largest chunk's. A value, and a
+/// fence's prefix of one, lies in one page of one chunk, its dictionary
+/// page or a data page, and an order page over that ceiling is refused
+/// (`check_order_page_headers`), so the bound follows the footer's chunks.
 /// `DiskChunks::checked_verification` refuses a stored record longer than
 /// this before reading it, so a record's claimed length cannot ask for
-/// more than the footer's key pages and order type allow.
-pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderShape>) -> u64 {
+/// more than the footer's pages, chunks, and order type allow; a footer
+/// that understates its chunks only makes its chunk file stale.
+pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
     let groups = column.metadata.num_row_groups();
     let fences: usize = (0..groups)
         .map(|row_group| fence_count(column.group(row_group)))
         .sum();
     let field = FIELD_KEY_BYTES + MOST_VARINT_BYTES;
     let keys = approx::count(fences).saturating_add(approx::count(groups));
-    let order_bytes = order.map_or(0, |shape| {
-        let value = match shape {
+    let order_bytes = order.map_or(0, |order| {
+        let order_column = Column {
+            leaf: order.leaf,
+            ..*column
+        };
+        let value = |chunk: ColumnChunk<'_>| match order.shape {
             OrderShape::Int32 | OrderShape::Int64 => approx::count(size_of::<i64>()),
             OrderShape::Fixed(width) => u64::from(width),
-            OrderShape::Str | OrderShape::Bin => MOST_VALUE_PAGE_BYTES,
+            OrderShape::Str | OrderShape::Bin => {
+                approx::measured(chunk.metadata().uncompressed_size()).min(MOST_VALUE_PAGE_BYTES)
+            }
         };
+        let chunks = || (0..groups).map(|row_group| order_column.group(row_group));
+        let largest = chunks().map(value).max().unwrap_or(0);
         let (message, min, max, counts, longest_run) =
-            (field, value + field, value + field, field, field);
-        [message, min, max, counts, longest_run]
+            (field, largest + field, largest + field, field, field);
+        let facts = [message, min, max, counts, longest_run]
             .into_iter()
             .fold(0, u64::saturating_add)
-            .saturating_add(approx::count(groups).saturating_mul(MOST_VARINT_BYTES))
+            .saturating_add(approx::count(groups).saturating_mul(MOST_VARINT_BYTES));
+        let fence = |chunk: ColumnChunk<'_>| {
+            let pair = (approx::count(MAX_KEY_BYTES) + field).saturating_add(value(chunk) + field);
+            approx::count(chunk.page_locations().len())
+                .saturating_mul(pair)
+                .saturating_add(field)
+        };
+        chunks().map(fence).fold(facts, u64::saturating_add)
     });
     keys.saturating_mul(approx::count(MAX_KEY_BYTES) + field)
         .saturating_add(approx::count(groups).saturating_mul(field))
@@ -431,16 +619,29 @@ pub(super) fn estimated_len(groups: impl IntoIterator<Item = (u64, u64)>) -> u64
     total
 }
 
-/// The length `encode` writes for an ordered file's order facts, given
-/// the rows of each row group and the bytes the least and greatest order
-/// value hold in the record, `values`: each row group's distinct keys
-/// taken at its rows and the longest run at the file's rows, at least what
-/// either takes, so at least the record's length when the values' lengths
-/// are exact. What the Disk tier's ordered chunk file is predicted to hold
-/// for them at the footer stage (RFD 025, Load).
+/// One row group's order fences as the record stores them: the fences, and
+/// the bytes their keys and their order values hold together.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FenceBytes {
+    pub(super) pages: u64,
+    pub(super) keys: u64,
+    pub(super) orders: u64,
+}
+
+/// The length `encode` writes for an ordered file's order facts and order
+/// fences, given the rows of each row group, the bytes the least and
+/// greatest order value hold in the record, `values`, and each row group's
+/// fences, `fences`: each row group's distinct keys taken at its rows and
+/// the longest run at the file's rows, at least what either takes, and
+/// each fence's key and order value at their row group's mean lengths, as
+/// `estimated_len` takes keys, so at least the record's length when the
+/// lengths are exact, as for integer order values and keys of one width.
+/// What the Disk tier's ordered chunk file is predicted to hold for them at
+/// the footer stage (RFD 025, Load).
 pub(super) fn estimated_order_len(
     group_rows: impl IntoIterator<Item = u64>,
     values: [u64; 2],
+    fences: impl IntoIterator<Item = FenceBytes>,
 ) -> u64 {
     let framed = |len: u64| FIELD_KEY_BYTES + varint_len(len) + len;
     let (mut counts, mut rows) = (0, 0u64);
@@ -448,10 +649,21 @@ pub(super) fn estimated_order_len(
         counts += varint_len(group);
         rows = rows.saturating_add(group);
     }
+    let parts = |pages: u64, bytes: u64| match bytes.checked_div(pages) {
+        Some(mean) => pages
+            .saturating_mul(FIELD_KEY_BYTES + varint_len(mean))
+            .saturating_add(bytes),
+        None => 0,
+    };
+    let fences = fences.into_iter().fold(0, |total: u64, group| {
+        let body = parts(group.pages, group.keys).saturating_add(parts(group.pages, group.orders));
+        total.saturating_add(framed(body))
+    });
     let message = framed(values[0])
         .saturating_add(framed(values[1]))
         .saturating_add(framed(counts))
-        .saturating_add(FIELD_KEY_BYTES + varint_len(rows));
+        .saturating_add(FIELD_KEY_BYTES + varint_len(rows))
+        .saturating_add(fences);
     framed(message)
 }
 
@@ -484,6 +696,31 @@ pub(super) fn with_fences(bytes: &[u8], edit: impl FnOnce(&mut Vec<Vec<Vec<u8>>>
     record.encode_to_vec()
 }
 
+/// An ordered record's order fences as `with_order_fences` edits them.
+#[cfg(test)]
+pub(super) type StoredFences = Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>;
+
+/// `bytes`, an ordered file's record, with its order fences, per row group
+/// a list of keys and a list of order values as the record stores them,
+/// edited by `edit`: how a test makes a record whose fences do not describe
+/// the file.
+#[cfg(test)]
+pub(super) fn with_order_fences(bytes: &[u8], edit: impl FnOnce(&mut StoredFences)) -> Vec<u8> {
+    let mut record = VerificationRecord::decode(bytes).unwrap();
+    let order = record.order.as_mut().unwrap();
+    let mut fences: StoredFences = order
+        .fences
+        .drain(..)
+        .map(|group| (group.keys, group.orders))
+        .collect();
+    edit(&mut fences);
+    order.fences = fences
+        .into_iter()
+        .map(|(keys, orders)| FenceGroupRecord { keys, orders })
+        .collect();
+    record.encode_to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,7 +731,8 @@ mod tests {
     use crate::index::FileIndex;
     use crate::index::build::Verified;
     use crate::index::testing::{
-        FEW_ROWS, FIXED_KEY_BYTES, Fixture, ROW_GROUPS, contract_rows, long_orders, stepped, store,
+        FEW_ROWS, FIXED_KEY_BYTES, Fixture, Orders, ROW_GROUPS, contract_rows, long_orders,
+        stepped, store,
     };
     use crate::key::KeyType;
     use crate::order::{OrderFacts, OrderType, OrderValue};
@@ -534,7 +772,7 @@ mod tests {
             bytes,
             &index.key_column(),
             index.layout.key_shape,
-            index.layout.order.map(|order| order.shape),
+            index.layout.order,
         )
     }
 
@@ -559,9 +797,7 @@ mod tests {
         let bytes = encode(&verified);
         assert_eq!(decoded_for(&index, &bytes), Ok(verified.clone()));
         let column = index.key_column();
-        assert!(
-            count(bytes.len()) <= most_bytes(&column, index.layout.order.map(|order| order.shape))
-        );
+        assert!(count(bytes.len()) <= most_bytes(&column, index.layout.order));
         // Under key-value rules the same keys are out of order, and a
         // record carrying order facts describes no key-value file.
         assert_eq!(
@@ -586,13 +822,13 @@ mod tests {
     async fn test_decode_refuses_order_facts_that_do_not_describe_the_file() {
         let index = ordered_index().await;
         let verified = verified_of(&index);
-        let facts = verified.order.clone().unwrap();
+        let order = verified.order.clone().unwrap();
         let rows = index.metadata().row_group(0).num_rows();
         let edited = |edit: &dyn Fn(&mut OrderFacts)| {
-            let mut facts = facts.clone();
-            edit(&mut facts);
+            let mut order = order.clone();
+            edit(&mut order.facts);
             encode(&Verified {
-                order: Some(facts),
+                order: Some(order),
                 ..verified.clone()
             })
         };
@@ -780,5 +1016,121 @@ mod tests {
                 "{key_type}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_decode_refuses_order_fences_that_do_not_describe_the_file() {
+        let index = ordered_index().await;
+        let bytes = encode(&verified_of(&index));
+        let fences = index.order_fences().unwrap();
+        assert!((0..ROW_GROUPS).all(|row_group| fences.pages(row_group) > 1));
+        let later_key = |row_group: usize| {
+            let Key::Long(last) = &index.groups[row_group].last else {
+                panic!("the ordered fixture's keys are longs");
+            };
+            (last + 1).to_le_bytes().to_vec()
+        };
+        let cases = [
+            (
+                with_order_fences(&bytes, |groups| {
+                    groups.pop();
+                }),
+                RecordFault::OrderFences {
+                    row_group: ROW_GROUPS,
+                },
+            ),
+            (
+                with_order_fences(&bytes, |groups| {
+                    let (keys, orders) = &mut groups[0];
+                    keys.push(keys[0].clone());
+                    orders.push(orders[0].clone());
+                }),
+                RecordFault::OrderFences { row_group: 0 },
+            ),
+            (
+                with_order_fences(&bytes, |groups| groups[1].0[0] = later_key(1)),
+                RecordFault::OrderFences { row_group: 1 },
+            ),
+            (
+                with_order_fences(&bytes, |groups| {
+                    let last = groups[2].0.len() - 1;
+                    groups[2].0[last] = later_key(2);
+                }),
+                RecordFault::OrderFences { row_group: 2 },
+            ),
+            (
+                with_order_fences(&bytes, |groups| groups[0].1.swap(0, 1)),
+                RecordFault::OrderFences { row_group: 0 },
+            ),
+            (
+                with_order_fences(&bytes, |groups| {
+                    groups[1].1[1].pop();
+                }),
+                RecordFault::OrderFences { row_group: 1 },
+            ),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(decoded_for(&index, &bytes), Err(expected));
+        }
+    }
+
+    /// The rows per key page and order page of the string-ordered fixture.
+    const STRING_ORDER_ROWS: usize = 2_000;
+
+    /// A file of one key whose `string` order values change their second
+    /// character from an ASCII letter to a two-byte one at the second order
+    /// page, so that page's fence is cut inside a character.
+    async fn string_ordered_index() -> FileIndex {
+        let page = page_rows();
+        let orders = (0..STRING_ORDER_ROWS)
+            .map(|i| {
+                let letter = if i < page { 'a' } else { 'é' };
+                Some(format!("p{letter}{i:06}").into_bytes())
+            })
+            .collect();
+        let keys = vec![0; STRING_ORDER_ROWS];
+        let opened = store(&Fixture::ordered(&keys, Orders::Bytes(orders))).await;
+        let dir = tempfile::tempdir().unwrap();
+        opened
+            .build_ordered_in(OrderType::String, Residency::Full, dir.path())
+            .await
+            .unwrap()
+    }
+
+    /// A string order value's fence may be a prefix that is not UTF-8,
+    /// and the record keeps it byte for byte.
+    #[tokio::test]
+    async fn test_decode_of_encode_round_trips_a_string_fence_cut_inside_a_character() {
+        let index = string_ordered_index().await;
+        let verified = verified_of(&index);
+        let cut = verified.order.as_ref().unwrap().fences.fence(0, 1).order;
+        let FencePart::Bytes(cut) = cut else {
+            panic!("a string order value's fence is bytes");
+        };
+        assert_eq!(
+            cut,
+            &"pé".as_bytes()[..2],
+            "one byte past the shared prefix"
+        );
+        assert!(std::str::from_utf8(cut).is_err());
+        let bytes = encode(&verified);
+        assert_eq!(decoded_for(&index, &bytes), Ok(verified));
+    }
+
+    /// The bound on a stored record follows the footer for string and
+    /// binary order values too (load review M7): each value at most the
+    /// uncompressed bytes of its order chunk, not `MOST_VALUE_PAGE_BYTES`
+    /// for each of the least and greatest whatever the file.
+    #[tokio::test]
+    async fn test_most_bytes_bounds_string_order_values_by_their_chunks() {
+        let index = string_ordered_index().await;
+        let order = index.layout.order;
+        let most = most_bytes(&index.key_column(), order);
+        assert!(count(encode(&verified_of(&index)).len()) <= most);
+        assert!(
+            most < MOST_VALUE_PAGE_BYTES,
+            "{most} bytes for a file of {} rows",
+            index.rows()
+        );
     }
 }

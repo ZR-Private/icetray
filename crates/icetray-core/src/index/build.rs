@@ -22,15 +22,14 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
 
 use super::inspect::{bloom_ranges, column_chunk_ranges, rules_of};
-use super::ordered::PairCheck;
+use super::ordered::{OrderVerified, PairCheck};
 use super::page_header::{check_key_page_headers, check_page_headers};
 use super::pages::{ChunkPages, PageTally};
 use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, OrderLeaf, OrderShape, file_fault, group_starts, identity_of, row_index,
-    unless_panicked,
+    KeyShape, Keys, OrderLeaf, file_fault, group_starts, identity_of, row_index, unless_panicked,
 };
 use crate::blocking::on_blocking_pool;
 use crate::config::{ConfigError, ConfigViolation, Residency};
@@ -41,7 +40,6 @@ use crate::local::{
     ChunkFileLookup, ChunkRules, DiskChunks, LocalDir, LocalFault, Rejection, Reservation,
     VerifiedUnder,
 };
-use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
 
 impl Inspected {
@@ -267,12 +265,6 @@ impl KeysToVerify {
         verified_under(self.shape.key_type(), rules_of(self.order))
     }
 
-    /// The order column's shape, which the verification record's order
-    /// facts decode by; `None` on a key-value table.
-    fn order_shape(&self) -> Option<OrderShape> {
-        self.order.map(|order| order.shape)
-    }
-
     /// `verify` of this column over `chunks`, run on the blocking pool
     /// (`on_blocking_pool`): decoding every key of a file is CPU-bound
     /// work that grows with the file, and inline it would hold the async
@@ -452,7 +444,7 @@ async fn trusted(
 ) -> Result<std::result::Result<(DiskChunks, Verified), Stale>> {
     let handle = Arc::clone(&to_verify.handle);
     let metadata = Arc::clone(&to_verify.metadata);
-    let (leaf, shape, order) = (to_verify.leaf, to_verify.shape, to_verify.order_shape());
+    let (leaf, shape, order) = (to_verify.leaf, to_verify.shape, to_verify.order);
     on_blocking_pool(move || {
         let column = Column {
             metadata: &metadata,
@@ -607,8 +599,9 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 /// of any other version is stale and the file is verified again from
 /// object storage, so a result computed under other rules is never trusted.
 /// Version 2 verifies an ordered table's rows by key and order value and
-/// records its order facts (RFD 025).
-pub(super) const VERIFIER_VERSION: u32 = 2;
+/// records its order facts (RFD 025); version 3 records its order fences
+/// besides.
+pub(super) const VERIFIER_VERSION: u32 = 3;
 
 /// The verification context of this build for keys of `key_type` under
 /// `rules`.
@@ -621,7 +614,8 @@ pub(super) fn verified_under(key_type: KeyType, rules: ChunkRules) -> VerifiedUn
 }
 
 /// What verifying the key column establishes, with an ordered table's
-/// order facts, and what a Disk-tier chunk file stores of it (`record`).
+/// order facts and order fences, and what a Disk-tier chunk file stores of
+/// it (`record`).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Verified {
     pub(super) fences: Vec<Vec<Key>>,
@@ -629,7 +623,7 @@ pub(super) struct Verified {
     pub(super) key_range: (Key, Key),
     pub(super) max_key_bytes: usize,
     /// What the ordered rules recorded; `None` under the key-value rules.
-    pub(super) order: Option<OrderFacts>,
+    pub(super) order: Option<OrderVerified>,
 }
 
 /// Decodes every key of every row group from `chunks` and checks what the
@@ -672,8 +666,9 @@ fn verify(
 /// decodes. Within a row group, a decode fault stands before a null key, a
 /// null key before a null order value, that before a key and then an order
 /// value that is not UTF-8, those before an index mismatch, and that before
-/// a pair out of order. Records the order facts besides what `verify`
-/// records. The keys are read by parquet's column reader alone.
+/// a pair out of order. Records the order facts and the order fences
+/// besides what `verify` records. The keys are read by parquet's column
+/// reader alone.
 fn verify_ordered(
     table: &str,
     column: &Column<'_>,
@@ -779,7 +774,7 @@ fn verify_with(
         fences,
         groups,
         max_key_bytes: longest,
-        order: pairs.map(PairCheck::facts),
+        order: pairs.map(PairCheck::verified),
     })
 }
 
@@ -1083,6 +1078,85 @@ pub(super) fn decode_run(
     })
 }
 
+/// Every key of row group `chunk` decoded from `chunks` a batch at a time
+/// by one column reader (`ChunkBatches`), each batch as the `Keys` its
+/// shape decodes to, as `decode_run` decodes a range of them.
+pub(super) enum KeyBatches<'a> {
+    /// `INT64` keys.
+    Long(ChunkBatches<'a, Int64Type>),
+    /// `BYTE_ARRAY` keys, strings when `text`.
+    Bytes {
+        batches: ChunkBatches<'a, ByteArrayType>,
+        text: bool,
+    },
+    /// `FIXED_LEN_BYTE_ARRAY` keys, uuids when `uuid`.
+    Fixed {
+        batches: ChunkBatches<'a, FixedLenByteArrayType>,
+        uuid: bool,
+    },
+}
+
+impl<'a> KeyBatches<'a> {
+    /// The decode of every row of `chunk`, whose keys decode as `shape`.
+    pub(super) fn open(
+        chunk: ColumnChunk<'a>,
+        shape: KeyShape,
+        chunks: &Arc<Segments>,
+    ) -> Result<Self> {
+        let rows = row_index(chunk.rows());
+        let segments = Arc::clone(chunks);
+        Ok(match shape {
+            KeyShape::Long => Self::Long(ChunkBatches::open(chunk, segments, 0, rows)?),
+            KeyShape::Str | KeyShape::Bin => Self::Bytes {
+                batches: ChunkBatches::open(chunk, segments, 0, rows)?,
+                text: shape == KeyShape::Str,
+            },
+            KeyShape::FixedBin | KeyShape::Uuid => Self::Fixed {
+                batches: ChunkBatches::open(chunk, segments, 0, rows)?,
+                uuid: shape == KeyShape::Uuid,
+            },
+        })
+    }
+
+    /// The next `records` rows' keys, with how many rows were decoded
+    /// (`ChunkBatches::next`).
+    pub(super) fn next(&mut self, records: usize) -> Result<Option<(usize, Keys)>> {
+        Ok(match self {
+            Self::Long(batches) => batches
+                .next(records)?
+                .map(|(read, values, _)| (read, Keys::Long(std::mem::take(values)))),
+            Self::Bytes { batches, text } => batches.next(records)?.map(|(read, values, _)| {
+                let values = std::mem::take(values);
+                (
+                    read,
+                    if *text {
+                        Keys::Str(values)
+                    } else {
+                        Keys::Bin(values)
+                    },
+                )
+            }),
+            Self::Fixed { batches, uuid } => batches.next(records)?.map(|(read, values, _)| {
+                let keys = if *uuid {
+                    Keys::Uuid(fixed_as_uuids(values))
+                } else {
+                    Keys::Bin(fixed_as_binary(std::mem::take(values)))
+                };
+                (read, keys)
+            }),
+        })
+    }
+
+    /// `ChunkBatches::finish`.
+    pub(super) fn finish(self) -> Result<()> {
+        match self {
+            Self::Long(batches) => batches.finish(),
+            Self::Bytes { batches, .. } => batches.finish(),
+            Self::Fixed { batches, .. } => batches.finish(),
+        }
+    }
+}
+
 /// Every value of a `Keys::Str` run is UTF-8, or the file is
 /// `FileFault::KeyNotUtf8`; the other arms hold what their bytes are.
 pub(super) fn check_utf8(chunk: ColumnChunk<'_>, keys: &Keys) -> Result<()> {
@@ -1228,73 +1302,177 @@ fn read_batches_with_levels<T: ParquetDataType>(
     take: usize,
     sink: &mut LevelledSink<'_, T::T>,
 ) -> Result<()> {
-    let tally = Arc::new(Mutex::new(PageTally::default()));
-    // Unwind-safe: the page reader, the column reader, and the buffers are
-    // built inside `decode` and dropped with a panic; the footer `chunk`
-    // borrows is only read, the tally `decode` shares holds each page's
-    // record whole, written under its lock, the thread's zstd context
-    // starts each page afresh, and what the sink gathered is dropped with
-    // the error a panic becomes.
-    let decode =
-        AssertUnwindSafe(|| decode_records::<T>(chunk, segments, skip, take, &tally, sink));
-    let decoded = unless_panicked(chunk.column.path, decode, || DecodedPart::Pages {
-        row_group: chunk.row_group(),
-        page: tally.lock().unwrap_or_else(PoisonError::into_inner).taken,
-    })??;
-    let tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(page) = tally.refused {
-        return Err(chunk.page_rows_mismatch(page));
+    let mut batches = ChunkBatches::<T>::open(chunk, segments, skip, take)?;
+    let batch_records = row_index(DECODE_BATCH_RECORDS);
+    while batches.asked < take {
+        let Some((_, values, levels)) = batches.next(batch_records.min(take - batches.asked))?
+        else {
+            break;
+        };
+        sink(values, levels);
     }
-    chunk.check_pages_read(skip..skip + take, &tally.seen, decoded)
+    batches.finish()
 }
 
-/// The decode `read_column_batches` runs under `catch_unwind`: `take`
-/// records after skipping `skip`, each batch handed to `sink`, and how many
-/// records the column reader produced or the error it ended in, with what
-/// the page reader saw recorded in `tally`.
-fn decode_records<T: ParquetDataType>(
-    chunk: ColumnChunk<'_>,
-    segments: Arc<Segments>,
+/// One batch a `ChunkBatches` decoded: how many records, their values, and
+/// their definition levels.
+pub(super) type Batch<'b, V> = (usize, &'b mut Vec<V>, &'b [i16]);
+
+/// The rows of one column chunk decoded in order by one column reader, a
+/// batch at a time as the caller asks (`next`), so that the chunk's
+/// dictionary page is decoded once and each data page once however many
+/// batches the rows take, and two chunks of a row group can be decoded in
+/// lockstep. `read_column` documents what is read and checked; `finish`
+/// checks what the decode produced against the offset index once the
+/// caller stops asking. Each step runs under `catch_unwind`, a panic
+/// `FileFault::DecoderPanicked` at the last page the page reader took up,
+/// after which the decode is not driven again.
+pub(super) struct ChunkBatches<'a, T: ParquetDataType> {
+    chunk: ColumnChunk<'a>,
+    /// The first row decoded.
     skip: usize,
-    take: usize,
-    tally: &Arc<Mutex<PageTally>>,
-    sink: &mut LevelledSink<'_, T::T>,
-) -> Result<parquet::errors::Result<usize>> {
-    let descr = chunk.column.descriptor();
-    let nullable = descr.max_def_level() > 0;
-    let pages = ChunkPages::new(chunk, skip..skip + take, segments, Arc::clone(tally))?;
-    let skip = skip.checked_sub(pages.first_row()).expect(
-        "the first page read is the one holding row `skip`, and inspect checked that a chunk's first page starts at row zero",
-    );
-    let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
-    let batch_records = row_index(DECODE_BATCH_RECORDS);
-    let mut batch = Vec::new();
-    let mut def_levels = Vec::new();
-    let mut decode = || -> parquet::errors::Result<usize> {
-        let skipped = if skip > 0 {
-            reader.skip_records(skip)?
-        } else {
-            0
+    tally: Arc<Mutex<PageTally>>,
+    reader: ColumnReaderImpl<T>,
+    nullable: bool,
+    /// The records asked for so far; every record of the decode once a
+    /// skip to its first ends short, since none of them can be decoded.
+    asked: usize,
+    /// The records decoded so far.
+    decoded: usize,
+    /// The error the decode ended in.
+    failed: Option<parquet::errors::ParquetError>,
+    /// Whether the decode ended: in an error, short of the records asked
+    /// for, or by skipping short of `skip`.
+    ended: bool,
+    values: Vec<T::T>,
+    levels: Vec<i16>,
+}
+
+impl<'a, T: ParquetDataType> ChunkBatches<'a, T> {
+    /// A decode of the `take` records of `chunk` after `skip`, from
+    /// `segments`, which hold at least the pages those rows are in and the
+    /// chunk's dictionary page when it has one; no record is decoded yet.
+    pub(super) fn open(
+        chunk: ColumnChunk<'a>,
+        segments: Arc<Segments>,
+        skip: usize,
+        take: usize,
+    ) -> Result<Self> {
+        let tally = Arc::new(Mutex::new(PageTally::default()));
+        let descr = chunk.column.descriptor();
+        let nullable = descr.max_def_level() > 0;
+        // Unwind-safe: the page reader and the column reader are built
+        // inside the closure and dropped with a panic, the footer `chunk`
+        // borrows is only read, and the tally holds each page's record
+        // whole, written under its lock.
+        let opened = unless_panicked(
+            chunk.column.path,
+            AssertUnwindSafe(|| -> Result<_> {
+                let pages =
+                    ChunkPages::new(chunk, skip..skip + take, segments, Arc::clone(&tally))?;
+                let within = skip.checked_sub(pages.first_row()).expect(
+                    "the first page read is the one holding row `skip`, and inspect checked that a chunk's first page starts at row zero",
+                );
+                let mut reader: ColumnReaderImpl<T> = ColumnReaderImpl::new(descr, Box::new(pages));
+                let skipped = (within > 0).then(|| reader.skip_records(within));
+                Ok((reader, skipped.map(|skipped| (within, skipped))))
+            }),
+            || Self::panicked_at(chunk, &tally),
+        )??;
+        let (reader, skipped) = opened;
+        let mut batches = Self {
+            chunk,
+            skip,
+            tally,
+            reader,
+            nullable,
+            asked: 0,
+            decoded: 0,
+            failed: None,
+            ended: false,
+            values: Vec::new(),
+            levels: Vec::new(),
         };
-        let mut records = 0;
-        while skipped == skip && records < take {
-            batch.clear();
-            def_levels.clear();
-            let (read, _, _) = reader.read_records(
-                (take - records).min(batch_records),
-                nullable.then_some(&mut def_levels),
-                None,
-                &mut batch,
-            )?;
-            sink(&mut batch, &def_levels);
-            if read == 0 {
-                break;
+        let short = match skipped {
+            None => false,
+            Some((within, Ok(skipped))) => skipped != within,
+            Some((_, Err(error))) => {
+                batches.failed = Some(error);
+                true
             }
-            records += read;
+        };
+        if short {
+            batches.ended = true;
+            batches.asked = take;
         }
-        Ok(records)
-    };
-    Ok(decode())
+        Ok(batches)
+    }
+
+    /// The part a panic in the decode of `chunk` is reported at.
+    fn panicked_at(chunk: ColumnChunk<'_>, tally: &Mutex<PageTally>) -> DecodedPart {
+        DecodedPart::Pages {
+            row_group: chunk.row_group(),
+            page: tally.lock().unwrap_or_else(PoisonError::into_inner).taken,
+        }
+    }
+
+    /// The next `records` records, at most `DECODE_BATCH_RECORDS`: how many
+    /// were decoded, their values, nulls left out, in a buffer the caller
+    /// may read or take and that is cleared before the next batch, and
+    /// their definition levels (`read_batches_with_levels`). `None` once
+    /// the decode has ended or decodes no record; a batch short of
+    /// `records` ends it. What ended it is reported by `finish`.
+    pub(super) fn next(&mut self, records: usize) -> Result<Option<Batch<'_, T::T>>> {
+        if self.ended {
+            return Ok(None);
+        }
+        self.asked += records;
+        self.values.clear();
+        self.levels.clear();
+        let (reader, values, levels, nullable) = (
+            &mut self.reader,
+            &mut self.values,
+            &mut self.levels,
+            self.nullable,
+        );
+        // Unwind-safe: after a panic the decode is never driven again, what
+        // the buffers hold is dropped with the error it becomes, the tally
+        // holds each page's record whole, written under its lock, and the
+        // thread's zstd context starts each page afresh.
+        let read = unless_panicked(
+            self.chunk.column.path,
+            AssertUnwindSafe(|| {
+                reader.read_records(records, nullable.then_some(levels), None, values)
+            }),
+            || Self::panicked_at(self.chunk, &self.tally),
+        )?;
+        let read = match read {
+            Ok((read, _, _)) => read,
+            Err(error) => {
+                self.failed = Some(error);
+                self.ended = true;
+                return Ok(None);
+            }
+        };
+        self.decoded += read;
+        self.ended = read < records;
+        Ok((read > 0).then_some((read, &mut self.values, &self.levels[..])))
+    }
+
+    /// Whether the decode produced what was asked for: the records asked
+    /// for, from exactly the pages the offset index names for them, each
+    /// holding the rows the index gives it (`ColumnChunk::check_pages_read`);
+    /// a page refused for a header that claims more values than its rows is
+    /// `FileFault::PageRowsMismatch` at that page.
+    pub(super) fn finish(self) -> Result<()> {
+        let tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(page) = tally.refused {
+            return Err(self.chunk.page_rows_mismatch(page));
+        }
+        let decoded = self.failed.map_or(Ok(self.decoded), Err);
+        self.chunk
+            .check_pages_read(self.skip..self.skip + self.asked, &tally.seen, decoded)
+    }
 }
 
 /// Exactly row `row` of the value column chunk `chunk` from `segments`:
@@ -1399,13 +1577,17 @@ mod tests {
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
         WireType,
     };
+    use crate::index::{Fence, FencePart};
     use crate::key::KeyType;
     use crate::local::testing as local_testing;
+    use crate::manifest::TableLayout;
     use crate::manifest::testing::KEY_COLUMN;
     use crate::order::{OrderFacts, OrderType, OrderValue};
     use parquet::basic::PageType;
     use parquet::file::page_index::column_index::ColumnIndexMetaData;
     use parquet::file::properties::WriterVersion;
+    use rand::rngs::StdRng;
+    use rand::{RngExt as _, SeedableRng as _};
 
     /// Rows per row group in the hand-written fixtures with two row groups.
     const TINY_GROUP_ROWS: usize = 2;
@@ -3782,7 +3964,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            verified.order.unwrap().max,
+            verified.order.unwrap().facts.max,
             OrderValue::Str(String::from_utf8(long_text(2).unwrap()).unwrap())
         );
     }
@@ -3951,5 +4133,487 @@ mod tests {
                 .unwrap(),
             "a key-value build leaves the ordered chunk file"
         );
+    }
+
+    /// Rows per page in the fence fixtures: a few, so a file has many
+    /// order pages, at which runs start and continue alike.
+    const FENCE_PAGE_ROWS: usize = 5;
+    /// Rows per row group in the fence fixtures.
+    const FENCE_GROUP_ROWS: usize = 40;
+    /// The rows a fence fixture draws: three row groups.
+    const FENCE_ROWS: usize = 3 * FENCE_GROUP_ROWS;
+    /// The most rows a drawn key's run takes.
+    const LONGEST_DRAWN_RUN: usize = 12;
+    /// The most a drawn key, or a drawn long order value, steps by.
+    const MOST_DRAWN_STEP: i64 = 3;
+    /// The bytes every drawn string key and string order value starts
+    /// with (Review Focus 3): adjacent pages then differ only past it.
+    const SHARED_PREFIX_BYTES: usize = 64;
+    /// The letters a drawn string order value's suffix is spelled in, and
+    /// its longest suffix: few, so one suffix is often a prefix of the next.
+    const SUFFIX_LETTERS: &[u8] = b"ab";
+    const LONGEST_SUFFIX: usize = 3;
+    /// The seeds the fence property test draws from, one table each.
+    const FENCE_SEEDS: u64 = 12;
+
+    /// A fence fixture's pairs, sorted by key and then order value: runs
+    /// of random lengths, long keys or string keys sharing
+    /// `SHARED_PREFIX_BYTES`, and long order values or string ones sharing
+    /// as many, each run's strings drawn from short suffixes so that one
+    /// is often a prefix of the next.
+    fn drawn_pairs(
+        rng: &mut StdRng,
+        string_keys: bool,
+        string_orders: bool,
+    ) -> Vec<(Key, OrderValue)> {
+        let prefix = "p".repeat(SHARED_PREFIX_BYTES);
+        let mut pairs = Vec::with_capacity(FENCE_ROWS);
+        let mut key = 0;
+        while pairs.len() < FENCE_ROWS {
+            key += rng.random_range(1..=MOST_DRAWN_STEP);
+            let run = rng
+                .random_range(1..=LONGEST_DRAWN_RUN)
+                .min(FENCE_ROWS - pairs.len());
+            let orders: Vec<OrderValue> = if string_orders {
+                let mut suffixes: Vec<String> = (0..run)
+                    .map(|_| {
+                        let len = rng.random_range(0..=LONGEST_SUFFIX);
+                        (0..len)
+                            .map(|_| {
+                                char::from(
+                                    SUFFIX_LETTERS[rng.random_range(0..SUFFIX_LETTERS.len())],
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                suffixes.sort();
+                suffixes.dedup();
+                suffixes
+                    .into_iter()
+                    .map(|suffix| OrderValue::Str(format!("{prefix}{suffix}")))
+                    .collect()
+            } else {
+                let mut order = rng.random_range(-MOST_DRAWN_STEP..=MOST_DRAWN_STEP);
+                (0..run)
+                    .map(|_| {
+                        order += rng.random_range(1..=MOST_DRAWN_STEP);
+                        OrderValue::Long(order)
+                    })
+                    .collect()
+            };
+            let key = if string_keys {
+                Key::Str(format!("{prefix}{key:06}"))
+            } else {
+                Key::Long(key)
+            };
+            pairs.extend(orders.into_iter().map(|order| (key.clone(), order)));
+        }
+        pairs
+    }
+
+    /// `pairs` as an ordered fixture of `FENCE_PAGE_ROWS` rows a page and
+    /// `FENCE_GROUP_ROWS` a row group, with the layout to build it under.
+    fn fence_fixture(pairs: &[(Key, OrderValue)]) -> (Fixture, TableLayout) {
+        let (key_type, column) = match &pairs[0].0 {
+            Key::Str(_) => (KeyType::String, KeyColumn::Utf8),
+            Key::Long(_) | Key::Bytes(_) | Key::Uuid(_) => (KeyType::Long, KeyColumn::Int64),
+        };
+        let mut fixture = Fixture::with_keys(
+            column,
+            pairs.iter().map(|(key, _)| Some(key.clone())).collect(),
+        );
+        let order_type = match &pairs[0].1 {
+            OrderValue::Long(_) => {
+                fixture.orders = Some(Orders::Long(
+                    pairs
+                        .iter()
+                        .map(|(_, order)| match order {
+                            OrderValue::Long(value) => Some(*value),
+                            OrderValue::Str(_) | OrderValue::Bytes(_) => None,
+                        })
+                        .collect(),
+                ));
+                OrderType::Long
+            }
+            OrderValue::Str(_) | OrderValue::Bytes(_) => {
+                fixture.orders = Some(Orders::Bytes(
+                    pairs
+                        .iter()
+                        .map(|(_, order)| match order {
+                            OrderValue::Str(text) => Some(text.clone().into_bytes()),
+                            OrderValue::Long(_) | OrderValue::Bytes(_) => None,
+                        })
+                        .collect(),
+                ));
+                OrderType::String
+            }
+        };
+        fixture.layout.page_rows = FENCE_PAGE_ROWS;
+        fixture.layout.write_batch = FENCE_PAGE_ROWS;
+        fixture.layout.row_group_rows = FENCE_GROUP_ROWS;
+        (fixture, ordered_layout(key_type, order_type))
+    }
+
+    /// What the fence property test saw across its fixtures: order pages,
+    /// pages whose first row starts a key, pages whose first row continues
+    /// the key before it, and byte fences cut short of the page's first
+    /// value and cut past the shared prefix.
+    #[derive(Default)]
+    struct FencesSeen {
+        pages: usize,
+        new_keys: usize,
+        continued: usize,
+        cut_short: usize,
+        past_prefix: usize,
+    }
+
+    /// Asserts that `index`'s order fences fence `pairs`, its rows: one per
+    /// order page, each above the pair before its page's first row and at
+    /// or below that row's pair, on that row's exact key, with its order
+    /// value exact for a long and otherwise a prefix of the row's that one
+    /// byte fewer would leave at or below the pair before (or empty, where
+    /// there is none on the key); and that `page_of` places every row's
+    /// pair on the page holding the row.
+    fn assert_fences_fence(index: &FileIndex, pairs: &[(Key, OrderValue)], seen: &mut FencesSeen) {
+        let fences = index.order_fences().unwrap();
+        let metadata = index.metadata();
+        let order_leaf = index.order_leaf().unwrap();
+        let pair = |row: usize| Fence::of(&pairs[row].0, &pairs[row].1);
+        let path = location();
+        assert_eq!(fences.row_groups(), metadata.num_row_groups());
+        let mut start = 0;
+        for row_group in 0..metadata.num_row_groups() {
+            let locations =
+                metadata.offset_index().unwrap()[row_group][order_leaf].page_locations();
+            assert_eq!(fences.pages(row_group), locations.len());
+            for (page, location) in locations.iter().enumerate() {
+                let row = start + row_index(location.first_row_index);
+                let (fence, first) = (fences.fence(row_group, page), pair(row));
+                let previous = row.checked_sub(1).map(pair);
+                assert!(fence <= first, "row {row}: {fence:?} above {first:?}");
+                assert!(
+                    previous.is_none_or(|previous| previous < fence),
+                    "row {row}"
+                );
+                assert_eq!(fence.key, first.key, "row {row}: the key is exact");
+                let continues = previous.is_some_and(|previous| previous.key == first.key);
+                seen.pages += 1;
+                seen.new_keys += usize::from(!continues);
+                seen.continued += usize::from(continues);
+                match (fence.order, first.order) {
+                    (FencePart::Long(kept), FencePart::Long(exact)) => assert_eq!(kept, exact),
+                    (FencePart::Bytes(cut), FencePart::Bytes(whole)) => {
+                        assert!(whole.starts_with(cut), "row {row}");
+                        if let Some(shorter) = cut.len().checked_sub(1) {
+                            let previous = previous.expect("a cut value follows a row on its key");
+                            let shorter = Fence {
+                                order: FencePart::Bytes(&cut[..shorter]),
+                                ..fence
+                            };
+                            assert!(
+                                shorter <= previous,
+                                "row {row}: {cut:?} is not the shortest"
+                            );
+                        } else {
+                            assert!(!continues, "row {row}: an empty value starts a key");
+                        }
+                        seen.cut_short += usize::from(cut.len() < whole.len());
+                        seen.past_prefix += usize::from(cut.len() > SHARED_PREFIX_BYTES);
+                    }
+                    (kept, exact) => panic!("row {row}: {kept:?} fences {exact:?}"),
+                }
+            }
+            let rows = row_index(metadata.row_group(row_group).num_rows());
+            let order_chunk = Column {
+                metadata,
+                leaf: order_leaf,
+                path: &path,
+            }
+            .group(row_group);
+            for row in 0..rows {
+                assert_eq!(
+                    fences.page_of(row_group, pair(start + row)),
+                    Some(order_chunk.page_holding(row)),
+                    "row {row} of row group {row_group}"
+                );
+            }
+            start += rows;
+        }
+    }
+
+    /// Every order fence of random runs (RFD 025, Load; Review Focus 3),
+    /// over long and string keys and long and string order values that
+    /// share a long prefix, sorts above the last pair of the page before
+    /// its page and at or below its page's first pair, is the shortest such
+    /// pair, and places every row on its page.
+    #[tokio::test]
+    async fn test_verify_ordered_fences_bound_every_order_page_with_the_shortest_pair() {
+        let mut seen = FencesSeen::default();
+        for seed in 0..FENCE_SEEDS {
+            for (string_keys, string_orders) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let pairs = drawn_pairs(&mut rng, string_keys, string_orders);
+                let (fixture, layout) = fence_fixture(&pairs);
+                let opened = store(&fixture).await;
+                let index = opened
+                    .build_under(&layout, Residency::Full, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    index.metadata().num_row_groups(),
+                    FENCE_ROWS / FENCE_GROUP_ROWS
+                );
+                assert_fences_fence(&index, &pairs, &mut seen);
+            }
+        }
+        assert!(seen.pages > 0 && seen.new_keys > 0 && seen.continued > 0);
+        assert!(
+            seen.cut_short > 0,
+            "some byte fence is cut short of its row's value"
+        );
+        assert!(
+            seen.past_prefix > 0,
+            "some byte fence is cut past the shared prefix"
+        );
+    }
+
+    /// Verification decodes each column's dictionary once per row group,
+    /// and each page once, under the ordered rules as under the key-value
+    /// rules (load review M3): a row group of several decode windows, over
+    /// dictionary-encoded key and order columns, hands each column reader
+    /// its dictionary page once.
+    #[tokio::test]
+    async fn test_verify_decodes_each_dictionary_once_per_row_group() {
+        use super::super::pages::{HANDED, Handed};
+        const WINDOWS: usize = 3;
+        let rows = row_index(DECODE_BATCH_RECORDS) * WINDOWS;
+        // Distinct keys, which the key-value rules admit too.
+        let pairs: Vec<(i64, i64)> = (0..i64::try_from(rows).unwrap())
+            .map(|i| (i, i % 2))
+            .collect();
+        let mut fixture = ordered_of(&pairs);
+        fixture.layout.row_group_rows = rows;
+        fixture.layout.dictionary = Dictionary::All;
+        let opened = store(&fixture).await;
+        let layout = ordered_layout(KeyType::Long, OrderType::Long);
+        let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
+            .await
+            .unwrap();
+        let metadata = Arc::clone(&inspected.metadata);
+        assert_eq!(metadata.num_row_groups(), 1);
+        let order = inspected.layout.order.unwrap();
+        let ranges = inspected
+            .layout
+            .verified_ranges(&metadata, opened.handle.size());
+        let parts = fetch_chunk_parts(&opened.handle, &ranges).await.unwrap();
+        let chunks = Arc::new(Segments::new(parts, opened.handle.size()));
+        let path = location();
+        let column = Column {
+            metadata: &metadata,
+            leaf: inspected.layout.key_leaf,
+            path: &path,
+        };
+        let key_chunk = column.group(0);
+        let order_chunk = Column {
+            leaf: order.leaf,
+            ..column
+        }
+        .group(0);
+        assert!(key_chunk.dictionary_range().is_some() && order_chunk.dictionary_range().is_some());
+        let data_pages = key_chunk.page_locations().len() + order_chunk.page_locations().len();
+        let handed = || HANDED.with(std::cell::Cell::get);
+        let before = handed();
+        verify_ordered(TABLE, &column, KeyShape::Long, order, &chunks).unwrap();
+        let after = handed();
+        assert_eq!(
+            Handed {
+                dictionaries: after.dictionaries - before.dictionaries,
+                data: after.data - before.data,
+            },
+            Handed {
+                dictionaries: 2,
+                data: data_pages,
+            }
+        );
+        let before = handed();
+        verify(TABLE, &column, KeyShape::Long, &chunks).unwrap();
+        let after = handed();
+        assert_eq!(
+            Handed {
+                dictionaries: after.dictionaries - before.dictionaries,
+                data: after.data - before.data,
+            },
+            Handed {
+                dictionaries: 1,
+                data: key_chunk.page_locations().len(),
+            },
+            "the key-value rules read the key column alone, once"
+        );
+    }
+
+    /// A file whose writer left out the order column's column index loads
+    /// in every tier, with the fences the same rows get with one (Review
+    /// Focus 2): the fences come from the rows, not from the index.
+    #[tokio::test]
+    async fn test_build_ordered_without_an_order_column_index_gets_its_fences_from_the_rows() {
+        let mut rng = StdRng::seed_from_u64(FENCE_SEEDS);
+        for string_orders in [false, true] {
+            let pairs = drawn_pairs(&mut rng, false, string_orders);
+            let (mut fixture, layout) = fence_fixture(&pairs);
+            let indexed = store(&fixture).await;
+            fixture.layout.order_statistics = Some(EnabledStatistics::Chunk);
+            let unindexed = store(&fixture).await;
+            let oracle = indexed
+                .build_under(&layout, Residency::Full, None)
+                .await
+                .unwrap();
+            for residency in Residency::ALL {
+                let dir = tempfile::tempdir().unwrap();
+                let local = testing::local_dir(dir.path(), unindexed.stats(), None);
+                let local = (residency == Residency::Disk).then_some(&local);
+                let index = unindexed
+                    .build_under(&layout, residency, local)
+                    .await
+                    .unwrap();
+                let order_leaf = index.order_leaf().unwrap();
+                assert!(
+                    index.metadata().column_index().is_none_or(|index| index
+                        .iter()
+                        .all(|group| matches!(group[order_leaf], ColumnIndexMetaData::NONE))),
+                    "{residency}: no order column index"
+                );
+                assert_eq!(index.order_fences(), oracle.order_fences(), "{residency}");
+                let mut seen = FencesSeen::default();
+                assert_fences_fence(&index, &pairs, &mut seen);
+                assert!(seen.pages > 0);
+            }
+        }
+    }
+
+    /// A Disk-tier restart over a trusted ordered chunk file restores the
+    /// fences the first load recorded (Review Focus 4), with the footer
+    /// the only GET and no chunk read back, so no order value decoded.
+    #[tokio::test]
+    async fn test_disk_tier_restart_restores_identical_order_fences_without_a_get_or_a_decode() {
+        let mut rng = StdRng::seed_from_u64(FENCE_SEEDS + 1);
+        for (string_keys, string_orders) in [(false, false), (true, true)] {
+            let pairs = drawn_pairs(&mut rng, string_keys, string_orders);
+            let (fixture, layout) = fence_fixture(&pairs);
+            let opened = store(&fixture).await;
+            let dir = tempfile::tempdir().unwrap();
+            let local = testing::local_dir(dir.path(), opened.stats(), None);
+            let first = opened
+                .build_under(&layout, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            let fences = first.order_fences().unwrap();
+            assert!(fences.pages(0) > 1);
+            let reads = opened.stats().local_reads();
+            let restarted = store_file(opened.file.clone()).await;
+            let reused = restarted
+                .build_under(&layout, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            assert_eq!(restarted.stats().gets(), 1, "the footer only");
+            assert_eq!(
+                opened.stats().local_reads(),
+                reads,
+                "no chunk was read back to be decoded"
+            );
+            assert_eq!(reused.order_fences(), Some(fences));
+            assert_eq!(reused.order_facts(), first.order_facts());
+        }
+    }
+
+    /// An ordered chunk file this build does not trust is treated as
+    /// absent and rebuilt with its fences: one of the previous format
+    /// version, one verified under the previous rules, and one whose record
+    /// holds no fences, as a file of the previous version did. The rebuilt
+    /// file is trusted by the restart after it.
+    #[tokio::test]
+    async fn test_disk_tier_rebuilds_an_ordered_chunk_file_of_the_previous_version() {
+        type Edit = fn(&std::path::Path);
+        let layout = ordered_layout(KeyType::Long, OrderType::Long);
+        let cases: [(&str, Edit, Stale); 3] = [
+            (
+                "previous format version",
+                |path| local_testing::set_version_byte(path, local_testing::PREVIOUS_VERSION),
+                Stale::Rejected(Rejection::UnsupportedVersion {
+                    version: local_testing::PREVIOUS_VERSION,
+                }),
+            ),
+            (
+                "previous verifier version",
+                |path| local_testing::set_verifier_version(path, VERIFIER_VERSION - 1),
+                Stale::VerifierVersion {
+                    stored: VERIFIER_VERSION - 1,
+                },
+            ),
+            (
+                "record without fences",
+                |path| {
+                    local_testing::edit_verification(path, |bytes| {
+                        *bytes = record::with_order_fences(bytes, Vec::clear);
+                    });
+                },
+                Stale::Record(RecordFault::OrderFences {
+                    row_group: ROW_GROUPS,
+                }),
+            ),
+        ];
+        let pairs: Vec<(i64, i64)> = (0..i64::try_from(contract_rows()).unwrap())
+            .map(|i| (i / 3, i % 3))
+            .collect();
+        let opened = store(&ordered_of(&pairs)).await;
+        let oracle = opened
+            .build_under(&layout, Residency::Full, None)
+            .await
+            .unwrap();
+        for (case, edit, stale) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let local = testing::local_dir(dir.path(), opened.stats(), None);
+            let index = opened
+                .build_under(&layout, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            edit(&local.chunk_path(&identity_of(&opened.handle), index.chunk_rules()));
+            let restarted = store_file(opened.file.clone()).await;
+            let mut inspected = FileIndex::inspect(TABLE, Arc::clone(&restarted.handle), &layout)
+                .await
+                .unwrap();
+            assert_eq!(
+                inspected.trusted_key_range(&local).await.unwrap(),
+                None,
+                "{case}"
+            );
+            let Some(Err(Some(found))) = inspected.reuse.clone() else {
+                panic!("{case}: the chunk file is stale");
+            };
+            assert_eq!(found, stale, "{case}");
+            let rebuilt = inspected
+                .build(Residency::Disk, Some(&local), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted.stats().gets(),
+                1 + 2 * count(ROW_GROUPS),
+                "{case}: the footer, then every key and order chunk"
+            );
+            assert_eq!(rebuilt.order_fences(), oracle.order_fences(), "{case}");
+            let again = store_file(opened.file.clone()).await;
+            let reused = again
+                .build_under(&layout, Residency::Disk, Some(&local))
+                .await
+                .unwrap();
+            assert_eq!(
+                again.stats().gets(),
+                1,
+                "{case}: the rebuilt file is trusted"
+            );
+            assert_eq!(reused.order_fences(), oracle.order_fences(), "{case}");
+        }
     }
 }

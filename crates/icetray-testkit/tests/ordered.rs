@@ -6,7 +6,7 @@
 //! reads; the calls each table kind refuses; and the cache a Scan's pages
 //! stay in.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use iceberg::spec::{FormatVersion, Literal, PrimitiveType};
 use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
-    ColumnRead, Direction, Error, Key, KeyType, OrderValue, ScanBounds, ScanRow, Scanned,
-    TableKind, bucket,
+    ColumnRead, Direction, Error, Fence, Key, KeyType, LoadedFile, OrderValue, ScanBounds, ScanRow,
+    Scanned, TableKind, bucket,
 };
 use icetray_testkit::fixture::{
     HandSnapshot, ONE_BUCKET, SECOND_VALUE_COLUMN, SchemaChange, StatedDefault, TWO_BUCKETS,
@@ -567,6 +567,139 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
     );
     assert!(truncated, "some table's column index is truncated");
     assert!(unindexed, "some table's order column has no column index");
+    Ok(())
+}
+
+/// Random tables the fence test draws.
+const FENCE_INSTANCES: usize = 12;
+
+/// One row of a data file as the oracle reads it: its key, its order value,
+/// and whether a delete names it.
+struct FileRow {
+    key: Key,
+    order: OrderValue,
+    deleted: bool,
+}
+
+/// Every row of every live data file `oracle` read, by file path, in
+/// position order, deleted rows included.
+fn rows_by_file(oracle: &MergeOracle) -> HashMap<String, Vec<FileRow>> {
+    let mut by_position: HashMap<String, Vec<(u64, FileRow)>> = HashMap::new();
+    for key in oracle.keys() {
+        for copy in oracle.copies(key) {
+            let row = FileRow {
+                key: key.clone(),
+                order: copy
+                    .order
+                    .clone()
+                    .expect("an ordered file's row has an order value"),
+                deleted: copy.deleted,
+            };
+            by_position
+                .entry(copy.path.clone())
+                .or_default()
+                .push((copy.position, row));
+        }
+    }
+    by_position
+        .into_iter()
+        .map(|(path, mut rows)| {
+            rows.sort_unstable_by_key(|(position, _)| *position);
+            let positions = rows.iter().map(|(position, _)| *position);
+            assert!(
+                positions.eq(0..count(rows.len())),
+                "{path}: every position once"
+            );
+            (path, rows.into_iter().map(|(_, row)| row).collect())
+        })
+        .collect()
+}
+
+/// Asserts that `file`'s order fences bound its order pages over `rows`,
+/// every row of the file: each fence above the pair before its page's
+/// first row and at or below that row's, and every row placed on the page
+/// holding it. The pages fenced, and those whose first row, or the row
+/// before it, a delete names.
+fn assert_fences_bound(file: &LoadedFile, rows: &[FileRow]) -> (usize, usize) {
+    let index = &file.index;
+    let fences = index
+        .order_fences()
+        .expect("an ordered file has order fences");
+    let metadata = index.metadata();
+    let leaf = index
+        .order_leaf()
+        .expect("an ordered file has an order column");
+    let pair = |row: usize| Fence::of(&rows[row].key, &rows[row].order);
+    let (mut pages, mut at_deleted, mut start) = (0, 0, 0);
+    for row_group in 0..metadata.num_row_groups() {
+        let locations = metadata
+            .offset_index()
+            .expect("a served file has an offset index")[row_group][leaf]
+            .page_locations();
+        assert_eq!(fences.pages(row_group), locations.len());
+        let first_rows: Vec<usize> = locations
+            .iter()
+            .map(|location| {
+                let first = usize::try_from(location.first_row_index);
+                start + first.expect("inspect checked first rows non-negative")
+            })
+            .collect();
+        for (page, &row) in first_rows.iter().enumerate() {
+            let fence = fences.fence(row_group, page);
+            assert!(fence <= pair(row), "{} page {page}", file.entry.path);
+            if let Some(before) = row.checked_sub(1) {
+                assert!(pair(before) < fence, "{} page {page}", file.entry.path);
+                at_deleted += usize::from(rows[before].deleted || rows[row].deleted);
+            }
+            pages += 1;
+        }
+        let group_rows = usize::try_from(metadata.row_group(row_group).num_rows())
+            .expect("inspect checked row counts non-negative");
+        for row in start..start + group_rows {
+            let holding = first_rows.partition_point(|&first| first <= row) - 1;
+            assert_eq!(
+                fences.page_of(row_group, pair(row)),
+                Some(holding),
+                "{} row {row}",
+                file.entry.path
+            );
+        }
+        start += group_rows;
+    }
+    assert_eq!(start, rows.len(), "{}", file.entry.path);
+    (pages, at_deleted)
+}
+
+/// Every order fence of every file of a drawn table, served in every tier,
+/// bounds its order page against all of the file's rows, the rows a delete
+/// names included, since fences bound positions (RFD 025, Load): above the
+/// pair before the page's first row and at or below that row's, and every
+/// row placed on the page holding it.
+#[tokio::test]
+async fn test_order_fences_bound_every_page_of_every_file_deleted_rows_included() -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(SCAN_SEED ^ 2);
+    let (mut pages, mut at_deleted, mut files_with_deleted) = (0, 0, 0);
+    let mut kinds = HashSet::new();
+    for instance in 0..FENCE_INSTANCES {
+        let drawn = draw_table(&mut rng, instance).await?;
+        kinds.insert(format!("{:?}", drawn.kind));
+        let oracle = MergeOracle::read(&drawn.fixture).await?;
+        let rows = rows_by_file(&oracle);
+        let tiers = serve_drawn(&drawn).await?;
+        for (_, served) in tiers.all() {
+            for file in &served.current().files {
+                let rows = &rows[&file.entry.path];
+                let (fenced, deleted) = assert_fences_bound(file, rows);
+                pages += fenced;
+                at_deleted += deleted;
+                files_with_deleted += usize::from(rows.iter().any(|row| row.deleted));
+            }
+        }
+    }
+    assert!(pages > 0, "the files have order pages");
+    assert!(files_with_deleted > 0, "some file holds deleted rows");
+    assert!(at_deleted > 0, "some page starts at or after a deleted row");
+    assert!(kinds.len() > 1, "several order kinds: {kinds:?}");
     Ok(())
 }
 

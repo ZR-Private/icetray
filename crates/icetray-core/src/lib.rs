@@ -58,8 +58,8 @@ pub use error::{
 };
 pub use generation::{Generation, LoadedFile, Lookup, MultiLookup, Row};
 pub use index::{
-    ChunkPage, DecodedPart, FileFault, FileIndex, HeaderField, PageHeaderFault, PageRef,
-    ResidentBytes, ResidentParts, WireType,
+    ChunkPage, DecodedPart, Fence, FencePart, FileFault, FileIndex, HeaderField, OrderFences,
+    PageHeaderFault, PageRef, ResidentBytes, ResidentParts, WireType,
 };
 pub use key::{Key, KeyBytes, KeyType};
 pub use level::{FALL_PER_MILLE, Level, PAGE_CACHE_SAMPLE_INTERVAL, PER_MILLE, RECOVER_PER_MILLE};

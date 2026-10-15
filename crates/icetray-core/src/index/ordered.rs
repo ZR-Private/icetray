@@ -2,9 +2,10 @@
 //! order column decoded beside its key column, every row's key and order
 //! value strictly above the row's before it, across pages and row groups
 //! alike, each order page's values within its column index entry, and the
-//! order facts recorded on the way; and, since the entries are then checked
-//! bounds, which pages an entry rules out of a range of order values. A
-//! key-value table never reaches this module.
+//! order facts and the order fences (`order_fences`) recorded on the way;
+//! and, since the entries are then checked bounds, which pages an entry
+//! rules out of a range of order values. A key-value table never reaches
+//! this module.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -16,8 +17,9 @@ use parquet::file::page_index::column_index::{
 };
 
 use super::build::{
-    DECODE_BATCH_RECORDS, RunCheck, decode_run, fixed_as_binary, is_utf8, read_column,
+    ChunkBatches, DECODE_BATCH_RECORDS, KeyBatches, RunCheck, fixed_as_binary, is_utf8, read_column,
 };
+use super::order_fences::{Fence, FencePart, GroupFences, OrderFences, Parts};
 use super::page_header::check_order_page_headers;
 use super::{
     Column, ColumnChunk, FileFault, KeyShape, Keys, OrderLeaf, OrderShape, file_fault, row_index,
@@ -67,6 +69,14 @@ impl OrderRun {
                     .expect("a run of strings is read back once is_utf8 holds for it"),
             ),
             Self::Bin(run) => OrderValue::Bytes(run[at].data().to_vec()),
+        }
+    }
+
+    /// Value `at`, which is below `len`, as fences compare it.
+    fn part(&self, at: usize) -> FencePart<'_> {
+        match self {
+            Self::Long(run) => FencePart::Long(run[at]),
+            Self::Str(run) | Self::Bin(run) => FencePart::Bytes(run[at].data()),
         }
     }
 
@@ -146,6 +156,83 @@ pub(super) fn decode_orders(
             read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?,
         )),
     })
+}
+
+/// Every order value of row group `chunk` decoded a batch at a time by one
+/// column reader (`ChunkBatches`), each batch as the `OrderRun` its shape
+/// decodes to, as `decode_orders` decodes a range of them.
+enum OrderBatches<'a> {
+    Int32(ChunkBatches<'a, Int32Type>),
+    Int64(ChunkBatches<'a, Int64Type>),
+    /// `BYTE_ARRAY` values, strings when `text`.
+    Bytes {
+        batches: ChunkBatches<'a, ByteArrayType>,
+        text: bool,
+    },
+    Fixed(ChunkBatches<'a, FixedLenByteArrayType>),
+}
+
+impl<'a> OrderBatches<'a> {
+    /// The decode of every row of `chunk`, whose values decode as `shape`.
+    fn open(chunk: ColumnChunk<'a>, shape: OrderShape, chunks: &Arc<Segments>) -> Result<Self> {
+        let rows = row_index(chunk.rows());
+        let segments = Arc::clone(chunks);
+        Ok(match shape {
+            OrderShape::Int32 => Self::Int32(ChunkBatches::open(chunk, segments, 0, rows)?),
+            OrderShape::Int64 => Self::Int64(ChunkBatches::open(chunk, segments, 0, rows)?),
+            OrderShape::Str | OrderShape::Bin => Self::Bytes {
+                batches: ChunkBatches::open(chunk, segments, 0, rows)?,
+                text: shape == OrderShape::Str,
+            },
+            OrderShape::Fixed(_) => Self::Fixed(ChunkBatches::open(chunk, segments, 0, rows)?),
+        })
+    }
+
+    /// The next `records` rows' values, with how many rows were decoded
+    /// (`ChunkBatches::next`).
+    fn next(&mut self, records: usize) -> Result<Option<(usize, OrderRun)>> {
+        Ok(match self {
+            Self::Int32(batches) => batches.next(records)?.map(|(read, values, _)| {
+                (
+                    read,
+                    OrderRun::Long(values.iter().copied().map(i64::from).collect()),
+                )
+            }),
+            Self::Int64(batches) => batches
+                .next(records)?
+                .map(|(read, values, _)| (read, OrderRun::Long(std::mem::take(values)))),
+            Self::Bytes { batches, text } => batches.next(records)?.map(|(read, values, _)| {
+                let values = std::mem::take(values);
+                let run = if *text {
+                    OrderRun::Str(values)
+                } else {
+                    OrderRun::Bin(values)
+                };
+                (read, run)
+            }),
+            Self::Fixed(batches) => batches.next(records)?.map(|(read, values, _)| {
+                (read, OrderRun::Bin(fixed_as_binary(std::mem::take(values))))
+            }),
+        })
+    }
+
+    /// `ChunkBatches::finish`.
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Int32(batches) => batches.finish(),
+            Self::Int64(batches) => batches.finish(),
+            Self::Bytes { batches, .. } => batches.finish(),
+            Self::Fixed(batches) => batches.finish(),
+        }
+    }
+}
+
+/// What the ordered rules record of a file that passed them (RFD 025,
+/// Load): its order facts and its order fences.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct OrderVerified {
+    pub(super) facts: OrderFacts,
+    pub(super) fences: OrderFences,
 }
 
 /// How a row's pair fails to be above the pair before it.
@@ -232,6 +319,8 @@ struct GroupState {
     not_utf8: bool,
     /// The order page of the row last checked against the column index.
     page: usize,
+    /// The order page whose fence is next to be recorded.
+    fence_page: usize,
     index_mismatch: Option<usize>,
     disorder: Option<Disorder>,
 }
@@ -241,7 +330,8 @@ struct GroupState {
 /// keys and order values is held however long the row group is: whether
 /// each row's key and order value are above the row's before it, the last
 /// pair carried across windows and row groups, whether each order value
-/// lies within its page's column index entry, and the order facts.
+/// lies within its page's column index entry, the order facts, and each
+/// order page's fence.
 pub(super) struct PairCheck<'a> {
     /// The order column.
     column: Column<'a>,
@@ -250,6 +340,8 @@ pub(super) struct PairCheck<'a> {
     max: Option<OrderValue>,
     distinct_keys: Vec<u64>,
     longest_run: u64,
+    /// The fences of the row groups checked, in footer order.
+    fences: Vec<GroupFences>,
     /// The pair of the last row compared, and the rows of its key's run.
     last: Option<(Key, OrderValue)>,
     run: u64,
@@ -270,6 +362,7 @@ impl<'a> PairCheck<'a> {
             max: None,
             distinct_keys: Vec::with_capacity(keys.metadata.num_row_groups()),
             longest_run: 0,
+            fences: Vec::with_capacity(keys.metadata.num_row_groups()),
             last: None,
             run: 0,
             group: GroupState::default(),
@@ -277,14 +370,17 @@ impl<'a> PairCheck<'a> {
     }
 
     /// Every key of row group `chunk`, whose keys decode as `shape`, and
-    /// every order value beside it, decoded from `chunks` a window of
-    /// `DECODE_BATCH_RECORDS` rows at a time and checked: the keys by
-    /// `RunCheck` with the ordered rules, which leave their order to this
-    /// check, and the pairs here. Every order page header of the row group
-    /// is checked first (`check_order_page_headers`), as the key pages'
-    /// are. A window starting inside a page decodes that page from its
-    /// start again, and a dictionary-encoded chunk decodes its dictionary
-    /// once a window.
+    /// every order value beside it, decoded from `chunks` by one column
+    /// reader per column in lockstep, a window of `DECODE_BATCH_RECORDS`
+    /// rows at a time, and checked: the keys by `RunCheck` with the ordered
+    /// rules, which leave their order to this check, and the pairs here,
+    /// each order page's fence recorded at its first row. Every order page
+    /// header of the row group is checked first (`check_order_page_headers`),
+    /// as the key pages' are. Each column's dictionary page is decoded once
+    /// for the row group and each page once, whatever windows it spans. A
+    /// decode fault stands before anything the windows found, the key
+    /// column's before the order column's when both end in one, each at the
+    /// rows it was asked for.
     pub(super) fn check_group<'k>(
         &mut self,
         chunk: ColumnChunk<'k>,
@@ -304,23 +400,37 @@ impl<'a> PairCheck<'a> {
         let rows = row_index(chunk.rows());
         let window = row_index(DECODE_BATCH_RECORDS);
         let mut run = RunCheck::ordered(chunk);
+        let mut fences = GroupFences::new(
+            Parts::for_key(shape, pages),
+            Parts::for_order(self.shape, pages),
+        );
+        let mut key_batches = KeyBatches::open(chunk, shape, chunks)?;
+        let mut order_batches = OrderBatches::open(order_chunk, self.shape, chunks)?;
         let mut start = 0;
         while start < rows {
-            let end = rows.min(start + window);
-            let range = super::row_offset(start)..super::row_offset(end);
-            let keys = decode_run(chunk, shape, range.clone(), Arc::clone(chunks))?;
-            let orders = decode_orders(order_chunk, self.shape, range, Arc::clone(chunks))?;
+            let wanted = window.min(rows - start);
+            let Some((read, keys)) = key_batches.next(wanted)? else {
+                break;
+            };
+            let Some((order_read, orders)) = order_batches.next(wanted)? else {
+                break;
+            };
+            if read != wanted || order_read != wanted {
+                break;
+            }
             run.visit(&keys);
-            self.visit(
-                order_chunk,
-                start,
-                end - start,
-                &keys,
-                &orders,
-                run.not_utf8(),
-            );
-            start = end;
+            let batch = Window {
+                base: start,
+                rows: wanted,
+                keys: &keys,
+                orders: &orders,
+            };
+            self.visit(order_chunk, &batch, run.not_utf8(), &mut fences);
+            start += wanted;
         }
+        key_batches.finish()?;
+        order_batches.finish()?;
+        self.fences.push(fences.shrunk());
         let group = std::mem::take(&mut self.group);
         self.distinct_keys.push(group.distinct);
         let outcome = GroupOutcome {
@@ -333,31 +443,40 @@ impl<'a> PairCheck<'a> {
     }
 
     /// What the check recorded of a file whose every row group passed it.
-    pub(super) fn facts(self) -> OrderFacts {
+    pub(super) fn verified(self) -> OrderVerified {
         let has_rows = "inspect checked that the row groups sum to the file's rows, which are above zero, so an order value was decoded";
-        OrderFacts {
-            min: self.min.expect(has_rows),
-            max: self.max.expect(has_rows),
-            distinct_keys: self.distinct_keys,
-            longest_run: self.longest_run,
+        OrderVerified {
+            facts: OrderFacts {
+                min: self.min.expect(has_rows),
+                max: self.max.expect(has_rows),
+                distinct_keys: self.distinct_keys,
+                longest_run: self.longest_run,
+            },
+            fences: OrderFences::new(self.fences),
         }
     }
 
-    /// The next window of the row group: its `rows` rows from row `base`
-    /// on, their `keys` and `orders`. Nothing more is compared once a window
-    /// holds a null in either column, a key that is not UTF-8
-    /// (`keys_not_utf8`, which `RunCheck` found), or an order value that is
-    /// not, since a refusal or a fault then stands; the column index is
-    /// checked past a disorder, since a fault stands before a refusal.
+    /// The next window of the row group. Nothing more is compared or
+    /// fenced once a window holds a null in either column, a key that is
+    /// not UTF-8 (`keys_not_utf8`, which `RunCheck` found), or an order
+    /// value that is not, since a refusal or a fault then stands; the
+    /// column index is checked past a disorder, since a fault stands before
+    /// a refusal. Each order page starting in the window has its fence
+    /// recorded into `fences` before the window's pairs are compared,
+    /// against the pair before it.
     fn visit(
         &mut self,
         order_chunk: ColumnChunk<'a>,
-        base: usize,
-        rows: usize,
-        keys: &Keys,
-        orders: &OrderRun,
+        window: &Window<'_>,
         keys_not_utf8: bool,
+        fences: &mut GroupFences,
     ) {
+        let Window {
+            base,
+            rows,
+            keys,
+            orders,
+        } = *window;
         self.group.values += orders.len();
         if keys.len() != rows || orders.len() != rows {
             self.group.misaligned = true;
@@ -371,7 +490,40 @@ impl<'a> PairCheck<'a> {
         }
         self.check_index(order_chunk, base, orders);
         if self.group.disorder.is_none() {
+            self.record_fences(order_chunk, window, fences);
             self.check_pairs(keys, orders);
+        }
+    }
+
+    /// The fence of each order page of `chunk` whose first row lies in
+    /// `window`, after the pair before that row: the window's row before
+    /// it, or for the window's first row the last pair compared, of the
+    /// window, row group, or file before (`Fence::between`). Every row
+    /// counts, a row a delete names included, since fences bound positions.
+    fn record_fences(
+        &mut self,
+        chunk: ColumnChunk<'a>,
+        window: &Window<'_>,
+        fences: &mut GroupFences,
+    ) {
+        let locations = chunk.page_locations();
+        let pair = |at: usize| Fence {
+            key: window.keys.part(at),
+            order: window.orders.part(at),
+        };
+        while let Some(location) = locations.get(self.group.fence_page) {
+            let Some(at) = row_index(location.first_row_index)
+                .checked_sub(window.base)
+                .filter(|at| *at < window.rows)
+            else {
+                break;
+            };
+            let previous = match at.checked_sub(1) {
+                Some(before) => Some(pair(before)),
+                None => self.last.as_ref().map(|(key, order)| Fence::of(key, order)),
+            };
+            fences.push(Fence::between(previous, pair(at)));
+            self.group.fence_page += 1;
         }
     }
 
@@ -464,6 +616,17 @@ impl<'a> PairCheck<'a> {
             }
         }
     }
+}
+
+/// One window of a row group's rows as `PairCheck` visits it: `rows` rows
+/// from row `base` on, their keys and order values, a value per row unless
+/// a column holds a null.
+#[derive(Clone, Copy)]
+struct Window<'w> {
+    base: usize,
+    rows: usize,
+    keys: &'w Keys,
+    orders: &'w OrderRun,
 }
 
 /// The column index entry of `chunk`, an order column chunk; `None` when

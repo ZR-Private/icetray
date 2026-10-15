@@ -11,6 +11,7 @@
 
 mod build;
 mod inspect;
+mod order_fences;
 mod ordered;
 mod page_header;
 mod pages;
@@ -48,6 +49,8 @@ use crate::parquet_io::{FileHandle, Segments};
 use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one, read_rows};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
+pub use order_fences::{Fence, FencePart, OrderFences};
+use ordered::OrderVerified;
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
@@ -344,10 +347,10 @@ impl std::fmt::Display for DecodedPart {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct ResidentBytes {
     /// Footer, page indexes, key chunks, and fences, and an ordered
-    /// table's order facts.
+    /// table's order facts and order fences.
     pub full: u64,
     /// Footer, page indexes, and fences, and an ordered table's order
-    /// facts: the memory the disk tier keeps.
+    /// facts and order fences: the memory the disk tier keeps.
     pub disk_memory: u64,
     /// The chunk file the disk tier writes, its envelope and header, its
     /// verification record, and the key chunks, with an ordered table's
@@ -356,7 +359,7 @@ pub struct ResidentBytes {
     /// load.
     pub disk_bytes: u64,
     /// Footer, page indexes, filters, and fences, and an ordered table's
-    /// order facts.
+    /// order facts and order fences.
     pub bloom: Option<u64>,
     /// Filter bits per row of the file; the bloom tier's miss cost follows
     /// it. Per row, not per distinct key, on an ordered table too: the
@@ -388,7 +391,7 @@ impl ResidentBytes {
 
 /// One built file's resident memory by part (`FileIndex::resident_parts`),
 /// under the definitions of `FileIndex::predicted_resident_bytes` with the
-/// fences and the order facts exact. The parts sum to
+/// fences, the order facts, and the order fences exact. The parts sum to
 /// `FileIndex::resident_bytes`, and a part the index's tier does not hold
 /// is zero. Each page index part is the memory the kept footer loses
 /// without it, the order column's column index taken out first, then the
@@ -411,6 +414,9 @@ pub struct ResidentParts {
     pub key_fences: u64,
     /// An ordered file's order facts; zero on a key-value table.
     pub order_facts: u64,
+    /// An ordered file's order fences, one per order page; zero on a
+    /// key-value table.
+    pub order_fences: u64,
     /// The key column's chunks, which Full holds; zero in the other tiers.
     pub key_chunks: u64,
     /// The key column's bloom filters, which Bloom holds; zero in the
@@ -428,6 +434,7 @@ impl ResidentParts {
             self.offset_indexes,
             self.key_fences,
             self.order_facts,
+            self.order_fences,
             self.key_chunks,
             self.filters,
         ])
@@ -446,6 +453,7 @@ impl ResidentParts {
             offset_indexes: self.offset_indexes.saturating_add(other.offset_indexes),
             key_fences: self.key_fences.saturating_add(other.key_fences),
             order_facts: self.order_facts.saturating_add(other.order_facts),
+            order_fences: self.order_fences.saturating_add(other.order_fences),
             key_chunks: self.key_chunks.saturating_add(other.key_chunks),
             filters: self.filters.saturating_add(other.filters),
         }
@@ -564,6 +572,15 @@ impl Keys {
             }
             Self::Bin(run) => Key::Bytes(run[at].data().to_vec()),
             Self::Uuid(run) => Key::Uuid(run[at]),
+        }
+    }
+
+    /// Key `at`, which is below `len`, as fences compare it.
+    pub(crate) fn part(&self, at: usize) -> FencePart<'_> {
+        match self {
+            Self::Long(run) => FencePart::Long(run[at]),
+            Self::Str(run) | Self::Bin(run) => FencePart::Bytes(run[at].data()),
+            Self::Uuid(run) => FencePart::Bytes(&run[at]),
         }
     }
 
@@ -863,10 +880,10 @@ pub struct FileIndex {
     /// The exact first and last key of the file.
     key_range: (Key, Key),
     max_key_bytes: usize,
-    /// What verifying an ordered file's order column recorded (RFD 025);
-    /// `None` on a key-value table. The column's offset index and column
-    /// index stay in the kept footer.
-    order: Option<OrderFacts>,
+    /// What verifying an ordered file's order column recorded, its order
+    /// facts and its order fences (RFD 025); `None` on a key-value table.
+    /// The column's offset index and column index stay in the kept footer.
+    order: Option<OrderVerified>,
     rows: i64,
 }
 
@@ -924,7 +941,7 @@ impl FileIndex {
     /// filters. Every tier keeps the footer, both page indexes of the key
     /// column and of an ordered table's order column, the offset index of
     /// every value column the table serves, the fences, and an ordered
-    /// table's order facts; the column index of every other
+    /// table's order facts and order fences; the column index of every other
     /// column, the value columns' above all, and the offset index of every
     /// column the table does not serve, are never resident (RFD 004, RFD
     /// 017, RFD 022, RFD 025).
@@ -1017,9 +1034,11 @@ impl FileIndex {
     /// has loaded its footer), except that the record, a key per key page,
     /// is exact only for keys of one width (longs, uuids, a fixed-width
     /// binary column) and estimated as the fences are for string and binary
-    /// keys, `key_type` saying which, and an ordered file's order facts in
-    /// it are estimated at no less than what they take: each row group's
-    /// distinct keys as its rows, the longest run as the file's rows. Every
+    /// keys, `key_type` saying which, an ordered file's order facts in it
+    /// are estimated at no less than what they take: each row group's
+    /// distinct keys as its rows, the longest run as the file's rows, and
+    /// its order fences, one per order page, as the order fences in memory
+    /// are. Every
     /// total saturates at `u64::MAX` rather than wrapping. Estimated: the
     /// fences, one `Key` per key page plus, for `BYTE_ARRAY` keys, the
     /// page's minimum from the column index when the file has one, which a
@@ -1029,8 +1048,12 @@ impl FileIndex {
     /// an ordered file's order facts, a `u64` per row group and the least
     /// and greatest order value, exact for integer and fixed-width order
     /// values and estimated for string and binary ones as the fences of
-    /// such keys are (RFD 025, Load). `resident_bytes` shares the
-    /// definitions.
+    /// such keys are; and an ordered file's order fences, one per order
+    /// page from the offset index, a key at the mean bytes the row group's
+    /// key fences take per key page and an order value exact for an integer,
+    /// at the column's width for a fixed-width value, and estimated for a
+    /// string or binary one as the fences of such keys are (RFD 025, Load).
+    /// `resident_bytes` shares the definitions.
     pub(crate) fn predicted_resident_bytes(
         metadata: &ParquetMetaData,
         key_leaf: usize,
@@ -1130,7 +1153,15 @@ impl FileIndex {
     /// order value, each row group's distinct keys, and the longest run
     /// (RFD 025, Load); `None` on a key-value table.
     pub fn order_facts(&self) -> Option<&OrderFacts> {
-        self.order.as_ref()
+        self.order.as_ref().map(|order| &order.facts)
+    }
+
+    /// The order fences: per row group, the fence of each order page, by
+    /// which a pair of key and order value is placed on the page holding it
+    /// (`OrderFences::page_of`, `OrderFences::page_pairs`; RFD 025, Load);
+    /// `None` on a key-value table.
+    pub fn order_fences(&self) -> Option<&OrderFences> {
+        self.order.as_ref().map(|order| &order.fences)
     }
 
     /// The rules the file was verified under, which name its Disk-tier
@@ -1241,7 +1272,7 @@ impl FileIndex {
     }
 
     /// The parts `resident_bytes` and `resident_parts` are made of, with
-    /// the fences and the order facts exact.
+    /// the fences, the order facts, and the order fences exact.
     fn resident_set(&self) -> ResidentSet {
         ResidentSet::from_footer(
             &self.metadata,

@@ -6,7 +6,7 @@
 //! serves it; the page cache's disk level serves evicted pages and survives
 //! a restart.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,8 +19,8 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, DataFileIdentity, Direction, Error, FindingLog, KeyType, LocalDir, RefusalReason, Row,
-    ScanBounds, Storage,
+    Budget, DataFileIdentity, Direction, Error, FindingLog, KeyType, LocalDir, OrderFences,
+    RefusalReason, Row, ScanBounds, Storage,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
@@ -207,6 +207,72 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
             "key {key}"
         );
     }
+    Ok(())
+}
+
+/// The digits the ordered restart fixture pads its string order values to:
+/// a long prefix every value shares, which the fences cut past.
+const PADDED_ORDER_DIGITS: u32 = 64;
+
+/// Rows per key of the ordered restart fixture: a few, varying, so a
+/// file's runs start and continue across its order pages.
+fn a_few_rows(id: u64) -> u64 {
+    2 + id % 3
+}
+
+/// Every served file's order fences, by data file path.
+fn fences_of(served: &Served) -> BTreeMap<String, OrderFences> {
+    served
+        .current()
+        .files
+        .iter()
+        .map(|file| {
+            let fences = file
+                .index
+                .order_fences()
+                .expect("an ordered file has fences");
+            (file.entry.path.clone(), fences.clone())
+        })
+        .collect()
+}
+
+/// A Disk restart over an ordered table's trusted chunk files restores
+/// every file's order fences as the first load recorded them (RFD 025,
+/// Load), fetching metadata and footers alone and reading nothing back from
+/// a chunk file, so no order value is decoded.
+#[tokio::test]
+async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let ordered = Ordered {
+        kind: OrderKind::PaddedStr(PADDED_ORDER_DIGITS),
+        rows_per_key: a_few_rows,
+        start: 0,
+        step: 1,
+    };
+    let spec = FixtureSpec::ordered("ordered_disk_restart", KeyType::String, ordered);
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let files = count(fixture.file_count());
+    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let first = fences_of(&served?);
+    assert_eq!(count(first.len()), files);
+    assert!(
+        first
+            .values()
+            .any(|fences| (0..fences.row_groups()).any(|row_group| fences.pages(row_group) > 1)),
+        "a file has several order pages"
+    );
+    drop(local);
+
+    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let restarted = fences_of(&served?);
+    assert_eq!(
+        storage.stats().gets(),
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + files,
+        "metadata and footers only: every chunk file is trusted"
+    );
+    assert_eq!(storage.stats().local_reads(), 0, "no chunk is read back");
+    assert_eq!(restarted, first);
     Ok(())
 }
 

@@ -41,6 +41,24 @@ thread_local! {
     static ZSTD: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The pages this thread's `ChunkPages` handed to a column reader, the
+    /// dictionary pages and the data pages: what a test counts a decode's
+    /// pages by.
+    pub(super) static HANDED: std::cell::Cell<Handed> = const {
+        std::cell::Cell::new(Handed { dictionaries: 0, data: 0 })
+    };
+}
+
+/// Pages handed to a column reader (`HANDED`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Handed {
+    pub(super) dictionaries: usize,
+    pub(super) data: usize,
+}
+
 /// What a `ChunkPages` saw, shared with the `read_column` call that reads
 /// through it, since the column reader owns the page reader.
 #[derive(Default)]
@@ -309,6 +327,15 @@ impl PageReader for ChunkPages {
             return Ok(None);
         };
         self.tally().taken = Some(planned.page);
+        #[cfg(test)]
+        HANDED.with(|handed| {
+            let mut count = handed.get();
+            match planned.page {
+                ChunkPage::Dictionary => count.dictionaries += 1,
+                ChunkPage::Data(_) => count.data += 1,
+            }
+            handed.set(count);
+        });
         let page = self.read(&planned)?;
         if page.is_data_page() {
             self.tally().seen.push(approx::length(page.num_values()));
