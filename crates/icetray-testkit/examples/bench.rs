@@ -27,8 +27,9 @@
 //! rounds of GETs it waited on (`RoundsStore`); plus the wall time, CPU
 //! time, allocations, reads, and peak resident set of a load, of a load
 //! over the chunk files a Disk load left (a restart), and of a refresh,
-//! with an ordered table's rounds of GETs, the resident index's bytes by
-//! part, and the chunk files' bytes.
+//! with an ordered table's rounds of GETs and the bytes its uniqueness
+//! merge held, the resident index's bytes by part, and the chunk files'
+//! bytes.
 //! Results print as a table and are written as JSON under `--out-dir`. Run
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
@@ -796,6 +797,14 @@ struct Cli {
     /// Loads, and refreshes, per table and tier.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
     load_rounds: u32,
+    /// Rows per row group of the tables written, the writer's default when
+    /// absent. The manifest records it, so a table recorded under another
+    /// value is written again; another `--data-dir` keeps both.
+    #[arg(
+        long,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    row_group_rows: Option<usize>,
     /// Where the tables are written and, on later runs, reused from.
     #[arg(long, default_value = "target/bench/tables")]
     data_dir: PathBuf,
@@ -883,6 +892,14 @@ fn set_serving(cli: &Cli) {
 /// `SERVING`, or the defaults before `main` sets it.
 fn serving() -> Serving {
     SERVING.get().cloned().unwrap_or_default()
+}
+
+/// The run's `--row-group-rows`.
+static ROW_GROUP_ROWS: OnceLock<Option<usize>> = OnceLock::new();
+
+/// `ROW_GROUP_ROWS`, or the writer's default before `main` sets it.
+fn row_group_rows() -> Option<usize> {
+    ROW_GROUP_ROWS.get().copied().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,8 +1398,17 @@ impl TableShape {
     /// most), and for the scattered table files rolled at
     /// `SCATTERED_FILE_BYTES`; for the string-ordered table the column
     /// index cut to `ORDER_INDEX_TRUNCATE_BYTES`, and for the rolled table
-    /// files rolled at `ROLLED_FILE_BYTES`.
+    /// files rolled at `ROLLED_FILE_BYTES`; every table's row groups of the
+    /// run's `--row-group-rows` when it sets them.
     fn layout(self) -> FileLayout {
+        FileLayout {
+            row_group_rows: row_group_rows(),
+            ..self.table_layout()
+        }
+    }
+
+    /// `layout` before the run's `--row-group-rows`.
+    fn table_layout(self) -> FileLayout {
         let byte_pages = FileLayout {
             page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
             ..FileLayout::contract()
@@ -1479,7 +1505,8 @@ struct Prepared {
 impl Prepared {
     /// The table as the manifest records it; `rows` and `appended_rows`
     /// are keys, an ordered table records its `rows_per_key` beside them,
-    /// and the appended table its `overlapping_appends`.
+    /// the appended table its `overlapping_appends`, and a run that sets
+    /// `--row-group-rows` that count.
     fn to_json(&self) -> Json {
         let mut table = json!({
             "name": self.shape.table_name(),
@@ -1497,6 +1524,9 @@ impl Prepared {
         }
         if self.shape.overlapping_appends() > 0 {
             table["overlapping_appends"] = json!(self.shape.overlapping_appends());
+        }
+        if let Some(rows) = row_group_rows() {
+            table["row_group_rows"] = json!(rows);
         }
         table
     }
@@ -1674,7 +1704,8 @@ fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
             && table["value_bytes"].as_u64() == Some(approx::count(shape.value_bytes))
             && table["rows_per_key"].as_u64() == shape.ordered.map(|_| shape.rows_per_key())
             && table["overlapping_appends"].as_u64()
-                == Some(shape.overlapping_appends()).filter(|&appends| appends > 0);
+                == Some(shape.overlapping_appends()).filter(|&appends| appends > 0)
+            && table["row_group_rows"].as_u64() == row_group_rows().map(approx::count);
         if current && local_path(&first)?.exists() && local_path(&second)?.exists() {
             recorded.push(Prepared {
                 shape,
@@ -2673,6 +2704,86 @@ impl Counters {
     }
 }
 
+/// The field of the load's debug event for the ordered uniqueness merge
+/// that `HeldBytes` reads: the most bytes of chosen pages the merge held at
+/// once.
+const HELD_FIELD: &str = "held_bytes";
+
+/// The largest `HELD_FIELD` reported since `HeldBytes::take`.
+static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether any merge reported `HELD_FIELD` since `HeldBytes::take`.
+static HELD_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// A subscriber interested only in events that carry `HELD_FIELD`, so every
+/// other callsite of the library stays disabled, as with no subscriber.
+struct HeldBytes;
+
+impl HeldBytes {
+    fn reads(metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_event() && metadata.fields().field(HELD_FIELD).is_some()
+    }
+
+    /// The largest `HELD_FIELD` reported since the last take, `None` when
+    /// none was, and starts over.
+    fn take() -> Option<u64> {
+        HELD_SEEN
+            .swap(false, Ordering::Relaxed)
+            .then(|| HELD_BYTES.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Reads `HELD_FIELD` from an event's fields.
+struct HeldField(Option<u64>);
+
+impl tracing::field::Visit for HeldField {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == HELD_FIELD {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl tracing::Subscriber for HeldBytes {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if Self::reads(metadata) {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        Self::reads(metadata)
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut held = HeldField(None);
+        event.record(&mut held);
+        if let Some(bytes) = held.0 {
+            HELD_BYTES.fetch_max(bytes, Ordering::Relaxed);
+            HELD_SEEN.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 /// What a measured run is of.
 #[derive(Clone, Copy, Debug)]
 struct RunLabel {
@@ -3407,6 +3518,9 @@ struct Loaded {
     /// The rounds of GETs the load or refresh waited on, counted through
     /// `served.rounds`; `None` where that store is not in place.
     get_rounds: Option<u64>,
+    /// The most bytes of chosen order pages the uniqueness merge held at
+    /// once (`HeldBytes`); `None` when no merge ran.
+    held_bytes: Option<u64>,
     files: usize,
     index_bytes: usize,
     /// The resident memory of the generation's file indexes by part, summed
@@ -3437,6 +3551,7 @@ impl Loaded {
             "local_reads": self.local_reads,
             "local_bytes": self.local_bytes,
             "get_rounds": self.get_rounds,
+            "held_bytes": self.held_bytes,
             "files": self.files,
             "index_bytes": self.index_bytes,
             "resident_parts": self.parts,
@@ -3448,8 +3563,9 @@ impl Loaded {
 
 /// Times `work` against `served`: wall and CPU time, allocations, the
 /// resident set before and at its sampled peak, the storage reads, and for
-/// an ordered table the rounds of GETs; then, outside the timing, the
-/// generation's resident parts and under Disk its chunk files' bytes.
+/// an ordered table the rounds of GETs and the bytes its merge held; then,
+/// outside the timing, the generation's resident parts and under Disk its
+/// chunk files' bytes.
 async fn timed<F: Future<Output = BenchResult<()>>>(
     served: &Served,
     what: &'static str,
@@ -3460,6 +3576,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     if let Some(store) = &served.rounds {
         store.restart();
     }
+    HeldBytes::take();
     let before = Counters::read(served);
     let usage = Usage::now();
     let sampler = RssSampler::start();
@@ -3470,6 +3587,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     let after = Usage::now();
     let counters = Counters::read(served).since(before);
     let get_rounds = served.rounds.as_ref().map(|store| store.rounds());
+    let held_bytes = HeldBytes::take();
     let generation = served.table.serving()?;
     let parts = generation
         .files
@@ -3498,6 +3616,7 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         local_reads: counters.local_reads,
         local_bytes: counters.local_bytes,
         get_rounds,
+        held_bytes,
         files: generation.files.len(),
         index_bytes: generation.index_bytes,
         parts,
@@ -3923,6 +4042,9 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
 async fn main() -> BenchResult<()> {
     let cli = Cli::parse();
     set_serving(&cli);
+    ROW_GROUP_ROWS
+        .set(cli.row_group_rows)
+        .expect("main sets the row groups once");
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
@@ -3936,6 +4058,9 @@ async fn main() -> BenchResult<()> {
     }
     if !cli.no_metrics {
         install_recorder()?;
+    }
+    if scenarios.contains(&Scenario::Load) || scenarios.contains(&Scenario::Refresh) {
+        tracing::subscriber::set_global_default(HeldBytes)?;
     }
     let mut primed = 0;
     for table in &prepared {
