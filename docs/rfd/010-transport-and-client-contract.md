@@ -32,8 +32,9 @@
 > direction, and bounds are read, so a call of the wrong kind is
 > `INVALID_ARGUMENT` even while the table loads and is never the retryable
 > `UNAVAILABLE`. TableInfo reports `max_multi_scan_values`, the most values
-> a MultiScan may ask for. A malformed value a Scan reads names the order
-> value of its row. See RFD 025.
+> a MultiScan may ask for, and `max_scan_bytes`, the most bytes a Scan or
+> MultiScan response may encode to. A malformed value a Scan reads names
+> the order value of its row. See RFD 025.
 
 ## Problem
 
@@ -105,9 +106,9 @@ TableInfo reports the snapshot id, bucket count, file count, row count, key
 type, resident index bytes, and the table's value columns in name order,
 each with its type, a `fixed` column's width, and its format, and for an
 ordered table its order column, the column's type and a `fixed` width,
-`max_scan_rows`, and `max_multi_scan_values`. The key type, each
-column's type, its format, and the order type are enums, so clients
-switch on them.
+`max_scan_rows`, `max_multi_scan_values`, and `max_scan_bytes`. The key
+type, each column's type, its format, and the order type are enums, so
+clients switch on them.
 
 Field comments in the proto describe what a caller can rely on and leave
 the server's internal structures out.

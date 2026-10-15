@@ -111,7 +111,7 @@ pub struct Service {
     /// `TableInfo` reports.
     max_multi_scan_values: usize,
     /// `server.max_scan_bytes`: the encoded size above which a Scan or
-    /// `MultiScan` response is refused.
+    /// `MultiScan` response is refused, which `TableInfo` reports.
     max_scan_bytes: usize,
 }
 
@@ -770,6 +770,9 @@ impl Service {
             max_multi_scan_values: entry
                 .scan_rows()
                 .map_or(0, |_| approx::count(self.max_multi_scan_values)),
+            max_scan_bytes: entry
+                .scan_rows()
+                .map_or(0, |_| approx::count(self.max_scan_bytes)),
         }))
     }
 }

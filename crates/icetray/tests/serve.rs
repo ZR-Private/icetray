@@ -3822,8 +3822,8 @@ async fn test_multi_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refu
 }
 
 /// `TableInfo` of an ordered table names its order column and type, the
-/// width of a fixed one, and `max_scan_rows`; of a key-value table it
-/// leaves those unset.
+/// width of a fixed one, `max_scan_rows`, `max_multi_scan_values`, and
+/// `max_scan_bytes`; of a key-value table it leaves those unset.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestResult {
     /// The width of the second ordered table's `fixed` order column.
@@ -3861,6 +3861,10 @@ async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestRes
         info.max_multi_scan_values,
         approx::count(ServerConfig::default().max_multi_scan_values)
     );
+    assert_eq!(
+        info.max_scan_bytes,
+        approx::count(ServerConfig::default().max_scan_bytes)
+    );
 
     let info = stack.table_info(FIXED_TABLE).await?;
     assert_eq!(info.order_column, icetray_testkit::ORDER_COLUMN);
@@ -3877,5 +3881,6 @@ async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestRes
         info.max_multi_scan_values, 0,
         "a key-value table is not scanned"
     );
+    assert_eq!(info.max_scan_bytes, 0, "a key-value table is not scanned");
     Ok(())
 }

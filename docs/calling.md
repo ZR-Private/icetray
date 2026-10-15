@@ -194,9 +194,11 @@ An ordered table holds many rows per key, each with an order value, such
 as a time series by key and timestamp or the activity of each user. The
 table's owner configures its order column, and `TableInfo` reports it in
 `order_column`, its type in `order_type`, the most rows one `Scan`
-returns in `max_scan_rows`, and the most values one `MultiScan` may ask
-for in `max_multi_scan_values`. A key-value table reports an empty
-`order_column` and a `max_scan_rows` and `max_multi_scan_values` of 0. The
+returns in `max_scan_rows`, the most values one `MultiScan` may ask
+for in `max_multi_scan_values`, and the most bytes one `Scan` or
+`MultiScan` response may encode to in `max_scan_bytes`. A key-value table
+reports an empty `order_column` and a `max_scan_rows`,
+`max_multi_scan_values`, and `max_scan_bytes` of 0. The
 server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
 `MultiScan` of a key-value table, as `INVALID_ARGUMENT`. It decides this
 from the table's configuration before anything else about the call, so it
@@ -268,7 +270,8 @@ resp, err := client.Scan(ctx, &icetrayv1.ScanRequest{
 
 The server refuses to send a `Scan` or `MultiScan` response whose encoded
 size is above `server.max_scan_bytes`, 4 MiB (4,194,304 bytes) by default,
-a gRPC client's default limit on a message it receives. The call fails
+a gRPC client's default limit on a message it receives, which `TableInfo`
+reports in `max_scan_bytes`. The call fails
 as `FAILED_PRECONDITION`, with no rows, and its message names the
 response's size, the bound, and how many rows of a `Scan`, or how many
 leading keys' results of a `MultiScan`, would have fit. The size is the

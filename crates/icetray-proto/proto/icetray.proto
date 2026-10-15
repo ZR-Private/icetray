@@ -523,4 +523,9 @@ message TableInfoResponse {
   // any key is read, so a caller sizes its keys and limit by it; 0 for a
   // table with no order column.
   uint64 max_multi_scan_values = 13;
+  // The most bytes one Scan or MultiScan response may encode to. The server
+  // refuses a larger response as a FAILED_PRECONDITION error that carries
+  // no rows, so a caller sizes its limit, keys, and columns by it; 0 for a
+  // table with no order column.
+  uint64 max_scan_bytes = 14;
 }
