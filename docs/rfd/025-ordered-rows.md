@@ -79,7 +79,8 @@ direction under a limit and optional bounds on the order value.
   request order from one snapshot, a key listed twice answered at each
   position as `MultiGet` answers it, and fails the whole call when any
   key fails, as for `MultiGet`. `TableInfo` reports the order column,
-  its type, and `max_scan_rows`. Errors follow RFD 010 (Transport and
+  its type, `max_scan_rows`, `server.max_multi_scan_values`, and
+  `server.max_scan_bytes`. Errors follow RFD 010 (Transport and
   client contract) as for `Get` and `MultiGet`, and a malformed request
   is `INVALID_ARGUMENT`: an unspecified direction, a limit above
   `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
