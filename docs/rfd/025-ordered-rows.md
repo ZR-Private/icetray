@@ -168,16 +168,18 @@ direction under a limit and optional bounds on the order value.
   64 MiB (67,108,864 bytes). It therefore holds at most 64 MiB beyond
   one row group's chosen pages per file, and a file whose row groups are
   larger than that merges a row group at a time. Where a group's chosen
-  pages fit within 64 MiB, a merge over files of several row groups
-  waits on about the rounds of GETs a merge over files of one row group
-  does; a merge that refuses or ends first may have read row groups
-  ahead that it never reached. The load refuses a live pair present
-  twice as `duplicate_rows`, naming the later file in file order, as
-  `duplicate_keys` does. A refresh that appends later rows therefore
-  reads only its new files, files a compaction rolled by size cost the
-  pages at the edge keys they share, and an append of rows inside an
-  existing file's order range costs the pages those rows fall among, in
-  the new file and the old.
+  pages fit within 64 MiB, and its reads within the load's concurrency,
+  a merge over files of several row groups waits on about the rounds of
+  GETs a merge over files of one row group does. A merge that refuses or
+  ends first may have read row groups ahead that it never reached, and a
+  read error on a row group read ahead fails the load as any read error
+  does, even where the merge would have refused first. The load refuses
+  a live pair present twice as `duplicate_rows`, naming the later file
+  in file order, as `duplicate_keys` does. A refresh that appends later
+  rows therefore reads only its new files, files a compaction rolled by
+  size cost the pages at the edge keys they share, and an append of rows
+  inside an existing file's order range costs the pages those rows fall
+  among, in the new file and the old.
 - **Cost.** Per file that holds the key, a Scan finds the run, then
   reads the order column and each requested column over the run's rows,
   in one round across all files:

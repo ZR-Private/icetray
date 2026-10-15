@@ -650,12 +650,15 @@ type RowGroupRead = BoxFuture<'static, Result<Arrival>>;
 /// next row group is read once the cursor reaches it, whatever it takes;
 /// beyond those, the merge reads row groups ahead of need, in the order it
 /// reaches them, while the bytes held and in flight stay within
-/// `read_ahead` (`ReadAhead`), at most `load_concurrency()` reads at once.
-/// The merge resumes on the blocking pool over owned data while reads go
-/// on, and stops for the async side when a cursor waits on a row group not
-/// yet read, when it has dropped the bytes the next read ahead needs, or
-/// when it ends. A canceled step is `Error::VerifyCanceled` for the
-/// merge's first checked file.
+/// `read_ahead` (`ReadAhead`), at most `load_concurrency()` reads at once
+/// with a slot left for each cursor still to read. The merge resumes on
+/// the blocking pool over owned data while reads go on, and stops for the
+/// async side when a cursor waits on a row group not yet read, when it has
+/// dropped the bytes the next read ahead needs, or when it ends. A read
+/// that fails, ahead of need or not, fails the merge at once, even where
+/// the merge would have refused before it reached that row group. A
+/// canceled step is `Error::VerifyCanceled` for the merge's first checked
+/// file.
 async fn refuse_duplicate_rows(
     table: &str,
     files: &[Arc<LoadedFile>],
@@ -669,29 +672,27 @@ async fn refuse_duplicate_rows(
         .find(|(at, _)| checked[*at])
         .map(|(at, _)| files[*at].index.handle().location.clone())
         .expect("a merge reads pages of a checked file");
-    let mut ahead = ReadAhead::new(files, &reads, read_ahead);
+    let mut ahead = ReadAhead::new(files, &reads, read_ahead, load_concurrency());
     let cursors = reads
         .into_iter()
         .map(|(at, groups)| PairCursor::new(at, checked[at], Arc::clone(&files[at]), groups.len()))
         .collect();
     let mut merge = MergeState::new(table, cursors, Arc::clone(deletes));
-    let concurrency = load_concurrency();
-    let mut in_flight: FuturesUnordered<RowGroupRead> = FuturesUnordered::new();
-    let mut arrived: Vec<Arrival> = Vec::new();
     loop {
         ahead.want(merge.wants.drain(..));
         ahead.release(std::mem::take(&mut merge.dropped));
-        ahead.start(&mut in_flight, concurrency);
-        if merge.waiting > 0 && arrived.is_empty() {
-            let one = in_flight
+        ahead.start();
+        if merge.waiting > 0 && ahead.landed.is_empty() {
+            let one = ahead
+                .in_flight
                 .next()
                 .await
                 .expect("a row group a cursor waits on is being read")?;
-            arrived.push(one);
+            ahead.land(one);
             continue;
         }
         let room = ahead.room();
-        let batch = std::mem::take(&mut arrived);
+        let batch = std::mem::take(&mut ahead.landed);
         let mut step = std::pin::pin!(blocking::on_blocking_pool(move || {
             let progress = merge.resume(batch, room);
             (merge, progress)
@@ -700,10 +701,7 @@ async fn refuse_duplicate_rows(
             tokio::select! {
                 biased;
                 stepped = &mut step => break stepped,
-                Some(one) = in_flight.next() => {
-                    arrived.push(one?);
-                    ahead.start(&mut in_flight, concurrency);
-                }
+                Some(one) = ahead.in_flight.next() => ahead.land(one?),
             }
         };
         let (resumed, progress) =
@@ -722,9 +720,11 @@ async fn refuse_duplicate_rows(
 }
 
 /// When a merge reads each row group of its cursors: a cursor's row groups
-/// in file order, the one a cursor waits on at once, whatever it takes,
-/// and the others ahead of need while the bytes held and in flight, with
-/// the row group's, stay within `budget`. Row groups are read ahead in the
+/// in file order, the one a cursor waits on first, whatever it takes, and
+/// the others ahead of need while the bytes held and in flight, with the
+/// row group's, stay within `budget`, and while a slot of `concurrency`
+/// stays free for each cursor still to read, so that a wanted read never
+/// queues behind reads ahead. Row groups are read ahead in the
 /// order the merge reaches them across the files: a row group is needed
 /// once its cursor runs dry of the one before, so they go by the sweep
 /// step that passed the one before (`GroupPages::passed`), and one that
@@ -743,6 +743,15 @@ struct ReadAhead {
     /// The row groups after each cursor's first, as `wanted` names them, in
     /// the order the merge reaches them.
     order: VecDeque<(usize, usize)>,
+    /// The cursors with a row group not yet read or being read: each may
+    /// come to want one, so reads ahead leave a slot of `concurrency` for
+    /// each, and a wanted read never queues behind reads ahead.
+    unfinished: usize,
+    /// The reads under way, at most `concurrency`.
+    in_flight: FuturesUnordered<RowGroupRead>,
+    concurrency: usize,
+    /// The reads done since the merge last took them.
+    landed: Vec<Arrival>,
     /// The bytes of every row group read or being read that the merge has
     /// not dropped (`PairRead::bytes`), and the most at once. The merge
     /// reports what it dropped when a step ends, so the count stays at or
@@ -761,8 +770,13 @@ struct ReadAhead {
 impl ReadAhead {
     /// The reads of the chosen pages `reads` names of `files`, for the
     /// cursors in the order `reads` lists them, reading ahead within
-    /// `budget` bytes.
-    fn new(files: &[Arc<LoadedFile>], reads: &[(usize, Vec<GroupPages>)], budget: u64) -> Self {
+    /// `budget` bytes, at most `concurrency` at once.
+    fn new(
+        files: &[Arc<LoadedFile>],
+        reads: &[(usize, Vec<GroupPages>)],
+        budget: u64,
+        concurrency: usize,
+    ) -> Self {
         let mut order: Vec<(usize, usize, usize)> = reads
             .iter()
             .enumerate()
@@ -794,6 +808,13 @@ impl ReadAhead {
                 .into_iter()
                 .map(|(_, cursor, place)| (cursor, place))
                 .collect(),
+            unfinished: reads
+                .iter()
+                .filter(|(_, groups)| !groups.is_empty())
+                .count(),
+            in_flight: FuturesUnordered::new(),
+            concurrency,
+            landed: Vec::new(),
             taken: 0,
             most_taken: 0,
             budget,
@@ -816,28 +837,39 @@ impl ReadAhead {
         self.taken -= dropped;
     }
 
-    /// Starts reads into `in_flight` while it holds fewer than
-    /// `concurrency`: wanted row groups first, then row groups ahead in
-    /// order while they fit the budget.
-    fn start(&mut self, in_flight: &mut FuturesUnordered<RowGroupRead>, concurrency: usize) {
-        while in_flight.len() < concurrency
-            && let Some((cursor, place, read)) = self.next()
-        {
+    /// Starts the reads `next` gives into `in_flight`.
+    fn start(&mut self) {
+        while let Some((cursor, place, read)) = self.next(self.in_flight.len(), self.concurrency) {
             let file = Arc::clone(&self.files[cursor]);
-            in_flight.push(Box::pin(async move {
+            self.in_flight.push(Box::pin(async move {
                 let chunks = file.index.pair_chunks(read).await?;
                 Ok((cursor, place, chunks))
             }));
         }
     }
 
+    /// Takes `arrival` as landed and starts the reads the slot it frees
+    /// lets start, while the merge steps.
+    fn land(&mut self, arrival: Arrival) {
+        self.landed.push(arrival);
+        self.start();
+    }
+
     /// The next row group to read, its cursor, and its place among the
-    /// cursor's: a wanted one, else the next ahead when it fits.
-    fn next(&mut self) -> Option<(usize, usize, PairRead)> {
+    /// cursor's, with `in_flight` reads of `concurrency` under way: a
+    /// wanted one while a slot is free, else the next ahead when it fits
+    /// the budget and leaves a slot for each unfinished cursor.
+    fn next(&mut self, in_flight: usize, concurrency: usize) -> Option<(usize, usize, PairRead)> {
+        if in_flight >= concurrency {
+            return None;
+        }
         while let Some((cursor, place)) = self.wanted.pop_front() {
             if self.issued[cursor] == place {
                 return Some(self.issue(cursor));
             }
+        }
+        if in_flight + self.unfinished >= concurrency {
+            return None;
         }
         let cursor = self.ahead()?;
         let bytes = self.unread[cursor]
@@ -870,6 +902,9 @@ impl ReadAhead {
         let read = self.unread[cursor]
             .pop_front()
             .expect("a row group to read is unread");
+        if self.unread[cursor].is_empty() {
+            self.unfinished -= 1;
+        }
         let place = self.issued[cursor];
         self.issued[cursor] += 1;
         self.taken += read.bytes();
@@ -2134,6 +2169,224 @@ mod tests {
             first_file_in_flight, 1,
             "the first file's next row group waits for the budget"
         );
+    }
+
+    /// Slots of a read-ahead test: enough that slots never hold a read
+    /// back.
+    const ROOMY_SLOTS: usize = 64;
+
+    /// Every order page of `row_group` of `file`, as chosen, the sweep
+    /// passing the last at step `passed`.
+    fn every_page(file: &LoadedFile, row_group: usize, passed: usize) -> GroupPages {
+        GroupPages {
+            row_group,
+            pages: (0..order_pages(file, row_group)).collect(),
+            passed,
+        }
+    }
+
+    /// The reads `ahead` lets start, one after another, with none under
+    /// way before them, of `slots` slots.
+    fn next_reads(ahead: &mut ReadAhead, slots: usize) -> Vec<(usize, usize, PairRead)> {
+        let mut reads = Vec::new();
+        while let Some(read) = ahead.next(reads.len(), slots) {
+            reads.push(read);
+        }
+        reads
+    }
+
+    /// The cursor and place of each of `reads`.
+    fn places(reads: &[(usize, usize, PairRead)]) -> Vec<(usize, usize)> {
+        reads
+            .iter()
+            .map(|&(cursor, place, _)| (cursor, place))
+            .collect()
+    }
+
+    /// Under a budget that holds the first row groups and no more, a merge
+    /// that drops a file's row group stops for the read ahead the bytes it
+    /// dropped let in, while the cursor that read is for still holds pairs
+    /// of its current row group: the first file ends inside the second
+    /// file's first row group, whose next one the third file meets.
+    #[tokio::test]
+    async fn test_merge_stops_to_read_ahead_once_it_drops_what_the_next_read_needs() {
+        let residency = Residency::Full;
+        let (first_rows, second_rows, last_key_rows) = (16, 24, 4);
+        let last_key = 2;
+        let first: Vec<(i64, i64)> = (0..first_rows).map(|row| (0, 2 * row)).collect();
+        let second: Vec<(i64, i64)> = (0..second_rows)
+            .map(|row| (0, 2 * row + 1))
+            .chain((0..last_key_rows).map(|row| (last_key, 2 * row + 1)))
+            .collect();
+        let third: Vec<(i64, i64)> = (0..last_key_rows).map(|row| (last_key, 2 * row)).collect();
+        let group_rows = usize::try_from(second_rows).unwrap();
+        let built = [
+            built_in_groups("s-0", &first, FEW_PAGE_ROWS, group_rows, residency).await,
+            built_in_groups("s-1", &second, FEW_PAGE_ROWS, group_rows, residency).await,
+            built_in_groups("s-2", &third, FEW_PAGE_ROWS, group_rows, residency).await,
+        ];
+        let files: Vec<Arc<LoadedFile>> = built.iter().map(|one| Arc::clone(&one.file)).collect();
+        let reads = vec![
+            (0, vec![every_page(&files[0], 0, 0)]),
+            (
+                1,
+                vec![every_page(&files[1], 0, 0), every_page(&files[1], 1, 0)],
+            ),
+            (2, vec![every_page(&files[2], 0, 0)]),
+        ];
+        let bytes = |at: usize, row_group: usize| {
+            let group = &reads[at].1[row_group];
+            files[at]
+                .index
+                .pair_read(group.row_group, &group.pages)
+                .bytes()
+        };
+        assert!(
+            bytes(0, 0) >= bytes(1, 1),
+            "the first file's drop makes room"
+        );
+        let budget = bytes(0, 0) + bytes(1, 0) + bytes(2, 0);
+        let mut ahead = ReadAhead::new(&files, &reads, budget, ROOMY_SLOTS);
+        let cursors = reads
+            .iter()
+            .map(|(at, groups)| PairCursor::new(*at, true, Arc::clone(&files[*at]), groups.len()))
+            .collect();
+        let deletes: Arc<[Option<Arc<FileDeletes>>]> = vec![None; files.len()].into();
+        let mut merge = MergeState::new(TABLE, cursors, deletes);
+        ahead.want(merge.wants.drain(..));
+        let firsts = next_reads(&mut ahead, ROOMY_SLOTS);
+        assert_eq!(
+            places(&firsts),
+            [(0, 0), (1, 0), (2, 0)],
+            "nothing ahead fits"
+        );
+        let mut arrived = Vec::new();
+        for (cursor, place, read) in firsts {
+            arrived.push((
+                cursor,
+                place,
+                files[cursor].index.pair_chunks(read).await.unwrap(),
+            ));
+        }
+        let room = ahead.room();
+        let progress = merge.resume(arrived, room).unwrap();
+        assert_eq!(progress, Progress::Room);
+        assert!(
+            merge.waiting == 0 && !merge.heads.cursors[1].waits,
+            "the second file still holds pairs of its first row group"
+        );
+        ahead.release(std::mem::take(&mut merge.dropped));
+        assert_eq!(places(&next_reads(&mut ahead, ROOMY_SLOTS)), [(1, 1)]);
+    }
+
+    /// A read that lands while the merge steps frees a slot, and the next
+    /// read ahead starts in it at once: of three slots, one cursor's wanted
+    /// read and one read ahead start, a slot left for the cursor, and the
+    /// first read to land lets its last row group start.
+    #[tokio::test]
+    async fn test_read_ahead_starts_the_next_read_in_the_slot_a_landed_read_frees() {
+        let residency = Residency::Full;
+        let groups = 3;
+        let rows: Vec<(i64, i64)> = (0..i64::try_from(groups).unwrap())
+            .flat_map(|key| (0..OVERLAPPING_ROWS_PER_KEY).map(move |row| (key, row)))
+            .collect();
+        let group_rows = usize::try_from(OVERLAPPING_ROWS_PER_KEY).unwrap();
+        let built = built_in_groups("l-0", &rows, FEW_PAGE_ROWS, group_rows, residency).await;
+        let files = vec![Arc::clone(&built.file)];
+        let reads = vec![(
+            0,
+            (0..groups)
+                .map(|row_group| every_page(&files[0], row_group, row_group))
+                .collect(),
+        )];
+        let three_slots = 3;
+        let mut ahead = ReadAhead::new(&files, &reads, MERGE_READ_AHEAD_BYTES, three_slots);
+        ahead.want([(0, 0)]);
+        ahead.start();
+        assert_eq!(ahead.in_flight.len(), 2, "the wanted read and one ahead");
+        let one = ahead.in_flight.next().await.unwrap().unwrap();
+        ahead.land(one);
+        assert_eq!(ahead.in_flight.len(), 2, "the freed slot starts a read");
+        assert_eq!(
+            ahead.issued[0], groups,
+            "every row group read or being read"
+        );
+    }
+
+    /// Reads ahead leave a slot for every cursor with a row group to read,
+    /// so a row group a cursor comes to want starts at once however the
+    /// merge's needs depart from the order of the reads ahead: here the
+    /// reads ahead favour the first file, and the merge needs the second
+    /// file's row groups first, with three slots for two cursors.
+    #[tokio::test]
+    async fn test_read_ahead_leaves_a_slot_for_every_row_group_a_cursor_comes_to_want() {
+        let residency = Residency::Full;
+        let (first_groups, second_groups) = (6, 3);
+        let group_rows = usize::try_from(OVERLAPPING_ROWS_PER_KEY).unwrap();
+        let mut files = Vec::new();
+        let mut built = Vec::new();
+        for (at, groups) in [first_groups, second_groups].into_iter().enumerate() {
+            let rows: Vec<(i64, i64)> = (0..i64::try_from(groups).unwrap())
+                .flat_map(|key| (0..OVERLAPPING_ROWS_PER_KEY).map(move |row| (key, row)))
+                .collect();
+            let one = built_in_groups(
+                &format!("w-{at}"),
+                &rows,
+                FEW_PAGE_ROWS,
+                group_rows,
+                residency,
+            )
+            .await;
+            files.push(Arc::clone(&one.file));
+            built.push(one);
+        }
+        let later = first_groups;
+        let reads: Vec<(usize, Vec<GroupPages>)> = [(0, 0), (1, later)]
+            .into_iter()
+            .map(|(at, from)| {
+                let groups = files[at].index.metadata().num_row_groups();
+                (
+                    at,
+                    (0..groups)
+                        .map(|row_group| every_page(&files[at], row_group, from + row_group))
+                        .collect(),
+                )
+            })
+            .collect();
+        let needs: Vec<(usize, usize)> = [(0, 0), (1, 0)]
+            .into_iter()
+            .chain((1..second_groups).map(|place| (1, place)))
+            .chain((1..first_groups).map(|place| (0, place)))
+            .collect();
+        let slots = 3;
+        let mut ahead = ReadAhead::new(&files, &reads, MERGE_READ_AHEAD_BYTES, slots);
+        let mut in_flight: VecDeque<(usize, usize)> = VecDeque::new();
+        let start = |ahead: &mut ReadAhead, in_flight: &mut VecDeque<(usize, usize)>| {
+            while let Some((cursor, place, _)) = ahead.next(in_flight.len(), slots) {
+                in_flight.push_back((cursor, place));
+            }
+        };
+        ahead.want([(0, 0), (1, 0)]);
+        start(&mut ahead, &mut in_flight);
+        let mut landed = BTreeSet::new();
+        let mut wanted_later = 0;
+        for need in needs {
+            if !landed.contains(&need) && !in_flight.contains(&need) {
+                ahead.want([need]);
+                start(&mut ahead, &mut in_flight);
+                assert!(in_flight.contains(&need), "{need:?} starts once wanted");
+                wanted_later += 1;
+            }
+            while !landed.contains(&need) {
+                let one = in_flight
+                    .pop_front()
+                    .expect("a needed row group is being read");
+                landed.insert(one);
+                start(&mut ahead, &mut in_flight);
+            }
+        }
+        assert!(wanted_later > 0, "some needs outrun the reads ahead");
+        assert_eq!(landed.len(), first_groups + second_groups);
     }
 
     /// Under a budget below any row group, a first load of `OVERLAPPING`
