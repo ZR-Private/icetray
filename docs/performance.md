@@ -126,6 +126,29 @@ load. Resident memory adds the order column's offset index, a few facts
 per file, and the order fences, one pair of key and order value per
 order page, and a `Scan` reads the order values from their pages.
 
+### MultiScan across worker threads
+
+While fewer calls than worker threads are in flight, icetray splits a
+`MultiScan`'s distinct keys, in order, into up to one run per worker
+thread of at least 32 keys, and reads the runs on several cores at once,
+as it splits a `MultiGet`'s keys into runs of at least 8. A `MultiScan`
+of 32 distinct keys or fewer, and any `MultiScan` that arrives while as
+many calls as worker threads are in flight, reads its keys on one task.
+The runs share the call's `server.batch_fan_out` slots, and the answer,
+the response bound, and the metrics are the same either way.
+
+Spreading trades CPU for latency. Measured warm under `full` on local
+files, at a limit of 1, a lone `MultiScan` took a median of 0.32 ms at
+100 keys where one task took 1.07 ms, and 2.35 ms at 1,000 keys where
+one task took 10.5 ms, for 10% and 70% more CPU per key: the cost of
+spawning the runs, waking workers on other cores, and workers spinning
+before they park. With 11 callers at once, one per core, the difference
+was within noise, since the calls in flight keep most `MultiScan`s from
+splitting. The extra CPU is spent only while cores would otherwise sit
+idle, so it lowers the latency of a lightly loaded server without
+taking throughput from a busy one
+([the measurements](analysis/2026-10-14-order-fences.md#multiscan)).
+
 ### The scan cache
 
 icetray caches each page a span GET fetches as its own entry, keyed by
@@ -465,4 +488,5 @@ read without blocking, so every local read there moves to another thread
 - [RFD 024](rfd/024-field-projection.md): field projection, and when to
   project within a column rather than split.
 - [RFD 025](rfd/025-ordered-rows.md): ordered tables, what a `Scan`
-  reads in each residency, and the scan cache.
+  reads in each residency, the scan cache, and spreading a `MultiScan`
+  across idle worker threads.

@@ -241,9 +241,10 @@ pub enum Error {
         /// The canceled task's outcome.
         source: tokio::task::JoinError,
     },
-    /// A task of a `multi_get` was canceled before it answered its keys:
-    /// the runtime it was spawned on shut down under it. A panic in that
-    /// task is resumed on the caller instead, never turned into an error.
+    /// A task of a `multi_get` or a `multi_scan` was canceled before it
+    /// answered its keys: the runtime it was spawned on shut down under it.
+    /// A panic in that task is resumed on the caller instead, never turned
+    /// into an error.
     #[error("a lookup task of table {table} was canceled: {source}")]
     LookupCanceled {
         /// The table's configured name.

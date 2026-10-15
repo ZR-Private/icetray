@@ -54,6 +54,16 @@ use crate::time;
 /// workers.
 const MULTI_GET_TASK_KEYS_MIN: usize = 8;
 
+/// The fewest distinct keys one task of a `multi_scan` is given: 32. A
+/// warm Scan of one key costs about what a warm hit does, and a spread
+/// `multi_scan` pays for its spawns, the wakeups across workers, and
+/// workers spinning before they park on every run. Measured over warm
+/// Scans at limit 1, runs of at least 32 keys cut a lone call's latency to
+/// about a third at 100 keys and a fifth at 1,000, for 10% and 70% more
+/// CPU per key, spent only while workers would otherwise sit idle; a call
+/// of fewer keys stays on its task.
+const MULTI_SCAN_TASK_KEYS_MIN: usize = 32;
+
 /// Where a table is in its lifecycle. Display gives the `state` metric
 /// label: the variant's name alone, `loading`, `serving`, `degraded`, or
 /// `held`.
@@ -301,10 +311,10 @@ pub struct Table {
     /// Scan's key pages use: a span's latency grows with its pages, so the
     /// window holds per-page latencies and a span's delay scales with its
     /// pages (`Storage::read_span_hedged`).
-    span_hedge: HedgeWindow,
+    span_hedge: Arc<HedgeWindow>,
     /// What a Scan needs beside its generation, on an ordered table;
     /// `None` on a key-value table, which no Scan reads.
-    scans: Option<Scans>,
+    scans: Option<Arc<Scans>>,
     /// `TableHandles::max_multi_scan_values`.
     max_multi_scan_values: usize,
     /// `TableHandles::max_scan_bytes`.
@@ -517,18 +527,20 @@ impl Lookups {
     }
 
     /// The runs a batch of `keys` keys is split into: up to one per worker
-    /// thread (`shard::workers`), each of at least `MULTI_GET_TASK_KEYS_MIN`
-    /// keys, while fewer calls than worker threads are in flight on the
-    /// tables sharing this one's count, the batch's own included; one run
-    /// otherwise. A split batch waits on its slowest run, and on busy
-    /// workers its runs queue behind other calls' work, so splitting pays
-    /// while some workers would sit idle and costs once they are all busy.
-    /// Calls to every table of the process run on the same workers, so
-    /// their count is the signal, not this table's alone.
-    fn runs(&self, keys: usize) -> usize {
+    /// thread (`shard::workers`), each of at least `keys_min` keys
+    /// (`MULTI_GET_TASK_KEYS_MIN` for a `multi_get`,
+    /// `MULTI_SCAN_TASK_KEYS_MIN` for a `multi_scan`), while fewer calls
+    /// than worker threads are in flight on the tables sharing this one's
+    /// count, the batch's own included; one run otherwise. A split batch
+    /// waits on its slowest run, and on busy workers its runs queue behind
+    /// other calls' work, so splitting pays while some workers would sit
+    /// idle and costs once they are all busy. Calls to every table of the
+    /// process run on the same workers, so their count is the signal, not
+    /// this table's alone.
+    fn runs(&self, keys: usize, keys_min: usize) -> usize {
         let workers = shard::workers();
         if self.in_flight.sum() < workers {
-            workers.min(keys.div_ceil(MULTI_GET_TASK_KEYS_MIN))
+            workers.min(keys.div_ceil(keys_min))
         } else {
             1
         }
@@ -950,38 +962,65 @@ struct ScanTally {
 /// a later key's read fails, the call's deadline passes, or its client
 /// cancels, counts the keys that finished as answered, as a failed
 /// `MultiGet` counts the keys it completed; a key that failed counted as an
-/// error when it did.
+/// error when it did. Whichever settles the receipt first ends its count,
+/// so a key of a spread `multi_scan` that finishes or fails on another
+/// task after the call ended counts nowhere, as it would had the call read
+/// it on its own task.
 #[must_use = "a receipt settles the call's scan counts: `sent` or `refused` it"]
 pub struct ScanReceipt {
     /// The table's configured name.
     table: String,
+    /// The call's counts, shared with the runs a spread `multi_scan`
+    /// spawns.
+    counts: Arc<ScanCounts>,
+}
+
+/// The Scans of one call as they end, shared by every task that reads the
+/// call's keys until its `ScanReceipt` settles them.
+struct ScanCounts {
     /// The table's scan metric handles.
     metrics: ScanMetrics,
-    /// The keys read and not yet counted. Read keys are pushed as their
-    /// Scans finish, concurrently on one task, so it is a `Mutex`.
-    pending: Mutex<Vec<ScanTally>>,
+    /// The keys read and not yet counted, pushed as their Scans finish, on
+    /// the call's task or on the runs it spawned; `None` once the receipt
+    /// has settled, after which nothing more is counted.
+    pending: Mutex<Option<Vec<ScanTally>>>,
+}
+
+impl ScanCounts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<ScanTally>>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The Scan of one key has finished.
+    fn finished(&self, tally: ScanTally) {
+        if let Some(pending) = self.lock().as_mut() {
+            pending.push(tally);
+        }
+    }
+
+    /// The Scan of one key has failed: one `error`, counted at once.
+    fn failed(&self) {
+        let pending = self.lock();
+        if pending.is_some() {
+            self.metrics.error.increment(1);
+        }
+    }
+
+    /// The keys finished and not yet counted, taken, and the count ended.
+    fn settle(&self) -> Vec<ScanTally> {
+        self.lock().take().unwrap_or_default()
+    }
 }
 
 impl ScanReceipt {
     fn new(table: &str, metrics: &ScanMetrics) -> Self {
         Self {
             table: table.to_string(),
-            metrics: metrics.clone(),
-            pending: Mutex::new(Vec::new()),
+            counts: Arc::new(ScanCounts {
+                metrics: metrics.clone(),
+                pending: Mutex::new(Some(Vec::new())),
+            }),
         }
-    }
-
-    /// The Scan of one key has finished.
-    fn finished(&self, tally: ScanTally) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(tally);
-    }
-
-    /// The keys finished and not yet counted, taken.
-    fn take(&self) -> Vec<ScanTally> {
-        std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Counts every key read as answered, with no response size: for a
@@ -993,16 +1032,20 @@ impl ScanReceipt {
     /// The response of `bytes` encoded bytes goes out: counts every key
     /// read as answered and records the size.
     pub fn sent(self, bytes: usize) {
-        self.metrics.response_bytes.record(approx::gauge_len(bytes));
+        self.counts
+            .metrics
+            .response_bytes
+            .record(approx::gauge_len(bytes));
     }
 
     /// The response is refused as `oversize`: counts every key read as an
     /// error, records the size it would have had, and gives
     /// `Error::ResponseTooLarge` to return.
     pub fn refused(self, oversize: Oversize) -> Error {
-        let keys = self.take().len();
-        self.metrics.error.increment(approx::count(keys));
-        self.metrics
+        let keys = self.counts.settle().len();
+        let metrics = &self.counts.metrics;
+        metrics.error.increment(approx::count(keys));
+        metrics
             .response_bytes
             .record(approx::gauge_len(oversize.bytes));
         Error::ResponseTooLarge {
@@ -1014,8 +1057,8 @@ impl ScanReceipt {
 
 impl Drop for ScanReceipt {
     fn drop(&mut self) {
-        for tally in self.take() {
-            self.metrics.record(&tally);
+        for tally in self.counts.settle() {
+            self.counts.metrics.record(&tally);
         }
     }
 }
@@ -1023,10 +1066,155 @@ impl Drop for ScanReceipt {
 /// A Scan request checked against the generation and the table's entry
 /// before any read (`Table::check_scan`): the columns it reads and its
 /// limit, resolved.
-struct CheckedScan<'a> {
-    scans: &'a Scans,
+struct CheckedScan {
     selection: Selection,
     limit: u32,
+}
+
+/// A Scan call checked and ready to read (`Table::scan_call`).
+struct ScanCall<'a> {
+    generation: Arc<Generation>,
+    scans: &'a Arc<Scans>,
+    checked: CheckedScan,
+    fan_out: Arc<Semaphore>,
+    receipt: ScanReceipt,
+}
+
+/// What every key's Scan of one `scan` or `multi_scan` call reads through,
+/// borrowed: the generation, the table's lookup and scan handles and span
+/// hedge window, the checked request and its bounds, the call's fan-out,
+/// and its counts. Each run a spread `multi_scan` spawns builds one over
+/// an `OwnedScan` of its own, as each run of a `multi_get` holds its own
+/// handles.
+#[derive(Clone, Copy)]
+struct ScanThrough<'a> {
+    generation: &'a Arc<Generation>,
+    lookups: &'a Arc<Lookups>,
+    scans: &'a Arc<Scans>,
+    window: &'a Arc<HedgeWindow>,
+    checked: &'a CheckedScan,
+    bounds: &'a ScanBounds,
+    fan_out: &'a Arc<Semaphore>,
+    counts: &'a Arc<ScanCounts>,
+}
+
+/// A `ScanThrough`'s handles and request owned, for a run a spread
+/// `multi_scan` spawns, which holds no borrow of the call.
+struct OwnedScan {
+    generation: Arc<Generation>,
+    lookups: Arc<Lookups>,
+    scans: Arc<Scans>,
+    window: Arc<HedgeWindow>,
+    checked: CheckedScan,
+    bounds: ScanBounds,
+    fan_out: Arc<Semaphore>,
+    counts: Arc<ScanCounts>,
+}
+
+impl OwnedScan {
+    fn through(&self) -> ScanThrough<'_> {
+        ScanThrough {
+            generation: &self.generation,
+            lookups: &self.lookups,
+            scans: &self.scans,
+            window: &self.window,
+            checked: &self.checked,
+            bounds: &self.bounds,
+            fan_out: &self.fan_out,
+            counts: &self.counts,
+        }
+    }
+}
+
+impl ScanThrough<'_> {
+    /// The handles and request owned, the request's selection and bounds
+    /// cloned.
+    fn owned(self) -> OwnedScan {
+        OwnedScan {
+            generation: Arc::clone(self.generation),
+            lookups: Arc::clone(self.lookups),
+            scans: Arc::clone(self.scans),
+            window: Arc::clone(self.window),
+            checked: CheckedScan {
+                selection: self.checked.selection.clone(),
+                limit: self.checked.limit,
+            },
+            bounds: self.bounds.clone(),
+            fan_out: Arc::clone(self.fan_out),
+            counts: Arc::clone(self.counts),
+        }
+    }
+
+    /// One Scan of `key`, its rows trimmed (`Lookups::project`): the one
+    /// path `scan` and `multi_scan` share. A failed read counts under
+    /// `ScanResult::Error` at once; an answered one is handed to the
+    /// call's counts as its tally, rows, files, and temperature, cold when
+    /// any order or value page came from object storage, for the receipt
+    /// to count.
+    async fn key(self, key: &Key) -> Result<Scanned> {
+        let started = Instant::now();
+        let metrics = &self.scans.metrics;
+        let source = RunSource {
+            cache: &self.scans.cache,
+            fan_out: Some(self.fan_out),
+            window: self.window,
+            value_gets: &self.lookups.metrics.value_page_gets,
+            order_gets: Some(&metrics.order_gets),
+        };
+        let selection = &self.checked.selection;
+        let answered = async {
+            let (mut scanned, read) = self
+                .generation
+                .scan(
+                    key,
+                    &selection.positions,
+                    self.bounds,
+                    self.checked.limit,
+                    source,
+                )
+                .await?;
+            for row in &mut scanned.rows {
+                self.lookups.project(
+                    self.generation,
+                    key,
+                    Some(&row.order),
+                    selection,
+                    &mut row.values,
+                )?;
+            }
+            Ok::<_, Error>((scanned, read))
+        }
+        .await;
+        match answered {
+            Ok((scanned, read)) => {
+                self.counts.finished(ScanTally {
+                    rows: scanned.rows.len(),
+                    files: read.files,
+                    cold: read.from_store,
+                    elapsed: started.elapsed(),
+                });
+                Ok(scanned)
+            }
+            Err(error) => {
+                self.counts.failed();
+                Err(error)
+            }
+        }
+    }
+
+    /// Scans of `keys`, answered in their order, at most
+    /// `TableHandles::batch_fan_out` read at once on this task, every GET
+    /// holding a permit of the call's fan-out. The first failure ends the
+    /// run.
+    async fn keys(self, keys: &[&Key]) -> Result<Vec<Scanned>> {
+        // Built before the stream, unpolled, as `Lookups::run` builds its
+        // lookups, so the returned future stays provably `Send`.
+        let scans: Vec<_> = keys.iter().map(|key| self.key(key)).collect();
+        stream::iter(scans)
+            .buffered(self.lookups.batch_fan_out)
+            .try_collect()
+            .await
+    }
 }
 
 impl Table {
@@ -1091,10 +1279,12 @@ impl Table {
             max_scan_bytes,
         } = handles;
         let hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
-        let span_hedge = HedgeWindow::new(storage.hedge_config());
-        let scans = config.order_column.as_deref().map(|order_column| Scans {
-            cache: scan_cache.with_fetch_deadline(scan_deadline),
-            metrics: ScanMetrics::new(&config.name, order_column),
+        let span_hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
+        let scans = config.order_column.as_deref().map(|order_column| {
+            Arc::new(Scans {
+                cache: scan_cache.with_fetch_deadline(scan_deadline),
+                metrics: ScanMetrics::new(&config.name, order_column),
+            })
         });
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
@@ -1442,14 +1632,22 @@ impl Table {
         }
         let selection = generation.layout.select(&self.config.load(), columns)?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
-        let runs = self.lookups.runs(keys.len());
+        let runs = self.lookups.runs(keys.len(), MULTI_GET_TASK_KEYS_MIN);
         let rows = if runs <= 1 {
             self.lookups
                 .run(&generation, keys, &selection, &fan_out)
                 .await?
         } else {
-            self.run_spawned(&generation, keys, selection, runs, &fan_out)
-                .await?
+            let selection = Arc::new(selection);
+            self.spawned(keys, runs, |part| {
+                let lookups = Arc::clone(&self.lookups);
+                let generation = Arc::clone(&generation);
+                let selection = Arc::clone(&selection);
+                let fan_out = Arc::clone(&fan_out);
+                let part = part.to_vec();
+                async move { lookups.run(&generation, &part, &selection, &fan_out).await }
+            })
+            .await?
         };
         Ok(MultiLookup {
             rows,
@@ -1494,26 +1692,13 @@ impl Table {
         bounds: &ScanBounds,
     ) -> Result<(ScanLookup, ScanReceipt)> {
         let _in_flight = self.lookups.enter();
-        let scans = self.ordered()?;
-        let generation = self.serving()?;
-        let checked = self.check_scan(
-            scans,
-            &generation,
-            std::slice::from_ref(key),
-            columns,
-            bounds,
-            false,
-        )?;
-        let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
-        let receipt = ScanReceipt::new(&self.name, &checked.scans.metrics);
-        let scanned = self
-            .scan_key(&generation, key, &checked, bounds, &fan_out, &receipt)
-            .await?;
+        let call = self.scan_call(std::slice::from_ref(key), columns, bounds, false)?;
+        let scanned = self.through(&call, bounds).key(key).await?;
         let lookup = ScanLookup {
             scanned,
-            snapshot_id: generation.snapshot_id,
+            snapshot_id: call.generation.snapshot_id,
         };
-        Ok((lookup, receipt))
+        Ok((lookup, call.receipt))
     }
 
     /// Scans of `keys` from one generation, each answered as `scan`
@@ -1522,11 +1707,21 @@ impl Table {
     /// checked before any read, as `scan` checks them, and so is the
     /// request's size: keys times the resolved limit times one more than
     /// the columns above `server.max_multi_scan_values` is
-    /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. The keys
-    /// share one bound of `TableHandles::batch_fan_out` GETs in flight, at
-    /// most that many keys read at once on this task; any failure fails the
-    /// whole call (RFD 010). A key listed more than once is read once and
-    /// its answer given at each position.
+    /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. A key
+    /// listed more than once is read once and its answer given at each
+    /// position. While fewer calls than worker threads are in flight on
+    /// the tables sharing this one's `TableHandles::calls`, this one
+    /// included, the distinct keys are split, in order, into up to one run
+    /// per worker thread (`shard::workers`) of at least
+    /// `MULTI_SCAN_TASK_KEYS_MIN` keys, each spawned as a task, as
+    /// `multi_get` splits its keys (`Lookups::runs`); keys that make one
+    /// run are read here, unspawned. Each run reads at most
+    /// `TableHandles::batch_fan_out` keys at once, and the runs share one
+    /// bound of that many GETs in flight; any failure fails the whole call
+    /// (RFD 010). Dropping the returned future aborts the runs still
+    /// going, and a key one of them finishes after that counts nowhere
+    /// (`ScanReceipt`). A run's panic is resumed here; a run canceled
+    /// under a runtime shutdown is `Error::LookupCanceled`.
     pub async fn multi_scan(
         &self,
         keys: &[Key],
@@ -1547,11 +1742,7 @@ impl Table {
         bounds: &ScanBounds,
     ) -> Result<(MultiScanLookup, ScanReceipt)> {
         let _in_flight = self.lookups.enter();
-        let scans = self.ordered()?;
-        let generation = self.serving()?;
-        let checked = self.check_scan(scans, &generation, keys, columns, bounds, true)?;
-        let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
-        let receipt = ScanReceipt::new(&self.name, &checked.scans.metrics);
+        let call = self.scan_call(keys, columns, bounds, true)?;
         // Each distinct key is read once, and every position that lists it
         // takes that answer.
         let mut distinct: Vec<&Key> = Vec::with_capacity(keys.len());
@@ -1565,16 +1756,21 @@ impl Table {
                 })
             })
             .collect();
-        // Built before the stream, unpolled, as `Lookups::run` builds its
-        // lookups, so the returned future stays provably `Send`.
-        let scans: Vec<_> = distinct
-            .iter()
-            .map(|key| self.scan_key(&generation, key, &checked, bounds, &fan_out, &receipt))
-            .collect();
-        let answered: Vec<Scanned> = stream::iter(scans)
-            .buffered(self.lookups.batch_fan_out)
-            .try_collect()
-            .await?;
+        let through = self.through(&call, bounds);
+        let runs = self.lookups.runs(distinct.len(), MULTI_SCAN_TASK_KEYS_MIN);
+        let answered: Vec<Scanned> = if runs <= 1 {
+            through.keys(&distinct).await?
+        } else {
+            self.spawned(&distinct, runs, |part| {
+                let owned = through.owned();
+                let part: Vec<Key> = part.iter().map(|&key| key.clone()).collect();
+                async move {
+                    let keys: Vec<&Key> = part.iter().collect();
+                    owned.through().keys(&keys).await
+                }
+            })
+            .await?
+        };
         // Each answer moves to the last position that lists its key and is
         // cloned only for the positions before it.
         let mut last_at = vec![0; answered.len()];
@@ -1596,103 +1792,74 @@ impl Table {
             .collect();
         let lookup = MultiScanLookup {
             results,
-            snapshot_id: generation.snapshot_id,
+            snapshot_id: call.generation.snapshot_id,
         };
-        Ok((lookup, receipt))
+        Ok((lookup, call.receipt))
     }
 
-    /// One checked Scan of `key` through `generation` under `fan_out`, its
-    /// rows trimmed (`Lookups::project`): the one path `scan` and
-    /// `multi_scan` share. A failed read counts under `ScanResult::Error`
-    /// at once; an answered one is handed to `receipt` as its tally, rows,
-    /// files, and temperature, cold when any order or value page came from
-    /// object storage, for the receipt to count.
-    async fn scan_key(
+    /// A Scan call of `keys` reading `columns` under `bounds` (`multi` for
+    /// a `MultiScan`), ready to read: `Error::WrongTableKind` on a
+    /// key-value table, then `Error::NotReady` with no generation, then the
+    /// faults `check_scan` names, all before any read; otherwise the
+    /// serving generation, the checked request, a fan-out of
+    /// `TableHandles::batch_fan_out` permits, and the call's receipt.
+    fn scan_call(
         &self,
-        generation: &Generation,
-        key: &Key,
-        checked: &CheckedScan<'_>,
+        keys: &[Key],
+        columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
-        fan_out: &Arc<Semaphore>,
-        receipt: &ScanReceipt,
-    ) -> Result<Scanned> {
-        let started = Instant::now();
-        let metrics = &checked.scans.metrics;
-        let source = RunSource {
-            cache: &checked.scans.cache,
-            fan_out: Some(fan_out),
+        multi: bool,
+    ) -> Result<ScanCall<'_>> {
+        let scans = self.ordered()?;
+        let generation = self.serving()?;
+        let checked = self.check_scan(&generation, keys, columns, bounds, multi)?;
+        Ok(ScanCall {
+            fan_out: Arc::new(Semaphore::new(self.lookups.batch_fan_out)),
+            receipt: ScanReceipt::new(&self.name, &scans.metrics),
+            generation,
+            scans,
+            checked,
+        })
+    }
+
+    /// What every key's Scan of `call` reads through, under `bounds`.
+    fn through<'a>(&'a self, call: &'a ScanCall<'a>, bounds: &'a ScanBounds) -> ScanThrough<'a> {
+        ScanThrough {
+            generation: &call.generation,
+            lookups: &self.lookups,
+            scans: call.scans,
             window: &self.span_hedge,
-            value_gets: &self.lookups.metrics.value_page_gets,
-            order_gets: Some(&metrics.order_gets),
-        };
-        let answered = async {
-            let (mut scanned, read) = generation
-                .scan(
-                    key,
-                    &checked.selection.positions,
-                    bounds,
-                    checked.limit,
-                    source,
-                )
-                .await?;
-            for row in &mut scanned.rows {
-                self.lookups.project(
-                    generation,
-                    key,
-                    Some(&row.order),
-                    &checked.selection,
-                    &mut row.values,
-                )?;
-            }
-            Ok::<_, Error>((scanned, read))
-        }
-        .await;
-        match answered {
-            Ok((scanned, read)) => {
-                receipt.finished(ScanTally {
-                    rows: scanned.rows.len(),
-                    files: read.files,
-                    cold: read.from_store,
-                    elapsed: started.elapsed(),
-                });
-                Ok(scanned)
-            }
-            Err(error) => {
-                metrics.error.increment(1);
-                Err(error)
-            }
+            checked: &call.checked,
+            bounds,
+            fan_out: &call.fan_out,
+            counts: &call.receipt.counts,
         }
     }
 
     /// `keys` split in order into `runs` runs of nearly equal length, each
-    /// run spawned on its own task over owned copies of its keys, and the
-    /// answers put back in key order. The tasks live in a `JoinSet`, so
-    /// returning early on a failure, or being dropped, aborts the rest.
-    async fn run_spawned(
+    /// run spawned on its own task as the future `run` builds over it,
+    /// which owns what it reads, and the answers put back in key order.
+    /// The tasks live in a `JoinSet`, so returning early on a failure, or
+    /// being dropped, aborts the rest. A run's panic is resumed here; a run
+    /// canceled under a runtime shutdown is `Error::LookupCanceled`.
+    async fn spawned<K, T, F>(
         &self,
-        generation: &Arc<Generation>,
-        keys: &[Key],
-        selection: Selection,
+        keys: &[K],
         runs: usize,
-        fan_out: &Arc<Semaphore>,
-    ) -> Result<Vec<Row>> {
+        mut run: impl FnMut(&[K]) -> F,
+    ) -> Result<Vec<T>>
+    where
+        F: Future<Output = Result<Vec<T>>> + Send + 'static,
+        T: Send + 'static,
+    {
         let per_run = keys.len().div_ceil(runs);
-        let selection = Arc::new(selection);
         let mut tasks = JoinSet::new();
         for (index, part) in keys.chunks(per_run).enumerate() {
-            let lookups = Arc::clone(&self.lookups);
-            let generation = Arc::clone(generation);
-            let selection = Arc::clone(&selection);
-            let fan_out = Arc::clone(fan_out);
-            let part = part.to_vec();
-            tasks.spawn(async move {
-                (
-                    index,
-                    lookups.run(&generation, &part, &selection, &fan_out).await,
-                )
-            });
+            let answers = run(part);
+            tasks.spawn(async move { (index, answers.await) });
         }
-        let mut answered: Vec<Vec<Row>> = vec![Vec::new(); tasks.len()];
+        let mut answered: Vec<Vec<T>> =
+            std::iter::repeat_with(Vec::new).take(tasks.len()).collect();
         while let Some(joined) = tasks.join_next().await {
             let (index, values) = joined.map_err(|error| match error.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
@@ -2431,7 +2598,7 @@ impl Table {
 
     /// What a Scan needs beside its generation, or `Error::WrongTableKind`
     /// on a key-value table: `check_kind` for the calls that use it.
-    fn ordered(&self) -> Result<&Scans> {
+    fn ordered(&self) -> Result<&Arc<Scans>> {
         self.scans.as_ref().ok_or_else(|| self.wrong_kind())
     }
 
@@ -2460,15 +2627,14 @@ impl Table {
     /// `max_multi_scan_values`, in that order. Every position the selection
     /// holds is one of the generation's columns, which every file's index
     /// holds a slot for.
-    fn check_scan<'a>(
+    fn check_scan(
         &self,
-        scans: &'a Scans,
         generation: &Generation,
         keys: &[Key],
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
         multi: bool,
-    ) -> Result<CheckedScan<'a>> {
+    ) -> Result<CheckedScan> {
         let config = self.config.load();
         // An ordered table's generation and entry both name its order
         // column; one that does not is not served as ordered.
@@ -2499,11 +2665,7 @@ impl Table {
             )
             .map_err(refused)?;
         }
-        Ok(CheckedScan {
-            scans,
-            selection,
-            limit,
-        })
+        Ok(CheckedScan { selection, limit })
     }
 
     /// `Error::KeyType` for a key of another type than the generation's.
@@ -2617,6 +2779,7 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
     use super::*;
+    use crate::cache::CacheError;
     use crate::catalog::TableFault;
     use crate::config::{
         ConfigError, ConfigViolation, DEFAULT_BATCH_FAN_OUT, DEFAULT_MAX_SCAN_ROWS, Residency,
@@ -3965,6 +4128,18 @@ mod tests {
     /// The name of the second table over a fixture, beside `TABLE`.
     const OTHER_TABLE: &str = "other";
 
+    /// The holders of a serving generation's `Arc` while one batch reads
+    /// it, beside the runs the batch spawned: the table's own, the
+    /// batch's, and `runs_alive`'s read.
+    const HOLDERS_BESIDE_THE_RUNS: usize = 3;
+
+    /// The spawned runs of a `multi_get` or `multi_scan` in flight on
+    /// `table` that are still alive: each holds the generation's `Arc`
+    /// until it ends.
+    fn runs_alive(table: &Table) -> usize {
+        Arc::strong_count(&table.current().unwrap()) - HOLDERS_BESIDE_THE_RUNS
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_multi_get_splits_while_fewer_calls_than_workers_are_in_flight() {
         assert_eq!(shard::workers(), SPLIT_WORKERS);
@@ -4014,7 +4189,6 @@ mod tests {
     /// so the holders beyond the batch table's own, the batch's, and this
     /// read's are the runs.
     async fn runs_spawned_beside_another_table(others: usize) -> usize {
-        let holders_of_an_inline_batch = 3;
         let (fixture, all, gauged) = one_row_per_page_fixture(DEFAULT_BATCH_FAN_OUT + others).await;
         let handles = handles_over(&fixture).await;
         let defaults = ServerConfig::default();
@@ -4052,7 +4226,7 @@ mod tests {
         reach(&gauged, others).await;
         let every_get_held = async {
             reach(&gauged, others + DEFAULT_BATCH_FAN_OUT).await;
-            Arc::strong_count(&batch_table.current().unwrap()) - holders_of_an_inline_batch
+            runs_alive(&batch_table)
         };
         let value = [ColumnRead::whole(VALUE_COLUMN)];
         tokio::select! {
@@ -4068,7 +4242,6 @@ mod tests {
     /// `Arc`, so the holders beyond the table's own, the batch's, and this
     /// read's are the runs.
     async fn runs_spawned_beside(others: usize) -> usize {
-        let holders_of_an_inline_batch = 3;
         let (table, _fixture, all, gauged) = one_row_per_page(DEFAULT_BATCH_FAN_OUT).await;
         let keys = long_keys(&all);
         let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
@@ -4079,7 +4252,7 @@ mod tests {
         gauged.fill_to(DEFAULT_BATCH_FAN_OUT + 1);
         let every_get_held = async {
             reach(&gauged, DEFAULT_BATCH_FAN_OUT).await;
-            Arc::strong_count(&table.current().unwrap()) - holders_of_an_inline_batch
+            runs_alive(&table)
         };
         let value = [ColumnRead::whole(VALUE_COLUMN)];
         tokio::select! {
@@ -5245,12 +5418,30 @@ mod tests {
     /// read the series while it runs. A snapshot zeroes every series it
     /// reads, so a later one holds only what was written after it.
     fn recorded_with<T, F: Future<Output = T>>(body: impl FnOnce(Snapshotter) -> F) -> (T, Series) {
+        recorded_on(tokio::runtime::Builder::new_current_thread(), body)
+    }
+
+    /// `recorded_with` on a runtime of `SPLIT_WORKERS` worker threads, where
+    /// a batch of enough keys spreads over spawned runs. `body` runs on the
+    /// thread the local recorder is set on, so a table it builds registers
+    /// its series there, and their handles count from every worker.
+    fn recorded_on_split_workers<T, F: Future<Output = T>>(
+        body: impl FnOnce(Snapshotter) -> F,
+    ) -> (T, Series) {
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(SPLIT_WORKERS);
+        recorded_on(runtime, body)
+    }
+
+    /// `body` run on the runtime `runtime` builds, under a debugging
+    /// recorder, and a snapshot of what it emitted.
+    fn recorded_on<T, F: Future<Output = T>>(
+        mut runtime: tokio::runtime::Builder,
+        body: impl FnOnce(Snapshotter) -> F,
+    ) -> (T, Series) {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = runtime.enable_all().build().unwrap();
         let out = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(body(recorder.snapshotter()))
         });
@@ -7481,6 +7672,351 @@ mod tests {
             scan_results(&series),
             [2, 0, 0],
             "the warming Scan and the dropped call's finished key"
+        );
+    }
+
+    /// Distinct keys of the spread `MultiScan` tests: one run of
+    /// `MULTI_SCAN_TASK_KEYS_MIN` keys for each worker of the split runtime.
+    const SPREAD_KEYS: usize = MULTI_SCAN_TASK_KEYS_MIN * SPLIT_WORKERS;
+
+    /// The keys of the spread tests' first file, `SPREAD_KEYS` of them.
+    fn spread_keys() -> Vec<i64> {
+        keys_from(0, i64::try_from(SPREAD_KEYS).unwrap())
+    }
+
+    /// A key between two of `spread_keys`, which no file holds.
+    const ABSENT_KEY: i64 = 1;
+
+    /// The spread keys a `MultiScan` lists twice in the answer test.
+    const SPREAD_REPEATS: usize = 8;
+
+    /// The answer test's limit: below `SCAN_ROWS_PER_KEY`, so every key
+    /// held answers with `more` set, and small enough that the listed keys
+    /// stay within `max_multi_scan_values`.
+    const SPREAD_LIMIT: usize = 4;
+
+    /// A `MultiScan` of `asked` under `bounds`, over a fresh cold table of
+    /// `spread_keys` while `others` calls are counted in flight on it: its
+    /// answers, and the runs it spawned, counted while the store holds
+    /// every GET, so no run has ended.
+    async fn multi_scan_counting_runs(
+        asked: &[Key],
+        bounds: &ScanBounds,
+        others: usize,
+    ) -> (Vec<Scanned>, usize) {
+        let rows = ordered_rows(&spread_keys(), SCAN_ROWS_PER_KEY);
+        let (table, _fixture, gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+        gauged.hold();
+        let mut call = Box::pin(table.multi_scan(asked, &BOTH_READS, bounds));
+        let runs = tokio::select! {
+            biased;
+            answered = &mut call => panic!("the store holds every GET: {answered:?}"),
+            runs = async {
+                reach(&gauged, 1).await;
+                runs_alive(&table)
+            } => runs,
+        };
+        gauged.release();
+        (call.await.unwrap().results, runs)
+    }
+
+    /// The runs a `MultiScan` of `distinct` of the spread keys, each listed
+    /// `listed` times, spawns while `others` calls are counted in flight on
+    /// its table.
+    async fn multi_scan_runs_beside(distinct: usize, listed: usize, others: usize) -> usize {
+        let keys = long_keys(&spread_keys()[..distinct]);
+        let asked: Vec<Key> = (0..listed).flat_map(|_| keys.iter().cloned()).collect();
+        let head = ScanBounds {
+            limit: 1,
+            ..oldest_first()
+        };
+        multi_scan_counting_runs(&asked, &head, others).await.1
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_splits_while_fewer_calls_than_workers_are_in_flight() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let (once, idle) = (1, 0);
+        assert_eq!(
+            multi_scan_runs_beside(SPREAD_KEYS, once, idle).await,
+            SPLIT_WORKERS
+        );
+        let others_leaving_room = SPLIT_WORKERS - 2;
+        assert_eq!(
+            multi_scan_runs_beside(SPREAD_KEYS, once, others_leaving_room).await,
+            SPLIT_WORKERS,
+            "with the call, one fewer call in flight than workers"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_runs_inline_once_as_many_calls_as_workers_are_in_flight() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let once = 1;
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        assert_eq!(
+            multi_scan_runs_beside(SPREAD_KEYS, once, others_filling_the_workers).await,
+            0
+        );
+        let others_past_the_workers = SPLIT_WORKERS;
+        assert_eq!(
+            multi_scan_runs_beside(SPREAD_KEYS, once, others_past_the_workers).await,
+            0
+        );
+    }
+
+    /// Runs hold at least `MULTI_SCAN_TASK_KEYS_MIN` distinct keys each: a
+    /// key listed twice is read once, so it counts once toward a run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_splits_its_distinct_keys_into_runs_of_the_task_minimum() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let (once, twice, idle) = (1, 2, 0);
+        let below = MULTI_SCAN_TASK_KEYS_MIN - 1;
+        assert_eq!(
+            multi_scan_runs_beside(below, twice, idle).await,
+            0,
+            "{below} distinct keys at {} positions",
+            below * twice
+        );
+        assert_eq!(
+            multi_scan_runs_beside(MULTI_SCAN_TASK_KEYS_MIN, once, idle).await,
+            0
+        );
+        let two_runs = 2;
+        assert_eq!(
+            multi_scan_runs_beside(MULTI_SCAN_TASK_KEYS_MIN + 1, once, idle).await,
+            two_runs
+        );
+    }
+
+    /// A `MultiScan` of more than `MULTI_SCAN_TASK_KEYS_MIN` keys answers
+    /// spread over idle workers exactly as on its own task, in either
+    /// direction: every key's rows and `more` in key order, a key listed
+    /// twice at each position, and a key no file holds empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_scan_answers_spread_over_workers_as_on_its_own_task() {
+        assert_eq!(shard::workers(), SPLIT_WORKERS);
+        let held = spread_keys();
+        let mut asked = long_keys(&held);
+        asked.insert(SPREAD_KEYS / 2, Key::Long(ABSENT_KEY));
+        asked.extend(long_keys(&held[..SPREAD_REPEATS]));
+        for direction in [Direction::OldestFirst, Direction::NewestFirst] {
+            let bounds = ScanBounds {
+                direction,
+                limit: u32::try_from(SPREAD_LIMIT).unwrap(),
+                after: None,
+                before: None,
+            };
+            let expected: Vec<Scanned> = asked
+                .iter()
+                .map(|key| {
+                    let Key::Long(key) = *key else {
+                        unreachable!("long keys")
+                    };
+                    if key == ABSENT_KEY {
+                        return Scanned {
+                            rows: Vec::new(),
+                            more: false,
+                        };
+                    }
+                    let mut rows = ordered_rows(&[key], SCAN_ROWS_PER_KEY);
+                    if direction == Direction::NewestFirst {
+                        rows.reverse();
+                    }
+                    rows.truncate(SPREAD_LIMIT);
+                    Scanned {
+                        rows: scanned_both(&rows),
+                        more: true,
+                    }
+                })
+                .collect();
+            let idle = 0;
+            let (spread, runs) = multi_scan_counting_runs(&asked, &bounds, idle).await;
+            assert_eq!(
+                runs, SPLIT_WORKERS,
+                "{direction:?}: spread over every worker"
+            );
+            let others_filling_the_workers = SPLIT_WORKERS - 1;
+            let (inline, runs) =
+                multi_scan_counting_runs(&asked, &bounds, others_filling_the_workers).await;
+            assert_eq!(runs, 0, "{direction:?}: read on the call's task");
+            assert_eq!(spread, inline, "{direction:?}");
+            assert_eq!(spread, expected, "{direction:?}");
+        }
+    }
+
+    /// A table of two files under a fan-out of one, the first holding
+    /// `spread_keys` with their pages cached and the second one key, cold,
+    /// past them; and a `MultiScan` of every key, the cold one last, so
+    /// each run reads its keys one after the other and the cold key, the
+    /// last of the last run, is the only one to reach the store.
+    async fn spread_keys_then_a_cold_one() -> (Table, Fixture, Arc<Gauged>, Vec<Key>) {
+        let held = spread_keys();
+        let cold = held.last().unwrap() + KEY_STEP;
+        let warm = ordered_rows(&held, SCAN_ROWS_PER_KEY);
+        let last = ordered_rows(&[cold], SCAN_ROWS_PER_KEY);
+        let (table, fixture, gauged) =
+            ordered_table_over(&[&warm, &last], WriterLayout::contract(), 1).await;
+        let mut keys = long_keys(&held);
+        table
+            .multi_scan(&keys, &BOTH_READS, &spread_bounds())
+            .await
+            .unwrap();
+        keys.push(Key::Long(cold));
+        (table, fixture, gauged, keys)
+    }
+
+    /// Every row of a spread key, oldest first.
+    fn spread_bounds() -> ScanBounds {
+        ScanBounds {
+            limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+            ..oldest_first()
+        }
+    }
+
+    /// Polls `call`, a `MultiScan` of `spread_keys_then_a_cold_one`'s keys,
+    /// until every key but the cold one has finished and the store holds
+    /// the cold key's GET: the GET is issued after every other key of its
+    /// run, and every other run has ended. The runs still alive then, the
+    /// cold key's alone when the call spread and none when it read on its
+    /// own task.
+    async fn until_only_the_cold_key_waits<F: Future>(
+        table: &Table,
+        gauged: &Gauged,
+        call: &mut std::pin::Pin<Box<F>>,
+    ) -> usize {
+        let cold_key_alone = async {
+            reach(gauged, 1).await;
+            tokio::time::timeout(DEADLINE_GUARD, async {
+                while runs_alive(table) > 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every run but the cold key's ends");
+            runs_alive(table)
+        };
+        tokio::select! {
+            biased;
+            _ = call.as_mut() => panic!("the cold key's GET is held"),
+            runs = cold_key_alone => runs,
+        }
+    }
+
+    /// The scan results counted by a `MultiScan` of
+    /// `spread_keys_then_a_cold_one`'s keys whose cold key fails, its file
+    /// gone, while `others` calls are counted in flight, and the runs alive
+    /// once the cold key alone was left.
+    fn failed_cold_key_counts(others: usize) -> ([u64; 3], usize) {
+        let (runs, series) = recorded_on_split_workers(|snapshotter| async move {
+            let (table, fixture, gauged, keys) = spread_keys_then_a_cold_one().await;
+            drop(snapshotter.snapshot());
+            let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+            gauged.hold();
+            let bounds = spread_bounds();
+            let mut call = Box::pin(table.multi_scan(&keys, &BOTH_READS, &bounds));
+            let runs = until_only_the_cold_key_waits(&table, &gauged, &mut call).await;
+            let path = fixture.path_of("f1");
+            std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+            gauged.release();
+            let failed = call.await;
+            let Err(Error::Cache(CacheError::Fetch(failed))) = failed else {
+                panic!("the cold key's file is gone: {failed:?}");
+            };
+            assert!(
+                matches!(
+                    *failed,
+                    Error::ObjectStore(object_store::Error::NotFound { .. })
+                ),
+                "{failed:?}"
+            );
+            runs
+        });
+        (scan_results(&series), runs)
+    }
+
+    /// A `MultiScan` whose last key fails counts the same spread over idle
+    /// workers as on its own task: every key it finished before the
+    /// failure as answered, and the failed key as one error.
+    #[test]
+    fn test_multi_scan_counts_a_failing_key_spread_as_on_its_own_task() {
+        let finished = approx::count(SPREAD_KEYS);
+        let idle = 0;
+        let (spread, runs) = failed_cold_key_counts(idle);
+        assert_eq!(runs, 1, "the cold key read on a spawned run");
+        assert_eq!(spread, [finished, 0, 1]);
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        let (inline, runs) = failed_cold_key_counts(others_filling_the_workers);
+        assert_eq!(runs, 0, "the cold key read on the call's task");
+        assert_eq!(inline, spread);
+    }
+
+    /// The scan results counted by a `MultiScan` of
+    /// `spread_keys_then_a_cold_one`'s keys dropped while its cold key's
+    /// GET is held, as at its deadline or a client's cancel, while `others`
+    /// calls are counted in flight, and the runs alive once the cold key
+    /// alone was left.
+    fn dropped_call_counts(others: usize) -> ([u64; 3], usize) {
+        let (runs, series) = recorded_on_split_workers(|snapshotter| async move {
+            let (table, _fixture, gauged, keys) = spread_keys_then_a_cold_one().await;
+            drop(snapshotter.snapshot());
+            let _others: Vec<InFlight<'_>> = (0..others).map(|_| table.lookups.enter()).collect();
+            gauged.hold();
+            let bounds = spread_bounds();
+            let mut call = Box::pin(table.multi_scan(&keys, &BOTH_READS, &bounds));
+            let runs = until_only_the_cold_key_waits(&table, &gauged, &mut call).await;
+            drop(call);
+            gauged.release();
+            runs
+        });
+        (scan_results(&series), runs)
+    }
+
+    /// A `MultiScan` dropped while its last key waits on the store counts
+    /// the same spread over idle workers as on its own task: every key it
+    /// finished, and nothing for the key still reading.
+    #[test]
+    fn test_multi_scan_counts_a_dropped_call_spread_as_on_its_own_task() {
+        let finished = approx::count(SPREAD_KEYS);
+        let idle = 0;
+        let (spread, runs) = dropped_call_counts(idle);
+        assert_eq!(runs, 1, "the cold key read on a spawned run");
+        assert_eq!(spread, [finished, 0, 0]);
+        let others_filling_the_workers = SPLIT_WORKERS - 1;
+        let (inline, runs) = dropped_call_counts(others_filling_the_workers);
+        assert_eq!(runs, 0, "the cold key read on the call's task");
+        assert_eq!(inline, spread);
+    }
+
+    /// A Scan that ends after its call's receipt settled, as a run of a
+    /// spread `MultiScan` still going on another worker when the call
+    /// ended can, counts nowhere: neither a finished key as answered nor a
+    /// failed one as an error.
+    #[test]
+    fn test_scan_receipt_counts_no_scan_that_ends_after_it_settles() {
+        let tally = ScanTally {
+            rows: 1,
+            files: 1,
+            cold: false,
+            elapsed: Duration::ZERO,
+        };
+        let ((), series) = recorded(async {
+            let metrics = ScanMetrics::new(TABLE, testing::ORDER_COLUMN);
+            let receipt = ScanReceipt::new(TABLE, &metrics);
+            let counts = Arc::clone(&receipt.counts);
+            counts.finished(tally);
+            counts.failed();
+            receipt.answered();
+            counts.finished(tally);
+            counts.failed();
+            drop(counts);
+        });
+        assert_eq!(
+            scan_results(&series),
+            [1, 0, 1],
+            "the Scans that ended before the receipt settled"
         );
     }
 
