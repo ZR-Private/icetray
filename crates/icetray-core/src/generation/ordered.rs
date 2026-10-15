@@ -849,6 +849,14 @@ struct MergeState {
     waiting: Vec<usize>,
     checked: usize,
     deletes: Arc<[Option<Arc<FileDeletes>>]>,
+    /// The bytes fetched or read for the row groups the cursors hold now
+    /// (`PairChunks::read_bytes`), and the most they held at once. A
+    /// cursor's decoded run is not counted, and it outlives what is: its
+    /// byte-array keys and order values are slices of the pages they
+    /// decoded from, the fetched bytes or the buffers a compressed page
+    /// was decompressed into, so a run keeps those alive, and a cursor's
+    /// last run of a row group stays after the row group's pages are
+    /// dropped, until its next fill decodes over it or the merge ends.
     held: u64,
     most_held: u64,
 }
@@ -996,7 +1004,7 @@ impl MergeState {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::super::testing::{TABLE, bucketing, refusal_of};
+    use super::super::testing::{KeyColumn, TABLE, bucketing, local_dir, refusal_of};
     use super::super::{Span, overlap_groups, routes};
     use super::*;
     use crate::approx;
@@ -1250,23 +1258,34 @@ mod tests {
         fixture.layout.page_rows = page_rows;
         fixture.layout.write_batch = page_rows;
         fixture.layout.row_group_rows = group_rows;
-        let opened = index_testing::store(&fixture).await;
+        let layout = index_testing::ordered_layout(KeyType::Long, OrderType::Long);
+        built_of(name, &fixture, &layout, Some((TWO, 0)), residency).await
+    }
+
+    /// `fixture`, an ordered file served under `layout`, as file `name`
+    /// filed at `place`, indexed in `residency`.
+    async fn built_of(
+        name: &str,
+        fixture: &index_testing::Fixture,
+        layout: &crate::manifest::TableLayout,
+        place: Place,
+        residency: Residency,
+    ) -> Built {
+        let opened = index_testing::store(fixture).await;
         let (index, dir) = match residency {
             Residency::Disk => {
                 let dir = tempfile::tempdir().unwrap();
+                let local = local_dir(dir.path(), opened.stats(), None);
                 let index = opened
-                    .build_ordered_in(OrderType::Long, residency, dir.path())
+                    .build_under(layout, residency, Some(&local))
                     .await
                     .unwrap();
                 (index, Some(dir))
             }
-            Residency::Full | Residency::Bloom => {
-                let layout = index_testing::ordered_layout(KeyType::Long, OrderType::Long);
-                (
-                    opened.build_under(&layout, residency, None).await.unwrap(),
-                    None,
-                )
-            }
+            Residency::Full | Residency::Bloom => (
+                opened.build_under(layout, residency, None).await.unwrap(),
+                None,
+            ),
         };
         let (first, last) = index.key_range();
         let (first, last) = (first.clone(), last.clone());
@@ -1274,9 +1293,9 @@ mod tests {
             file: Arc::new(LoadedFile {
                 entry: DataFileEntry {
                     path: name.to_string(),
-                    bucket: 0,
-                    bucketing: Some(bucketing(TWO)),
-                    records: approx::count(rows.len()),
+                    bucket: place.map_or(0, |(_, bucket)| bucket),
+                    bucketing: place.map(|(count, _)| bucketing(count)),
+                    records: index.rows().unsigned_abs(),
                     sequence: SequenceNumber(1),
                     added_by: SnapshotId(1),
                     size: opened.handle.size(),
@@ -1296,14 +1315,18 @@ mod tests {
     /// otherwise.
     async fn check_rows(built: &[Built], reused: &[bool]) -> Result<RowCheck> {
         let none = vec![Vec::new(); built.len()];
-        check_rows_deleting(built, reused, &none).await.1
+        let unshrunk = vec![false; built.len()];
+        check_rows_deleting(built, reused, &unshrunk, &none).await.1
     }
 
-    /// `check_rows` with the rows at the positions of `gone` of each file
-    /// deleted, and the overlap groups the check went through.
+    /// `check_rows` with each file whose deletes shrank where `shrank`
+    /// says so, which is checked though reused, and the rows at the
+    /// positions of `gone` of each file deleted; with the overlap groups the
+    /// check went through.
     async fn check_rows_deleting(
         built: &[Built],
         reused: &[bool],
+        shrank: &[bool],
         gone: &[Vec<u64>],
     ) -> (Vec<Vec<usize>>, Result<RowCheck>) {
         let files: Vec<Arc<LoadedFile>> = built.iter().map(|one| Arc::clone(&one.file)).collect();
@@ -1315,13 +1338,13 @@ mod tests {
             .collect();
         let members: Vec<Member> = files
             .iter()
-            .zip(reused)
+            .zip(reused.iter().zip(shrank))
             .zip(deletes.iter())
-            .map(|((file, &reused), deletes)| Member {
+            .map(|((file, (&reused, &shrank)), deletes)| Member {
                 file: Arc::clone(file),
                 reused,
                 deletes: deletes.clone(),
-                shrank: false,
+                shrank,
             })
             .collect();
         let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
@@ -1695,57 +1718,209 @@ mod tests {
     /// Cases of the drawn check, files per case at least and at most, and
     /// the pair universe the files draw from: few keys and order values,
     /// so files repeat pairs.
-    const DRAWN_CASES: u64 = 150;
+    const DRAWN_CASES: u64 = 240;
     const FEWEST_DRAWN_FILES: u64 = 2;
-    const MOST_DRAWN_FILES: u64 = 6;
-    const DRAWN_KEYS: u64 = 6;
-    const DRAWN_ORDERS: u64 = 8;
+    const MOST_DRAWN_FILES: u64 = 7;
+    const DRAWN_KEYS: u64 = 8;
+    const DRAWN_ORDERS: usize = 8;
 
-    /// One in how many drawn pairs a file holds, one in how many drawn rows
-    /// is deleted, and one in how many drawn files is checked.
-    const PAIR_ONE_IN: u64 = 3;
-    const DELETED_ONE_IN: u64 = 8;
+    /// One in how many drawn rows is deleted, one in how many drawn files
+    /// is checked, one in how many checked files is reused with deletes
+    /// that shrank, and one in how many cases draws its files around the
+    /// corners of their own key and order ranges.
+    const DELETED_ONE_IN: u64 = 7;
     const CHECKED_ONE_IN: u64 = 2;
+    const SHRANK_ONE_IN: u64 = 2;
+    const CORNERS_ONE_IN: u64 = 3;
+
+    /// The sparsest a drawn file's rows are: one in how many pairs of its
+    /// range at most.
+    const SPARSEST_ONE_IN: u64 = 3;
 
     /// The most rows a drawn file's pages and row groups hold.
     const MOST_DRAWN_PAGE_ROWS: u64 = 4;
-    const MOST_DRAWN_GROUP_ROWS: u64 = 12;
+    const MOST_DRAWN_GROUP_ROWS: u64 = 14;
 
-    /// One drawn file: its rows, ascending, whether the load checks it, and
-    /// the positions of its deleted rows.
-    struct DrawnFile {
-        rows: Vec<(i64, i64)>,
-        checked: bool,
-        deleted: Vec<u64>,
+    /// Where drawn files are filed: unbucketed, and every bucket of two
+    /// bucketings, one key falling in buckets congruent modulo two.
+    const DRAWN_PLACES: [Place; 7] = [
+        None,
+        Some((TWO, 0)),
+        Some((TWO, 1)),
+        Some((FOUR, 0)),
+        Some((FOUR, 1)),
+        Some((FOUR, 2)),
+        Some((FOUR, 3)),
+    ];
+
+    /// The bytes every drawn string key, and every drawn string order
+    /// value, starts with: long shared prefixes, which the fences cut past.
+    const TEXT_KEY_PREFIX: usize = 40;
+    const TEXT_ORDER_PREFIX: usize = 64;
+
+    /// The ends of the drawn string order values, ascending, several a
+    /// prefix of the next, so fences cut at every length.
+    const TEXT_ORDER_ENDS: [&str; DRAWN_ORDERS] = ["", "a", "aa", "ab", "b", "ba", "bb", "c"];
+
+    /// How a drawn file's keys, or its order values, are written: as longs,
+    /// or as strings sharing a long prefix, ascending as the indexes do.
+    #[derive(Clone, Copy, Debug)]
+    enum Written {
+        Long,
+        Text,
     }
 
-    /// Files drawn from the pair universe by `draw`, in file order.
-    fn draw_files(draw: &mut impl FnMut(u64) -> u64) -> Vec<DrawnFile> {
+    /// Drawn key `index` as `written`.
+    fn drawn_key(written: Written, index: u64) -> Key {
+        match written {
+            Written::Long => Key::Long(i64::try_from(index).unwrap()),
+            Written::Text => Key::Str(format!(
+                "{}{}",
+                "k".repeat(TEXT_KEY_PREFIX),
+                char::from(b'a' + u8::try_from(index).unwrap())
+            )),
+        }
+    }
+
+    /// Drawn order value `index` as `written`.
+    fn drawn_order(written: Written, index: u64) -> OrderValue {
+        match written {
+            Written::Long => OrderValue::Long(i64::try_from(index).unwrap()),
+            Written::Text => OrderValue::Str(format!(
+                "{}{}",
+                "p".repeat(TEXT_ORDER_PREFIX),
+                TEXT_ORDER_ENDS[usize::try_from(index).unwrap()]
+            )),
+        }
+    }
+
+    /// One drawn file: where it is filed, its rows as (key, order value)
+    /// indexes, ascending, whether the load checks it and whether it is
+    /// reused with deletes that shrank, the positions of its deleted rows,
+    /// and its rows per page and per row group.
+    struct DrawnFile {
+        place: Place,
+        rows: Vec<(u64, u64)>,
+        checked: bool,
+        shrank: bool,
+        deleted: Vec<u64>,
+        page_rows: usize,
+        group_rows: usize,
+    }
+
+    /// Files drawn from the pair universe by `draw`, in file order, each
+    /// holding only keys its bucket can hold (a key falls in its index
+    /// modulo the bucket count). Around corners, each file draws an order
+    /// range of its own and holds the four pairs at its key range's and
+    /// that range's ends, so the ranges files share often end on a pair.
+    fn draw_files(draw: &mut impl FnMut(u64) -> u64, corners: bool) -> Vec<DrawnFile> {
         let count = FEWEST_DRAWN_FILES + draw(MOST_DRAWN_FILES - 1);
+        let orders = approx::count(DRAWN_ORDERS);
         let mut drawn: Vec<DrawnFile> = (0..count)
             .map(|_| {
-                let first = draw(DRAWN_KEYS);
-                let last = first + draw(DRAWN_KEYS - first);
-                let long = |value: u64| i64::try_from(value).unwrap();
-                let mut rows: Vec<(i64, i64)> = (first..=last)
-                    .flat_map(|key| (0..DRAWN_ORDERS).map(move |order| (long(key), long(order))))
-                    .filter(|_| draw(PAIR_ONE_IN) == 0)
+                let place =
+                    DRAWN_PLACES[usize::try_from(draw(approx::count(DRAWN_PLACES.len()))).unwrap()];
+                let keys: Vec<u64> = (0..DRAWN_KEYS)
+                    .filter(|&key| {
+                        place.is_none_or(|(of, bucket)| key % u64::from(of) == u64::from(bucket))
+                    })
+                    .collect();
+                let first = usize::try_from(draw(approx::count(keys.len()))).unwrap();
+                let last =
+                    first + usize::try_from(draw(approx::count(keys.len() - first))).unwrap();
+                let (low, high) = if corners {
+                    let low = draw(orders);
+                    (low, low + draw(orders - low))
+                } else {
+                    (0, orders - 1)
+                };
+                let one_in = 1 + draw(SPARSEST_ONE_IN);
+                let ends = [keys[first], keys[last]];
+                let mut rows: Vec<(u64, u64)> = keys[first..=last]
+                    .iter()
+                    .flat_map(|&key| (low..=high).map(move |order| (key, order)))
+                    .filter(|&(key, order)| {
+                        let corner =
+                            corners && ends.contains(&key) && (order == low || order == high);
+                        corner || draw(one_in) == 0
+                    })
                     .collect();
                 if rows.is_empty() {
-                    rows.push((long(first), 0));
+                    rows.push((keys[first], low));
                 }
                 let deleted = (0..approx::count(rows.len()))
                     .filter(|_| draw(DELETED_ONE_IN) == 0)
                     .collect();
+                let checked = draw(CHECKED_ONE_IN) == 0;
+                let page_rows = 1 + draw(MOST_DRAWN_PAGE_ROWS);
                 DrawnFile {
+                    place,
                     rows,
-                    checked: draw(CHECKED_ONE_IN) == 0,
+                    checked,
+                    shrank: checked && draw(SHRANK_ONE_IN) == 0,
                     deleted,
+                    page_rows: usize::try_from(page_rows).unwrap(),
+                    group_rows: usize::try_from(page_rows + draw(MOST_DRAWN_GROUP_ROWS)).unwrap(),
                 }
             })
             .collect();
-        drawn.sort_by_key(|file| file.rows[0].0);
+        drawn.sort_by_key(|file| (file.place, file.rows[0].0));
         drawn
+    }
+
+    /// `file` written with keys and order values as `keys` and `orders`
+    /// say, as file `name`, indexed in `residency`.
+    async fn built_drawn(
+        name: &str,
+        file: &DrawnFile,
+        (keys, orders): (Written, Written),
+        residency: Residency,
+    ) -> Built {
+        let (column, key_type) = match keys {
+            Written::Long => (KeyColumn::Int64, KeyType::Long),
+            Written::Text => (KeyColumn::Utf8, KeyType::String),
+        };
+        let mut fixture = index_testing::Fixture::with_keys(
+            column,
+            file.rows
+                .iter()
+                .map(|&(key, _)| Some(drawn_key(keys, key)))
+                .collect(),
+        );
+        let values = file
+            .rows
+            .iter()
+            .map(|&(_, order)| drawn_order(orders, order));
+        let (column, order_type) = match orders {
+            Written::Long => (
+                index_testing::Orders::Long(
+                    values
+                        .map(|value| match value {
+                            OrderValue::Long(value) => Some(value),
+                            OrderValue::Str(_) | OrderValue::Bytes(_) => None,
+                        })
+                        .collect(),
+                ),
+                OrderType::Long,
+            ),
+            Written::Text => (
+                index_testing::Orders::Bytes(
+                    values
+                        .map(|value| match value {
+                            OrderValue::Str(text) => Some(text.into_bytes()),
+                            OrderValue::Long(_) | OrderValue::Bytes(_) => None,
+                        })
+                        .collect(),
+                ),
+                OrderType::String,
+            ),
+        };
+        fixture.orders = Some(column);
+        fixture.layout.page_rows = file.page_rows;
+        fixture.layout.write_batch = file.page_rows;
+        fixture.layout.row_group_rows = file.group_rows;
+        let layout = index_testing::ordered_layout(key_type, order_type);
+        built_of(name, &fixture, &layout, file.place, residency).await
     }
 
     /// What a scan of every live pair of `drawn` finds: the pair the check
@@ -1754,14 +1929,14 @@ mod tests {
     /// file holding it; and how many pairs only unchecked files share live,
     /// and how many have other copies all deleted.
     struct Scanned {
-        refused: Option<((i64, i64), usize)>,
+        refused: Option<((u64, u64), usize)>,
         unchecked_ties: usize,
         deleted_ties: usize,
     }
 
     fn scan_live_pairs(drawn: &[DrawnFile], groups: &[Vec<usize>]) -> Scanned {
-        let mut holders: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
-        let mut copies: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+        let mut holders: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+        let mut copies: BTreeMap<(u64, u64), usize> = BTreeMap::new();
         for (at, file) in drawn.iter().enumerate() {
             for (position, &pair) in file.rows.iter().enumerate() {
                 *copies.entry(pair).or_insert(0) += 1;
@@ -1792,13 +1967,30 @@ mod tests {
         }
     }
 
+    /// What the drawn check saw across its cases, each a count that must
+    /// be above zero for the check to prove anything.
+    #[derive(Debug, Default)]
+    struct Seen {
+        refusals: usize,
+        serves: usize,
+        unchecked_ties: usize,
+        deleted_ties: usize,
+        shrank_refusals: usize,
+        several_groups: usize,
+        corner_refusals: usize,
+    }
+
     /// The check across drawn files, of several row groups and pages each,
-    /// some checked and some with deleted rows, in every tier, refuses
-    /// exactly what a scan of every file's live pairs refuses (RFD 025,
-    /// Refresh): in the first overlap group that holds one, the least live
-    /// pair two files hold where one is checked, naming the latest file
-    /// holding it in file order; a pair only unchecked files share, or one
-    /// whose other copies are deleted, is no refusal.
+    /// in buckets of two bucketings and unbucketed, some checked, some
+    /// reused with deletes that shrank, some with deleted rows, with long
+    /// keys and order values and string ones sharing long prefixes, in
+    /// every tier, refuses exactly what a scan of every file's live pairs
+    /// refuses (RFD 025, Refresh): in the first overlap group that holds
+    /// one, the least live pair two files hold where one is checked, naming
+    /// the latest file holding it in file order; a pair only unchecked
+    /// files share, or one whose other copies are deleted, is no refusal.
+    /// A third of the cases draw their files around the corners of their
+    /// ranges, where the ranges files share end on a pair.
     #[tokio::test]
     async fn test_verify_rows_refuses_what_a_scan_of_every_live_pair_refuses() {
         let mut state = 0_u64;
@@ -1806,35 +1998,41 @@ mod tests {
             state = state.wrapping_mul(MIX).wrapping_add(STEP);
             (state >> 33) % below
         };
-        let (mut refusals, mut serves, mut unchecked_ties, mut deleted_ties) = (0, 0, 0, 0);
         let residencies = [Residency::Full, Residency::Disk, Residency::Bloom];
+        let written = [
+            (Written::Long, Written::Long),
+            (Written::Text, Written::Text),
+            (Written::Long, Written::Text),
+            (Written::Text, Written::Long),
+        ];
+        let mut seen = Seen::default();
         for case in 0..DRAWN_CASES {
-            let residency = residencies[usize::try_from(case).unwrap() % residencies.len()];
-            let drawn = draw_files(&mut draw);
+            let at = usize::try_from(case).unwrap();
+            let residency = residencies[at % residencies.len()];
+            let kinds = written[(at / residencies.len()) % written.len()];
+            let corners = draw(CORNERS_ONE_IN) == 0;
+            let drawn = draw_files(&mut draw, corners);
             let mut files = Vec::new();
             for (at, file) in drawn.iter().enumerate() {
-                let page_rows = 1 + draw(MOST_DRAWN_PAGE_ROWS);
-                let group_rows = page_rows + draw(MOST_DRAWN_GROUP_ROWS);
-                files.push(
-                    built_in_groups(
-                        &format!("d-{at:02}"),
-                        &file.rows,
-                        usize::try_from(page_rows).unwrap(),
-                        usize::try_from(group_rows).unwrap(),
-                        residency,
-                    )
-                    .await,
-                );
+                files.push(built_drawn(&format!("d-{at:02}"), file, kinds, residency).await);
             }
-            let reused: Vec<bool> = drawn.iter().map(|file| !file.checked).collect();
+            let reused: Vec<bool> = drawn
+                .iter()
+                .map(|file| !file.checked || file.shrank)
+                .collect();
+            let shrank: Vec<bool> = drawn.iter().map(|file| file.shrank).collect();
             let gone: Vec<Vec<u64>> = drawn.iter().map(|file| file.deleted.clone()).collect();
-            let (groups, check) = check_rows_deleting(&files, &reused, &gone).await;
+            let (groups, check) = check_rows_deleting(&files, &reused, &shrank, &gone).await;
             let scanned = scan_live_pairs(&drawn, &groups);
-            unchecked_ties += scanned.unchecked_ties;
-            deleted_ties += scanned.deleted_ties;
+            seen.unchecked_ties += scanned.unchecked_ties;
+            seen.deleted_ties += scanned.deleted_ties;
+            seen.several_groups += usize::from(groups.len() > 1);
             let Some(((key, order), latest)) = scanned.refused else {
-                assert!(check.is_ok(), "case {case}, {residency:?}: {check:?}");
-                serves += 1;
+                assert!(
+                    check.is_ok(),
+                    "case {case}, {kinds:?}, {residency:?}: {check:?}"
+                );
+                seen.serves += 1;
                 continue;
             };
             let RefusalReason::DuplicateRows {
@@ -1849,16 +2047,24 @@ mod tests {
                 (path, refused_key, *refused_order),
                 (
                     format!("d-{latest:02}"),
-                    Key::Long(key),
-                    OrderValue::Long(order)
+                    drawn_key(kinds.0, key),
+                    drawn_order(kinds.1, order)
                 ),
-                "case {case}, {residency:?}"
+                "case {case}, {kinds:?}, {residency:?}"
             );
-            refusals += 1;
+            seen.refusals += 1;
+            seen.shrank_refusals += usize::from(drawn.iter().any(|file| file.shrank));
+            seen.corner_refusals += usize::from(corners);
         }
         assert!(
-            refusals > 0 && serves > 0 && unchecked_ties > 0 && deleted_ties > 0,
-            "refused {refusals}, served {serves}, unchecked ties {unchecked_ties}, deleted ties {deleted_ties}"
+            seen.refusals > 0
+                && seen.serves > 0
+                && seen.unchecked_ties > 0
+                && seen.deleted_ties > 0
+                && seen.shrank_refusals > 0
+                && seen.several_groups > 0
+                && seen.corner_refusals > 0,
+            "{seen:?}"
         );
     }
 

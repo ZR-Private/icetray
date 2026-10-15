@@ -927,12 +927,12 @@ impl FileIndex {
     /// and writes them with that record; it keeps no key bytes in memory.
     /// Bloom fetches and verifies the chunks, drops them, and keeps the
     /// filters. Every tier keeps the footer, both page indexes of the key
-    /// column and of an ordered table's order column, the offset index of
+    /// column, the offset index of an ordered table's order column and of
     /// every value column the table serves, the fences, and an ordered
     /// table's order facts and order fences; the column index of every other
-    /// column, the value columns' above all, and the offset index of every
-    /// column the table does not serve, are never resident (RFD 004, RFD
-    /// 017, RFD 022, RFD 025).
+    /// column, the value columns' and the order column's among them, and the
+    /// offset index of every column the table does not serve, are never
+    /// resident (RFD 004, RFD 017, RFD 022, RFD 025).
     ///
     /// Only tests call this: the loader runs `inspect` and
     /// `Inspected::build` apart, so its budget check sits between them.
@@ -1035,13 +1035,14 @@ impl FileIndex {
     /// over-counts a uuid key, held inline, by `UUID_BYTES` per page; and
     /// an ordered file's order facts, a `u64` per row group and the least
     /// and greatest order value, exact for integer and fixed-width order
-    /// values and estimated for string and binary ones as the fences of
-    /// such keys are; and an ordered file's order fences, one per order
-    /// page from the offset index, a key at the mean bytes the row group's
-    /// key fences take per key page and an order value exact for an integer,
-    /// at the column's width for a fixed-width value, and for a string or
-    /// binary one at the larger of its page's minimum in the column index
-    /// and the order chunk's uncompressed bytes per value; no footer number
+    /// values and for string and binary ones at the order chunks'
+    /// uncompressed bytes per value; and an ordered file's order fences,
+    /// one per order page from the offset index, a key at the mean bytes
+    /// the row group's key fences take per key page and an order value
+    /// exact for an integer, at the column's width for a fixed-width value,
+    /// and for a string or binary one at the order chunk's uncompressed
+    /// bytes per value, the footer as kept holding no order column index;
+    /// no footer number
     /// bounds a dictionary-encoded column's, so a load charges an ordered
     /// file's built fences exactly (RFD 025, Load). `resident_bytes` shares
     /// the definitions.
@@ -1127,8 +1128,8 @@ impl FileIndex {
         self.layout.held_value_leaves()
     }
 
-    /// The order column's leaf, whose offset index and column index the
-    /// footer keeps; `None` on a key-value table.
+    /// The order column's leaf, whose offset index the footer keeps;
+    /// `None` on a key-value table.
     pub fn order_leaf(&self) -> Option<usize> {
         self.layout.order_leaf()
     }

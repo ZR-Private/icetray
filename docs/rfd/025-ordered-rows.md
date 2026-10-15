@@ -132,10 +132,9 @@ direction under a limit and optional bounds on the order value.
   with different order columns, or with none, therefore each keep their
   own chunk file, and none trusts a file verified under other rules. The
   chunk-file budget and the resident budget reserve an ordered file from
-  the footer's sizes, estimating string and binary order values in the
-  facts as they estimate key fences, and in each order fence at the larger
-  of its page's minimum in the column index and the order chunk's
-  uncompressed bytes per value. No footer number bounds the fences of a
+  the footer's sizes, estimating string and binary order values, in the
+  facts and in each order fence, at the order chunk's uncompressed bytes
+  per value. No footer number bounds the fences of a
   dictionary-encoded order column, so the exact fences are charged once a
   file is built: the chunk file's exact length is reserved before it is
   written, a `full` table's exact resident bytes are checked against its

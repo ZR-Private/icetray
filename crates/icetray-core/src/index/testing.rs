@@ -314,7 +314,7 @@ pub(crate) struct Fixture {
     pub(super) values: Vec<Option<Vec<u8>>>,
     /// The order column of an ordered fixture, as many values as keys;
     /// `None` writes none.
-    pub(super) orders: Option<Orders>,
+    pub(crate) orders: Option<Orders>,
     pub(crate) layout: Layout,
 }
 
@@ -328,7 +328,7 @@ impl Fixture {
     }
 
     /// RFD 002's shape over hand-written keys with `VALUE_BYTES` values.
-    pub(super) fn with_keys(key_column: KeyColumn, keys: Vec<Option<Key>>) -> Self {
+    pub(crate) fn with_keys(key_column: KeyColumn, keys: Vec<Option<Key>>) -> Self {
         let values = (0..keys.len()).map(|i| Some(value_for(i))).collect();
         Self {
             key_column,
@@ -624,15 +624,8 @@ pub(super) fn longs(values: &[i64]) -> Vec<Option<Key>> {
 
 /// `predicted_resident_bytes` of a built index's own footer.
 pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
-    predicted_from(index, index.metadata())
-}
-
-/// What the footer `metadata` of `index`'s file predicts for it, as the
-/// load predicts from the footer as loaded, which holds every page index
-/// the writer wrote.
-pub(super) fn predicted_from(index: &FileIndex, metadata: &ParquetMetaData) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(
-        metadata,
+        index.metadata(),
         index.key_leaf(),
         index.order_column(),
         &index.held_value_leaves(),

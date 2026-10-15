@@ -1595,7 +1595,7 @@ mod tests {
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
         Opened, Orders, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows,
         fault_of, group_rows, header_at, key_for, location, long_orders, longs, moved_by_header,
-        ordered_layout, pages_of, predicted_from, predicted_of, row_of, stepped, store, store_file,
+        ordered_layout, pages_of, predicted_of, row_of, stepped, store, store_file,
         with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
         with_pages,
     };
@@ -4750,15 +4750,17 @@ mod tests {
 
     /// The Full tier's resident bytes and the Disk tier's chunk file of
     /// `opened`, built under a `string` order column, beside what the
-    /// footer as loaded predicted for each.
+    /// load's footer stage (`FileIndex::inspect`) predicted for each.
     async fn budget_of(opened: &Opened) -> ([u64; 2], [u64; 2]) {
         let layout = ordered_layout(KeyType::Long, OrderType::String);
+        let predicted = *FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
+            .await
+            .unwrap()
+            .predicted();
         let full = opened
             .build_under(&layout, Residency::Full, None)
             .await
             .unwrap();
-        let loaded = opened.handle.load_metadata().await.unwrap();
-        let predicted = predicted_from(&full, &loaded);
         let dir = tempfile::tempdir().unwrap();
         let local = testing::local_dir(dir.path(), opened.stats(), None);
         opened
@@ -4772,15 +4774,57 @@ mod tests {
         )
     }
 
-    /// The footer stage's estimate of string order fences covers them
-    /// where the footer bounds them, a page's fence at no less than the
-    /// order chunk's uncompressed bytes per value (review 1, Important 1):
-    /// under a truncated column index, whose page minimums keep 16 of each
-    /// value's thousand bytes, under a full one, and without one. Each case
-    /// gives the Full tier's predicted and resident bytes and the Disk
-    /// tier's predicted and written chunk file; the truncated case's
-    /// prediction was 558,176 bytes before the estimate took the chunk's
-    /// bytes per value.
+    /// The load predicts a file's resident bytes from the footer as it
+    /// keeps it (`FileIndex::inspect`), which holds no order column index
+    /// (RFD 025, Load), so the prediction is the one the footer as loaded
+    /// gives: string order values and fences are estimated from the order
+    /// chunks' uncompressed bytes per value alone, whatever the writer's
+    /// column index holds, truncated, full, or none.
+    #[tokio::test]
+    async fn test_predicted_bytes_of_string_orders_never_read_the_order_column_index() {
+        type Edit = fn(&mut crate::index::testing::Layout);
+        let cases: [(&str, Edit); 3] = [
+            ("truncated", |layout| {
+                layout.truncate = Some(BUDGET_TRUNCATE_BYTES);
+            }),
+            ("full", |_| {}),
+            ("absent", |layout| {
+                layout.order_statistics = Some(EnabledStatistics::Chunk);
+            }),
+        ];
+        let layout = ordered_layout(KeyType::Long, OrderType::String);
+        for (case, edit) in cases {
+            let fixture = budget_fixture(
+                BUDGET_ROWS,
+                BUDGET_RUN_ROWS,
+                BUDGET_PREFIX_BYTES,
+                PLAIN_PAGE_ROWS,
+                edit,
+            );
+            let opened = store(&fixture).await;
+            let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
+                .await
+                .unwrap();
+            let loaded = opened.handle.load_metadata().await.unwrap();
+            let from_loaded = FileIndex::predicted_resident_bytes(
+                &loaded,
+                inspected.layout.key_leaf,
+                inspected.layout.order,
+                &inspected.layout.held_value_leaves(),
+                KeyType::Long,
+                &opened.handle,
+            );
+            assert_eq!(*inspected.predicted(), from_loaded, "{case}");
+        }
+    }
+
+    /// The footer stage's estimate of string order fences, each at the
+    /// order chunk's uncompressed bytes per value, covers them where the
+    /// footer bounds them, a plain chunk's, whatever the writer's column
+    /// index holds: truncated, whose page minimums keep 16 of each value's
+    /// thousand bytes, full, or none. Each case gives the Full tier's
+    /// predicted and resident bytes and the Disk tier's predicted and
+    /// written chunk file, as the load's footer stage predicts them.
     #[tokio::test]
     async fn test_predicted_bytes_cover_string_order_fences_whatever_the_column_index() {
         type Edit = fn(&mut crate::index::testing::Layout);
@@ -4788,14 +4832,14 @@ mod tests {
             (
                 "truncated",
                 |layout| layout.truncate = Some(BUDGET_TRUNCATE_BYTES),
-                [2_442_080, 2_377_460],
-                [2_269_697, 2_205_036],
+                [2_444_086, 2_377_460],
+                [2_271_705, 2_205_036],
             ),
             (
                 "full",
                 |_| {},
-                [2_442_560, 2_377_844],
-                [2_269_793, 2_205_036],
+                [2_444_470, 2_377_844],
+                [2_271_705, 2_205_036],
             ),
             (
                 "absent",
@@ -4835,7 +4879,7 @@ mod tests {
     /// it (review 1, Important 1): beyond the footer's estimate, the
     /// reservation grows by the rest, refused as `OverBudget` where the
     /// budget does not hold it though it held the estimate. The Full tier's
-    /// prediction falls as far short, 258,840 bytes for 2,070,894 resident,
+    /// prediction falls as far short, 241,466 bytes for 2,070,894 resident,
     /// which the load charges once built (`generation::check_built_budget`).
     #[tokio::test]
     async fn test_disk_tier_charges_the_exact_ordered_chunk_file_before_writing_it() {
@@ -4848,10 +4892,10 @@ mod tests {
         );
         let opened = store(&fixture).await;
         let (full, [estimate, exact]) = budget_of(&opened).await;
-        assert_eq!(full, [258_840, 2_070_894], "predicted and resident");
+        assert_eq!(full, [241_466, 2_070_894], "predicted and resident");
         assert_eq!(
             [estimate, exact],
-            [150_385, 1_963_372],
+            [133_011, 1_963_372],
             "predicted and written"
         );
         let layout = ordered_layout(KeyType::Long, OrderType::String);

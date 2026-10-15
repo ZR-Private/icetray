@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
-use parquet::file::page_index::column_index::{ByteArrayColumnIndex, ColumnIndexMetaData};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 
@@ -429,9 +429,7 @@ fn check_offset_index(
 /// `ParquetMetaData::memory_size` reports follow each vector's capacity,
 /// which a copy sets from its contents alone, so the footer as kept and a
 /// copy of the footer as loaded measure the same and
-/// `predicted_resident_bytes` sizes the footer exactly from either. Only
-/// the footer as loaded holds the order column's column index that the
-/// estimate of string and binary order fences reads.
+/// `predicted_resident_bytes` is exact from either.
 pub(super) fn kept_footer(
     metadata: &ParquetMetaData,
     key_leaf: usize,
@@ -777,62 +775,26 @@ fn exact_order_fact_bytes(facts: &OrderFacts) -> u64 {
 }
 
 /// The bytes of the least and greatest order value of the file `order` is
-/// the order column of, before any is decoded, as the fences of a
-/// byte-array key are estimated (`byte_array_fence_heap`): for a byte
-/// array the mean length of the column index's page minimums for the
-/// least and of its page maximums for the greatest, which a writer may
-/// truncate, and without a column index the chunks' mean encoded bytes
-/// per value for both; for a fixed-width column its width; for an integer
-/// the eight bytes of a long.
+/// the order column of, before any is decoded: for a byte array the
+/// chunks' mean uncompressed bytes per value for both, since the footer as
+/// kept holds no order column index (RFD 025, Load); for a fixed-width
+/// column its width; for an integer the eight bytes of a long.
 fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 2] {
     match order.shape {
         OrderShape::Int32 | OrderShape::Int64 => [approx::count(size_of::<i64>()); 2],
         OrderShape::Fixed(width) => [u64::from(width); 2],
         OrderShape::Str | OrderShape::Bin => {
-            let indexes: Vec<&ByteArrayColumnIndex> = (0..metadata.num_row_groups())
-                .filter_map(|row_group| {
-                    match metadata.column_index()?.get(row_group)?.get(order.leaf)? {
-                        ColumnIndexMetaData::BYTE_ARRAY(index) => Some(index),
-                        ColumnIndexMetaData::NONE
-                        | ColumnIndexMetaData::BOOLEAN(_)
-                        | ColumnIndexMetaData::INT32(_)
-                        | ColumnIndexMetaData::INT64(_)
-                        | ColumnIndexMetaData::INT96(_)
-                        | ColumnIndexMetaData::FLOAT(_)
-                        | ColumnIndexMetaData::DOUBLE(_)
-                        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => None,
-                    }
-                })
-                .collect();
-            if indexes.len() == metadata.num_row_groups() {
-                let mean = |lengths: &mut dyn Iterator<Item = Option<&[u8]>>| {
-                    let (bytes, values) =
-                        lengths
-                            .flatten()
-                            .fold((0, 0), |(bytes, values): (u64, u64), value| {
-                                (bytes.saturating_add(approx::count(value.len())), values + 1)
-                            });
-                    bytes.checked_div(values).unwrap_or(0)
-                };
-                [
-                    mean(&mut indexes.iter().flat_map(|index| index.min_values_iter())),
-                    mean(&mut indexes.iter().flat_map(|index| index.max_values_iter())),
-                ]
-            } else {
-                let chunks = || {
-                    metadata
-                        .row_groups()
-                        .iter()
-                        .map(|group| group.column(order.leaf))
-                };
-                let encoded = saturating_sum(
-                    chunks().map(|chunk| approx::measured(chunk.uncompressed_size())),
-                );
-                let values =
-                    saturating_sum(chunks().map(|chunk| approx::measured(chunk.num_values())));
-                // A column of no values has no mean.
-                [encoded.checked_div(values).unwrap_or(0); 2]
-            }
+            let chunks = || {
+                metadata
+                    .row_groups()
+                    .iter()
+                    .map(|group| group.column(order.leaf))
+            };
+            let encoded =
+                saturating_sum(chunks().map(|chunk| approx::measured(chunk.uncompressed_size())));
+            let values = saturating_sum(chunks().map(|chunk| approx::measured(chunk.num_values())));
+            // A column of no values has no mean.
+            [encoded.checked_div(values).unwrap_or(0); 2]
         }
     }
 }
@@ -843,10 +805,9 @@ fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 
 /// the row group's key fences are estimated at per key page
 /// (`estimated_fence_keys`), and its order value at eight bytes for an
 /// integer, the width for a fixed-width value, and for a byte array at the
-/// larger of its page's minimum in the order column's index and the chunk's
-/// uncompressed bytes per value (`byte_array_order_fence_heap`). The built
-/// fences are charged exactly (RFD 025, Load), since no footer number
-/// bounds a dictionary-encoded column's.
+/// chunk's uncompressed bytes per value (`byte_array_order_fence_heap`).
+/// The built fences are charged exactly (RFD 025, Load), since no footer
+/// number bounds a dictionary-encoded column's.
 fn estimated_order_fences(
     metadata: &ParquetMetaData,
     key_leaf: usize,
@@ -872,11 +833,7 @@ fn estimated_order_fences(
                 }
                 OrderShape::Fixed(width) => count.saturating_mul(u64::from(width)),
                 OrderShape::Str | OrderShape::Bin => {
-                    let column_index = metadata
-                        .column_index()
-                        .and_then(|index| index.get(row_group))
-                        .and_then(|columns| columns.get(order.leaf));
-                    byte_array_order_fence_heap(column_index, group.column(order.leaf), pages)
+                    byte_array_order_fence_heap(group.column(order.leaf), pages)
                 }
             };
             FenceBytes {
@@ -903,39 +860,17 @@ fn order_fence_bytes(groups: &[FenceBytes], long_keys: bool, long_orders: bool) 
 
 /// The heap the order values of the fences of one row group of a
 /// `BYTE_ARRAY` order column would hold, `pages` of them: per page the
-/// larger of its minimum's length in the column index, when the file has
-/// one, and the chunk's uncompressed bytes per value. A fence keeps a prefix
-/// of its page's first value, which a writer's truncated minimum, or the
-/// minimum of a page that holds several keys, can fall far short of; the
-/// chunk's bytes per value covers a plain chunk's values on average, and a
-/// dictionary-encoded chunk's values only as far as its dictionary holds
-/// them.
-fn byte_array_order_fence_heap(
-    column_index: Option<&ColumnIndexMetaData>,
-    chunk: &ColumnChunkMetaData,
-    pages: usize,
-) -> u64 {
+/// chunk's uncompressed bytes per value. A fence keeps a prefix of its
+/// page's first value; the chunk's bytes per value covers a plain chunk's
+/// values on average, and a dictionary-encoded chunk's values only as far
+/// as its dictionary holds them, so the built fences are charged exactly
+/// (RFD 025, Load).
+fn byte_array_order_fence_heap(chunk: &ColumnChunkMetaData, pages: usize) -> u64 {
     let encoded = approx::measured(chunk.uncompressed_size());
     let values = approx::measured(chunk.num_values());
     // A chunk of no values has no mean.
     let mean = encoded.checked_div(values).unwrap_or(0);
-    match column_index {
-        Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => index
-            .min_values_iter()
-            .map(|min| approx::count(min.map_or(0, <[u8]>::len)).max(mean))
-            .fold(0, u64::saturating_add),
-        None
-        | Some(
-            ColumnIndexMetaData::NONE
-            | ColumnIndexMetaData::BOOLEAN(_)
-            | ColumnIndexMetaData::INT32(_)
-            | ColumnIndexMetaData::INT64(_)
-            | ColumnIndexMetaData::INT96(_)
-            | ColumnIndexMetaData::FLOAT(_)
-            | ColumnIndexMetaData::DOUBLE(_)
-            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
-        ) => approx::count(pages).saturating_mul(mean),
-    }
+    approx::count(pages).saturating_mul(mean)
 }
 
 /// The fence array's bytes: one `Key` per key page plus what each key holds

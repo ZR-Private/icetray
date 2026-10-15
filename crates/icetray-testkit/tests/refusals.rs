@@ -1482,63 +1482,84 @@ async fn test_duplicate_rows_across_files_are_refused_naming_the_later_file() ->
     Ok(())
 }
 
+/// Every residency, each of which the revived-pair refusal is checked in.
+const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
+
 /// A ref moved back to a snapshot that lists both copies of an updated pair
 /// but not the deletion vector that hid the older one revives it (RFD 021):
 /// the reused file whose deletes shrank is checked again, and the refresh is
 /// `duplicate_rows`, naming the later file in file order, while the last
-/// generation keeps serving.
+/// generation keeps serving, in every residency.
 #[tokio::test]
 async fn test_refresh_refuses_a_pair_revived_by_dropped_deletes() -> Result<()> {
-    let (_dir, catalog) = local_catalog().await?;
-    let mut fixture = two_row_fixture(&catalog, "ord_revived", 1).await?;
-    fixture
-        .update_rows(
-            &[(REPEATED_ID, SECOND_ORDER)],
-            DeleteForm::Vectors,
-            "update",
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let mut fixture = two_row_fixture(&catalog, &format!("ord_revived_{at}"), 1).await?;
+        fixture
+            .update_rows(
+                &[(REPEATED_ID, SECOND_ORDER)],
+                DeleteForm::Vectors,
+                "update",
+            )
+            .await?;
+        let vector = fixture.deletes().to_vec();
+        assert_eq!(vector.len(), 1, "one deletion vector hides the older copy");
+        fixture
+            .commit_by_hand(HandSnapshot {
+                data: fixture.files().to_vec(),
+                deletes: Vec::new(),
+            })
+            .await?;
+        let without_vector = fixture.snapshot_id().expect("a snapshot was committed");
+        fixture
+            .commit_by_hand(HandSnapshot {
+                data: fixture.files().to_vec(),
+                deletes: vector,
+            })
+            .await?;
+        let source = fixture.root_source();
+        let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
+        let scratch = tempfile::tempdir()?;
+        let local = match residency {
+            Residency::Disk => Some(Arc::new(LocalDir::open(
+                &LocalConfig {
+                    dir: scratch.path().to_path_buf(),
+                    index_budget_bytes: None,
+                    page_cache_disk_bytes: 0,
+                },
+                storage.stats(),
+            )?)),
+            Residency::Full | Residency::Bloom => None,
+        };
+        let served = verify::serve_over(
+            storage,
+            TableConfig {
+                source: source.clone(),
+                residency,
+                ..ordered_config(&fixture)
+            },
+            TableSource::from_config(&source).await?,
+            local,
         )
         .await?;
-    let vector = fixture.deletes().to_vec();
-    assert_eq!(vector.len(), 1, "one deletion vector hides the older copy");
-    fixture
-        .commit_by_hand(HandSnapshot {
-            data: fixture.files().to_vec(),
-            deletes: Vec::new(),
-        })
-        .await?;
-    let without_vector = fixture.snapshot_id().expect("a snapshot was committed");
-    fixture
-        .commit_by_hand(HandSnapshot {
-            data: fixture.files().to_vec(),
-            deletes: vector,
-        })
-        .await?;
-    let source = fixture.root_source();
-    let served = verify::serve(
-        TableConfig {
-            source: source.clone(),
-            ..ordered_config(&fixture)
-        },
-        TableSource::from_config(&source).await?,
-        verify::storage_config_for_tests(),
-    )
-    .await?;
-    let generation = served.current();
-    assert_eq!(generation.files.len(), 2, "both copies' files serve");
-    let later = generation.files[1].entry.path.clone();
+        let generation = served.current();
+        assert_eq!(generation.residency, residency);
+        assert_eq!(generation.files.len(), 2, "both copies' files serve");
+        let later = generation.files[1].entry.path.clone();
 
-    fixture.move_ref(without_vector).await?;
-    let error = served.table.refresh().await.unwrap_err();
-    let Error::Refused {
-        reason: RefusalReason::DuplicateRows { path, key, order },
-        ..
-    } = error
-    else {
-        panic!("expected duplicate_rows, got {error:?}");
-    };
-    assert_eq!(path, later);
-    assert_eq!(key, fixture.key(REPEATED_ID));
-    assert_eq!(*order, OrderValue::Long(SECOND_ORDER));
-    assert_eq!(served.current().snapshot_id, generation.snapshot_id);
+        fixture.move_ref(without_vector).await?;
+        let error = served.table.refresh().await.unwrap_err();
+        let Error::Refused {
+            reason: RefusalReason::DuplicateRows { path, key, order },
+            ..
+        } = error
+        else {
+            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
+        };
+        assert_eq!(path, later, "{residency:?}");
+        assert_eq!(key, fixture.key(REPEATED_ID));
+        assert_eq!(*order, OrderValue::Long(SECOND_ORDER));
+        assert_eq!(served.current().snapshot_id, generation.snapshot_id);
+    }
     Ok(())
 }
