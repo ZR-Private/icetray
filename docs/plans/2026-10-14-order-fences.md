@@ -147,3 +147,36 @@ The baseline is the library code of 39b8a7c (this task's commit changes only the
 - [ ] Profile (samply) a warm bounded Scan on `ordered-long` and `ordered-string` and a first load of the rolled table; name the top costs.
 - [ ] Write the analysis: what moved, by how much, whether each RFD claim holds (one round always; work follows the limit; edge-only merge reads; memory per fence), the key-value regression check, and anything that did not move as expected. House voice; host by specs only.
 - [ ] Commit `docs(analysis): order fences measured`.
+
+---
+
+## Follow-up (maintainer, 2026-10-15)
+
+Decisions after the measurement: the merge reads ahead under a byte budget; MultiScan spreads its keys across idle workers as MultiGet does; the JSON output warns when an order value exceeds what a double holds exactly.
+
+## Task 11: Merge read-ahead under a byte budget
+
+**Files:** `crates/icetray-core/src/generation/ordered.rs`, `index/pairs.rs`, `docs/rfd/025-ordered-rows.md` (Refresh), `docs/operating.md`, tests.
+
+- [ ] Each file of a merge holds the chosen pages of its current row group, always; beyond that the merge issues the reads of later row groups ahead of need, across the group's files in the order the merge will consume them, while the bytes held and in flight stay within `MERGE_READ_AHEAD_BYTES` (64 MiB, 67,108,864) per merge. Pages are read once; GETs and bytes are unchanged; only their timing moves.
+- [ ] RFD 025 Refresh: replace "holds at most one row group's chosen pages per file" with the read-ahead rule as it stands; operating.md's refresh notes match.
+- [ ] Tests: with a gated store, the merge issues the next row group's reads before a cursor runs dry when the budget allows (count rounds, not time); with a budget smaller than one row group per file it degrades to one row group per file and still completes; GET and byte counts equal the no-read-ahead counts; the held-bytes bound holds; every refusal test unchanged.
+- [ ] Commit `perf(icetray-core): read the merge's row groups ahead under a byte budget`.
+
+## Task 12: MultiScan spreads its keys across idle workers
+
+**Files:** `crates/icetray-core/src/table.rs` (`Lookups::runs`, multi_scan), docs/rfd/025-ordered-rows.md (Limits or Cost), docs/performance.md, tests.
+
+- [ ] MultiScan splits its keys into runs of at least `MULTI_SCAN_TASK_KEYS_MIN` (32) keys spread across idle workers through `Lookups::runs`, the gate MultiGet uses (it declines to split once calls in flight reach the worker count); below 32 keys a MultiScan stays on its task. Results, order, the receipt's counts, the value bound, and the response bound unchanged.
+- [ ] Tests: a MultiScan of more than 32 keys answers identically split and unsplit (every key, both directions, repeated keys, a failing key, a dropped call's counts); the split happens only while workers are idle (assert through the gate, not timing).
+- [ ] RFD 025 states that a MultiScan spreads as a MultiGet does; performance.md notes the latency/CPU trade with the Task 7 numbers.
+- [ ] Commit `perf(icetray-core): spread a MultiScan's keys across idle workers`.
+
+## Task 13: Warn when JSON output loses an order value's precision
+
+**Files:** `crates/icetray/src/output.rs`, `docs/configuration.md` (Output), tests.
+
+- [ ] When the doctor's or info's JSON output carries a long order value whose magnitude exceeds 2^53 (9,007,199,254,740,992), the command writes one warning to stderr naming the table and saying such values are exact as JSON text but lose precision in readers that parse numbers as doubles. The JSON itself is unchanged; text output never warns.
+- [ ] configuration.md's Output section names the warning.
+- [ ] Tests: a value at 2^53 does not warn, 2^53 + 1 and its negative do; text output never warns; stdout bytes unchanged.
+- [ ] Commit `feat(icetray): warn when JSON output carries an order value past 2^53`.
