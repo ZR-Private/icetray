@@ -287,10 +287,11 @@ doctor's `large_runs` advice tells the owner which tables would be
 refused at the full limit.
 
 In each file that holds the key, a cold `Scan` costs a GET per
-contiguous span of uncached pages of each requested column, and under
-`full` and `bloom` of the order column, which `disk` reads locally;
-under `bloom` the key-page GETs come first. A caller therefore requests
-only the columns it uses. A compaction that writes one file per bucket
+contiguous span of uncached pages of each requested column over the rows
+it reads, and under `full` and `bloom` of the order column, which `disk`
+reads locally; under `bloom` the key-page GETs come first. A caller
+therefore requests only the columns it uses. A compaction that writes
+one file per bucket
 holds each key in one file; one that rolls files by size can split a key
 at a file boundary (`shared_edge_keys`), and a `Scan` of that key reads
 every file that holds it. A table that takes appends between compactions
@@ -403,7 +404,7 @@ its `limit`.
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` (4 MiB by default); the error names the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit, and the server sends no rows. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. The server sends this for no other reason. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
-| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a span GET within any `Scan` or `MultiScan`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
+| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |
 
 The gRPC layer enforces a deadline the client sends and reports its

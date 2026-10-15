@@ -83,15 +83,18 @@ of its pages cached, a cold `Scan` of one value column costs:
 | `bloom` | the filter screens the file, then a GET of each of those key pages | 2 GETs, as under `full`, after the key-page round |
 
 Within a row group, a column's rows for one `Scan` are contiguous, so
-icetray fetches each column's uncached pages over the run as one span
-GET, however many rows the limit takes, and a dictionary-encoded column
-adds its dictionary page. A `Scan` therefore costs about what a cold
-`Get` with one more column does, and its bytes grow with the rows it
-returns and their values' size. A run that spans row groups costs a span
-per row group, and a run the cache holds in part costs one GET per
-uncached span. With a bound, icetray selects from the order column's
-resident column index the pages that can hold the bound, and reads them
-in the same round as the value pages.
+icetray fetches each column's uncached pages over the rows it reads as
+one span GET, however many rows the limit takes, and a
+dictionary-encoded column adds its dictionary page. A `Scan` therefore
+costs about what a cold `Get` with one more column does, and its bytes
+grow with the rows it returns and their values' size. A run that spans
+row groups costs a span per row group, and a run the cache holds in part
+costs one GET per uncached span. Whole pages of deleted rows between the
+rows a `Scan` reads are never decoded: where they take at most 256 KiB,
+the span GET fetches them with the pages around them, and a wider stretch
+splits the span into two GETs. With a bound, icetray places the bound on
+one order page by the order fences it holds resident, and reads that
+page in the same round as the value pages.
 
 The files that hold the key multiply the cost. A cold `Scan` of a key in
 K files costs K times the GETs of a compacted one and waits on the
@@ -114,9 +117,9 @@ latency, tens of milliseconds
 
 A load of an ordered table reads each file's order column once per row
 group to verify it, one more GET per row group than a key-value table's
-load. Resident memory adds the order column's offset index and column
-index and a few facts per file, and a `Scan` reads the order values from
-their pages.
+load. Resident memory adds the order column's offset index, a few facts
+per file, and the order fences, one pair of key and order value per
+order page, and a `Scan` reads the order values from their pages.
 
 ### The scan cache
 

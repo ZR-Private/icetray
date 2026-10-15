@@ -335,10 +335,11 @@ ALTER TABLE db.events WRITE LOCALLY ORDERED BY key, ts;
   `unsorted`. Serve a tag or branch that the compaction job moves after
   it sorts the files, so icetray serves only sorted snapshots.
 - **Page indexes.** icetray locates the order column's pages through
-  its offset index and selects the pages a bound reaches from its column
-  index, both of which Iceberg's writers write by default. With the
-  recipe's `'parquet.columnindex.truncate.length' = '256'`, the column
-  index of a string order column holds values of up to 256 bytes whole.
+  its offset index, which Iceberg's writers write by default. A `Scan`
+  places its bounds, and a refresh chooses the order pages it compares,
+  by the order fences icetray records from the rows at load, one per
+  order page, so both read the same pages whether the writer keeps the
+  order column's column index whole, truncates it, or leaves it out.
 
 ### Requirements of an ordered table
 
@@ -355,13 +356,11 @@ replace.
 | An order column of Iceberg type `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed` | Refused: `order_type_unsupported`. An order column stored in another Parquet type than Iceberg's, such as INT96 or millisecond timestamps, or promoted to a type of another unit, such as `date` to `timestamp`, is refused as `order_type_mismatch`. A file written before Iceberg promoted the column from `int` to `long` is served | Declare the order column with one of those types and write it through an Iceberg writer; rewrite files a migration left in another unit |
 | No null order values | Refused: `null_order` | Filter nulls before the write |
 | The order column in every data file | Refused: `column_mismatch`, for a file written before the order column was added, since a default would give every row of the file one order value | A compaction that rewrites those files with the column |
-| An offset index on the order column, and, where present, a column index whose entries bound each order page's values | Fails the load as a `file` fault. icetray checks every order page's values against that page's column index entry, so it places a bound only by an index it has checked | An Iceberg writer, which writes both |
-| A column index on the order column | Under `full` and `bloom`, caps at `balanced`: `order_index_missing`, since a bounded `Scan` reads the run's order pages in a first round and its value pages in a second, with as many GETs as one round. Under `disk` the order pages are local reads | An Iceberg writer, which writes the column index by default |
+| An offset index on the order column | Fails the load as a `file` fault, since icetray locates every order page through it | An Iceberg writer, which writes it by default |
 | Dictionary encoding off on the order column | Under `full` and `bloom`, caps at `balanced`: `dictionary_encoded_order`, one extra GET per `Scan` per file for the dictionary page. Under `disk` the dictionary page is a local read | `'parquet.enable.dictionary' = 'false'` |
-| A full-length column index on the order column | Advice: `order_index_truncated`, since long values sharing a prefix widen the pages a bound selects, and where the rows a bounded `Scan` walks to fill its limit lie on more than one page holding only the key's rows across the same bound, it reads their value pages in a second round | `'parquet.columnindex.truncate.length'` at least the longest order value |
 | Within a bucket, files with disjoint key ranges | Caps at `balanced`: `shared_edge_keys`, for files one snapshot added that meet only where one file's last key is the next file's first, as a compaction that rolls files by size writes them; a `Scan` of such an edge key reads every file that holds it. Caps at `permissive`: `overlapping_files`, for any other overlap, as appends write it | A compaction, which merges the appended files; a bucket compacted into one file has no edge keys |
 | Runs of at most 1,000 rows | Advice: `long_runs`, naming the longest run; a caller reads a longer history in more than one `Scan` at the default `max_scan_rows` | Nothing in the layout: callers page by order value ([Calling icetray](calling.md#paging-by-order-value)) |
-| `max_scan_rows` rows of the configured value columns within `server.max_scan_bytes`, 4 MiB by default, a gRPC client's default message limit | Advice: `large_runs`, from the footer's uncompressed bytes per row; a `Scan` at the full limit would be refused as `FAILED_PRECONDITION` | A lower `max_scan_rows`, or callers that request fewer rows or columns; an owner whose clients accept larger messages raises `server.max_scan_bytes`. The advice counts the value columns' bytes alone: each row's order value and framing add 10 to 20 bytes more, so a table just under the bound can still be refused |
+| `max_scan_rows` rows of the configured value columns within `server.max_scan_bytes`, 4 MiB by default, a gRPC client's default message limit | Advice: `large_runs`, from the footer's uncompressed bytes per row; a `Scan` at the full limit would be refused as `FAILED_PRECONDITION` | A lower `max_scan_rows`, or callers that request fewer rows or columns; an owner whose clients accept larger messages raises `server.max_scan_bytes`. The advice counts the value columns' bytes alone: each row's order value and framing add more, 10 to 20 bytes for an integer or time order value, so a table just under the bound can still be refused |
 
 The bloom findings `bloom_oversized` and `bloom_undersized` divide a row
 group's filter bits by the distinct keys it holds, which the load counts,

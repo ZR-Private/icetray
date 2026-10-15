@@ -6,9 +6,10 @@
 > it names. See RFD 022.
 
 > Updated 2026-10-14: an ordered table's file also keeps its order
-> column's offset index and column index and the order facts its load
-> records, and its load reads the order column's chunk of each row
-> group, one more GET per row group. See RFD 025.
+> column's offset index, the order facts its load records, and its
+> order fences, a pair of key and order value per order page by which a
+> Scan places its bounds; its load reads the order column's chunk of
+> each row group, one more GET per row group. See RFD 025.
 
 ## Problem
 

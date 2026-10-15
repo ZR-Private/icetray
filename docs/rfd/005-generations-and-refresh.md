@@ -39,8 +39,10 @@
 > Updated 2026-10-14: on an ordered table, uniqueness holds for a key
 > and order value together, checked only for a new file, or one whose
 > deletes shrank, against the files whose key and order ranges both meet
-> its own, in one merge per overlap group; an append of later rows
-> merges nothing. See RFD 025.
+> its own, in one merge per overlap group. The merge reads only the
+> order pages whose order fences show they can hold a pair another file
+> of the group holds, a row group of each file at a time, and an append
+> of later rows merges nothing. See RFD 025.
 
 ## Problem
 

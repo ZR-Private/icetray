@@ -175,7 +175,7 @@ direction under a limit and optional bounds on the order value.
   | Step | `full` | `disk` | `bloom` |
   |---|---|---|---|
   | Find the run | decode of at most two key pages per row group it spans, from memory | the same, read from the local file | the filter screens the file, then GETs of those key pages, concurrently, and of the key column's dictionary page when it has one |
-  | Read the rows | per column and row group, one GET per contiguous span of uncached pages, and the column's dictionary page when it is dictionary-encoded | the same, with the order column read from the local chunk file | the same as `full` |
+  | Read the rows | per column and row group, one GET per contiguous span of uncached pages over the rows read, with the pages of deleted rows between two spans in the same GET when they take at most 256 KiB, and the column's dictionary page when it is dictionary-encoded | the same, with the order column read from the local chunk file | the same as `full` |
   | A file without the key | one key-page decode | one local read | a key-page GET at the filter's false-positive rate |
 
   Within a row group, the run lies between the first and last key pages
@@ -184,11 +184,16 @@ direction under a limit and optional bounds on the order value.
   resident first and last key of each row group give the row groups a
   run spans. The server takes up to the limit of the run's newest or
   oldest live rows, counted against the resident deleted rows without
-  I/O. With a bound, a binary search over the run's fences places the
-  bound on one order page, and the server reads that page with the value
-  pages in the same round, so beyond the rows the limit selects, a
-  bounded Scan reads in each requested column at most the rows of the
-  order page that holds the bound. Where that page is local, under
+  I/O. It passes over a whole order page of deleted rows in one step
+  and decodes no page that holds none of the rows it reads, so such
+  pages split a column's span; where the pages between two spans take at
+  most 256 KiB, one GET fetches them with both spans, since a GET moves
+  that many bytes in a small part of its round trip. With a bound, a binary
+  search over the run's fences places the bound on one order page, and
+  the server reads that page with the value pages in the same round, so
+  beyond the rows the limit selects, a bounded Scan reads in each
+  requested column at most the rows of the order page that holds the
+  bound. Where that page is local, under
   `disk`, or already cached, the server decodes it first and reads only
   the value pages of the rows taken, at no more rounds to object
   storage. A Scan's work follows its limit, not its run's length. Across
@@ -261,7 +266,9 @@ direction under a limit and optional bounds on the order value.
   group's filter bits by its distinct keys, which the load counts.
 - **Metrics.** `icetray_scans_total` by table and result (`rows`,
   `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
-  histograms, and `icetray_scan_seconds`, cold and warm. A Scan is cold
+  histograms, `icetray_scan_seconds`, cold and warm, and
+  `icetray_scan_response_bytes`, the encoded size of each Scan and
+  MultiScan response, a refused one included. A Scan is cold
   when an order or value page it reads, or such a column's dictionary
   page, came from object storage, as a Get's cold hit counts its value
   pages (RFD 022); its key-page GETs under `bloom` leave it warm.

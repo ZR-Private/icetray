@@ -9,9 +9,21 @@
 > the value's bytes, and returns the fields named. See RFD 024.
 
 > Updated 2026-10-14: a Scan of an ordered table finds the key's run
-> by decoding at most two key pages per row group it spans, then reads
-> the order column and each requested column over the run's rows, one
-> GET per contiguous span of uncached pages, in one round. See RFD 025.
+> by decoding at most two key pages per row group it spans, places its
+> bounds on order pages by the order fences, then reads the order column
+> and each requested column over the rows it reads, one GET per
+> contiguous span of uncached pages, in one round. Whole pages of
+> deleted rows between the rows it reads split a column's span, and one
+> GET fetches them, undecoded, with the spans beside them when they take
+> at most 256 KiB. See RFD 025.
+
+> Updated 2026-10-14: a lookup and a Scan read a value page of plain
+> byte arrays, in a column neither nested nor repeated and with no
+> dictionary page, with icetray's own plain reader, which slices each
+> value from the decompressed page in place, where the column reader
+> builds and reference-counts each value it decodes. The column reader
+> reads every other page, and any page the plain reader cannot read
+> exactly, so no other layout needs a path of its own.
 
 ## Problem
 

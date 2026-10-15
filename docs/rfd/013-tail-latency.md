@@ -20,7 +20,11 @@
 > the GETs of a Scan and a MultiScan as of a MultiGet; a Scan has
 > `server.scan_deadline` and a MultiScan `server.multi_scan_deadline`,
 > and span GETs are hedged in a window of their own per table whose
-> delay scales with a span's pages. See RFD 025.
+> delay scales with a span's pages. A span GET takes its fan-out slot
+> before it claims its pages as in flight, as a lookup's GET does, so a
+> read of another call waits only on pages a GET is fetching and fetches
+> pages still queued behind a full fan-out itself; a span read whose
+> pages the scan cache holds in memory takes no lock. See RFD 025.
 
 ## Problem
 

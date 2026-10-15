@@ -20,9 +20,12 @@
 > bounds as an `OrderValue` and return rows with their order values and
 > a `more` flag; TableInfo reports the order column, its type, and
 > `max_scan_rows`. A call of the wrong kind for the table, an unspecified
-> direction, a limit above `max_scan_rows`, a bound of the wrong variant,
-> or an `after` at or above `before` is `INVALID_ARGUMENT`, and a
-> MultiScan fails whole as a MultiGet does. See RFD 025.
+> direction, a limit above `max_scan_rows`, a bound of the wrong variant
+> or of none, an `after` at or above `before`, or a MultiScan above
+> `server.max_multi_scan_values` is `INVALID_ARGUMENT`, and a MultiScan
+> fails whole as a MultiGet does. A Scan or MultiScan response that would
+> encode to more than `server.max_scan_bytes` is `FAILED_PRECONDITION`,
+> and the server sends none of its rows. See RFD 025.
 
 > Updated 2026-10-15: the kind of a call is checked against the table
 > first, before the table's readiness and before the request's key,
@@ -102,8 +105,9 @@ TableInfo reports the snapshot id, bucket count, file count, row count, key
 type, resident index bytes, and the table's value columns in name order,
 each with its type, a `fixed` column's width, and its format, and for an
 ordered table its order column, the column's type and a `fixed` width,
-and `max_scan_rows`. The key type, each column's type, its format, and
-the order type are enums, so clients switch on them.
+`max_scan_rows`, and `max_multi_scan_values`. The key type, each
+column's type, its format, and the order type are enums, so clients
+switch on them.
 
 Field comments in the proto describe what a caller can rely on and leave
 the server's internal structures out.
@@ -159,6 +163,11 @@ of 0 counting as the table's `max_scan_rows`, and a larger call is
 MultiGet fan-out included, is an open question
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
 and its answer may move the limit.
+
+A Scan or MultiScan response that would encode to more than
+`server.max_scan_bytes`, 4 MiB by default and a gRPC client's default
+limit on a message it receives, is `FAILED_PRECONDITION`, and the server
+sends none of its rows (RFD 025).
 
 A whole-batch failure, of a MultiGet or a MultiScan, discards the keys
 that were answered, which costs the fan-out pattern in archetype A a

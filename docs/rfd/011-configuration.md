@@ -23,8 +23,8 @@
 > Updated 2026-10-14: a table entry that sets `order_column` is an
 > ordered table and may set `max_scan_rows`; `server.multi_get_fan_out`
 > is renamed `server.batch_fan_out`, and the server adds
-> `max_multi_scan_values`, `scan_deadline`, `multi_scan_deadline`, and
-> `scan_page_cache_bytes`. See RFD 025.
+> `max_multi_scan_values`, `max_scan_bytes`, `scan_deadline`,
+> `multi_scan_deadline`, and `scan_page_cache_bytes`. See RFD 025.
 
 ## Problem
 

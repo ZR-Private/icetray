@@ -109,7 +109,7 @@ Counters and histograms:
 | `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. icetray counts a failure it remembers for a snapshot once, when it first meets it ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
-| `icetray_scans_total` | `table`, `result` | every ordered table and result | Scans of one key that an ordered table read; each key of a `MultiScan` counts one. A request refused before any read is not counted. A call whose response the server refused above `server.max_scan_bytes` counts each key it read as `error`. |
+| `icetray_scans_total` | `table`, `result` | every ordered table and result | Scans of one key that an ordered table read; each key of a `MultiScan` counts one, and a key listed twice counts once. A request refused before any read is not counted. A call whose response the server refused above `server.max_scan_bytes` counts each key it read as `error`. A `MultiScan` that fails, runs past its deadline, or is canceled counts the keys it finished by their results and the key whose read failed as `error`, as a failed `MultiGet` counts the keys it completed. |
 | `icetray_lookup_seconds` (histogram) | `table`, `result` | every table and result | Lookup latency. |
 | `icetray_object_get_seconds` (histogram) | `kind` | every kind | Object-store GET latency. |
 | `icetray_scan_rows` (histogram) | `table` | every ordered table | Rows each answered Scan of one key returned. |
@@ -220,10 +220,9 @@ The label values:
   `many_files_per_bucket`, `no_bloom_filter`, `bloom_oversized`,
   `bloom_undersized`, `deletes_pending`, `column_default`, and the codes
   of [ordered tables](#ordered-tables), `shared_edge_keys`,
-  `dictionary_encoded_order`, `order_index_missing`,
-  `order_index_truncated`, `long_runs`, and `large_runs`. icetray
+  `dictionary_encoded_order`, `long_runs`, and `large_runs`. icetray
   publishes every load-time code for every table, so a key-value table
-  carries a series of 0 for each of the six ordered codes.
+  carries a series of 0 for each of the four ordered codes.
   `dictionary_encoded_value`, `large_value_pages`,
   `value_pages_over_ceiling`, and `column_default` are about one value
   column and carry the `column` label; the other codes carry none.
@@ -233,7 +232,8 @@ The label values:
   file count is in the finding's message and in the doctor's
   `files_predating_column`. The doctor's `malformed_protobuf` has no
   series: a load reads no values, so only the `doctor` command raises it.
-- `column`: a configured value column's name.
+- `column`: a configured value column's name, or for
+  `icetray_value_page_gets_total` an ordered table's order column's.
 - `reason` of `icetray_refresh_errors_total`: a refusal reason
   (`unsorted`, `null_keys`, `duplicate_keys`, `duplicate_rows`,
   `null_order`, `key_outside_bucket`, `key_type_mismatch`,
@@ -315,8 +315,9 @@ level.
 
 - The chunk files of tables with `residency = "disk"`: each data file's
   key chunks, and for an ordered table its order chunks too, while its
-  footer, page indexes, and fence array stay in memory. A key-value entry
-  and an ordered entry over the same data file, or two ordered entries
+  footer, page indexes, and fence array, and an ordered table's order
+  fences and order facts, stay in memory. A key-value entry and an
+  ordered entry over the same data file, or two ordered entries
   with different order columns, each keep a chunk file of their own,
   named by the rules it was verified under.
 - The disk level of the value-page cache, bounded by
@@ -462,17 +463,19 @@ poll reads depends on the table's source
   snapshot, or refuses it in turn, icetray logs `source moved past a
   refused snapshot` at `info` with the `reason` and, when the ref named
   one, the refused `snapshot_id`. A reload that changes a setting of the
-  table's entry other than `lookups`, `strict`, and column formats loads
-  the table anew under the new entry, the refused snapshot included, so
-  fixing `ref` or a column name or raising `resident_budget_bytes` takes
-  effect without waiting for a new snapshot; if icetray still refuses the
-  snapshot, it refuses the reload. A reload that changes only `lookups`,
-  `strict`, or the formats of the table's value columns retunes the table
-  in place and loads nothing. The retune forgets every remembered
-  refusal, whatever its reason, and icetray logs `retune forgot a refused
-  snapshot` at `info`, so the next poll builds the snapshot the ref names
-  under the new entry. icetray then refuses once more a snapshot it
-  had refused for a reason other than its level, and remembers it again.
+  table's entry other than `lookups`, `strict`, column formats, and
+  `max_scan_rows` loads the table anew under the new entry, the refused
+  snapshot included, so fixing `ref` or a column name or raising
+  `resident_budget_bytes` takes effect without waiting for a new
+  snapshot; if icetray still refuses the snapshot, it refuses the
+  reload. A reload that changes only `lookups`, `strict`, the formats of
+  the table's value columns, or an ordered table's `max_scan_rows`
+  retunes the table in place and loads nothing. The retune forgets every
+  remembered refusal, whatever its reason, and icetray logs `retune
+  forgot a refused snapshot` at `info`, so the next poll builds the
+  snapshot the ref names under the new entry. icetray then refuses once
+  more a snapshot it had refused for a reason other than its level, and
+  remembers it again.
 - icetray retries every other failure on every poll, and counts and logs
   it each time: a store, catalog, cache, or local-directory error; a
   timeout or deadline; `over_budget` against the shared
@@ -480,7 +483,9 @@ poll reads depends on the table's source
   version hint or catalog record that names no usable metadata; a
   `parquet` or `iceberg` library error; a `file` fault found while
   decoding a data file's pages, which a `disk` table may have read from
-  its local chunk file instead of the data file; and a delete file whose
+  its local chunk file instead of the data file, such as a string key or
+  order value that is not UTF-8, or a row group whose order fences
+  together pass the 4 GiB their offsets address; and a delete file whose
   framing is invalid: a Puffin footer whose magics or length are wrong or
   whose payload is not its JSON, a deletion vector blob whose length,
   magic, or checksum is wrong, or a position delete file's page header
@@ -514,11 +519,12 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
   equals the original. A change to the set of value columns changes the
   entry, and icetray loads the table anew.
 - icetray retunes in place a table whose entry changed only in `lookups`,
-  `strict`, or the formats of its value columns: its generation keeps
-  serving and icetray loads nothing, since it judges the level from the
-  layout the generation already holds, and a lookup reads each column's
-  format from the entry. icetray accepts or refuses a field list by the
-  new format from the next call on. icetray refuses the reload when a
+  `strict`, the formats of its value columns, or an ordered table's
+  `max_scan_rows`: its generation keeps serving and icetray loads
+  nothing, since it judges the level from the layout the generation
+  already holds, and a lookup reads each column's format, and a `Scan`
+  its limit, from the entry. icetray accepts or refuses a field list by
+  the new format from the next call on. icetray refuses the reload when a
   strict table's serving snapshot is below its new level, as it would
   refuse to start with that file, and when the reload declares a protobuf
   format on a column whose type in the serving snapshot is not `binary`.
@@ -577,7 +583,7 @@ writer appends between compactions is `permissive` under
 left at the default, icetray reports such a table below its level after
 every append. `icetray_scan_files` shows how many files each `Scan`
 reads, and its rise between compactions measures what the appends cost.
-Six finding codes apply to ordered tables alone:
+Four finding codes apply to ordered tables alone:
 
 - `shared_edge_keys` caps the level at `balanced`: files one snapshot
   added, as a compaction that rolls files by size writes them, meet
@@ -588,35 +594,41 @@ Six finding codes apply to ordered tables alone:
   and `bloom`: every `Scan` fetches the order column's dictionary page.
   Its penalty is in `extra_gets_per_hit`, which on an ordered table
   counts the extra GETs of one `Scan` in each file it reads, here one.
-- `order_index_missing` caps the level at `balanced` under `full` and
-  `bloom`: a file has no column index on the order column, so a bounded
-  `Scan` reads the run's order pages in one round and its value pages in
-  a second, with as many GETs as one round. Its penalty is that second
-  round, which none of the penalty units counts, so each of its penalty
-  fields is `null`.
-- `order_index_truncated`, `long_runs`, and `large_runs` are advice.
+  Under `disk` the dictionary page is a local read.
+- `long_runs` and `large_runs` are advice.
 
-Under `disk` the order column's dictionary page and the order pages a
-bound reaches are local reads, so the two order findings apply under
-`full` and `bloom` alone.
+A `Scan` places its bounds by the order fences icetray records at load,
+so the order column's column index, which the writer may truncate or
+leave out, draws no finding.
 
 **Refresh.** A refresh checks a key and order value for repeats only
 where they can occur: a new file, or a reused one whose deletes shrank,
 against the files of its overlap group whose key ranges and order ranges
 both meet its own. A file that meets none, as an append of later rows
 does, is merged with nothing and read no further. Within an overlap
-group that holds a file to check, one merge reads each checked file that
-meets another whole, and only the order pages of the group's other files
-that can hold its rows, each page once. A checked file is read again for
-the merge: under `full` its order chunks, one GET per row group; under
-`bloom` its order and key chunks, two GETs per row group; and under
-`disk` its chunk file, locally. A refresh that appends later rows
-therefore reads only its new files, and an append of rows inside an
-existing file's order range costs the new file's order chunks again and
-the order pages its rows fall among. With `RUST_LOG=icetray_core=debug`,
-each load logs `assembled generation` with `overlap_groups_verified`,
-the overlap groups it merged, which on an ordered table counts the
-groups merged by key and order value.
+group that holds a file to check, one merge reads only the order pages
+that can hold a pair another file of the group also holds, as the order
+fences bound each page's pairs: the pages of a checked file that meet a
+page of another file, and the pages of the other files that meet a page
+of a checked file. It reads each such page once, a row group of each
+file at a time as the merge advances, so it holds at most one row
+group's chosen pages per file: under `full` the order pages by GET,
+under `bloom` the order pages and the key pages they span by GET, and
+under `disk` both from the chunk file, locally. Each run of consecutive
+chosen pages costs one GET or local read per column, and a dictionary
+page one more. A refresh that appends later rows therefore reads only
+its new files; one that adds files a compaction rolled by size reads
+the pages at the edge keys they share; and an append of rows inside an existing file's order
+range reads the order pages those rows fall among, in the new file and
+the old. With `RUST_LOG=icetray_core=debug`, each load logs `assembled
+generation` with `overlap_groups_verified`, the overlap groups it
+merged, which on an ordered table counts the groups merged by key and
+order value. An ordered table's load also logs `checked ordered rows
+across files` with `merges`, the same count; `compared`, the
+comparisons the check made, of files' ranges and buckets, of pages'
+pairs, and of pairs in the merge; and `held_bytes`, the most bytes of
+chosen pages one merge held at once, which leaves out the key chunks
+`full` keeps resident.
 
 ## Deploying
 

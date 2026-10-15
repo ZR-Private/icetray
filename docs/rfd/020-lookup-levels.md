@@ -16,10 +16,9 @@
 > finding the row. See RFD 022.
 
 > Updated 2026-10-14: an ordered table's levels are read for a Scan of
-> one key; `shared_edge_keys`, `dictionary_encoded_order`, and
-> `order_index_missing` cap it at `balanced`, and icetray publishes
-> `icetray_table_gets_per_scan` for it in place of the per-hit and
-> per-miss gauges. See RFD 025.
+> one key; `shared_edge_keys` and `dictionary_encoded_order` cap it at
+> `balanced`, and icetray publishes `icetray_table_gets_per_scan` for it
+> in place of the per-hit and per-miss gauges. See RFD 025.
 
 ## Problem
 
@@ -85,7 +84,7 @@ lowest cap any of its files, buckets, or conditions sets:
 | `balanced` | `large_key_pages` |
 | `balanced` | a `disk` table's key chunks out of the page cache |
 | `balanced` | `shared_edge_keys`, on an ordered table (RFD 025) |
-| `balanced` | `dictionary_encoded_order` and `order_index_missing`, on an ordered table under `full` and `bloom` (RFD 025) |
+| `balanced` | `dictionary_encoded_order`, on an ordered table under `full` and `bloom` (RFD 025) |
 | `permissive` | `overlapping_files` |
 | `permissive` | `no_bucket_partition` |
 

@@ -1084,8 +1084,8 @@ async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<
 /// A sorting compaction leaves one file in each bucket, as Spark sizes the
 /// output for the target file size, so a Scan reads one file: `optimal`
 /// with no capping finding, whatever the run length. The string table's
-/// order column index is cut, which the doctor advises on, and it stays
-/// `optimal`.
+/// writer cuts its order column index, which icetray never reads, and it
+/// stays `optimal`.
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_compacted_is_optimal_with_one_file_per_bucket() -> Result<()> {

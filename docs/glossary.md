@@ -89,6 +89,15 @@ value appear together at most once among a table's live rows, so a
 caller pages by order value. See
 [Reading an ordered table](calling.md#reading-an-ordered-table).
 
+**Order fence.** For each order page of an ordered table's data file,
+the shortest pair of key and order value that sorts above the last row
+of the page before it and at or below the page's first row. A load
+records the fences from the rows, and icetray keeps them in memory under
+every residency. A `Scan` places each bound on one order page by a binary
+search over them, and a refresh compares them to choose the order pages
+that can hold a pair another file holds. See
+[RFD 025](rfd/025-ordered-rows.md).
+
 **Ordered table.** A table configured with an order column, which holds
 many rows per key and which `Scan` and `MultiScan` read, newest or oldest
 first, under a limit and optional bounds on the order value. Its writer

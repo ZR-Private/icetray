@@ -37,10 +37,10 @@
 
 > Updated 2026-10-14: an ordered table adds the refusals
 > `duplicate_rows`, `null_order`, `order_type_unsupported`, and
-> `order_type_mismatch`, the findings `shared_edge_keys`,
-> `dictionary_encoded_order`, and `order_index_missing`, and the advice
-> `order_index_truncated`, `long_runs`, and `large_runs`; a key repeated
-> within or across its files is no duplicate. See RFD 025.
+> `order_type_mismatch`, the findings `shared_edge_keys` and
+> `dictionary_encoded_order`, and the advice `long_runs` and
+> `large_runs`; a key repeated within or across its files is no
+> duplicate. See RFD 025.
 
 ## Problem
 

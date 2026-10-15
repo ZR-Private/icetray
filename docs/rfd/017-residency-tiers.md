@@ -4,13 +4,6 @@
 > system's page cache serves without blocking runs on the worker; a read
 > that would block still runs on the blocking pool.
 
-> Updated 2026-10-15: the disk level's format marker is written to a
-> temporary file, synced, renamed over `cache.format`, and the directory
-> synced, after the emptying it vouches for is synced, so a crash leaves
-> the old marker or none and never a marker over files it does not
-> describe. A build from before the marker, rolled back to, writes cache
-> files the newer marker does not describe; see Operating icetray.
-
 > Updated 2026-09-29: a chunk file stores what verifying its keys
 > established and a checksum of its payload, and a restart trusts a file
 > whose checksum and verification context match without decoding a key;
@@ -44,9 +37,23 @@
 > release wrote it.
 
 > Updated 2026-10-14: an ordered table's chunk file holds its key
-> chunks, order chunks, and per-file order facts, and every chunk file
-> is named by the rules it was verified under; a run is found from the
-> fences in every tier, with key-page GETs under `bloom`. See RFD 025.
+> chunks, order chunks, per-file order facts, and order fences, so a
+> restart that trusts it restores them without decoding a value, and
+> every chunk file is named by the rules it was verified under; a run is
+> found from the fence array in every tier, with key-page GETs under
+> `bloom`. The chunk-file and resident budgets estimate an ordered
+> file's string and binary order values at its order chunks'
+> uncompressed bytes per value and charge its exact fences once it is
+> built, refusing a load over either as `over_budget`. The chunk-file
+> format and the verifier's version are raised, so a chunk file an
+> earlier release wrote is rebuilt. See RFD 025.
+
+> Updated 2026-10-15: the disk level's format marker is written to a
+> temporary file, synced, renamed over `cache.format`, and the directory
+> synced, after the emptying it vouches for is synced, so a crash leaves
+> the old marker or none and never a marker over files it does not
+> describe. A build from before the marker, rolled back to, writes cache
+> files the newer marker does not describe; see Operating icetray.
 
 ## Problem
 
@@ -123,9 +130,9 @@ verifying the data file's keys established (the fences, each row group's
 first and last key, the longest key), the key type, the rule set it was
 verified under, and the verifier's version, and a crc32c of everything
 after its header. An ordered table's chunk file holds its key
-chunks, its order chunks, and the file's order facts, so entries that
-verify one data file under different rules each keep a chunk file of
-their own. A data file is immutable, so a replica that restarts
+chunks, its order chunks, and the file's order facts and order fences,
+so entries that verify one data file under different rules each keep a
+chunk file of their own. A data file is immutable, so a replica that restarts
 reuses every chunk file already on its disk whose identity, verification
 context, and checksum match. It does so without fetching the chunks again
 or decoding a key, and checking the checksum is one sequential local read
@@ -303,9 +310,13 @@ except for its stored verification result, a key per key page. That part
 is exact for keys of one width (longs, uuids, fixed-width binary) and
 estimated for string and binary keys the same way the fences' memory is,
 and it is a small fraction of the chunks beside it. An ordered chunk
-file is reserved from the footer's sizes too, its order chunks exactly
-and its order facts estimated, string and binary order values the same
-way as fences. Several disk tables
+file is reserved from the footer's sizes too, its order chunks exactly,
+and its order facts and order fences estimated, a string or binary
+order value at its chunk's uncompressed bytes per value. No footer
+number bounds the fences of a dictionary-encoded order column, so the
+loader reserves an ordered chunk file's exact length before it writes
+the file and refuses the load as `over_budget` when that length does
+not fit. Several disk tables
 load at once, so each load reserves what it would write from the check
 until its writes finish, and the check counts every other load's
 reservation too. Two loads that fit alone but not together cannot both

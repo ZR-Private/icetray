@@ -210,6 +210,12 @@ workaround at write time or in the platform:
   position deletes, and refuses a snapshot with equality deletes. For a
   writer that uses them, serve a tag or branch that a compaction job
   moves after it rewrites the equality deletes into data files.
+- **Unsorted ordered files.** icetray serves an ordered table whose
+  files are each sorted by key and then order value, and refuses as
+  `unsorted` a snapshot with a file that is not, as streaming appends
+  often leave them. Serve a tag or branch that the compaction job moves
+  after it sorts the files
+  ([the recipe for an ordered table](docs/table-layout.md#the-recipe-for-an-ordered-table)).
 - **Typed values.** Each value column is served as bytes, of Iceberg type
   `binary`, `fixed`, or `string`. Serialize a number or a struct into a
   binary column at write time; a protobuf column can be projected to its

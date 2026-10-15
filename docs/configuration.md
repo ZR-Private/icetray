@@ -104,7 +104,7 @@ table = "profiles"
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
 | `max_in_flight` | count | `1024` | The most `Get`, `MultiGet`, `Scan`, and `MultiScan` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
 | `max_multi_get_values` | count | `1000` | The most values one `MultiGet` may request: its keys times the columns it requests, a presence-only request counting one per key. icetray rejects a larger request with `INVALID_ARGUMENT` before any lookup. Zero is invalid, as `server.max_multi_get_values 0 is not above zero`. |
-| `batch_fan_out` | count | `64` | The most GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once, across every key and column it requests. Each GET a lookup issues, a key page under `bloom`, a value page, or a dictionary page, holds one slot until it ends, and a page served from the page cache takes none. When a batch needs more GETs than this, icetray issues the rest as slots free. Each GET has at most one hedge beside it. Above about 128, a cold batch against S3 gets no faster ([Performance and tuning](performance.md#multiget-fan-out)). Zero is invalid, as `server.batch_fan_out 0 is not above zero`. |
+| `batch_fan_out` | count | `64` | The most GETs one `MultiGet`, `Scan`, or `MultiScan` holds in flight at once, across every key and column it requests. Each GET holds one slot until it ends: for a lookup, a key page under `bloom`, a value page, or a dictionary page; for a `Scan`, a span of pages, a dictionary page, or a key page under `bloom`. A page served from the page cache or the scan cache takes none. When a batch needs more GETs than this, icetray issues the rest as slots free. Each GET has at most one hedge beside it. Above about 128, a cold batch against S3 gets no faster ([Performance and tuning](performance.md#multiget-fan-out)). Zero is invalid, as `server.batch_fan_out 0 is not above zero`. |
 | `max_multi_scan_values` | count | `4000` | The most values one `MultiScan` may request: its keys times its limit times one more than its requested columns, a limit of 0 counting as the table's `max_scan_rows`. icetray rejects a larger call with `INVALID_ARGUMENT` before it reads any key. Zero is invalid, as `server.max_multi_scan_values 0 is not above zero`. |
 | `max_scan_bytes` | bytes | `4194304` (4 MiB) | The most bytes one `Scan` or `MultiScan` response may encode to, the default being a gRPC client's default limit on a message it receives. icetray measures the response it would send and refuses a larger one with `FAILED_PRECONDITION`, sending no rows and naming the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit; a `Scan` counts as an `error` in `icetray_scans_total`, and a `MultiScan` counts each key it read as one. An owner whose clients accept larger messages raises it. Like every setting outside `[[tables]]`, a change applies on restart. Zero is invalid, as `server.max_scan_bytes 0 is not above zero`. |
 | `scan_deadline` | duration | `"5s"` | The longest a `Scan` may run, and the longest each span GET of it may run. Past it the call fails with `DEADLINE_EXCEEDED`. |
@@ -222,7 +222,7 @@ storage ([Operating icetray](operating.md#the-local-directory)).
 |---|---|---|---|
 | `dir` | path | required | The directory. A relative path is taken from the working directory. |
 | `page_cache_disk_bytes` | bytes | required | The size bound of the page cache's disk level. `0` turns the level off; any other value is at least one 4 MiB block, 4194304. |
-| `index_budget_bytes` | bytes | unbounded | The bytes chunk files may occupy across every table. icetray checks it when a load begins and refuses a load that would exceed it as `over_budget`. |
+| `index_budget_bytes` | bytes | unbounded | The bytes chunk files may occupy across every table. icetray checks it when a load begins and refuses a load that would exceed it as `over_budget`. The footer gives an ordered table's string and binary order fences only by estimate, so icetray reserves each of its chunk files at the exact length before it writes it, and refuses the load then when that length does not fit. |
 
 The disk level holds one open file descriptor per 4 MiB block, so
 `page_cache_disk_bytes` sets part of the descriptor limit a replica needs
@@ -242,7 +242,7 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `lookups` | string | the best level `residency` reaches | The lookup cost the owner accepts for the table: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Whether icetray refuses a snapshot whose layout falls below the table's `lookups` level. When a strict table's first snapshot is below its level, the start fails; icetray refuses a later one and [holds](glossary.md) the table, and the last snapshot that met the level keeps serving. With `strict` off, icetray serves the snapshot and flags the table below its level. |
 | `residency` | string | `"full"` | `"full"`, `"disk"`, or `"bloom"`; see [Choosing a residency](#choosing-a-residency). `"disk"` requires `[storage.local]`; without it the file is invalid, as `tables[0].residency disk needs a local directory under storage.local`. |
-| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: the most resident bytes a load may hold, its delete state counted at a bound taken from the manifests. icetray refuses a load that would exceed it as `over_budget` once the footers are read, before it fetches any key chunk or delete. Set on a `disk` or `bloom` table, it makes the file invalid. |
+| `resident_budget_bytes` | bytes | unbounded | For `full` residency only: the most resident bytes a load may hold, its delete state counted at a bound taken from the manifests. icetray refuses a load that would exceed it as `over_budget` once the footers are read, before it fetches any key chunk or delete. On an ordered table, whose string and binary order fences the footer gives only by estimate, icetray checks the exact resident bytes again once the files are built, and refuses the load then when they exceed it. Set on a `disk` or `bloom` table, it makes the file invalid. |
 
 An ordered table of each user's activity, read by user and timestamp,
 whose writer appends between compactions:
@@ -391,7 +391,12 @@ order column. `full` and `bloom` fetch its pages by GET beside the value
 columns', and `disk` stores its chunks in the chunk file beside the key
 chunks, so a cold `Scan` reads it locally and `predicted.disk_bytes`
 counts it. Under `bloom` a `Scan` fetches the key pages that bound the
-key's run before it reads the rows.
+key's run before it reads the rows. Every residency also holds the
+order column's offset index, each file's order facts, and its order
+fences, one per order page. `predicted` estimates them from the footer,
+a string or binary order value at the order chunk's uncompressed bytes
+per value, and the budgets charge the exact fences once a file is
+built.
 
 The decision is recorded in [RFD 017](rfd/017-residency-tiers.md).
 
@@ -781,7 +786,7 @@ for it:
 | Key | Value |
 |---|---|
 | `reason` | A refusal reason from [the optimal layout's requirements](table-layout.md#requirements) and [an ordered table's](table-layout.md#requirements-of-an-ordered-table) (`unsorted`, `null_keys`, `duplicate_keys`, `duplicate_rows`, `null_order`, `key_outside_bucket`, `key_type_mismatch`, `key_type_unsupported`, `order_type_unsupported`, `order_type_mismatch`, `column_mismatch`, `value_type_unsupported`, `data_format_unsupported`, `equality_deletes`, `delete_kind_unsupported`, `key_too_long`, `over_budget`, `no_bloom_filter`); `below_level` for a strict table whose layout is below its `lookups`, with the codes that cap it in `message`, a column's finding with its column, such as `dictionary_encoded_value (column payload)`; or `load_failed` when an error rather than a rule stopped the load. |
-| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `scan_request`, `wrong_table_kind`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
+| `error_kind` | Present only with `load_failed`: what failed, one of `iceberg`, `parquet`, `object_store`, `object_store_path`, `json`, `config`, `location`, `cache`, `key_type`, `column_request`, `scan_request`, `response_too_large`, `wrong_table_kind`, `malformed_value`, `table`, `file`, `not_ready`, `local`, `catalog_timeout`, `catalog`, `load_deadline`, `refresh_deadline`, `verify_canceled`, `lookup_canceled`. |
 | `message` | The error, for a person. |
 
 `reason` and `error_kind` use the same names as the `reason` label of

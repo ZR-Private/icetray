@@ -200,9 +200,9 @@ impl Opened {
     /// Replaces the tables served with `configs`, all or nothing (RFD
     /// 018). Tables are matched by name: one whose configuration is equal
     /// in every field is kept as it is, generation and refresh untouched;
-    /// one whose configuration differs in `lookups`, `strict`, or value
-    /// column formats alone is retuned in place at the swap, with no load
-    /// (RFD 020, RFD 024); every other is
+    /// one whose configuration differs in `lookups`, `strict`, value
+    /// column formats, or `max_scan_rows` alone is retuned in place at the
+    /// swap, with no load (RFD 020, RFD 024, RFD 025); every other is
     /// built and loaded beside the set serving, the serving table of its
     /// name included, and neither is touched until every one has loaded.
     /// Each retuned table's serving generation is judged against its new
