@@ -148,6 +148,17 @@ impl FileHandle {
             .await
     }
 
+    /// `pages` from `cache`'s memory when it holds every one of them, keyed
+    /// as `read_pages` keys them; `None` when it lacks one, with nothing
+    /// fetched or claimed (`PageCache::held_span`).
+    pub(crate) fn cached_pages(
+        &self,
+        pages: &[Range<u64>],
+        cache: &PageCache,
+    ) -> Option<Vec<Bytes>> {
+        cache.held_span(&self.file_id, pages)
+    }
+
     /// One page on the lookup path and where it came from. Through `cache`
     /// when given, keyed by the file id and `range.start`: parquet pages are
     /// always addressed at their offset-index position, so a page is one

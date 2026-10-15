@@ -321,23 +321,12 @@ pub enum FindingCode {
     /// On an ordered table, the order column is dictionary-encoded; every
     /// Scan fetches its dictionary page besides the order pages.
     DictionaryEncodedOrder,
-    /// On an ordered table, a file has no column index on the order
-    /// column; a bounded Scan reads its order pages before it knows which
-    /// value pages its rows lie on, a second round.
-    OrderIndexMissing,
     /// A manifest lacks key bounds, or its bounds are shorter than the
     /// file's exact first or last key.
     BoundsMissing,
     /// The key column's column index is truncated: too few page minimums
     /// are distinct.
     ColumnIndexTruncated,
-    /// On an ordered table, the order column's column index is truncated,
-    /// as its extremes against the file's exact least and greatest order
-    /// value prove; long values sharing a prefix widen the pages a bound
-    /// selects, and where the rows a bounded Scan walks to fill its limit
-    /// lie on more than one page holding only the key's rows across the
-    /// same bound, it reads their value pages in a second round.
-    OrderIndexTruncated,
     /// A value column's mean uncompressed value page is above the advice
     /// threshold.
     LargeValuePages,
@@ -390,17 +379,15 @@ impl FindingCode {
     /// generation does not raise reads zero. Complete: a successor match
     /// over every variant, which a new variant fails to compile, is
     /// compared to this list in tests.
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 21] = [
         Self::DictionaryEncodedValue,
         Self::LargeKeyPages,
         Self::NoBucketPartition,
         Self::OverlappingFiles,
         Self::SharedEdgeKeys,
         Self::DictionaryEncodedOrder,
-        Self::OrderIndexMissing,
         Self::BoundsMissing,
         Self::ColumnIndexTruncated,
-        Self::OrderIndexTruncated,
         Self::LargeValuePages,
         Self::ValuePagesOverCeiling,
         Self::LongRuns,
@@ -427,12 +414,10 @@ impl FindingCode {
             Self::DictionaryEncodedValue
             | Self::LargeKeyPages
             | Self::SharedEdgeKeys
-            | Self::DictionaryEncodedOrder
-            | Self::OrderIndexMissing => Some(Level::Balanced),
+            | Self::DictionaryEncodedOrder => Some(Level::Balanced),
             Self::NoBucketPartition | Self::OverlappingFiles => Some(Level::Permissive),
             Self::BoundsMissing
             | Self::ColumnIndexTruncated
-            | Self::OrderIndexTruncated
             | Self::LargeValuePages
             | Self::ValuePagesOverCeiling
             | Self::LongRuns
@@ -462,10 +447,8 @@ impl FindingCode {
             | Self::OverlappingFiles
             | Self::SharedEdgeKeys
             | Self::DictionaryEncodedOrder
-            | Self::OrderIndexMissing
             | Self::BoundsMissing
             | Self::ColumnIndexTruncated
-            | Self::OrderIndexTruncated
             | Self::LargeValuePages
             | Self::ValuePagesOverCeiling
             | Self::LongRuns
@@ -499,10 +482,8 @@ impl FindingCode {
             | Self::OverlappingFiles
             | Self::SharedEdgeKeys
             | Self::DictionaryEncodedOrder
-            | Self::OrderIndexMissing
             | Self::BoundsMissing
             | Self::ColumnIndexTruncated
-            | Self::OrderIndexTruncated
             | Self::LongRuns
             | Self::LargeRuns
             | Self::LongKeys
@@ -525,10 +506,8 @@ impl fmt::Display for FindingCode {
             Self::OverlappingFiles => "overlapping_files",
             Self::SharedEdgeKeys => "shared_edge_keys",
             Self::DictionaryEncodedOrder => "dictionary_encoded_order",
-            Self::OrderIndexMissing => "order_index_missing",
             Self::BoundsMissing => "bounds_missing",
             Self::ColumnIndexTruncated => "column_index_truncated",
-            Self::OrderIndexTruncated => "order_index_truncated",
             Self::LargeValuePages => "large_value_pages",
             Self::ValuePagesOverCeiling => "value_pages_over_ceiling",
             Self::LongRuns => "long_runs",
@@ -1382,8 +1361,7 @@ impl Caps {
 /// the load's level gate, and the cost gauges all measure a layout by, so
 /// none can disagree. Per file, a dictionary-encoded value column, named,
 /// and large key pages, and on an ordered table under `full` and `bloom` a
-/// dictionary-encoded order column and a missing order column index; per
-/// table, files written with no bucket partition, overlapping files, and on
+/// dictionary-encoded order column; per table, files written with no bucket partition, overlapping files, and on
 /// an ordered table shared edge keys. A column's level is its own
 /// findings' caps with those of finding the row, the findings that name no
 /// column, and the residency's best level; the table's is the dearest of
@@ -1546,8 +1524,8 @@ struct FileFacts {
     order: Option<OrderAdviceFacts>,
 }
 
-/// What the advice on an ordered table's runs and order column index
-/// measures in one file (RFD 025, Levels and findings).
+/// What the advice on an ordered table's runs measures in one file (RFD
+/// 025, Levels and findings).
 struct OrderAdviceFacts {
     /// The rows of the file's longest run of one key, as the load counted
     /// them (`OrderFacts::longest_run`).
@@ -1555,9 +1533,6 @@ struct OrderAdviceFacts {
     /// The uncompressed bytes of the configured value columns the file
     /// holds, from its footer.
     value_bytes: u64,
-    /// Whether the order column's column index proves a writer cut it
-    /// (`order_index_cut`).
-    index_cut: bool,
 }
 
 /// The key column's bloom filter sizing at the row groups that size it
@@ -1708,13 +1683,10 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             index.key_leaf(),
             order_facts.map(|facts| facts.distinct_keys.as_slice()),
         ),
-        order: order_facts
-            .zip(index.order_leaf())
-            .map(|(facts, leaf)| OrderAdviceFacts {
-                longest_run: facts.longest_run,
-                value_bytes,
-                index_cut: order_index_cut(metadata, leaf, facts),
-            }),
+        order: order_facts.map(|facts| OrderAdviceFacts {
+            longest_run: facts.longest_run,
+            value_bytes,
+        }),
     }
 }
 
@@ -1854,66 +1826,6 @@ fn distinct_mins_ratio(metadata: &ParquetMetaData, key_leaf: usize) -> f64 {
     }
 }
 
-/// Whether the column index of the order column at `leaf` proves that a
-/// writer cut its entries, against `facts`, the exact least and greatest
-/// order value the load decoded. Whole, an index's least page minimum is
-/// the least value and its greatest page maximum the greatest; a cut
-/// leaves the minimum a strict prefix of the value it stands for and the
-/// maximum a prefix with its last byte incremented, above every value.
-/// Only a byte-array entry is ever cut, so an integer order column proves
-/// nothing. Neither does a repeated page minimum, which pages of keys whose
-/// histories start alike report whole, so no ratio of distinct minimums is
-/// consulted. A cut that leaves both extremes whole, as order values no
-/// longer than the cut at both ends do, goes unseen.
-fn order_index_cut(metadata: &ParquetMetaData, leaf: usize, facts: &OrderFacts) -> bool {
-    let (Some(least), Some(greatest)) = (order_bytes(&facts.min), order_bytes(&facts.max)) else {
-        return false;
-    };
-    let Some(index) = metadata.column_index() else {
-        return false;
-    };
-    let mut lowest: Option<&[u8]> = None;
-    let mut highest: Option<&[u8]> = None;
-    for columns in index {
-        match columns.get(leaf) {
-            Some(
-                ColumnIndexMetaData::BYTE_ARRAY(entries)
-                | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(entries),
-            ) => {
-                for min in entries.min_values_iter().flatten() {
-                    lowest = Some(lowest.map_or(min, |held| held.min(min)));
-                }
-                for max in entries.max_values_iter().flatten() {
-                    highest = Some(highest.map_or(max, |held| held.max(max)));
-                }
-            }
-            Some(
-                ColumnIndexMetaData::NONE
-                | ColumnIndexMetaData::BOOLEAN(_)
-                | ColumnIndexMetaData::INT32(_)
-                | ColumnIndexMetaData::INT64(_)
-                | ColumnIndexMetaData::INT96(_)
-                | ColumnIndexMetaData::FLOAT(_)
-                | ColumnIndexMetaData::DOUBLE(_),
-            )
-            | None => {}
-        }
-    }
-    let cut_min = lowest.is_some_and(|min| min.len() < least.len() && least.starts_with(min));
-    let cut_max = highest.is_some_and(|max| max > greatest);
-    cut_min || cut_max
-}
-
-/// An order value's bytes as a byte-array column index compares them;
-/// `None` for an integer value, whose entries are never cut.
-fn order_bytes(value: &OrderValue) -> Option<&[u8]> {
-    match value {
-        OrderValue::Long(_) => None,
-        OrderValue::Str(text) => Some(text.as_bytes()),
-        OrderValue::Bytes(bytes) => Some(bytes),
-    }
-}
-
 /// Whether the manifest's key bounds are present and not truncated: both
 /// recorded, and each at least as long as the exact key it bounds, since a
 /// truncated string or binary bound is a cut prefix, shorter than the key
@@ -1980,15 +1892,12 @@ fn file_capping_findings(
     }
 }
 
-/// An ordered table's per-file capping findings on the order column at
-/// leaf `order` (RFD 025, Levels and findings), under `full` and `bloom`
-/// alone: under `disk` the chunk file holds the order column's dictionary
-/// page and every order page a bound needs, so neither costs a GET or a
-/// round. A dictionary-encoded order column is `dictionary_encoded_order`,
-/// since every Scan fetches its dictionary page; a file without an order
-/// column index on some row group is `order_index_missing`, since a
-/// bounded Scan then reads the run's order pages in a first round and its
-/// value pages in a second, with as many GETs as one round takes.
+/// An ordered table's per-file capping finding on the order column at leaf
+/// `order` (RFD 025, Levels and findings), under `full` and `bloom` alone:
+/// under `disk` the chunk file holds the order column's dictionary page,
+/// so it costs no GET. A dictionary-encoded order column is
+/// `dictionary_encoded_order`, since every Scan fetches its dictionary
+/// page.
 fn order_capping_findings(
     file: &FileView<'_>,
     order: usize,
@@ -2016,37 +1925,6 @@ fn order_capping_findings(
             Some(WriterProperty::EnableDictionary),
         ));
     }
-    if order_index_missing(file.metadata, order) {
-        findings.push(Finding::cost(
-            FindingCode::OrderIndexMissing,
-            Some(path),
-            "the order column has no column index in some row group; a bounded Scan reads the run's order pages before it knows which value pages its rows lie on, a second round with as many GETs (write page statistics on the order column)".to_string(),
-            Penalty::default(),
-            None,
-        ));
-    }
-}
-
-/// Whether some row group of the file `metadata` describes has no column
-/// index entry for the column at `leaf`: the file has no column index, or
-/// the row group's entry is missing or lists nothing.
-fn order_index_missing(metadata: &ParquetMetaData, leaf: usize) -> bool {
-    let Some(index) = metadata.column_index() else {
-        return true;
-    };
-    index.iter().any(|columns| match columns.get(leaf) {
-        None | Some(ColumnIndexMetaData::NONE) => true,
-        Some(
-            ColumnIndexMetaData::BOOLEAN(_)
-            | ColumnIndexMetaData::INT32(_)
-            | ColumnIndexMetaData::INT64(_)
-            | ColumnIndexMetaData::INT96(_)
-            | ColumnIndexMetaData::FLOAT(_)
-            | ColumnIndexMetaData::DOUBLE(_)
-            | ColumnIndexMetaData::BYTE_ARRAY(_)
-            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
-        ) => false,
-    })
 }
 
 /// `dictionary_encoded_value` on value column `column` of the file at
@@ -2072,8 +1950,8 @@ fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
 
 /// The per-file advice apart from the bloom filter: bounds, column index,
 /// each value column's pages (over the advice line, and over the lookup's
-/// ceiling), key length, file size, and on an ordered table the order
-/// column index and the runs (`order_advice`). The one `f64` comparison is
+/// ceiling), key length, file size, and on an ordered table the runs
+/// (`order_advice`). The one `f64` comparison is
 /// on `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero
 /// for a zero denominator), so a plain comparison is total.
 fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
@@ -2139,25 +2017,12 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 }
 
 /// An ordered table's advice on one file (RFD 025, Levels and findings):
-/// `order_index_truncated` where the order column's column index proves a
-/// cut (`order_index_cut`), since long values sharing a prefix widen the
-/// pages a bound selects; `long_runs` where a run is longer than
+/// `long_runs` where a run is longer than
 /// `thresholds::RUN_ROWS_ADVICE`; and `large_runs` where that many rows of
 /// the configured value columns, at the footer's uncompressed bytes per
 /// row over the file's `rows`, are more than `thresholds::RUN_BYTES_ADVICE`,
 /// compared in integers.
 fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut Vec<Finding>) {
-    if order.index_cut {
-        findings.push(Finding::advice(
-            FindingCode::OrderIndexTruncated,
-            Some(path),
-            format!(
-                "the order column's column index is cut: its least page minimum is a prefix of the least order value, or its greatest page maximum lies above the greatest; long order values sharing a prefix widen the pages a bounded Scan selects ({property}, at least the longest order value)",
-                property = WriterProperty::ColumnIndexTruncateLength,
-            ),
-            Some(WriterProperty::ColumnIndexTruncateLength),
-        ));
-    }
     let run_rows = u64::from(thresholds::RUN_ROWS_ADVICE);
     if order.longest_run > run_rows {
         findings.push(Finding::advice(
@@ -2637,10 +2502,8 @@ mod tests {
             FindingCode::DictionaryEncodedOrder,
             "dictionary_encoded_order",
         ),
-        (FindingCode::OrderIndexMissing, "order_index_missing"),
         (FindingCode::BoundsMissing, "bounds_missing"),
         (FindingCode::ColumnIndexTruncated, "column_index_truncated"),
-        (FindingCode::OrderIndexTruncated, "order_index_truncated"),
         (FindingCode::LargeValuePages, "large_value_pages"),
         (
             FindingCode::ValuePagesOverCeiling,
@@ -2857,7 +2720,6 @@ mod tests {
                 (FindingCode::OverlappingFiles, Level::Permissive),
                 (FindingCode::SharedEdgeKeys, Level::Balanced),
                 (FindingCode::DictionaryEncodedOrder, Level::Balanced),
-                (FindingCode::OrderIndexMissing, Level::Balanced),
             ]
         );
     }
@@ -2986,11 +2848,9 @@ mod tests {
             FindingCode::NoBucketPartition => Some(FindingCode::OverlappingFiles),
             FindingCode::OverlappingFiles => Some(FindingCode::SharedEdgeKeys),
             FindingCode::SharedEdgeKeys => Some(FindingCode::DictionaryEncodedOrder),
-            FindingCode::DictionaryEncodedOrder => Some(FindingCode::OrderIndexMissing),
-            FindingCode::OrderIndexMissing => Some(FindingCode::BoundsMissing),
+            FindingCode::DictionaryEncodedOrder => Some(FindingCode::BoundsMissing),
             FindingCode::BoundsMissing => Some(FindingCode::ColumnIndexTruncated),
-            FindingCode::ColumnIndexTruncated => Some(FindingCode::OrderIndexTruncated),
-            FindingCode::OrderIndexTruncated => Some(FindingCode::LargeValuePages),
+            FindingCode::ColumnIndexTruncated => Some(FindingCode::LargeValuePages),
             FindingCode::LargeValuePages => Some(FindingCode::ValuePagesOverCeiling),
             FindingCode::ValuePagesOverCeiling => Some(FindingCode::LongRuns),
             FindingCode::LongRuns => Some(FindingCode::LargeRuns),

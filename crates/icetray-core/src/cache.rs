@@ -590,6 +590,23 @@ impl PageCache {
         Ok((pages, origin))
     }
 
+    /// Every page of `pages` of `file`, keyed as `get_span` keys them, when
+    /// memory holds them all, each counted a hit; `None` when memory lacks
+    /// one, with nothing counted, claimed, or fetched. A page in memory is
+    /// whole and final, so no in-flight lock is taken. What a Scan reads to
+    /// place a bound exactly from pages it holds before its round to object
+    /// storage (RFD 025, Cost).
+    pub(crate) fn held_span(&self, file: &Arc<str>, pages: &[Range<u64>]) -> Option<Vec<Bytes>> {
+        let held = pages
+            .iter()
+            .map(|page| self.in_memory(&PageKey(Arc::clone(file), page.start)))
+            .collect::<Option<Vec<Bytes>>>()?;
+        for _ in &held {
+            self.record_hit();
+        }
+        Some(held)
+    }
+
     /// Takes stock of `pages` of `file` that `served` does not hold yet,
     /// under the in-flight lock so no page is claimed twice: a page in
     /// memory is served and counted a hit, a page another read is fetching

@@ -26,7 +26,7 @@ use icetray_core::check::thresholds::{
 use icetray_core::config::{LocalConfig, Residency, TableConfig, ValueFormat};
 use icetray_core::{
     Capping, Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, LocalDir,
-    RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
+    OrderValue, RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -1019,11 +1019,12 @@ async fn test_dictionary_encoded_order_leaves_disk_optimal() -> Result<()> {
     Ok(())
 }
 
-/// A file without an order column index makes a bounded Scan read its
-/// order pages before it knows which value pages its rows lie on: a
-/// second round, with no more GETs.
+/// A file without an order column index draws no finding: the order
+/// fences place a bounded Scan's bounds in one round whatever the writer's
+/// column index holds or leaves out, so the table stays `optimal` and
+/// `strict` loads it.
 #[tokio::test]
-async fn test_order_index_missing_caps_at_balanced() -> Result<()> {
+async fn test_ordered_table_without_an_order_column_index_draws_no_finding() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = ordered_in(
         "ord_noorderindex",
@@ -1046,13 +1047,11 @@ async fn test_order_index_missing_caps_at_balanced() -> Result<()> {
         );
     }
     let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
-    assert_codes(&report, &[FindingCode::OrderIndexMissing], &[]);
-    let missing = finding(&report, FindingCode::OrderIndexMissing);
-    assert_eq!(missing.caps(), Some(Level::Balanced));
-    assert_eq!(missing.column(), None, "a finding about the table");
-    assert_eq!(
-        strict_refusal(&fixture, &catalog).await?,
-        vec![FindingCode::OrderIndexMissing]
+    assert_codes(&report, &[], &[]);
+    assert_eq!(report.summary.level, Level::Optimal);
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "strict loads the table"
     );
     Ok(())
 }
@@ -1063,14 +1062,15 @@ async fn test_order_index_missing_caps_at_balanced() -> Result<()> {
 const ORDER_INDEX_TRUNCATE: usize = 6;
 
 /// Rows per page of the truncated-order-index fixture: thirty order pages
-/// per file, so one shared cut minimum is far below the advice ratio.
+/// per file.
 const ORDER_PAGE_ROWS: usize = 100;
 
-/// A truncated order column index widens the pages a bound selects, which
-/// is advice; the long key's index is never cut, so the key column draws
-/// none, and `strict` loads the table.
+/// A truncated order column index draws no finding, since the order
+/// fences, not the writer's column index, place a bounded Scan's bounds;
+/// the long key's index is never cut, so the key column draws none either,
+/// and `strict` loads the table.
 #[tokio::test]
-async fn test_order_index_truncated_is_advice() -> Result<()> {
+async fn test_ordered_table_with_a_truncated_order_column_index_draws_no_finding() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         layout: Layout {
@@ -1081,41 +1081,14 @@ async fn test_order_index_truncated_is_advice() -> Result<()> {
         ..ordered_spec("ord_cutorderindex", OrderKind::Str)
     };
     let (fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(
-        &served.current(),
-        Level::Optimal,
-        &ValueFormat::opaque,
-        None,
-    );
-    assert_codes(&report, &[], &[FindingCode::OrderIndexTruncated]);
-    assert_eq!(
-        finding(&report, FindingCode::OrderIndexTruncated).property(),
-        Some(WriterProperty::ColumnIndexTruncateLength)
-    );
-    for file in &report.files {
-        assert!(
-            file.distinct_page_mins_ratio >= DISTINCT_MINS_RATIO_ADVICE,
-            "{}: the key column's index is whole",
-            file.path
-        );
-    }
-    assert!(
-        strict_refusal(&fixture, &catalog).await?.is_empty(),
-        "an advice-only table loads under strict"
-    );
-    Ok(())
-}
-
-/// The share of the order column's pages in `served`'s files whose
-/// column-index minimum is distinct, over every file.
-fn order_mins_ratio(served: &Served) -> f64 {
     let generation = served.current();
-    let (mut pages, mut distinct) = (0, 0);
     for file in &generation.files {
-        let order = file
-            .index
-            .order_leaf()
-            .expect("an ordered table's file has an order column");
+        let order = file.index.order_leaf().unwrap();
+        let facts = file.index.order_facts().unwrap();
+        let OrderValue::Str(least) = &facts.min else {
+            panic!("a string order column's least value is a string");
+        };
+        assert!(least.len() > ORDER_INDEX_TRUNCATE, "{least:?}");
         let index = file
             .index
             .metadata()
@@ -1125,42 +1098,29 @@ fn order_mins_ratio(served: &Served) -> f64 {
             let ColumnIndexMetaData::BYTE_ARRAY(entries) = &group[order] else {
                 panic!("a string order column's index lists byte arrays");
             };
-            let mins: Vec<&[u8]> = entries.min_values_iter().flatten().collect();
-            pages += mins.len();
-            distinct += mins.iter().collect::<BTreeSet<_>>().len();
+            assert!(
+                entries
+                    .min_values_iter()
+                    .flatten()
+                    .all(|min| min.len() <= ORDER_INDEX_TRUNCATE),
+                "{}: every page minimum is cut",
+                file.entry.path
+            );
         }
     }
-    approx::ratio(approx::count(distinct), approx::count(pages))
-}
-
-/// An untruncated string order column whose page minimums repeat, as a
-/// history that starts at the same time for every key writes them, draws
-/// no `order_index_truncated`: only a cut the order facts prove is
-/// advised on, and a repeated minimum proves none. One key's rows per page,
-/// so every page's minimum is that key's first order value.
-#[tokio::test]
-async fn test_order_index_truncated_is_not_raised_for_repeated_whole_minimums() -> Result<()> {
-    let (_dir, catalog) = local_catalog().await?;
-    let spec = FixtureSpec {
-        layout: Layout {
-            page_rows: approx::length(ROWS_PER_KEY),
-            ..Layout::contract()
-        },
-        ..ordered_spec("ord_repeatedmins", OrderKind::Str)
-    };
-    let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let ratio = order_mins_ratio(&served);
-    assert!(
-        ratio < DISTINCT_MINS_RATIO_ADVICE,
-        "the page minimums repeat: {ratio}"
-    );
-    let report = diagnose(
-        &served.current(),
-        Level::Optimal,
-        &ValueFormat::opaque,
-        None,
-    );
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[]);
+    for file in &report.files {
+        assert!(
+            file.distinct_page_mins_ratio >= DISTINCT_MINS_RATIO_ADVICE,
+            "{}: the key column's index is whole",
+            file.path
+        );
+    }
+    assert!(
+        strict_refusal(&fixture, &catalog).await?.is_empty(),
+        "a table with no finding loads under strict"
+    );
     Ok(())
 }
 

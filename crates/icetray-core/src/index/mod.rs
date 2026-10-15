@@ -197,8 +197,11 @@ pub enum FileFault {
     },
     /// The order fences of a row group hold more bytes together than the
     /// `u32` offsets the index addresses them by reach (RFD 025, Load): a
-    /// row group of more than a million order pages of long keys, or of
-    /// dozens of pages whose first order values share tens of mebibytes.
+    /// row group of more than about 2^20 order pages whose first keys are
+    /// string or binary keys of `contract::MAX_KEY_BYTES`, or of dozens of
+    /// pages whose first order values share tens of mebibytes. A long key
+    /// and an integer order value are held as numbers, which never
+    /// overflow.
     #[error("the order fences of row group {row_group} hold more than 4 GiB")]
     OrderFencesOverflow {
         /// The row group whose fences overflow.
@@ -207,9 +210,10 @@ pub enum FileFault {
     /// An order page holds a value outside its column index entry, below
     /// the entry's minimum or above its maximum, or the order column's
     /// column index of a row group describes another count of pages than
-    /// its offset index (RFD 025, Load): a Scan places its bounds by that
-    /// index, so an index that fails to bound its pages would place a
-    /// bound wrong. A truncated byte-array entry is still a bound, its
+    /// its offset index (RFD 025, Load): the check across files rules
+    /// pages out of its merge by that index, so an index that fails to
+    /// bound its pages would leave a repeated pair unread. A truncated
+    /// byte-array entry is still a bound, its
     /// minimum a prefix of the least value and its maximum above the
     /// greatest.
     #[error(

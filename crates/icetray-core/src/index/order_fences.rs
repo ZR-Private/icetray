@@ -451,11 +451,27 @@ pub(super) fn groups_heap(row_groups: usize) -> u64 {
     approx::count(row_groups * size_of::<GroupFences>())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The steps this thread's binary searches over fences took: what a
+    /// test counts a placement's work by.
+    static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The steps binary searches over fences took on this thread since the
+/// last call.
+#[cfg(test)]
+pub(super) fn take_steps() -> usize {
+    STEPS.replace(0)
+}
+
 /// The first of `0..len` for which `below` is false, `below` holding for a
 /// prefix of the range: `slice::partition_point` over positions.
 fn partition_point(len: usize, below: impl Fn(usize) -> bool) -> usize {
     let (mut low, mut high) = (0, len);
     while low < high {
+        #[cfg(test)]
+        STEPS.set(STEPS.get() + 1);
         let middle = low + (high - low) / 2;
         if below(middle) {
             low = middle + 1;

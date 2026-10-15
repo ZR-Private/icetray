@@ -1036,8 +1036,8 @@ fn longest_derived_run(table: GoldenTable) -> u64 {
 }
 
 /// What the doctor reports of every ordered table: it is read as an ordered
-/// table of the order column's type, its longest run is a run the recipe
-/// wrote, and only the string table's column index is cut.
+/// table of the order column's type, and its longest run is a run the
+/// recipe wrote.
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<()> {
@@ -1062,11 +1062,6 @@ async fn test_golden_ordered_doctor_reads_the_order_column_and_runs() -> Result<
             assert!(order.longest_run <= derived, "{table}");
         }
         let advice = advice_codes(&golden);
-        assert_eq!(
-            advice.contains(&FindingCode::OrderIndexTruncated),
-            table == GoldenTable::OrderedString100k,
-            "{table} {advice:?}"
-        );
         assert!(
             !advice.contains(&FindingCode::LongRuns),
             "{table} {advice:?}"
