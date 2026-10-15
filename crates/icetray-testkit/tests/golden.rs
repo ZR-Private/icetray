@@ -1101,14 +1101,13 @@ async fn test_golden_ordered_compacted_is_optimal_with_one_file_per_bucket() -> 
             "{table}"
         );
         assert!(golden.current().overlapping_buckets().is_empty(), "{table}");
+        assert_eq!(report.summary.lookup_cost, None, "{table}");
+        let order = report.summary.order.as_ref().expect("an ordered table");
+        assert_eq!(order.files_probed, 1, "{table}");
         assert_eq!(
-            report.summary.lookup_cost,
-            Some(LookupCost {
-                gets_per_hit: 1,
-                gets_per_miss: 0,
-                files_probed: 1,
-            }),
-            "{table}"
+            Some(order.gets_per_scan),
+            golden.current().gets_per_scan,
+            "{table}: the doctor and the gauge predict one Scan"
         );
         let advice = advice_codes(&golden);
         assert!(!advice.contains(&FindingCode::DeletesPending), "{table}");
@@ -1145,13 +1144,15 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
         );
         let two_files = 2;
         assert_eq!(report.summary.max_files_per_bucket, two_files, "{table}");
+        assert_eq!(report.summary.lookup_cost, None, "{table}");
         assert_eq!(
-            report.summary.lookup_cost,
-            Some(LookupCost {
-                gets_per_hit: 1,
-                gets_per_miss: 0,
-                files_probed: two_files,
-            }),
+            report
+                .summary
+                .order
+                .as_ref()
+                .expect("an ordered table")
+                .files_probed,
+            two_files,
             "{table}"
         );
         let advice = advice_codes(&golden);
@@ -1226,7 +1227,16 @@ async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Re
         .max()
         .expect("the table has files");
     assert!(deepest > 1, "overlapping files share a key range");
-    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, deepest);
+    assert_eq!(report.summary.lookup_cost, None);
+    assert_eq!(
+        report
+            .summary
+            .order
+            .as_ref()
+            .expect("an ordered table")
+            .files_probed,
+        deepest
+    );
     Ok(())
 }
 

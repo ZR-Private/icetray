@@ -136,6 +136,21 @@ fn advice_codes(report: &TableReport) -> BTreeSet<FindingCode> {
         .collect()
 }
 
+/// The doctor's report on `served` as the binary runs it: with its entry's
+/// scan limits, so an ordered table's line carries its `order` and no
+/// `lookup_cost`.
+fn diagnose_scanned(served: &verify::Served) -> TableReport {
+    diagnose(
+        &served.current(),
+        served.table.config().lookups(),
+        &ValueFormat::opaque,
+        served
+            .table
+            .config()
+            .scan_limits(ServerConfig::default().max_scan_bytes),
+    )
+}
+
 /// Asserts `report` raises exactly `capping` among the findings that cap
 /// the level and `advice` among those that do not, and that its level is
 /// the dearest of their caps.
@@ -854,12 +869,7 @@ async fn test_shared_edge_keys_caps_a_compaction_rolled_by_size_at_balanced() ->
     let (_dir, catalog) = local_catalog().await?;
     let (fixture, served) = write_and_serve(&catalog, rolled_spec("ord_rolled")).await?;
     assert_two_files_share_an_edge_key(&served);
-    let report = diagnose(
-        &served.current(),
-        Level::Optimal,
-        &ValueFormat::opaque,
-        None,
-    );
+    let report = diagnose_scanned(&served);
     assert_codes(&report, &[FindingCode::SharedEdgeKeys], &[]);
     let shared = finding(&report, FindingCode::SharedEdgeKeys);
     assert_eq!(shared.caps(), Some(Level::Balanced));
@@ -869,7 +879,11 @@ async fn test_shared_edge_keys_caps_a_compaction_rolled_by_size_at_balanced() ->
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(TWO_FILES)
     );
-    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, TWO_FILES);
+    assert_eq!(report.summary.lookup_cost, None);
+    assert_eq!(
+        report.summary.order.as_ref().unwrap().files_probed,
+        TWO_FILES
+    );
     assert_eq!(
         strict_refusal(&fixture, &catalog).await?,
         vec![FindingCode::SharedEdgeKeys]
@@ -934,10 +948,11 @@ async fn test_a_compacted_ordered_table_in_one_file_per_bucket_is_optimal() -> R
         write_and_serve(&catalog, ordered_spec("ord_compacted", OrderKind::Long)).await?;
     let generation = served.current();
     assert_eq!(generation.files.len(), approx::length(TWO_BUCKETS));
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
+    let report = diagnose_scanned(&served);
     assert_codes(&report, &[], &[]);
     assert_eq!(report.summary.level, Level::Optimal);
-    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, 1);
+    assert_eq!(report.summary.lookup_cost, None);
+    assert_eq!(report.summary.order.as_ref().unwrap().files_probed, 1);
     assert!(
         strict_refusal(&fixture, &catalog).await?.is_empty(),
         "an optimal table loads under strict"

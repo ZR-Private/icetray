@@ -822,6 +822,31 @@ mod tests {
     }
 
     #[test]
+    fn test_write_marker_failures_are_local_errors_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        let Err(Error::Local {
+            path,
+            fault: LocalFault::Io(_),
+        }) = write_marker(&missing, &cache_format())
+        else {
+            panic!("expected a local I/O error for the temporary file");
+        };
+        assert_eq!(path, marker_temp(&missing));
+
+        let blocked = dir.path().join("blocked");
+        fs::create_dir_all(blocked.join(CACHE_FORMAT_FILE).join("held")).unwrap();
+        let Err(Error::Local {
+            path,
+            fault: LocalFault::Io(_),
+        }) = write_marker(&blocked, &cache_format())
+        else {
+            panic!("expected a local I/O error for the rename");
+        };
+        assert_eq!(path, blocked.join(CACHE_FORMAT_FILE));
+    }
+
+    #[test]
     fn test_open_ignores_a_temporary_marker_a_crash_left() {
         let dir = tempfile::tempdir().unwrap();
         open(dir.path());

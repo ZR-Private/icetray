@@ -2470,14 +2470,16 @@ impl Table {
         multi: bool,
     ) -> Result<CheckedScan<'a>> {
         let config = self.config.load();
-        let order = generation
-            .layout
-            .order
-            .as_ref()
-            .expect("an ordered table's generations carry its order column");
-        let max_scan_rows = config
-            .scan_rows()
-            .expect("an ordered table's entry carries its scan limit");
+        // An ordered table's generation and entry both name its order
+        // column; one that does not is not served as ordered.
+        let (Some(order), Some(max_scan_rows)) =
+            (generation.layout.order.as_ref(), config.scan_rows())
+        else {
+            return Err(Error::WrongTableKind {
+                table: self.name.clone(),
+                kind: TableKind::KeyValue,
+            });
+        };
         for key in keys {
             self.check_key_type(generation, key)?;
         }

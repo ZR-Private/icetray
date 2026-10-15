@@ -303,7 +303,9 @@ enum Direction {
 // `after` at or above `before`, or names a table that has no order column.
 message ScanRequest {
   // The name the server is configured to serve the table under. A name the
-  // server does not serve is a NOT_FOUND error.
+  // server does not serve is a NOT_FOUND error, and the name of a table that
+  // has no order column (a key-value table, which Get reads) is an
+  // INVALID_ARGUMENT error.
   string table = 1;
   // The key whose rows to read. Its variant must match the table's key
   // type; a request that omits it is an INVALID_ARGUMENT error.
@@ -368,7 +370,9 @@ message ScanResponse {
 // any key.
 message MultiScanRequest {
   // The name the server is configured to serve the table under. A name the
-  // server does not serve is a NOT_FOUND error.
+  // server does not serve is a NOT_FOUND error, and the name of a table that
+  // has no order column (a key-value table, which MultiGet reads) is an
+  // INVALID_ARGUMENT error.
   string table = 1;
   // The keys whose rows to read. Every variant must match the table's key
   // type. The response carries one result per key, in this order, and a

@@ -1063,7 +1063,7 @@ pub fn diagnose(
         index_bytes: g.index_bytes,
         predicted,
         level_by_residency: level_by_residency(g, &predicted),
-        lookup_cost: order.is_none().then_some(caps.cost),
+        lookup_cost: g.layout.order.is_none().then_some(caps.cost),
         value_columns,
         deletes,
         capping,
