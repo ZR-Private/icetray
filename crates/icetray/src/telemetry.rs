@@ -56,7 +56,7 @@ pub const SCAN_FILES_BUCKETS: [f64; 11] =
     [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0];
 
 /// Histogram bucket bounds in bytes for `scan_response_bytes`: fourfold from
-/// 1 KiB to 1 MiB, then doubling through 4 MiB, the default
+/// 1 KiB to 1 MiB, then doubling to 16 MiB through 4 MiB, the default
 /// `server.max_scan_bytes`, so a response at the bound and one just past
 /// it fall in different buckets, then fourfold to 256 MiB for the size of a
 /// refused response.

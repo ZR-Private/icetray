@@ -115,13 +115,13 @@ Counters and histograms:
 | `icetray_scan_rows` (histogram) | `table` | every ordered table | Rows each answered Scan of one key returned. |
 | `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 for a key held in one file, as on a table compacted to one file per bucket; more for an edge key that a compaction rolling files by size split across files, and for a key in files that appends overlap. |
 | `icetray_scan_seconds` (histogram) | `table`, `temperature` | every ordered table and temperature | Latency of each answered Scan of one key. |
-| `icetray_scan_response_bytes` (histogram) | `table` | every ordered table | The encoded size of each `Scan` or `MultiScan` response the server built, one sample per call, a response it refused above `server.max_scan_bytes` included at the size it would have been. A sample in the buckets past 4 MiB, or a rise in `icetray_requests_total{code="failed_precondition"}` of `scan` or `multi_scan`, means callers request more than the bound allows. |
+| `icetray_scan_response_bytes` (histogram) | `table` | every ordered table | The encoded size of each `Scan` or `MultiScan` response the server built, one sample per call, a response it refused above `server.max_scan_bytes` included at the size it would have been. A sample in the buckets past `server.max_scan_bytes`, or a rise in `icetray_requests_total{code="failed_precondition"}` of `scan` or `multi_scan`, means callers request more than the bound allows. |
 
 The latency histograms' buckets run from 100 microseconds to 2 seconds,
 and `icetray_scan_seconds`' to 10. `icetray_scan_rows`' run from 0 to
 10,000 rows and `icetray_scan_files`' from 0 to 64 files.
 `icetray_scan_response_bytes`' run from 1 KiB to 256 MiB, with a bound at
-2, 4, and 8 MiB.
+2, 4, 8, and 16 MiB.
 
 `icetray_requests_total` counts every call to `Get`, `MultiGet`, `Scan`,
 `MultiScan`, and `TableInfo`, including those the gRPC layer fails before icetray's
