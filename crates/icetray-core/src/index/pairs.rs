@@ -1,7 +1,8 @@
 //! An ordered file's rows as pairs of key and order value, for the check
-//! across files that no live pair repeats (RFD 025, Refresh): the bytes
-//! one row group's chosen order pages decode from in each tier, and the
-//! pairs of one run of those pages decoded at a time. Which pages a check
+//! across files that no live pair repeats (RFD 025, Refresh): the reads
+//! one row group's chosen order pages take in each tier, planned before
+//! they are made, the bytes those pages decode from, and the pairs of one
+//! run of them decoded at a time. Which pages a check
 //! reads is chosen by the order fences (`generation::ordered`). A key-value
 //! table never reaches this module.
 
@@ -30,6 +31,25 @@ use crate::parquet_io::Segments;
 struct RowSpan {
     row_group: usize,
     rows: Range<i64>,
+}
+
+/// The reads one row group's chosen order pages of an ordered file take
+/// in its tier, planned before any is made, so a merge knows the bytes a
+/// row group will hold before it reads it.
+pub(crate) struct PairRead {
+    spans: Vec<RowSpan>,
+    /// The ranges of the file the tier reads, in the order it reads them.
+    ranges: Vec<Range<u64>>,
+    /// Their bytes.
+    bytes: u64,
+}
+
+impl PairRead {
+    /// The bytes the reads fetch or read: what the row group holds once
+    /// read (`PairChunks::read_bytes`).
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 /// One row group's chosen order pages of an ordered file, in runs, and the
@@ -125,84 +145,70 @@ impl FileIndex {
         }
     }
 
-    /// The bytes order pages `pages` of `row_group`, ascending, decode
-    /// from, in runs of consecutive pages (`RowSpan`): each run of the
-    /// order pages and of the key pages its rows span as one range, and
-    /// each chunk's dictionary page as one more. Full fetches the order
-    /// ranges by load GET and holds its key chunks; Disk reads both from
-    /// the chunk file, one counted local read per range, and no GET; Bloom
-    /// fetches both by load GET.
-    pub(crate) async fn pair_chunks(
-        &self,
-        row_group: usize,
-        pages: &[usize],
-    ) -> Result<PairChunks> {
+    /// The reads order pages `pages` of `row_group`, ascending, decode
+    /// from, without I/O: each run of consecutive pages (`RowSpan`) as one
+    /// range of the order chunk and one of the key pages its rows span,
+    /// and each chunk's dictionary page as one more. Full reads the order
+    /// ranges and holds its key chunks; Disk and Bloom read the order and
+    /// key ranges together.
+    pub(crate) fn pair_read(&self, row_group: usize, pages: &[usize]) -> PairRead {
         let order_chunk = self.order_values(self.order_leaf_of()).group(row_group);
         let key_chunk = self.key_column().group(row_group);
         let spans = page_runs(order_chunk, pages);
-        let mut order_ranges = Vec::new();
+        let mut ranges = Vec::new();
         for &page in pages {
-            coalesce(&mut order_ranges, order_chunk.page_range(page));
+            coalesce(&mut ranges, order_chunk.page_range(page));
         }
-        let mut key_ranges = Vec::new();
-        for span in &spans {
-            let first = key_chunk.page_holding(row_index(span.rows.start));
-            let last = key_chunk.page_holding(row_index(span.rows.end - 1));
-            for page in first..=last {
-                coalesce(&mut key_ranges, key_chunk.page_range(page));
+        ranges.extend(order_chunk.dictionary_range());
+        match &self.keys {
+            KeyResidency::Chunks(_) => {}
+            KeyResidency::Disk(_) | KeyResidency::Filters(_) => {
+                let mut key_ranges = Vec::new();
+                for span in &spans {
+                    let first = key_chunk.page_holding(row_index(span.rows.start));
+                    let last = key_chunk.page_holding(row_index(span.rows.end - 1));
+                    for page in first..=last {
+                        coalesce(&mut key_ranges, key_chunk.page_range(page));
+                    }
+                }
+                ranges.extend(key_ranges);
+                ranges.extend(key_chunk.dictionary_range());
             }
         }
-        order_ranges.extend(order_chunk.dictionary_range());
-        let both = || {
-            let mut both = order_ranges.clone();
-            both.extend(key_ranges.iter().cloned());
-            both.extend(key_chunk.dictionary_range());
-            both
-        };
-        let (chunks, read) = self.read_ranges(&order_ranges, both).await?;
-        Ok(PairChunks {
+        let bytes = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .fold(0, u64::saturating_add);
+        PairRead {
             spans,
-            chunks,
-            read,
-        })
+            ranges,
+            bytes,
+        }
     }
 
-    /// The bytes of `order_ranges` and of the key column the tier does not
-    /// hold, with how many bytes were fetched or read: Full fetches
-    /// `order_ranges` and holds the key chunks; Disk reads `both`, the
-    /// order and key ranges together, from the chunk file; Bloom fetches
-    /// `both`.
-    async fn read_ranges(
-        &self,
-        order_ranges: &[Range<u64>],
-        both: impl FnOnce() -> Vec<Range<u64>>,
-    ) -> Result<(Arc<Segments>, u64)> {
+    /// The bytes `read`, which `pair_read` of this file planned, decodes
+    /// from: under Full its ranges by load GET beside the resident key
+    /// chunks, under Disk from the chunk file, one counted local read per
+    /// range and no GET, and under Bloom by load GET.
+    pub(crate) async fn pair_chunks(&self, read: PairRead) -> Result<PairChunks> {
         let size = self.handle.size();
-        let length = |ranges: &[Range<u64>]| {
-            ranges
-                .iter()
-                .map(|range| range.end - range.start)
-                .fold(0, u64::saturating_add)
-        };
-        match &self.keys {
+        let chunks = match &self.keys {
             KeyResidency::Chunks(held) => {
-                let mut parts = fetch_chunk_parts(&self.handle, order_ranges).await?;
+                let mut parts = fetch_chunk_parts(&self.handle, &read.ranges).await?;
                 parts.extend(held.parts().iter().cloned());
-                Ok((Arc::new(Segments::new(parts, size)), length(order_ranges)))
+                Arc::new(Segments::new(parts, size))
             }
-            KeyResidency::Disk(disk) => {
-                let ranges = both();
-                Ok((
-                    chunks_from_disk(disk, &ranges, size).await?,
-                    length(&ranges),
-                ))
-            }
-            KeyResidency::Filters(_) => {
-                let ranges = both();
-                let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
-                Ok((Arc::new(Segments::new(parts, size)), length(&ranges)))
-            }
-        }
+            KeyResidency::Disk(disk) => chunks_from_disk(disk, &read.ranges, size).await?,
+            KeyResidency::Filters(_) => Arc::new(Segments::new(
+                fetch_chunk_parts(&self.handle, &read.ranges).await?,
+                size,
+            )),
+        };
+        Ok(PairChunks {
+            spans: read.spans,
+            chunks,
+            read: read.bytes,
+        })
     }
 
     /// The pairs of span `at` of `chunks`, which `pair_chunks` of this file

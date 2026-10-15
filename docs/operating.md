@@ -610,24 +610,29 @@ group that holds a file to check, one merge reads only the order pages
 that can hold a pair another file of the group also holds, as the order
 fences bound each page's pairs: the pages of a checked file that meet a
 page of another file, and the pages of the other files that meet a page
-of a checked file. It reads each such page once, a row group of each
-file at a time as the merge advances, so it holds at most one row
-group's chosen pages per file: under `full` the order pages by GET,
-under `bloom` the order pages and the key pages they span by GET, and
-under `disk` both from the chunk file, locally. Each run of consecutive
-chosen pages costs one GET or local read per column, and a dictionary
-page one more. A refresh that appends later rows therefore reads only
-its new files; one that adds files a compaction rolled by size reads
-the pages at the edge keys they share; and an append of rows inside an existing file's order
-range reads the order pages those rows fall among, in the new file and
-the old. With `RUST_LOG=icetray_core=debug`, each load logs `assembled
+of a checked file. It reads each such page at most once: under `full`
+the order pages by GET, under `bloom` the order pages and the key pages
+they span by GET, and under `disk` both from the chunk file, locally. It
+reads each file's next row group when the merge reaches it, and reads
+later row groups ahead of need, in the order the merge reaches them,
+while the bytes it holds and has in flight stay within 64 MiB, so a
+merge holds at most 64 MiB beyond one row group's chosen pages per file.
+Where a group's chosen pages fit within 64 MiB, a merge over files of
+several row groups waits on about the rounds of GETs a merge over files
+of one row group does. Each run of consecutive chosen pages costs one
+GET or local read per column, and a dictionary page one more. A refresh
+that appends later rows therefore reads only its new files; one that
+adds files a compaction rolled by size reads the pages at the edge keys
+they share; and an append of rows inside an existing file's order range
+reads the order pages those rows fall among, in the new file and the
+old. With `RUST_LOG=icetray_core=debug`, each load logs `assembled
 generation` with `overlap_groups_verified`, the overlap groups it
 merged, which on an ordered table counts the groups merged by key and
 order value. An ordered table's load also logs `checked ordered rows
-across files` with `merges`, the same count; `compared`, the
-comparisons the check made, of files' ranges and buckets, of pages'
-pairs, and of pairs in the merge; and `held_bytes`, the most bytes of
-chosen pages one merge held at once, which leaves out the key chunks
+across files` with `merges`, the same count; `compared`, the comparisons
+the check made, of files' ranges and buckets, of pages' pairs, and of
+pairs in the merge; and `held_bytes`, the most bytes of chosen pages one
+merge held and had in flight at once, which leaves out the key chunks
 `full` keeps resident.
 
 ## Deploying

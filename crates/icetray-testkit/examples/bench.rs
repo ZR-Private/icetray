@@ -28,8 +28,8 @@
 //! time, allocations, reads, and peak resident set of a load, of a load
 //! over the chunk files a Disk load left (a restart), and of a refresh,
 //! with an ordered table's rounds of GETs and the bytes its uniqueness
-//! merge held, the resident index's bytes by part, and the chunk files'
-//! bytes.
+//! merge held and had in flight, the resident index's bytes by part, and
+//! the chunk files' bytes.
 //! Results print as a table and are written as JSON under `--out-dir`. Run
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
@@ -2705,8 +2705,8 @@ impl Counters {
 }
 
 /// The field of the load's debug event for the ordered uniqueness merge
-/// that `HeldBytes` reads: the most bytes of chosen pages the merge held at
-/// once.
+/// that `HeldBytes` reads: the most bytes of chosen pages the merge held
+/// and had in flight at once.
 const HELD_FIELD: &str = "held_bytes";
 
 /// The largest `HELD_FIELD` reported since `HeldBytes::take`.

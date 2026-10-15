@@ -446,7 +446,7 @@ pub(super) async fn store_hedged_by(fixture: &Fixture, window: Arc<HedgeWindow>)
 
 /// `store` through a `Gauged` store over the in-memory one, so a test
 /// sees how many GETs a read runs together.
-pub(super) async fn store_gauged(fixture: &Fixture) -> (Opened, Arc<Gauged>) {
+pub(crate) async fn store_gauged(fixture: &Fixture) -> (Opened, Arc<Gauged>) {
     let mem = MemStore::new();
     let inner: Arc<dyn ObjectStore> = Arc::<InMemory>::clone(&mem.store);
     let gauged = Arc::new(Gauged::new(inner));

@@ -320,8 +320,15 @@ impl Generation {
         });
         let verified_groups = match layout.order {
             Some(_) => {
-                let check =
-                    ordered::verify_rows(table, &members, &files, &groups, &deletes).await?;
+                let check = ordered::verify_rows(
+                    table,
+                    &members,
+                    &files,
+                    &groups,
+                    &deletes,
+                    ordered::MERGE_READ_AHEAD_BYTES,
+                )
+                .await?;
                 tracing::debug!(
                     table,
                     merges = check.merges,

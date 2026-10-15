@@ -56,7 +56,7 @@ use ordered::OrderVerified;
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
-pub(crate) use pairs::{PairChunks, Pairs};
+pub(crate) use pairs::{PairChunks, PairRead, Pairs};
 pub(crate) use run::RunSource;
 
 /// A row's position in a file: its row group and its row within that group.

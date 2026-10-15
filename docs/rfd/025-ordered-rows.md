@@ -159,16 +159,25 @@ direction under a limit and optional bounds on the order value.
   pairs lie between its fence and the next page's. It takes the pages of
   a checked file that meet a page of any other file of the group, and
   the pages of any other file that meet a page of a checked file. It
-  reads each such page once, a row group of each file at a time as the
-  merge advances, so it holds at most one row group's chosen pages per
-  file: by GET under `full`, from the ordered chunk file under `disk`,
-  and with the key pages they span under `bloom`. The load refuses a
-  live pair present twice as `duplicate_rows`, naming the later file in
-  file order, as `duplicate_keys` does. A refresh that appends later
-  rows therefore reads only its new files, files a compaction rolled by
-  size cost the pages at the edge keys they share, and an append of rows
-  inside an existing file's order range costs the pages those rows fall
-  among, in the new file and the old.
+  reads each such page at most once: by GET under `full`, from the
+  ordered chunk file under `disk`, and with the key pages they span
+  under `bloom`. It reads each file's next row group when the merge
+  reaches it, whatever that takes, and beyond those reads later row
+  groups ahead of need, across the group's files in the order the merge
+  reaches them, while the bytes it holds and has in flight stay within
+  64 MiB (67,108,864 bytes). It therefore holds at most 64 MiB beyond
+  one row group's chosen pages per file, and a file whose row groups are
+  larger than that merges a row group at a time. Where a group's chosen
+  pages fit within 64 MiB, a merge over files of several row groups
+  waits on about the rounds of GETs a merge over files of one row group
+  does; a merge that refuses or ends first may have read row groups
+  ahead that it never reached. The load refuses a live pair present
+  twice as `duplicate_rows`, naming the later file in file order, as
+  `duplicate_keys` does. A refresh that appends later rows therefore
+  reads only its new files, files a compaction rolled by size cost the
+  pages at the edge keys they share, and an append of rows inside an
+  existing file's order range costs the pages those rows fall among, in
+  the new file and the old.
 - **Cost.** Per file that holds the key, a Scan finds the run, then
   reads the order column and each requested column over the run's rows,
   in one round across all files:
