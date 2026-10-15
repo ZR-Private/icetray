@@ -118,6 +118,10 @@ const FIELD_11_VARINT_TAG: u8 = 0x58;
 /// `TableInfoResponse.max_scan_rows`.
 const FIELD_12_VARINT_TAG: u8 = 0x60;
 
+/// The tag byte that opens a varint field 13, `13 << 3`:
+/// `TableInfoResponse.max_multi_scan_values`.
+const FIELD_13_VARINT_TAG: u8 = 0x68;
+
 /// A snapshot id under 128, whose varint is the one byte of its value.
 const SMALL_SNAPSHOT_ID: u8 = 7;
 
@@ -208,6 +212,10 @@ const SCAN_LIMIT: u32 = 250;
 
 /// The most rows the fixture ordered table serves per Scan.
 const MAX_SCAN_ROWS: u32 = 1_000;
+
+/// `TableInfoResponse.max_multi_scan_values` in the tests: above `u32`, so
+/// the field's width is under test.
+const MAX_MULTI_SCAN_VALUES: u64 = 5_000_000_000;
 
 /// The width of the fixture ordered table's `fixed` order column.
 const ORDER_WIDTH: u32 = 12;
@@ -499,6 +507,7 @@ fn test_round_trip_table_info_response_order_fields_every_order_type() {
                 0
             },
             max_scan_rows: MAX_SCAN_ROWS,
+            max_multi_scan_values: MAX_MULTI_SCAN_VALUES,
             ..TableInfoResponse::default()
         };
         assert_round_trips(&response);
@@ -875,7 +884,7 @@ fn test_encode_multi_scan_response_exact_bytes() {
     );
 }
 
-/// The order column's description is `TableInfoResponse`'s fields 9 to 12.
+/// The order column's description is `TableInfoResponse`'s fields 9 to 13.
 #[test]
 fn test_encode_table_info_order_fields_exact_bytes() {
     let response = TableInfoResponse {
@@ -883,6 +892,7 @@ fn test_encode_table_info_order_fields_exact_bytes() {
         order_type: i32::from(OrderType::Fixed),
         order_width: ORDER_WIDTH,
         max_scan_rows: SCAN_LIMIT,
+        max_multi_scan_values: MAX_MULTI_SCAN_VALUES,
         ..TableInfoResponse::default()
     };
     let wire = [
@@ -894,6 +904,8 @@ fn test_encode_table_info_order_fields_exact_bytes() {
         vec![FIELD_11_VARINT_TAG, u8::try_from(ORDER_WIDTH).unwrap()],
         vec![FIELD_12_VARINT_TAG],
         varint(i64::from(SCAN_LIMIT)),
+        vec![FIELD_13_VARINT_TAG],
+        varint(i64::try_from(MAX_MULTI_SCAN_VALUES).unwrap()),
     ]
     .concat();
     assert_eq!(response.encode_to_vec(), wire);

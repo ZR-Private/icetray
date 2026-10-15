@@ -40,6 +40,10 @@
 > bloom findings divide a row group's filter bits by its distinct keys.
 > See RFD 025.
 
+> Updated 2026-10-15: an ordered table's `table` line prices a Scan, not
+> a lookup: `order.gets_per_scan` and `order.files_probed` carry the
+> figures the matching gauges publish, and the line has no `lookup_cost`.
+
 ## Problem
 
 RFD 002 (Serving layout) leaves to this RFD what the doctor

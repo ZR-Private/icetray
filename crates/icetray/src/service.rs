@@ -14,6 +14,9 @@
 //! or `MultiScan` response is measured as the message that would be sent,
 //! and one above `server.max_scan_bytes` is refused with no rows
 //! (`scan_within_bound`, `multi_scan_within_bound`).
+//! A call of the wrong kind for its table is `INVALID_ARGUMENT`, decided
+//! before the table's readiness and before its request is read
+//! (`table_serving`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use icetray_core::key::UUID_BYTES;
 use icetray_core::{
     CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup, Opened,
     OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanRow, Scanned, Table,
-    TableConfig, TableLayout, Tables, ValueFormat, ValueType, approx,
+    TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -104,6 +107,9 @@ pub struct Service {
     slots: Slots,
     /// The most values one `MultiGet` may ask for.
     max_multi_get_values: usize,
+    /// `server.max_multi_scan_values`, which core holds a `MultiScan` to and
+    /// `TableInfo` reports.
+    max_multi_scan_values: usize,
     /// `server.max_scan_bytes`: the encoded size above which a Scan or
     /// `MultiScan` response is refused.
     max_scan_bytes: usize,
@@ -121,6 +127,7 @@ impl Service {
             multi_scan_deadline: server.multi_scan_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_values: server.max_multi_get_values,
+            max_multi_scan_values: server.max_multi_scan_values,
             max_scan_bytes: server.max_scan_bytes,
         }
     }
@@ -146,6 +153,23 @@ fn table<'a>(tables: &'a Tables, name: &str) -> Result<&'a Arc<Table>, Status> {
     tables
         .get(name)
         .ok_or_else(|| Status::not_found(format!("table {name} is not served")))
+}
+
+/// The table `tables` serves under `name`, as `table` finds it, and of the
+/// kind the call serves: a table of the other kind is `INVALID_ARGUMENT`
+/// whether or not it has loaded, so a call made to the wrong kind of table
+/// is never answered `UNAVAILABLE`, which a caller retries, and is refused
+/// before the call reads its key, direction, or bounds off the wire.
+fn table_serving<'a>(
+    tables: &'a Tables,
+    name: &str,
+    served: TableKind,
+) -> Result<&'a Arc<Table>, Status> {
+    let table = table(tables, name)?;
+    table
+        .check_kind(served)
+        .map_err(|error| status_from(&error))?;
+    Ok(table)
 }
 
 /// The variant a wire `Key` carries (RFD 010), the closed set the `oneof`
@@ -419,7 +443,7 @@ pub fn status_from(error: &Error) -> Status {
     match error {
         Error::KeyType { .. }
         | Error::ColumnRequest { .. }
-        | Error::ScanRequest(_)
+        | Error::ScanRequest { .. }
         | Error::WrongTableKind { .. } => Status::invalid_argument(message),
         Error::MalformedValue { .. } | Error::ResponseTooLarge { .. } => {
             Status::failed_precondition(message)
@@ -573,7 +597,7 @@ impl Service {
     /// `Get` inside its deadline.
     async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let tables = self.serving();
-        let table = table(&tables, &request.table)?;
+        let table = table_serving(&tables, &request.table, TableKind::KeyValue)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, key_type)?;
         let lookup = table
@@ -594,7 +618,7 @@ impl Service {
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
         let tables = self.serving();
-        let table = table(&tables, &request.table)?;
+        let table = table_serving(&tables, &request.table, TableKind::KeyValue)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let keys = request
             .keys
@@ -625,7 +649,7 @@ impl Service {
     /// `Scan` inside its deadline.
     async fn scan_rows(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
         let tables = self.serving();
-        let table = table(&tables, &request.table)?;
+        let table = table_serving(&tables, &request.table, TableKind::Ordered)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let key = key_from_wire(request.key, key_type)?;
         let bounds = scan_bounds_from_wire(
@@ -653,7 +677,7 @@ impl Service {
         request: MultiScanRequest,
     ) -> Result<Response<MultiScanResponse>, Status> {
         let tables = self.serving();
-        let table = table(&tables, &request.table)?;
+        let table = table_serving(&tables, &request.table, TableKind::Ordered)?;
         let key_type = table.key_type().map_err(|error| status_from(&error))?;
         let keys = request
             .keys
@@ -743,6 +767,9 @@ impl Service {
             order_type: i32::from(order_type),
             order_width,
             max_scan_rows: entry.scan_rows().unwrap_or(0),
+            max_multi_scan_values: entry
+                .scan_rows()
+                .map_or(0, |_| approx::count(self.max_multi_scan_values)),
         }))
     }
 }
@@ -787,8 +814,9 @@ mod tests {
     use bytes::Bytes;
     use icetray_core::config::{ConfigError, ConfigViolation, StorageConfig};
     use icetray_core::{
-        ColumnRequestFault, FileFault, LocalFault, Malformed, OrderVariant, RefusalReason,
-        ScanRequestFault, SourceConfig, Storage, TableFault, TableKind, ValueColumnConfig,
+        BoundSide, ColumnRequestFault, FileFault, LocalFault, Malformed, OrderVariant,
+        RefusalReason, ScanRequestFault, SourceConfig, Storage, TableFault, TableKind,
+        ValueColumnConfig,
     };
     use tonic::Code;
 
@@ -1094,18 +1122,29 @@ mod tests {
         [
             ScanRequestFault::LimitAboveMax { limit, max },
             ScanRequestFault::BoundVariant {
+                bound: BoundSide::After,
                 expected: OrderVariant::Long,
+                got: OrderVariant::Str,
             },
             ScanRequestFault::BoundsInverted,
             ScanRequestFault::TooManyValues {
                 keys: SAMPLE_LIMIT,
                 limit,
                 columns: 1,
+                values: SAMPLE_LIMIT * 2,
                 max: SAMPLE_LIMIT,
             },
         ]
         .into_iter()
-        .map(|fault| (Error::ScanRequest(fault), Code::InvalidArgument))
+        .map(|fault| {
+            (
+                Error::ScanRequest {
+                    table: TABLE.to_string(),
+                    fault,
+                },
+                Code::InvalidArgument,
+            )
+        })
         .chain([TableKind::KeyValue, TableKind::Ordered].map(|kind| {
             (
                 Error::WrongTableKind {
@@ -1159,7 +1198,8 @@ mod tests {
             Error::MalformedValue {
                 table: TABLE.to_string(),
                 column: "value".to_string(),
-                key: Key::Long(LONG_VALUE),
+                key: Box::new(Key::Long(LONG_VALUE)),
+                order: None,
                 fault: Malformed::WireType {
                     at: 0,
                     wire_type: 7,

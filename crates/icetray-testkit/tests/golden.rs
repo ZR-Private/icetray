@@ -223,7 +223,7 @@ fn level(golden: &Golden) -> Level {
 /// tier, where a hit's GETs are the value pages the plan names.
 fn assert_lookup_cost(golden: &Golden, keys: &[Key], expected: LookupCost) -> Result<()> {
     let generation = golden.current();
-    assert_eq!(golden.report().summary.lookup_cost, expected);
+    assert_eq!(golden.report().summary.lookup_cost, Some(expected));
     assert_eq!(generation.lookup_cost, expected);
     for key in keys {
         assert_eq!(
@@ -1103,11 +1103,11 @@ async fn test_golden_ordered_compacted_is_optimal_with_one_file_per_bucket() -> 
         assert!(golden.current().overlapping_buckets().is_empty(), "{table}");
         assert_eq!(
             report.summary.lookup_cost,
-            LookupCost {
+            Some(LookupCost {
                 gets_per_hit: 1,
                 gets_per_miss: 0,
                 files_probed: 1,
-            },
+            }),
             "{table}"
         );
         let advice = advice_codes(&golden);
@@ -1147,11 +1147,11 @@ async fn test_golden_ordered_appends_and_merges_are_permissive_for_overlapping_f
         assert_eq!(report.summary.max_files_per_bucket, two_files, "{table}");
         assert_eq!(
             report.summary.lookup_cost,
-            LookupCost {
+            Some(LookupCost {
                 gets_per_hit: 1,
                 gets_per_miss: 0,
                 files_probed: two_files,
-            },
+            }),
             "{table}"
         );
         let advice = advice_codes(&golden);
@@ -1226,7 +1226,7 @@ async fn test_golden_ordered_overlap_is_permissive_for_overlapping_files() -> Re
         .max()
         .expect("the table has files");
     assert!(deepest > 1, "overlapping files share a key range");
-    assert_eq!(report.summary.lookup_cost.files_probed, deepest);
+    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, deepest);
     Ok(())
 }
 

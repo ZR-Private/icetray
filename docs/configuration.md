@@ -662,7 +662,8 @@ Two conventions hold for every line:
 - A snapshot id is a decimal string, `"7128216514704790069"`, because an
   id above 2^53 loses digits as a JSON number in most readers.
 - A key that does not apply is `null` rather than absent, except where a
-  line kind below says otherwise.
+  line kind below says otherwise, as the `table` line does for `order`
+  and `lookup_cost`.
 - An order value is a JSON number for an order type that travels as a
   long (`int`, `long`, `date`, and the timestamp types), in the type's
   unit; a JSON string for a `string` order column; and a string of `0x`
@@ -699,6 +700,7 @@ One per table, from `info` and from `doctor`:
 | `predicted.key_chunk_bytes` | The key column's compressed bytes. |
 | `predicted.filter_bytes` | The key column's bloom filter bytes; `null` when `predicted.bloom` is. |
 | `level_by_residency` | For each residency that can load the table, the level its files would reach there. A residency that cannot load the table is left out, as `bloom` is when `predicted.bloom` is `null`. |
+| `lookup_cost` | Absent on an ordered table, which serves no lookup and prices its `Scan` under `order` instead. Otherwise an object of the three keys below. |
 | `lookup_cost.gets_per_hit` | GETs one cold hit makes at worst in the loaded residency, locating the row and reading the costliest value column, as `icetray_table_gets_per_hit` reports it while the snapshot serves. For a table with no value columns, locating the row alone. |
 | `lookup_cost.gets_per_miss` | GETs one miss makes at worst, as `icetray_table_gets_per_miss` reports it. |
 | `lookup_cost.files_probed` | Files one lookup probes at worst, as `icetray_table_files_probed_per_lookup` reports it. |
@@ -706,7 +708,7 @@ One per table, from `info` and from `doctor`:
 | `value_columns[].column` | The column's name. |
 | `value_columns[].format` | The column's format as configured in the table's entry: `opaque` or `protobuf`. |
 | `value_columns[].level` | The level a lookup requesting the column achieves, as `icetray_table_column_level` reports it. |
-| `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. |
+| `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. On an ordered table, the GETs a cold `Scan` spends on the column's span, which `order.gets_per_scan` sums over the configured columns. |
 | `value_columns[].files_predating_column` | Data files written before the column was added, for which a lookup returns the column's default. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
@@ -719,6 +721,8 @@ One per table, from `info` and from `doctor`:
 | `order.order_type` | The order column's Iceberg type in the snapshot: `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed(N)` with its width. |
 | `order.max_scan_rows` | The table's `max_scan_rows`, configured or the default. |
 | `order.longest_run` | The rows of the longest run of one key in any one file. A key that several files hold, as appends between compactions leave it, has more rows than its longest run in one file. |
+| `order.gets_per_scan` | GETs one cold `Scan` at `max_scan_rows` makes at worst in the loaded residency, of a key held in one file and one row group, reading every configured value column, as `icetray_table_gets_per_scan` reports it while the snapshot serves. The figure an owner compares residencies by, in place of `lookup_cost`. A key held in several files costs this in each. |
+| `order.files_probed` | Files one `Scan` reads at worst, as `icetray_table_files_probed_per_lookup` reports it. |
 
 #### `finding`
 

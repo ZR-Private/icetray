@@ -869,7 +869,7 @@ async fn test_shared_edge_keys_caps_a_compaction_rolled_by_size_at_balanced() ->
             .and_then(|penalty| penalty.files_probed_per_lookup),
         Some(TWO_FILES)
     );
-    assert_eq!(report.summary.lookup_cost.files_probed, TWO_FILES);
+    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, TWO_FILES);
     assert_eq!(
         strict_refusal(&fixture, &catalog).await?,
         vec![FindingCode::SharedEdgeKeys]
@@ -937,7 +937,7 @@ async fn test_a_compacted_ordered_table_in_one_file_per_bucket_is_optimal() -> R
     let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
     assert_codes(&report, &[], &[]);
     assert_eq!(report.summary.level, Level::Optimal);
-    assert_eq!(report.summary.lookup_cost.files_probed, 1);
+    assert_eq!(report.summary.lookup_cost.unwrap().files_probed, 1);
     assert!(
         strict_refusal(&fixture, &catalog).await?.is_empty(),
         "an optimal table loads under strict"

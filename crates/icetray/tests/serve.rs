@@ -121,6 +121,9 @@ const SCAN_CAP: u32 = 5;
 /// passes `max_multi_scan_values`.
 const SCAN_KEYS_OVER: usize = 3;
 
+/// A column no table of the tests serves.
+const UNSERVED_COLUMN: &str = "unserved";
+
 /// The `max_multi_scan_values` the `MultiScan` limit test configures: two
 /// keys at `SCAN_CAP` rows and one value column, each row counting its
 /// order value and its column.
@@ -3316,6 +3319,185 @@ async fn test_get_on_an_ordered_table_is_invalid_argument() -> TestResult {
     Ok(())
 }
 
+/// A call the wire refuses as `INVALID_ARGUMENT` for the table or the
+/// request it carries.
+enum Refused {
+    /// A Scan to send as it is.
+    Scan(ScanRequest),
+    /// A `MultiScan` to send as it is.
+    MultiScan(MultiScanRequest),
+    /// A `MultiGet` of keys on a table.
+    MultiGet(&'static str, Vec<Key>),
+}
+
+impl Stack {
+    /// The code `call` is answered with.
+    async fn answered(&mut self, call: Refused) -> Code {
+        match call {
+            Refused::Scan(request) => code_of(self.scan(request).await),
+            Refused::MultiScan(request) => code_of(self.multi_scan(request).await),
+            Refused::MultiGet(table, keys) => code_of(self.multi_get(table, &keys).await),
+        }
+    }
+}
+
+/// Every way a request is wrong for the table it names that the service
+/// refuses over the wire is `INVALID_ARGUMENT` and reads nothing: a bound of
+/// another variant than the order type takes, in either position, and one
+/// that sets no variant; a `MultiGet` of an ordered table; a `MultiScan` of
+/// a key-value table; a Scan naming a column the table does not serve or
+/// naming one twice; and a `MultiScan` key of another variant than the key
+/// type.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_and_multi_get_requests_the_table_refuses_are_invalid_argument() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::ready_ordered_with(async |_| Ok(())).await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    let kv_key = stack.fixtures[0].key(SAMPLE[0]);
+    let str_bound = v1::OrderValue {
+        value: Some(v1::order_value::Value::Str("not a long".to_string())),
+    };
+    let empty_bound = v1::OrderValue { value: None };
+    let cases = vec![
+        Refused::Scan(ScanRequest {
+            after: Some(str_bound.clone()),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::Scan(ScanRequest {
+            before: Some(str_bound.clone()),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::MultiScan(MultiScanRequest {
+            after: Some(str_bound),
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))
+        }),
+        Refused::Scan(ScanRequest {
+            after: Some(empty_bound.clone()),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::Scan(ScanRequest {
+            before: Some(empty_bound.clone()),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::MultiScan(MultiScanRequest {
+            before: Some(empty_bound),
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))
+        }),
+        Refused::MultiGet(ORDERED_TABLE, vec![key.clone()]),
+        Refused::MultiScan(multi_scan_of(TABLE, std::slice::from_ref(&kv_key))),
+        Refused::Scan(ScanRequest {
+            columns: wire_columns(&[UNSERVED_COLUMN]),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::Scan(ScanRequest {
+            columns: wire_columns(&[VALUE_COLUMN, VALUE_COLUMN]),
+            ..scan_of(ORDERED_TABLE, &key)
+        }),
+        Refused::MultiScan(MultiScanRequest {
+            columns: wire_columns(&[UNSERVED_COLUMN]),
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))
+        }),
+        Refused::MultiScan(MultiScanRequest {
+            keys: vec![
+                wire_key(&key),
+                v1::Key {
+                    key: Some(v1::key::Key::Str("not a long".to_string())),
+                },
+            ],
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))
+        }),
+    ];
+    let gets = stack.stats.gets();
+    for (at, case) in cases.into_iter().enumerate() {
+        assert_eq!(
+            stack.answered(case).await,
+            Code::InvalidArgument,
+            "case {at}"
+        );
+    }
+    assert_eq!(stack.stats.gets(), gets, "a refused call issues no GET");
+    Ok(())
+}
+
+/// The kind check comes before the readiness check and before the request is
+/// read: while the tables load, a call of the wrong kind is
+/// `INVALID_ARGUMENT`, which a caller does not retry, whatever else its
+/// request holds, and a call of the right kind is still `UNAVAILABLE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_call_of_the_wrong_kind_is_invalid_argument_while_the_table_loads() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let mut stack = Stack::start_with(
+        vec![
+            FixtureSpec::small(TABLE, KeyType::Long),
+            ordered_spec(ORDERED_TABLE),
+        ],
+        async |setup| {
+            setup.hold_store = true;
+            Ok(())
+        },
+    )
+    .await?;
+    let key = stack.ordered().key(ORDERED_IDS.start);
+    let kv_key = stack.fixtures[0].key(SAMPLE[0]);
+    assert_eq!(
+        stack.health_status(OVERALL_SERVICE).await?,
+        ServingStatus::NotServing,
+        "the tables are loading"
+    );
+
+    let unset_direction = i32::from(v1::Direction::Unspecified);
+    let loading_scan = ScanRequest {
+        direction: unset_direction,
+        key: None,
+        ..scan_of(TABLE, &kv_key)
+    };
+    let cases = [
+        (
+            Refused::MultiGet(ORDERED_TABLE, vec![key.clone()]),
+            Code::InvalidArgument,
+        ),
+        (Refused::Scan(loading_scan), Code::InvalidArgument),
+        (
+            Refused::MultiScan(MultiScanRequest {
+                direction: unset_direction,
+                ..multi_scan_of(TABLE, std::slice::from_ref(&kv_key))
+            }),
+            Code::InvalidArgument,
+        ),
+        (
+            Refused::MultiGet(TABLE, vec![kv_key.clone()]),
+            Code::Unavailable,
+        ),
+        (
+            Refused::Scan(scan_of(ORDERED_TABLE, &key)),
+            Code::Unavailable,
+        ),
+        (
+            Refused::MultiScan(multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key))),
+            Code::Unavailable,
+        ),
+    ];
+    for (at, (call, code)) in cases.into_iter().enumerate() {
+        assert_eq!(stack.answered(call).await, code, "case {at}");
+    }
+    assert_eq!(
+        code_of(stack.get(ORDERED_TABLE, None).await),
+        Code::InvalidArgument,
+        "a Get of an ordered table with no key"
+    );
+    assert_eq!(
+        code_of(stack.get(TABLE, Some(wire_key(&kv_key))).await),
+        Code::Unavailable,
+        "a Get of a loading key-value table is retried"
+    );
+
+    stack.s3.release();
+    stack.serving.ready().await;
+    let response = stack.get(TABLE, Some(wire_key(&kv_key))).await?;
+    assert_eq!(response.presence, i32::from(v1::Presence::Present));
+    Ok(())
+}
+
 /// A `MultiScan` whose keys times its limit times one more than its columns
 /// pass `max_multi_scan_values` is `INVALID_ARGUMENT` before any read, a
 /// limit of 0 counting as `max_scan_rows`; one at the bound is answered.
@@ -3362,6 +3544,11 @@ async fn test_multi_scan_over_max_values_is_invalid_argument_before_any_read() -
         }
     }
     assert!(stack.stats.gets() > gets, "the calls at the bound read");
+    assert_eq!(
+        stack.table_info(ORDERED_TABLE).await?.max_multi_scan_values,
+        approx::count(MULTI_SCAN_VALUES),
+        "a caller learns the bound it was held to"
+    );
     Ok(())
 }
 
@@ -3670,6 +3857,10 @@ async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestRes
     assert_eq!(info.order_type(), v1::OrderType::Long);
     assert_eq!(info.order_width, 0);
     assert_eq!(info.max_scan_rows, SCAN_CAP);
+    assert_eq!(
+        info.max_multi_scan_values,
+        approx::count(ServerConfig::default().max_multi_scan_values)
+    );
 
     let info = stack.table_info(FIXED_TABLE).await?;
     assert_eq!(info.order_column, icetray_testkit::ORDER_COLUMN);
@@ -3682,5 +3873,9 @@ async fn test_table_info_reports_the_order_column_and_max_scan_rows() -> TestRes
     assert_eq!(info.order_type(), v1::OrderType::Unspecified);
     assert_eq!(info.order_width, 0);
     assert_eq!(info.max_scan_rows, 0);
+    assert_eq!(
+        info.max_multi_scan_values, 0,
+        "a key-value table is not scanned"
+    );
     Ok(())
 }

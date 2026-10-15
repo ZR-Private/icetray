@@ -24,6 +24,14 @@
 > or an `after` at or above `before` is `INVALID_ARGUMENT`, and a
 > MultiScan fails whole as a MultiGet does. See RFD 025.
 
+> Updated 2026-10-15: the kind of a call is checked against the table
+> first, before the table's readiness and before the request's key,
+> direction, and bounds are read, so a call of the wrong kind is
+> `INVALID_ARGUMENT` even while the table loads and is never the retryable
+> `UNAVAILABLE`. TableInfo reports `max_multi_scan_values`, the most values
+> a MultiScan may ask for. A malformed value a Scan reads names the order
+> value of its row. See RFD 025.
+
 ## Problem
 
 icetray answers get-by-key lookups for programs written in more than one

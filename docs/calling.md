@@ -193,11 +193,16 @@ takes longer and its load on object storage stays within that cap.
 An ordered table holds many rows per key, each with an order value, such
 as a time series by key and timestamp or the activity of each user. The
 table's owner configures its order column, and `TableInfo` reports it in
-`order_column`, its type in `order_type`, and the most rows one `Scan`
-returns in `max_scan_rows`. A key-value table reports an empty
-`order_column` and a `max_scan_rows` of 0. The server rejects a `Get` or
-`MultiGet` of an ordered table, and a `Scan` or `MultiScan` of a
-key-value table, as `INVALID_ARGUMENT`.
+`order_column`, its type in `order_type`, the most rows one `Scan`
+returns in `max_scan_rows`, and the most values one `MultiScan` may ask
+for in `max_multi_scan_values`. A key-value table reports an empty
+`order_column` and a `max_scan_rows` and `max_multi_scan_values` of 0. The
+server rejects a `Get` or `MultiGet` of an ordered table, and a `Scan` or
+`MultiScan` of a key-value table, as `INVALID_ARGUMENT`. It decides this
+from the table's configuration before anything else about the call, so it
+answers `INVALID_ARGUMENT` even while the table is still loading, where a
+call of the right kind meets `UNAVAILABLE` until the load completes; a
+caller does not retry it.
 
 A `Scan` request carries the table, the key, the value columns to read
 as `Get` reads them, a direction, a limit, and optional bounds:
@@ -345,9 +350,12 @@ position. When the read of any key fails, the whole call fails, as for
 `MultiGet`.
 
 A `MultiScan` may request up to `server.max_multi_scan_values` values,
-4,000 by default, counted as its keys times its limit times one more
+4,000 by default, which `TableInfo` reports in `max_multi_scan_values`.
+They are counted as its keys times its limit times one more
 than its columns, the one being the order value; a limit of 0 counts as
-the table's `max_scan_rows`. The server rejects a larger call as
+the table's `max_scan_rows`, so a `MultiScan` that leaves `limit` unset
+asks for the most each key can return and is refused for more than a few
+keys. The server rejects a larger call as
 `INVALID_ARGUMENT` before it reads any key. At the defaults, a
 `MultiScan` at the full limit of 1,000 rows with one column covers two
 keys, and one with a limit of 20 and one column covers 100. A caller
@@ -391,8 +399,8 @@ its `limit`.
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
-| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
-| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` (4 MiB by default); the error names the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit, and the server sends no rows. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
+| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
+| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` (4 MiB by default); the error names the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit, and the server sends no rows. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. The server sends this for no other reason. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
 | `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a span GET within any `Scan` or `MultiScan`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |

@@ -98,8 +98,13 @@ pub enum Error {
     /// above `max_scan_rows`, a bound of the wrong variant, an `after` at or
     /// above `before`, or a `MultiScan` asking for more than
     /// `max_multi_scan_values`; checked before any read.
-    #[error("scan request: {0}")]
-    ScanRequest(ScanRequestFault),
+    #[error("table {table}: scan request: {fault}")]
+    ScanRequest {
+        /// The table's configured name.
+        table: String,
+        /// What is wrong with the request.
+        fault: ScanRequestFault,
+    },
     /// A Scan or `MultiScan` response above `server.max_scan_bytes` (RFD
     /// 025, Limits). The rows were read and none is returned; the same
     /// request meets it again until the caller lowers its limit or the
@@ -125,14 +130,19 @@ pub enum Error {
     /// column declares (RFD 024): the bytes are the writer's, so every
     /// attempt fails the same way until they are rewritten or the caller
     /// stops trimming them.
-    #[error("table {table}: column {column} of key {key} is not protobuf: {fault}")]
+    #[error("table {table}: column {column} of key {key}{} is not protobuf: {fault}", at_order(.order.as_deref()))]
     MalformedValue {
         /// The table's configured name.
         table: String,
         /// The column whose value it is.
         column: String,
-        /// The key whose row holds it.
-        key: Key,
+        /// The key whose row holds it. Boxed with `order`, to keep `Error`
+        /// under clippy's `large-error-threshold`, which `CliError` wraps.
+        key: Box<Key>,
+        /// The order value of the row that holds it, on an ordered table,
+        /// so a caller paging the key's rows can step past it; `None` for a
+        /// key-value lookup.
+        order: Option<Box<OrderValue>>,
         /// Where the walk stopped.
         fault: Malformed,
     },
@@ -282,7 +292,7 @@ impl Error {
             | Self::Refused { .. }
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
-            | Self::ScanRequest(_)
+            | Self::ScanRequest { .. }
             | Self::ResponseTooLarge { .. }
             | Self::WrongTableKind { .. }
             | Self::MalformedValue { .. }
@@ -322,7 +332,7 @@ impl Error {
             Self::Refused { reason, .. } => ErrorKind::Refused(reason.clone()),
             Self::KeyType { .. } => ErrorKind::KeyType,
             Self::ColumnRequest { .. } => ErrorKind::ColumnRequest,
-            Self::ScanRequest(_) => ErrorKind::ScanRequest,
+            Self::ScanRequest { .. } => ErrorKind::ScanRequest,
             Self::ResponseTooLarge { .. } => ErrorKind::ResponseTooLarge,
             Self::WrongTableKind { .. } => ErrorKind::WrongTableKind,
             Self::MalformedValue { .. } => ErrorKind::MalformedValue,
@@ -456,7 +466,7 @@ impl Recurs for Error {
             // A lookup's own key, columns, and request, never a build's.
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
-            | Self::ScanRequest(_)
+            | Self::ScanRequest { .. }
             | Self::ResponseTooLarge { .. }
             | Self::WrongTableKind { .. }
             | Self::ObjectStore(_)
@@ -520,6 +530,13 @@ fn location_detail(table: Option<&str>, source: &LocationError) -> String {
         Some(table) => format!("table {table}: {source}"),
         None => source.to_string(),
     }
+}
+
+/// The clause a malformed value's message carries for the row of an
+/// ordered table that holds it: the row's order value, which a caller
+/// paging the key's rows steps past; nothing for a key-value lookup.
+fn at_order(order: Option<&OrderValue>) -> String {
+    order.map_or_else(String::new, |order| format!(" at order value {order}"))
 }
 
 /// A refusal for a log line: the name, then the fields a reader needs to
@@ -1667,7 +1684,8 @@ mod tests {
             Error::MalformedValue {
                 table: TABLE.to_string(),
                 column: "value".to_string(),
-                key: Key::Long(1),
+                key: Box::new(Key::Long(1)),
+                order: None,
                 fault: crate::projection::Malformed::PastEnd { at: 0 },
             },
             Recurrence::Deterministic,
@@ -1688,7 +1706,7 @@ mod tests {
             | Error::Location { .. }
             | Error::KeyType { .. }
             | Error::ColumnRequest { .. }
-            | Error::ScanRequest(_)
+            | Error::ScanRequest { .. }
             | Error::ResponseTooLarge { .. }
             | Error::WrongTableKind { .. }
             | Error::NotReady { .. }
@@ -1898,7 +1916,10 @@ mod tests {
                 "column_request",
             ),
             (
-                Error::ScanRequest(crate::scan::ScanRequestFault::BoundsInverted),
+                Error::ScanRequest {
+                    table: TABLE.to_string(),
+                    fault: crate::scan::ScanRequestFault::BoundsInverted,
+                },
                 "scan_request",
             ),
             (
@@ -1923,7 +1944,8 @@ mod tests {
                 Error::MalformedValue {
                     table: TABLE.to_string(),
                     column: "value".to_string(),
-                    key: Key::Long(1),
+                    key: Box::new(Key::Long(1)),
+                    order: None,
                     fault: crate::projection::Malformed::PastEnd { at: 0 },
                 },
                 "malformed_value",

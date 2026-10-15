@@ -93,6 +93,25 @@ impl fmt::Display for Oversize {
     }
 }
 
+/// Which of a Scan request's two bounds a fault names. Display gives the
+/// field's name in the contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundSide {
+    /// `after`: exclusive, below every row returned.
+    After,
+    /// `before`: exclusive, above every row returned.
+    Before,
+}
+
+impl fmt::Display for BoundSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::After => "after",
+            Self::Before => "before",
+        })
+    }
+}
+
 /// What makes a Scan or `MultiScan` request malformed (RFD 025, Wire), each
 /// found before any read. Display gives the fault for
 /// `Error::ScanRequest`'s message.
@@ -108,8 +127,12 @@ pub enum ScanRequestFault {
     /// A bound is an order value of another variant than the table's
     /// order type takes.
     BoundVariant {
+        /// The bound that carries it.
+        bound: BoundSide,
         /// The variant the table's order type travels as.
         expected: OrderVariant,
+        /// The variant the bound carries.
+        got: OrderVariant,
     },
     /// `after` is at or above `before`, so no row lies between them.
     BoundsInverted,
@@ -123,6 +146,9 @@ pub enum ScanRequestFault {
         limit: u32,
         /// The columns requested.
         columns: usize,
+        /// The values the request asks for: keys times limit times one
+        /// more than the columns, saturating.
+        values: usize,
         /// `server.max_multi_scan_values`.
         max: usize,
     },
@@ -134,9 +160,14 @@ impl fmt::Display for ScanRequestFault {
             Self::LimitAboveMax { limit, max } => {
                 write!(f, "limit {limit} is above max_scan_rows {max}")
             }
-            Self::BoundVariant { expected } => write!(
+            Self::BoundVariant {
+                bound,
+                expected,
+                got,
+            } => write!(
                 f,
-                "a bound is not an order value of the table's variant, {}",
+                "{bound} is an order value of variant {}, not the table's variant, {}",
+                variant_name(*got),
                 variant_name(*expected)
             ),
             Self::BoundsInverted => f.write_str("after is at or above before"),
@@ -144,13 +175,21 @@ impl fmt::Display for ScanRequestFault {
                 keys,
                 limit,
                 columns,
+                values,
                 max,
             } => write!(
                 f,
-                "{keys} keys at limit {limit} with {columns} columns and the order value ask for more than max_multi_scan_values {max}"
+                "{keys} {} at limit {limit}, each row with {columns} {} and its order value, ask for {values} values, above max_multi_scan_values {max}",
+                plural(*keys, "key", "keys"),
+                plural(*columns, "column", "columns"),
             ),
         }
     }
+}
+
+/// `one` for a count of 1, else `many`.
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 /// The wire name of an order variant, as `OrderValue`'s oneof names it.
@@ -196,9 +235,18 @@ pub(crate) fn check_bounds(
     bounds: &ScanBounds,
     expected: OrderVariant,
 ) -> Result<(), ScanRequestFault> {
-    for bound in [&bounds.after, &bounds.before].into_iter().flatten() {
-        if variant_of(bound) != expected {
-            return Err(ScanRequestFault::BoundVariant { expected });
+    for (side, bound) in [
+        (BoundSide::After, &bounds.after),
+        (BoundSide::Before, &bounds.before),
+    ] {
+        if let Some(bound) = bound
+            && variant_of(bound) != expected
+        {
+            return Err(ScanRequestFault::BoundVariant {
+                bound: side,
+                expected,
+                got: variant_of(bound),
+            });
         }
     }
     if let (Some(after), Some(before)) = (&bounds.after, &bounds.before)
@@ -227,6 +275,7 @@ pub(crate) fn check_multi_scan_values(
             keys,
             limit,
             columns,
+            values,
             max,
         });
     }
@@ -340,7 +389,9 @@ mod tests {
                 OrderVariant::Long
             ),
             Err(ScanRequestFault::BoundVariant {
-                expected: OrderVariant::Long
+                bound: BoundSide::Before,
+                expected: OrderVariant::Long,
+                got: OrderVariant::Str,
             })
         );
         assert_eq!(
@@ -349,7 +400,9 @@ mod tests {
                 OrderVariant::Str
             ),
             Err(ScanRequestFault::BoundVariant {
-                expected: OrderVariant::Str
+                bound: BoundSide::After,
+                expected: OrderVariant::Str,
+                got: OrderVariant::Bin,
             })
         );
         for (after, before) in [(2, 2), (3, 2)] {
@@ -380,6 +433,7 @@ mod tests {
                 keys: keys + 1,
                 limit: MAX,
                 columns,
+                values: (keys + 1) * usize::try_from(MAX).unwrap() * (columns + 1),
                 max
             })
         );
@@ -389,6 +443,7 @@ mod tests {
                 keys: usize::MAX,
                 limit: u32::MAX,
                 columns: usize::MAX,
+                values: usize::MAX,
                 max
             }),
             "the product saturates rather than wrapping"

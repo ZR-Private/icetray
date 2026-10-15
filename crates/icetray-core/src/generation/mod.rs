@@ -5896,7 +5896,7 @@ mod tests {
                     check::diagnose(&generation, config.lookups(), &ValueFormat::opaque, None)
                         .summary
                         .lookup_cost,
-                    expected,
+                    Some(expected),
                     "{name} {residency}: the doctor reports the gauges' cost"
                 );
                 let most = (0..end)

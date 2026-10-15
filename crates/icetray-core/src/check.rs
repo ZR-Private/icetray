@@ -875,6 +875,16 @@ pub struct OrderSummary {
     /// several files hold, as appends between compactions leave it, has
     /// more rows than its longest run, so this is a floor on its history.
     pub longest_run: u64,
+    /// The GETs one cold Scan at `max_scan_rows` makes at worst in the
+    /// loaded tier, of a key held in one file and one row group, reading
+    /// every configured value column: the figure
+    /// `icetray_table_gets_per_scan` publishes while the snapshot serves.
+    /// An ordered table's cost of reading a key, which a lookup's
+    /// (`TableSummary::lookup_cost`) is not.
+    pub gets_per_scan: u64,
+    /// The files one Scan reads at worst in the loaded tier, as
+    /// `icetray_table_files_probed_per_lookup` publishes it.
+    pub files_probed: usize,
 }
 
 /// The doctor's verdict on one generation and the numbers an owner chooses
@@ -920,8 +930,10 @@ pub struct TableSummary {
     /// out, as Bloom is when `predicted.bloom` is `None`.
     pub level_by_residency: BTreeMap<Residency, Level>,
     /// What one cold lookup pays at worst in the loaded tier, from the same
-    /// measurement as `level`.
-    pub lookup_cost: LookupCost,
+    /// measurement as `level`; `None` on an ordered table, which serves no
+    /// lookup and whose `order` carries the cost of a Scan instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_cost: Option<LookupCost>,
     /// Each value column's level and cost, in the layout's order.
     pub value_columns: Vec<ColumnSummary>,
     /// What the snapshot's deletes come to (RFD 021), from the delete state
@@ -1023,6 +1035,20 @@ pub fn diagnose(
         .iter()
         .filter(|finding| finding.caps().is_some())
         .count();
+    let order = g
+        .layout
+        .order
+        .as_ref()
+        .zip(scan)
+        .zip(caps.gets_per_scan)
+        .map(|((order, limits), gets_per_scan)| OrderSummary {
+            column: order.name.clone(),
+            order_type: order.order_type,
+            max_scan_rows: limits.max_scan_rows,
+            longest_run: longest_run_of(facts.iter().filter_map(|file| file.report.order.as_ref())),
+            gets_per_scan,
+            files_probed: caps.cost.files_probed,
+        });
     let summary = TableSummary {
         table: g.table.clone(),
         snapshot_id: g.snapshot_id,
@@ -1037,24 +1063,12 @@ pub fn diagnose(
         index_bytes: g.index_bytes,
         predicted,
         level_by_residency: level_by_residency(g, &predicted),
-        lookup_cost: caps.cost,
+        lookup_cost: order.is_none().then_some(caps.cost),
         value_columns,
         deletes,
         capping,
         advice: findings.len() - capping,
-        order: g
-            .layout
-            .order
-            .as_ref()
-            .zip(scan)
-            .map(|(order, limits)| OrderSummary {
-                column: order.name.clone(),
-                order_type: order.order_type,
-                max_scan_rows: limits.max_scan_rows,
-                longest_run: longest_run_of(
-                    facts.iter().filter_map(|file| file.report.order.as_ref()),
-                ),
-            }),
+        order,
     };
     TableReport {
         summary,

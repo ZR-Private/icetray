@@ -450,11 +450,11 @@ mod tests {
                 (Residency::Disk, Level::Optimal),
                 (Residency::Bloom, Level::Balanced),
             ]),
-            lookup_cost: LookupCost {
+            lookup_cost: Some(LookupCost {
                 gets_per_hit: 1,
                 gets_per_miss: 0,
                 files_probed: 1,
-            },
+            }),
             value_columns: vec![ColumnSummary {
                 column: COLUMN.to_string(),
                 format: icetray_core::ValueFormat::Protobuf,
@@ -617,6 +617,8 @@ mod tests {
     /// The order facts an ordered table's sample lines carry.
     const LONGEST_RUN: u64 = 7;
     const SCAN_ROWS: u32 = 50;
+    const GETS_PER_SCAN: u64 = 3;
+    const FILES_PROBED: usize = 2;
     const DISTINCT_KEYS: [u64; 2] = [3, 4];
     const LEAST_ORDER: i64 = -5;
 
@@ -626,13 +628,17 @@ mod tests {
         let mut file = file_report();
         let line = serde_json::to_value(SummaryLine::new(&summary)).unwrap();
         assert!(line.get("order").is_none(), "{line}");
+        assert!(line.get("lookup_cost").is_some(), "{line}");
         let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
         assert!(line.get("order").is_none(), "{line}");
+        summary.lookup_cost = None;
         summary.order = Some(OrderSummary {
             column: COLUMN.to_string(),
             order_type: OrderType::Binary,
             max_scan_rows: SCAN_ROWS,
             longest_run: LONGEST_RUN,
+            gets_per_scan: GETS_PER_SCAN,
+            files_probed: FILES_PROBED,
         });
         file.order = Some(FileOrderReport {
             min: OrderValue::Long(LEAST_ORDER),
@@ -645,6 +651,12 @@ mod tests {
         assert_eq!(line["order"]["order_type"], Json::String("binary".into()));
         assert_eq!(line["order"]["max_scan_rows"], Json::from(SCAN_ROWS));
         assert_eq!(line["order"]["longest_run"], Json::from(LONGEST_RUN));
+        assert_eq!(line["order"]["gets_per_scan"], Json::from(GETS_PER_SCAN));
+        assert_eq!(line["order"]["files_probed"], Json::from(FILES_PROBED));
+        assert!(
+            line.get("lookup_cost").is_none(),
+            "an ordered table's line carries a Scan's cost, not a lookup's: {line}"
+        );
         let line = serde_json::to_value(FileLine::new(TABLE, &file)).unwrap();
         assert_eq!(line["order"]["min"], Json::from(LEAST_ORDER));
         assert_eq!(line["order"]["max"], Json::String("0x00ab".to_string()));

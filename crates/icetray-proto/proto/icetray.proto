@@ -16,10 +16,14 @@ package icetray.v1;
 // INVALID_ARGUMENT error when it omits the key or sets no variant in it,
 // sets a variant that does not match the table's key type, lists a value
 // column the table does not serve or lists one twice, or lists fields of a
-// column in a way ColumnRead does not allow. A key that is not in the table
-// is a successful response, never an error. A request that lists fields of
-// a value that is not the protobuf its column declares is a
-// FAILED_PRECONDITION error, the same on every attempt until the table's
+// column in a way ColumnRead does not allow. Get and MultiGet serve a table
+// with no order column, and Scan and MultiScan serve a table that has one (an
+// ordered table); a call that names a table of the other kind is an
+// INVALID_ARGUMENT error, whether or not the table has finished loading and
+// whatever else the request holds, so a caller does not retry it. A key that
+// is not in the table is a successful response, never an error. A request
+// that lists fields of a value that is not the protobuf its column declares
+// is a FAILED_PRECONDITION error, the same on every attempt until the table's
 // data changes, so a caller does not retry it.
 service Icetray {
   // Look up one key in one table. The response carries the id of the
@@ -80,7 +84,9 @@ message Key {
 // One lookup in one table.
 message GetRequest {
   // The name the server is configured to serve the table under. A name the
-  // server does not serve is a NOT_FOUND error.
+  // server does not serve is a NOT_FOUND error, and the name of a table that
+  // has an order column (an ordered table, which Scan reads) is an
+  // INVALID_ARGUMENT error.
   string table = 1;
   // The key to look up. Its variant must match the table's key type; a
   // request that omits it is an INVALID_ARGUMENT error.
@@ -175,7 +181,9 @@ message GetResponse {
 // Several lookups in one table, all read from one snapshot.
 message MultiGetRequest {
   // The name the server is configured to serve the table under. A name the
-  // server does not serve is a NOT_FOUND error.
+  // server does not serve is a NOT_FOUND error, and the name of a table that
+  // has an order column (an ordered table, which MultiScan reads) is an
+  // INVALID_ARGUMENT error.
   string table = 1;
   // The keys to look up. Every variant must match the table's key type.
   // The response carries one result per key, in this order.
@@ -353,7 +361,8 @@ message ScanResponse {
 // Several Scans in one ordered table with one set of columns, direction,
 // limit, and bounds, all read from one snapshot. The request is an
 // INVALID_ARGUMENT error for every reason a ScanRequest is, for a key of
-// any position, and when its keys times its limit times one more than its
+// any position, when it names a table that has no order column, and when
+// its keys times its limit times one more than its
 // columns exceed the server's limit, a limit of 0 counting as
 // TableInfoResponse.max_scan_rows; the server refuses that before it reads
 // any key.
@@ -504,4 +513,10 @@ message TableInfoResponse {
   // The most rows one Scan may ask for, and what a limit of 0 reads; 0
   // for a table with no order column.
   uint32 max_scan_rows = 12;
+  // The most values one MultiScan may ask for: its keys times its limit
+  // times one more than its columns, where a limit of 0 counts as
+  // max_scan_rows. A MultiScan above it is an INVALID_ARGUMENT error before
+  // any key is read, so a caller sizes its keys and limit by it; 0 for a
+  // table with no order column.
+  uint64 max_multi_scan_values = 13;
 }

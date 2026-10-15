@@ -2,7 +2,7 @@
 //! protobuf beside an opaque one, read whole and trimmed to field numbers
 //! in every residency tier at the GETs a whole read costs; a null, a value
 //! holding none of the fields, a field list the column's format does not
-//! take, a malformed value on `get` and `multi_get`, a format applied in
+//! take, a malformed value on `get`, `multi_get`, and `scan`, a format applied in
 //! place by a reload, and the doctor's walk of one value page per protobuf
 //! column.
 
@@ -12,8 +12,8 @@ use std::sync::Arc;
 use icetray_core::config::{Config, Residency, ServerConfig, TableConfig, ValueFormat};
 use icetray_core::open::open_with;
 use icetray_core::{
-    ColumnRead, ColumnRequestFault, Error, FindingCode, FindingLog, Key, KeyType, Level, Row,
-    Storage, examine,
+    ColumnRead, ColumnRequestFault, Direction, Error, FindingCode, FindingLog, Key, KeyType, Level,
+    OrderValue, Row, ScanBounds, Storage, examine,
 };
 use icetray_testkit::fixture::{NAMESPACE, SAMPLE, SECOND_VALUE_COLUMN};
 use icetray_testkit::layout::VALUE_COLUMN;
@@ -23,7 +23,8 @@ use icetray_testkit::protobuf::{
 };
 use icetray_testkit::verify::{self, ColdCosts};
 use icetray_testkit::{
-    Fixture, FixtureSpec, Nulls, Result, ValueKind, memory_catalog_local, write_fixture,
+    Fixture, FixtureSpec, Nulls, OrderKind, Ordered, Result, TestScan, ValueKind,
+    memory_catalog_local, write_fixture,
 };
 
 /// Every residency tier a table can be served in.
@@ -198,6 +199,86 @@ async fn test_a_null_stays_null_and_a_value_of_none_of_the_fields_is_empty() -> 
     Ok(())
 }
 
+/// Rows per key of the ordered fixture the Scan test reads, and the first
+/// order value and the step between a key's rows.
+const SCAN_ROWS: u64 = 4;
+const ORDER_START: i64 = 1_000;
+const ORDER_STEP: i64 = 10;
+
+fn scan_rows(_: u64) -> u64 {
+    SCAN_ROWS
+}
+
+/// A malformed value a Scan reads fails the call, naming the key and the
+/// order value of the row that holds it, so a caller paging the key's rows
+/// can step past it.
+#[tokio::test]
+async fn test_a_malformed_value_fails_a_scan_naming_the_key_and_the_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let catalog = memory_catalog_local(dir.path()).await?;
+    let spec = FixtureSpec {
+        value_kind: ValueKind::Random,
+        ..FixtureSpec::ordered(
+            "events_project_malformed",
+            KeyType::Long,
+            Ordered {
+                kind: OrderKind::Long,
+                rows_per_key: scan_rows,
+                start: ORDER_START,
+                step: ORDER_STEP,
+            },
+        )
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let scratch = tempfile::tempdir()?;
+    let config = entry(&fixture, Residency::Full, ValueFormat::Protobuf);
+    let served = verify::serve_in(config, scratch.path()).await?;
+    let fields = [ID_FIELD];
+    let reads = [ColumnRead {
+        name: VALUE_COLUMN,
+        fields: &fields,
+    }];
+    let bounds = ScanBounds {
+        direction: Direction::OldestFirst,
+        limit: 0,
+        after: None,
+        before: None,
+    };
+    let mut refused = 0;
+    for key in fixture.keys() {
+        let Err(error) = served.table.scan(&key, &reads, &bounds).await else {
+            continue;
+        };
+        let Error::MalformedValue {
+            key: named,
+            order: Some(order),
+            ..
+        } = error
+        else {
+            panic!("expected a malformed value naming its row, got {error:?}");
+        };
+        let OrderValue::Long(order) = *order else {
+            panic!("a long order column's value is a long, got {order:?}");
+        };
+        assert_eq!(*named, key);
+        let (rows, _) = fixture.expected_scan(
+            &key,
+            &[VALUE_COLUMN],
+            &TestScan {
+                limit: 0,
+                ..TestScan::default()
+            },
+        );
+        assert!(
+            rows.iter().any(|(held, _)| *held == order),
+            "{order} is an order value of {key}'s rows"
+        );
+        refused += 1;
+    }
+    assert!(refused > 0, "some random value is malformed protobuf");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_a_malformed_value_fails_get_and_its_multi_get_naming_the_key() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -219,17 +300,19 @@ async fn test_a_malformed_value_fails_get_and_its_multi_get_naming_the_key() -> 
             table,
             column,
             key,
+            order,
             fault,
         } = error
         else {
             panic!("expected a malformed value, got {error:?}");
         };
         assert_eq!(
-            (table.as_str(), column.as_str(), key, fault),
+            (table.as_str(), column.as_str(), *key, order, fault),
             (
                 served.table.name(),
                 VALUE_COLUMN,
                 malformed.clone(),
+                None,
                 expected
             )
         );
