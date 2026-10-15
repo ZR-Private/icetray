@@ -12,8 +12,8 @@ use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -371,25 +371,38 @@ impl fmt::Debug for SpanFlights {
     }
 }
 
-/// The pages in flight of the files one shard of `SpanFlights` holds: per
-/// page, the outcome its fetch will publish.
-#[derive(Default)]
-struct FlightShard {
-    /// Never held across an `await`.
-    pages: Mutex<InFlight>,
-    /// How many times `lock` has taken `pages`: what the lock tests count.
+/// `FlightShard` in a module of its own, so that its pages are reachable
+/// only through `FlightShard::lock`, which counts every lock the lock
+/// tests assert on.
+mod flight_shard {
     #[cfg(test)]
-    locked: AtomicU64,
-}
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
-impl FlightShard {
-    /// The shard's pages in flight, locked.
-    fn lock(&self) -> MutexGuard<'_, InFlight> {
+    use super::InFlight;
+
+    /// The pages in flight of the files one shard of `SpanFlights` holds:
+    /// per page, the outcome its fetch will publish.
+    #[derive(Default)]
+    pub(super) struct FlightShard {
+        /// Never held across an `await`.
+        pages: Mutex<InFlight>,
+        /// How many times `lock` has taken `pages`: what the lock tests
+        /// count.
         #[cfg(test)]
-        self.locked.fetch_add(1, Ordering::Relaxed);
-        self.pages.lock().unwrap_or_else(PoisonError::into_inner)
+        pub(super) locked: AtomicU64,
+    }
+
+    impl FlightShard {
+        /// The shard's pages in flight, locked.
+        pub(super) fn lock(&self) -> MutexGuard<'_, InFlight> {
+            #[cfg(test)]
+            self.locked.fetch_add(1, Ordering::Relaxed);
+            self.pages.lock().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 }
+use flight_shard::FlightShard;
 
 /// What a span fetch publishes for one of its pages: the page's bytes, or
 /// why the fetch produced none.
@@ -561,7 +574,8 @@ impl PageCache {
     /// is `CacheError::Fetch` and caches nothing of it. A read returns at
     /// its first failure, of a run of its own or of a fetch it waits on,
     /// without waiting for the rest: its runs still in flight are dropped
-    /// with it, releasing their pages as a dropped read does. A read dropped
+    /// with it, releasing their pages as a dropped read does, so a read
+    /// that joined one of those runs fetches its pages again. A read dropped
     /// before its runs end releases their pages unserved, and a read
     /// waiting on one of them claims it again itself. The disk level is not
     /// read, since the Scan cache has none. A run whose bytes come back
@@ -2079,10 +2093,12 @@ mod tests {
             .unwrap()
     }
 
-    /// Span reads of two files, as Scans of two tables make, never take one
-    /// lock: a cold read takes only its own file's shard's lock, and warm
-    /// reads running together on several workers take no in-flight lock at
-    /// all, since memory holds every page they read.
+    /// Span reads of two files, as Scans of two tables make, the second
+    /// file chosen so that its pages fall in another shard than the
+    /// first's (`file_of_another_shard`), never take one lock: a cold read
+    /// takes only its own file's shard's lock, and warm reads running
+    /// together on several workers take no in-flight lock at all, since
+    /// memory holds every page they read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_get_span_of_two_files_takes_no_shared_lock_and_warm_reads_none() {
         let cache = PageCache::for_scans(ROOMY_BYTES);
