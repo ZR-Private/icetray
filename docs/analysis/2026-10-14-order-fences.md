@@ -36,8 +36,8 @@ and time order columns:
   files from 55.3 to 6.4 ms, reading 0.33 MiB from the chunk files where
   it read 6.23 MiB. A refresh after an append that overlaps the last one
   makes 29 GETs where it made 427 (41 where it made 837 under `bloom`),
-  and its time did not change: a profile puts two thirds of it in the
-  merge's comparisons.
+  and its time did not change: two thirds of a profile's busy samples
+  fall in the merge.
 - **Fence memory.** Over a timestamp order column the fences take 16
   bytes per order page, 32 KB per table against 82 KB for the column
   index, and the resident index is 6 to 9% smaller. Over the string column
@@ -45,11 +45,16 @@ and time order columns:
   and the chunk files grow 5%.
 
 The merge's read waves are a decision left open since the streaming
-merge, `77aed9c`. Over the bench tables, whose files are one row group
-each, a first load and a refresh wait on the same rounds of GETs as
-before. Over the same rows in row groups of 25,000 rows, about four per
-file, the appended table's first load waits on 61 rounds where it waited
-on 9, at 30 ms a round about 1.6 s more, and 5.2 s at 100 ms.
+merge, `77aed9c`. The writer recipe in the
+[table layout](../table-layout.md) sets 128 MiB row groups and 32 to
+64 MiB data files, and advises `large_file` above 128 MiB, so a file
+written to it holds one row group, as every bench table's file does.
+There a first load and a refresh wait on the same rounds of GETs as
+before, and the waves cost nothing. The decision concerns tables
+outside the recipe, such as files at Iceberg's default 512 MiB target.
+Over the same rows in row groups of 25,000 rows, about four per file,
+the appended table's first load waits on 61 rounds where it waited on
+9: at 30 ms a round about 1.6 s more, and 5.2 s at 100 ms.
 
 The key-value path is slower in none of its 48 comparisons, faster
 outside the spread in 20, and makes 6 fewer allocations per value read.
@@ -62,14 +67,22 @@ outside the spread in 20, and makes 6 fewer allocations per value read.
   comparison alternated its two binaries run by run.
 - **Binaries.** Both are `crates/icetray-testkit/examples/bench.rs` built
   with the `profiling` profile (release with debug info).
-  - Before is the baseline binary, the bench at `2eae81e` over
-    the library code of `39b8a7c`.
+  - Before is the baseline binary, the bench at `2eae81e` over the
+    library code of `39b8a7c` plus the reporting-only `resident_parts`
+    accessor and a test fixture's knob that `2eae81e` adds to
+    `icetray-core`; no Scan, merge, or load path differs from `39b8a7c`.
   - After is `bfe2e39`, the bench with load rounds over the library code
-    of `6c39252`, the branch head.
+    of `6c39252`, the branch head. The main set ran this binary;
+    `821820f` changes only the bench, so the reproduction below builds
+    it, over the same library.
   - The load-rounds set needs the bench's load rounds and held bytes on
     both sides. Its before binary is `2eae81e` with the two bench commits
-    `bfe2e39` and `821820f` applied, built in a scratch worktree; the
-    library is still `39b8a7c`'s. Its after binary is `821820f`.
+    `bfe2e39` and `821820f` applied, built in a scratch worktree, over
+    the same library as the main set's before binary. That it carries
+    the old library shows in its figures: the rolled table's first load
+    under `full` takes 60.8 ms there, as the main set's before binary
+    takes 61.7 ms, where the after binary takes 11.5. Its after binary
+    is `821820f`.
 - **Serving.** The bench serves tables through `Table` over `Storage`'s
   `file://` store, so no figure includes object-store latency, and a
   cold read is a copy from the OS page cache. An ordered table's reads
@@ -94,8 +107,10 @@ outside the spread in 20, and makes 6 fewer allocations per value read.
     files, and a fifth overlapping append for the refresh.
 
   Every file of every bench table is one row group. For the read waves,
-  `--row-group-rows 25000` writes `ordered_rolled` as 30 files in 105
-  row groups and `ordered_appended` as 24 files in 102.
+  `--row-group-rows 25000` writes the same rows in row groups of 25,000
+  rows: `ordered_rolled` as 30 files in 105 row groups and
+  `ordered_appended` as 24 files in 102, counting the refresh's append;
+  a first load reads 28 and 20 of those files.
 - **Main set.** The baseline's run set, three runs per binary, alternating:
   `warm-hit`, `cold-hit`, `miss`, and `multi-get-100` on `long`; the
   `ordered` Scan and MultiScan scenarios and `kv-beside-ordered`; the
@@ -103,8 +118,12 @@ outside the spread in 20, and makes 6 fewer allocations per value read.
   table, in every tier. Each lookup scenario has a 1 s warm-up and a 5 s
   window, on one task and on eleven. Lookup figures are medians of three
   runs, with the lowest and highest in parentheses; a difference falls
-  outside the spread when the two binaries' ranges do not overlap. Load
-  figures are medians of rounds 2 and 3 of each run, six per binary.
+  outside the spread when the two binaries' ranges do not overlap, that
+  is, when all three runs of one binary fall on one side of all three of
+  the other's. Load figures are medians of rounds 2 and 3 of each run,
+  six per binary, with their range read the same way; each run's first
+  load is left out. Every figure is computed by that rule from the JSON
+  reports the bench writes.
   Rounds are counted over 100 Scans run one at a time before each
   window, on one task only.
 - **Load-rounds set.** `load,refresh` of `ordered_rolled` and
@@ -132,20 +151,21 @@ it:
 
 ```sh
 ROOT=$PWD
-cargo build --profile profiling --locked -p icetray-testkit --example bench
+F="flox activate --"
+$F cargo build --profile profiling --locked -p icetray-testkit --example bench
 mkdir -p target/bench/after && cp target/profiling/examples/bench target/bench/after/
 
 git diff 6c39252 821820f -- crates/icetray-testkit/examples/bench.rs > $ROOT/target/bench.patch
 git worktree add --detach ../bench-before 2eae81e
 cd ../bench-before
-cargo build --profile profiling --locked -p icetray-testkit --example bench
+$F cargo build --profile profiling --locked -p icetray-testkit --example bench
 mkdir -p $ROOT/target/bench/before && cp target/profiling/examples/bench $ROOT/target/bench/before/
 git apply $ROOT/target/bench.patch
-cargo build --profile profiling --locked -p icetray-testkit --example bench
+$F cargo build --profile profiling --locked -p icetray-testkit --example bench
 mkdir -p $ROOT/target/bench/before-rounds && cp target/profiling/examples/bench $ROOT/target/bench/before-rounds/
-cd $ROOT
+cd $ROOT && git worktree remove --force ../bench-before
 
-A=target/bench/after/bench; DATA=target/bench/tables
+A=target/bench/after/bench; B=target/bench/before/bench; DATA=target/bench/tables
 $A --prepare --table long,ordered,ordered-long,ordered-string,ordered-rolled,ordered-appended \
   --values random --data-dir $DATA
 $A --prepare --table ordered-rolled,ordered-appended --values random \
@@ -161,11 +181,12 @@ set_of() {  # binary, output directory
   $1 --scenario load,refresh --table long,ordered,ordered-long,ordered-string,ordered-rolled,ordered-appended \
     --load-rounds 3 $COMMON --out-dir $2/load
 }
-LOADS="--scenario load,refresh --table ordered-rolled,ordered-appended --values random --tier full,disk,bloom --load-rounds 3"
 for n in 1 2 3; do
-  set_of target/bench/before/bench target/bench/results/before-$n
+  set_of $B target/bench/results/before-$n
   set_of $A target/bench/results/after-$n
 done
+
+LOADS="--scenario load,refresh --table ordered-rolled,ordered-appended --values random --tier full,disk,bloom --load-rounds 3"
 for n in 1 2 3; do
   for side in before-rounds after; do
     target/bench/$side/bench $LOADS --data-dir $DATA --out-dir target/bench/results/$side-one-$n
@@ -173,17 +194,29 @@ for n in 1 2 3; do
       --out-dir target/bench/results/$side-rg-$n
   done
 done
+
 for n in 1 2 3; do
   $A --scenario multi-scan-100,multi-scan-100-cold,multi-scan-1000,multi-scan-1000-cold --table ordered \
     $COMMON --out-dir target/bench/results/multi-scan-$n
 done
-for keys in 10 100 1000; do for d in 4 16; do
-  /usr/bin/time -p $A --scenario multi-scan-$keys --table ordered --tier full --mode single \
-    --duration $d --warmup 1 --values random --data-dir $DATA --out-dir target/bench/results/cpu-$keys-$d
-done; done
-samply record -- $A --scenario scan-bounded-string --table ordered-string --tier full --mode single \
-  --duration 20 --warmup 2 --values random --data-dir $DATA
-samply record -- $A --scenario load --table ordered-rolled --tier full --load-rounds 400 \
+ONE="--table ordered --tier full --mode single --warmup 1 --values random --data-dir $DATA"
+for n in 1 2 3; do
+  for run in "before $B 10" "after $A 10" "after $A 100" "after $A 1000"; do
+    set -- $run
+    for d in 4 16; do
+      /usr/bin/time -p $2 --scenario multi-scan-$3 $ONE --duration $d \
+        --out-dir target/bench/results/cpu-$1-$3-$d-$n
+    done
+  done
+done
+
+PROF="--mode single --duration 20 --warmup 2 --values random --data-dir $DATA"
+$F samply record -- $A --scenario scan-bounded-long --table ordered-long --tier full $PROF
+$F samply record -- $A --scenario scan-bounded-string --table ordered-string --tier full $PROF
+$F samply record -- $A --scenario scan-bounded --table ordered --tier disk $PROF
+$F samply record -- $A --scenario load --table ordered-rolled --tier full --load-rounds 400 \
+  --values random --data-dir $DATA
+$F samply record -- $A --scenario load,refresh --table ordered-appended --tier full --load-rounds 80 \
   --values random --data-dir $DATA
 ```
 
@@ -210,8 +243,8 @@ order page first and the value pages after it, a second round; under
 `bloom` the key-page round came first, so three. With the fences the
 string Scan takes the rounds of the timestamp one: one under `full` and
 `disk`, and under `bloom` the key-page round and the row round that RFD
-025 counts. A mean below one is a Scan whose pages the 1 MiB cold cache
-still held.
+025 counts. A mean below one counts Scans that made no GET; the
+inference is that the 1 MiB cold cache still held their pages.
 
 The single round costs bytes. Under `full` and `bloom` the cold string
 Scan requests about 90 KB more than before, about one value page of
@@ -256,11 +289,11 @@ in this tree).
 
 The bounded Scan of the long run still takes twice the time of the same
 Scan on a short run, 24.2 against 11.9 µs, and allocates 91 KiB more,
-about one decompressed page. The profile below puts 28.6% of it in
-decoding the run's first and last key pages and 26.5% in the bound's
-order page. The inference from that, without a profile of the short-run
-Scan, is that a run of ten pages has its first and last key on two
-pages, which the Scan decompresses separately, where a 100-row run's
+about one decompressed page. In the profile below, 28.6% of its samples
+fall in decoding the run's first and last key pages and 26.5% in the
+bound's order page. The inference from that, without a profile of the
+short-run Scan, is that a run of ten pages has its first and last key on
+two pages, which the Scan decompresses separately, where a 100-row run's
 ends share one page. That cost is fixed per Scan whatever the run's
 length.
 
@@ -275,6 +308,9 @@ medians of six, with the time's range:
 | | Disk | first load | 63.4 (62.9–64.5) | 14.4 (14.0–14.9) | 136.1 → 86.6 | 143 → 143 | 20.3 → 20.3 | 56 → 96 | 6.23 → 0.33 |
 | | Disk | restart | 55.3 (54.7–55.6) | 6.4 (6.2–6.8) | 64.4 → 16.1 | 31 → 31 | 14.0 → 14.0 | 56 → 96 | 6.23 → 0.33 |
 | | Bloom | first load | 61.8 (61.0–62.7) | 11.3 (11.2–11.6) | 123.2 → 67.7 | 227 → 267 | 26.5 → 20.6 | | |
+| | Full | refresh | 1.8 (1.6–1.9) | 1.5 (1.5–1.6) | 2.1 → 2.0 | 15 → 15 | 1.08 → 1.08 | | |
+| | Disk | refresh | 2.0 (1.9–2.1) | 2.0 (1.8–2.0) | 2.7 → 2.7 | 15 → 15 | 1.08 → 1.08 | 0 → 0 | |
+| | Bloom | refresh | 1.9 (1.6–1.9) | 1.5 (1.5–1.5) | 2.2 → 2.0 | 17 → 17 | 1.08 → 1.08 | | |
 | `ordered_appended` | Full | first load | 48.6 (47.7–49.9) | 49.5 (49.4–50.6) | 86.2 → 83.5 | 83 → 83 | 11.8 → 11.8 | | |
 | | Full | refresh | 17.1 (16.8–17.3) | 17.5 (17.3–17.9) | 22.4 → 22.2 | 427 → 29 | 2.60 → 2.60 | | |
 | | Disk | restart | 44.1 (43.9–44.6) | 46.4 (45.6–47.4) | 49.3 → 51.6 | 27 → 27 | 10.0 → 10.0 | 32 → 32 | 0.95 → 0.95 |
@@ -284,7 +320,11 @@ medians of six, with the time's range:
 
 Times are in milliseconds. For comparison, the compacted `ordered_long`,
 the same rows in 4 files, loads in 10.6 ms under `full` (12.1 before)
-and restarts under `disk` in 1.3 ms (1.2 before).
+and restarts under `disk` in 1.3 ms (1.2 before). The peak resident set
+grew by at most 14 MiB in any of these loads on either binary, and by
+about the same on both: 13.9 MiB before and 13.3 after for the rolled
+table's first load under `full`, under 1 MiB for every load of the
+appended table.
 
 The claim holds for the files a compaction rolls by size. The merge of
 `ordered_rolled` reads the pages at the edge keys neighbouring files
@@ -292,22 +332,26 @@ share, and a restart over its chunk files reads 0.33 MiB of them where
 it read every joined file's key and order chunks, 6.23 MiB. The first
 load fetches 5.6 MiB less. It does so in more requests: 191 GETs where it
 made 171 under `full`, 267 where it made 227 under `bloom`, and 96 local
-reads where it made 56 under `disk`. A file in the middle of a chain
-reads two runs of pages per column, its first page and its last, where
-the old merge read its chunk whole in one. The rolled table's first load
-still fetches 12.3 MiB more than the compacted one; that is the 512 KiB
-footer prefetch of each of its 24 more files, which the merge does not
-touch.
+reads where it made 56 under `disk`. The inference from the merge's
+code is that a file in the middle of a chain reads two runs of pages per
+column, its first page and its last, where the old merge read its chunk
+whole in one. The rolled table's first load still fetches 12.3 MiB more
+than the compacted one. The load prefetches 512 KiB of each file's
+footer, and the rolled table has 24 more files, 12 MiB, so the inference
+is that the footers, not the merge, account for it. The rolled table's
+refresh appends files of new keys, which meet no other file and are
+read no further; it makes the same reads as before.
 
 The appended table shows the claim's other half. Every key there has
 rows in every append, so every page of every file can hold a pair
 another file holds, the merge chooses them all, and its first load and
 restart read what they read before. Its refresh reads the same 2.60 MiB
-in 29 GETs where it made 427, because the merge now fetches a run of
-consecutive chosen pages in one GET where it fetched each page alone;
-under `disk` it makes 16 local reads where it made 812. The refresh's
-time under `full` and `bloom` did not move with its GETs. The busy
-samples of 80 loads and refreshes of this table put 66% in the merge's
+in 29 GETs where it made 427, and under `disk` it makes 16 local reads
+where it made 812. The inference from the code is that the merge now
+fetches a run of consecutive chosen pages in one GET where the old merge
+fetched each page alone. The refresh's
+time under `full` and `bloom` did not move with its GETs. Of the busy
+samples of 80 loads and refreshes of this table, 66% fall in the merge's
 CPU: `MergeState::place` 21.7%, key comparisons (`Keys::cmp_at`) 20.3%
 self, and the heap's pops 17.1%. On local files a GET is a copy from the
 OS page cache, so 400 fewer cost little here; against S3, each was a
@@ -324,8 +368,8 @@ against 47.2 ms. These runs do not establish a slowdown.
 ### Held bytes
 
 The merge's `held_bytes` in a first load, the most bytes of chosen pages
-it held at once, from the load-rounds set; the before library has no
-such counter:
+it held at once, from the load-rounds set, over the first load's 20
+appended and 28 rolled files; the before library has no such counter:
 
 | table | tier | one row group per file | row groups of 25,000 rows |
 |---|---|--:|--:|
@@ -341,10 +385,13 @@ key pages the chosen order pages span. The old merge read every chosen
 page of a group before it merged; the inference from that code, without
 a counter, is that it held what the one-row-group column shows whatever
 the files' row groups, and so four times the 25,000-row figures of the
-appended table. For 50 files of 4 row groups, the branch review's probe
-measured 36,896 bytes held by the old merge, and the unit test of the
-same shape (`test_verify_rows_holds_one_row_group_of_chosen_pages_per_file`)
-9,549 by the new one.
+appended table. The branch review's probe of the old merge, under
+`bloom` with 50 overlapping files of 1 or 4 row groups each, measured
+36,896 bytes held before the first comparison, against 8,249 bytes for
+one row group per file. The unit test of that shape
+(`test_verify_rows_holds_one_row_group_of_chosen_pages_per_file`) holds
+the new merge between the sum of each file's first row group and the sum
+of each file's largest, and passes in this tree.
 
 ## The merge's read waves
 
@@ -352,18 +399,19 @@ The streaming merge reads each file's next row group when that file's
 cursor runs dry, and it does not prefetch, so a merge over files of
 several row groups waits on a round for each wave of row groups it
 reads. Rounds of GETs per load or refresh, medians of six, from the
-load-rounds set; under `full` every load took the median's count, and
-under `bloom` the count varied by up to three rounds between loads:
+load-rounds set; under `full` and `disk` every load took the median's
+count, and under `bloom` the count varied by up to three rounds between
+loads:
 
 | table | tier | what | one row group per file | row groups of 25,000 rows | added at 30 ms | added at 100 ms |
 |---|---|---|--:|--:|--:|--:|
 | `ordered_appended` | Full | first load | 9 → 9 | 9 → 61 | +1.56 s | +5.2 s |
 | | Full | refresh | 10 → 10 | 10 → 36 | +0.78 s | +2.6 s |
-| | Bloom | first load | 14 → 14 | 16 → 66 | +1.50 s | +5.0 s |
-| | Bloom | refresh | 12 → 12 | 12 → 37 | +0.75 s | +2.5 s |
+| | Bloom | first load | 13.5 → 13.5 | 16 → 66 | +1.50 s | +5.0 s |
+| | Bloom | refresh | 12 → 12 | 12.5 → 37 | +0.74 s | +2.5 s |
 | | Disk | first load, refresh | 5 → 5, 6 → 6 | 5 → 5, 6 → 6 | 0 | 0 |
 | `ordered_rolled` | Full | first load | 10 → 10 | 10 → 30 | +0.60 s | +2.0 s |
-| | Bloom | first load | 18 → 18 | 18 → 38 | +0.60 s | +2.0 s |
+| | Bloom | first load | 17.5 → 18 | 18 → 38.5 | +0.62 s | +2.1 s |
 | | Disk | first load | 6 → 6 | 6 → 6 | 0 | 0 |
 
 The added latency multiplies the added rounds by the round's latency. It
@@ -372,25 +420,49 @@ out the time each GET takes to transfer its bytes. Under `disk` the merge
 reads its pages from the chunk files, so its waves are local reads,
 which these rounds do not count.
 
-With one row group per file, as in every bench table, the merge reads
-one wave per overlap group, the round count
-equals the old design's, and the read waves cost nothing. With about
-four row groups per file the appended table's first load waits on 52
-more rounds, across 4 overlap groups of 5 files, about 21 row groups
-each. The inference from the counts, without a trace, is that
-most row groups after a file's first start a wave of their own, because
-the merge pauses whenever any one cursor waits and the files' row-group
+On local files each added round costs about 50 µs. Over the row groups
+of 25,000 rows the appended table's first load under `full` takes
+50.4 ms (50.1–50.6) where it took 47.8 (47.6–48.1), 2.6 ms for 52 more
+rounds; its refresh takes 18.6 ms (18.3–31.7) where it took 17.2
+(17.0–17.7) under `full`, and 18.5 (18.2–18.8) where it took 17.1
+(17.0–17.3) under `bloom`; and its Disk restart takes 46.0 ms
+(45.8–49.2) where it took 44.1 (44.0–44.3). All four fall outside the
+spread; the Bloom first load, 48.1 (47.7–50.6) against 50.4
+(50.1–50.6), does not. The GETs fall where the rounds rise: the
+appended refresh makes 81 where it made 466 (132 where it made 902
+under `bloom`), and the rolled first load 341 where it made 396 (492
+where it made 602 under `bloom`), while the appended first load makes
+265 on both binaries. The rolled first load is still 4.8 times faster,
+12.8 ms against 61.4.
+
+The writer recipe in the [table layout](../table-layout.md) sets
+128 MiB row groups and data files of 32 to 64 MiB, and the doctor
+advises `large_file` above 128 MiB. A file written to it holds one row
+group, as every bench table's file does, so the merge reads one wave per
+overlap group, the round count equals the old design's, and the read
+waves cost nothing. The decision concerns tables outside the recipe,
+such as files written at Iceberg's default 512 MiB target with 128 MiB
+row groups, about four row groups per file, the shape of the 25,000-row
+set. There the appended table's first load waits on 52 more rounds,
+across 4 overlap groups of 5 files and about 21 row groups each. The
+inference from the counts, without a trace, is that most row groups
+after a file's first start a wave of their own, because the merge
+pauses whenever any one cursor waits and the files' row-group
 boundaries fall at different pairs. The overlap groups are merged one
-after another, so their waves add up. An S3 GET of a file read moments
-before, as a load's later waves read the files its first wave opened,
-took 26 to 32 ms at the median in-region, and of a file read hours
-before about 90 ms (the
+after another, so their waves add up.
+
+An S3 GET of a file read moments before, as a load's later waves read
+the files its first wave opened, took 26 to 32 ms at the median
+in-region, and of a file read hours before about 90 ms (the
 [range-GET measurements](2026-09-29-cold-range-get-latency.md)). At
-30 ms a round, this table's first load waits about 1.8 s on GETs where
-the old design waited about 0.3 s. A prefetch of each file's next row
-group, which holds two row groups per file, or a byte budget for
-read-ahead, would bring the waves back toward one per group; the
-held-bytes table shows the memory each would spend.
+30 ms a round, the appended table's first load waits about 1.8 s on GETs
+where the old design waited about 0.3 s. A prefetch of each file's next
+row group, or a byte budget for read-ahead, would bring the waves back
+toward one per group. A prefetch holds two row groups' chosen pages per
+file, so the inference from the held-bytes table is that it would hold
+about twice the 25,000-row column, about 82 KiB for the appended table
+under `full`, and it would replace RFD 025's bound of at most one row
+group's chosen pages per file with two.
 
 ## Fence memory and the chunk files
 
@@ -424,9 +496,8 @@ index could not give: the one round and the 10-fold faster warm Scan
 above.
 
 The chunk files hold the fences too, so a restart restores them without a
-read: each ordered chunk file grows by about its fences' bytes, 40 KB for
-the timestamp tables (0.6% of `ordered_long`'s) and 159 KB for the string
-table (5.2%).
+read. Their bytes grow by 40,017 for `ordered_long`, 0.6%, whose fences
+are 32,256 bytes resident, and by 159,036 for the string table, 5.2%.
 
 ## The key-value path
 
@@ -450,16 +521,17 @@ outside it and 28 overlap. p50 on one task:
 | | Bloom | 332.58 (317.42–332.62) | 315.17 (312.46–315.62) | −5.2%, faster |
 
 Times are in µs. A hit makes 6 fewer allocations (34.0 to 28.0 warm
-under `full`, 72.7 to 66.7 cold) and requests 3.2 KiB less, and a
-100-key MultiGet 600 fewer and 322 KiB less; a miss, which reads no
-value page, is unchanged. The plain value reader (`2550686`) is the one
-change on a Get's path, and the inference from that, together with a
-measurement of the same counts at `1f985f6`, is that it accounts for the
-difference. GETs and local reads per call are the same in every
-scenario, and the key-value table's loads and refreshes make the same
-reads within the spread of their times. Of the 48 comparisons, the 24
-beside the idle ordered table split as the 24 alone do: 11 faster
-outside the spread and 13 overlapping, against 9 and 15.
+under `full`, 72.7 to 66.7 cold) and allocates 3.2 KiB less, and a
+100-key MultiGet makes 600 fewer and allocates 322 KiB less; a miss,
+which reads no value page, is unchanged. The plain value reader
+(`2550686`) is the one change on a Get's path, and the inference from
+that, together with a measurement of the same counts at `1f985f6`, is
+that it accounts for the difference. GETs and local reads per call are
+the same in every scenario, and the key-value table's loads and
+refreshes make the same reads within the spread of their times. Of the
+48 comparisons, the 24 beside the idle ordered table split as the 24
+alone do: 11 faster outside the spread and 13 overlapping, against 9 and
+15.
 
 ## MultiScan
 
@@ -471,8 +543,10 @@ A warm MultiScan of 10 keys at limit 200, both binaries, p50:
 | Disk | 348.6 µs | 297.7 µs | 2,020.4 µs | 1,997.9 µs |
 | Bloom | 225.3 µs | 182.1 µs | 511.6 µs | 224.4 µs |
 
-CPU per key on one task under `full` fell from 22.1 to 17.9 µs (22.2,
-22.1, 23.0 against 17.7, 17.9, 18.2).
+CPU per key on one task under `full` fell from 22.2 to 17.9 µs (22.1,
+22.2, 23.0 against 17.7, 17.9, 18.2). Cold, the same MultiScan takes
+496.6 µs on one task where it took 541.0 (507.4–568.6) under `full`,
+49.7 µs a key against 54.1.
 
 MultiScans of 100 and 1,000 keys at limit 1, which the baseline bench
 cannot run, at the branch head only:
@@ -519,9 +593,10 @@ operation:
 | `Bytes` reference-count clone and drop, self | | 8.4% |
 | UTF-8 check of each order value (`OrderRun::is_utf8`), self | | 8.2% |
 
-Both Scans spend most of their time decompressing pages the cache holds
-compressed, as the warm Scans of the
-[earlier analysis](2026-10-13-ordered-rows-costs.md) did: RFD 006's
+Decompressing pages the cache holds compressed takes half of the long
+Scan and over a third of the string Scan, the largest share of each, as
+it was of the warm Scans in the
+[earlier analysis](2026-10-13-ordered-rows-costs.md): RFD 006's
 decompressed-page level remains the largest lever. The string Scan
 decodes its order page through parquet's column reader, which builds and
 reference-counts each value, and it checks every order value as UTF-8,
@@ -534,14 +609,14 @@ profiled run) spends 9.0% waking the blocking pool for its two local
 reads (`pthread_cond_signal`) and 5.8% in the chunk-file page read.
 
 A first load of `ordered_rolled` under `full`, shares of the busy samples
-of 400 loads: verifying each file's rows takes 64.9% (zstd 36.7%,
+of 400 loads: verifying each file's rows takes 65.2% (zstd 36.8%,
 comparisons of order values and keys 21.5% self), opening and reading
 the local files 9.3%, the merge 8.7%, and reading footers 3.9%. The
 merge is a twelfth of the load. The compacted table's 10.6 ms load
 suggests, without a profile of it, that the rest is what any ordered
 load of these rows costs. In 80 loads and refreshes of
-`ordered_appended` the merge takes 66.1% and verification 22.9%, as the
-merge section sets out.
+`ordered_appended` the merge takes 66.1% and verification 22.9%; the
+merge section breaks the merge's share down.
 
 ## What did not move as expected
 
@@ -559,17 +634,18 @@ merge section sets out.
   blocking pool takes 9% of the Scan's samples.
 - **The single round reads more bytes over a long order prefix.** A cold
   bounded Scan of the string table under `full` and `bloom` requests a
-  value page more than it did, as the one-round section sets out.
+  value page more than it did; the one-round section gives the bytes.
 - **Fences over long string prefixes take more memory than the cut
   index.** 159 KB against 146 KB, and 5% more chunk-file bytes.
 - **The overlapping-append refresh is no faster.** Its GETs fell 93%,
-  its bytes stayed the same, and the merge's CPU sets its time.
+  its bytes stayed the same, and two thirds of its busy samples fall in
+  the merge.
 - **More requests for fewer bytes.** The rolled table's first load makes
   12% to 18% more GETs, and its restart 71% more local reads, for 21%
   and 95% fewer bytes.
-- **The read waves.** Over files of several row groups a first load
-  waits on two to seven times the rounds it waited on, as the waves
-  section sets out.
+- **The read waves.** Over files of several row groups, outside the
+  writer recipe, a first load waits on two to seven times the rounds it
+  waited on; the read-waves section gives the counts.
 - **The Disk-tier Scan's throughput.** On eleven tasks the Disk-tier
   Scans of `ordered` and `ordered_long` run at 47,000 to 50,000 a second
   before and after, while the Full-tier figures for the same Scans rose
@@ -598,9 +674,13 @@ is slower in none of its comparisons.
 
 The figures come from local files, so no GET here waits on a network,
 and the latency each round adds on S3 is estimated from the counts, not
-measured. The read waves are measured over one row-group size, 25,000
-rows; a writer's row groups of 128 MiB over 512 MiB files give about
-four per file, as here, and other sizes would move the counts. The bench
+measured. A table written to the recipe in the
+[table layout](../table-layout.md), 128 MiB row groups in files of 32
+to 64 MiB, holds one row group per file, where the read waves cost
+nothing. The waves are measured outside the recipe at one row-group
+size, 25,000 rows, about four per file, the shape of Iceberg's default
+512 MiB files with 128 MiB row groups; other sizes would move the
+counts. The bench
 tables have no deleted rows, so the skipping of deleted pages and the
 256 KiB bridge between spans are covered by their unit tests and not by
 these runs. The host ran other work throughout; every comparison

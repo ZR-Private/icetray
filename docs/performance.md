@@ -109,11 +109,12 @@ and `bloom` and 34 µs under `disk`, where the order column is a local
 read, and a page of 10 of those rows took about 12 µs. A page of 10 rows
 from the middle of a 10,000-row run took about 24 µs, and about 44 µs
 over a string order column whose values share 64 leading bytes and whose
-column index the writer cut short; a profile puts most of a warm `Scan`
-in decompressing the pages it reads from the scan cache. A cold bounded
-`Scan` took one round of GETs whatever the writer's order column index
-held, after the key-page round under `bloom`, and made the GETs in the
-table above. A `MultiScan` of 10 keys took about 18 µs a key warm and
+column index the writer cut short. Decompressing the pages a `Scan`
+reads from the scan cache took half of the long run's warm `Scan` and
+over a third of the string one's, the largest share of each. A cold
+bounded `Scan` took one round of GETs whatever the writer's order column
+index held, after the key-page round under `bloom`, and made the GETs in
+the table above. A `MultiScan` of 10 keys took about 18 µs a key warm and
 50 µs a key cold, where its keys' GETs overlap under
 `server.batch_fan_out`. Against S3, each cold figure is a GET's latency,
 tens of milliseconds
