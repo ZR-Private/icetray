@@ -6,7 +6,6 @@
 //! order fences place, in one round. A key-value table never reaches this
 //! module.
 
-use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -19,8 +18,8 @@ use super::order_fences::Pair;
 use super::ordered::{OrderRun, decode_orders};
 use super::page_header::{check_order_pages, check_value_pages};
 use super::{
-    ColumnChunk, FileFault, FileIndex, GroupRange, KeyResidency, OrderLeaf, PageSource,
-    RowPosition, RowRef, file_fault, row_index, row_offset,
+    ColumnChunk, DeletedRows, FileFault, FileIndex, GroupRange, KeyResidency, OrderLeaf,
+    PageSource, RowRef, file_fault, row_index, row_offset,
 };
 use crate::cache::{Issue, PageCache, PageOrigin};
 use crate::error::{Error, Result};
@@ -285,7 +284,10 @@ impl FileIndex {
     /// the layout, over the rows taken up with their values, are read
     /// together, and the bounds cut the rows exactly.
     ///
-    /// Per column and row group, the pages are one span GET through
+    /// Per column, the rows read are spans by its pages (`spans_of`), a
+    /// row group's split where whole pages between two rows hold none of
+    /// those read, as pages whose rows are all deleted do, so no such page
+    /// is read. Per column and span, the pages are one span GET through
     /// `source`'s cache under its span window for every contiguous run the
     /// cache does not hold, and one GET for the chunk's dictionary page when
     /// it has one, each holding a permit of the fan-out and counted in the
@@ -303,7 +305,7 @@ impl FileIndex {
         bounds: &ScanBounds,
         limit: u32,
         columns: &[usize],
-        deleted: &(dyn Fn(RowPosition) -> bool + Sync),
+        deleted: &dyn DeletedRows,
         source: RunSource<'_>,
     ) -> Result<FileRows> {
         let order = self.order_leaf_of();
@@ -328,11 +330,21 @@ impl FileIndex {
         } else {
             walk.rows(&known)
         };
-        let order_spans = spans_of(walked.iter().filter(|walked| !known.holds(walked.row)));
-        let value_spans = spans_of(walked.iter().filter(|walked| walked.values));
+        let order_rows = in_file_order(
+            walked
+                .iter()
+                .filter(|walked| !known.holds(walked.row))
+                .map(|walked| walked.row),
+        );
+        let value_rows = in_file_order(
+            walked
+                .iter()
+                .filter(|walked| walked.values)
+                .map(|walked| walked.row),
+        );
         let (read, values) = futures::try_join!(
-            self.read_orders(order, &order_spans, source),
-            self.read_values(columns, &value_spans, source),
+            self.read_orders(order, &order_rows, source),
+            self.read_values(columns, &value_rows, source),
         )?;
         let orders = known.and(read);
         let mut rows = Vec::new();
@@ -481,9 +493,8 @@ impl FileIndex {
             return Ok(Orders::default());
         }
         if self.disk_chunks().is_some() {
-            return self
-                .read_orders(order, &spans_of(placed.iter()), source)
-                .await;
+            let rows = in_file_order(placed.iter().map(|walked| walked.row));
+            return self.read_orders(order, &rows, source).await;
         }
         let mut spans = Vec::new();
         for at in bound_pieces {
@@ -502,16 +513,17 @@ impl FileIndex {
         })
     }
 
-    /// The order values of `spans`, rows per row group, read with their
-    /// pages' headers checked: from the chunk file under Disk, through
-    /// `source` otherwise.
+    /// The order values of the spans of `rows`, rows in file order, by the
+    /// order column's pages (`spans_of`), read with their pages' headers
+    /// checked: from the chunk file under Disk, through `source` otherwise.
     async fn read_orders(
         &self,
         order: OrderLeaf,
-        spans: &[(usize, Range<i64>)],
+        rows: &[RowRef],
         source: RunSource<'_>,
     ) -> Result<Orders> {
         let local = self.disk_chunks();
+        let spans = spans_of(rows, |row_group| self.order_values(order).group(row_group));
         let read = spans.iter().map(|(row_group, rows)| async move {
             let chunk = self.order_values(order).group(*row_group);
             let pages = pages_holding(chunk, rows);
@@ -560,12 +572,13 @@ impl FileIndex {
     }
 
     /// The values of each column of `columns`, positions in the layout,
-    /// over `spans`, every column's and row group's pages read together;
-    /// `None` for a column the file does not hold.
+    /// at `rows`, rows in file order, over the spans of them by each
+    /// column's pages (`spans_of`), every column's and span's pages read
+    /// together; `None` for a column the file does not hold.
     async fn read_values(
         &self,
         columns: &[usize],
-        spans: &[(usize, Range<i64>)],
+        rows: &[RowRef],
         source: RunSource<'_>,
     ) -> Result<Values> {
         let read = columns.iter().map(|&column| async move {
@@ -573,6 +586,7 @@ impl FileIndex {
                 return Ok::<_, Error>((None, false));
             };
             let counted = source.value_gets.get(column);
+            let spans = spans_of(rows, |row_group| self.value_column(value).group(row_group));
             let spans =
                 futures::future::try_join_all(spans.iter().map(|(row_group, rows)| async move {
                     let chunk = self.value_column(value).group(*row_group);
@@ -829,7 +843,7 @@ struct Walk<'a> {
     cut: Cut<'a>,
     direction: Direction,
     limit: usize,
-    deleted: &'a (dyn Fn(RowPosition) -> bool + Sync),
+    deleted: &'a dyn DeletedRows,
 }
 
 impl Walk<'_> {
@@ -845,83 +859,181 @@ impl Walk<'_> {
     /// unless no row has counted yet, as under a limit of zero, where only
     /// a row known inside does.
     fn rows(&self, known: &Orders) -> Vec<Walked> {
-        let far = match self.direction {
-            Direction::OldestFirst => Fit::Above,
-            Direction::NewestFirst => Fit::Below,
+        let mut walk = Taking {
+            taken: Vec::new(),
+            inside: 0,
+            far: match self.direction {
+                Direction::OldestFirst => Fit::Above,
+                Direction::NewestFirst => Fit::Below,
+            },
         };
-        let mut taken = Vec::new();
-        let mut inside = 0;
-        let order = (0..self.pieces.len()).map(|at| (at, &self.pieces[at]));
-        let pieces: Box<dyn Iterator<Item = (usize, &Piece)>> = match self.direction {
-            Direction::OldestFirst => Box::new(order),
-            Direction::NewestFirst => Box::new(order.rev()),
-        };
-        for (at, piece) in pieces {
-            let rows: Box<dyn Iterator<Item = i64>> = match self.direction {
-                Direction::OldestFirst => Box::new(piece.rows.clone()),
-                Direction::NewestFirst => Box::new(piece.rows.clone().rev()),
+        let count = self.pieces.len();
+        for step in 0..count {
+            let at = match self.direction {
+                Direction::OldestFirst => step,
+                Direction::NewestFirst => count - 1 - step,
             };
-            for row in rows {
-                let row = RowRef {
-                    row_group: piece.row_group,
-                    row,
-                };
-                #[cfg(test)]
-                testing::visit_row(self.index, row);
-                if (self.deleted)(self.index.position(row)) {
-                    continue;
-                }
-                let fit = match piece.bound {
-                    None => Some(Fit::Inside),
-                    Some(_) => known.fit(row, self.cut),
-                };
-                let values = inside < self.limit;
-                match fit {
-                    Some(Fit::Inside) => {
-                        taken.push(Walked {
-                            row,
-                            values,
-                            piece: at,
-                        });
-                        if !values {
-                            return taken;
-                        }
-                        inside += 1;
-                    }
-                    Some(out) if out == far => return taken,
-                    Some(Fit::Below | Fit::Above) => {}
-                    None => {
-                        taken.push(Walked {
-                            row,
-                            values,
-                            piece: at,
-                        });
-                        if !values && inside > 0 {
-                            return taken;
-                        }
-                    }
-                }
+            if self.walk_piece(at, known, &mut walk) == Walking::Ended {
+                break;
             }
         }
-        taken
+        walk.taken
+    }
+
+    /// The rows of piece `at` that `Walk::rows` takes up, in the walk's
+    /// direction, into `walk`; whether the walk ends there. On entering
+    /// each order page, the piece's rows on it are passed over in one step
+    /// where every one of them is deleted, which the resident deletes tell
+    /// with no I/O (`DeletedRows::all_deleted`).
+    fn walk_piece(&self, at: usize, known: &Orders, walk: &mut Taking) -> Walking {
+        let piece = &self.pieces[at];
+        let chunk = self
+            .index
+            .order_values(self.index.order_leaf_of())
+            .group(piece.row_group);
+        let (mut row, step) = match self.direction {
+            Direction::OldestFirst => (piece.rows.start, 1),
+            Direction::NewestFirst => (piece.rows.end - 1, -1),
+        };
+        let position = |row| {
+            self.index.position(RowRef {
+                row_group: piece.row_group,
+                row,
+            })
+        };
+        let mut page_entry = row;
+        while piece.rows.contains(&row) {
+            if row == page_entry {
+                let held = chunk.page_rows(chunk.page_holding(row_index(row)));
+                let on_page = held.start.max(piece.rows.start)..held.end.min(piece.rows.end);
+                page_entry = match self.direction {
+                    Direction::OldestFirst => on_page.end,
+                    Direction::NewestFirst => on_page.start - 1,
+                };
+                if self.deleted.deleted(position(row))
+                    && self
+                        .deleted
+                        .all_deleted(position(on_page.start)..position(on_page.end))
+                {
+                    row = page_entry;
+                    continue;
+                }
+            }
+            let at_row = RowRef {
+                row_group: piece.row_group,
+                row,
+            };
+            #[cfg(test)]
+            testing::visit_row(self.index, at_row);
+            if !self.deleted.deleted(position(row))
+                && walk.row(self, at, at_row, known) == Walking::Ended
+            {
+                return Walking::Ended;
+            }
+            row += step;
+        }
+        Walking::On
     }
 }
 
-/// Per row group, the rows from the first to the last of `walked`, in row
-/// group order.
-fn spans_of<'w>(walked: impl Iterator<Item = &'w Walked>) -> Vec<(usize, Range<i64>)> {
-    let mut spans: BTreeMap<usize, Range<i64>> = BTreeMap::new();
-    for walked in walked {
-        let row = walked.row.row;
-        spans
-            .entry(walked.row.row_group)
-            .and_modify(|span| {
-                span.start = span.start.min(row);
-                span.end = span.end.max(row + 1);
-            })
-            .or_insert(row..row + 1);
+/// What a walk has taken up so far (`Walk::rows`): the rows, how many of
+/// them count toward the limit, and the side of the bounds past which it
+/// ends.
+struct Taking {
+    taken: Vec<Walked>,
+    inside: usize,
+    far: Fit,
+}
+
+/// Whether a walk goes on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walking {
+    On,
+    Ended,
+}
+
+impl Taking {
+    /// Live row `row` of piece `at` of `walk`, taken up as `Walk::rows`
+    /// says; whether the walk ends at it.
+    fn row(&mut self, walk: &Walk<'_>, at: usize, row: RowRef, known: &Orders) -> Walking {
+        let fit = match walk.pieces[at].bound {
+            None => Some(Fit::Inside),
+            Some(_) => known.fit(row, walk.cut),
+        };
+        let values = self.inside < walk.limit;
+        let walked = Walked {
+            row,
+            values,
+            piece: at,
+        };
+        match fit {
+            Some(Fit::Inside) => {
+                self.taken.push(walked);
+                if !values {
+                    return Walking::Ended;
+                }
+                self.inside += 1;
+            }
+            Some(out) if out == self.far => return Walking::Ended,
+            Some(Fit::Below | Fit::Above) => {}
+            None => {
+                self.taken.push(walked);
+                if !values && self.inside > 0 {
+                    return Walking::Ended;
+                }
+            }
+        }
+        Walking::On
     }
-    spans.into_iter().collect()
+}
+
+/// `rows` in file order: by row group, then by row.
+fn in_file_order(rows: impl Iterator<Item = RowRef>) -> Vec<RowRef> {
+    let mut rows: Vec<RowRef> = rows.collect();
+    rows.sort_unstable_by_key(|row| (row.row_group, row.row));
+    rows
+}
+
+/// The spans of `rows`, rows in file order, that a read decodes, by the
+/// pages of the column whose chunk in each row group `chunk_of` gives: per
+/// row group, in row group order, each span from a row to the last of
+/// `rows` after it with no whole page between them that holds none of
+/// `rows`. So a page holding none of them is not read. A walk takes up
+/// every live row between two it takes up, so the only such pages between
+/// two of `rows` are pages whose rows are all deleted, or whose order
+/// values the read knows already.
+fn spans_of<'c>(
+    rows: &[RowRef],
+    chunk_of: impl Fn(usize) -> ColumnChunk<'c>,
+) -> Vec<(usize, Range<i64>)> {
+    let mut spans: Vec<(usize, Range<i64>)> = Vec::new();
+    // The page holding the last span's last row, and the row past it.
+    let mut last: Option<(usize, i64)> = None;
+    for row in rows {
+        let span = spans
+            .last_mut()
+            .filter(|(row_group, _)| *row_group == row.row_group);
+        if let (Some((_, span)), Some((_, page_end))) = (span, last)
+            && row.row < page_end
+        {
+            span.end = row.row + 1;
+            continue;
+        }
+        let chunk = chunk_of(row.row_group);
+        let page = chunk.page_holding(row_index(row.row));
+        let page_end = chunk.page_rows(page).end;
+        let span = spans
+            .last_mut()
+            .filter(|(row_group, _)| *row_group == row.row_group);
+        match (span, last) {
+            (Some((_, span)), Some((last_page, _))) if page == last_page + 1 => {
+                span.end = row.row + 1;
+            }
+            (Some(_) | None, Some(_) | None) => spans.push((row.row_group, row.row..row.row + 1)),
+        }
+        last = Some((page, page_end));
+    }
+    spans
 }
 
 /// The order values a read decoded: spans of rows, each its row group, its
@@ -1009,6 +1121,7 @@ mod tests {
     use crate::approx::count;
     use crate::config::{HedgeConfig, Residency};
     use crate::generation::testing::{self as generation_testing, cache};
+    use crate::index::RowPosition;
     use crate::index::order_fences::take_steps;
     use crate::index::testing::{
         EXTRA_COLUMN, Fixture, ORDER_FIELD_ID, Opened, Orders, long_orders, ordered_layout, store,
@@ -1452,11 +1565,12 @@ mod tests {
                 .collect();
             assert_eq!(got.rows, expected, "{residency}");
             assert_eq!(got.next, Some(order_at(7 - FIRST_RUN_ROW)), "{residency}");
-            // Order pages 1 to 3 are one span; the value page is page 3's.
+            // Order pages 1 and 3 are two spans, page 2 between them all
+            // deleted and not read; the value page is page 3's.
             let (gets, local) = since(&stats, before);
             match residency {
-                Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
-                Residency::Disk => assert_eq!((gets, local), (1, 1)),
+                Residency::Full | Residency::Bloom => assert_eq!((gets, local), (3, 0)),
+                Residency::Disk => assert_eq!((gets, local), (1, 2)),
             }
             let before = costs(&stats);
             let again = index
@@ -1487,6 +1601,84 @@ mod tests {
                 .unwrap();
             assert_eq!(none.rows, []);
             assert_eq!(none.next, Some(order_at(14 - FIRST_RUN_ROW)));
+        }
+    }
+
+    /// Order pages of the run of the deleted-pages read, `PAGE` rows each.
+    const DELETED_RUN_PAGES: usize = 40;
+    /// The last row of the deleted-pages read's run below its deleted rows.
+    const BELOW_DELETED_ROW: i64 = 8;
+
+    /// Newest first at limit 2 over a run of `DELETED_RUN_PAGES` pages whose
+    /// rows are all deleted from the one after `BELOW_DELETED_ROW` to the
+    /// one before the last: the read takes the last row and
+    /// `BELOW_DELETED_ROW`, and reads in every tier only the value pages
+    /// holding those two and the order pages holding them and the next live
+    /// row, the whole pages of deleted rows between them passed over by the
+    /// walk in one step each and read in no column.
+    #[tokio::test]
+    async fn test_read_run_passes_over_whole_pages_of_deleted_rows() {
+        let rows = DELETED_RUN_PAGES * PAGE;
+        let last = i64::try_from(rows).unwrap();
+        let (opened, gauged) = store_gauged(&runs_of(&[(1, 1), (2, rows), (3, 1)], rows + 2)).await;
+        let position = |row: i64| u64::try_from(row).unwrap();
+        let deleted: BTreeSet<u64> = (position(BELOW_DELETED_ROW + 1)..position(last)).collect();
+        let is_deleted = |position: RowPosition| deleted.contains(&position.0);
+        let row = |row| RowRef { row_group: 0, row };
+        for residency in Residency::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let index = index_in(&opened, residency, dir.path(), 0).await;
+            let run = index
+                .locate_run(&RUN_KEY, Reads::new().await.source())
+                .await
+                .unwrap()
+                .unwrap();
+            let probe = Probe {
+                index: &index,
+                gauged: &gauged,
+                run: &run,
+            };
+            testing::take_pages();
+            let (got, ranges) = probe
+                .read(&bounds(Direction::NewestFirst), 2, &is_deleted)
+                .await;
+            let walked = testing::take_pages();
+            let expected: Vec<_> = [last, BELOW_DELETED_ROW]
+                .into_iter()
+                .map(|at| row_answer(at, at - FIRST_RUN_ROW, 1))
+                .collect();
+            assert_eq!(got.rows, expected, "{residency}");
+            assert_eq!(
+                got.next,
+                Some(order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW))
+            );
+            let value_leaf = index.value_leaf(0).unwrap();
+            let order_leaf = index.order_leaf().unwrap();
+            let values = fetched(&index, value_leaf, &ranges);
+            let orders = fetched(&index, order_leaf, &ranges);
+            let pages = |leaf, rows: &[i64]| -> BTreeSet<PageAt> {
+                rows.iter()
+                    .map(|&at| page_of(&index, leaf, row(at)))
+                    .collect()
+            };
+            assert_eq!(
+                values,
+                pages(value_leaf, &[BELOW_DELETED_ROW, last]),
+                "{residency}: value pages"
+            );
+            let order_pages = match residency {
+                Residency::Disk => BTreeSet::new(),
+                Residency::Full | Residency::Bloom => pages(
+                    order_leaf,
+                    &[BELOW_DELETED_ROW - 1, BELOW_DELETED_ROW, last],
+                ),
+            };
+            assert_eq!(orders, order_pages, "{residency}: order pages");
+            let walked_pages = pages(
+                order_leaf,
+                &[BELOW_DELETED_ROW - 1, BELOW_DELETED_ROW, last],
+            );
+            assert_eq!(walked, walked_pages.len(), "{residency}: pages walked");
         }
     }
 
@@ -2229,7 +2421,7 @@ mod tests {
             self,
             scan: &ScanBounds,
             limit: u32,
-            deleted: &(dyn Fn(RowPosition) -> bool + Sync),
+            deleted: &dyn DeletedRows,
         ) -> (FileRows, Vec<Range<u64>>) {
             let reads = Reads::new().await;
             self.read_through(&reads, scan, limit, deleted).await
@@ -2241,7 +2433,7 @@ mod tests {
             reads: &Reads,
             scan: &ScanBounds,
             limit: u32,
-            deleted: &(dyn Fn(RowPosition) -> bool + Sync),
+            deleted: &dyn DeletedRows,
         ) -> (FileRows, Vec<Range<u64>>) {
             self.gauged.take_ranges();
             let got = self
@@ -2258,7 +2450,7 @@ mod tests {
             self,
             scan: &ScanBounds,
             limit: u32,
-            deleted: &(dyn Fn(RowPosition) -> bool + Sync),
+            deleted: &dyn DeletedRows,
             gets: usize,
             case: &str,
         ) {

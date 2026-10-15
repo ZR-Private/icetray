@@ -28,6 +28,7 @@ mod puffin;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
@@ -44,7 +45,7 @@ use crate::approx;
 use crate::blocking;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::generation::load_concurrency;
-use crate::index::{FileFault, RowPosition};
+use crate::index::{DeletedRows, FileFault, RowPosition};
 use crate::manifest::{DataFileEntry, DeleteFileEntry, DeleteKind, Partition};
 use crate::snapshot::SequenceNumber;
 use crate::storage::Storage;
@@ -353,6 +354,11 @@ impl FileDeletes {
         self.rows.contains(position.0)
     }
 
+    /// Whether every row of `positions` is deleted; true for none.
+    pub(crate) fn contains_all(&self, positions: Range<RowPosition>) -> bool {
+        positions.is_empty() || self.rows.contains_range(positions.start.0..positions.end.0)
+    }
+
     /// The bytes these rows and sources hold, as `bound` counts them.
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.sources
@@ -380,6 +386,21 @@ impl FileDeletes {
                 now.peek()
                     .is_some_and(|&(at, bitmap)| at == high && held.is_subset(bitmap))
             })
+    }
+}
+
+/// A data file's deleted rows as a read counts them: none for a file no
+/// delete applies to.
+impl DeletedRows for Option<&FileDeletes> {
+    fn deleted(&self, position: RowPosition) -> bool {
+        self.is_some_and(|rows| rows.contains(position))
+    }
+
+    fn all_deleted(&self, positions: Range<RowPosition>) -> bool {
+        match self {
+            Some(rows) => rows.contains_all(positions),
+            None => positions.is_empty(),
+        }
     }
 }
 
@@ -1770,5 +1791,23 @@ mod tests {
         assert!(now.holds(&before));
         assert!(before.holds(&now));
         assert!(!FileDeletes::of_rows([2]).holds(&before));
+    }
+
+    #[test]
+    fn test_deleted_rows_answers_a_range_whole_or_not_at_all() {
+        let rows = FileDeletes::of_rows([3, 4, 5]);
+        let deleted = Some(&rows);
+        let range = |start, end| RowPosition(start)..RowPosition(end);
+        assert!(deleted.deleted(RowPosition(4)));
+        assert!(!deleted.deleted(RowPosition(6)));
+        assert!(deleted.all_deleted(range(3, 6)));
+        assert!(deleted.all_deleted(range(4, 5)));
+        assert!(!deleted.all_deleted(range(3, 7)), "a live row after");
+        assert!(!deleted.all_deleted(range(2, 6)), "a live row before");
+        assert!(deleted.all_deleted(range(9, 9)), "no row");
+        let none: Option<&FileDeletes> = None;
+        assert!(!none.deleted(RowPosition(4)));
+        assert!(!none.all_deleted(range(3, 6)));
+        assert!(none.all_deleted(range(3, 3)), "no row");
     }
 }

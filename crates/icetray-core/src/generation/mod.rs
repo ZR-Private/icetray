@@ -36,7 +36,9 @@ use crate::check::{
 use crate::config::{Residency, TableConfig};
 use crate::deletes::{self, DataTarget, DeleteFault, DeleteSummary, FileDeletes};
 use crate::error::{Budget, Error, RefusalReason, Result};
-use crate::index::{self, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition, RunSource};
+use crate::index::{
+    self, DeletedRows as _, FileFault, FileIndex, Inspected, Keys, PageRef, RowPosition, RunSource,
+};
 use crate::key::Key;
 use crate::level::Level;
 use crate::local::{
@@ -440,9 +442,7 @@ impl Generation {
     /// Whether the deletes of the file at `at` in `files` remove the row at
     /// `position`.
     fn is_deleted(&self, at: usize, position: RowPosition) -> bool {
-        self.deletes[at]
-            .as_ref()
-            .is_some_and(|rows| rows.contains(position))
+        self.deletes[at].as_deref().deleted(position)
     }
 
     /// Whether the deletes of the file at `at` in `files` remove the row
@@ -632,7 +632,7 @@ impl Generation {
             let Some(run) = file.index.locate_run(key, source).await? else {
                 return Ok::<_, Error>(None);
             };
-            let deleted = |position: RowPosition| self.is_deleted(at, position);
+            let deleted = self.deletes[at].as_deref();
             let rows = file
                 .index
                 .read_run(&run, bounds, limit, columns, &deleted, source)

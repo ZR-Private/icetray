@@ -75,6 +75,30 @@ pub(crate) struct RowRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RowPosition(pub(crate) u64);
 
+/// The rows of one data file a read counts as deleted, held resident and
+/// asked with no I/O (RFD 021): row by row, and whether a whole range of
+/// rows is, so a Scan passes over a page of deleted rows in one question.
+pub(crate) trait DeletedRows: Sync {
+    /// Whether the row at `position` is deleted.
+    fn deleted(&self, position: RowPosition) -> bool;
+
+    /// Whether every row of `positions` is deleted; true for none.
+    fn all_deleted(&self, positions: Range<RowPosition>) -> bool;
+}
+
+/// A test's deleted rows as a predicate on positions, whose ranges are
+/// asked row by row.
+#[cfg(test)]
+impl<F: Fn(RowPosition) -> bool + Sync> DeletedRows for F {
+    fn deleted(&self, position: RowPosition) -> bool {
+        self(position)
+    }
+
+    fn all_deleted(&self, positions: Range<RowPosition>) -> bool {
+        (positions.start.0..positions.end.0).all(|position| self(RowPosition(position)))
+    }
+}
+
 /// What makes a data file unservable beyond the contract's refusals. The set
 /// is closed; a fault outside it is a library error, not a file fault.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
