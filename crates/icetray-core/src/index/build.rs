@@ -29,7 +29,8 @@ use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, OrderLeaf, file_fault, group_starts, identity_of, row_index, unless_panicked,
+    KeyShape, Keys, OrderLeaf, ValueShape, file_fault, group_starts, identity_of, row_index,
+    unless_panicked, value_bytes,
 };
 use crate::approx;
 use crate::blocking::on_blocking_pool;
@@ -1267,8 +1268,9 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// parquet decodes into. The callers read those headers ahead of the page
 /// reader and refuse one that declares more than its page can hold: `verify`
 /// every key page's before the row group's first decode
-/// (`check_page_headers`), and `FileIndex::read_value` the value page's
-/// and its dictionary page's before `read_one` (`check_value_page_headers`).
+/// (`check_page_headers`), and `FileIndex::read_column` the value page's
+/// and its dictionary page's before `decode_values`
+/// (`check_value_page_headers`).
 /// A key page decoded at lookup is one `verify` checked at load, read from
 /// the resident chunks, the chunk file, or, in the Bloom tier, the data
 /// file again. A delta-length or delta byte-array page sizes its lengths
@@ -1501,23 +1503,10 @@ impl<'a, T: ParquetDataType> ChunkBatches<'a, T> {
     }
 }
 
-/// Exactly row `row` of the value column chunk `chunk` from `segments`:
-/// `Some` with the value, `None` for a null. The caller has checked the
-/// headers of the value page and of the chunk's dictionary page in
-/// `segments` (`check_value_page_headers`); `read_column` says why.
-pub(super) fn read_one<T: ParquetDataType>(
-    chunk: ColumnChunk<'_>,
-    row: i64,
-    segments: Arc<Segments>,
-) -> Result<Option<T::T>> {
-    let mut values = read_column::<T>(chunk, segments, row_index(row), 1)?;
-    Ok(values.pop())
-}
-
 /// The rows `rows` of the value column chunk `chunk` from `segments`, its
 /// nulls left out: the values of one value page, which the caller has
-/// fetched with its dictionary page and whose headers it has checked, as
-/// for `read_one`.
+/// fetched with its dictionary page and whose headers it has checked
+/// (`check_value_page_headers`); `read_column` says why.
 pub(super) fn read_rows<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     rows: Range<i64>,
@@ -1534,7 +1523,7 @@ pub(super) fn read_rows<T: ParquetDataType>(
 /// Rows `rows` of the value column chunk `chunk` from `segments`, one
 /// entry per row, `None` for a null: the values of a span of value pages a
 /// Scan reads (RFD 025), which the caller has fetched with the chunk's
-/// dictionary page and whose headers it has checked, as for `read_one`.
+/// dictionary page and whose headers it has checked, as for `read_rows`.
 /// Exactly those rows decode, from exactly the pages the offset index names
 /// for them, as `read_column` guarantees; a column whose levels and values
 /// disagree is `FileFault::PageRowsMismatch` at the rows' first page.
@@ -1569,6 +1558,81 @@ pub(super) fn read_optional<T: ParquetDataType>(
         return Err(chunk.page_rows_mismatch(chunk.page_holding(skip)));
     }
     Ok(values)
+}
+
+/// Rows of a value column chunk a read decoded (`decode_values`), in
+/// order, each value given as `value_bytes` keeps it once asked for.
+pub(super) enum ValueRows {
+    /// Read in place from plain pages (`plain::value_rows`), held as the
+    /// pages they lie in until a value is asked for, so a row never asked
+    /// for costs no copy.
+    Plain {
+        values: plain::PlainValues,
+        segments: Arc<Segments>,
+    },
+    /// Decoded by parquet's column reader, each value kept already.
+    Decoded(Vec<Option<Bytes>>),
+}
+
+impl ValueRows {
+    /// The rows decoded.
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Plain { values, .. } => values.len(),
+            Self::Decoded(values) => values.len(),
+        }
+    }
+
+    /// The value of the `at`th row decoded, which is below `len`, as
+    /// `value_bytes` keeps it; `None` for a null.
+    pub(super) fn value(&self, at: usize) -> Option<Bytes> {
+        match self {
+            Self::Plain { values, segments } => {
+                values.value(at).map(|value| value_bytes(segments, value))
+            }
+            Self::Decoded(values) => values[at].clone(),
+        }
+    }
+}
+
+/// Rows `rows` of the value column chunk `chunk`, whose values decode as
+/// `shape`, from `segments`, which hold the pages holding them and the
+/// chunk's dictionary page when it has one, and whose headers the caller
+/// has checked (`check_value_page_headers`, `check_value_pages`): one
+/// entry per row, `None` for a null. A chunk of `PLAIN` byte-array pages
+/// is read in place (`plain::value_rows`); any other chunk, or one
+/// holding a page that reader does not read exactly, by parquet's column
+/// reader (`read_optional`), which meets and reports every fault. Either
+/// way the values are the column reader's.
+pub(super) fn decode_values(
+    chunk: ColumnChunk<'_>,
+    shape: ValueShape,
+    rows: Range<i64>,
+    segments: &Arc<Segments>,
+) -> Result<ValueRows> {
+    let keep = |value: &[u8]| value_bytes(segments, value);
+    Ok(match shape {
+        ValueShape::Variable => {
+            if let Some(values) = plain::value_rows(chunk, rows.clone(), segments) {
+                return Ok(ValueRows::Plain {
+                    values,
+                    segments: Arc::clone(segments),
+                });
+            }
+            ValueRows::Decoded(
+                read_optional::<ByteArrayType>(chunk, rows, Arc::clone(segments))?
+                    .iter()
+                    .map(|value| value.as_ref().map(|value| keep(value.data())))
+                    .collect(),
+            )
+        }
+        ValueShape::Fixed => ValueRows::Decoded(
+            read_optional::<FixedLenByteArrayType>(chunk, rows, Arc::clone(segments))?
+                .iter()
+                .map(|value| value.as_ref().map(|value| keep(value.data())))
+                .collect(),
+        ),
+    })
 }
 
 #[cfg(test)]

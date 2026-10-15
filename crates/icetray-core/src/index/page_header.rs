@@ -716,11 +716,19 @@ fn non_negative(
 /// varint ends before `bytes` do, runs past them, or carries more than 64
 /// bits.
 pub(super) fn whole_varint(bytes: &[u8]) -> Option<u64> {
+    let (value, len) = leading_varint(bytes)?;
+    (len == bytes.len()).then_some(value)
+}
+
+/// The unsigned varint `bytes` start with, read as `whole_varint` reads
+/// one, and the bytes it takes; `None` when it runs past them or carries
+/// more than 64 bits.
+pub(super) fn leading_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut input = Compact { bytes, at: 0 };
-    // intentional: the caller asks only whether the bytes are one varint,
-    // and a fault of any kind says they are not.
+    // intentional: the caller asks only whether the bytes start with a
+    // varint, and a fault of any kind says they do not.
     let value = input.varint().ok()?;
-    (input.at == bytes.len()).then_some(value)
+    Some((value, input.at))
 }
 
 /// Compact-protocol input over the bytes of one page.

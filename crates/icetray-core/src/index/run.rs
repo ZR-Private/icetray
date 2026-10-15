@@ -12,16 +12,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use metrics::Counter;
-use parquet::data_type::{ByteArrayType, FixedLenByteArrayType};
 use tokio::sync::Semaphore;
 
-use super::build::{decode_run, read_optional};
+use super::build::{ValueRows, decode_run, decode_values};
 use super::order_fences::Pair;
 use super::ordered::{OrderRun, decode_orders};
 use super::page_header::{check_order_pages, check_value_pages};
 use super::{
     ColumnChunk, FileFault, FileIndex, GroupRange, KeyResidency, OrderLeaf, PageSource,
-    RowPosition, RowRef, ValueShape, file_fault, row_index, row_offset, value_bytes,
+    RowPosition, RowRef, file_fault, row_index, row_offset,
 };
 use crate::cache::{Issue, PageCache, PageOrigin};
 use crate::error::{Error, Result};
@@ -718,30 +717,6 @@ fn pages_holding(chunk: ColumnChunk<'_>, rows: &Range<i64>) -> Range<usize> {
     chunk.page_holding(row_index(rows.start))..chunk.page_holding(row_index(rows.end - 1)) + 1
 }
 
-/// Rows `rows` of the value column chunk `chunk`, whose values decode as
-/// `shape`, from `segments`: one entry per row, `None` for a null, the
-/// bytes as `value_bytes` keeps them.
-fn decode_values(
-    chunk: ColumnChunk<'_>,
-    shape: ValueShape,
-    rows: Range<i64>,
-    segments: &Arc<Segments>,
-) -> Result<Vec<Option<Bytes>>> {
-    let keep = |value: &[u8]| value_bytes(segments, value);
-    Ok(match shape {
-        ValueShape::Variable => read_optional::<ByteArrayType>(chunk, rows, Arc::clone(segments))?
-            .iter()
-            .map(|value| value.as_ref().map(|value| keep(value.data())))
-            .collect(),
-        ValueShape::Fixed => {
-            read_optional::<FixedLenByteArrayType>(chunk, rows, Arc::clone(segments))?
-                .iter()
-                .map(|value| value.as_ref().map(|value| keep(value.data())))
-                .collect()
-        }
-    })
-}
-
 /// A Scan's exclusive bounds on the order value.
 #[derive(Clone, Copy)]
 struct Cut<'a> {
@@ -1001,24 +976,26 @@ struct Values {
     from_store: bool,
 }
 
-/// One column's values a read decoded: per row group, the first row and
-/// the values from it on.
+/// One column's values a read decoded: spans of rows, each its row
+/// group, its first row, and the values from it on.
 struct ColumnValues {
-    spans: Vec<(usize, i64, Vec<Option<Bytes>>)>,
+    spans: Vec<(usize, i64, ValueRows)>,
 }
 
 impl ColumnValues {
     /// The value of `row`, `None` for a null; the read decoded it.
     fn value(&self, row: RowRef) -> Option<Bytes> {
-        self.spans
+        let (at, values) = self
+            .spans
             .iter()
             .find_map(|(row_group, start, values)| {
-                (*row_group == row.row_group && *start <= row.row)
-                    .then(|| values.get(row_index(row.row - start)))
-                    .flatten()
+                let held = *row_group == row.row_group
+                    && *start <= row.row
+                    && row_index(row.row - start) < values.len();
+                held.then(|| (row_index(row.row - start), values))
             })
-            .expect("the values of every row taken are read")
-            .clone()
+            .expect("the values of every row taken are read");
+        values.value(at)
     }
 }
 

@@ -246,6 +246,9 @@ pub(crate) struct Layout {
     /// writer's own choice for the writer version when `None` (`PLAIN` for
     /// v1, a delta encoding of byte arrays for v2).
     pub(super) key_encoding: Option<Encoding>,
+    /// The value column's encoding where no dictionary is written, as
+    /// `key_encoding` is the key column's.
+    pub(super) value_encoding: Option<Encoding>,
 }
 
 impl Layout {
@@ -264,6 +267,7 @@ impl Layout {
             writer_version: WriterVersion::PARQUET_1_0,
             compression: Compression::ZSTD(ZstdLevel::default()),
             key_encoding: None,
+            value_encoding: None,
         }
     }
 
@@ -285,6 +289,10 @@ impl Layout {
             .set_writer_version(self.writer_version);
         let builder = match self.key_encoding {
             Some(encoding) => builder.set_column_encoding(ColumnPath::from(KEY_COLUMN), encoding),
+            None => builder,
+        };
+        let builder = match self.value_encoding {
+            Some(encoding) => builder.set_column_encoding(ColumnPath::from(VALUE_COLUMN), encoding),
             None => builder,
         };
         let builder = match self.order_statistics {

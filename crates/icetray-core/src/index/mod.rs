@@ -46,7 +46,9 @@ use crate::local::{ChunkRules, DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
 use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
-use build::{check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts, read_one, read_rows};
+use build::{
+    check_utf8, chunks_from_disk, decode_run, decode_values, fetch_chunk_parts, read_rows,
+};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub use order_fences::{OrderFences, Pair, PairPart};
@@ -1358,16 +1360,7 @@ impl FileIndex {
             .fetch_pages(chunk, page, PageSource::Store(cache, issue))
             .await?;
         check_value_page_headers(chunk, value.shape, page, &segments)?;
-        let value = match value.shape {
-            ValueShape::Variable => {
-                read_one::<ByteArrayType>(chunk, row.row, Arc::clone(&segments))?
-                    .map(|value| value_bytes(&segments, value.data()))
-            }
-            ValueShape::Fixed => {
-                read_one::<FixedLenByteArrayType>(chunk, row.row, Arc::clone(&segments))?
-                    .map(|value| value_bytes(&segments, value.data()))
-            }
-        };
+        let value = decode_values(chunk, value.shape, row.row..row.row + 1, &segments)?.value(0);
         Ok(Some(ValueRead {
             value,
             origin: origins.page,

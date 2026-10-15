@@ -382,7 +382,7 @@ mod tests {
 
     use super::*;
     use crate::generation::testing::Dictionary;
-    use crate::index::build::{decode_run, read_one};
+    use crate::index::build::{decode_run, read_optional};
     use crate::index::testing::{Fixture, Layout, contract_rows, location};
     use crate::index::{Column, KeyShape, Keys};
     use crate::key::KeyType;
@@ -474,7 +474,7 @@ mod tests {
     /// For the first, a middle, and the last page of row group 0 in
     /// `file`, from that page alone and the chunk's dictionary page: the
     /// page's keys as `decode_run` decodes them, and its first, a middle,
-    /// and its last value as `read_one` decodes each, are what parquet
+    /// and its last value as `read_optional` decodes each, are what parquet
     /// decodes at those rows reading the whole chunk. The pages compared.
     fn assert_one_page_reads_match_parquet(file: &Bytes) -> usize {
         let metadata = footer(file);
@@ -504,9 +504,13 @@ mod tests {
             let rows = values.page_rows(page);
             for row in [rows.start, rows.start.midpoint(rows.end), rows.end - 1] {
                 let held = held_for(file, values, page);
-                let decoded: Option<ByteArray> =
-                    read_one::<ByteArrayType>(values, row, held).unwrap();
-                assert_eq!(decoded, every_value[row_index(row)], "value row {row}");
+                let decoded: Vec<Option<ByteArray>> =
+                    read_optional::<ByteArrayType>(values, row..row + 1, held).unwrap();
+                assert_eq!(
+                    decoded,
+                    [every_value[row_index(row)].clone()],
+                    "value row {row}"
+                );
             }
             compared += 1;
         }
