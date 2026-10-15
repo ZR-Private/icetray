@@ -1,5 +1,20 @@
 # Order fences measured
 
+> Updated 2026-10-15: both open decisions below have been made. The
+> uniqueness merge now reads row groups ahead of need under a budget of
+> 64 MiB per merge (`097acfc`, `4a9a210`). At row groups of 25,000
+> rows, under `full`, the appended table's first load waits on 9 rounds
+> of GETs where it waited on 61, its refresh on 10 where 36, and the
+> rolled table's first load on 10 where 30; under `bloom`, on 14 where
+> 66, 12 where 38, and 18 where 38. GETs and bytes are unchanged in
+> every case, and `disk`, whose reads are local, waits on the same 5 and
+> 6 rounds as before. A MultiScan now spreads its keys across idle
+> worker threads (`6aad27c`). On one task, its p50 fell from 1.10 to
+> 1.18 ms to 0.32 ms at 100 keys, for 4% more CPU per key, and from
+> 10.6 to 11.1 ms to 2.38 to 2.40 ms at 1,000 keys, for 66% more. On 11
+> tasks it is unchanged. The body below is the record as measured
+> before either change.
+
 Measured 2026-10-15 on one Apple M3 Pro. The branch `feat/order-fences`
 replaces the writer's order column index with order fences, one pair of
 key and order value per order page, which the load records and holds
