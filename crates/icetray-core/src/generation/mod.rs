@@ -279,9 +279,9 @@ impl Generation {
     /// files where the snapshot changed it: a key-value table merges every
     /// group that a non-reused file belongs to, or a member whose deletes
     /// shrank, refusing a live key two files share (`verify_groups`); an
-    /// ordered table merges, once per such group, those files with the
-    /// order pages of the group's other files that can share a live pair
-    /// with them, refusing one (`ordered::verify_rows`). A
+    /// ordered table merges, once per such group, the order pages of its
+    /// files that can hold a pair two of them share where one is checked,
+    /// refusing such a live pair (`ordered::verify_rows`). A
     /// row a file's deletes remove is not live (RFD 021). A data file with
     /// deletes whose manifest records another row count than its footer is
     /// `DeleteFault::RecordCountMismatch`, since its deletes' positions
@@ -324,6 +324,7 @@ impl Generation {
                     table,
                     merges = check.merges,
                     compared = check.compared,
+                    held_bytes = check.held,
                     "checked ordered rows across files"
                 );
                 check.merges
@@ -1830,49 +1831,67 @@ impl ProbeWidths {
 /// key, so a group whose files chain end to end probes fewer files than it
 /// holds. Each group is swept in first-key order, and at each member's
 /// first key the members whose range still covers it are counted as
-/// `probed_together` counts them. Every key's candidates are open at the
-/// last-swept of them, so no lookup probes more than the sweep records.
-/// Under `Edges::Shared`, the count at a key goes under `shared_edges`
-/// instead when the open members a key can reach there all share it as an
-/// edge key (`share_an_edge`), and a key one file alone reaches is not
-/// counted: a bucket appears under `overlapping` exactly when two of its
-/// files intersect other than at a shared edge key, since such a pair is
-/// open together at the later one's first key. The work is the group's
-/// files times the files open at once.
+/// `OpenFiles::probed_together` counts them. Every key's candidates are
+/// open at the last-swept of them, so no lookup probes more than the sweep
+/// records. Under `Edges::Shared`, the count at a key goes under
+/// `shared_edges` instead when the open members a key can reach there all
+/// share it as an edge key (`Reach::shares_an_edge`), and a key one file
+/// alone reaches is not counted: a bucket appears under `overlapping`
+/// exactly when two of its files intersect other than at a shared edge
+/// key, since such a pair is open together at the later one's first key.
+/// The open members are kept counted per bucket (`OpenFiles`), so the work
+/// is two sorts of the group and, per member, a step per bucket that holds
+/// open members.
 fn probe_widths(spans: &[Span<'_>], groups: &[Vec<usize>], edges: Edges) -> ProbeWidths {
     let mut widths = ProbeWidths::default();
     for group in groups {
-        let mut members = group.clone();
-        members.sort_by(|&a, &b| spans[a].first.cmp(spans[b].first));
-        let mut open: Vec<usize> = Vec::new();
-        for at in members {
-            let first = spans[at].first;
-            open.retain(|&member| spans[member].last >= first);
-            open.push(at);
+        let mut by_first = group.clone();
+        by_first.sort_by(|&a, &b| spans[a].first.cmp(spans[b].first));
+        let mut by_last = group.clone();
+        by_last.sort_by(|&a, &b| spans[a].last.cmp(spans[b].last));
+        let mut open = OpenFiles::default();
+        let mut closing = 0;
+        for &at in &by_first {
+            let step = spans[at];
+            while let Some(&next) = by_last.get(closing) {
+                if spans[next].last >= step.first {
+                    break;
+                }
+                open.close(spans[next]);
+                closing += 1;
+            }
+            open.open(step);
             let widest = match edges {
                 Edges::Overlap => &mut widths.overlapping,
                 Edges::Shared => {
-                    let reached: Vec<usize> = open
-                        .iter()
-                        .copied()
-                        .filter(|&member| {
-                            buckets_may_share_a_key(spans[at].place(), spans[member].place())
-                        })
-                        .collect();
-                    if reached.len() <= FILES_PROBED_ALONE {
+                    let reached = open.reach(step);
+                    if reached.files <= FILES_PROBED_ALONE {
                         continue;
                     }
-                    if share_an_edge(spans, &reached, first) {
+                    if reached.shares_an_edge() {
                         &mut widths.shared_edges
                     } else {
                         &mut widths.overlapping
                     }
                 }
             };
-            probed_together(spans, &open, at, widest);
+            open.probed_together(step, widest);
         }
     }
     widths
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The steps this thread's overlap sweeps took over open files: what a
+    /// test counts a sweep's work by.
+    static SWEPT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The steps overlap sweeps took on this thread since the last call.
+#[cfg(test)]
+fn take_swept() -> u64 {
+    SWEPT.replace(0)
 }
 
 /// The files that may end at a shared edge key, and the files that may
@@ -1880,87 +1899,207 @@ fn probe_widths(spans: &[Span<'_>], groups: &[Vec<usize>], edges: Edges) -> Prob
 /// it, share more keys than it.
 const ONE_SIDE_OF_AN_EDGE: usize = 1;
 
-/// Whether `members`, files whose key ranges all cover `key`, pairwise meet
-/// only at `key` as an edge key one snapshot wrote: every one added by one
-/// snapshot, none holding `key` inside its range, at most one ending at it
-/// and at most one starting at it, and any number holding it alone. Two
-/// that end at it, or two that start at it, share more keys than it.
-fn share_an_edge(spans: &[Span<'_>], members: &[usize], key: &Key) -> bool {
-    let Some(&head) = members.first() else {
-        return true;
-    };
-    let added_by = spans[head].added_by;
-    let (mut ending, mut starting) = (0_usize, 0_usize);
-    for &member in members {
-        let span = spans[member];
-        if span.added_by != added_by {
-            return false;
-        }
-        match (span.first < key, span.last > key) {
-            (true, true) => return false,
-            (true, false) => ending += 1,
-            (false, true) => starting += 1,
-            (false, false) => {}
-        }
-    }
-    ending <= ONE_SIDE_OF_AN_EDGE && starting <= ONE_SIDE_OF_AN_EDGE
+/// The open members of one bucket in an overlap sweep, counted: how many,
+/// by the snapshot that added them, and by their last key, and of those
+/// that start at the first key the latest of them starts at, how many, and
+/// how many end there too.
+#[derive(Default)]
+struct OpenInBucket<'a> {
+    files: usize,
+    added_by: HashMap<SnapshotId, usize>,
+    lasts: BTreeMap<&'a Key, usize>,
+    start: Option<&'a Key>,
+    at_start: usize,
+    alone_at_start: usize,
 }
 
-/// Records in `widest`, per bucket, the files one key can reach among
-/// `open`, the members whose ranges cover `at`'s first key: every
-/// unbucketed member, the members of `at`'s own bucket under its
-/// bucketing, and under each other bucketing one bucket that can share a
-/// key with `at`'s. The count with each other bucketing's largest such
-/// bucket goes under the buckets of the unbucketed members and of `at`'s
-/// own, and each other bucket's count with it in place of its
-/// bucketing's largest goes under that bucket. Under at most one bucketing
-/// beside unbucketed files that is every candidate set a key reaching
-/// `at` can have; under two or more, the buckets taken from different
-/// bucketings are not checked against one another, so the count is an
-/// upper bound.
-fn probed_together(
-    spans: &[Span<'_>],
-    open: &[usize],
-    at: usize,
-    widest: &mut BTreeMap<u32, usize>,
-) {
-    let step = spans[at];
-    let mut together: Vec<u32> = Vec::new();
-    let mut others: BTreeMap<(Bucketing, u32), usize> = BTreeMap::new();
-    for &member in open {
-        let span = spans[member];
-        match span.bucketing {
-            None => together.push(span.bucket),
-            Some(_) if span.bucketing == step.bucketing => {
-                if span.bucket == step.bucket {
-                    together.push(span.bucket);
-                }
+/// One key as the open members of a bucket hold it: how many hold it
+/// strictly inside their range, how many end at it having started before,
+/// how many start at it and end after, and how many hold it alone.
+#[derive(Clone, Copy, Default)]
+struct Holding {
+    inside: usize,
+    ending: usize,
+    starting: usize,
+}
+
+impl OpenInBucket<'_> {
+    /// How the open members hold `key`, which every open member's range
+    /// covers.
+    fn holding(&self, key: &Key) -> Holding {
+        let (at_start, alone) = if self.start == Some(key) {
+            (self.at_start, self.alone_at_start)
+        } else {
+            (0, 0)
+        };
+        let at_last = self.lasts.get(key).copied().unwrap_or(0);
+        Holding {
+            inside: self.files + alone - at_start - at_last,
+            ending: at_last - alone,
+            starting: at_start - alone,
+        }
+    }
+}
+
+/// What the open members a key can reach hold of it, summed over the
+/// buckets it can share (`OpenFiles::reach`).
+struct Reach {
+    files: usize,
+    /// Whether one snapshot added every one of them.
+    one_snapshot: bool,
+    holding: Holding,
+}
+
+impl Reach {
+    /// Whether the members pairwise meet only at the key as an edge key
+    /// one snapshot wrote: every one added by one snapshot, none holding
+    /// the key inside its range, at most one ending at it and at most one
+    /// starting at it, and any number holding it alone. Two that end at it,
+    /// or two that start at it, share more keys than it.
+    fn shares_an_edge(&self) -> bool {
+        self.one_snapshot
+            && self.holding.inside == 0
+            && self.holding.ending <= ONE_SIDE_OF_AN_EDGE
+            && self.holding.starting <= ONE_SIDE_OF_AN_EDGE
+    }
+}
+
+/// The open members of an overlap sweep, counted per bucket they are filed
+/// under, with its bucketing; a bucket leaves once none of its members is
+/// open.
+#[derive(Default)]
+struct OpenFiles<'a> {
+    buckets: BTreeMap<(Option<Bucketing>, u32), OpenInBucket<'a>>,
+}
+
+impl<'a> OpenFiles<'a> {
+    /// Opens `span`, which starts at or after every open member.
+    fn open(&mut self, span: Span<'a>) {
+        let bucket = self.buckets.entry(span.place()).or_default();
+        bucket.files += 1;
+        *bucket.added_by.entry(span.added_by).or_insert(0) += 1;
+        *bucket.lasts.entry(span.last).or_insert(0) += 1;
+        if bucket.start != Some(span.first) {
+            bucket.start = Some(span.first);
+            bucket.at_start = 0;
+            bucket.alone_at_start = 0;
+        }
+        bucket.at_start += 1;
+        if span.first == span.last {
+            bucket.alone_at_start += 1;
+        }
+    }
+
+    /// Closes `span`, an open member.
+    fn close(&mut self, span: Span<'a>) {
+        let place = span.place();
+        let bucket = self
+            .buckets
+            .get_mut(&place)
+            .expect("a member closed was opened in its bucket");
+        bucket.files -= 1;
+        if bucket.files == 0 {
+            self.buckets.remove(&place);
+            return;
+        }
+        let less = |count: &mut usize| {
+            *count -= 1;
+            *count > 0
+        };
+        if !bucket.added_by.get_mut(&span.added_by).is_some_and(less) {
+            bucket.added_by.remove(&span.added_by);
+        }
+        if !bucket.lasts.get_mut(span.last).is_some_and(less) {
+            bucket.lasts.remove(span.last);
+        }
+    }
+
+    /// The buckets with open members, each with its bucketing and number.
+    fn each(&self) -> impl Iterator<Item = (&(Option<Bucketing>, u32), &OpenInBucket<'a>)> {
+        #[cfg(test)]
+        SWEPT.set(SWEPT.get() + approx::count(self.buckets.len()));
+        self.buckets.iter()
+    }
+
+    /// What the open members a key at `step`'s first key can reach hold of
+    /// it: those in buckets one key can share with `step`'s.
+    fn reach(&self, step: Span<'_>) -> Reach {
+        let mut reach = Reach {
+            files: 0,
+            one_snapshot: true,
+            holding: Holding::default(),
+        };
+        let mut snapshot = None;
+        for (&place, bucket) in self.each() {
+            if !buckets_may_share_a_key(step.place(), place) {
+                continue;
             }
-            Some(bucketing) => {
-                if buckets_may_share_a_key(
-                    (step.bucketing, step.bucket),
-                    (span.bucketing, span.bucket),
-                ) {
-                    *others.entry((bucketing, span.bucket)).or_insert(0) += 1;
+            reach.files += bucket.files;
+            let holding = bucket.holding(step.first);
+            reach.holding.inside += holding.inside;
+            reach.holding.ending += holding.ending;
+            reach.holding.starting += holding.starting;
+            let mut added = bucket.added_by.keys();
+            let only = added.next();
+            if added.next().is_some() || (snapshot.is_some() && snapshot != only) {
+                reach.one_snapshot = false;
+            }
+            snapshot = snapshot.or(only);
+        }
+        reach
+    }
+
+    /// Records in `widest`, per bucket, the files one key can reach among
+    /// the open members, whose ranges cover `step`'s first key: every
+    /// unbucketed member, the members of `step`'s own bucket under its
+    /// bucketing, and under each other bucketing one bucket that can share
+    /// a key with `step`'s. The count with each other bucketing's largest
+    /// such bucket goes under the buckets of the unbucketed members and of
+    /// `step`'s own, and each other bucket's count with it in place of its
+    /// bucketing's largest goes under that bucket. Under at most one
+    /// bucketing beside unbucketed files that is every candidate set a key
+    /// reaching `step` can have; under two or more, the buckets taken from
+    /// different bucketings are not checked against one another, so the
+    /// count is an upper bound.
+    fn probed_together(&self, step: Span<'_>, widest: &mut BTreeMap<u32, usize>) {
+        let mut together: Vec<u32> = Vec::new();
+        let mut together_files = 0;
+        let mut others: Vec<(Bucketing, u32, usize)> = Vec::new();
+        for (&(bucketing, bucket), open) in self.each() {
+            match bucketing {
+                None => {
+                    together.push(bucket);
+                    together_files += open.files;
+                }
+                Some(_) if bucketing == step.bucketing => {
+                    if bucket == step.bucket {
+                        together.push(bucket);
+                        together_files += open.files;
+                    }
+                }
+                Some(other) => {
+                    if buckets_may_share_a_key(step.place(), (bucketing, bucket)) {
+                        others.push((other, bucket, open.files));
+                    }
                 }
             }
         }
-    }
-    let mut largest: BTreeMap<Bucketing, usize> = BTreeMap::new();
-    for (&(bucketing, _), &files) in &others {
-        let entry = largest.entry(bucketing).or_insert(0);
-        *entry = (*entry).max(files);
-    }
-    let total = together.len() + largest.values().sum::<usize>();
-    let mut record = |bucket: u32, probed: usize| {
-        let entry = widest.entry(bucket).or_insert(0);
-        *entry = (*entry).max(probed);
-    };
-    for bucket in together {
-        record(bucket, total);
-    }
-    for (&(bucketing, bucket), &files) in &others {
-        record(bucket, total - largest[&bucketing] + files);
+        let mut largest: BTreeMap<Bucketing, usize> = BTreeMap::new();
+        for &(bucketing, _, files) in &others {
+            let entry = largest.entry(bucketing).or_insert(0);
+            *entry = (*entry).max(files);
+        }
+        let total = together_files + largest.values().sum::<usize>();
+        let mut record = |bucket: u32, probed: usize| {
+            let entry = widest.entry(bucket).or_insert(0);
+            *entry = (*entry).max(probed);
+        };
+        for bucket in together {
+            record(bucket, total);
+        }
+        for (bucketing, bucket, files) in others {
+            record(bucket, total - largest[&bucketing] + files);
+        }
     }
 }
 
@@ -4525,6 +4664,217 @@ mod tests {
         let disjoint = widths_of(&[(0, 4, s), (5, 9, t)], Edges::Shared);
         assert_eq!(disjoint, ProbeWidths::default());
         assert_eq!(disjoint.most_probed(), None);
+    }
+
+    /// Files of an appended bucket, each over the bucket's keys.
+    const APPENDS: usize = 2_000;
+
+    /// The most steps the overlap sweep of an appended bucket may take per
+    /// file: a constant few, where counting the open files at each file
+    /// takes about `APPENDS` squared halved.
+    const SWEPT_PER_FILE: u64 = 8;
+
+    /// The overlap sweep of a bucket of appends, every one over the
+    /// bucket's keys and each added by its own snapshot, finds every file
+    /// overlapping every other, in steps linear in the files.
+    #[test]
+    fn test_probe_widths_of_an_appended_bucket_is_linear() {
+        let files: Vec<Described> = (0..APPENDS)
+            .map(|at| {
+                (
+                    0,
+                    KEYS_PER_FILE,
+                    FIRST_SNAPSHOT + i64::try_from(at).unwrap(),
+                )
+            })
+            .collect();
+        for edges in [Edges::Overlap, Edges::Shared] {
+            take_swept();
+            let widths = widths_of(&files, edges);
+            let swept = take_swept();
+            assert_eq!(widths.overlapping, in_bucket_zero(APPENDS), "{edges:?}");
+            assert!(widths.shared_edges.is_empty(), "{edges:?}");
+            assert!(
+                swept > 0 && swept <= SWEPT_PER_FILE * approx::count(APPENDS),
+                "{edges:?}: {swept} steps over {APPENDS} files"
+            );
+        }
+    }
+
+    /// What `probe_widths` finds, by a scan of every open member at every
+    /// step: the sweep's definition, against which the counted sweep is
+    /// checked.
+    fn widths_by_scan(spans: &[Span<'_>], groups: &[Vec<usize>], edges: Edges) -> ProbeWidths {
+        let mut widths = ProbeWidths::default();
+        for group in groups {
+            let mut members = group.clone();
+            members.sort_by(|&a, &b| spans[a].first.cmp(spans[b].first));
+            let mut open: Vec<usize> = Vec::new();
+            for at in members {
+                let step = spans[at];
+                open.retain(|&member| spans[member].last >= step.first);
+                open.push(at);
+                let widest = match edges {
+                    Edges::Overlap => &mut widths.overlapping,
+                    Edges::Shared => {
+                        let reached: Vec<Span<'_>> = open
+                            .iter()
+                            .map(|&member| spans[member])
+                            .filter(|span| buckets_may_share_a_key(step.place(), span.place()))
+                            .collect();
+                        if reached.len() <= FILES_PROBED_ALONE {
+                            continue;
+                        }
+                        let one_snapshot = reached
+                            .iter()
+                            .all(|span| span.added_by == reached[0].added_by);
+                        let inside = reached
+                            .iter()
+                            .filter(|span| span.first < step.first && span.last > step.first)
+                            .count();
+                        let ending = reached
+                            .iter()
+                            .filter(|span| span.first < step.first && span.last == step.first)
+                            .count();
+                        let starting = reached
+                            .iter()
+                            .filter(|span| span.first == step.first && span.last > step.first)
+                            .count();
+                        if one_snapshot
+                            && inside == 0
+                            && ending <= ONE_SIDE_OF_AN_EDGE
+                            && starting <= ONE_SIDE_OF_AN_EDGE
+                        {
+                            &mut widths.shared_edges
+                        } else {
+                            &mut widths.overlapping
+                        }
+                    }
+                };
+                let mut together: Vec<u32> = Vec::new();
+                let mut others: BTreeMap<(Bucketing, u32), usize> = BTreeMap::new();
+                for &member in &open {
+                    let span = spans[member];
+                    match span.bucketing {
+                        None => together.push(span.bucket),
+                        Some(_) if span.bucketing == step.bucketing => {
+                            if span.bucket == step.bucket {
+                                together.push(span.bucket);
+                            }
+                        }
+                        Some(bucketing) => {
+                            if buckets_may_share_a_key(step.place(), span.place()) {
+                                *others.entry((bucketing, span.bucket)).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+                let mut largest: BTreeMap<Bucketing, usize> = BTreeMap::new();
+                for (&(bucketing, _), &files) in &others {
+                    let entry = largest.entry(bucketing).or_insert(0);
+                    *entry = (*entry).max(files);
+                }
+                let total = together.len() + largest.values().sum::<usize>();
+                let mut record = |bucket: u32, probed: usize| {
+                    let entry = widest.entry(bucket).or_insert(0);
+                    *entry = (*entry).max(probed);
+                };
+                for bucket in together {
+                    record(bucket, total);
+                }
+                for (&(bucketing, bucket), &files) in &others {
+                    record(bucket, total - largest[&bucketing] + files);
+                }
+            }
+        }
+        widths
+    }
+
+    /// Cases of the drawn sweep test, the fewest and the most files per
+    /// case beyond the fewest, and the keys their ranges fall in, few, so
+    /// ranges share edge keys often.
+    const DRAWN_SWEEPS: u64 = 300;
+    const FEWEST_SWEEP_FILES: u64 = 2;
+    const DRAWN_SWEEP_FILES: u64 = 12;
+    const DRAWN_SWEEP_KEYS: u64 = 16;
+
+    /// A multiplier and an increment of a linear congruential sequence,
+    /// which draws the sweep test's files without a seed.
+    const DRAW_MIX: u64 = 6_364_136_223_846_793_005;
+    const DRAW_STEP: u64 = 1_442_695_040_888_963_407;
+
+    /// A drawn file of the sweep test: where it is filed, its first and
+    /// last key, and the snapshot that added it.
+    type DrawnSpan = ((Option<Bucketing>, u32), Key, Key, SnapshotId);
+
+    /// The counted sweep finds what a scan of every open member at every
+    /// step finds, under both edge rules, over drawn files of two
+    /// snapshots in unbucketed files and buckets of two bucketings: shared
+    /// edges, one-key files, and overlap.
+    #[test]
+    fn test_probe_widths_are_those_of_a_scan_of_the_open_files() {
+        let mut state = 0_u64;
+        let mut draw = |below: u64| {
+            state = state.wrapping_mul(DRAW_MIX).wrapping_add(DRAW_STEP);
+            (state >> 33) % below
+        };
+        let places = [
+            (None, UNBUCKETED),
+            (Some(bucketing(TWO)), 0),
+            (Some(bucketing(TWO)), 1),
+            (Some(bucketing(FOUR)), 0),
+            (Some(bucketing(FOUR)), 1),
+            (Some(bucketing(FOUR)), 2),
+        ];
+        let snapshots = [FIRST_SNAPSHOT, SECOND_SNAPSHOT];
+        let (mut shared, mut overlapping) = (0, 0);
+        for case in 0..DRAWN_SWEEPS {
+            let files: Vec<DrawnSpan> = (0..FEWEST_SWEEP_FILES + draw(DRAWN_SWEEP_FILES))
+                .map(|_| {
+                    let place = places[usize::try_from(draw(approx::count(places.len()))).unwrap()];
+                    let first = draw(DRAWN_SWEEP_KEYS);
+                    let last = first + draw(DRAWN_SWEEP_KEYS - first).min(draw(DRAWN_SWEEP_KEYS));
+                    let added_by =
+                        snapshots[usize::try_from(draw(approx::count(snapshots.len()))).unwrap()];
+                    (
+                        place,
+                        Key::Long(i64::try_from(first).unwrap()),
+                        Key::Long(i64::try_from(last).unwrap()),
+                        SnapshotId(added_by),
+                    )
+                })
+                .collect();
+            let mut spans: Vec<Span<'_>> = files
+                .iter()
+                .map(|((bucketing, bucket), first, last, added_by)| Span {
+                    bucketing: *bucketing,
+                    bucket: *bucket,
+                    first,
+                    last,
+                    added_by: *added_by,
+                })
+                .collect();
+            spans.sort_by(|a, b| {
+                (a.bucketing, a.bucket, a.first).cmp(&(b.bucketing, b.bucket, b.first))
+            });
+            let groups = overlap_groups(&spans, &routes(&spans));
+            for edges in [Edges::Overlap, Edges::Shared] {
+                let found = probe_widths(&spans, &groups, edges);
+                assert_eq!(
+                    found,
+                    widths_by_scan(&spans, &groups, edges),
+                    "case {case}, {edges:?}"
+                );
+                if edges == Edges::Shared {
+                    shared += found.shared_edges.len();
+                    overlapping += found.overlapping.len();
+                }
+            }
+        }
+        assert!(
+            shared > 0 && overlapping > 0,
+            "{shared} shared, {overlapping} overlapping"
+        );
     }
 
     /// An unbucketed file and one file per bucket of a bucketing, all

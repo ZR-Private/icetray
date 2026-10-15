@@ -624,8 +624,15 @@ pub(super) fn longs(values: &[i64]) -> Vec<Option<Key>> {
 
 /// `predicted_resident_bytes` of a built index's own footer.
 pub(super) fn predicted_of(index: &FileIndex) -> ResidentBytes {
+    predicted_from(index, index.metadata())
+}
+
+/// What the footer `metadata` of `index`'s file predicts for it, as the
+/// load predicts from the footer as loaded, which holds every page index
+/// the writer wrote.
+pub(super) fn predicted_from(index: &FileIndex, metadata: &ParquetMetaData) -> ResidentBytes {
     FileIndex::predicted_resident_bytes(
-        index.metadata(),
+        metadata,
         index.key_leaf(),
         index.order_column(),
         &index.held_value_leaves(),

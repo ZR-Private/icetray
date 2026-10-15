@@ -1,24 +1,21 @@
 //! An ordered file's rows as pairs of key and order value, for the check
-//! across files that no live pair repeats (RFD 025, Refresh): which of the
-//! file's order pages can hold rows in a key range and an order range,
-//! judged by the key pages each order page's rows span and by the order
-//! column's column index; the bytes those pages, or all of the file's rows,
-//! decode from in each tier; and the pairs of one span of rows decoded at a
-//! time. A key-value table never reaches this module.
+//! across files that no live pair repeats (RFD 025, Refresh): the bytes
+//! one row group's chosen order pages decode from in each tier, and the
+//! pairs of one run of those pages decoded at a time. Which pages a check
+//! reads is chosen by the order fences (`generation::ordered`). A key-value
+//! table never reaches this module.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use super::build::{
     DECODE_BATCH_RECORDS, check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts,
 };
-use super::inspect::column_chunk_ranges;
-use super::ordered::{OrderRun, decode_orders, order_column_index, page_meets};
+use super::ordered::{OrderRun, decode_orders};
 use super::{
-    Column, FileFault, FileIndex, KeyResidency, Keys, OrderLeaf, RowPosition, RowRef, file_fault,
-    row_index,
+    Column, ColumnChunk, FileFault, FileIndex, KeyResidency, Keys, OrderLeaf, RowPosition, RowRef,
+    file_fault, row_index,
 };
 use crate::approx;
 use crate::error::Result;
@@ -26,30 +23,35 @@ use crate::key::Key;
 use crate::order::OrderValue;
 use crate::parquet_io::Segments;
 
-/// A closed key range and a closed order range: the rows a file a load
-/// checks can hold, which the order pages of another file are judged
-/// against (`FileIndex::order_pages_meeting`).
-pub(crate) type Bounds<'a> = ((&'a Key, &'a Key), (&'a OrderValue, &'a OrderValue));
-
-/// Rows of one row group whose pairs decode together: one order page, or
-/// a window of a row group.
+/// Rows of one row group whose pairs decode together: a run of
+/// consecutive chosen order pages, of at most `DECODE_BATCH_RECORDS` rows
+/// unless one page holds more.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RowSpan {
+struct RowSpan {
     row_group: usize,
     rows: Range<i64>,
 }
 
-/// Rows of an ordered file in file order and the bytes they decode from
-/// without further I/O.
+/// One row group's chosen order pages of an ordered file, in runs, and the
+/// bytes they decode from without further I/O.
 pub(crate) struct PairChunks {
     spans: Vec<RowSpan>,
     chunks: Arc<Segments>,
+    /// The bytes fetched or read from the chunk file for them: what a merge
+    /// holds while it reads the row group, a Full table's resident key
+    /// chunks not among them.
+    read: u64,
 }
 
 impl PairChunks {
-    /// The spans of rows held.
+    /// The runs of rows held.
     pub(crate) fn len(&self) -> usize {
         self.spans.len()
+    }
+
+    /// The bytes fetched or read for them.
+    pub(crate) fn read_bytes(&self) -> u64 {
+        self.read
     }
 }
 
@@ -123,164 +125,88 @@ impl FileIndex {
         }
     }
 
-    /// The exact last key of `row_group`, which has rows; the file's last
-    /// key bounds it where the row group has no entry.
-    fn group_last(&self, row_group: usize) -> &Key {
-        self.groups
-            .iter()
-            .find(|group| group.row_group == row_group)
-            .map_or(&self.key_range.1, |group| &group.last)
-    }
-
-    /// The order pages, in file order, that can hold a row within one of
-    /// `bounds`, each a closed key range and a closed order range: those
-    /// whose rows' keys, bounded below by the first key of the key page
-    /// holding the page's first row and above by the first key of the key
-    /// page after the one holding its last row (the row group's last key
-    /// for its last key page), meet the bound's keys, and whose column
-    /// index entry meets its order values. A file without a column index
-    /// for a row group's order chunk keeps every page of it whose keys
-    /// meet. With them, per bound, whether a page kept meets it. No I/O.
-    pub(crate) fn order_pages_meeting(&self, bounds: &[Bounds<'_>]) -> (Vec<RowSpan>, Vec<bool>) {
-        let order = self.order_leaf_of();
-        let mut spans = Vec::new();
-        let mut met = vec![false; bounds.len()];
-        for (row_group, fences) in self.fences.iter().enumerate() {
-            let Some(first) = fences.first() else {
-                continue;
-            };
-            let last = self.group_last(row_group);
-            let in_group: Vec<usize> = (0..bounds.len())
-                .filter(|&at| {
-                    let (keys, _) = bounds[at];
-                    first <= keys.1 && keys.0 <= last
-                })
-                .collect();
-            if in_group.is_empty() {
-                continue;
-            }
-            let key_chunk = self.key_column().group(row_group);
-            let order_chunk = self.order_values(order).group(row_group);
-            let index = order_column_index(order_chunk);
-            for page in 0..order_chunk.page_locations().len() {
-                let rows = order_chunk.page_rows(page);
-                if rows.is_empty() {
-                    continue;
-                }
-                let low = &fences[key_chunk.page_holding(row_index(rows.start))];
-                let high = fences
-                    .get(key_chunk.page_holding(row_index(rows.end - 1)) + 1)
-                    .unwrap_or(last);
-                let mut kept = false;
-                for &at in &in_group {
-                    let (keys, orders) = bounds[at];
-                    let keys_meet = low <= keys.1 && keys.0 <= high;
-                    if keys_meet && index.is_none_or(|entry| page_meets(entry, page, orders)) {
-                        met[at] = true;
-                        kept = true;
-                    }
-                }
-                if kept {
-                    spans.push(RowSpan { row_group, rows });
-                }
-            }
+    /// The bytes order pages `pages` of `row_group`, ascending, decode
+    /// from, in runs of consecutive pages (`RowSpan`): each run of the
+    /// order pages and of the key pages its rows span as one range, and
+    /// each chunk's dictionary page as one more. Full fetches the order
+    /// ranges by load GET and holds its key chunks; Disk reads both from
+    /// the chunk file, one counted local read per range, and no GET; Bloom
+    /// fetches both by load GET.
+    pub(crate) async fn pair_chunks(
+        &self,
+        row_group: usize,
+        pages: &[usize],
+    ) -> Result<PairChunks> {
+        let order_chunk = self.order_values(self.order_leaf_of()).group(row_group);
+        let key_chunk = self.key_column().group(row_group);
+        let spans = page_runs(order_chunk, pages);
+        let mut order_ranges = Vec::new();
+        for &page in pages {
+            coalesce(&mut order_ranges, order_chunk.page_range(page));
         }
-        (spans, met)
-    }
-
-    /// The bytes `spans`, order pages `order_pages_meeting` chose, decode
-    /// from: each page and its chunk's dictionary page, with the key pages
-    /// its rows span. Full fetches the order pages by load GET, one per
-    /// page and dictionary page, and holds its key chunks; Disk reads both
-    /// from the chunk file, one counted local read per page, and no GET;
-    /// Bloom fetches both by load GET, the key column's dictionary page
-    /// with them.
-    pub(crate) async fn order_page_chunks(&self, spans: Vec<RowSpan>) -> Result<PairChunks> {
-        let order = self.order_leaf_of();
-        let mut order_ranges = BTreeSet::new();
-        let mut key_ranges = BTreeSet::new();
-        let held = |range: Range<u64>| (range.start, range.end);
+        let mut key_ranges = Vec::new();
         for span in &spans {
-            let order_chunk = self.order_values(order).group(span.row_group);
-            let page = order_chunk.page_holding(row_index(span.rows.start));
-            order_ranges.insert(held(order_chunk.page_range(page)));
-            order_ranges.extend(order_chunk.dictionary_range().map(held));
-            let key_chunk = self.key_column().group(span.row_group);
-            let pages = key_chunk.page_holding(row_index(span.rows.start))
-                ..=key_chunk.page_holding(row_index(span.rows.end - 1));
-            key_ranges.extend(pages.map(|page| held(key_chunk.page_range(page))));
-            key_ranges.extend(key_chunk.dictionary_range().map(held));
+            let first = key_chunk.page_holding(row_index(span.rows.start));
+            let last = key_chunk.page_holding(row_index(span.rows.end - 1));
+            for page in first..=last {
+                coalesce(&mut key_ranges, key_chunk.page_range(page));
+            }
         }
-        let ranges = |set: &BTreeSet<(u64, u64)>| -> Vec<Range<u64>> {
-            set.iter().map(|&(start, end)| start..end).collect()
-        };
-        let order_ranges = ranges(&order_ranges);
+        order_ranges.extend(order_chunk.dictionary_range());
         let both = || {
             let mut both = order_ranges.clone();
-            both.extend(ranges(&key_ranges));
+            both.extend(key_ranges.iter().cloned());
+            both.extend(key_chunk.dictionary_range());
             both
         };
-        let chunks = self.read_ranges(&order_ranges, both).await?;
-        Ok(PairChunks { spans, chunks })
-    }
-
-    /// Every row of the file, a window of at most `DECODE_BATCH_RECORDS`
-    /// rows of one row group at a time, and the key and order chunks they
-    /// decode from: Full holds its key chunks and fetches the order chunks,
-    /// one load GET per row group; Disk reads both from the chunk file, one
-    /// counted local read per row group per column, and no GET; Bloom
-    /// fetches both, one load GET per row group per column.
-    pub(crate) async fn all_pair_chunks(&self) -> Result<PairChunks> {
-        let order = self.order_leaf_of();
-        let size = self.handle.size();
-        let order_ranges = column_chunk_ranges(&self.metadata, order.leaf, size);
-        let both = || {
-            let mut ranges = column_chunk_ranges(&self.metadata, self.layout.key_leaf, size);
-            ranges.extend(order_ranges.iter().cloned());
-            ranges
-        };
-        let chunks = self.read_ranges(&order_ranges, both).await?;
-        let mut spans = Vec::new();
-        for (row_group, group) in self.metadata.row_groups().iter().enumerate() {
-            let mut start = 0;
-            while start < group.num_rows() {
-                let end = group.num_rows().min(start + DECODE_BATCH_RECORDS);
-                spans.push(RowSpan {
-                    row_group,
-                    rows: start..end,
-                });
-                start = end;
-            }
-        }
-        Ok(PairChunks { spans, chunks })
+        let (chunks, read) = self.read_ranges(&order_ranges, both).await?;
+        Ok(PairChunks {
+            spans,
+            chunks,
+            read,
+        })
     }
 
     /// The bytes of `order_ranges` and of the key column the tier does not
-    /// hold: Full fetches `order_ranges` and holds the key chunks; Disk
-    /// reads `both`, the order and key ranges together, from the chunk
-    /// file; Bloom fetches `both`.
+    /// hold, with how many bytes were fetched or read: Full fetches
+    /// `order_ranges` and holds the key chunks; Disk reads `both`, the
+    /// order and key ranges together, from the chunk file; Bloom fetches
+    /// `both`.
     async fn read_ranges(
         &self,
         order_ranges: &[Range<u64>],
         both: impl FnOnce() -> Vec<Range<u64>>,
-    ) -> Result<Arc<Segments>> {
+    ) -> Result<(Arc<Segments>, u64)> {
         let size = self.handle.size();
+        let length = |ranges: &[Range<u64>]| {
+            ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .fold(0, u64::saturating_add)
+        };
         match &self.keys {
             KeyResidency::Chunks(held) => {
                 let mut parts = fetch_chunk_parts(&self.handle, order_ranges).await?;
                 parts.extend(held.parts().iter().cloned());
-                Ok(Arc::new(Segments::new(parts, size)))
+                Ok((Arc::new(Segments::new(parts, size)), length(order_ranges)))
             }
-            KeyResidency::Disk(disk) => chunks_from_disk(disk, &both(), size).await,
+            KeyResidency::Disk(disk) => {
+                let ranges = both();
+                Ok((
+                    chunks_from_disk(disk, &ranges, size).await?,
+                    length(&ranges),
+                ))
+            }
             KeyResidency::Filters(_) => {
-                let parts = fetch_chunk_parts(&self.handle, &both()).await?;
-                Ok(Arc::new(Segments::new(parts, size)))
+                let ranges = both();
+                let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
+                Ok((Arc::new(Segments::new(parts, size)), length(&ranges)))
             }
         }
     }
 
-    /// The pairs of span `at` of `chunks`, which `order_page_chunks` or
-    /// `all_pair_chunks` of this file returned. The rows were verified when
+    /// The pairs of span `at` of `chunks`, which `pair_chunks` of this file
+    /// returned. The rows were verified when
     /// the file was indexed; a span that decodes to fewer keys or order
     /// values than it has rows is `FileFault::PageRowsMismatch` at its
     /// first order page, a key that is not UTF-8 `FileFault::KeyNotUtf8`,
@@ -329,5 +255,42 @@ impl FileIndex {
                 row: span.rows.start,
             }),
         })
+    }
+}
+
+/// The runs of consecutive pages among `pages` of the order chunk `chunk`,
+/// ascending, each as the rows it holds, a run ending where adding the
+/// next page would take it past `DECODE_BATCH_RECORDS` rows. A page
+/// without rows is passed over.
+fn page_runs(chunk: ColumnChunk<'_>, pages: &[usize]) -> Vec<RowSpan> {
+    let mut spans: Vec<RowSpan> = Vec::new();
+    for &page in pages {
+        let rows = chunk.page_rows(page);
+        if rows.is_empty() {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(span)
+                if span.rows.end == rows.start
+                    && rows.end - span.rows.start <= DECODE_BATCH_RECORDS =>
+            {
+                span.rows.end = rows.end;
+            }
+            Some(_) | None => spans.push(RowSpan {
+                row_group: chunk.row_group(),
+                rows,
+            }),
+        }
+    }
+    spans
+}
+
+/// `range` after `ranges`, which ascend and end at or before it starts,
+/// joined to the last of them where the two meet or overlap: a page met
+/// again, or the next page of a run.
+fn coalesce(ranges: &mut Vec<Range<u64>>, range: Range<u64>) {
+    match ranges.last_mut() {
+        Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+        Some(_) | None => ranges.push(range),
     }
 }

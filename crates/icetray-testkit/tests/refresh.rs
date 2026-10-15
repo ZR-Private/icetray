@@ -20,6 +20,7 @@ use icetray_core::{
     Capping, Error, ErrorKind, FILE_PREFIX, FindingCode, Generation, KeyType, Level, LoadedFile,
     LocalDir, OrderValue, RefusalReason, Row, Storage, TableSource, TableState, UnsupportedFormat,
 };
+use icetray_testkit::delete_files::{Vector, write_vectors};
 use icetray_testkit::fixture::{
     APPENDED_4K_6K, DATA_DIR, IDS_4K, INTERLEAVED_BUCKETS, INTERLEAVED_SAMPLE, NAMESPACE, NEW_ID,
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
@@ -35,6 +36,7 @@ use icetray_testkit::{
     Ordered, Result, Statistics, TestkitError, write_fixture,
 };
 use object_store::ObjectStore;
+use roaring::RoaringTreemap;
 
 /// The first build of the reuse fixture and the range its second appends.
 const IDS_8K: Range<u64> = 0..8_000;
@@ -598,7 +600,7 @@ fn ordered_rows_per_key(_id: u64) -> u64 {
 }
 
 /// Rows per key of the late-row fixture: a run of many pages, each page's
-/// order values a narrow slice of it, so the column index rules out every
+/// order values a narrow slice of it, so the order fences rule out every
 /// page of the run but those a late row can fall among.
 const LONG_RUN_ROWS: u64 = 40;
 
@@ -728,8 +730,8 @@ async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Resu
 
 /// A row appended inside an existing file's order range costs that file's
 /// order pages the row falls among (RFD 025, Refresh): under `full` a GET
-/// of each, fewer than the pages its key's run spans, which the column
-/// index rules out but for those; under `bloom` those and the key pages
+/// of each, fewer than the pages its key's run spans, which the order
+/// fences rule out but for those; under `bloom` those and the key pages
 /// they span; under `disk` none, the pages read from the chunk file. The
 /// file of the other bucket, which cannot share the key, is not read.
 #[tokio::test]
@@ -766,10 +768,13 @@ async fn test_refresh_reads_only_the_order_pages_late_rows_fall_among() -> Resul
 }
 
 /// Without a column index on the order column, a row appended inside an
-/// existing file's order range costs every order page of that file its key
-/// can be in (RFD 025, Refresh): at least the pages of its key's run.
+/// existing file's order range costs the order pages it falls among, as
+/// with one (RFD 025, Refresh): the order fences choose the pages, and the
+/// writer's column index is not read.
 #[tokio::test]
-async fn test_refresh_reads_every_order_page_of_the_key_without_a_column_index() -> Result<()> {
+async fn test_refresh_reads_the_same_order_pages_without_a_column_index() -> Result<()> {
+    let indexed =
+        refresh_with_a_late_row(ordered_spec("ord_indexed", long_runs), Residency::Full).await?;
     let spec = ordered_spec("ord_unindexed", long_runs);
     let spec = FixtureSpec {
         layout: Layout {
@@ -780,10 +785,12 @@ async fn test_refresh_reads_every_order_page_of_the_key_without_a_column_index()
     };
     let late = refresh_with_a_late_row(spec, Residency::Full).await?;
     assert_eq!(late.other_gets, 0);
+    assert_eq!(late.holding_gets, indexed.holding_gets);
     assert!(
-        late.holding_gets >= long_run_pages(),
-        "{} order pages",
-        late.holding_gets
+        late.holding_gets > 0 && late.holding_gets < long_run_pages(),
+        "{} order pages of a run of {}",
+        late.holding_gets,
+        long_run_pages()
     );
     Ok(())
 }
@@ -1001,6 +1008,84 @@ async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
             generation.overlap_groups_verified(),
             1,
             "{residency:?}: the new file is merged against the file it shares a pair with"
+        );
+    }
+    Ok(())
+}
+
+/// A new file holding a pair the table holds live, its own copy deleted
+/// by a deletion vector committed with it, is no repeat (RFD 021, RFD
+/// 025): its deleted rows are not live, the refresh merges it against the
+/// file holding the live copy, and the table serves. The same file
+/// committed without the vector repeats every pair it holds, and that
+/// refresh is `duplicate_rows`, naming the new file, later in file order,
+/// at the key's first pair, while the last generation keeps serving.
+#[tokio::test]
+async fn test_a_pair_whose_new_copy_is_deleted_is_served() -> Result<()> {
+    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let spec = ordered_spec(&format!("ord_new_deleted_{at}"), ordered_rows_per_key);
+        let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+        fixture.write_hint().await?;
+        let local = tempfile::tempdir()?;
+        let (served, _counting) = serve_counted(&fixture, residency, local.path()).await?;
+        let v1 = served.current();
+        let deletes = fixture.deletes().to_vec();
+
+        let copy = fixture.write_rows(&[AN_ID], FIRST_VERSION, "copy").await?;
+        assert_eq!(copy.len(), 1, "one key, one file");
+        let new_file = copy[0].file_path().to_string();
+        let vector = write_vectors(
+            fixture.file_io(),
+            &fixture.delete_path("copy.puffin"),
+            &[Vector {
+                data_file: new_file.clone(),
+                positions: (0..ORDERED_ROWS_PER_KEY).collect::<RoaringTreemap>(),
+                spec_id: fixture.metadata().default_partition_spec_id(),
+                partition: copy[0].partition().clone(),
+            }],
+        )
+        .await?;
+        let mut data = fixture.files().to_vec();
+        data.extend(copy);
+        fixture
+            .commit_by_hand(HandSnapshot {
+                data: data.clone(),
+                deletes: deletes.iter().cloned().chain(vector).collect(),
+            })
+            .await?;
+        assert!(served.table.refresh().await?, "{residency:?}");
+        assert!(matches!(served.table.state(), TableState::Serving { .. }));
+        let deleted_copy = served.current();
+        assert_eq!(
+            deleted_copy.files.len(),
+            v1.files.len() + 1,
+            "{residency:?}"
+        );
+        assert_eq!(
+            deleted_copy.overlap_groups_verified(),
+            1,
+            "{residency:?}: the new file is merged against the file holding the live copy"
+        );
+
+        fixture
+            .commit_by_hand(HandSnapshot { data, deletes })
+            .await?;
+        let error = served.table.refresh().await.unwrap_err();
+        let Error::Refused {
+            reason: RefusalReason::DuplicateRows { path, key, order },
+            ..
+        } = error
+        else {
+            panic!("{residency:?}: expected duplicate_rows, got {error:?}");
+        };
+        assert_eq!(path, new_file, "{residency:?}");
+        assert_eq!(key, fixture.key(AN_ID));
+        assert_eq!(*order, OrderValue::Long(order_of(0)));
+        assert_eq!(
+            served.current().snapshot_id,
+            deleted_copy.snapshot_id,
+            "the last generation serves"
         );
     }
     Ok(())

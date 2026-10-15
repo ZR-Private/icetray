@@ -25,8 +25,8 @@ use icetray_core::check::thresholds::{
 };
 use icetray_core::config::{LocalConfig, Residency, TableConfig, ValueFormat};
 use icetray_core::{
-    Capping, Error, FileFault, Finding, FindingCode, HeaderField, KeyType, Level, LocalDir,
-    OrderValue, RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
+    Capping, Error, FILE_PREFIX, FileFault, Finding, FindingCode, HeaderField, KeyType, Level,
+    LocalDir, OrderValue, RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -40,6 +40,7 @@ use icetray_testkit::{
     Bloom, Dictionary, Fixture, FixtureSpec, Layout, OrderKind, Ordered, Result, Statistics,
     TestkitError, write_fixture,
 };
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use tempfile::TempDir;
 
@@ -1019,6 +1020,16 @@ async fn test_dictionary_encoded_order_leaves_disk_optimal() -> Result<()> {
     Ok(())
 }
 
+/// The footer of the data file at `path`, a local location, with the page
+/// indexes its writer wrote, which the server's kept footer does not all
+/// hold.
+fn written_footer(path: &str) -> Result<ParquetMetaData> {
+    let local = path.strip_prefix(FILE_PREFIX).unwrap_or(path);
+    Ok(ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&std::fs::File::open(local)?)?)
+}
+
 /// A file without an order column index draws no finding: the order
 /// fences place a bounded Scan's bounds in one round whatever the writer's
 /// column index holds or leaves out, so the table stays `optimal` and
@@ -1037,7 +1048,8 @@ async fn test_ordered_table_without_an_order_column_index_draws_no_finding() -> 
     let generation = served.current();
     for file in &generation.files {
         let order = file.index.order_leaf().unwrap();
-        let index = file.index.metadata().column_index();
+        let written = written_footer(&file.entry.path)?;
+        let index = written.column_index();
         assert!(
             index.is_none_or(|groups| groups
                 .iter()
@@ -1089,9 +1101,8 @@ async fn test_ordered_table_with_a_truncated_order_column_index_draws_no_finding
             panic!("a string order column's least value is a string");
         };
         assert!(least.len() > ORDER_INDEX_TRUNCATE, "{least:?}");
-        let index = file
-            .index
-            .metadata()
+        let written = written_footer(&file.entry.path)?;
+        let index = written
             .column_index()
             .expect("the fixture writes a column index");
         for group in index {

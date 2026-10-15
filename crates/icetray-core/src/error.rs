@@ -1421,10 +1421,6 @@ mod tests {
                 Transient,
             ),
             (
-                file(FileFault::OrderIndexMismatch { row_group, page: 0 }),
-                Transient,
-            ),
-            (
                 file(FileFault::PageOutOfRange { row: 1, row_group }),
                 Transient,
             ),

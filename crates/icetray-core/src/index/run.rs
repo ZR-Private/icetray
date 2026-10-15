@@ -1033,7 +1033,6 @@ mod tests {
     use crate::config::{HedgeConfig, Residency};
     use crate::generation::testing::{self as generation_testing, cache};
     use crate::index::order_fences::take_steps;
-    use crate::index::ordered::order_column_index;
     use crate::index::testing::{
         EXTRA_COLUMN, Fixture, ORDER_FIELD_ID, Opened, Orders, long_orders, ordered_layout, store,
         store_gauged, value_for,
@@ -1719,11 +1718,15 @@ mod tests {
         let mut fixture = bounded_run(0);
         fixture.layout.statistics = parquet::file::properties::EnabledStatistics::Chunk;
         let (opened, gauged) = store_gauged(&fixture).await;
+        let loaded = opened.handle.load_metadata().await.unwrap();
         for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             let index = index_in(&opened, residency, dir.path(), 0).await;
-            let order = index.order_values(index.order_leaf_of()).group(0);
-            assert!(order_column_index(order).is_none());
+            let leaf = index.order_leaf_of().leaf;
+            assert!(loaded.column_index().is_none_or(|groups| matches!(
+                groups[0][leaf],
+                parquet::file::page_index::column_index::ColumnIndexMetaData::NONE
+            )));
             let stats = opened.stats();
             let reads = Reads::new().await;
             let run = index

@@ -415,43 +415,46 @@ fn check_offset_index(
 }
 
 /// The footer as the index keeps it: a copy of `metadata` with the column
-/// index of every column but the key and `order_leaf`, an ordered table's
-/// order column, replaced by `NONE` in every row group, so the page
-/// minimums and maximums of the value columns, which the reader never
-/// consults and which dominate the index of a large-value table, are not
-/// resident (RFD 017), and the offset index of every column but the key,
-/// the order column, and `value_leaves`, the value columns the table serves
-/// that the file holds, replaced by an empty one, so a column the table
-/// does not serve costs nothing resident however wide the file (RFD 004,
-/// RFD 022). The key column and the order column keep both indexes: a Scan
-/// places its bounds by the order column's (RFD 025). A replaced entry
-/// stays in its place, so every kept one is still found at its leaf. Always
-/// a copy, never the footer moved: the bytes `ParquetMetaData::memory_size`
-/// reports follow each vector's capacity, which a copy sets from its
-/// contents alone, so the footer as kept and a copy of the footer as loaded
-/// measure the same and `predicted_resident_bytes` is exact from either.
+/// index of every column but the key replaced by `NONE` in every row group,
+/// so the page minimums and maximums of the value columns, which the reader
+/// never consults and which dominate the index of a large-value table, are
+/// not resident (RFD 017), nor those of an ordered table's order column,
+/// whose pages the order fences place (RFD 025); and the offset index of
+/// every column but the key, `order_leaf`, an ordered table's order
+/// column, and `value_leaves`, the value columns the table serves that the
+/// file holds, replaced by an empty one, so a column the table does not
+/// serve costs nothing resident however wide the file (RFD 004, RFD 022).
+/// A replaced entry stays in its place, so every kept one is still found
+/// at its leaf. Always a copy, never the footer moved: the bytes
+/// `ParquetMetaData::memory_size` reports follow each vector's capacity,
+/// which a copy sets from its contents alone, so the footer as kept and a
+/// copy of the footer as loaded measure the same and
+/// `predicted_resident_bytes` sizes the footer exactly from either. Only
+/// the footer as loaded holds the order column's column index that the
+/// estimate of string and binary order fences reads.
 pub(super) fn kept_footer(
     metadata: &ParquetMetaData,
     key_leaf: usize,
     order_leaf: Option<usize>,
     value_leaves: &[usize],
 ) -> ParquetMetaData {
-    let indexed = |leaf: usize| leaf == key_leaf || order_leaf == Some(leaf);
     let mut builder = metadata.clone().into_builder();
     if let Some(mut column_index) = builder.take_column_index() {
         for row_group in &mut column_index {
             for (leaf, entry) in row_group.iter_mut().enumerate() {
-                if !indexed(leaf) {
+                if leaf != key_leaf {
                     *entry = ColumnIndexMetaData::NONE;
                 }
             }
         }
         builder = builder.set_column_index(Some(column_index));
     }
+    let offsets =
+        |leaf: usize| leaf == key_leaf || order_leaf == Some(leaf) || value_leaves.contains(&leaf);
     if let Some(mut offset_index) = builder.take_offset_index() {
         for row_group in &mut offset_index {
             for (leaf, entry) in row_group.iter_mut().enumerate() {
-                if !indexed(leaf) && !value_leaves.contains(&leaf) {
+                if !offsets(leaf) {
                     *entry = OffsetIndexMetaData {
                         page_locations: Vec::new(),
                         unencoded_byte_array_data_bytes: None,
@@ -692,30 +695,17 @@ impl ResidentSet {
     }
 
     /// The parts `residency` holds (`ResidentParts`), with the footer split
-    /// over `kept`, the footer as kept that `footer` measures, whose order
-    /// column is at `order_leaf`; `None` only for Bloom when the filters
-    /// are. Each footer part is what `kept` loses without it, removed in
-    /// turn: the order column's column index, then the key column's, then
-    /// the offset indexes, so the footer parts sum to `footer`.
+    /// over `kept`, the footer as kept that `footer` measures; `None` only
+    /// for Bloom when the filters are. Each footer part is what `kept`
+    /// loses without it, removed in turn: the key column's column index,
+    /// the only one kept, then the offset indexes, so the footer parts sum
+    /// to `footer`.
     pub(super) fn parts(
         &self,
         kept: &ParquetMetaData,
-        order_leaf: Option<usize>,
         residency: Residency,
     ) -> Option<ResidentParts> {
         let size = |metadata: ParquetMetaData| approx::count(metadata.memory_size());
-        let mut builder = kept.clone().into_builder();
-        if let (Some(mut column_index), Some(leaf)) = (builder.take_column_index(), order_leaf) {
-            for row_group in &mut column_index {
-                if let Some(entry) = row_group.get_mut(leaf) {
-                    *entry = ColumnIndexMetaData::NONE;
-                }
-            }
-            builder = builder.set_column_index(Some(column_index));
-        } else {
-            builder = builder.set_column_index(kept.column_index().cloned());
-        }
-        let without_order_index = size(builder.build());
         let without_column_index = size(kept.clone().into_builder().set_column_index(None).build());
         let without_page_index = size(
             kept.clone()
@@ -731,8 +721,7 @@ impl ResidentSet {
         };
         Some(ResidentParts {
             footer: without_page_index,
-            key_column_index: without_order_index.saturating_sub(without_column_index),
-            order_column_index: self.footer.saturating_sub(without_order_index),
+            key_column_index: self.footer.saturating_sub(without_column_index),
             offset_indexes: without_column_index.saturating_sub(without_page_index),
             key_fences: self.fences,
             order_facts: self.order_facts,
@@ -1603,12 +1592,13 @@ mod tests {
         store(&fixture).await
     }
 
-    /// An ordered table keeps both page indexes of its order column, the
-    /// ones a Scan places its bounds by (RFD 025), where a key-value table
-    /// keeps neither for a column it does not serve; the prediction from
-    /// the footer as loaded stays exact.
+    /// An ordered table keeps the offset index of its order column, which
+    /// a Scan and the check across files read its pages by, and not its
+    /// column index, whose pages the order fences place (RFD 025), where a
+    /// key-value table keeps neither for a column it does not serve; the
+    /// prediction from the footer as loaded stays exact.
     #[tokio::test]
-    async fn test_build_keeps_both_page_indexes_of_the_order_column() {
+    async fn test_build_keeps_the_offset_index_of_the_order_column_alone() {
         let opened = long_order_file().await;
         let loaded = opened.handle.load_metadata().await.unwrap();
         let index = FileIndex::build(
@@ -1625,9 +1615,14 @@ mod tests {
         for row_group in 0..ROW_GROUPS {
             assert!(
                 matches!(
-                    kept.column_index().unwrap()[row_group][VALUE_LEAF],
+                    loaded.column_index().unwrap()[row_group][VALUE_LEAF],
                     ColumnIndexMetaData::INT64(_)
                 ),
+                "row group {row_group}: the writer wrote one"
+            );
+            assert_eq!(
+                kept.column_index().unwrap()[row_group][VALUE_LEAF],
+                ColumnIndexMetaData::NONE,
                 "row group {row_group}"
             );
             let pages = kept.offset_index().unwrap()[row_group][VALUE_LEAF].page_locations();
@@ -1650,7 +1645,7 @@ mod tests {
         let key_value = kept_footer(&loaded, index.key_leaf(), None, &[]);
         assert!(
             key_value.memory_size() < kept.memory_size(),
-            "the order column's indexes are resident"
+            "the order column's offset index is resident"
         );
         for row_group in 0..ROW_GROUPS {
             assert_eq!(

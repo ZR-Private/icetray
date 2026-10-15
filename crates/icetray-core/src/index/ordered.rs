@@ -1,20 +1,16 @@
 //! The ordered rules of verification (RFD 025, Load): an ordered table's
 //! order column decoded beside its key column, every row's key and order
 //! value strictly above the row's before it, across pages and row groups
-//! alike, each order page's values within its column index entry, and the
-//! order facts and the order fences (`order_fences`) recorded on the way;
-//! and, since the entries are then checked bounds, which pages an entry
-//! rules out of a range of order values. A key-value table never reaches
-//! this module.
+//! alike, and the order facts and the order fences (`order_fences`)
+//! recorded on the way. The writer's column index of the order column is
+//! neither read nor checked: the fences place every pair whatever it holds.
+//! A key-value table never reaches this module.
 
 use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
 
 use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType, Int32Type, Int64Type};
-use parquet::file::page_index::column_index::{
-    ByteArrayColumnIndex, ColumnIndexMetaData, PrimitiveColumnIndex,
-};
 
 use super::build::{
     ChunkBatches, DECODE_BATCH_RECORDS, KeyBatches, RunCheck, fixed_as_binary, is_utf8, read_column,
@@ -253,8 +249,6 @@ pub(super) struct GroupOutcome {
     not_utf8: bool,
     /// The row group's order fences outgrew what they are addressed by.
     fences_overflow: bool,
-    /// The first order page a value of lies outside its column index entry.
-    index_mismatch: Option<usize>,
     disorder: Option<Disorder>,
 }
 
@@ -275,11 +269,9 @@ impl GroupOutcome {
     /// The rest of what the row group `chunk` found, in order: a string
     /// order value that is not UTF-8 (`FileFault::OrderNotUtf8`), order
     /// fences past what they are addressed by
-    /// (`FileFault::OrderFencesOverflow`), an order page outside its column
-    /// index entry (`FileFault::OrderIndexMismatch`),
-    /// then a pair not above the one before it under `table`, an equal one
-    /// `RefusalReason::DuplicateRows` and a falling one
-    /// `RefusalReason::Unsorted`.
+    /// (`FileFault::OrderFencesOverflow`), then a pair not above the one
+    /// before it under `table`, an equal one `RefusalReason::DuplicateRows`
+    /// and a falling one `RefusalReason::Unsorted`.
     pub(super) fn check_values(self, table: &str, chunk: ColumnChunk<'_>) -> Result<()> {
         let path = chunk.column.path;
         let row_group = chunk.row_group();
@@ -290,12 +282,6 @@ impl GroupOutcome {
             return Err(file_fault(
                 path,
                 FileFault::OrderFencesOverflow { row_group },
-            ));
-        }
-        if let Some(page) = self.index_mismatch {
-            return Err(file_fault(
-                path,
-                FileFault::OrderIndexMismatch { row_group, page },
             ));
         }
         let reason = match self.disorder {
@@ -327,11 +313,8 @@ struct GroupState {
     started: bool,
     distinct: u64,
     not_utf8: bool,
-    /// The order page of the row last checked against the column index.
-    page: usize,
     /// The order page whose fence is next to be recorded.
     fence_page: usize,
-    index_mismatch: Option<usize>,
     disorder: Option<Disorder>,
 }
 
@@ -339,8 +322,7 @@ struct GroupState {
 /// and within one a decode window at a time, so that at most a window of
 /// keys and order values is held however long the row group is: whether
 /// each row's key and order value are above the row's before it, the last
-/// pair carried across windows and row groups, whether each order value
-/// lies within its page's column index entry, the order facts, and each
+/// pair carried across windows and row groups, the order facts, and each
 /// order page's fence.
 pub(super) struct PairCheck<'a> {
     /// The order column.
@@ -401,12 +383,6 @@ impl<'a> PairCheck<'a> {
         check_order_page_headers(order_chunk, self.shape, chunks)?;
         self.group = GroupState::default();
         let pages = order_chunk.page_locations().len();
-        if let Some(index) = order_column_index(order_chunk) {
-            let described = usize::try_from(index.num_pages()).unwrap_or(usize::MAX);
-            if described != pages {
-                self.group.index_mismatch = Some(described.min(pages));
-            }
-        }
         let rows = row_index(chunk.rows());
         let window = row_index(DECODE_BATCH_RECORDS);
         let mut run = RunCheck::ordered(chunk);
@@ -455,7 +431,6 @@ impl<'a> PairCheck<'a> {
             null_order: group.values < rows,
             not_utf8: group.not_utf8,
             fences_overflow,
-            index_mismatch: group.index_mismatch,
             disorder: group.disorder,
         };
         Ok((run, outcome))
@@ -478,11 +453,10 @@ impl<'a> PairCheck<'a> {
     /// The next window of the row group. Nothing more is compared or
     /// fenced once a window holds a null in either column, a key that is
     /// not UTF-8 (`keys_not_utf8`, which `RunCheck` found), or an order
-    /// value that is not, since a refusal or a fault then stands; the
-    /// column index is checked past a disorder, since a fault stands before
-    /// a refusal. Each order page starting in the window has its fence
-    /// recorded into `fences` before the window's pairs are compared,
-    /// against the pair before it.
+    /// value that is not, since a refusal or a fault then stands. Each
+    /// order page starting in the window has its fence recorded into
+    /// `fences` before the window's pairs are compared, against the pair
+    /// before it.
     fn visit(
         &mut self,
         order_chunk: ColumnChunk<'a>,
@@ -491,10 +465,7 @@ impl<'a> PairCheck<'a> {
         fences: &mut GroupFencesBuilder,
     ) {
         let Window {
-            base,
-            rows,
-            keys,
-            orders,
+            rows, keys, orders, ..
         } = *window;
         self.group.values += orders.len();
         if keys.len() != rows || orders.len() != rows {
@@ -507,7 +478,6 @@ impl<'a> PairCheck<'a> {
             self.group.not_utf8 = true;
             return;
         }
-        self.check_index(order_chunk, base, orders);
         if self.group.disorder.is_none() {
             self.record_fences(order_chunk, window, fences);
             self.check_pairs(keys, orders);
@@ -548,34 +518,6 @@ impl<'a> PairCheck<'a> {
                 return;
             }
             self.group.fence_page += 1;
-        }
-    }
-
-    /// Whether each of `orders`, rows from `base` on, lies within its
-    /// order page's column index entry, when the chunk has one; the first
-    /// page that a value does not is the mismatch. A truncated byte-array
-    /// entry is still a bound and is compared as one.
-    fn check_index(&mut self, chunk: ColumnChunk<'a>, base: usize, orders: &OrderRun) {
-        if self.group.index_mismatch.is_some() {
-            return;
-        }
-        let Some(entry) = order_column_index(chunk) else {
-            return;
-        };
-        let locations = chunk.page_locations();
-        let page = &mut self.group.page;
-        for at in 0..orders.len() {
-            let row = base + at;
-            while locations
-                .get(*page + 1)
-                .is_some_and(|next| row_index(next.first_row_index) <= row)
-            {
-                *page += 1;
-            }
-            if !within(entry, *page, orders, at) {
-                self.group.index_mismatch = Some(*page);
-                return;
-            }
         }
     }
 
@@ -651,153 +593,4 @@ struct Window<'w> {
     rows: usize,
     keys: &'w Keys,
     orders: &'w OrderRun,
-}
-
-/// The column index entry of `chunk`, an order column chunk; `None` when
-/// the file has none for it, which the check across files reads every page
-/// of.
-pub(super) fn order_column_index(chunk: ColumnChunk<'_>) -> Option<&ColumnIndexMetaData> {
-    let entry = chunk
-        .column
-        .metadata
-        .column_index()?
-        .get(chunk.row_group())?
-        .get(chunk.column.leaf)?;
-    match entry {
-        ColumnIndexMetaData::NONE => None,
-        ColumnIndexMetaData::BOOLEAN(_)
-        | ColumnIndexMetaData::INT32(_)
-        | ColumnIndexMetaData::INT64(_)
-        | ColumnIndexMetaData::INT96(_)
-        | ColumnIndexMetaData::FLOAT(_)
-        | ColumnIndexMetaData::DOUBLE(_)
-        | ColumnIndexMetaData::BYTE_ARRAY(_)
-        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => Some(entry),
-    }
-}
-
-/// Whether page `page`'s entry of the column index `entry` meets the
-/// closed range `orders`: its minimum at or below the range's top and its
-/// maximum at or above its bottom, an integer entry against longs and a
-/// byte-array entry against bytes. Verification checked that every value
-/// of a page lies within its entry (`within`), so a page that does not
-/// meet the range holds no value in it. An entry that bounds nothing for
-/// these values, of another type or with a bound missing, meets every
-/// range.
-pub(super) fn page_meets(
-    entry: &ColumnIndexMetaData,
-    page: usize,
-    orders: (&OrderValue, &OrderValue),
-) -> bool {
-    match entry {
-        ColumnIndexMetaData::INT32(index) => primitive_meets(index, page, orders, i64::from),
-        ColumnIndexMetaData::INT64(index) => primitive_meets(index, page, orders, |value| value),
-        ColumnIndexMetaData::BYTE_ARRAY(index)
-        | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index) => bytes_meet(index, page, orders),
-        ColumnIndexMetaData::NONE
-        | ColumnIndexMetaData::BOOLEAN(_)
-        | ColumnIndexMetaData::INT96(_)
-        | ColumnIndexMetaData::FLOAT(_)
-        | ColumnIndexMetaData::DOUBLE(_) => true,
-    }
-}
-
-/// `page_meets` for an integer entry, its values widened to longs by
-/// `widen`.
-fn primitive_meets<T: Copy>(
-    index: &PrimitiveColumnIndex<T>,
-    page: usize,
-    orders: (&OrderValue, &OrderValue),
-    widen: fn(T) -> i64,
-) -> bool {
-    match (index.min_value(page), index.max_value(page), orders) {
-        (Some(&min), Some(&max), (OrderValue::Long(low), OrderValue::Long(high))) => {
-            widen(min) <= *high && *low <= widen(max)
-        }
-        (None | Some(_), None | Some(_), _) => true,
-    }
-}
-
-/// `page_meets` for a byte-array entry.
-fn bytes_meet(
-    index: &ByteArrayColumnIndex,
-    page: usize,
-    (low, high): (&OrderValue, &OrderValue),
-) -> bool {
-    match (
-        index.min_value(page),
-        index.max_value(page),
-        order_bytes(low),
-        order_bytes(high),
-    ) {
-        (Some(min), Some(max), Some(low), Some(high)) => min <= high && low <= max,
-        (None | Some(_), None | Some(_), None | Some(_), None | Some(_)) => true,
-    }
-}
-
-/// The bytes a string or binary order value compares by; `None` for a long.
-fn order_bytes(value: &OrderValue) -> Option<&[u8]> {
-    match value {
-        OrderValue::Str(text) => Some(text.as_bytes()),
-        OrderValue::Bytes(bytes) => Some(bytes),
-        OrderValue::Long(_) => None,
-    }
-}
-
-/// Whether value `at` of `orders` lies within page `page`'s entry of the
-/// column index `entry`: at or above its minimum and at or below its
-/// maximum, an integer entry against a long numerically and a byte-array
-/// entry against bytes bytewise. A page the entry calls all null, or an
-/// entry of a type the column's values are not, bounds nothing.
-fn within(entry: &ColumnIndexMetaData, page: usize, orders: &OrderRun, at: usize) -> bool {
-    match (entry, orders) {
-        (ColumnIndexMetaData::INT32(index), OrderRun::Long(run)) => {
-            within_primitive(index, page, run[at], i64::from)
-        }
-        (ColumnIndexMetaData::INT64(index), OrderRun::Long(run)) => {
-            within_primitive(index, page, run[at], |value| value)
-        }
-        (
-            ColumnIndexMetaData::BYTE_ARRAY(index)
-            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index),
-            OrderRun::Str(run) | OrderRun::Bin(run),
-        ) => within_bytes(index, page, run[at].data()),
-        (
-            ColumnIndexMetaData::INT32(_) | ColumnIndexMetaData::INT64(_),
-            OrderRun::Str(_) | OrderRun::Bin(_),
-        )
-        | (
-            ColumnIndexMetaData::BYTE_ARRAY(_) | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
-            OrderRun::Long(_),
-        )
-        | (
-            ColumnIndexMetaData::NONE
-            | ColumnIndexMetaData::BOOLEAN(_)
-            | ColumnIndexMetaData::INT96(_)
-            | ColumnIndexMetaData::FLOAT(_)
-            | ColumnIndexMetaData::DOUBLE(_),
-            OrderRun::Long(_) | OrderRun::Str(_) | OrderRun::Bin(_),
-        ) => false,
-    }
-}
-
-/// `within` for an integer entry, its values widened to longs by `widen`.
-fn within_primitive<T: Copy>(
-    index: &PrimitiveColumnIndex<T>,
-    page: usize,
-    value: i64,
-    widen: fn(T) -> i64,
-) -> bool {
-    match (index.min_value(page), index.max_value(page)) {
-        (Some(&min), Some(&max)) => widen(min) <= value && value <= widen(max),
-        (None | Some(_), None) | (None, Some(_)) => false,
-    }
-}
-
-/// `within` for a byte-array entry.
-fn within_bytes(index: &ByteArrayColumnIndex, page: usize, value: &[u8]) -> bool {
-    match (index.min_value(page), index.max_value(page)) {
-        (Some(min), Some(max)) => min <= value && value <= max,
-        (None | Some(_), None) | (None, Some(_)) => false,
-    }
 }

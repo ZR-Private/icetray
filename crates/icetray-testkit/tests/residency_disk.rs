@@ -23,7 +23,7 @@ use icetray_core::{
     RefusalReason, Row, ScanBounds, Storage,
 };
 use icetray_testkit::fixture::{
-    FOUR_BUCKETS, IDS_4K, NAMESPACE, SAMPLE, TINY_BUDGET, local_catalog,
+    FOUR_BUCKETS, IDS_4K, NAMESPACE, ONE_BUCKET, SAMPLE, TINY_BUDGET, local_catalog,
 };
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
@@ -273,6 +273,120 @@ async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read(
     );
     assert_eq!(storage.stats().local_reads(), 0, "no chunk is read back");
     assert_eq!(restarted, first);
+    Ok(())
+}
+
+/// Ids of the rolled ordered fixture, all in one bucket, and its rows per
+/// key: fewer than a page holds, so a key a file boundary cuts lies on one
+/// order page on each side of it.
+const ROLLED_IDS: std::ops::Range<u64> = 0..200;
+const ROLLED_ROWS_PER_KEY: u64 = 3;
+
+fn rolled_rows(_id: u64) -> u64 {
+    ROLLED_ROWS_PER_KEY
+}
+
+/// Rows per page of the rolled fixture, which its writer writes a batch
+/// at a time, and the file size it rolls at: about a dozen batches, so
+/// each file holds many pages and its runs cross into the next file.
+const ROLLED_PAGE_ROWS: usize = 4;
+const ROLLED_FILE_BYTES: usize = 4 * 1024;
+
+/// The local reads one edge page of a rolled file costs a Disk merge:
+/// its order page and the key page of the same rows, each read from the
+/// chunk file.
+const EDGE_PAGE_READS: u64 = 2;
+
+/// The files a shared edge key lies in: the one ending at it and the one
+/// starting at it.
+const SIDES_OF_AN_EDGE: u64 = 2;
+
+/// The local bytes a Disk merge reads of the last order page of `file`,
+/// when `last`, or its first: the page and the key page holding the same
+/// rows, which the rolled fixture writes in pages of the same rows.
+fn edge_page_bytes(file: &icetray_core::LoadedFile, last: bool) -> u64 {
+    let metadata = file.index.metadata();
+    let offsets = metadata.offset_index().expect("an offset index");
+    let row_group = if last { offsets.len() - 1 } else { 0 };
+    let at = |leaf: usize| {
+        let pages = offsets[row_group][leaf].page_locations();
+        let page = if last { pages.len() - 1 } else { 0 };
+        pages[page].clone()
+    };
+    let order = at(file.index.order_leaf().expect("an ordered file"));
+    let key = at(file.index.key_leaf());
+    assert_eq!(order.first_row_index, key.first_row_index, "aligned pages");
+    count(
+        usize::try_from(order.compressed_page_size + key.compressed_page_size)
+            .expect("page sizes are not negative"),
+    )
+}
+
+/// A Disk restart of an ordered table whose files one compaction rolled
+/// by size, meeting at edge keys, trusts every chunk file and reads back
+/// only the edge pages for the check across files (RFD 025, Refresh): per
+/// key two neighbours share, the first file's last order page and the
+/// second's first, each with the key page of its rows, and nothing else.
+#[tokio::test]
+async fn test_disk_restart_of_a_rolled_ordered_table_reads_only_edge_pages() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let scratch = tempfile::tempdir()?;
+    let ordered = Ordered {
+        kind: OrderKind::Long,
+        rows_per_key: rolled_rows,
+        start: 0,
+        step: 1,
+    };
+    let spec = FixtureSpec {
+        ids: ROLLED_IDS,
+        buckets: ONE_BUCKET,
+        layout: icetray_testkit::Layout {
+            page_rows: ROLLED_PAGE_ROWS,
+            target_file_bytes: ROLLED_FILE_BYTES,
+            ..icetray_testkit::Layout::contract()
+        },
+        ..FixtureSpec::ordered("ordered_disk_rolled", KeyType::Long, ordered)
+    };
+    let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    drop(served?);
+    drop(local);
+
+    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let served = served?;
+    let generation = served.current();
+    let files = &generation.files;
+    let mut shared = 0;
+    let mut chains = 0;
+    let mut bytes = 0;
+    let mut chained = false;
+    for pair in files.windows(2) {
+        let meets_next = pair[0].index.key_range().1 == pair[1].index.key_range().0;
+        if meets_next {
+            shared += 1;
+            bytes += edge_page_bytes(&pair[0], true) + edge_page_bytes(&pair[1], false);
+            if !chained {
+                chains += 1;
+            }
+        }
+        chained = meets_next;
+    }
+    let stats = storage.stats();
+    assert!(
+        files.len() >= 3 && shared >= 2 && chains >= 1,
+        "a rolled table"
+    );
+    assert_eq!(
+        stats.gets(),
+        METADATA_FILE_GETS + LOAD_METADATA_GETS + count(files.len()),
+        "metadata and footers only: every chunk file is trusted"
+    );
+    assert_eq!(
+        (stats.local_reads(), stats.local_bytes()),
+        (SIDES_OF_AN_EDGE * EDGE_PAGE_READS * shared, bytes),
+        "the edge pages alone"
+    );
+    assert_eq!(generation.overlap_groups_verified(), chains);
     Ok(())
 }
 

@@ -627,8 +627,9 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 /// object storage, so a result computed under other rules is never trusted.
 /// Version 2 verifies an ordered table's rows by key and order value and
 /// records its order facts (RFD 025); version 3 records its order fences
-/// besides.
-pub(super) const VERIFIER_VERSION: u32 = 3;
+/// besides; version 4 no longer checks the order column's values against
+/// the writer's column index.
+pub(super) const VERIFIER_VERSION: u32 = 4;
 
 /// The verification context of this build for keys of `key_type` under
 /// `rules`.
@@ -686,14 +687,12 @@ fn verify(
 /// groups, deleted rows included, so an equal pair is
 /// `RefusalReason::DuplicateRows` naming the key and the order value and a
 /// falling one `RefusalReason::Unsorted`; a null order value is
-/// `RefusalReason::NullOrder`, a `string` order value that is not UTF-8
-/// `FileFault::OrderNotUtf8`, and an order page whose values its column
-/// index entry does not bound `FileFault::OrderIndexMismatch`. Every order
-/// page header is checked as a value page's is before its row group
-/// decodes. Within a row group, a decode fault stands before a null key, a
-/// null key before a null order value, that before a key and then an order
-/// value that is not UTF-8, those before an index mismatch, and that before
-/// a pair out of order. Records the order facts and the order fences
+/// `RefusalReason::NullOrder`, and a `string` order value that is not
+/// UTF-8 `FileFault::OrderNotUtf8`. Every order page header is checked as a
+/// value page's is before its row group decodes. Within a row group, a
+/// decode fault stands before a null key, a null key before a null order
+/// value, that before a key and then an order value that is not UTF-8, and
+/// those before a pair out of order. Records the order facts and the order fences
 /// besides what `verify` records. The keys are read by parquet's column
 /// reader alone.
 fn verify_ordered(
@@ -1596,7 +1595,7 @@ mod tests {
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
         Opened, Orders, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows,
         fault_of, group_rows, header_at, key_for, location, long_orders, longs, moved_by_header,
-        ordered_layout, pages_of, predicted_of, row_of, stepped, store, store_file,
+        ordered_layout, pages_of, predicted_from, predicted_of, row_of, stepped, store, store_file,
         with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
         with_pages,
     };
@@ -3936,12 +3935,13 @@ mod tests {
         verify_ordered(TABLE, &column, KeyShape::Long, order, &chunks)
     }
 
-    /// Each order page's values lie within its column index entry (RFD
-    /// 025, Load): the key column's index stood in for the order column's
-    /// fails to bound the order page, and the file's own index bounds it,
-    /// truncated or not.
+    /// Verification never reads the order column's column index (RFD 025,
+    /// Load): with the key column's index stood in for it, an index that
+    /// bounds no order page, a file verifies to the same order facts and
+    /// fences as under its own index; and a byte-array index the writer
+    /// truncated leaves the facts exact.
     #[tokio::test]
-    async fn test_verify_ordered_refuses_a_column_index_that_fails_to_bound_its_page() {
+    async fn test_verify_ordered_ignores_the_order_column_index() {
         let opened = store(&ordered_of(&[(1, 100), (1, 200), (2, 100)])).await;
         let loaded = opened.handle.load_metadata().await.unwrap();
         let schema = loaded.file_metadata().schema_descr();
@@ -3951,22 +3951,18 @@ mod tests {
                 .unwrap()
         };
         let (key_leaf, order_leaf) = (leaf_of(KEY_COLUMN), leaf_of(ORDER_COLUMN));
-        assert!(
-            verify_ordered_over(&opened, &loaded, OrderType::Long)
-                .await
-                .is_ok()
-        );
+        let own = verify_ordered_over(&opened, &loaded, OrderType::Long)
+            .await
+            .unwrap();
         let mut builder = ParquetMetaData::clone(&loaded).into_builder();
         let mut column_index = builder.take_column_index().unwrap();
         column_index[0][order_leaf] = column_index[0][key_leaf].clone();
         let key_index = builder.set_column_index(Some(column_index)).build();
-        assert_eq!(
-            fault_of(verify_ordered_over(&opened, &key_index, OrderType::Long).await),
-            FileFault::OrderIndexMismatch {
-                row_group: 0,
-                page: 0
-            }
-        );
+        let stood_in = verify_ordered_over(&opened, &key_index, OrderType::Long)
+            .await
+            .unwrap();
+        assert_eq!(stood_in.order, own.order);
+        assert!(own.order.is_some());
 
         let long_text =
             |n: usize| Some(format!("{:a>len$}{n}", "", len = LONG_ORDER_BYTES).into_bytes());
@@ -4754,14 +4750,15 @@ mod tests {
 
     /// The Full tier's resident bytes and the Disk tier's chunk file of
     /// `opened`, built under a `string` order column, beside what the
-    /// footer predicted for each.
+    /// footer as loaded predicted for each.
     async fn budget_of(opened: &Opened) -> ([u64; 2], [u64; 2]) {
         let layout = ordered_layout(KeyType::Long, OrderType::String);
         let full = opened
             .build_under(&layout, Residency::Full, None)
             .await
             .unwrap();
-        let predicted = predicted_of(&full);
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        let predicted = predicted_from(&full, &loaded);
         let dir = tempfile::tempdir().unwrap();
         let local = testing::local_dir(dir.path(), opened.stats(), None);
         opened
@@ -4791,13 +4788,13 @@ mod tests {
             (
                 "truncated",
                 |layout| layout.truncate = Some(BUDGET_TRUNCATE_BYTES),
-                [2_556_112, 2_491_492],
+                [2_442_080, 2_377_460],
                 [2_269_697, 2_205_036],
             ),
             (
                 "full",
                 |_| {},
-                [2_748_592, 2_683_876],
+                [2_442_560, 2_377_844],
                 [2_269_793, 2_205_036],
             ),
             (
@@ -4838,7 +4835,7 @@ mod tests {
     /// it (review 1, Important 1): beyond the footer's estimate, the
     /// reservation grows by the rest, refused as `OverBudget` where the
     /// budget does not hold it though it held the estimate. The Full tier's
-    /// prediction falls as far short, 412,025 bytes for 2,224,079 resident,
+    /// prediction falls as far short, 258,840 bytes for 2,070,894 resident,
     /// which the load charges once built (`generation::check_built_budget`).
     #[tokio::test]
     async fn test_disk_tier_charges_the_exact_ordered_chunk_file_before_writing_it() {
@@ -4851,7 +4848,7 @@ mod tests {
         );
         let opened = store(&fixture).await;
         let (full, [estimate, exact]) = budget_of(&opened).await;
-        assert_eq!(full, [412_025, 2_224_079], "predicted and resident");
+        assert_eq!(full, [258_840, 2_070_894], "predicted and resident");
         assert_eq!(
             [estimate, exact],
             [150_385, 1_963_372],

@@ -54,7 +54,7 @@ use ordered::OrderVerified;
 pub(crate) use page_header::check_chunk_page_headers;
 use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
-pub(crate) use pairs::{Bounds, PairChunks, Pairs, RowSpan};
+pub(crate) use pairs::{PairChunks, Pairs};
 pub(crate) use run::RunSource;
 
 /// A row's position in a file: its row group and its row within that group.
@@ -207,24 +207,6 @@ pub enum FileFault {
         /// The row group whose fences overflow.
         row_group: usize,
     },
-    /// An order page holds a value outside its column index entry, below
-    /// the entry's minimum or above its maximum, or the order column's
-    /// column index of a row group describes another count of pages than
-    /// its offset index (RFD 025, Load): the check across files rules pages
-    /// out of its merge by that index, so an index that fails to bound its
-    /// pages would leave a repeated pair unread. A truncated byte-array
-    /// entry is still a bound, its minimum a prefix of the least value and
-    /// its maximum above the greatest.
-    #[error(
-        "page {page} of row group {row_group} holds an order value outside its column index entry"
-    )]
-    OrderIndexMismatch {
-        /// The row group holding the page.
-        row_group: usize,
-        /// The page, counted among the order column's data pages in the
-        /// row group.
-        page: usize,
-    },
     /// A value column's physical type is neither `BYTE_ARRAY` nor
     /// `FIXED_LEN_BYTE_ARRAY`. The snapshot's schema admitted the column as
     /// binary, fixed, or string (`TableLayout::derive` refuses anything else
@@ -298,7 +280,6 @@ impl Recurs for FileFault {
             | Self::OrderNotUtf8 { .. }
             // Found decoding the order pages, which may be a local copy.
             | Self::OrderFencesOverflow { .. }
-            | Self::OrderIndexMismatch { .. }
             | Self::DecoderPanicked {
                 part: DecodedPart::Pages { .. },
                 ..
@@ -407,19 +388,17 @@ impl ResidentBytes {
 /// fences, the order facts, and the order fences exact. The parts sum to
 /// `FileIndex::resident_bytes`, and a part the index's tier does not hold
 /// is zero. Each page index part is the memory the kept footer loses
-/// without it, the order column's column index taken out first, then the
-/// key column's, then the offset indexes, and `footer` is what remains.
+/// without it, the key column's column index taken out first, then the
+/// offset indexes, and `footer` is what remains.
 /// Serializes with these field names, for a reader that reports sizes by
 /// part.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ResidentParts {
     /// The footer as kept, without its page indexes.
     pub footer: u64,
-    /// The key column's column index.
+    /// The key column's column index, the only column index the footer
+    /// keeps.
     pub key_column_index: u64,
-    /// An ordered table's order column's column index; zero on a
-    /// key-value table.
-    pub order_column_index: u64,
     /// Every offset index the footer keeps: the key column's, an ordered
     /// table's order column's, and each served value column's.
     pub offset_indexes: u64,
@@ -443,7 +422,6 @@ impl ResidentParts {
         saturating_sum([
             self.footer,
             self.key_column_index,
-            self.order_column_index,
             self.offset_indexes,
             self.key_fences,
             self.order_facts,
@@ -460,9 +438,6 @@ impl ResidentParts {
         Self {
             footer: self.footer.saturating_add(other.footer),
             key_column_index: self.key_column_index.saturating_add(other.key_column_index),
-            order_column_index: self
-                .order_column_index
-                .saturating_add(other.order_column_index),
             offset_indexes: self.offset_indexes.saturating_add(other.offset_indexes),
             key_fences: self.key_fences.saturating_add(other.key_fences),
             order_facts: self.order_facts.saturating_add(other.order_facts),
@@ -871,10 +846,10 @@ pub(crate) struct ValueRead {
 #[derive(Debug)]
 pub struct FileIndex {
     handle: Arc<FileHandle>,
-    /// The footer with the page indexes of the key column and of an
-    /// ordered table's order column, and the offset index of every value
-    /// column the table serves; every other column index and offset index
-    /// is dropped at build (`kept_footer`).
+    /// The footer with the page indexes of the key column, the offset index
+    /// of an ordered table's order column, and the offset index of every
+    /// value column the table serves; every other column index and offset
+    /// index is dropped at build (`kept_footer`).
     metadata: Arc<ParquetMetaData>,
     /// The key leaf, how the keys decode, the value column the file holds
     /// per column of the table's layout, `None` for one the file was
@@ -895,7 +870,8 @@ pub struct FileIndex {
     max_key_bytes: usize,
     /// What verifying an ordered file's order column recorded, its order
     /// facts and its order fences (RFD 025); `None` on a key-value table.
-    /// The column's offset index and column index stay in the kept footer.
+    /// The column's offset index stays in the kept footer, its column
+    /// index does not.
     order: Option<OrderVerified>,
     rows: i64,
 }
@@ -935,8 +911,7 @@ impl FileIndex {
     /// `RefusalReason::DuplicateRows`, one below the pair before it
     /// `RefusalReason::Unsorted`, a null order value
     /// `RefusalReason::NullOrder`, and a string order value that is not
-    /// UTF-8 or an order page outside its column index entry a file fault
-    /// (RFD 025). The Disk tier with no
+    /// UTF-8 a file fault (RFD 025). The Disk tier with no
     /// local directory is `Error::Config` with
     /// `ConfigViolation::DiskResidencyWithoutLocalDir`, before any chunk is
     /// fetched.
@@ -1283,7 +1258,7 @@ impl FileIndex {
             &leaves,
         );
         self.resident_set()
-            .parts(&kept, self.order_leaf(), self.residency())
+            .parts(&kept, self.residency())
             .expect(BOUNDED_FILTERS)
     }
 
@@ -3659,9 +3634,9 @@ mod tests {
     }
 
     /// The parts `resident_parts` reports sum to `resident_bytes` in every
-    /// tier, an ordered file's order column index and order facts among
-    /// them and a key-value file's zero; each tier holds only its own key
-    /// structure, the chunks under Full and the filters under Bloom.
+    /// tier, an ordered file's order facts and order fences among them and
+    /// a key-value file's zero; each tier holds only its own key structure,
+    /// the chunks under Full and the filters under Bloom.
     #[tokio::test]
     async fn test_resident_parts_sum_to_resident_bytes_in_every_tier() {
         const ROWS_PER_KEY: usize = 10;
@@ -3682,10 +3657,10 @@ mod tests {
             for (part, bytes) in [
                 ("footer", parts.footer),
                 ("key column index", parts.key_column_index),
-                ("order column index", parts.order_column_index),
                 ("offset indexes", parts.offset_indexes),
                 ("key fences", parts.key_fences),
                 ("order facts", parts.order_facts),
+                ("order fences", parts.order_fences),
             ] {
                 assert!(bytes > 0, "{residency}: {part}");
             }
@@ -3700,13 +3675,14 @@ mod tests {
             let parts = index.resident_parts();
             assert_eq!(parts.total(), count(index.resident_bytes()), "{residency}");
             assert!(parts.key_column_index > 0 && parts.key_fences > 0);
-            assert_eq!((parts.order_column_index, parts.order_facts), (0, 0));
+            assert_eq!((parts.order_facts, parts.order_fences), (0, 0));
         }
     }
 
-    /// An ordered file whose writer left out the order column's column
-    /// index reports none of it, and its parts still sum to
-    /// `resident_bytes`, the order column's offset index among them.
+    /// The footer keeps no order column index (RFD 025, Load): an ordered
+    /// file whose writer wrote one holds exactly what the same file without
+    /// it holds, part by part, and the parts still sum to `resident_bytes`,
+    /// the order column's offset index among them.
     #[tokio::test]
     async fn test_resident_parts_of_a_file_without_an_order_column_index() {
         const ROWS_PER_KEY: usize = 10;
@@ -3736,10 +3712,9 @@ mod tests {
                 count(index.resident_bytes()),
                 "{residency}"
             );
-            assert_eq!(without.order_column_index, 0, "{residency}");
-            assert!(with.order_column_index > 0, "{residency}");
-            assert_eq!(without.offset_indexes, with.offset_indexes, "{residency}");
-            assert!(without.key_column_index > 0 && without.order_facts > 0);
+            assert_eq!(without, with, "{residency}");
+            assert!(without.key_column_index > 0 && without.offset_indexes > 0);
+            assert!(without.order_facts > 0 && without.order_fences > 0);
         }
     }
 }
