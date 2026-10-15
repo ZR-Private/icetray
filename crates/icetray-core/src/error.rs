@@ -245,7 +245,7 @@ pub enum Error {
     /// answered its keys: the runtime it was spawned on shut down under it.
     /// A panic in that task is resumed on the caller instead, never turned
     /// into an error.
-    #[error("a lookup task of table {table} was canceled: {source}")]
+    #[error("a task of a multi_get or multi_scan of table {table} was canceled: {source}")]
     LookupCanceled {
         /// The table's configured name.
         table: String,
@@ -406,7 +406,8 @@ pub enum ErrorKind {
     RefreshDeadline,
     /// `Error::VerifyCanceled`.
     VerifyCanceled,
-    /// `Error::LookupCanceled`.
+    /// `Error::LookupCanceled`: a task of a `multi_get` or `multi_scan`
+    /// canceled as the runtime shut down.
     LookupCanceled,
 }
 

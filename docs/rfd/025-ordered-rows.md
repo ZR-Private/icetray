@@ -227,23 +227,23 @@ direction under a limit and optional bounds on the order value.
   the table's lookup window.
 - **Limits.** `server.batch_fan_out`, renamed from
   `server.multi_get_fan_out`, bounds the GETs one MultiGet, one Scan, or
-  one MultiScan holds in flight. A MultiScan spreads its keys across idle
-  worker threads as a MultiGet does: while fewer calls than worker
-  threads are in flight, its distinct keys are split in order into up to
-  one run per worker of at least 32 keys each, and the runs are read on
-  several cores at once under the one bound. A MultiScan of 32 distinct
-  keys or fewer, or one that arrives while as many calls as worker
-  threads are in flight, reads its keys on one task. Its answers, their
-  order, its counts, and the response bound are the same either way.
-  Spreading cuts a lone MultiScan's latency for more CPU per key, spent
-  only while cores would otherwise sit idle.
-  `server.max_multi_scan_values`, 4,000 by default, bounds a
-  MultiScan's keys times its limit times one more than its requested
-  columns, a limit of 0 counting as `max_scan_rows`, and the server
-  rejects a larger call before it reads any key. A
-  configuration whose `max_multi_scan_values` is below twice an ordered
-  table's `max_scan_rows` is refused, so a MultiScan of one key at the
-  full limit and one column is always valid. That limit applies to a
+  one MultiScan holds in flight. A MultiScan spreads its keys across
+  idle worker threads as a MultiGet does: while fewer calls than worker
+  threads are in flight, its distinct keys are split in order and evenly
+  into one run for each 32 distinct keys or part of 32, up to one run
+  per worker, and the runs are read on several cores at once under the
+  one bound. A MultiScan of 32 distinct keys or fewer, or one that
+  arrives while as many calls as worker threads are in flight, reads its
+  keys on one task. Its answers, their order, its counts, and the
+  response bound are the same either way. Spreading cuts a lone
+  MultiScan's latency for more CPU per key, spent only while cores would
+  otherwise sit idle. `server.max_multi_scan_values`, 4,000 by default,
+  bounds a MultiScan's keys times its limit times one more than its
+  requested columns, a limit of 0 counting as `max_scan_rows`, and the
+  server rejects a larger call before it reads any key. A configuration
+  whose `max_multi_scan_values` is below twice an ordered table's
+  `max_scan_rows` is refused, so a MultiScan of one key at the full
+  limit and one column is always valid. That limit applies to a
   MultiScan of one key as to any other, and a caller reading one key's
   full limit over many columns uses Scan. `server.scan_deadline`, 5 s by
   default, bounds one Scan and each span GET, and

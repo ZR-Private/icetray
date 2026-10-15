@@ -129,13 +129,16 @@ order page, and a `Scan` reads the order values from their pages.
 ### MultiScan across worker threads
 
 While fewer calls than worker threads are in flight, icetray splits a
-`MultiScan`'s distinct keys, in order, into up to one run per worker
-thread of at least 32 keys, and reads the runs on several cores at once,
-as it splits a `MultiGet`'s keys into runs of at least 8. A `MultiScan`
-of 32 distinct keys or fewer, and any `MultiScan` that arrives while as
-many calls as worker threads are in flight, reads its keys on one task.
-The runs share the call's `server.batch_fan_out` slots, and the answer,
-the response bound, and the metrics are the same either way.
+`MultiScan`'s distinct keys, in order and evenly, into one run for each
+32 distinct keys or part of 32, up to one run per worker thread, and
+reads the runs on several cores at once, as it splits a `MultiGet`'s
+keys into one run for each 8 keys or part of 8. On 11 worker threads, 33
+distinct keys make two runs of 17 and 16, and 100 make four runs of 25.
+A `MultiScan` of 32 distinct keys or fewer, and any `MultiScan` that
+arrives while as many calls as worker threads are in flight, reads its
+keys on one task. The runs share the call's `server.batch_fan_out`
+slots, and the answer, the response bound, and the metrics are the same
+either way.
 
 Spreading trades CPU for latency. Measured warm under `full` on local
 files, at a limit of 1, a lone `MultiScan` took a median of 0.32 ms at

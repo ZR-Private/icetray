@@ -47,21 +47,22 @@ use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
-/// The fewest keys one task of a `multi_get` is given: 8. A warm hit's
-/// decode is on the order of ten microseconds, so a task of eight keys
-/// holds about a hundred microseconds of work, far more than spawning it
-/// costs, and a batch of a hundred keys still spreads over a dozen
-/// workers.
+/// The keys per run of a split `multi_get`: 8, one run for each 8 keys
+/// or part of 8, up to one per worker (`Lookups::runs`). A warm hit's
+/// decode is on the order of ten microseconds, so eight keys hold about a
+/// hundred microseconds of work, far more than spawning a run costs, and a
+/// batch of a hundred keys still spreads over a dozen workers.
 const MULTI_GET_TASK_KEYS_MIN: usize = 8;
 
-/// The fewest distinct keys one task of a `multi_scan` is given: 32. A
-/// warm Scan of one key costs about what a warm hit does, and a spread
-/// `multi_scan` pays for its spawns, the wakeups across workers, and
-/// workers spinning before they park on every run. Measured over warm
-/// Scans at limit 1, runs of at least 32 keys cut a lone call's latency to
-/// about a third at 100 keys and a fifth at 1,000, for 10% and 70% more
-/// CPU per key, spent only while workers would otherwise sit idle; a call
-/// of fewer keys stays on its task.
+/// The distinct keys per run of a split `multi_scan`: 32, one run for
+/// each 32 distinct keys or part of 32, up to one per worker
+/// (`Lookups::runs`), so a call of 32 distinct keys or fewer stays on its
+/// task. A warm Scan of one key costs about what a warm hit does, and a
+/// spread `multi_scan` pays for its spawns, the wakeups across workers,
+/// and workers spinning before they park on every run. Measured over warm
+/// Scans at limit 1, splitting so cut a lone call's latency to about a
+/// third at 100 keys and a fifth at 1,000, for 10% and 70% more CPU per
+/// key, spent only while workers would otherwise sit idle.
 const MULTI_SCAN_TASK_KEYS_MIN: usize = 32;
 
 /// Where a table is in its lifecycle. Display gives the `state` metric
@@ -526,17 +527,19 @@ impl Lookups {
         self.in_flight.enter()
     }
 
-    /// The runs a batch of `keys` keys is split into: up to one per worker
-    /// thread (`shard::workers`), each of at least `keys_min` keys
-    /// (`MULTI_GET_TASK_KEYS_MIN` for a `multi_get`,
-    /// `MULTI_SCAN_TASK_KEYS_MIN` for a `multi_scan`), while fewer calls
-    /// than worker threads are in flight on the tables sharing this one's
-    /// count, the batch's own included; one run otherwise. A split batch
-    /// waits on its slowest run, and on busy workers its runs queue behind
-    /// other calls' work, so splitting pays while some workers would sit
-    /// idle and costs once they are all busy. Calls to every table of the
-    /// process run on the same workers, so their count is the signal, not
-    /// this table's alone.
+    /// The runs a batch of `keys` keys is split into: one for each
+    /// `keys_min` keys or part of them (`MULTI_GET_TASK_KEYS_MIN` for a
+    /// `multi_get`, `MULTI_SCAN_TASK_KEYS_MIN` for a `multi_scan`), up to
+    /// one per worker thread (`shard::workers`), while fewer calls than
+    /// worker threads are in flight on the tables sharing this one's count,
+    /// the batch's own included; one run otherwise. The caller splits its
+    /// keys evenly over the runs, so a run may hold fewer than `keys_min`:
+    /// 33 keys under a `keys_min` of 32 make two runs of 17 and 16. A split
+    /// batch waits on its slowest run, and on busy workers its runs queue
+    /// behind other calls' work, so splitting pays while some workers would
+    /// sit idle and costs once they are all busy. Calls to every table of
+    /// the process run on the same workers, so their count is the signal,
+    /// not this table's alone.
     fn runs(&self, keys: usize, keys_min: usize) -> usize {
         let workers = shard::workers();
         if self.in_flight.sum() < workers {
@@ -1609,10 +1612,10 @@ impl Table {
     /// (RFD 010), a malformed value of any key included (RFD 024). While
     /// fewer `get` and `multi_get` calls than worker threads are in flight
     /// on the tables sharing this one's `TableHandles::calls`, this one
-    /// included, the keys are split, in order, into up to one run per
-    /// worker thread (`shard::workers`) of at least
-    /// `MULTI_GET_TASK_KEYS_MIN` keys, each spawned as a task so a batch's
-    /// decodes run on several cores (`Lookups::runs`). A batch that makes
+    /// included, the keys are split, in order and evenly, into one run for
+    /// each `MULTI_GET_TASK_KEYS_MIN` keys or part of them, up to one per
+    /// worker thread (`shard::workers`), each spawned as a task so a
+    /// batch's decodes run on several cores (`Lookups::runs`). A batch that makes
     /// one run, as a batch does once that many calls are in flight, is
     /// looked up here, unspawned. `open_with` gives every table of a
     /// process one count, so calls to any of them count toward holding a
@@ -1711,11 +1714,11 @@ impl Table {
     /// listed more than once is read once and its answer given at each
     /// position. While fewer calls than worker threads are in flight on
     /// the tables sharing this one's `TableHandles::calls`, this one
-    /// included, the distinct keys are split, in order, into up to one run
-    /// per worker thread (`shard::workers`) of at least
-    /// `MULTI_SCAN_TASK_KEYS_MIN` keys, each spawned as a task, as
-    /// `multi_get` splits its keys (`Lookups::runs`); keys that make one
-    /// run are read here, unspawned. Each run reads at most
+    /// included, the distinct keys are split, in order and evenly, into one
+    /// run for each `MULTI_SCAN_TASK_KEYS_MIN` distinct keys or part of
+    /// them, up to one per worker thread (`shard::workers`), each spawned
+    /// as a task, as `multi_get` splits its keys (`Lookups::runs`); keys
+    /// that make one run are read here, unspawned. Each run reads at most
     /// `TableHandles::batch_fan_out` keys at once, and the runs share one
     /// bound of that many GETs in flight; any failure fails the whole call
     /// (RFD 010). Dropping the returned future aborts the runs still
@@ -7767,10 +7770,11 @@ mod tests {
         );
     }
 
-    /// Runs hold at least `MULTI_SCAN_TASK_KEYS_MIN` distinct keys each: a
-    /// key listed twice is read once, so it counts once toward a run.
+    /// A `MultiScan` makes one run for each `MULTI_SCAN_TASK_KEYS_MIN`
+    /// distinct keys or part of them: a key listed twice is read once, so
+    /// it counts once, and one key past the minimum makes a second run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_multi_scan_splits_its_distinct_keys_into_runs_of_the_task_minimum() {
+    async fn test_multi_scan_makes_a_run_for_each_task_minimum_of_distinct_keys() {
         assert_eq!(shard::workers(), SPLIT_WORKERS);
         let (once, twice, idle) = (1, 2, 0);
         let below = MULTI_SCAN_TASK_KEYS_MIN - 1;

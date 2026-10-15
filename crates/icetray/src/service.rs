@@ -434,8 +434,8 @@ async fn within<T>(
 /// retry (no generation yet, an object-store, cache, or local-directory
 /// failure, a catalog call that failed, a catalog or load that did not
 /// answer in time, a load's key
-/// verification or a batch's lookup task canceled as the runtime shut
-/// down) is
+/// verification or a task of a `MultiGet` or `MultiScan` canceled as the
+/// runtime shut down) is
 /// `UNAVAILABLE`; every other failure is `INTERNAL`. The message is the
 /// error's `Display`.
 pub fn status_from(error: &Error) -> Status {
