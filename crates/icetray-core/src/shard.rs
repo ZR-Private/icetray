@@ -80,6 +80,13 @@ impl<T> Sharded<T> {
         &self.shards[slot() & (self.shards.len() - 1)].0
     }
 
+    /// The shard `hash` masks to, for state split by a key rather than by
+    /// thread: callers whose keys' hashes differ in their low bits use
+    /// distinct shards, whichever thread they run on.
+    pub(crate) fn of(&self, hash: u64) -> &T {
+        &self.shards[crate::approx::length(hash) & (self.shards.len() - 1)].0
+    }
+
     /// Every shard, for a reader that sums or takes them.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.shards.iter().map(|line| &line.0)
@@ -125,6 +132,17 @@ mod tests {
             .filter(|&value| value > 0)
             .collect();
         assert_eq!(written, [2], "both writes reach one shard");
+    }
+
+    #[test]
+    fn test_sharded_of_is_the_shard_a_hash_masks_to() {
+        let sharded: Sharded<AtomicUsize> = Sharded::new();
+        let shards: Vec<&AtomicUsize> = sharded.iter().collect();
+        let wrapped = 2 * shards.len();
+        for hash in 0..wrapped {
+            let shard = sharded.of(crate::approx::count(hash));
+            assert!(std::ptr::eq(shard, shards[hash % shards.len()]));
+        }
     }
 
     #[test]

@@ -5,13 +5,15 @@
 //! evicted from memory is written there, served back with a local read and
 //! no GET, and recovered when the next process opens the same directory.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -334,20 +336,67 @@ pub struct PageCache {
     fetch_deadline: Option<Duration>,
 }
 
-/// The pages span reads of one cache are fetching (`PageCache::get_span`):
-/// per page, the outcome its fetch will publish, and the count of pages a
-/// span read found in flight and waited for.
-#[derive(Debug, Default)]
+/// The pages span reads of one cache are fetching (`PageCache::get_span`),
+/// split by file over `shard::count()` shards, so that span reads of
+/// different files, and so of different tables, mostly take different
+/// locks; and the count of pages a span read found in flight and waited
+/// for.
 struct SpanFlights {
-    /// Never held across an `await`.
-    pages:
-        std::sync::Mutex<std::collections::HashMap<PageKey, watch::Receiver<Option<SpanOutcome>>>>,
+    shards: Sharded<FlightShard>,
+    /// Picks a file's shard from its id.
+    hasher: RandomState,
     joined: AtomicU64,
+}
+
+impl SpanFlights {
+    fn new() -> Self {
+        Self {
+            shards: Sharded::new(),
+            hasher: RandomState::new(),
+            joined: AtomicU64::new(0),
+        }
+    }
+
+    /// The shard that holds the pages of `file` in flight.
+    fn shard(&self, file: &Arc<str>) -> &FlightShard {
+        self.shards.of(self.hasher.hash_one(&**file))
+    }
+}
+
+impl fmt::Debug for SpanFlights {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpanFlights")
+            .field("joined", &self.joined.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The pages in flight of the files one shard of `SpanFlights` holds: per
+/// page, the outcome its fetch will publish.
+#[derive(Default)]
+struct FlightShard {
+    /// Never held across an `await`.
+    pages: Mutex<InFlight>,
+    /// How many times `lock` has taken `pages`: what the lock tests count.
+    #[cfg(test)]
+    locked: AtomicU64,
+}
+
+impl FlightShard {
+    /// The shard's pages in flight, locked.
+    fn lock(&self) -> MutexGuard<'_, InFlight> {
+        #[cfg(test)]
+        self.locked.fetch_add(1, Ordering::Relaxed);
+        self.pages.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// What a span fetch publishes for one of its pages: the page's bytes, or
 /// why the fetch produced none.
 type SpanOutcome = std::result::Result<Bytes, FetchFailed>;
+
+/// Pages in flight, each with the receiver its fetch publishes to.
+type InFlight = HashMap<PageKey, watch::Receiver<Option<SpanOutcome>>>;
 
 impl PageCache {
     /// Opens a cache holding at most `capacity_bytes` of pages in memory,
@@ -393,7 +442,7 @@ impl PageCache {
             level: Arc::new(level),
             hits: Arc::new(Hits::new(name)),
             fetches: Arc::new(Fetches::new(name)),
-            spans: Arc::new(SpanFlights::default()),
+            spans: Arc::new(SpanFlights::new()),
             fetch_deadline: None,
         }
     }
@@ -485,18 +534,19 @@ impl PageCache {
     /// The pages at `pages`, ranges of the file `file` in ascending order
     /// that do not overlap, each page's bytes in that order, and whether any
     /// came from outside. A page in memory is served from it, counted as a
-    /// hit. A page another span read of this cache is fetching is waited
-    /// for and served from that fetch, counted in neither `hits` nor
-    /// `fetches`, so concurrent span reads that need one page issue one GET
-    /// for it, as `get_or_fetch` coalesces a lookup's page (RFD 025,
-    /// Caching and hedging); its fetch's failure is this read's. Every
-    /// maximal run of the remaining pages whose ranges meet end to start is
-    /// one call of `fetch` over the run's whole range and the count of pages
-    /// it holds, its bytes split by page and each page inserted as its own
-    /// entry, keyed by `file` and the page's offset as `get_or_fetch` keys a
-    /// page, so that a later read of any one of them finds it alone, then
-    /// handed to every read waiting on it. The runs are fetched together,
-    /// and the waits run beside them.
+    /// hit, without the in-flight lock, so a read memory holds whole takes
+    /// no lock at all (`pending`). A page another span read of this cache
+    /// is fetching is waited for and served from that fetch, counted in
+    /// neither `hits` nor `fetches`, so concurrent span reads that need one
+    /// page issue one GET for it, as `get_or_fetch` coalesces a lookup's
+    /// page (RFD 025, Caching and hedging); its fetch's failure is this
+    /// read's. Every maximal run of the remaining pages whose ranges meet
+    /// end to start is one call of `fetch` over the run's whole range and
+    /// the count of pages it holds, its bytes split by page and each page
+    /// inserted as its own entry, keyed by `file` and the page's offset as
+    /// `get_or_fetch` keys a page, so that a later read of any one of them
+    /// finds it alone, then handed to every read waiting on it. The runs
+    /// are fetched together, and the waits run beside them.
     /// Each run takes one permit of `issue` before it claims its pages as in
     /// flight and holds it until it ends, so none waits for a permit while
     /// it holds one (RFD 022), and no read waits on a run still queued for
@@ -642,36 +692,56 @@ impl PageCache {
         Some(held)
     }
 
-    /// Takes stock of `pages` of `file` that `served` does not hold yet,
-    /// under the in-flight lock: a page in memory is served and counted a
-    /// hit, a page another read is fetching is joined and counted in
-    /// `span_joins`, and every maximal run of the rest whose ranges meet end
-    /// to start is to be fetched. Nothing is claimed here: a run claims its
-    /// pages only once it holds its permit (`claim_run`).
+    /// Takes stock of `pages` of `file` that `served` does not hold yet: a
+    /// page in memory is served and counted a hit, a page another read is
+    /// fetching is joined and counted in `span_joins`, and every maximal run
+    /// of the rest whose ranges meet end to start is to be fetched. Memory
+    /// is read first without the in-flight lock, since a page in memory is
+    /// whole and final, so a read memory holds whole takes no lock; the
+    /// lock of `file`'s shard is taken only for the pages memory lacks, and
+    /// memory is read again under it for a page not in flight, whose fetch
+    /// may have inserted it and given up its claim in between. Nothing is
+    /// claimed here: a run claims its pages only once it holds its permit
+    /// (`claim_run`).
     fn pending(
         &self,
         file: &Arc<str>,
         pages: &[Range<u64>],
         served: &mut [Option<Bytes>],
     ) -> Pending {
-        let flights = self
-            .spans
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut missing = false;
+        for (at, page) in pages.iter().enumerate() {
+            if served[at].is_some() {
+                continue;
+            }
+            match self.in_memory(&PageKey(Arc::clone(file), page.start)) {
+                Some(held) => {
+                    self.record_hit();
+                    served[at] = Some(held);
+                }
+                None => missing = true,
+            }
+        }
+        if !missing {
+            return Pending {
+                runs: Vec::new(),
+                waits: Vec::new(),
+            };
+        }
         let mut waits = Vec::new();
         let mut wanted = vec![false; pages.len()];
+        let flights = self.spans.shard(file).lock();
         for (at, page) in pages.iter().enumerate() {
             if served[at].is_some() {
                 continue;
             }
             let key = PageKey(Arc::clone(file), page.start);
-            if let Some(held) = self.in_memory(&key) {
-                self.record_hit();
-                served[at] = Some(held);
-            } else if let Some(flight) = flights.get(&key) {
+            if let Some(flight) = flights.get(&key) {
                 self.spans.joined.fetch_add(1, Ordering::Relaxed);
                 waits.push((at, flight.clone()));
+            } else if let Some(held) = self.in_memory(&key) {
+                self.record_hit();
+                served[at] = Some(held);
             } else {
                 wanted[at] = true;
             }
@@ -682,8 +752,8 @@ impl PageCache {
         }
     }
 
-    /// Claims as in flight, under the in-flight lock so no page is claimed
-    /// twice, the first stretch of `run` of `pages` of `file` that is
+    /// Claims as in flight, under the lock of `file`'s shard so no page is
+    /// claimed twice, the first stretch of `run` of `pages` of `file` that is
     /// neither in memory nor in flight now; `None` when no page of `run` is.
     /// The pages of `run` before and after that stretch are left to the
     /// read's next pass. Memory is checked under the lock, and a fetch
@@ -695,11 +765,8 @@ impl PageCache {
         pages: &[Range<u64>],
         run: Range<usize>,
     ) -> Option<Claim<'_>> {
-        let mut flights = self
-            .spans
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let shard = self.spans.shard(file);
+        let mut flights = shard.lock();
         let free = |at: &usize| {
             let key = PageKey(Arc::clone(file), pages[*at].start);
             !flights.contains_key(&key) && self.in_memory(&key).is_none()
@@ -715,7 +782,7 @@ impl PageCache {
             })
             .collect();
         Some(Claim {
-            flights: &self.spans,
+            flights: shard,
             run: start..end,
             senders,
         })
@@ -865,7 +932,7 @@ struct Pending {
 /// read dropped before its fetch ends leaves its waiters to claim the
 /// pages again, their senders gone with no outcome.
 struct Claim<'a> {
-    flights: &'a SpanFlights,
+    flights: &'a FlightShard,
     run: Range<usize>,
     senders: Vec<(PageKey, watch::Sender<Option<SpanOutcome>>)>,
 }
@@ -886,11 +953,7 @@ impl Claim<'_> {
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        let mut flights = self
-            .flights
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut flights = self.flights.lock();
         for (key, _) in &self.senders {
             flights.remove(key);
         }
@@ -1996,6 +2059,82 @@ mod tests {
         );
         assert_eq!(cache.span_joins(), 1, "it joined the claimed page");
         assert_eq!(cache.fetches(), 3, "each page fetched once");
+    }
+
+    /// File ids tried to find one whose in-flight shard differs from an
+    /// anchor's; with one shard per test worker, the first few suffice.
+    const SHARD_SEARCH_FILES: usize = 1024;
+    /// Times a cold span read of `SPAN` takes its shard's lock: to take
+    /// stock, to claim its one run, and to release the claim.
+    const COLD_SPAN_LOCKS: u64 = 3;
+    /// Warm span reads each concurrent test task makes.
+    const WARM_READS: usize = 64;
+
+    /// A file id whose pages in flight fall in a shard other than
+    /// `anchor`'s.
+    fn file_of_another_shard(cache: &PageCache, anchor: &Arc<str>) -> Arc<str> {
+        (0..SHARD_SEARCH_FILES)
+            .map(|n| Arc::<str>::from(format!("{FILE_ID}.{n}")))
+            .find(|id| !std::ptr::eq(cache.spans.shard(id), cache.spans.shard(anchor)))
+            .unwrap()
+    }
+
+    /// Span reads of two files, as Scans of two tables make, never take one
+    /// lock: a cold read takes only its own file's shard's lock, and warm
+    /// reads running together on several workers take no in-flight lock at
+    /// all, since memory holds every page they read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_get_span_of_two_files_takes_no_shared_lock_and_warm_reads_none() {
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let file = span_file();
+        let first: Arc<str> = Arc::from(FILE_ID);
+        let second = file_of_another_shard(&cache, &first);
+        let locked = |id: &Arc<str>| cache.spans.shard(id).locked.load(Ordering::Relaxed);
+        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
+        cache
+            .get_span(&first, &SPAN, Issue::default(), answering)
+            .await
+            .unwrap();
+        assert_eq!(
+            (locked(&first), locked(&second)),
+            (COLD_SPAN_LOCKS, 0),
+            "a cold read locks its own file's shard alone"
+        );
+        cache
+            .get_span(&second, &SPAN, Issue::default(), answering)
+            .await
+            .unwrap();
+        assert_eq!(
+            (locked(&first), locked(&second)),
+            (COLD_SPAN_LOCKS, COLD_SPAN_LOCKS)
+        );
+        let hits = cache.hits();
+        let files = [&first, &second];
+        let warm = files.map(|id| {
+            let (cache, id) = (cache.clone(), Arc::clone(id));
+            tokio::spawn(async move {
+                for _ in 0..WARM_READS {
+                    let (_, origin) = cache
+                        .get_span(&id, &SPAN, Issue::default(), |_, _| never())
+                        .await
+                        .unwrap();
+                    assert_eq!(origin, PageOrigin::Cached);
+                }
+            })
+        });
+        for task in warm {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            (locked(&first), locked(&second)),
+            (COLD_SPAN_LOCKS, COLD_SPAN_LOCKS),
+            "warm reads take no in-flight lock"
+        );
+        assert_eq!(
+            cache.hits() - hits,
+            count(files.len() * WARM_READS * SPAN.len())
+        );
+        assert_eq!(cache.fetches(), 2, "one run per file");
     }
 
     /// The lookup cache's and the scan cache's series are their own, told
