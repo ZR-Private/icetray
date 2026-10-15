@@ -11,7 +11,8 @@ use std::io::Write as _;
 use base64::Engine as _;
 use icetray_core::generation::{Lookup, Row};
 use icetray_core::{
-    ErrorKind, FileReport, Finding, Key, RefusalReason, SnapshotId, TableSummary, Unwalked,
+    ErrorKind, FileReport, Finding, Key, OrderValue, RefusalReason, SnapshotId, TableSummary,
+    Unwalked,
 };
 use serde::Serialize;
 use serde::ser::SerializeMap as _;
@@ -324,6 +325,46 @@ impl<'a> LookupLine<'a> {
             gets,
             elapsed_micros,
         }
+    }
+}
+
+/// The greatest magnitude a JSON number holds exactly in a reader that
+/// parses numbers as doubles: 2^53, where a double's significand ends. A
+/// long order value past it is exact in the text and rounded in such a
+/// reader.
+pub const MAX_EXACT_JSON_INTEGER: u64 = 1 << f64::MANTISSA_DIGITS;
+
+/// Whether `order` is written as a JSON number a double-parsing reader
+/// rounds: a long whose magnitude exceeds `MAX_EXACT_JSON_INTEGER`. A string
+/// or hex value is text and never rounds.
+fn loses_precision_as_json(order: &OrderValue) -> bool {
+    match order {
+        OrderValue::Long(value) => value.unsigned_abs() > MAX_EXACT_JSON_INTEGER,
+        OrderValue::Str(_) | OrderValue::Bytes(_) => false,
+    }
+}
+
+/// Whether any of `files`' `file` lines carries a long order value that
+/// `loses_precision_as_json`. Only a `file` line carries an order value: no
+/// other line of `doctor` or `info` does.
+fn carries_inexact_order(files: &[FileReport]) -> bool {
+    files
+        .iter()
+        .filter_map(|file| file.order.as_ref())
+        .any(|order| loses_precision_as_json(&order.min) || loses_precision_as_json(&order.max))
+}
+
+/// Writes the one warning of `table` on stderr, through the log stream, when
+/// its `file` lines carry a long order value past 2^53. A run calls it once
+/// per table, after printing the table's `file` lines, so each affected
+/// table is named once. It changes nothing on stdout.
+pub fn warn_if_inexact_order(table: &str, files: &[FileReport]) {
+    if carries_inexact_order(files) {
+        tracing::warn!(
+            table,
+            max_exact = MAX_EXACT_JSON_INTEGER,
+            "file lines carry order values past 2^53, which are exact as JSON text but lose precision in readers that parse numbers as doubles"
+        );
     }
 }
 
@@ -662,6 +703,60 @@ mod tests {
         assert_eq!(line["order"]["max"], Json::String("0x00ab".to_string()));
         assert_eq!(line["order"]["longest_run"], Json::from(LONGEST_RUN));
         assert_eq!(line["order"]["distinct_keys"], Json::from(DISTINCT_KEYS));
+    }
+
+    /// The greatest long a double-parsing reader holds exactly, as a signed
+    /// value.
+    const EXACT_LONG: i64 = 1 << f64::MANTISSA_DIGITS;
+
+    /// A file whose order column holds `min` through `max`.
+    fn ordered_file(min: OrderValue, max: OrderValue) -> FileReport {
+        let mut file = file_report();
+        file.order = Some(FileOrderReport {
+            min,
+            max,
+            longest_run: LONGEST_RUN,
+            distinct_keys: DISTINCT_KEYS.to_vec(),
+        });
+        file
+    }
+
+    #[test]
+    fn test_carries_inexact_order_is_false_at_2_pow_53_and_true_one_past_it() {
+        let at = |min, max| carries_inexact_order(&[ordered_file(min, max)]);
+        let long = OrderValue::Long;
+        assert_eq!(u64::try_from(EXACT_LONG), Ok(MAX_EXACT_JSON_INTEGER));
+        assert!(!at(long(EXACT_LONG), long(EXACT_LONG)));
+        assert!(!at(long(-EXACT_LONG), long(-EXACT_LONG)));
+        assert!(at(long(0), long(EXACT_LONG + 1)));
+        assert!(at(long(-EXACT_LONG - 1), long(0)));
+        assert!(at(long(i64::MIN), long(i64::MAX)));
+    }
+
+    #[test]
+    fn test_carries_inexact_order_ignores_text_values_and_files_without_an_order() {
+        let text = ordered_file(
+            OrderValue::Str("9".repeat(32)),
+            OrderValue::Bytes(vec![u8::MAX; 16]),
+        );
+        assert!(!carries_inexact_order(&[file_report(), text]));
+        assert!(!carries_inexact_order(&[]));
+    }
+
+    #[test]
+    fn test_carries_inexact_order_finds_one_file_among_many() {
+        let exact = ordered_file(OrderValue::Long(0), OrderValue::Long(EXACT_LONG));
+        let past = ordered_file(OrderValue::Long(0), OrderValue::Long(EXACT_LONG + 1));
+        assert!(carries_inexact_order(&[exact.clone(), past, exact]));
+    }
+
+    #[test]
+    fn test_serialize_file_line_writes_an_inexact_order_as_its_exact_digits() {
+        let past = EXACT_LONG + 1;
+        let file = ordered_file(OrderValue::Long(-past), OrderValue::Long(past));
+        let text = serde_json::to_string(&FileLine::new(TABLE, &file)).unwrap();
+        assert!(text.contains(&format!("\"min\":{}", -past)), "{text}");
+        assert!(text.contains(&format!("\"max\":{past}")), "{text}");
     }
 
     #[test]

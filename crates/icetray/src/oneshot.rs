@@ -16,6 +16,7 @@ use crate::error::{CliError, EXIT_BELOW_LEVEL, EXIT_FAILURE, EXIT_OK};
 use crate::key_text;
 use crate::output::{
     FileLine, FindingLine, LookupLine, RefusalLine, SummaryLine, UnwalkedLine, emit,
+    warn_if_inexact_order,
 };
 
 /// Opens every table of `config`, or the one named by `only`, logging the
@@ -67,7 +68,9 @@ async fn load_all(opened: &Opened) -> Vec<(Arc<Table>, icetray_core::Result<()>)
 /// is never strict (`Target::config`). The findings are the run's output,
 /// so the load logs them at debug alone. The exit code is `EXIT_FAILURE`
 /// when any table was refused, else `EXIT_BELOW_LEVEL` when any is below
-/// its declared level, else `EXIT_OK`.
+/// its declared level, else `EXIT_OK`. With `files`, a table whose `file`
+/// lines carry a long order value past 2^53 also gets one warning on
+/// stderr (`warn_if_inexact_order`); stdout is unchanged.
 pub async fn doctor(
     config: &Config,
     only: Option<&str>,
@@ -109,6 +112,7 @@ pub async fn doctor(
                     for file in &report.files {
                         emit(&FileLine::new(table.name(), file))?;
                     }
+                    warn_if_inexact_order(table.name(), &report.files);
                 }
                 let summary = &report.summary;
                 if let Err(error) = judge(

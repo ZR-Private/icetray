@@ -612,6 +612,11 @@ fn seven_rows(_id: u64) -> u64 {
 /// `ORDER_ROWS_PER_KEY` timestamps `ORDER_STEP` apart from `ORDER_START`,
 /// or all at `ORDER_START` when `step` is zero, which repeats every pair.
 fn ordered_spec(name: &str, step: i64) -> FixtureSpec {
+    ordered_spec_of(name, OrderKind::Timestamp, ORDER_START, step)
+}
+
+/// `ordered_spec` with the order column's kind and first value given.
+fn ordered_spec_of(name: &str, kind: OrderKind, start: i64, step: i64) -> FixtureSpec {
     FixtureSpec {
         ids: IDS_2K,
         buckets: TWO_BUCKETS,
@@ -619,9 +624,9 @@ fn ordered_spec(name: &str, step: i64) -> FixtureSpec {
             name,
             KeyType::Long,
             Ordered {
-                kind: OrderKind::Timestamp,
+                kind,
                 rows_per_key: seven_rows,
-                start: ORDER_START,
+                start,
                 step,
             },
         )
@@ -707,6 +712,195 @@ async fn test_doctor_leaves_a_key_value_table_s_lines_without_order() -> TestRes
     let report = lines(&output.stdout);
     assert!(report.iter().any(|line| line["kind"] == "file"));
     assert!(report.iter().all(|line| line.get("order").is_none()));
+    Ok(())
+}
+
+/// The greatest long a reader that parses JSON numbers as doubles holds
+/// exactly.
+const EXACT_ORDER: i64 = 1 << f64::MANTISSA_DIGITS;
+
+/// The log field the precision warning carries the table's name in.
+const WARNING_TABLE_FIELD: &str = "table";
+
+/// The log field the precision warning carries the exact limit in.
+const WARNING_LIMIT_FIELD: &str = "max_exact";
+
+/// The tables the precision warnings of a run on stderr name, in the order
+/// the run logged them: the warn-level events carrying the limit field.
+fn precision_warnings(output: &Output) -> Vec<String> {
+    let limit = Json::from(EXACT_ORDER);
+    stderr(output)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+        .filter(|event| event["level"] == "warn" && event[WARNING_LIMIT_FIELD] == limit)
+        .map(|event| {
+            event[WARNING_TABLE_FIELD]
+                .as_str()
+                .expect("the warning names its table")
+                .to_string()
+        })
+        .collect()
+}
+
+/// An ordered table of `ORDER_ROWS_PER_KEY` timestamps in nanoseconds a
+/// step of one apart, the last at `last`.
+async fn nanosecond_fixture(dir: &Path, name: &str, last: i64) -> Result<Fixture, BoxError> {
+    let first = last - i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    local_fixture(dir, ordered_spec_of(name, OrderKind::TimestampNs, first, 1)).await
+}
+
+/// A `doctor --files` run under `config`, which must exit 0.
+fn doctor_files(config: &str, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    let output = run(
+        &[&["doctor", "--config", config, "--files"], extra].concat(),
+        env,
+    );
+    assert_exit(&output, EXIT_OK);
+    output
+}
+
+/// The warning appears for a long order value of 2^53 + 1 and not for 2^53,
+/// and either way stdout carries the value as the exact number.
+#[tokio::test]
+async fn test_doctor_warns_when_a_file_line_carries_an_order_past_2_pow_53() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let cases = [
+        ("at_limit", EXACT_ORDER, false),
+        ("past_limit", EXACT_ORDER + 1, true),
+    ];
+    for (name, last, warns) in cases {
+        let fixture = nanosecond_fixture(dir.path(), name, last).await?;
+        let config = write_file(
+            dir.path(),
+            &format!("{name}.toml"),
+            &toml_ordered_table(TABLE_A, &fixture, None),
+        )?;
+        let output = doctor_files(&config, &[], &[]);
+        let expected: &[String] = if warns { &[TABLE_A.to_string()] } else { &[] };
+        assert_eq!(precision_warnings(&output), expected, "{name}");
+        let max = lines(&output.stdout)
+            .into_iter()
+            .find(|line| line["kind"] == "file")
+            .map(|line| line["order"]["max"].clone());
+        assert_eq!(max, Some(Json::from(last)), "{name}");
+    }
+    Ok(())
+}
+
+/// The negative side of the limit: a file whose least order value is
+/// -2^53 does not warn and one at -2^53 - 1 does.
+#[tokio::test]
+async fn test_doctor_warns_when_a_file_line_carries_an_order_below_minus_2_pow_53() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let span = i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    let cases = [
+        ("negative_at_limit", -EXACT_ORDER + span, false),
+        ("negative_past_limit", -EXACT_ORDER - 1 + span, true),
+    ];
+    for (name, last, warns) in cases {
+        let fixture = nanosecond_fixture(dir.path(), name, last).await?;
+        let config = write_file(
+            dir.path(),
+            &format!("{name}.toml"),
+            &toml_ordered_table(TABLE_A, &fixture, None),
+        )?;
+        let output = doctor_files(&config, &[], &[]);
+        let expected: &[String] = if warns { &[TABLE_A.to_string()] } else { &[] };
+        assert_eq!(precision_warnings(&output), expected, "{name}");
+    }
+    Ok(())
+}
+
+/// The warning goes to stderr alone: with the log stream silenced, stdout
+/// is the same bytes, and every stdout line is still one of the output
+/// contract's JSON lines.
+#[tokio::test]
+async fn test_doctor_warning_leaves_stdout_unchanged() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = nanosecond_fixture(dir.path(), "events_wide", EXACT_ORDER + 1).await?;
+    let config = write_file(
+        dir.path(),
+        "wide.toml",
+        &toml_ordered_table(TABLE_A, &fixture, None),
+    )?;
+    let warned = doctor_files(&config, &[], &[]);
+    let silenced = doctor_files(&config, &[], &[("RUST_LOG", "off")]);
+    assert_eq!(precision_warnings(&warned), [TABLE_A.to_string()]);
+    assert!(precision_warnings(&silenced).is_empty());
+    assert!(!warned.stdout.is_empty());
+    assert_eq!(warned.stdout, silenced.stdout);
+    assert!(
+        lines(&warned.stdout)
+            .iter()
+            .all(|line| line["kind"].is_string() && line["table"] == TABLE_A)
+    );
+    Ok(())
+}
+
+/// A run over two tables that both carry such a value warns once for
+/// each, naming each table once; a third table that does not is not named.
+#[tokio::test]
+async fn test_doctor_warns_once_for_each_table_that_carries_an_order_past_2_pow_53() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let first = nanosecond_fixture(dir.path(), "wide_first", EXACT_ORDER + 1).await?;
+    let second = nanosecond_fixture(dir.path(), "wide_second", EXACT_ORDER + 1).await?;
+    let narrow = nanosecond_fixture(dir.path(), "narrow", EXACT_ORDER).await?;
+    let text = format!(
+        "{}{}{}",
+        toml_ordered_table(TABLE_A, &first, None),
+        toml_ordered_table(TABLE_B, &second, None),
+        toml_ordered_table("c", &narrow, None),
+    );
+    let config = write_file(dir.path(), "three.toml", &text)?;
+    let output = doctor_files(&config, &[], &[]);
+    let mut named = precision_warnings(&output);
+    named.sort();
+    assert_eq!(named, [TABLE_A.to_string(), TABLE_B.to_string()]);
+    Ok(())
+}
+
+/// A table's lines carry an order value only on `file` lines, so a `doctor`
+/// without `--files` and `info` print no such number and warn of none,
+/// whatever the table holds.
+#[tokio::test]
+async fn test_doctor_and_info_without_file_lines_never_warn_of_an_order() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = nanosecond_fixture(dir.path(), "events_quiet", EXACT_ORDER + 1).await?;
+    let config = write_file(
+        dir.path(),
+        "quiet.toml",
+        &toml_ordered_table(TABLE_A, &fixture, None),
+    )?;
+    let doctor = run(&["doctor", "--config", &config], &[]);
+    assert_exit(&doctor, EXIT_OK);
+    assert!(precision_warnings(&doctor).is_empty());
+    assert!(
+        lines(&doctor.stdout)
+            .iter()
+            .all(|line| line["kind"] != "file")
+    );
+    let info = run(&["info", "--config", &config], &[]);
+    assert_exit(&info, EXIT_OK);
+    assert!(precision_warnings(&info).is_empty());
+    Ok(())
+}
+
+/// A string order column is JSON text and never warns, whatever it holds.
+#[tokio::test]
+async fn test_doctor_does_not_warn_of_a_string_order() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let fixture = local_fixture(
+        dir.path(),
+        ordered_spec_of("events_text", OrderKind::Str, EXACT_ORDER + 1, 1),
+    )
+    .await?;
+    let config = write_file(
+        dir.path(),
+        "text.toml",
+        &toml_ordered_table(TABLE_A, &fixture, None),
+    )?;
+    let output = doctor_files(&config, &[], &[]);
+    assert!(precision_warnings(&output).is_empty());
     Ok(())
 }
 

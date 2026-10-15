@@ -675,7 +675,15 @@ Two conventions hold for every line:
   and lowercase hex for `binary` and `fixed`. The number is exact as
   text, and a reader that parses JSON numbers as doubles loses precision
   above 2^53, as `timestamp_ns` and `timestamptz_ns` values are, so such
-  a reader parses these keys as 64-bit integers.
+  a reader parses these keys as 64-bit integers. Only a [`file` line](#file)
+  carries an order value, in `order.min` and `order.max`. When a `doctor
+  --files` run prints one whose magnitude exceeds 2^53 (9,007,199,254,740,992),
+  it logs one `warn` event on stderr for the table, with the table's name in
+  `table` and 2^53 in `max_exact`, saying such values are exact as JSON
+  text but lose precision in readers that parse numbers as doubles. A table
+  is named once per run, however many of its files carry such a value, and
+  stdout is the same with or without the event. `doctor` without `--files`
+  and `info` print no order value and never warn.
 
 #### `table`
 
