@@ -338,8 +338,8 @@ ALTER TABLE db.events WRITE LOCALLY ORDERED BY key, ts;
   its offset index, which Iceberg's writers write by default. A `Scan`
   places its bounds, and a refresh chooses the order pages it compares,
   by the order fences icetray records from the rows at load, one per
-  order page, so both read the same pages whether the writer keeps the
-  order column's column index whole, truncates it, or leaves it out.
+  order page, so neither depends on whether the writer keeps the order
+  column's column index whole, truncates it, or leaves it out.
 
 ### Requirements of an ordered table
 

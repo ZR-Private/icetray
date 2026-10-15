@@ -23,7 +23,7 @@
 > value from the decompressed page in place, where the column reader
 > builds and reference-counts each value it decodes. The column reader
 > reads every other page, and any page the plain reader cannot read
-> exactly, so no other layout needs a path of its own.
+> exactly. See RFD 025.
 
 ## Problem
 
@@ -49,8 +49,10 @@ the CPU a lookup spends beside its GET.
 
 ## Decision
 
-Lookups will decode keys and values with the Parquet column reader over the
-in-memory byte segments they are handed (a resident key chunk, a page from
+Lookups will decode keys with the Parquet column reader, and values with
+icetray's plain reader where a value page holds plain byte arrays and with
+the column reader otherwise, over the in-memory byte segments they are
+handed (a resident key chunk, a page from
 the page cache, or a key page from a disk-tier chunk file), keeping Arrow
 out of the path and treating any attempt to read a byte outside those
 segments as an error rather than a fetch.
@@ -68,8 +70,10 @@ The path is the same for every table whose key chunks are resident:
    column, a warm one costs none, and concurrent lookups for one page
    share one GET. A column the file answers by its default (RFD 023
    (Column resolution)) reads nothing.
-4. The column reader decodes one row from each page and returns the
-   values in the order the lookup named their columns.
+4. One row is decoded from each page, by the plain reader for a page of
+   plain byte arrays in a column neither nested nor repeated and with no
+   dictionary page, and by the column reader for every other page, and
+   the values return in the order the lookup named their columns.
 5. A value whose read names fields of a column declared protobuf (RFD
    024 (Field projection)) is walked over its top-level fields and
    trimmed to the ones named, after the page cache, so the cached page
@@ -95,10 +99,14 @@ hand back one row, and it puts Arrow in the hot path. On the same fixtures
 the column reader was faster in every case
 ([prototype findings, finding 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)).
 
-A hand-written plain or delta decoder over the key chunk. It would have to
-re-grow the encodings, compression, and definition-level handling the
-column reader already has, and every layout the doctor accepts would need
-its own path.
+A hand-written decoder for every encoding, over the key chunk and the
+value pages. It would have to re-grow the encodings, compression, and
+definition-level handling the column reader already has, and every layout
+the doctor accepts would need its own path. The plain reader covers one
+layout, the plain byte-array value page most value columns use, where it
+slices each value in place where the column reader builds and
+reference-counts it, and it hands every other page, and any page it
+cannot read exactly, to the column reader.
 
 Decoded key arrays kept in memory, so that no key page is decoded per
 lookup. Deferred: RFD 004 (Resident key-chunk index) leaves them open

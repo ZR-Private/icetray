@@ -184,20 +184,19 @@ direction under a limit and optional bounds on the order value.
   resident first and last key of each row group give the row groups a
   run spans. The server takes up to the limit of the run's newest or
   oldest live rows, counted against the resident deleted rows without
-  I/O. It passes over a whole order page of deleted rows in one step
-  and decodes no page that holds none of the rows it reads, so such
-  pages split a column's span; where the pages between two spans take at
-  most 256 KiB, one GET fetches them with both spans, since a GET moves
-  that many bytes in a small part of its round trip. With a bound, a binary
-  search over the run's fences places the bound on one order page, and
-  the server reads that page with the value pages in the same round, so
-  beyond the rows the limit selects, a bounded Scan reads in each
-  requested column at most the rows of the order page that holds the
-  bound. Where that page is local, under
-  `disk`, or already cached, the server decodes it first and reads only
-  the value pages of the rows taken, at no more rounds to object
-  storage. A Scan's work follows its limit, not its run's length. Across
-  K files that hold the key, a Scan
+  I/O. It passes over a whole order page of deleted rows in one step and
+  decodes no page that holds none of the rows it reads, so such pages
+  split a column's span; where the pages between two spans take at most
+  256 KiB, one GET fetches them with both spans, a bound set so that
+  fetching those pages costs less than the GET it saves. With a bound, a
+  binary search over the run's fences places the bound on one order
+  page, and the server reads that page with the value pages in the same
+  round, so beyond the rows the limit selects, a bounded Scan reads in
+  each requested column at most the rows of the order page that holds
+  the bound. Where that page is local, under `disk`, or already cached,
+  the server decodes it first and reads only the value pages of the rows
+  taken, at no more rounds to object storage. A Scan's work follows its
+  limit, not its run's length. Across K files that hold the key, a Scan
   with limit L reads up to K·L rows and returns L; to set `more`
   exactly, the server reads the order value of one more live row in each
   file. A Scan of a key held in one file, with none of its pages cached,
