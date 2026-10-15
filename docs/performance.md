@@ -104,16 +104,20 @@ cadence. `icetray_scan_files` reports the files each `Scan` read, and
 of a key in one file makes at worst.
 
 Measured on local files, which leave out a GET's latency to object
-storage, a warm `Scan` of a key's 100 rows took about 20 µs under `full`
-and `bloom` and 38 µs under `disk`, where the order column is a local
-read, and a page of 10 of those rows took about 16 µs. The analysis
-infers, without a profile, that finding the run and decoding its pages
-make most of a warm `Scan`. A cold `Scan`
-made the GETs in the table above. A `MultiScan` of 10 keys took about
-24 µs a key warm and 55 µs a key cold, where its keys' GETs overlap
-under `server.batch_fan_out`. Against S3, each cold figure is a GET's
-latency, tens of milliseconds
-([the measurements](analysis/2026-10-13-ordered-rows-costs.md)).
+storage, a warm `Scan` of a key's 100 rows took about 16 µs under `full`
+and `bloom` and 34 µs under `disk`, where the order column is a local
+read, and a page of 10 of those rows took about 12 µs. A page of 10 rows
+from the middle of a 10,000-row run took about 24 µs, and about 44 µs
+over a string order column whose values share 64 leading bytes and whose
+column index the writer cut short; a profile puts most of a warm `Scan`
+in decompressing the pages it reads from the scan cache. A cold bounded
+`Scan` took one round of GETs whatever the writer's order column index
+held, after the key-page round under `bloom`, and made the GETs in the
+table above. A `MultiScan` of 10 keys took about 18 µs a key warm and
+50 µs a key cold, where its keys' GETs overlap under
+`server.batch_fan_out`. Against S3, each cold figure is a GET's latency,
+tens of milliseconds
+([the measurements](analysis/2026-10-14-order-fences.md)).
 
 A load of an ordered table reads each file's order column once per row
 group to verify it, one more GET per row group than a key-value table's
