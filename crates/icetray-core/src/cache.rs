@@ -503,7 +503,10 @@ impl PageCache {
     /// a run that then fails included; and ends at the handle's fetch
     /// deadline from its start, its future dropped, as
     /// `CacheError::FetchDeadline` at the run's first offset. A failed run
-    /// is `CacheError::Fetch` and caches nothing of it. A read dropped
+    /// is `CacheError::Fetch` and caches nothing of it. A read returns at
+    /// its first failure, of a run of its own or of a fetch it waits on,
+    /// without waiting for the rest: its runs still in flight are dropped
+    /// with it, releasing their pages as a dropped read does. A read dropped
     /// before its runs end releases their pages unserved, and a read
     /// waiting on one of them claims it again itself. The disk level is not
     /// read, since the Scan cache has none. A run whose bytes come back
@@ -553,29 +556,30 @@ impl PageCache {
                     outcome.map(|split| (run, split)).map_err(fetch_failed)
                 }
             }));
-            let waiting =
-                futures::future::join_all(waits.into_iter().map(|(at, mut flight)| async move {
+            let waiting = futures::future::try_join_all(waits.into_iter().map(
+                |(at, mut flight)| async move {
                     let outcome = flight
                         .wait_for(Option::is_some)
                         .await
                         .ok()
                         .and_then(|outcome| outcome.clone());
-                    (at, outcome)
-                }));
-            let (fetched, waited) = futures::join!(fetching, waiting);
-            for (run, split) in fetched? {
+                    match outcome {
+                        Some(Ok(bytes)) => Ok(Some((at, bytes))),
+                        Some(Err(failed)) => Err(fetch_failed(failed)),
+                        // The fetch it waited on was dropped unfinished:
+                        // the next pass claims the page.
+                        None => Ok(None),
+                    }
+                },
+            ));
+            let (fetched, waited) = futures::try_join!(fetching, waiting)?;
+            for (run, split) in fetched {
                 for (at, bytes) in run.zip(split) {
                     served[at] = Some(bytes);
                 }
             }
-            for (at, outcome) in waited {
-                match outcome {
-                    Some(Ok(bytes)) => served[at] = Some(bytes),
-                    Some(Err(failed)) => return Err(fetch_failed(failed)),
-                    // The fetch it waited on was dropped unfinished: the
-                    // next pass claims the page.
-                    None => {}
-                }
+            for (at, bytes) in waited.into_iter().flatten() {
+                served[at] = Some(bytes);
             }
         }
         let origin = if from_outside {
@@ -1803,6 +1807,42 @@ mod tests {
         ));
         assert_eq!(cache.fetches(), 1);
         assert_eq!(read_again(&cache, &id, &file).await, pages_of(&file, &SPAN));
+    }
+
+    /// A read whose own run fails returns its failure while a page it
+    /// joined is still being fetched by another read, rather than waiting
+    /// for that fetch to end.
+    #[tokio::test]
+    async fn test_get_span_returns_a_failed_run_without_waiting_on_its_joins() {
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let mut fetching = Box::pin(cache.get_span(&id, &SPAN[1..], Issue::default(), |_, _| {
+            std::future::pending::<Result<Bytes>>()
+        }));
+        assert!(
+            futures::poll!(fetching.as_mut()).is_pending(),
+            "it claims the second page"
+        );
+        let failed = tokio::time::timeout(
+            crate::storage::testing::DEADLINE_GUARD,
+            cache.get_span(&id, &SPAN, Issue::default(), |_, _| {
+                std::future::ready(Err(Error::NotReady {
+                    table: TABLE.to_string(),
+                }))
+            }),
+        )
+        .await
+        .expect("a failed read returns while a page it joined is in flight");
+        let Err(Error::Cache(CacheError::Fetch(error))) = failed else {
+            panic!("the read receives its run's failure: {failed:?}");
+        };
+        assert!(matches!(*error, Error::NotReady { .. }));
+        assert_eq!(cache.span_joins(), 1, "it joined the second page");
+        assert_eq!(cache.fetches(), 2, "the other read's run, and its own");
+        assert!(
+            futures::poll!(fetching.as_mut()).is_pending(),
+            "the other read's fetch runs on"
+        );
     }
 
     /// The lookup cache's and the scan cache's series are their own, told
