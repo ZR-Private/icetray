@@ -491,17 +491,22 @@ impl PageCache {
     /// for it, as `get_or_fetch` coalesces a lookup's page (RFD 025,
     /// Caching and hedging); its fetch's failure is this read's. Every
     /// maximal run of the remaining pages whose ranges meet end to start is
-    /// claimed as in flight, then is one call of `fetch` over the run's
-    /// whole range and the count of pages it holds, its bytes split by page
-    /// and each page inserted as its own entry, keyed by `file` and the
-    /// page's offset as `get_or_fetch` keys a page, so that a later read of
-    /// any one of them finds it alone, then handed to every read waiting on
-    /// it. The runs are fetched together, and the waits run beside them.
-    /// Each run takes one permit of `issue` before it starts and holds it
-    /// until it ends, so none waits for a permit while it holds one (RFD
-    /// 022); counts once in `fetches` and in `issue`'s counter as it starts,
-    /// a run that then fails included; and ends at the handle's fetch
-    /// deadline from its start, its future dropped, as
+    /// one call of `fetch` over the run's whole range and the count of pages
+    /// it holds, its bytes split by page and each page inserted as its own
+    /// entry, keyed by `file` and the page's offset as `get_or_fetch` keys a
+    /// page, so that a later read of any one of them finds it alone, then
+    /// handed to every read waiting on it. The runs are fetched together,
+    /// and the waits run beside them.
+    /// Each run takes one permit of `issue` before it claims its pages as in
+    /// flight and holds it until it ends, so none waits for a permit while
+    /// it holds one (RFD 022), and no read waits on a run still queued for
+    /// its permit: a read of another call fetches such a page itself, as
+    /// `get_or_fetch` asks the cache only once it holds its permit (RFD 013).
+    /// A run claims what of it is still neither in memory nor in flight once
+    /// it holds its permit, and the read takes stock again for the rest
+    /// (`claim_run`). A run counts once in `fetches` and in `issue`'s counter
+    /// as it starts, a run that then fails included, and ends at the
+    /// handle's fetch deadline from its start, its future dropped, as
     /// `CacheError::FetchDeadline` at the run's first offset. A failed run
     /// is `CacheError::Fetch` and caches nothing of it. A read returns at
     /// its first failure, of a run of its own or of a fetch it waits on,
@@ -526,36 +531,14 @@ impl PageCache {
         let mut served: Vec<Option<Bytes>> = vec![None; pages.len()];
         let mut from_outside = false;
         loop {
-            let Claimed { claims, waits } = self.claim(file, pages, &mut served);
-            if claims.is_empty() && waits.is_empty() {
+            let Pending { runs, waits } = self.pending(file, pages, &mut served);
+            if runs.is_empty() && waits.is_empty() {
                 break;
             }
-            from_outside = true;
-            let fetching = futures::future::try_join_all(claims.into_iter().map(|claim| {
-                let run = claim.run.clone();
-                let span = pages[run.start].start..pages[run.end - 1].end;
-                let fetched = fetch(span.clone(), u32::try_from(run.len()).unwrap_or(u32::MAX));
-                async move {
-                    let run_of = Run {
-                        page: PageKey(Arc::clone(file), span.start),
-                        fetches: Arc::clone(&self.fetches),
-                        deadline: self.fetch_deadline,
-                        permit: issue.permit().await,
-                        counted: issue.counted.cloned(),
-                    };
-                    let outcome = match run_of.run(fetched, std::convert::identity).await {
-                        Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
-                        Err(failed) => Err(failed),
-                    };
-                    if let Ok(split) = &outcome {
-                        for (page, bytes) in pages[run.clone()].iter().zip(split) {
-                            self.insert(PageKey(Arc::clone(file), page.start), bytes.clone());
-                        }
-                    }
-                    claim.publish(&outcome);
-                    outcome.map(|split| (run, split)).map_err(fetch_failed)
-                }
-            }));
+            let fetching = futures::future::try_join_all(
+                runs.into_iter()
+                    .map(|run| self.fetch_run(file, pages, run, issue, &fetch)),
+            );
             let waiting = futures::future::try_join_all(waits.into_iter().map(
                 |(at, mut flight)| async move {
                     let outcome = flight
@@ -573,13 +556,13 @@ impl PageCache {
                 },
             ));
             let (fetched, waited) = futures::try_join!(fetching, waiting)?;
-            for (run, split) in fetched {
-                for (at, bytes) in run.zip(split) {
-                    served[at] = Some(bytes);
-                }
-            }
-            for (at, bytes) in waited.into_iter().flatten() {
+            for (at, bytes) in fetched
+                .into_iter()
+                .flatten()
+                .chain(waited.into_iter().flatten())
+            {
                 served[at] = Some(bytes);
+                from_outside = true;
             }
         }
         let origin = if from_outside {
@@ -592,6 +575,54 @@ impl PageCache {
             .map(|page| page.expect("every page is served from memory, a fetch, or a join"))
             .collect();
         Ok((pages, origin))
+    }
+
+    /// One run of `get_span`'s pages, at `run` of `pages` of `file`: waits
+    /// for `issue`'s permit holding no claim, claims what of the run is
+    /// still neither in memory nor in flight (`claim_run`), and fetches it
+    /// with `fetch` under the permit, inserting each page and handing the
+    /// outcome to every read waiting on one. The positions and bytes of the
+    /// pages it fetched, none when other reads took the whole run while it
+    /// waited.
+    async fn fetch_run<F, Fut>(
+        &self,
+        file: &Arc<str>,
+        pages: &[Range<u64>],
+        run: Range<usize>,
+        issue: Issue<'_>,
+        fetch: &F,
+    ) -> Result<Vec<(usize, Bytes)>>
+    where
+        F: Fn(Range<u64>, u32) -> Fut,
+        Fut: Future<Output = Result<Bytes>>,
+    {
+        let permit = issue.permit().await;
+        let Some(claim) = self.claim_run(file, pages, run) else {
+            return Ok(Vec::new());
+        };
+        let run = claim.run.clone();
+        let span = pages[run.start].start..pages[run.end - 1].end;
+        let fetched = fetch(span.clone(), u32::try_from(run.len()).unwrap_or(u32::MAX));
+        let run_of = Run {
+            page: PageKey(Arc::clone(file), span.start),
+            fetches: Arc::clone(&self.fetches),
+            deadline: self.fetch_deadline,
+            permit,
+            counted: issue.counted.cloned(),
+        };
+        let outcome = match run_of.run(fetched, std::convert::identity).await {
+            Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
+            Err(failed) => Err(failed),
+        };
+        if let Ok(split) = &outcome {
+            for (page, bytes) in pages[run.clone()].iter().zip(split) {
+                self.insert(PageKey(Arc::clone(file), page.start), bytes.clone());
+            }
+        }
+        claim.publish(&outcome);
+        outcome
+            .map(|split| run.zip(split).collect())
+            .map_err(fetch_failed)
     }
 
     /// Every page of `pages` of `file`, keyed as `get_span` keys them, when
@@ -612,26 +643,24 @@ impl PageCache {
     }
 
     /// Takes stock of `pages` of `file` that `served` does not hold yet,
-    /// under the in-flight lock so no page is claimed twice: a page in
-    /// memory is served and counted a hit, a page another read is fetching
-    /// is joined and counted in `span_joins`, and every maximal run of the
-    /// rest whose ranges meet end to start is claimed as in flight. Memory
-    /// is checked under the lock, and a fetch inserts its pages before it
-    /// gives up its claim, so a page leaves the in-flight set only once
-    /// memory holds it.
-    fn claim(
+    /// under the in-flight lock: a page in memory is served and counted a
+    /// hit, a page another read is fetching is joined and counted in
+    /// `span_joins`, and every maximal run of the rest whose ranges meet end
+    /// to start is to be fetched. Nothing is claimed here: a run claims its
+    /// pages only once it holds its permit (`claim_run`).
+    fn pending(
         &self,
         file: &Arc<str>,
         pages: &[Range<u64>],
         served: &mut [Option<Bytes>],
-    ) -> Claimed<'_> {
-        let mut flights = self
+    ) -> Pending {
+        let flights = self
             .spans
             .pages
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut waits = Vec::new();
-        let mut unclaimed: Vec<Option<Bytes>> = vec![Some(Bytes::new()); pages.len()];
+        let mut wanted = vec![false; pages.len()];
         for (at, page) in pages.iter().enumerate() {
             if served[at].is_some() {
                 continue;
@@ -644,28 +673,52 @@ impl PageCache {
                 self.spans.joined.fetch_add(1, Ordering::Relaxed);
                 waits.push((at, flight.clone()));
             } else {
-                unclaimed[at] = None;
+                wanted[at] = true;
             }
         }
-        let claims = uncached_runs(pages, &unclaimed)
-            .into_iter()
-            .map(|run| {
-                let senders = pages[run.clone()]
-                    .iter()
-                    .map(|page| {
-                        let (sender, receiver) = watch::channel(None);
-                        flights.insert(PageKey(Arc::clone(file), page.start), receiver);
-                        (PageKey(Arc::clone(file), page.start), sender)
-                    })
-                    .collect();
-                Claim {
-                    flights: &self.spans,
-                    run,
-                    senders,
-                }
+        Pending {
+            runs: wanted_runs(pages, &wanted),
+            waits,
+        }
+    }
+
+    /// Claims as in flight, under the in-flight lock so no page is claimed
+    /// twice, the first stretch of `run` of `pages` of `file` that is
+    /// neither in memory nor in flight now; `None` when no page of `run` is.
+    /// The pages of `run` before and after that stretch are left to the
+    /// read's next pass. Memory is checked under the lock, and a fetch
+    /// inserts its pages before it gives up its claim, so a page leaves the
+    /// in-flight set only once memory holds it.
+    fn claim_run(
+        &self,
+        file: &Arc<str>,
+        pages: &[Range<u64>],
+        run: Range<usize>,
+    ) -> Option<Claim<'_>> {
+        let mut flights = self
+            .spans
+            .pages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let free = |at: &usize| {
+            let key = PageKey(Arc::clone(file), pages[*at].start);
+            !flights.contains_key(&key) && self.in_memory(&key).is_none()
+        };
+        let start = run.clone().find(free)?;
+        let end = (start..run.end).find(|at| !free(at)).unwrap_or(run.end);
+        let senders = pages[start..end]
+            .iter()
+            .map(|page| {
+                let (sender, receiver) = watch::channel(None);
+                flights.insert(PageKey(Arc::clone(file), page.start), receiver);
+                (PageKey(Arc::clone(file), page.start), sender)
             })
             .collect();
-        Claimed { claims, waits }
+        Some(Claim {
+            flights: &self.spans,
+            run: start..end,
+            senders,
+        })
     }
 
     /// Lookups served without running a fetch: from memory, or from the
@@ -782,12 +835,12 @@ impl PageCache {
     }
 }
 
-/// The positions in `pages` of every maximal run of pages `served` does not
-/// hold whose ranges meet end to start, in order.
-fn uncached_runs(pages: &[Range<u64>], served: &[Option<Bytes>]) -> Vec<Range<usize>> {
+/// The positions in `pages` of every maximal run of pages `wanted` marks
+/// whose ranges meet end to start, in order.
+fn wanted_runs(pages: &[Range<u64>], wanted: &[bool]) -> Vec<Range<usize>> {
     let mut runs: Vec<Range<usize>> = Vec::new();
     for (at, page) in pages.iter().enumerate() {
-        if served[at].is_some() {
+        if !wanted[at] {
             continue;
         }
         match runs.last_mut() {
@@ -798,11 +851,11 @@ fn uncached_runs(pages: &[Range<u64>], served: &[Option<Bytes>]) -> Vec<Range<us
     runs
 }
 
-/// What one pass of `PageCache::get_span` takes on: the runs of pages it
-/// claimed to fetch, and the pages, by position, whose fetch by another
-/// read it waits for.
-struct Claimed<'a> {
-    claims: Vec<Claim<'a>>,
+/// What one pass of `PageCache::get_span` takes on: the runs of pages, by
+/// position, it is to fetch, and the pages, by position, whose fetch by
+/// another read it waits for.
+struct Pending {
+    runs: Vec<Range<usize>>,
     waits: Vec<(usize, watch::Receiver<Option<SpanOutcome>>)>,
 }
 
@@ -1843,6 +1896,106 @@ mod tests {
             futures::poll!(fetching.as_mut()).is_pending(),
             "the other read's fetch runs on"
         );
+    }
+
+    /// A read of pages another read is still waiting to take a fan-out
+    /// permit for fetches them itself rather than waiting behind that
+    /// read's queue: a run is claimed only once it holds its permit, as
+    /// `get_or_fetch` asks the cache only once it holds its own (RFD 013).
+    /// The queued read, once it has its permit, is served from what the
+    /// other read cached and fetches nothing.
+    #[tokio::test]
+    async fn test_get_span_of_pages_another_read_has_queued_is_not_held_behind_its_permits() {
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let full = Arc::new(Semaphore::new(1));
+        let taken = Arc::clone(&full).acquire_owned().await.unwrap();
+        let answering = |span: Range<u64>, _| std::future::ready(Ok(span_bytes(&file, &span)));
+        let queued_issue = Issue {
+            fan_out: Some(&full),
+            counted: None,
+        };
+        let mut queued = Box::pin(cache.get_span(&id, &SPAN, queued_issue, answering));
+        assert!(
+            futures::poll!(queued.as_mut()).is_pending(),
+            "it waits for its permit"
+        );
+        let (alone, origin) = tokio::time::timeout(
+            crate::storage::testing::DEADLINE_GUARD,
+            cache.get_span(&id, &SPAN, Issue::default(), answering),
+        )
+        .await
+        .expect("a read of another call is not held behind a full fan-out")
+        .unwrap();
+        assert_eq!(alone, pages_of(&file, &SPAN));
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(cache.span_joins(), 0, "nothing was in flight to join");
+        drop(taken);
+        let (served, origin) = queued.await.unwrap();
+        assert_eq!(served, alone);
+        assert_eq!(origin, PageOrigin::Cached);
+        assert_eq!(cache.fetches(), 1, "the other read's run alone");
+    }
+
+    /// A run whose pages another read claimed while it waited for its
+    /// permit fetches the stretch still free at its start, and the read's
+    /// next pass joins the claimed page and fetches the rest as a run of
+    /// its own: each page is fetched once.
+    #[tokio::test]
+    async fn test_get_span_of_a_run_partly_claimed_while_it_queued_fetches_the_rest() {
+        let pages = [0..10, 10..20, 20..30];
+        let claimed_elsewhere = 1;
+        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let full = Arc::new(Semaphore::new(1));
+        let taken = Arc::clone(&full).acquire_owned().await.unwrap();
+        let spans = std::sync::Mutex::new(Vec::new());
+        let recording = |span: Range<u64>, _| {
+            spans.lock().unwrap().push(span.clone());
+            std::future::ready(Ok(span_bytes(&file, &span)))
+        };
+        let queued_issue = Issue {
+            fan_out: Some(&full),
+            counted: None,
+        };
+        let mut queued = Box::pin(cache.get_span(&id, &pages, queued_issue, recording));
+        assert!(
+            futures::poll!(queued.as_mut()).is_pending(),
+            "it waits for its permit"
+        );
+        let gate = Notify::new();
+        let slow = |span: Range<u64>, _| {
+            let bytes = span_bytes(&file, &span);
+            let gate = &gate;
+            async move {
+                gate.notified().await;
+                Ok(bytes)
+            }
+        };
+        let middle = &pages[claimed_elsewhere..=claimed_elsewhere];
+        let mut other = Box::pin(cache.get_span(&id, middle, Issue::default(), slow));
+        assert!(
+            futures::poll!(other.as_mut()).is_pending(),
+            "it claims the middle page"
+        );
+        drop(taken);
+        let (queued, other, ()) = tokio::join!(queued, other, async {
+            joined(&cache, 1).await;
+            gate.notify_one();
+        });
+        let (served, origin) = queued.unwrap();
+        assert_eq!(served, pages_of(&file, &pages));
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(other.unwrap().0, pages_of(&file, middle));
+        assert_eq!(
+            *spans.lock().unwrap(),
+            [pages[0].clone(), pages[2].clone()],
+            "the queued read's runs, either side of the claimed page"
+        );
+        assert_eq!(cache.span_joins(), 1, "it joined the claimed page");
+        assert_eq!(cache.fetches(), 3, "each page fetched once");
     }
 
     /// The lookup cache's and the scan cache's series are their own, told
