@@ -223,7 +223,9 @@ grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
   values first, `DIRECTION_OLDEST_FIRST` the lowest. The request must set
   one.
 - **Limit.** The most rows to return, at most the table's
-  `max_scan_rows`. A limit of 0 reads up to `max_scan_rows`.
+  `max_scan_rows`. A limit of 0 reads up to `max_scan_rows`. The response
+  must also fit `server.max_scan_bytes` ([Response size](#response-size)),
+  so a caller whose values are large sets a limit that fits.
 - **Bounds.** `after` and `before` are exclusive: a row is returned only
   when its order value is above `after` and below `before`. Either may
   be left unset, and when both are set `after` must be below `before`.
@@ -257,6 +259,28 @@ resp, err := client.Scan(ctx, &icetrayv1.ScanRequest{
 })
 ```
 
+### Response size
+
+The server refuses to send a `Scan` or `MultiScan` response whose encoded
+size is above `server.max_scan_bytes`, 4 MiB (4,194,304 bytes) by default,
+a gRPC client's default limit on a message it receives. The call fails
+as `FAILED_PRECONDITION`, with no rows, and its message names the
+response's size, the bound, and how many rows of a `Scan`, or how many
+leading keys' results of a `MultiScan`, would have fit. The size is the
+exact encoded size of the response message, which is what a client's
+message limit measures.
+
+Nothing about the same request changes on a retry, so the caller lowers
+its `limit` or requests fewer columns, and sets `limit` explicitly: a
+limit of 0 reads up to `max_scan_rows`, which for large values may not
+fit. A caller that sets a limit of 100 and pages by order value (below)
+reads the same history in pages that each fit. An owner whose clients
+accept larger messages raises `server.max_scan_bytes`
+([Configuration](configuration.md#server)) and the clients raise their
+own receive limit to match, as grpc-go's `MaxCallRecvMsgSize` does; the
+doctor's `large_runs` advice tells the owner which tables would be
+refused at the full limit.
+
 In each file that holds the key, a cold `Scan` costs a GET per
 contiguous span of uncached pages of each requested column, and under
 `full` and `bloom` of the order column, which `disk` reads locally;
@@ -282,6 +306,7 @@ req := &icetrayv1.ScanRequest{
 	Key:       &icetrayv1.Key{Key: &icetrayv1.Key_Long{Long: 42}},
 	Columns:   []*icetrayv1.ColumnRead{{Name: "payload"}},
 	Direction: icetrayv1.Direction_DIRECTION_NEWEST_FIRST,
+	Limit:     100,
 }
 for {
 	resp, err := client.Scan(ctx, req)
@@ -332,6 +357,13 @@ several columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in
 flight are capped at `server.batch_fan_out`, 64 by default, as for
 `MultiGet`.
 
+The whole `MultiScan` response is held to `server.max_scan_bytes`
+([Response size](#response-size)): one result of many keys that together
+come to more is `FAILED_PRECONDITION` with no results, and the message
+names how many leading keys' results would have fit, a key listed twice
+counting at each position. The caller requests fewer keys or a smaller
+limit.
+
 ## Snapshots and consistency
 
 Every `Get` and `Scan` response carries the id of the snapshot the server
@@ -349,14 +381,19 @@ served.
 Three codes are transient and worth a retry: `RESOURCE_EXHAUSTED` with
 backoff, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` when the caller's own
 deadline allows. Every other code recurs until the request, the value,
-or the snapshot changes.
+or the snapshot changes. `RESOURCE_EXHAUSTED` is the server's overload
+alone: a response too large is never sent, but refused as
+`FAILED_PRECONDITION`. A `RESOURCE_EXHAUSTED` that a client library
+raises on its own for a message above its receive limit is not the server's
+and not worth a retry; the client raises its limit, or the caller lowers
+its `limit`.
 
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
 | `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
-| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. |
-| `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
+| `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` (4 MiB by default); the error names the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit, and the server sends no rows. | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
+| `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. The server sends this for no other reason. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
 | `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a span GET within any `Scan` or `MultiScan`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |

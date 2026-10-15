@@ -20,7 +20,7 @@ use crate::local::LocalFault;
 use crate::manifest::ColumnRequestFault;
 use crate::order::{OrderType, OrderValue};
 use crate::projection::Malformed;
-use crate::scan::ScanRequestFault;
+use crate::scan::{Oversize, ScanRequestFault};
 use crate::storage::LocationError;
 use crate::table::TableKind;
 
@@ -100,6 +100,17 @@ pub enum Error {
     /// `max_multi_scan_values`; checked before any read.
     #[error("scan request: {0}")]
     ScanRequest(ScanRequestFault),
+    /// A Scan or `MultiScan` response above `server.max_scan_bytes` (RFD
+    /// 025, Limits). The rows were read and none is returned; the same
+    /// request meets it again until the caller lowers its limit or the
+    /// owner raises the bound.
+    #[error("table {table}: {oversize}")]
+    ResponseTooLarge {
+        /// The table's configured name.
+        table: String,
+        /// The response's size, the bound, and what would fit.
+        oversize: Oversize,
+    },
     /// A call of the wrong kind for the table (RFD 025): a Get or `MultiGet`
     /// of an ordered table, or a Scan or `MultiScan` of a key-value table;
     /// checked before any read.
@@ -272,6 +283,7 @@ impl Error {
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
             | Self::ScanRequest(_)
+            | Self::ResponseTooLarge { .. }
             | Self::WrongTableKind { .. }
             | Self::MalformedValue { .. }
             | Self::Table { .. }
@@ -311,6 +323,7 @@ impl Error {
             Self::KeyType { .. } => ErrorKind::KeyType,
             Self::ColumnRequest { .. } => ErrorKind::ColumnRequest,
             Self::ScanRequest(_) => ErrorKind::ScanRequest,
+            Self::ResponseTooLarge { .. } => ErrorKind::ResponseTooLarge,
             Self::WrongTableKind { .. } => ErrorKind::WrongTableKind,
             Self::MalformedValue { .. } => ErrorKind::MalformedValue,
             Self::Table { .. } => ErrorKind::Table,
@@ -358,6 +371,8 @@ pub enum ErrorKind {
     ColumnRequest,
     /// `Error::ScanRequest`.
     ScanRequest,
+    /// `Error::ResponseTooLarge`.
+    ResponseTooLarge,
     /// `Error::WrongTableKind`.
     WrongTableKind,
     /// `Error::MalformedValue`.
@@ -442,6 +457,7 @@ impl Recurs for Error {
             | Self::KeyType { .. }
             | Self::ColumnRequest { .. }
             | Self::ScanRequest(_)
+            | Self::ResponseTooLarge { .. }
             | Self::WrongTableKind { .. }
             | Self::ObjectStore(_)
             | Self::NotReady { .. }
@@ -470,6 +486,7 @@ impl fmt::Display for ErrorKind {
             Self::KeyType => "key_type",
             Self::ColumnRequest => "column_request",
             Self::ScanRequest => "scan_request",
+            Self::ResponseTooLarge => "response_too_large",
             Self::WrongTableKind => "wrong_table_kind",
             Self::MalformedValue => "malformed_value",
             Self::Table => "table",
@@ -1672,6 +1689,7 @@ mod tests {
             | Error::KeyType { .. }
             | Error::ColumnRequest { .. }
             | Error::ScanRequest(_)
+            | Error::ResponseTooLarge { .. }
             | Error::WrongTableKind { .. }
             | Error::NotReady { .. }
             | Error::CatalogTimeout { .. }
@@ -1882,6 +1900,17 @@ mod tests {
             (
                 Error::ScanRequest(crate::scan::ScanRequestFault::BoundsInverted),
                 "scan_request",
+            ),
+            (
+                Error::ResponseTooLarge {
+                    table: TABLE.to_string(),
+                    oversize: crate::scan::Oversize {
+                        bytes: 2,
+                        bound: 1,
+                        fits: crate::scan::Fits::Rows(0),
+                    },
+                },
+                "response_too_large",
             ),
             (
                 Error::WrongTableKind {

@@ -1834,6 +1834,7 @@ async fn serve(
         batch_fan_out: serving.batch_fan_out,
         scan_cache: scan_cache.clone(),
         max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
+        max_scan_bytes: ServerConfig::default().max_scan_bytes,
     };
     let beside = match beside {
         Some(other) => {

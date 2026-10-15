@@ -94,7 +94,7 @@ pub async fn doctor(
                     &generation,
                     configured.lookups(),
                     &configured.formats(),
-                    configured.scan_rows(),
+                    configured.scan_limits(config.server.max_scan_bytes),
                 )
                 .await;
                 let report = &examined.report;
@@ -167,7 +167,7 @@ pub async fn info(config: &Config, only: Option<&str>) -> Result<(), CliError> {
             &generation,
             entry.lookups(),
             &entry.formats(),
-            entry.scan_rows(),
+            entry.scan_limits(config.server.max_scan_bytes),
         );
         emit(&SummaryLine::new(&report.summary))?;
     }

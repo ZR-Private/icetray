@@ -112,21 +112,26 @@ pub mod thresholds {
     /// index (RFD 002).
     pub const DISTINCT_MINS_RATIO_ADVICE: f64 = 0.5;
 
-    /// Rows of one key's run in one file above which `long_runs` is advice,
-    /// and the rows of the configured value columns `large_runs` sizes:
+    /// Rows of one key's run in one file above which `long_runs` is advice:
     /// `DEFAULT_MAX_SCAN_ROWS`, the most rows one Scan returns at the
     /// default, so a longer run takes a caller more than one Scan at the
     /// default to read whole (RFD 025, Levels and findings). Fixed, as
     /// every threshold is (RFD 016): a table's own `max_scan_rows` does not
-    /// move it.
+    /// move it. `large_runs` has no threshold of its own: it is judged
+    /// against the table's `max_scan_rows` and `server.max_scan_bytes`
+    /// (`ScanLimits`).
     pub const RUN_ROWS_ADVICE: u32 = crate::config::DEFAULT_MAX_SCAN_ROWS;
+}
 
-    /// Uncompressed bytes of `RUN_ROWS_ADVICE` rows of a file's configured
-    /// value columns above which `large_runs` is advice: 4 MiB, a gRPC
-    /// client's default limit on a message it receives, so a Scan at the
-    /// default `max_scan_rows` can answer more than such a client accepts
-    /// (RFD 025, Levels and findings).
-    pub const RUN_BYTES_ADVICE: u64 = 4 * 1024 * 1024;
+/// What a Scan of an ordered table is held to (RFD 025, Limits): its rows
+/// and the encoded size of its response, which `large_runs` sizes a file's
+/// runs against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanLimits {
+    /// The table's effective `max_scan_rows` (`TableConfig::scan_rows`).
+    pub max_scan_rows: u32,
+    /// `server.max_scan_bytes`.
+    pub max_scan_bytes: usize,
 }
 
 /// The GETs a cold lookup spends on a column chunk's dictionary page beside
@@ -338,9 +343,10 @@ pub enum FindingCode {
     /// On an ordered table, a file holds a run of more than
     /// `thresholds::RUN_ROWS_ADVICE` rows of one key.
     LongRuns,
-    /// On an ordered table, `thresholds::RUN_ROWS_ADVICE` rows of a file's
-    /// configured value columns, at the footer's uncompressed bytes per
-    /// row, exceed `thresholds::RUN_BYTES_ADVICE`.
+    /// On an ordered table, `max_scan_rows` rows of a file's configured
+    /// value columns, at the footer's uncompressed bytes per row, exceed
+    /// `server.max_scan_bytes` (`ScanLimits`), so a Scan at the full limit
+    /// is refused.
     LargeRuns,
     /// A key is longer than `contract::KEY_BYTES_ADVICE`.
     LongKeys,
@@ -970,14 +976,14 @@ impl TableReport {
 /// file from what the generation holds, raises each finding of the finding
 /// table whose trigger the measurements meet, the capping ones through
 /// `layout_caps`, and sums every tier's predicted resident bytes from the
-/// footers. `scan_rows` is the table's effective `max_scan_rows`
-/// (`TableConfig::scan_rows`), `Some` exactly on an ordered table, which
-/// reports its order column with it. No I/O and no metrics.
+/// footers. `scan` is the table's `ScanLimits` (`TableConfig::scan_limits`),
+/// `Some` exactly on an ordered table, which reports its order column with
+/// it and is judged for `large_runs` by it. No I/O and no metrics.
 pub fn diagnose(
     g: &Generation,
     lookups: Level,
     formats: &dyn Fn(&str) -> ValueFormat,
-    scan_rows: Option<u32>,
+    scan: Option<ScanLimits>,
 ) -> TableReport {
     let caps = layout_caps(&LayoutView::of(g));
     let deletes = g.delete_summary();
@@ -1006,7 +1012,7 @@ pub fn diagnose(
     findings.extend(
         facts
             .iter()
-            .flat_map(|file| file_advice_findings(file, &g.layout)),
+            .flat_map(|file| file_advice_findings(file, &g.layout, scan)),
     );
     findings.extend(many_files_findings(&buckets));
     findings.extend(pending);
@@ -1040,11 +1046,11 @@ pub fn diagnose(
             .layout
             .order
             .as_ref()
-            .zip(scan_rows)
-            .map(|(order, max_scan_rows)| OrderSummary {
+            .zip(scan)
+            .map(|(order, limits)| OrderSummary {
                 column: order.name.clone(),
                 order_type: order.order_type,
-                max_scan_rows,
+                max_scan_rows: limits.max_scan_rows,
                 longest_run: longest_run_of(
                     facts.iter().filter_map(|file| file.report.order.as_ref()),
                 ),
@@ -1102,9 +1108,9 @@ pub async fn examine(
     g: &Generation,
     lookups: Level,
     formats: &dyn Fn(&str) -> ValueFormat,
-    scan_rows: Option<u32>,
+    scan: Option<ScanLimits>,
 ) -> Examined {
-    let mut report = diagnose(g, lookups, formats, scan_rows);
+    let mut report = diagnose(g, lookups, formats, scan);
     let mut unwalked = Vec::new();
     for (at, column) in g.layout.value_columns.iter().enumerate() {
         match formats(&column.name) {
@@ -1843,9 +1849,13 @@ fn bounds_intact(entry: &DataFileEntry, (first, last): (&Key, &Key)) -> bool {
 
 /// Every advice finding of the finding table that one file's
 /// measurements trigger, in the table's order.
-fn file_advice_findings(facts: &FileFacts, layout: &TableLayout) -> Vec<Finding> {
+fn file_advice_findings(
+    facts: &FileFacts,
+    layout: &TableLayout,
+    scan: Option<ScanLimits>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    file_layout_advice(facts, layout, &mut findings);
+    file_layout_advice(facts, layout, scan, &mut findings);
     bloom_findings(facts, layout, &mut findings);
     findings
 }
@@ -1954,7 +1964,12 @@ fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
 /// (`order_advice`). The one `f64` comparison is on
 /// `distinct_page_mins_ratio`, which `approx::ratio` makes finite (zero for
 /// a zero denominator), so a plain comparison is total.
-fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Vec<Finding>) {
+fn file_layout_advice(
+    facts: &FileFacts,
+    layout: &TableLayout,
+    scan: Option<ScanLimits>,
+    findings: &mut Vec<Finding>,
+) {
     let report = &facts.report;
     if !report.bounds_present {
         findings.push(Finding::advice(
@@ -1985,7 +2000,7 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
         value_page_advice(&report.path, column, findings);
     }
     if let Some(order) = &facts.order {
-        order_advice(&report.path, order, facts.rows, findings);
+        order_advice(&report.path, order, facts.rows, scan, findings);
     }
     if report.max_key_bytes > contract::KEY_BYTES_ADVICE {
         findings.push(Finding::advice(
@@ -2018,10 +2033,18 @@ fn file_layout_advice(facts: &FileFacts, layout: &TableLayout, findings: &mut Ve
 
 /// An ordered table's advice on one file (RFD 025, Levels and findings):
 /// `long_runs` where a run is longer than `thresholds::RUN_ROWS_ADVICE`;
-/// and `large_runs` where that many rows of the configured value columns,
-/// at the footer's uncompressed bytes per row over the file's `rows`, are
-/// more than `thresholds::RUN_BYTES_ADVICE`, compared in integers.
-fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut Vec<Finding>) {
+/// and, where the table's `scan` limits are known, `large_runs` where
+/// `max_scan_rows` rows of the configured value columns, at the footer's
+/// uncompressed bytes per row over the file's `rows`, are more than
+/// `max_scan_bytes`, so a Scan at the full limit would be refused, compared
+/// in integers.
+fn order_advice(
+    path: &str,
+    order: &OrderAdviceFacts,
+    rows: u64,
+    scan: Option<ScanLimits>,
+    findings: &mut Vec<Finding>,
+) {
     let run_rows = u64::from(thresholds::RUN_ROWS_ADVICE);
     if order.longest_run > run_rows {
         findings.push(Finding::advice(
@@ -2034,16 +2057,20 @@ fn order_advice(path: &str, order: &OrderAdviceFacts, rows: u64, findings: &mut 
             None,
         ));
     }
-    let run_bytes = order.value_bytes.saturating_mul(run_rows);
-    if rows > 0 && run_bytes > thresholds::RUN_BYTES_ADVICE.saturating_mul(rows) {
+    let Some(limits) = scan else {
+        return;
+    };
+    let scan_rows = u64::from(limits.max_scan_rows);
+    let bound = approx::count(limits.max_scan_bytes);
+    let scan_bytes = order.value_bytes.saturating_mul(scan_rows);
+    if rows > 0 && scan_bytes > bound.saturating_mul(rows) {
         findings.push(Finding::advice(
             FindingCode::LargeRuns,
             Some(path),
             format!(
-                "{run_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above {limit}, a gRPC client's default message limit; a Scan at the default max_scan_rows can answer more than such a client accepts (request fewer rows, or fewer columns)",
-                bytes = run_bytes / rows,
+                "{scan_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above server.max_scan_bytes {bound}, so a Scan at max_scan_rows {scan_rows} is refused as FAILED_PRECONDITION (lower max_scan_rows, have callers request fewer rows or columns, or raise server.max_scan_bytes where every client accepts larger messages)",
+                bytes = scan_bytes / rows,
                 per_row = order.value_bytes / rows,
-                limit = thresholds::RUN_BYTES_ADVICE,
             ),
             None,
         ));
@@ -3461,15 +3488,15 @@ mod tests {
     async fn test_file_advice_findings_large_file_above_the_advice_size() {
         let (_table, generation) = one_file(WriterLayout::contract()).await;
         let mut facts = measure(&generation.files[0], &generation.layout);
-        assert!(file_advice_findings(&facts, &generation.layout).is_empty());
+        assert!(file_advice_findings(&facts, &generation.layout, None).is_empty());
         facts.size = FILE_BYTES_ADVICE;
         assert!(
-            file_advice_findings(&facts, &generation.layout).is_empty(),
+            file_advice_findings(&facts, &generation.layout, None).is_empty(),
             "the threshold itself passes"
         );
         facts.size = FILE_BYTES_ADVICE + 1;
         assert_eq!(
-            shapes_of(&file_advice_findings(&facts, &generation.layout)),
+            shapes_of(&file_advice_findings(&facts, &generation.layout, None)),
             [(
                 FindingCode::LargeFile,
                 None,

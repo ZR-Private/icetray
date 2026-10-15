@@ -55,6 +55,26 @@ pub const SCAN_ROWS_BUCKETS: [f64; 14] = [
 pub const SCAN_FILES_BUCKETS: [f64; 11] =
     [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0];
 
+/// Histogram bucket bounds in bytes for `scan_response_bytes`: fourfold from
+/// 1 KiB to 1 MiB, then doubling through 4 MiB, the default
+/// `server.max_scan_bytes`, so a response at the bound and one just past
+/// it fall in different buckets, then fourfold to 256 MiB for the size of a
+/// refused response.
+pub const SCAN_RESPONSE_BUCKETS: [f64; 12] = [
+    1_024.0,
+    4_096.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    2_097_152.0,
+    4_194_304.0,
+    8_388_608.0,
+    16_777_216.0,
+    67_108_864.0,
+    268_435_456.0,
+];
+
 /// How long a gauge no one writes stays in the exposition: none, so a
 /// render drops every gauge left unwritten since the render before it.
 /// Every render writes each live gauge first (`render_after`), so what it
@@ -105,6 +125,10 @@ pub fn install() -> Result<PrometheusHandle, ServeError> {
         .set_buckets_for_metric(
             Matcher::Full(metric::SCAN_FILES.to_string()),
             &SCAN_FILES_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(metric::SCAN_RESPONSE_BYTES.to_string()),
+            &SCAN_RESPONSE_BUCKETS,
         )?
         .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT))
         .install_recorder()?;
@@ -540,6 +564,7 @@ mod tests {
             &SCAN_LATENCY_BUCKETS[..],
             &SCAN_ROWS_BUCKETS[..],
             &SCAN_FILES_BUCKETS[..],
+            &SCAN_RESPONSE_BUCKETS[..],
         ] {
             assert!(
                 buckets
@@ -565,6 +590,7 @@ mod tests {
             (metric::SCAN_SECONDS, &SCAN_LATENCY_BUCKETS[..]),
             (metric::SCAN_ROWS, &SCAN_ROWS_BUCKETS[..]),
             (metric::SCAN_FILES, &SCAN_FILES_BUCKETS[..]),
+            (metric::SCAN_RESPONSE_BYTES, &SCAN_RESPONSE_BUCKETS[..]),
         ] {
             metrics::histogram!(name, metric::LABEL_TABLE => TABLE).record(bounds[0]);
             let exposition = render_after(&handle, || {});

@@ -112,6 +112,7 @@ pub async fn build(
         batch_fan_out: server.batch_fan_out,
         scan_cache: scan_cache.clone(),
         max_multi_scan_values: server.max_multi_scan_values,
+        max_scan_bytes: server.max_scan_bytes,
     };
     let table = Table::new(
         config,

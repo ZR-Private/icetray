@@ -986,6 +986,7 @@ mod tests {
                 usize::try_from(server.scan_page_cache_bytes).unwrap(),
             ),
             max_multi_scan_values: server.max_multi_scan_values,
+            max_scan_bytes: server.max_scan_bytes,
         };
         Arc::new(Table::new(
             config,

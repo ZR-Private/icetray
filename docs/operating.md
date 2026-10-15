@@ -72,7 +72,9 @@ limits in `[server]` ([Configuration](configuration.md#server)):
 `max_in_flight` calls at once, past which a call is `RESOURCE_EXHAUSTED`;
 `max_multi_get_values` per `MultiGet`; `batch_fan_out` GETs in flight
 per `MultiGet`, `Scan`, or `MultiScan`, past which the next GET waits for
-one to end; `max_multi_scan_values` per `MultiScan`; and the
+one to end; `max_multi_scan_values` per `MultiScan`; `max_scan_bytes`, the
+encoded size above which a `Scan` or `MultiScan` response is refused as
+`FAILED_PRECONDITION`; and the
 `get_deadline`, `multi_get_deadline`, `scan_deadline`, and
 `multi_scan_deadline` past which a call is `DEADLINE_EXCEEDED`.
 
@@ -107,16 +109,19 @@ Counters and histograms:
 | `icetray_refresh_errors_total` | `table`, `reason` | no: from the first error | Refreshes that failed and left the previous generation serving. icetray counts a failure it remembers for a snapshot once, when it first meets it ([Refresh and reload](#refresh-and-reload)). |
 | `icetray_generation_swaps_total` | `table` | every table | Generations a refresh swapped in. The first load is not counted. |
 | `icetray_config_reloads_total` | `result` | every result | Reloads that read a changed configuration file. |
-| `icetray_scans_total` | `table`, `result` | every ordered table and result | Scans of one key that an ordered table read; each key of a `MultiScan` counts one. A request refused before any read is not counted. |
+| `icetray_scans_total` | `table`, `result` | every ordered table and result | Scans of one key that an ordered table read; each key of a `MultiScan` counts one. A request refused before any read is not counted. A call whose response the server refused above `server.max_scan_bytes` counts each key it read as `error`. |
 | `icetray_lookup_seconds` (histogram) | `table`, `result` | every table and result | Lookup latency. |
 | `icetray_object_get_seconds` (histogram) | `kind` | every kind | Object-store GET latency. |
 | `icetray_scan_rows` (histogram) | `table` | every ordered table | Rows each answered Scan of one key returned. |
 | `icetray_scan_files` (histogram) | `table` | every ordered table | Files holding the key that each answered Scan of one key read: 1 for a key held in one file, as on a table compacted to one file per bucket; more for an edge key that a compaction rolling files by size split across files, and for a key in files that appends overlap. |
 | `icetray_scan_seconds` (histogram) | `table`, `temperature` | every ordered table and temperature | Latency of each answered Scan of one key. |
+| `icetray_scan_response_bytes` (histogram) | `table` | every ordered table | The encoded size of each `Scan` or `MultiScan` response the server built, one sample per call, a response it refused above `server.max_scan_bytes` included at the size it would have been. A sample in the buckets past 4 MiB, or a rise in `icetray_requests_total{code="failed_precondition"}` of `scan` or `multi_scan`, means callers request more than the bound allows. |
 
 The latency histograms' buckets run from 100 microseconds to 2 seconds,
 and `icetray_scan_seconds`' to 10. `icetray_scan_rows`' run from 0 to
 10,000 rows and `icetray_scan_files`' from 0 to 64 files.
+`icetray_scan_response_bytes`' run from 1 KiB to 256 MiB, with a bound at
+2, 4, and 8 MiB.
 
 `icetray_requests_total` counts every call to `Get`, `MultiGet`, `Scan`,
 `MultiScan`, and `TableInfo`, including those the gRPC layer fails before icetray's
@@ -198,7 +203,8 @@ The label values:
   no column), `miss` (the key is absent).
 - `result` of `icetray_config_reloads_total`: `applied`, `refused`.
 - `result` of `icetray_scans_total`: `rows` (the Scan returned at least
-  one row), `empty` (it returned none), `error` (its read failed).
+  one row), `empty` (it returned none), `error` (its read failed, or its
+  call's response was above `server.max_scan_bytes` and refused).
 - `temperature`: `cold` (an order or value page of the Scan came from
   object storage, including through a fetch another call started),
   `warm` (otherwise).

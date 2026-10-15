@@ -187,6 +187,7 @@ impl RefusalCode {
             | ErrorKind::KeyType
             | ErrorKind::ColumnRequest
             | ErrorKind::ScanRequest
+            | ErrorKind::ResponseTooLarge
             | ErrorKind::WrongTableKind
             | ErrorKind::MalformedValue
             | ErrorKind::Table

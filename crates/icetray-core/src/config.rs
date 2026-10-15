@@ -15,6 +15,7 @@ use serde_json::error::Category;
 use crate::approx;
 use crate::aws_catalog;
 use crate::cache::min_memory_bytes;
+use crate::check::ScanLimits;
 use crate::column;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
@@ -159,6 +160,12 @@ pub(crate) const DEFAULT_BATCH_FAN_OUT: usize = 64;
 /// Four times `DEFAULT_MAX_MULTI_GET_VALUES`, since a `MultiScan` reads
 /// spans of rows where a `MultiGet` reads single values.
 pub(crate) const DEFAULT_MAX_MULTI_SCAN_VALUES: usize = 4_000;
+
+/// The encoded size in bytes of one `Scan` or `MultiScan` response the server
+/// sends when the file says nothing: 4 MiB, a gRPC client's default message
+/// limit (RFD 025). A larger response is refused as `FAILED_PRECONDITION`
+/// instead of reaching a client that cannot receive it.
+pub(crate) const DEFAULT_MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long a `Scan`, and each span GET of one, may run when the file says
 /// nothing: five seconds, as long as a `Get` (RFD 025).
@@ -630,6 +637,10 @@ pub enum ConfigViolation {
     /// refused.
     #[error("server.max_multi_scan_values 0 is not above zero")]
     MaxMultiScanValuesZero,
+    /// No response may be any size, so every `Scan` and `MultiScan` would be
+    /// refused.
+    #[error("server.max_scan_bytes 0 is not above zero")]
+    MaxScanBytesZero,
     /// A `Scan` deadline of zero, which would fail every scan unstarted.
     #[error("server.scan_deadline 0s is not above zero")]
     ScanDeadlineZero,
@@ -902,6 +913,7 @@ impl ServerConfig {
             max_multi_scan_values,
             scan_deadline,
             multi_scan_deadline,
+            max_scan_bytes,
             scan_page_cache_bytes,
             load_deadline,
             refresh_deadline,
@@ -951,6 +963,10 @@ impl ServerConfig {
             (
                 "server.multi_scan_deadline",
                 *multi_scan_deadline == server.multi_scan_deadline,
+            ),
+            (
+                "server.max_scan_bytes",
+                *max_scan_bytes == server.max_scan_bytes,
             ),
             (
                 "server.scan_page_cache_bytes",
@@ -1267,6 +1283,7 @@ fn validate_bounds(
             server.max_multi_scan_values,
             ConfigViolation::MaxMultiScanValuesZero,
         ),
+        (server.max_scan_bytes, ConfigViolation::MaxScanBytesZero),
     ];
     if let Some((_, violation)) = durations
         .into_iter()
@@ -1325,8 +1342,8 @@ fn validate_hedge(hedge: &HedgeConfig) -> std::result::Result<(), ConfigViolatio
 /// surface. Every duration is written as a friendly duration such as
 /// `"5s"`. `Config::validated` holds `poll_interval` between one second
 /// and one day, and every other duration, `max_in_flight`,
-/// `max_multi_get_values`, `batch_fan_out`, and `max_multi_scan_values`
-/// above zero.
+/// `max_multi_get_values`, `batch_fan_out`, `max_multi_scan_values`, and
+/// `max_scan_bytes` above zero.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -1386,6 +1403,13 @@ pub struct ServerConfig {
     /// whatever its size (RFD 025).
     #[serde(with = "time::friendly_duration")]
     pub multi_scan_deadline: Duration,
+    /// The encoded size in bytes above which a `Scan` or `MultiScan`
+    /// response is refused as `FAILED_PRECONDITION`, returning no rows
+    /// (RFD 025). The default is a gRPC client's default message limit; an
+    /// owner whose clients accept larger messages raises it. Like
+    /// `max_in_flight`, it is set for the process, so a reload that changes
+    /// it is refused and a restart applies it (RFD 018).
+    pub max_scan_bytes: usize,
     /// The budget in bytes of the memory cache for the pages ordered
     /// tables' span GETs fetch, kept out of the disk level so a scan evicts
     /// only other scans' pages (RFD 025); held to the same minimum as
@@ -1424,6 +1448,7 @@ impl Default for ServerConfig {
             max_multi_scan_values: DEFAULT_MAX_MULTI_SCAN_VALUES,
             scan_deadline: DEFAULT_SCAN_DEADLINE,
             multi_scan_deadline: DEFAULT_MULTI_SCAN_DEADLINE,
+            max_scan_bytes: DEFAULT_MAX_SCAN_BYTES,
             scan_page_cache_bytes: DEFAULT_SCAN_PAGE_CACHE_BYTES,
             load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
@@ -2074,6 +2099,16 @@ impl TableConfig {
             .map(|_| self.max_scan_rows.unwrap_or(DEFAULT_MAX_SCAN_ROWS))
     }
 
+    /// The limits a Scan of this table is held to, `max_scan_bytes` being
+    /// `server.max_scan_bytes`, on an ordered table; `None` on a key-value
+    /// table, which is never scanned.
+    pub fn scan_limits(&self, max_scan_bytes: usize) -> Option<ScanLimits> {
+        self.scan_rows().map(|max_scan_rows| ScanLimits {
+            max_scan_rows,
+            max_scan_bytes,
+        })
+    }
+
     /// `ConfigViolation::MaxScanRowsZero` for an ordered table whose
     /// `max_scan_rows` is zero; `index` is the table's place in `tables`
     /// when validation asks, `None` when a load or retune does
@@ -2405,6 +2440,8 @@ mod tests {
     const FIXTURE_SCAN_DEADLINE: Duration = Duration::from_secs(3);
     /// The `MultiScan` deadline the full fixture names, `"9s"`.
     const FIXTURE_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(9);
+    /// The `max_scan_bytes` the full fixture names.
+    const FIXTURE_MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
     /// The `max_scan_rows` the full fixture's ordered table names, below
     /// half of `FIXTURE_MAX_MULTI_SCAN_VALUES`.
     const FIXTURE_MAX_SCAN_ROWS: u32 = 500;
@@ -2473,6 +2510,7 @@ batch_fan_out = {FIXTURE_BATCH_FAN_OUT}
 max_multi_scan_values = {FIXTURE_MAX_MULTI_SCAN_VALUES}
 scan_deadline = "3s"
 multi_scan_deadline = "9s"
+max_scan_bytes = {FIXTURE_MAX_SCAN_BYTES}
 scan_page_cache_bytes = {FIXTURE_SCAN_PAGE_CACHE_BYTES}
 load_deadline = "45m"
 refresh_deadline = "10m"
@@ -2590,6 +2628,7 @@ endpoint = "https://s3tables.example"
                 "max_multi_scan_values": FIXTURE_MAX_MULTI_SCAN_VALUES,
                 "scan_deadline": "3s",
                 "multi_scan_deadline": "9s",
+                "max_scan_bytes": FIXTURE_MAX_SCAN_BYTES,
                 "scan_page_cache_bytes": FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 "load_deadline": "45m",
                 "refresh_deadline": "10m",
@@ -2728,6 +2767,7 @@ value_columns = ["value"]
                 max_multi_scan_values: FIXTURE_MAX_MULTI_SCAN_VALUES,
                 scan_deadline: FIXTURE_SCAN_DEADLINE,
                 multi_scan_deadline: FIXTURE_MULTI_SCAN_DEADLINE,
+                max_scan_bytes: FIXTURE_MAX_SCAN_BYTES,
                 scan_page_cache_bytes: FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
@@ -3152,6 +3192,7 @@ locaton = "typo"
         next.server.max_multi_scan_values += 1;
         next.server.scan_deadline += Duration::from_secs(1);
         next.server.multi_scan_deadline += Duration::from_secs(1);
+        next.server.max_scan_bytes += 1;
         next.server.scan_page_cache_bytes += 1;
         next.storage.max_retries += 1;
         assert_eq!(
@@ -3162,6 +3203,7 @@ locaton = "typo"
                 "server.max_multi_scan_values",
                 "server.scan_deadline",
                 "server.multi_scan_deadline",
+                "server.max_scan_bytes",
                 "server.scan_page_cache_bytes",
                 "storage.max_retries"
             ]
@@ -4089,6 +4131,7 @@ locaton = "typo"
                 "max_multi_scan_values",
                 ConfigViolation::MaxMultiScanValuesZero,
             ),
+            ("max_scan_bytes", ConfigViolation::MaxScanBytesZero),
         ];
         for (key, expected) in limits {
             let text = format!("{TOML_MINIMAL}\n[server]\n{key} = 0\n");
@@ -4130,6 +4173,7 @@ locaton = "typo"
             config.server.multi_scan_deadline,
             DEFAULT_MULTI_SCAN_DEADLINE
         );
+        assert_eq!(config.server.max_scan_bytes, DEFAULT_MAX_SCAN_BYTES);
         assert_eq!(
             config.server.scan_page_cache_bytes,
             DEFAULT_SCAN_PAGE_CACHE_BYTES

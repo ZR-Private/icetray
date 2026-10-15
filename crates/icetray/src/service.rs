@@ -10,7 +10,10 @@
 //! at once. A `MultiGet` asks for at most `server.max_multi_get_values`
 //! values, its keys times the columns it names, whatever fields each names
 //! (RFD 022, RFD 024); a `MultiScan`'s bound, `server.max_multi_scan_values`,
-//! and a Scan's other checks against the table are core's (RFD 025).
+//! and a Scan's other checks against the table are core's (RFD 025). A Scan
+//! or `MultiScan` response is measured as the message that would be sent,
+//! and one above `server.max_scan_bytes` is refused with no rows
+//! (`scan_within_bound`, `multi_scan_within_bound`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,9 +24,9 @@ use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{
-    CacheError, ColumnRead, Direction, Error, Key, KeyType, Opened, OrderType, OrderValue, Row,
-    ScanBounds, ScanRow, Scanned, Table, TableConfig, TableLayout, Tables, ValueFormat, ValueType,
-    approx,
+    CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup, Opened,
+    OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanRow, Scanned, Table,
+    TableConfig, TableLayout, Tables, ValueFormat, ValueType, approx,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -32,6 +35,8 @@ use icetray_proto::v1::{
     MultiScanResponse, NullValue, ScanRequest, ScanResponse, TableInfoRequest, TableInfoResponse,
     column_value, order_value,
 };
+use prost::Message;
+use prost::encoding::message;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
@@ -99,6 +104,9 @@ pub struct Service {
     slots: Slots,
     /// The most values one `MultiGet` may ask for.
     max_multi_get_values: usize,
+    /// `server.max_scan_bytes`: the encoded size above which a Scan or
+    /// `MultiScan` response is refused.
+    max_scan_bytes: usize,
 }
 
 impl Service {
@@ -113,6 +121,7 @@ impl Service {
             multi_scan_deadline: server.multi_scan_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_values: server.max_multi_get_values,
+            max_scan_bytes: server.max_scan_bytes,
         }
     }
 
@@ -247,6 +256,90 @@ fn scan_bounds_from_wire(
     })
 }
 
+/// The field number of `ScanResponse.rows` and of `MultiScanResponse.results`,
+/// the repeated field each response is mostly made of.
+const REPEATED_FIELD_TAG: u32 = 1;
+
+/// A Scan response over `bound` bytes, its refusal, or the response and its
+/// size. The response is measured as the message that would be sent; past
+/// the bound, `Oversize` says how many rows, the longest prefix with `more`
+/// set, would fit.
+fn scan_within_bound(
+    lookup: ScanLookup,
+    bound: usize,
+) -> Result<(ScanResponse, Option<usize>), Oversize> {
+    let (rows, more) = scanned_wire(lookup.scanned);
+    let response = ScanResponse {
+        rows,
+        more,
+        snapshot_id: lookup.snapshot_id.0,
+    };
+    let bytes = response.encoded_len();
+    if bytes <= bound {
+        return Ok((response, Some(bytes)));
+    }
+    let fixed = ScanResponse {
+        rows: Vec::new(),
+        more: true,
+        snapshot_id: response.snapshot_id,
+    };
+    Err(Oversize {
+        bytes,
+        bound,
+        fits: Fits::Rows(fitting_prefix(&response.rows, fixed.encoded_len(), bound)),
+    })
+}
+
+/// A `MultiScan` response as `scan_within_bound` has a Scan's, `Oversize`
+/// counting the leading keys' results that would fit.
+fn multi_scan_within_bound(
+    lookup: MultiScanLookup,
+    bound: usize,
+) -> Result<(MultiScanResponse, Option<usize>), Oversize> {
+    let results = lookup
+        .results
+        .into_iter()
+        .map(|scanned| {
+            let (rows, more) = scanned_wire(scanned);
+            v1::ScanResult { rows, more }
+        })
+        .collect();
+    let response = MultiScanResponse {
+        results,
+        snapshot_id: lookup.snapshot_id.0,
+    };
+    let bytes = response.encoded_len();
+    if bytes <= bound {
+        return Ok((response, Some(bytes)));
+    }
+    let fixed = MultiScanResponse {
+        results: Vec::new(),
+        snapshot_id: response.snapshot_id,
+    };
+    Err(Oversize {
+        bytes,
+        bound,
+        fits: Fits::Keys(fitting_prefix(
+            &response.results,
+            fixed.encoded_len(),
+            bound,
+        )),
+    })
+}
+
+/// How many of `items`, the repeated field of a response whose other
+/// fields encode to `fixed` bytes, fit in `bound` bytes, taken in order.
+fn fitting_prefix<M: Message>(items: &[M], fixed: usize, bound: usize) -> usize {
+    let mut size = fixed;
+    items
+        .iter()
+        .take_while(|item| {
+            size += message::encoded_len(REPEATED_FIELD_TAG, *item);
+            size <= bound
+        })
+        .count()
+}
+
 /// A wire scan fault as a status: every fault is the caller's, so
 /// `INVALID_ARGUMENT`, with the fault's `Display` as the message.
 impl From<WireScanFault> for Status {
@@ -311,7 +404,8 @@ async fn within<T>(
 /// request, and a call of the wrong kind for the table (RFD 025), is
 /// `INVALID_ARGUMENT`; a
 /// value a field list trims that is not the protobuf its column declares is
-/// `FAILED_PRECONDITION`, which a retry meets again (RFD 024); a page
+/// `FAILED_PRECONDITION`, which a retry meets again (RFD 024), as is a Scan
+/// or `MultiScan` response above `server.max_scan_bytes` (RFD 025); a page
 /// fetch that ran past `server.get_deadline` is
 /// `DEADLINE_EXCEEDED`, the code the call's own deadline answers: a `Get`'s
 /// deadline and its fetch's pass moments apart, and the call answers one
@@ -330,7 +424,9 @@ pub fn status_from(error: &Error) -> Status {
         | Error::ColumnRequest { .. }
         | Error::ScanRequest(_)
         | Error::WrongTableKind { .. } => Status::invalid_argument(message),
-        Error::MalformedValue { .. } => Status::failed_precondition(message),
+        Error::MalformedValue { .. } | Error::ResponseTooLarge { .. } => {
+            Status::failed_precondition(message)
+        }
         Error::Cache(CacheError::FetchDeadline { .. }) => Status::deadline_exceeded(message),
         Error::NotReady { .. }
         | Error::ObjectStore(_)
@@ -541,16 +637,14 @@ impl Service {
             request.after,
             request.before,
         )?;
-        let lookup = table
-            .scan(&key, &reads(&request.columns), &bounds)
+        let bound = self.max_scan_bytes;
+        let response = table
+            .scan_with(&key, &reads(&request.columns), &bounds, move |lookup| {
+                scan_within_bound(lookup, bound)
+            })
             .await
             .map_err(|error| status_from(&error))?;
-        let (rows, more) = scanned_wire(lookup.scanned);
-        Ok(Response::new(ScanResponse {
-            rows,
-            more,
-            snapshot_id: lookup.snapshot_id.0,
-        }))
+        Ok(Response::new(response))
     }
 
     /// `MultiScan` inside its deadline.
@@ -572,22 +666,14 @@ impl Service {
             request.after,
             request.before,
         )?;
-        let lookup = table
-            .multi_scan(&keys, &reads(&request.columns), &bounds)
+        let bound = self.max_scan_bytes;
+        let response = table
+            .multi_scan_with(&keys, &reads(&request.columns), &bounds, move |lookup| {
+                multi_scan_within_bound(lookup, bound)
+            })
             .await
             .map_err(|error| status_from(&error))?;
-        let results = lookup
-            .results
-            .into_iter()
-            .map(|scanned| {
-                let (rows, more) = scanned_wire(scanned);
-                v1::ScanResult { rows, more }
-            })
-            .collect();
-        Ok(Response::new(MultiScanResponse {
-            results,
-            snapshot_id: lookup.snapshot_id.0,
-        }))
+        Ok(Response::new(response))
     }
 
     /// `Get`, admitted and inside its deadline.
@@ -1026,6 +1112,21 @@ mod tests {
                 Code::InvalidArgument,
             )
         }))
+        .chain(
+            [Fits::Rows(SAMPLE_LIMIT), Fits::Keys(SAMPLE_LIMIT)].map(|fits| {
+                (
+                    Error::ResponseTooLarge {
+                        table: TABLE.to_string(),
+                        oversize: Oversize {
+                            bytes: SAMPLE_LIMIT + 1,
+                            bound: SAMPLE_LIMIT,
+                            fits,
+                        },
+                    },
+                    Code::FailedPrecondition,
+                )
+            }),
+        )
         .collect()
     }
 
@@ -1415,6 +1516,164 @@ mod tests {
                 (wire, wire_width),
                 "{order_type}"
             );
+        }
+    }
+
+    /// Value lengths of the sample rows, chosen to cross the lengths at
+    /// which a varint grows a byte: 127 and 128, and 16,383 and 16,384.
+    const SAMPLE_VALUE_LENS: [usize; 6] = [10, 127, 128, 16_383, 16_384, 300];
+
+    /// The sample snapshot id: nine varint bytes, as an Iceberg id is.
+    const SAMPLE_SNAPSHOT: i64 = 0x3fff_ffff_ffff_fff1;
+
+    /// A Scan answer of `SAMPLE_VALUE_LENS`' rows, the first `rows` of
+    /// them, each with a long order value and one value.
+    fn sample_scanned(rows: usize, more: bool) -> Scanned {
+        Scanned {
+            rows: SAMPLE_VALUE_LENS[..rows]
+                .iter()
+                .zip(0_i64..)
+                .map(|(&len, order)| ScanRow {
+                    order: OrderValue::Long(order * 100),
+                    values: vec![Some(Bytes::from(vec![7u8; len]))],
+                })
+                .collect(),
+            more,
+        }
+    }
+
+    /// The `ScanResponse` the sample answer is sent as.
+    fn sample_response(rows: usize, more: bool) -> ScanResponse {
+        let (rows, more) = scanned_wire(sample_scanned(rows, more));
+        ScanResponse {
+            rows,
+            more,
+            snapshot_id: SAMPLE_SNAPSHOT,
+        }
+    }
+
+    fn sample_lookup(rows: usize, more: bool) -> ScanLookup {
+        ScanLookup {
+            scanned: sample_scanned(rows, more),
+            snapshot_id: icetray_core::SnapshotId(SAMPLE_SNAPSHOT),
+        }
+    }
+
+    /// A response exactly at the bound is sent with its size, and one byte
+    /// over is refused naming the size, the bound, and the rows that fit.
+    #[test]
+    fn test_scan_within_bound_sends_at_the_bound_and_refuses_one_byte_over() {
+        let rows = SAMPLE_VALUE_LENS.len();
+        let size = sample_response(rows, false).encoded_len();
+        let (response, bytes) = scan_within_bound(sample_lookup(rows, false), size).unwrap();
+        assert_eq!(bytes, Some(size));
+        assert_eq!(response, sample_response(rows, false));
+
+        let refused = scan_within_bound(sample_lookup(rows, false), size - 1).unwrap_err();
+        let fits = fits_rows(&sample_response(rows, false), size - 1);
+        assert_eq!(
+            refused,
+            Oversize {
+                bytes: size,
+                bound: size - 1,
+                fits: Fits::Rows(fits),
+            }
+        );
+        assert_eq!(fits, rows - 1, "only the last row does not fit");
+    }
+
+    /// The most leading rows of `response`, sent with `more` set, whose
+    /// encoded size is within `bound`, found by encoding each prefix.
+    fn fits_rows(response: &ScanResponse, bound: usize) -> usize {
+        (0..=response.rows.len())
+            .take_while(|&rows| {
+                ScanResponse {
+                    rows: response.rows[..rows].to_vec(),
+                    more: true,
+                    snapshot_id: response.snapshot_id,
+                }
+                .encoded_len()
+                    <= bound
+            })
+            .count()
+            .saturating_sub(1)
+    }
+
+    /// For a bound at, one under, and one over each prefix's size, the rows
+    /// reported to fit are the longest prefix whose encoding is within it,
+    /// none when not even the empty response is.
+    #[test]
+    fn test_scan_within_bound_counts_the_longest_prefix_that_fits() {
+        let rows = SAMPLE_VALUE_LENS.len();
+        let response = sample_response(rows, false);
+        let mut reported = std::collections::BTreeSet::new();
+        for prefix in 0..=rows {
+            let size = ScanResponse {
+                rows: response.rows[..prefix].to_vec(),
+                more: true,
+                snapshot_id: SAMPLE_SNAPSHOT,
+            }
+            .encoded_len();
+            for bound in [size - 1, size, size + 1] {
+                if bound >= response.encoded_len() {
+                    continue;
+                }
+                let Err(oversize) = scan_within_bound(sample_lookup(rows, false), bound) else {
+                    panic!("bound {bound} is below the response's size");
+                };
+                let expected = fits_rows(&response, bound);
+                assert_eq!(oversize.fits, Fits::Rows(expected), "bound {bound}");
+                reported.insert(expected);
+            }
+        }
+        assert_eq!(
+            reported,
+            (0..rows).collect(),
+            "every count from none to all but one is reported"
+        );
+    }
+
+    /// A `MultiScan` response reports the leading results that fit, a key
+    /// listed twice counting at each position, and is sent at the bound.
+    #[test]
+    fn test_multi_scan_within_bound_counts_the_leading_results_that_fit() {
+        let results = [2, 0, 3, 2];
+        let lookup = || MultiScanLookup {
+            results: results
+                .iter()
+                .map(|&rows| sample_scanned(rows, rows > 0))
+                .collect(),
+            snapshot_id: icetray_core::SnapshotId(SAMPLE_SNAPSHOT),
+        };
+        let response = |keys: usize| MultiScanResponse {
+            results: results[..keys]
+                .iter()
+                .map(|&rows| {
+                    let (rows, more) = scanned_wire(sample_scanned(rows, rows > 0));
+                    v1::ScanResult { rows, more }
+                })
+                .collect(),
+            snapshot_id: SAMPLE_SNAPSHOT,
+        };
+        let size = response(results.len()).encoded_len();
+        let (sent, bytes) = multi_scan_within_bound(lookup(), size).unwrap();
+        assert_eq!((sent, bytes), (response(results.len()), Some(size)));
+
+        for keys in 0..results.len() {
+            let fits = response(keys).encoded_len();
+            let over = response(keys + 1).encoded_len();
+            for bound in [fits, over - 1] {
+                let refused = multi_scan_within_bound(lookup(), bound).unwrap_err();
+                assert_eq!(
+                    refused,
+                    Oversize {
+                        bytes: size,
+                        bound,
+                        fits: Fits::Keys(keys),
+                    },
+                    "bound {bound}"
+                );
+            }
         }
     }
 }

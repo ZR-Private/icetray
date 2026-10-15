@@ -73,6 +73,10 @@ pub const SCAN_FILES: &str = "icetray_scan_files";
 /// Latency in seconds of each answered Scan of one key, by `table` and
 /// `temperature` (`Temperature`, RFD 025).
 pub const SCAN_SECONDS: &str = "icetray_scan_seconds";
+/// The encoded size in bytes of each Scan or `MultiScan` response, by
+/// `table`, one sample per call, one the server refused above
+/// `server.max_scan_bytes` included (RFD 025, Limits).
+pub const SCAN_RESPONSE_BYTES: &str = "icetray_scan_response_bytes";
 
 // Every gauge below is written on the scrape path (the binary's
 // `Scrape::publish`, through `Table::publish_gauges` and the like), never
@@ -197,7 +201,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 53] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 54] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -307,6 +311,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 53] = [
         SCAN_SECONDS,
         Kind::Histogram,
         "Latency in seconds of each answered Scan of one key, by table and temperature.",
+    ),
+    (
+        SCAN_RESPONSE_BYTES,
+        Kind::Histogram,
+        "Encoded size in bytes of each Scan or MultiScan response, a refused one included, by table.",
     ),
     (
         INDEX_BYTES,

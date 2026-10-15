@@ -2619,6 +2619,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

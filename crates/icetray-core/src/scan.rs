@@ -53,6 +53,46 @@ pub struct MultiScanLookup {
     pub snapshot_id: SnapshotId,
 }
 
+/// What of a refused response would have fit under the bound: the rows a
+/// Scan's response could hold, or the leading keys' results a `MultiScan`'s
+/// could, a key listed twice counting at each position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fits {
+    /// The longest prefix of a Scan's rows, in the order returned, whose
+    /// response is within the bound.
+    Rows(usize),
+    /// The longest prefix of a `MultiScan`'s results whose response is
+    /// within the bound.
+    Keys(usize),
+}
+
+/// A Scan or `MultiScan` response above `server.max_scan_bytes` (RFD 025,
+/// Limits): the size it would encode to, the bound, and what would fit.
+/// Display gives the fault for `Error::ResponseTooLarge`'s message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Oversize {
+    /// The response's encoded size in bytes.
+    pub bytes: usize,
+    /// `server.max_scan_bytes`.
+    pub bound: usize,
+    /// What of the response would fit.
+    pub fits: Fits,
+}
+
+impl fmt::Display for Oversize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the response is {} bytes, above server.max_scan_bytes {}; ",
+            self.bytes, self.bound
+        )?;
+        match self.fits {
+            Fits::Rows(rows) => write!(f, "the first {rows} rows would fit"),
+            Fits::Keys(keys) => write!(f, "the results of the first {keys} keys would fit"),
+        }
+    }
+}
+
 /// What makes a Scan or `MultiScan` request malformed (RFD 025, Wire), each
 /// found before any read. Display gives the fault for
 /// `Error::ScanRequest`'s message.

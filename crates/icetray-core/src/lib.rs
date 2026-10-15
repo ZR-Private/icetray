@@ -42,8 +42,8 @@ pub use cache::{CacheError, PageCache};
 pub use catalog::{TableFault, TableSource};
 pub use check::{
     Capping, ColumnCost, ColumnLevel, ColumnSummary, Examined, FileOrderReport, FileReport,
-    Finding, FindingCode, LookupCost, OrderSummary, Penalty, TableReport, TableSummary, Unwalked,
-    ValueColumnReport, WriterProperty, diagnose, examine, judge,
+    Finding, FindingCode, LookupCost, OrderSummary, Penalty, ScanLimits, TableReport, TableSummary,
+    Unwalked, ValueColumnReport, WriterProperty, diagnose, examine, judge,
 };
 pub use column::ColumnMismatch;
 pub use config::{
@@ -73,7 +73,7 @@ pub use order::{
     Direction, OrderColumnLayout, OrderFacts, OrderType, OrderValue, OrderVariant, ScanBounds,
 };
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
-pub use scan::{MultiScanLookup, ScanLookup, ScanRequestFault, ScanRow, Scanned};
+pub use scan::{Fits, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, ScanRow, Scanned};
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{FILE_PREFIX, IoStats, LocationError, LocationFault, Storage};
 pub use table::{CallsInFlight, FindingLog, Table, TableHandles, TableKind, TableState};

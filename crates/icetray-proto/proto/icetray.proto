@@ -33,14 +33,22 @@ service Icetray {
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   // Read the rows of one key in one ordered table, in order-value order,
   // one page at a time. The response carries the id of the snapshot the
-  // server read it from.
+  // server read it from. A response whose encoded size is above the
+  // server's limit on one, 4 MiB by default, is never sent: the call is a
+  // FAILED_PRECONDITION error, the same on every attempt, whose message
+  // names the response's size, the limit, and how many rows would have
+  // fit, and the caller sets a smaller `limit` or lists fewer columns.
   rpc Scan(ScanRequest) returns (ScanResponse);
   // Read the rows of many keys in one ordered table, each as a Scan reads
   // them, all from one snapshot. The response returns one result per key in
   // request order, a key listed twice answered at each position. When the
   // read of any key fails, the whole call fails, so a response always
   // covers every key of the request. A caller that retries resends the
-  // whole call; a FAILED_PRECONDITION error recurs on every retry.
+  // whole call; a FAILED_PRECONDITION error recurs on every retry. As for
+  // Scan, a response above the server's limit on a response's encoded size
+  // is a FAILED_PRECONDITION error; its message names how many leading
+  // keys' results would have fit, and the caller lists fewer keys, sets a
+  // smaller `limit`, or lists fewer columns.
   rpc MultiScan(MultiScanRequest) returns (MultiScanResponse);
   // Describe the snapshot the server currently serves for a table.
   rpc TableInfo(TableInfoRequest) returns (TableInfoResponse);
@@ -300,7 +308,9 @@ message ScanRequest {
   // The direction the rows are returned in. It must be set.
   Direction direction = 4;
   // The most rows to return. 0 reads up to TableInfoResponse.max_scan_rows;
-  // a limit above it is an INVALID_ARGUMENT error.
+  // a limit above it is an INVALID_ARGUMENT error. A response must also fit
+  // the server's limit on its encoded size (see Scan), so a caller whose
+  // values are large sets a limit that fits.
   uint32 limit = 5;
   // When set, only rows whose order value is above this one, exclusive. A
   // caller reading oldest first pages by setting it to the newest order
@@ -360,7 +370,9 @@ message MultiScanRequest {
   repeated ColumnRead columns = 3;
   // The direction every key's rows are returned in. It must be set.
   Direction direction = 4;
-  // The most rows to return per key, as ScanRequest.limit.
+  // The most rows to return per key, as ScanRequest.limit. The whole
+  // response must fit the server's limit on its encoded size (see
+  // MultiScan).
   uint32 limit = 5;
   // The exclusive lower bound on every key's rows, as ScanRequest.after.
   OrderValue after = 6;

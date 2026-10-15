@@ -41,6 +41,7 @@ use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, OrderKind, Ordered,
     S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
 };
+use prost::Message;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
@@ -1291,7 +1292,11 @@ fn assert_scan_series_exposed_at_zero(scrape: &str) {
         );
     }
     let infinite = ("le", "+Inf");
-    for name in [metric::SCAN_ROWS, metric::SCAN_FILES] {
+    for name in [
+        metric::SCAN_ROWS,
+        metric::SCAN_FILES,
+        metric::SCAN_RESPONSE_BYTES,
+    ] {
         assert_eq!(
             series_value(scrape, &format!("{name}_bucket"), &[ordered, infinite]),
             Some(0.0),
@@ -1318,6 +1323,7 @@ fn assert_scan_series_exposed_at_zero(scrape: &str) {
         metric::SCANS_TOTAL.to_string(),
         format!("{}_bucket", metric::SCAN_ROWS),
         format!("{}_bucket", metric::SCAN_FILES),
+        format!("{}_bucket", metric::SCAN_RESPONSE_BYTES),
         format!("{}_bucket", metric::SCAN_SECONDS),
     ];
     for name in &scan_series {
@@ -3391,6 +3397,224 @@ async fn test_multi_scan_answers_a_repeated_key_at_each_position() -> TestResult
     assert_ne!(response.results[0], response.results[1]);
     assert!(response.results[3].rows.is_empty());
     assert!(!response.results[3].more);
+    Ok(())
+}
+
+/// The scan the response-bound tests send: every row of a key, newest
+/// first.
+fn whole_key() -> TestScan {
+    TestScan {
+        limit: u32::try_from(ROWS_PER_KEY).expect("a row count fits u32"),
+        ..every_row(SCAN_CAP_DEFAULT)
+    }
+}
+
+/// `rows` as the server sends them, built from the fixture model's own
+/// rows rather than from the server's conversion.
+fn model_wire_rows(rows: ScanRows) -> Vec<v1::ScanRow> {
+    rows.into_iter()
+        .map(|(order, values)| v1::ScanRow {
+            order: Some(wire_order(order)),
+            values: values
+                .into_iter()
+                .map(|value| v1::ColumnValue {
+                    kind: Some(match value {
+                        Some(bytes) => v1::column_value::Kind::Value(bytes.into()),
+                        None => v1::column_value::Kind::NullValue(v1::NullValue {}),
+                    }),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The response the model says a Scan of `key` in `fixture` answers under
+/// `whole_key`, from the snapshot the fixture's table holds.
+fn model_scan_response(fixture: &Fixture, key: &Key) -> ScanResponse {
+    let (rows, more) = expected(fixture, key, &whole_key());
+    ScanResponse {
+        rows: model_wire_rows(rows),
+        more,
+        snapshot_id: fixture.snapshot_id().expect("a committed table"),
+    }
+}
+
+/// The response the model says a `MultiScan` of `keys` answers under
+/// `whole_key`, one result per position.
+fn model_multi_scan_response(fixture: &Fixture, keys: &[Key]) -> MultiScanResponse {
+    MultiScanResponse {
+        results: keys
+            .iter()
+            .map(|key| {
+                let (rows, more) = expected(fixture, key, &whole_key());
+                v1::ScanResult {
+                    rows: model_wire_rows(rows),
+                    more,
+                }
+            })
+            .collect(),
+        snapshot_id: fixture.snapshot_id().expect("a committed table"),
+    }
+}
+
+/// The `scans_total` of `ORDERED_TABLE` under `result` in `exposition`.
+fn scans_counted(exposition: &str, result: ScanResult) -> f64 {
+    series_sum(
+        exposition,
+        metric::SCANS_TOTAL,
+        &[
+            (metric::LABEL_TABLE, ORDERED_TABLE),
+            (metric::LABEL_RESULT, &result.to_string()),
+        ],
+    )
+}
+
+/// What `scan_response_bytes` of `ORDERED_TABLE` holds in `exposition`: its
+/// samples and their sum in bytes.
+fn response_bytes(exposition: &str) -> (f64, f64) {
+    let read = |suffix: &str| {
+        series_sum(
+            exposition,
+            &format!("{}_{suffix}", metric::SCAN_RESPONSE_BYTES),
+            &[(metric::LABEL_TABLE, ORDERED_TABLE)],
+        )
+    };
+    (read("count"), read("sum"))
+}
+
+/// Asserts that `later` counts `expected` more Scans of `ORDERED_TABLE`
+/// under each of `ScanResult`'s results than `earlier`, in `ScanResult::ALL`
+/// order.
+fn assert_scans_counted(earlier: &str, later: &str, expected: [u64; 3]) {
+    for (result, expected) in ScanResult::ALL.into_iter().zip(expected) {
+        let added = scans_counted(later, result) - scans_counted(earlier, result);
+        assert_eq!(
+            added.to_bits(),
+            approx::gauge(expected).to_bits(),
+            "{result}: {added} counted, {expected} expected"
+        );
+    }
+}
+
+/// A Scan whose response encodes to exactly `server.max_scan_bytes` is
+/// sent, and one a single byte over is `FAILED_PRECONDITION` with no rows:
+/// the call counts as an `error` in `scans_total` and not as `rows`, the
+/// response's size is recorded either way, and the code is counted in
+/// `requests_total`. The sizes come from the fixture model's rows, whose
+/// values the table's writer gave known lengths.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refused() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    for over in [0, 1] {
+        let mut size = 0;
+        let mut stack = Stack::ready_ordered_with(async |setup| {
+            let key = setup.fixtures[1].key(ORDERED_IDS.start);
+            size = model_scan_response(&setup.fixtures[1], &key).encoded_len();
+            setup.config.server.max_scan_bytes = size - over;
+            Ok(())
+        })
+        .await?;
+        let key = stack.ordered().key(ORDERED_IDS.start);
+        let request = ScanRequest {
+            limit: whole_key().limit,
+            ..scan_of(ORDERED_TABLE, &key)
+        };
+        let before = stack.scrape().await?;
+        let answered = stack.scan(request).await;
+        let after = stack.scrape().await?;
+
+        let (samples, bytes) = response_bytes(&after);
+        let (samples_before, bytes_before) = response_bytes(&before);
+        assert_eq!(
+            (samples - samples_before).to_bits(),
+            approx::gauge(1).to_bits(),
+            "over {over}: one sample"
+        );
+        assert_eq!(
+            (bytes - bytes_before).to_bits(),
+            approx::gauge_len(size).to_bits(),
+            "over {over}: the size of the response, sent or refused"
+        );
+        if over == 0 {
+            let response = answered?;
+            assert_eq!(response, model_scan_response(stack.ordered(), &key));
+            assert_eq!(response.encoded_len(), size);
+            assert_scans_counted(&before, &after, [1, 0, 0]);
+            assert_counted(&before, &after, Call::Scan, Code::Ok, 1);
+        } else {
+            assert_eq!(code_of(answered), Code::FailedPrecondition);
+            assert_scans_counted(&before, &after, [0, 0, 1]);
+            assert_counted(&before, &after, Call::Scan, Code::FailedPrecondition, 1);
+            assert_counted(&before, &after, Call::Scan, Code::Ok, 0);
+        }
+    }
+    Ok(())
+}
+
+/// A `MultiScan` is held to the bound as a whole: a response of exactly
+/// `server.max_scan_bytes` is sent, and one byte over is
+/// `FAILED_PRECONDITION` with no results, each distinct key it read counted
+/// as an `error` in `scans_total`, a key listed twice once.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refused() -> TestResult
+{
+    let _serial = SERIAL.lock().await;
+    for over in [0, 1] {
+        let keys_of = |fixture: &Fixture| {
+            let first = fixture.key(ORDERED_IDS.start);
+            let second = fixture.key(ORDERED_IDS.start + 1);
+            let absent = fixture.absent_near(ORDERED_IDS.end);
+            [first.clone(), second, first, absent]
+        };
+        let distinct = 3;
+        let mut size = 0;
+        let mut stack = Stack::ready_ordered_with(async |setup| {
+            let keys = keys_of(&setup.fixtures[1]);
+            size = model_multi_scan_response(&setup.fixtures[1], &keys).encoded_len();
+            setup.config.server.max_scan_bytes = size - over;
+            Ok(())
+        })
+        .await?;
+        let keys = keys_of(stack.ordered());
+        let request = MultiScanRequest {
+            limit: whole_key().limit,
+            ..multi_scan_of(ORDERED_TABLE, &keys)
+        };
+        let before = stack.scrape().await?;
+        let answered = stack.multi_scan(request).await;
+        let after = stack.scrape().await?;
+
+        let (samples, bytes) = response_bytes(&after);
+        let (samples_before, bytes_before) = response_bytes(&before);
+        assert_eq!(
+            (samples - samples_before).to_bits(),
+            approx::gauge(1).to_bits(),
+            "over {over}: one sample"
+        );
+        assert_eq!(
+            (bytes - bytes_before).to_bits(),
+            approx::gauge_len(size).to_bits(),
+            "over {over}: the size of the response, sent or refused"
+        );
+        if over == 0 {
+            let response = answered?;
+            assert_eq!(response, model_multi_scan_response(stack.ordered(), &keys));
+            assert_eq!(response.encoded_len(), size);
+            assert_scans_counted(&before, &after, [2, 1, 0]);
+            assert_counted(&before, &after, Call::MultiScan, Code::Ok, 1);
+        } else {
+            assert_eq!(code_of(answered), Code::FailedPrecondition);
+            assert_scans_counted(&before, &after, [0, 0, distinct]);
+            assert_counted(
+                &before,
+                &after,
+                Call::MultiScan,
+                Code::FailedPrecondition,
+                1,
+            );
+            assert_counted(&before, &after, Call::MultiScan, Code::Ok, 0);
+        }
+    }
     Ok(())
 }
 

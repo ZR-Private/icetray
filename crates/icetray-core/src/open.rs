@@ -459,6 +459,7 @@ pub async fn open_with(
         batch_fan_out: config.server.batch_fan_out,
         scan_cache: scan_cache.clone(),
         max_multi_scan_values: config.server.max_multi_scan_values,
+        max_scan_bytes: config.server.max_scan_bytes,
     };
     let deadlines = Deadlines {
         load: config.server.load_deadline,

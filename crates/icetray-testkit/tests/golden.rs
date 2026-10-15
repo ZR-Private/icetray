@@ -15,7 +15,7 @@ use iceberg::spec::{
 };
 use icetray_core::ColumnRead;
 use icetray_core::approx::count;
-use icetray_core::config::{Config, LocalConfig, StorageConfig, ValueFormat};
+use icetray_core::config::{Config, LocalConfig, ServerConfig, StorageConfig, ValueFormat};
 use icetray_core::{
     DEFAULT_MAX_SCAN_ROWS, Direction, Error, Finding, FindingCode, FindingLog, Generation, Key,
     Level, LookupCost, OrderType, RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned,
@@ -72,7 +72,9 @@ impl Golden {
             &self.current(),
             self.table.config().lookups(),
             &ValueFormat::opaque,
-            self.table.config().scan_rows(),
+            self.table
+                .config()
+                .scan_limits(ServerConfig::default().max_scan_bytes),
         )
     }
 }

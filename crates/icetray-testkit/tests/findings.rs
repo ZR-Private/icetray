@@ -21,12 +21,13 @@ use icetray_core::approx;
 use icetray_core::check::thresholds::{
     BLOOM_BITS_PER_KEY_MIN, BLOOM_BYTES_PER_KEY_ADVICE, DISTINCT_MINS_RATIO_ADVICE,
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
-    RUN_BYTES_ADVICE, RUN_ROWS_ADVICE,
+    RUN_ROWS_ADVICE,
 };
-use icetray_core::config::{LocalConfig, Residency, TableConfig, ValueFormat};
+use icetray_core::config::{LocalConfig, Residency, ServerConfig, TableConfig, ValueFormat};
 use icetray_core::{
     Capping, Error, FILE_PREFIX, FileFault, Finding, FindingCode, HeaderField, KeyType, Level,
-    LocalDir, OrderValue, RefusalReason, Row, Storage, TableReport, WriterProperty, diagnose,
+    LocalDir, OrderValue, RefusalReason, Row, ScanLimits, Storage, TableReport, WriterProperty,
+    diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -1193,7 +1194,8 @@ async fn test_long_runs_is_advice_above_one_thousand_rows() -> Result<()> {
 }
 
 /// Bytes per value of the large-run fixture: `RUN_ROWS_ADVICE` rows of
-/// them, incompressible, are a fifth over `RUN_BYTES_ADVICE`.
+/// them, incompressible, are a fifth over the default
+/// `server.max_scan_bytes`.
 const LARGE_RUN_VALUE_BYTES: usize = 5_000;
 
 /// Rows per page of the large-run fixture: small enough that a value page
@@ -1201,12 +1203,16 @@ const LARGE_RUN_VALUE_BYTES: usize = 5_000;
 /// code it is designed for.
 const LARGE_RUN_PAGE_ROWS: usize = 100;
 
-/// A file where `RUN_ROWS_ADVICE` rows of the configured value columns, at
+/// One mebibyte, the lowered `server.max_scan_bytes` of the large-run cases.
+const MIB: usize = 1024 * 1024;
+
+/// A file where `max_scan_rows` rows of the configured value columns, at
 /// the footer's uncompressed bytes per row, would exceed
-/// `RUN_BYTES_ADVICE` is advice: a Scan at the default `max_scan_rows`
-/// answers more than a gRPC client accepts by default.
+/// `server.max_scan_bytes` is advice: a Scan at the full limit is refused.
+/// Raising the bound or lowering the limit past what the fixture's rows
+/// come to clears it, and lowering the bound brings it back.
 #[tokio::test]
-async fn test_large_runs_is_advice_above_four_mib() -> Result<()> {
+async fn test_large_runs_is_advice_above_the_scan_byte_bound() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
         value_bytes: LARGE_RUN_VALUE_BYTES,
@@ -1217,24 +1223,41 @@ async fn test_large_runs_is_advice_above_four_mib() -> Result<()> {
         ..ordered_spec("ord_largeruns", OrderKind::Long)
     };
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
-    let report = diagnose(
-        &served.current(),
-        Level::Optimal,
-        &ValueFormat::opaque,
-        None,
-    );
-    assert_codes(&report, &[], &[FindingCode::LargeRuns]);
-    let run_bytes = approx::count(LARGE_RUN_VALUE_BYTES) * u64::from(RUN_ROWS_ADVICE);
-    assert!(run_bytes > RUN_BYTES_ADVICE);
-    assert_eq!(
-        report
+    let generation = served.current();
+    let default_bound = ServerConfig::default().max_scan_bytes;
+    let cases = [
+        (RUN_ROWS_ADVICE, default_bound, true),
+        (RUN_ROWS_ADVICE, 2 * default_bound, false),
+        (RUN_ROWS_ADVICE / 10, default_bound, false),
+        (3 * RUN_ROWS_ADVICE / 10, MIB, true),
+        (RUN_ROWS_ADVICE / 10, MIB, false),
+    ];
+    for (max_scan_rows, max_scan_bytes, advised) in cases {
+        let report = diagnose(
+            &generation,
+            Level::Optimal,
+            &ValueFormat::opaque,
+            Some(ScanLimits {
+                max_scan_rows,
+                max_scan_bytes,
+            }),
+        );
+        let drawn = report
             .findings
             .iter()
             .filter(|finding| finding.code() == FindingCode::LargeRuns)
-            .count(),
-        report.files.len(),
-        "every file draws it"
-    );
+            .count();
+        let case = format!("{max_scan_rows} rows, {max_scan_bytes} bytes");
+        if advised {
+            assert_codes(&report, &[], &[FindingCode::LargeRuns]);
+            assert_eq!(drawn, report.files.len(), "every file draws it: {case}");
+        } else {
+            assert_codes(&report, &[], &[]);
+            assert_eq!(drawn, 0, "{case}");
+        }
+    }
+    let unknown = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
+    assert_codes(&unknown, &[], &[]);
     Ok(())
 }
 
