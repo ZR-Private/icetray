@@ -4,6 +4,13 @@
 > system's page cache serves without blocking runs on the worker; a read
 > that would block still runs on the blocking pool.
 
+> Updated 2026-10-15: the disk level's format marker is written to a
+> temporary file, synced, renamed over `cache.format`, and the directory
+> synced, after the emptying it vouches for is synced, so a crash leaves
+> the old marker or none and never a marker over files it does not
+> describe. A build from before the marker, rolled back to, writes cache
+> files the newer marker does not describe; see Operating icetray.
+
 > Updated 2026-09-29: a chunk file stores what verifying its keys
 > established and a checksum of its payload, and a restart trusts a file
 > whose checksum and verification context match without decoding a key;

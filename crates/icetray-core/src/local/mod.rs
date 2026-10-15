@@ -25,7 +25,7 @@ pub(crate) mod testing;
 
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
-use std::io;
+use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -249,9 +249,8 @@ impl LocalDir {
     /// that cannot be created or emptied is `Error::Local` on that path.
     pub fn open(config: &LocalConfig, stats: Arc<IoStats>) -> Result<Self> {
         let index_dir = config.dir.join(INDEX_DIR);
-        let cache_dir = config.dir.join(CACHE_DIR);
         fs::create_dir_all(&index_dir).map_err(|error| local_error(index_dir.clone(), error))?;
-        open_cache_dir(&cache_dir, &config.dir.join(CACHE_FORMAT_FILE))?;
+        let cache_dir = open_cache_dir(&config.dir)?;
         Ok(Self {
             index_dir,
             cache_dir,
@@ -626,30 +625,63 @@ fn cache_release() -> String {
     )
 }
 
-/// Creates `cache_dir`, first emptying it when `marker` is missing, cannot
-/// be read, or holds anything but `cache_format()`: everything in the local
+/// Creates the cache directory under `dir` and returns its path, first
+/// emptying it when `CACHE_FORMAT_FILE` is missing, cannot be read, or
+/// holds anything but `cache_format()`: everything in the local
 /// directory that does not match this build's format is treated as absent
 /// (RFD 017), so a disk level is recovered only by a release of the minor
-/// version that wrote it. The marker is written after the directory is emptied, so a
-/// crash between the two empties it again on the next open.
-fn open_cache_dir(cache_dir: &Path, marker: &Path) -> Result<()> {
+/// version that wrote it. The marker is written after the directory is
+/// emptied and that emptying is synced, and the marker itself is written
+/// whole or not at all (`write_marker`), so a crash at any point either
+/// leaves the old marker over the old files or no marker, which empties the
+/// directory again on the next open, and never a marker over files it does
+/// not describe.
+fn open_cache_dir(dir: &Path) -> Result<PathBuf> {
+    let cache_dir = dir.join(CACHE_DIR);
+    let marker = dir.join(CACHE_FORMAT_FILE);
     let format = cache_format();
-    let ours = fs::read(marker).is_ok_and(|held| held == format);
+    let ours = fs::read(&marker).is_ok_and(|held| held == format);
     if !ours {
-        match fs::remove_dir_all(cache_dir) {
+        match fs::remove_dir_all(&cache_dir) {
             Ok(()) => tracing::info!(
                 path = %cache_dir.display(),
                 "page cache disk level emptied: written by another minor release"
             ),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(local_error(cache_dir.to_path_buf(), error)),
+            Err(error) => return Err(local_error(cache_dir.clone(), error)),
         }
     }
-    fs::create_dir_all(cache_dir).map_err(|error| local_error(cache_dir.to_path_buf(), error))?;
+    fs::create_dir_all(&cache_dir).map_err(|error| local_error(cache_dir.clone(), error))?;
     if !ours {
-        fs::write(marker, &format).map_err(|error| local_error(marker.to_path_buf(), error))?;
+        sync_dir(dir)?;
+        write_marker(dir, &format)?;
     }
-    Ok(())
+    Ok(cache_dir)
+}
+
+/// Writes `format` to `CACHE_FORMAT_FILE` in `dir` so that a crash leaves
+/// either the file it had or the whole of the new one: a temporary file
+/// beside it, synced, renamed over it, then `dir` synced so the rename is
+/// durable. A temporary file a crash left is rewritten here and never read.
+fn write_marker(dir: &Path, format: &[u8]) -> Result<()> {
+    let marker = dir.join(CACHE_FORMAT_FILE);
+    let temp = dir.join(format!("{CACHE_FORMAT_FILE}.{TEMP_EXTENSION}"));
+    let write = |temp: &Path| -> io::Result<()> {
+        let mut file = File::create(temp)?;
+        file.write_all(format)?;
+        file.sync_all()
+    };
+    write(&temp).map_err(|error| local_error(temp.clone(), error))?;
+    fs::rename(&temp, &marker).map_err(|error| local_error(marker, error))?;
+    sync_dir(dir)
+}
+
+/// Syncs the directory at `dir`, which makes the entries created, removed,
+/// or renamed in it durable.
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| local_error(dir.to_path_buf(), error))
 }
 
 /// A failure of the local directory at `path` as the crate's error; the one
@@ -760,6 +792,72 @@ mod tests {
         assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
         let marker = fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap();
         assert_eq!(marker, cache_format());
+    }
+
+    /// What a temporary marker a crash left holds: a torn prefix of the
+    /// format.
+    const TORN_MARKER: &[u8] = &[CACHE_FORMAT_MAGIC, 0];
+
+    /// The temporary file `write_marker` writes in `dir`.
+    fn marker_temp(dir: &Path) -> PathBuf {
+        dir.join(format!("{CACHE_FORMAT_FILE}.{TEMP_EXTENSION}"))
+    }
+
+    #[test]
+    fn test_write_marker_leaves_the_whole_format_and_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), &cache_format()).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap(),
+            cache_format()
+        );
+        assert!(!marker_temp(dir.path()).exists());
+        let other = [CACHE_FORMAT_MAGIC];
+        write_marker(dir.path(), &other).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap(),
+            other,
+            "a marker replaces the one before it whole"
+        );
+    }
+
+    #[test]
+    fn test_open_ignores_a_temporary_marker_a_crash_left() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path());
+        let page = dir.path().join(CACHE_DIR).join("page");
+        fs::write(&page, LEFTOVER).unwrap();
+        fs::write(marker_temp(dir.path()), TORN_MARKER).unwrap();
+        open(dir.path());
+        assert_eq!(
+            fs::read(&page).unwrap(),
+            LEFTOVER,
+            "a leftover temporary file does not empty a cache dir the marker vouches for"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap(),
+            cache_format()
+        );
+    }
+
+    #[test]
+    fn test_open_rewrites_the_marker_over_a_temporary_one_a_crash_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(CACHE_DIR);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("page"), LEFTOVER).unwrap();
+        fs::write(marker_temp(dir.path()), cache_format()).unwrap();
+        open(dir.path());
+        assert_eq!(
+            fs::read_dir(&cache).unwrap().count(),
+            0,
+            "a complete temporary marker never renamed vouches for nothing"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(CACHE_FORMAT_FILE)).unwrap(),
+            cache_format()
+        );
+        assert!(!marker_temp(dir.path()).exists());
     }
 
     #[test]

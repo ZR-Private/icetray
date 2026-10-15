@@ -347,6 +347,17 @@ major upgrade starts the disk level cold and a patch release keeps it. Each
 replica has its own directory, which needs only capacity and no backup;
 losing it costs one cold load.
 
+The disk level's `cache.format` marker is written whole or not at all, and
+after the emptying it vouches for is on disk, so a crash during an upgrade
+leaves either the old marker over the old files or no marker, which empties
+the level again at the next start. One case the marker cannot see: rolling
+back to a build from before the marker existed, which writes its own cache
+files under the newer build's marker; rolling forward again trusts them. That
+is harmless only when the two builds store the level in the same layout,
+and it ends once every deployed build writes the marker. Delete the
+directory's `cache/` and `cache.format` when a rollback crosses a release that
+changed the level's layout.
+
 The trade-offs between `full`, `disk`, and `bloom` are in
 [Choosing a residency](configuration.md#choosing-a-residency).
 
