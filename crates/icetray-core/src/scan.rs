@@ -249,8 +249,18 @@ pub(crate) struct FileAnswer {
 /// bounds past those it gave. Live pairs are unique across files (RFD 025,
 /// Uniqueness), so no row is dropped as a repeat, and a file's next row
 /// lies past every row it gave, so it lies past the last returned when
-/// nothing was cut.
-pub(crate) fn merge(files: Vec<FileAnswer>, direction: Direction, limit: u32) -> Scanned {
+/// nothing was cut. One file's rows, as a compacted table's key answers,
+/// are already in `direction` and at most `limit`, so they are the answer
+/// as given.
+pub(crate) fn merge(mut files: Vec<FileAnswer>, direction: Direction, limit: u32) -> Scanned {
+    if files.len() == 1
+        && let Some(file) = files.pop()
+    {
+        return Scanned {
+            more: file.next.is_some(),
+            rows: file.rows,
+        };
+    }
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let more_in_a_file = files.iter().any(|file| file.next.is_some());
     let mut rows: Vec<ScanRow> = files.into_iter().flat_map(|file| file.rows).collect();
@@ -425,5 +435,23 @@ mod tests {
         assert!(with_next.more, "a file holds a row past those it gave");
         let none = merge(Vec::new(), Direction::OldestFirst, MAX);
         assert!(none.rows.is_empty() && !none.more);
+    }
+
+    #[test]
+    fn test_merge_answers_one_files_rows_as_given() {
+        let file = |next| FileAnswer {
+            rows: FIRST_FILE.into_iter().map(row).collect(),
+            next,
+        };
+        let alone = merge(vec![file(None)], Direction::NewestFirst, MAX);
+        assert_eq!(orders(&alone), FIRST_FILE);
+        assert!(!alone.more);
+        let with_next = merge(
+            vec![file(Some(OrderValue::Long(SECOND_NEXT)))],
+            Direction::NewestFirst,
+            MAX,
+        );
+        assert_eq!(orders(&with_next), FIRST_FILE);
+        assert!(with_next.more, "the file holds a row past those it gave");
     }
 }

@@ -644,26 +644,23 @@ impl Generation {
         let mut from_store = false;
         for (file, rows) in read.into_iter().flatten() {
             from_store |= rows.from_store;
-            let defaults: Vec<Option<Option<Bytes>>> = columns
+            // Per position of `columns` the file does not hold, the
+            // column's default, set in each row's values in place.
+            let defaults: Vec<(usize, &Option<Bytes>)> = columns
                 .iter()
-                .map(|&column| {
-                    file.index
-                        .value_leaf(column)
-                        .is_none()
-                        .then(|| self.layout.value_columns[column].default.clone())
-                })
+                .enumerate()
+                .filter(|&(_, &column)| file.index.value_leaf(column).is_none())
+                .map(|(at, &column)| (at, &self.layout.value_columns[column].default))
                 .collect();
             answers.push(FileAnswer {
                 rows: rows
                     .rows
                     .into_iter()
-                    .map(|(order, values)| ScanRow {
-                        order,
-                        values: values
-                            .into_iter()
-                            .zip(&defaults)
-                            .map(|(value, default)| default.clone().unwrap_or(value))
-                            .collect(),
+                    .map(|(order, mut values)| {
+                        for &(at, default) in &defaults {
+                            values[at].clone_from(default);
+                        }
+                        ScanRow { order, values }
                     })
                     .collect(),
                 next: rows.next,
