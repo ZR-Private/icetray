@@ -1391,6 +1391,18 @@ pub(crate) mod testing {
         }
     }
 
+    /// One GET of a `Gauged` store counted in flight, taken out of the
+    /// count when dropped: a GET that ends, and one dropped while it waits
+    /// at the gate or on the inner store, as a timeout, a hedge's loser,
+    /// or a dropped caller drops it.
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl fmt::Display for Gauged {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "Gauged({})", self.inner)
@@ -1446,6 +1458,7 @@ pub(crate) mod testing {
                     self.ranges.lock().unwrap().push(range.clone());
                 }
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let _in_flight = InFlight(&self.in_flight);
                 self.high_water.fetch_max(now, Ordering::SeqCst);
                 if now >= self.fill.load(Ordering::SeqCst) {
                     self.open.send_replace(true);
@@ -1455,9 +1468,7 @@ pub(crate) mod testing {
                     .wait_for(|open| *open)
                     .await
                     .expect("the store holds the sender");
-                let answer = self.inner.get_opts(location, options).await;
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                answer
+                self.inner.get_opts(location, options).await
             })
         }
 
@@ -1692,7 +1703,7 @@ mod tests {
     };
     use tokio::sync::{Notify, watch};
 
-    use super::testing::{CountingProvider, LocalHttp, MEM_PREFIX, Reply};
+    use super::testing::{CountingProvider, Gauged, LocalHttp, MEM_PREFIX, Reply};
     use super::*;
     use crate::config::RewriteRule;
 
@@ -3199,5 +3210,34 @@ mod tests {
         for answer in &answers {
             assert!(Arc::ptr_eq(fresh, answer.as_ref().unwrap()));
         }
+    }
+
+    /// A GET dropped while `Gauged` holds it leaves the GETs in flight:
+    /// after it, one GET in flight does not open a gate of two, so a later
+    /// gate counts only the GETs that are running.
+    #[tokio::test]
+    async fn test_gauged_counts_a_dropped_get_out_of_flight() {
+        let gate_of_two = 2;
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(OBJECT_KEY);
+        inner
+            .put(&path, PutPayload::from_static(PAYLOAD))
+            .await
+            .unwrap();
+        let gauged = Gauged::new(Arc::clone(&inner));
+        gauged.hold();
+        let mut held = Box::pin(gauged.get_range(&path, INNER_RANGE));
+        assert!(
+            futures::poll!(held.as_mut()).is_pending(),
+            "the GET is held"
+        );
+        drop(held);
+        gauged.fill_to(gate_of_two);
+        assert_eq!(gauged.high_water(), 0, "no GET in flight after the drop");
+        let mut lone = Box::pin(gauged.get_range(&path, INNER_RANGE));
+        assert!(
+            futures::poll!(lone.as_mut()).is_pending(),
+            "one GET in flight does not open a gate of two"
+        );
     }
 }
