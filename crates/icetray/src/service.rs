@@ -264,10 +264,7 @@ const REPEATED_FIELD_TAG: u32 = 1;
 /// size. The response is measured as the message that would be sent; past
 /// the bound, `Oversize` says how many rows, the longest prefix with `more`
 /// set, would fit.
-fn scan_within_bound(
-    lookup: ScanLookup,
-    bound: usize,
-) -> Result<(ScanResponse, Option<usize>), Oversize> {
+fn scan_within_bound(lookup: ScanLookup, bound: usize) -> Result<(ScanResponse, usize), Oversize> {
     let (rows, more) = scanned_wire(lookup.scanned);
     let response = ScanResponse {
         rows,
@@ -276,7 +273,7 @@ fn scan_within_bound(
     };
     let bytes = response.encoded_len();
     if bytes <= bound {
-        return Ok((response, Some(bytes)));
+        return Ok((response, bytes));
     }
     let fixed = ScanResponse {
         rows: Vec::new(),
@@ -295,7 +292,7 @@ fn scan_within_bound(
 fn multi_scan_within_bound(
     lookup: MultiScanLookup,
     bound: usize,
-) -> Result<(MultiScanResponse, Option<usize>), Oversize> {
+) -> Result<(MultiScanResponse, usize), Oversize> {
     let results = lookup
         .results
         .into_iter()
@@ -310,7 +307,7 @@ fn multi_scan_within_bound(
     };
     let bytes = response.encoded_len();
     if bytes <= bound {
-        return Ok((response, Some(bytes)));
+        return Ok((response, bytes));
     }
     let fixed = MultiScanResponse {
         results: Vec::new(),
@@ -637,14 +634,17 @@ impl Service {
             request.after,
             request.before,
         )?;
-        let bound = self.max_scan_bytes;
-        let response = table
-            .scan_with(&key, &reads(&request.columns), &bounds, move |lookup| {
-                scan_within_bound(lookup, bound)
-            })
+        let (lookup, receipt) = table
+            .scan_receipt(&key, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        Ok(Response::new(response))
+        match scan_within_bound(lookup, self.max_scan_bytes) {
+            Ok((response, bytes)) => {
+                receipt.sent(bytes);
+                Ok(Response::new(response))
+            }
+            Err(oversize) => Err(status_from(&receipt.refused(oversize))),
+        }
     }
 
     /// `MultiScan` inside its deadline.
@@ -666,14 +666,17 @@ impl Service {
             request.after,
             request.before,
         )?;
-        let bound = self.max_scan_bytes;
-        let response = table
-            .multi_scan_with(&keys, &reads(&request.columns), &bounds, move |lookup| {
-                multi_scan_within_bound(lookup, bound)
-            })
+        let (lookup, receipt) = table
+            .multi_scan_receipt(&keys, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        Ok(Response::new(response))
+        match multi_scan_within_bound(lookup, self.max_scan_bytes) {
+            Ok((response, bytes)) => {
+                receipt.sent(bytes);
+                Ok(Response::new(response))
+            }
+            Err(oversize) => Err(status_from(&receipt.refused(oversize))),
+        }
     }
 
     /// `Get`, admitted and inside its deadline.
@@ -1566,7 +1569,7 @@ mod tests {
         let rows = SAMPLE_VALUE_LENS.len();
         let size = sample_response(rows, false).encoded_len();
         let (response, bytes) = scan_within_bound(sample_lookup(rows, false), size).unwrap();
-        assert_eq!(bytes, Some(size));
+        assert_eq!(bytes, size);
         assert_eq!(response, sample_response(rows, false));
 
         let refused = scan_within_bound(sample_lookup(rows, false), size - 1).unwrap_err();
@@ -1657,7 +1660,7 @@ mod tests {
         };
         let size = response(results.len()).encoded_len();
         let (sent, bytes) = multi_scan_within_bound(lookup(), size).unwrap();
-        assert_eq!((sent, bytes), (response(results.len()), Some(size)));
+        assert_eq!((sent, bytes), (response(results.len()), size));
 
         for keys in 0..results.len() {
             let fits = response(keys).encoded_len();

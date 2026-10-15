@@ -854,6 +854,7 @@ struct Scans {
 /// 025, Metrics). A Scan is far rarer and dearer than a lookup, so each is
 /// counted on the shared series as it ends. `response_bytes` is the size of
 /// each answered or refused call's response (RFD 025, Limits).
+#[derive(Clone)]
 struct ScanMetrics {
     rows: Counter,
     empty: Counter,
@@ -923,9 +924,8 @@ impl ScanMetrics {
     }
 }
 
-/// What one Scan of one key read, held until its call's response is known
-/// to go out (`Table::conclude`): a response refused above
-/// `server.max_scan_bytes` counts each of its keys as an error instead.
+/// What one Scan of one key read, held by its call's `ScanReceipt` until the
+/// call's response is known.
 #[derive(Clone, Copy)]
 struct ScanTally {
     /// Rows the Scan returned.
@@ -936,6 +936,85 @@ struct ScanTally {
     cold: bool,
     /// How long the Scan ran.
     elapsed: Duration,
+}
+
+/// The count of the Scans of one `scan_receipt` or `multi_scan_receipt`
+/// call, held for the caller who builds the response (RFD 025, Limits): a
+/// response the server refuses above `server.max_scan_bytes` counts each
+/// key as an error, not as the rows it read. `sent` counts every key read
+/// as answered, `refused` as an error, and the size goes into
+/// `scan_response_bytes` either way. A receipt dropped unsettled, as when
+/// a later key's read fails, the call's deadline passes, or its client
+/// cancels, counts the keys that finished as answered, as a failed
+/// `MultiGet` counts the keys it completed; a key that failed counted as an
+/// error when it did.
+#[must_use = "a receipt settles the call's scan counts: `sent` or `refused` it"]
+pub struct ScanReceipt {
+    /// The table's configured name.
+    table: String,
+    /// The table's scan metric handles.
+    metrics: ScanMetrics,
+    /// The keys read and not yet counted. Read keys are pushed as their
+    /// Scans finish, concurrently on one task, so it is a `Mutex`.
+    pending: Mutex<Vec<ScanTally>>,
+}
+
+impl ScanReceipt {
+    fn new(table: &str, metrics: &ScanMetrics) -> Self {
+        Self {
+            table: table.to_string(),
+            metrics: metrics.clone(),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The Scan of one key has finished.
+    fn finished(&self, tally: ScanTally) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tally);
+    }
+
+    /// The keys finished and not yet counted, taken.
+    fn take(&self) -> Vec<ScanTally> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Counts every key read as answered, with no response size: for a
+    /// caller that builds no response.
+    pub fn answered(self) {
+        drop(self);
+    }
+
+    /// The response of `bytes` encoded bytes goes out: counts every key
+    /// read as answered and records the size.
+    pub fn sent(self, bytes: usize) {
+        self.metrics.response_bytes.record(approx::gauge_len(bytes));
+    }
+
+    /// The response is refused as `oversize`: counts every key read as an
+    /// error, records the size it would have had, and gives
+    /// `Error::ResponseTooLarge` to return.
+    pub fn refused(self, oversize: Oversize) -> Error {
+        let keys = self.take().len();
+        self.metrics.error.increment(approx::count(keys));
+        self.metrics
+            .response_bytes
+            .record(approx::gauge_len(oversize.bytes));
+        Error::ResponseTooLarge {
+            table: self.table.clone(),
+            oversize,
+        }
+    }
+}
+
+impl Drop for ScanReceipt {
+    fn drop(&mut self) {
+        for tally in self.take() {
+            self.metrics.record(&tally);
+        }
+    }
 }
 
 /// A Scan request checked against the generation and the table's entry
@@ -1389,31 +1468,27 @@ impl Table {
     /// table's span window, and every GET holding one of
     /// `TableHandles::batch_fan_out` permits while it runs. Counted under
     /// `scans_total` by result, `scan_rows`, `scan_files`, and
-    /// `scan_seconds` by temperature.
+    /// `scan_seconds` by temperature, as answered.
     pub async fn scan(
         &self,
         key: &Key,
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
     ) -> Result<ScanLookup> {
-        self.scan_with(key, columns, bounds, |lookup| Ok((lookup, None)))
-            .await
+        let (lookup, receipt) = self.scan_receipt(key, columns, bounds).await?;
+        receipt.answered();
+        Ok(lookup)
     }
 
-    /// `scan`, with the answer handed to `finish` before the Scan is
-    /// counted: `finish` builds the response from the lookup and returns it
-    /// with its encoded size, `None` when the caller does not measure, or
-    /// `Oversize` for a response above the server's bound. An `Oversize` is
-    /// `Error::ResponseTooLarge`, counted under `ScanResult::Error` instead
-    /// of its rows; a size, measured or refused, is recorded in
-    /// `scan_response_bytes` (RFD 025, Limits).
-    pub async fn scan_with<T>(
+    /// `scan`, with the count of the Scan left to the caller, who knows
+    /// whether the response it builds from the answer goes out
+    /// (`ScanReceipt`).
+    pub async fn scan_receipt(
         &self,
         key: &Key,
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
-        finish: impl FnOnce(ScanLookup) -> std::result::Result<(T, Option<usize>), Oversize> + Send,
-    ) -> Result<T> {
+    ) -> Result<(ScanLookup, ScanReceipt)> {
         let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
         let checked = self.check_scan(
@@ -1424,14 +1499,15 @@ impl Table {
             false,
         )?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
-        let (scanned, tally) = self
-            .scan_key(&generation, key, &checked, bounds, &fan_out)
+        let receipt = ScanReceipt::new(&self.name, &checked.scans.metrics);
+        let scanned = self
+            .scan_key(&generation, key, &checked, bounds, &fan_out, &receipt)
             .await?;
         let lookup = ScanLookup {
             scanned,
             snapshot_id: generation.snapshot_id,
         };
-        self.conclude(&checked.scans.metrics, &[tally], lookup, finish)
+        Ok((lookup, receipt))
     }
 
     /// Scans of `keys` from one generation, each answered as `scan`
@@ -1451,24 +1527,24 @@ impl Table {
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
     ) -> Result<MultiScanLookup> {
-        self.multi_scan_with(keys, columns, bounds, |lookup| Ok((lookup, None)))
-            .await
+        let (lookup, receipt) = self.multi_scan_receipt(keys, columns, bounds).await?;
+        receipt.answered();
+        Ok(lookup)
     }
 
-    /// `multi_scan`, with the answers handed to `finish` as `scan_with`
-    /// hands its answer: each distinct key read counts one in `scans_total`,
-    /// as an answer or, for a refused response, as an error.
-    pub async fn multi_scan_with<T>(
+    /// `multi_scan`, with the count of the Scans left to the caller as for
+    /// `scan_receipt`: each distinct key read counts once.
+    pub async fn multi_scan_receipt(
         &self,
         keys: &[Key],
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
-        finish: impl FnOnce(MultiScanLookup) -> std::result::Result<(T, Option<usize>), Oversize> + Send,
-    ) -> Result<T> {
+    ) -> Result<(MultiScanLookup, ScanReceipt)> {
         let _in_flight = self.lookups.enter();
         let generation = self.serving()?;
         let checked = self.check_scan(&generation, keys, columns, bounds, true)?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
+        let receipt = ScanReceipt::new(&self.name, &checked.scans.metrics);
         // Each distinct key is read once, and every position that lists it
         // takes that answer.
         let mut distinct: Vec<&Key> = Vec::with_capacity(keys.len());
@@ -1486,13 +1562,12 @@ impl Table {
         // lookups, so the returned future stays provably `Send`.
         let scans: Vec<_> = distinct
             .iter()
-            .map(|key| self.scan_key(&generation, key, &checked, bounds, &fan_out))
+            .map(|key| self.scan_key(&generation, key, &checked, bounds, &fan_out, &receipt))
             .collect();
-        let read: Vec<(Scanned, ScanTally)> = stream::iter(scans)
+        let answered: Vec<Scanned> = stream::iter(scans)
             .buffered(self.lookups.batch_fan_out)
             .try_collect()
             .await?;
-        let (answered, tallies): (Vec<Scanned>, Vec<ScanTally>) = read.into_iter().unzip();
         // Each answer moves to the last position that lists its key and is
         // cloned only for the positions before it.
         let mut last_at = vec![0; answered.len()];
@@ -1516,49 +1591,15 @@ impl Table {
             results,
             snapshot_id: generation.snapshot_id,
         };
-        self.conclude(&checked.scans.metrics, &tallies, lookup, finish)
-    }
-
-    /// The end of a Scan call that read `tallies`' keys: `answer` goes to
-    /// `finish`, and each key counts as the answer it gave when the
-    /// response goes out, or as an error when `finish` refuses it as
-    /// `Oversize`. Either way the response's size is recorded.
-    fn conclude<A, T>(
-        &self,
-        metrics: &ScanMetrics,
-        tallies: &[ScanTally],
-        answer: A,
-        finish: impl FnOnce(A) -> std::result::Result<(T, Option<usize>), Oversize>,
-    ) -> Result<T> {
-        match finish(answer) {
-            Ok((response, bytes)) => {
-                for tally in tallies {
-                    metrics.record(tally);
-                }
-                if let Some(bytes) = bytes {
-                    metrics.response_bytes.record(approx::gauge_len(bytes));
-                }
-                Ok(response)
-            }
-            Err(oversize) => {
-                metrics.error.increment(approx::count(tallies.len()));
-                metrics
-                    .response_bytes
-                    .record(approx::gauge_len(oversize.bytes));
-                Err(Error::ResponseTooLarge {
-                    table: self.name.clone(),
-                    oversize,
-                })
-            }
-        }
+        Ok((lookup, receipt))
     }
 
     /// One checked Scan of `key` through `generation` under `fan_out`, its
     /// rows trimmed (`Lookups::project`): the one path `scan` and
-    /// `multi_scan` share. A failed read counts under `ScanResult::Error`;
-    /// an answered one returns its tally, rows, files, and temperature,
-    /// cold when any order or value page came from object storage, for
-    /// `conclude` to count once the call's response is known.
+    /// `multi_scan` share. A failed read counts under `ScanResult::Error`
+    /// at once; an answered one is handed to `receipt` as its tally, rows,
+    /// files, and temperature, cold when any order or value page came from
+    /// object storage, for the receipt to count.
     async fn scan_key(
         &self,
         generation: &Generation,
@@ -1566,7 +1607,8 @@ impl Table {
         checked: &CheckedScan<'_>,
         bounds: &ScanBounds,
         fan_out: &Arc<Semaphore>,
-    ) -> Result<(Scanned, ScanTally)> {
+        receipt: &ScanReceipt,
+    ) -> Result<Scanned> {
         let started = Instant::now();
         let metrics = &checked.scans.metrics;
         let source = RunSource {
@@ -1595,13 +1637,13 @@ impl Table {
         .await;
         match answered {
             Ok((scanned, read)) => {
-                let tally = ScanTally {
+                receipt.finished(ScanTally {
                     rows: scanned.rows.len(),
                     files: read.files,
                     cold: read.from_store,
                     elapsed: started.elapsed(),
-                };
-                Ok((scanned, tally))
+                });
+                Ok(scanned)
             }
             Err(error) => {
                 metrics.error.increment(1);
@@ -7207,16 +7249,107 @@ mod tests {
         }
     }
 
-    /// A Scan or `MultiScan` whose `finish` refuses its response as
-    /// `Oversize` fails as `Error::ResponseTooLarge` carrying it, counts
-    /// each distinct key it read as an error and none as rows or empty, and
-    /// records the refused size; one it sends counts its keys as answered
-    /// and records the size it reports; a plain `scan` records no size.
+    /// The result counters of `series`: rows, empty, and error, in that
+    /// order.
+    fn scan_results(series: &Series) -> [u64; 3] {
+        [ScanResult::Rows, ScanResult::Empty, ScanResult::Error].map(|result| {
+            series.counter(
+                metric::SCANS_TOTAL,
+                &[table_label(), (metric::LABEL_RESULT, result.to_string())],
+            )
+        })
+    }
+
+    /// A table of two files, each holding one key, built under a fan-out of
+    /// one so a `MultiScan` reads its keys one after the other, and the
+    /// two keys in file order.
+    async fn two_keys_in_two_files() -> (Table, Fixture, Arc<Gauged>, [Key; 2]) {
+        let first = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let second = ordered_rows(&[2 * KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (table, fixture, gauged) =
+            ordered_table_over(&[&first, &second], WriterLayout::contract(), 1).await;
+        (
+            table,
+            fixture,
+            gauged,
+            [Key::Long(KEY_STEP), Key::Long(2 * KEY_STEP)],
+        )
+    }
+
+    /// A `MultiScan` of two keys whose second key's file is gone fails
+    /// whole, and the key it finished before the failure still counts as
+    /// answered beside the one that failed, as a failed `MultiGet` counts
+    /// the keys it completed (operating.md, Metrics).
     #[test]
-    fn test_scan_with_counts_a_refused_response_as_an_error_and_records_its_size() {
+    fn test_multi_scan_counts_the_keys_it_finished_before_a_key_failed() {
+        let ((), series) = recorded(async {
+            let (table, fixture, _gauged, keys) = two_keys_in_two_files().await;
+            let path = fixture.path_of("f1");
+            std::fs::remove_file(path.strip_prefix("file://").unwrap()).unwrap();
+            let bounds = ScanBounds {
+                limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+                ..oldest_first()
+            };
+            let failed = table.multi_scan(&keys, &BOTH_READS, &bounds).await;
+            assert!(failed.is_err(), "the second key's file is gone");
+        });
+        assert_eq!(
+            scan_results(&series),
+            [1, 0, 1],
+            "the finished key answered, the failed key an error"
+        );
+    }
+
+    /// A `MultiScan` dropped while its second key waits on the store, as at
+    /// its deadline or a client's cancel, still counts the key it finished.
+    #[test]
+    fn test_multi_scan_counts_the_keys_it_finished_before_it_was_dropped() {
+        let ((), series) = recorded(async {
+            let (table, _fixture, gauged, keys) = two_keys_in_two_files().await;
+            let bounds = ScanBounds {
+                limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
+                ..oldest_first()
+            };
+            // The first key's pages are cached, so only the second key
+            // reads the store.
+            table.scan(&keys[0], &BOTH_READS, &bounds).await.unwrap();
+            gauged.hold();
+            let mut call = Box::pin(table.multi_scan(&keys, &BOTH_READS, &bounds));
+            let held = async {
+                tokio::time::timeout(DEADLINE_GUARD, async {
+                    while gauged.high_water() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the second key's first GET is held");
+            };
+            tokio::select! {
+                _ = &mut call => panic!("the second key's GETs are held"),
+                () = held => {}
+            }
+            drop(call);
+            gauged.release();
+        });
+        assert_eq!(
+            scan_results(&series),
+            [2, 0, 0],
+            "the warming Scan and the dropped call's finished key"
+        );
+    }
+
+    /// A `MultiScan` of keys the caller settles as `sent` counts each
+    /// distinct key as answered and records the size; one it settles as
+    /// `refused` returns `Error::ResponseTooLarge` carrying the `Oversize`,
+    /// counts each distinct key as an error and none as answered, and
+    /// records the refused size; a plain `scan` counts as answered and
+    /// records no size. A key listed twice counts once.
+    #[test]
+    fn test_scan_receipt_counts_sent_and_refused_calls_and_records_their_size() {
         const SENT_BYTES: usize = 1_234;
         const REFUSED_BYTES: usize = 5_678;
         const BOUND: usize = 1_000;
+        const DISTINCT_KEYS: u64 = 2;
         let refusal = Oversize {
             bytes: REFUSED_BYTES,
             bound: BOUND,
@@ -7228,58 +7361,46 @@ mod tests {
                 ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
             let first = Key::Long(KEY_STEP);
             let second = Key::Long(2 * KEY_STEP);
-            let keys = [first.clone(), second.clone(), first.clone()];
+            let keys = [first.clone(), second, first.clone()];
             let bounds = ScanBounds {
                 limit: u32::try_from(SCAN_ROWS_PER_KEY).unwrap(),
                 ..oldest_first()
             };
 
-            let sent = table
-                .multi_scan_with(&keys, &BOTH_READS, &bounds, |lookup| {
-                    Ok((lookup.results.len(), Some(SENT_BYTES)))
-                })
+            let (sent, receipt) = table
+                .multi_scan_receipt(&keys, &BOTH_READS, &bounds)
                 .await
                 .unwrap();
-            assert_eq!(sent, keys.len(), "the answers of every position");
-            let refused = table
-                .multi_scan_with(&keys, &BOTH_READS, &bounds, |_| {
-                    Err::<((), Option<usize>), _>(refusal)
-                })
-                .await;
+            assert_eq!(sent.results.len(), keys.len());
+            receipt.sent(SENT_BYTES);
+
+            let (_, receipt) = table
+                .multi_scan_receipt(&keys, &BOTH_READS, &bounds)
+                .await
+                .unwrap();
+            let refused = receipt.refused(refusal);
             assert!(
                 matches!(
                     refused,
-                    Err(Error::ResponseTooLarge { oversize, .. }) if oversize == refusal
+                    Error::ResponseTooLarge { oversize, .. } if oversize == refusal
                 ),
                 "{refused:?}"
             );
-            let refused = table
-                .scan_with(&first, &BOTH_READS, &bounds, |_| {
-                    Err::<((), Option<usize>), _>(refusal)
-                })
-                .await;
-            assert!(
-                matches!(refused, Err(Error::ResponseTooLarge { .. })),
-                "{refused:?}"
-            );
+
+            let (_, receipt) = table
+                .scan_receipt(&first, &BOTH_READS, &bounds)
+                .await
+                .unwrap();
+            assert!(matches!(
+                receipt.refused(refusal),
+                Error::ResponseTooLarge { .. }
+            ));
             table.scan(&first, &BOTH_READS, &bounds).await.unwrap();
         });
-        let result = |result: ScanResult| {
-            series.counter(
-                metric::SCANS_TOTAL,
-                &[table_label(), (metric::LABEL_RESULT, result.to_string())],
-            )
-        };
         assert_eq!(
-            result(ScanResult::Rows),
-            3,
-            "the two distinct keys of the sent MultiScan and the plain Scan"
-        );
-        assert_eq!(result(ScanResult::Empty), 0);
-        assert_eq!(
-            result(ScanResult::Error),
-            3,
-            "the two distinct keys of the refused MultiScan and the refused Scan"
+            scan_results(&series),
+            [DISTINCT_KEYS + 1, 0, DISTINCT_KEYS + 1],
+            "answered: the sent MultiScan's keys and the plain Scan; errors: the refused MultiScan's keys and the refused Scan"
         );
         assert_eq!(
             series.histogram(metric::SCAN_RESPONSE_BYTES, &[table_label()]),
@@ -7290,8 +7411,11 @@ mod tests {
             ],
             "a sent call's size and each refused call's, none for the plain Scan"
         );
-        let row_counts = series.histogram(metric::SCAN_ROWS, &[table_label()]);
-        assert_eq!(row_counts.len(), 3, "a refused Scan counts no rows");
+        assert_eq!(
+            series.histogram(metric::SCAN_ROWS, &[table_label()]).len(),
+            usize::try_from(DISTINCT_KEYS + 1).unwrap(),
+            "a refused call counts no rows"
+        );
     }
 
     /// A key-value table registers no scan series: every ordered-only rule
@@ -7321,7 +7445,13 @@ mod tests {
             let key = Key::Long(0);
             let bounds = oldest_first();
             assert_send(&table.scan(&key, &BOTH_READS, &bounds));
+            assert_send(&table.scan_receipt(&key, &BOTH_READS, &bounds));
             assert_send(&table.multi_scan(std::slice::from_ref(&key), &BOTH_READS, &bounds));
+            assert_send(&table.multi_scan_receipt(
+                std::slice::from_ref(&key),
+                &BOTH_READS,
+                &bounds,
+            ));
         }
     }
 

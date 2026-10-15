@@ -274,7 +274,7 @@ Nothing about the same request changes on a retry, so the caller lowers
 its `limit` or requests fewer columns, and sets `limit` explicitly: a
 limit of 0 reads up to `max_scan_rows`, which for large values may not
 fit. A caller that sets a limit of 100 and pages by order value (below)
-reads the same history in pages that each fit. An owner whose clients
+reads the same history in pages of at most 100 rows, each of which fits when 100 rows of the requested columns come to less than the bound. An owner whose clients
 accept larger messages raises `server.max_scan_bytes`
 ([Configuration](configuration.md#server)) and the clients raise their
 own receive limit to match, as grpc-go's `MaxCallRecvMsgSize` does; the

@@ -2068,7 +2068,7 @@ fn order_advice(
             FindingCode::LargeRuns,
             Some(path),
             format!(
-                "{scan_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above server.max_scan_bytes {bound}, so a Scan at max_scan_rows {scan_rows} is refused as FAILED_PRECONDITION (lower max_scan_rows, have callers request fewer rows or columns, or raise server.max_scan_bytes where every client accepts larger messages)",
+                "{scan_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above server.max_scan_bytes {bound}, so a Scan at max_scan_rows {scan_rows} is refused as FAILED_PRECONDITION; the figure counts the value columns alone, so a table a little under the bound can still be refused, since each row also carries its order value and framing (lower max_scan_rows, have callers request fewer rows or columns, or raise server.max_scan_bytes where every client accepts larger messages)",
                 bytes = scan_bytes / rows,
                 per_row = order.value_bytes / rows,
             ),

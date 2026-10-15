@@ -1206,6 +1206,15 @@ const LARGE_RUN_PAGE_ROWS: usize = 100;
 /// One mebibyte, the lowered `server.max_scan_bytes` of the large-run cases.
 const MIB: usize = 1024 * 1024;
 
+/// A limit a tenth of the default `max_scan_rows`: its 100 rows of
+/// `LARGE_RUN_VALUE_BYTES` come to about 0.5 MB, under every bound the
+/// large-run cases use.
+const SMALL_LIMIT: u32 = RUN_ROWS_ADVICE / 10;
+
+/// A limit of 300 rows: about 1.5 MB of values, over the lowered 1 MiB
+/// bound and under the default.
+const MIDDLE_LIMIT: u32 = 3 * SMALL_LIMIT;
+
 /// A file where `max_scan_rows` rows of the configured value columns, at
 /// the footer's uncompressed bytes per row, would exceed
 /// `server.max_scan_bytes` is advice: a Scan at the full limit is refused.
@@ -1225,12 +1234,14 @@ async fn test_large_runs_is_advice_above_the_scan_byte_bound() -> Result<()> {
     let (_fixture, served) = write_and_serve(&catalog, spec).await?;
     let generation = served.current();
     let default_bound = ServerConfig::default().max_scan_bytes;
+    // Past the 5 MB the fixture's 1,000 rows of values come to.
+    let raised_bound = 2 * default_bound;
     let cases = [
         (RUN_ROWS_ADVICE, default_bound, true),
-        (RUN_ROWS_ADVICE, 2 * default_bound, false),
-        (RUN_ROWS_ADVICE / 10, default_bound, false),
-        (3 * RUN_ROWS_ADVICE / 10, MIB, true),
-        (RUN_ROWS_ADVICE / 10, MIB, false),
+        (RUN_ROWS_ADVICE, raised_bound, false),
+        (SMALL_LIMIT, default_bound, false),
+        (MIDDLE_LIMIT, MIB, true),
+        (SMALL_LIMIT, MIB, false),
     ];
     for (max_scan_rows, max_scan_bytes, advised) in cases {
         let report = diagnose(

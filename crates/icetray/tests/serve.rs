@@ -3400,6 +3400,23 @@ async fn test_multi_scan_answers_a_repeated_key_at_each_position() -> TestResult
     Ok(())
 }
 
+/// The distinct keys of the `MultiScan` the response-bound test sends: two
+/// with rows and one with none, the first listed twice.
+const BOUND_TEST_DISTINCT_KEYS: u64 = 3;
+
+/// `scans_total` increments, in `ScanResult::ALL` order, of a `Scan` sent
+/// whole: one key with rows.
+const SCAN_SENT: [u64; 3] = [1, 0, 0];
+
+/// Of a refused `Scan`: its one key an error.
+const SCAN_REFUSED: [u64; 3] = [0, 0, 1];
+
+/// Of the `MultiScan` sent whole: two keys with rows, one with none.
+const MULTI_SCAN_SENT: [u64; 3] = [2, 1, 0];
+
+/// Of the refused `MultiScan`: each distinct key an error, none answered.
+const MULTI_SCAN_REFUSED: [u64; 3] = [0, 0, BOUND_TEST_DISTINCT_KEYS];
+
 /// The scan the response-bound tests send: every row of a key, newest
 /// first.
 fn whole_key() -> TestScan {
@@ -3539,11 +3556,11 @@ async fn test_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refused() 
             let response = answered?;
             assert_eq!(response, model_scan_response(stack.ordered(), &key));
             assert_eq!(response.encoded_len(), size);
-            assert_scans_counted(&before, &after, [1, 0, 0]);
+            assert_scans_counted(&before, &after, SCAN_SENT);
             assert_counted(&before, &after, Call::Scan, Code::Ok, 1);
         } else {
             assert_eq!(code_of(answered), Code::FailedPrecondition);
-            assert_scans_counted(&before, &after, [0, 0, 1]);
+            assert_scans_counted(&before, &after, SCAN_REFUSED);
             assert_counted(&before, &after, Call::Scan, Code::FailedPrecondition, 1);
             assert_counted(&before, &after, Call::Scan, Code::Ok, 0);
         }
@@ -3566,7 +3583,6 @@ async fn test_multi_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refu
             let absent = fixture.absent_near(ORDERED_IDS.end);
             [first.clone(), second, first, absent]
         };
-        let distinct = 3;
         let mut size = 0;
         let mut stack = Stack::ready_ordered_with(async |setup| {
             let keys = keys_of(&setup.fixtures[1]);
@@ -3600,11 +3616,11 @@ async fn test_multi_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refu
             let response = answered?;
             assert_eq!(response, model_multi_scan_response(stack.ordered(), &keys));
             assert_eq!(response.encoded_len(), size);
-            assert_scans_counted(&before, &after, [2, 1, 0]);
+            assert_scans_counted(&before, &after, MULTI_SCAN_SENT);
             assert_counted(&before, &after, Call::MultiScan, Code::Ok, 1);
         } else {
             assert_eq!(code_of(answered), Code::FailedPrecondition);
-            assert_scans_counted(&before, &after, [0, 0, distinct]);
+            assert_scans_counted(&before, &after, MULTI_SCAN_REFUSED);
             assert_counted(
                 &before,
                 &after,
