@@ -92,11 +92,21 @@ measured and what it showed: "the column reader was faster on every
 layout tried", "load is bound by CPU once enough files are in flight".
 Where the size of something is the argument, an order of magnitude makes
 it: a cold range GET costs tens of milliseconds and a resident lookup
-microseconds. Numbers that are part of the decision, such as a threshold,
-a default, or a limit, are stated exactly. Exact figures, machines, and
-dates belong in an analysis, and published benchmarks in documents of
+microseconds. A number that is part of the decision is stated exactly,
+with the reason that fixes it. Exact figures, machines, and dates belong
+in an analysis, and published benchmarks in documents of
 their own. An RFD may link to them where a reader would want the detail,
 and makes its claims without depending on the link.
+
+**A setting's default is not a decision.** An RFD names a setting and
+what it bounds, "`server.batch_fan_out` bounds the GETs one batch holds
+in flight", and leaves its value to the configuration reference. It
+states a value only where the value is itself the decision, with the
+reason that fixes it: the response bound defaults to a gRPC client's
+default receive limit, and a cache holds at least one value page per
+shard. A value that could change without anyone revisiting the decision
+lives in its code constant and in the reference, which a test checks
+against the code, so changing it needs no update note.
 
 **An RFD says what was decided and leaves the how to a plan.** It names
 its dependencies without versioning them, since versions come from the

@@ -190,14 +190,18 @@ A change a user can see is documented in the same change, in three places:
   [Calling icetray](docs/calling.md) for a service that sends requests,
   [The optimal layout](docs/table-layout.md) for whoever writes the table,
   and [Operating icetray](docs/operating.md) for whoever runs the server.
-- **The reference.** Every configuration key in
-  [Configuration and the command line](docs/configuration.md), every metric
+- **The reference.** Every configuration key and its default in
+  [Configuration and the command line](docs/configuration.md), which is
+  the one document that states a setting's default; a test checks those
+  defaults against the code. Every metric
   and log field in the operating guide, and every protobuf field in its
   comment in `icetray.proto`. The TOML examples in the README and `docs/`
   are parsed by a test, so an example that no longer matches the schema
   fails the build.
 - **The decision.** The RFD that records why, or an update note on the RFD
-  it changes.
+  it changes. An RFD names the settings it relies on and links the
+  reference for their values; it states a value only where the value is
+  the decision, with its reason (RFD 001, House rules).
 
 The README describes a feature only when it changes how a reader thinks
 about icetray, such as value columns or projection, in a short paragraph
