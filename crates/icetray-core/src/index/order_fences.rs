@@ -134,6 +134,13 @@ impl PartsBuilder {
         }
     }
 
+    fn len(&self) -> usize {
+        match self {
+            Self::Longs(values) => values.len(),
+            Self::Bytes { ends, .. } => ends.len(),
+        }
+    }
+
     /// `part` after the parts held; `FencesOverflow` once the byte parts
     /// would end past `u32::MAX`, where `ends` addresses them.
     fn push(&mut self, part: PairPart<'_>) -> Result<(), FencesOverflow> {
@@ -195,13 +202,13 @@ impl Parts {
         }
     }
 
-    /// The heap the parts hold: a long per long part, and per byte part
-    /// its bytes and where it ends.
+    /// The heap the parts hold (`parts_heap`).
     fn heap_bytes(&self) -> u64 {
-        match self {
-            Self::Longs(values) => approx::count(values.len() * size_of::<i64>()),
-            Self::Bytes { data, ends } => approx::count(data.len() + ends.len() * size_of::<u32>()),
-        }
+        let (long, bytes) = match self {
+            Self::Longs(_) => (true, 0),
+            Self::Bytes { data, .. } => (false, data.len()),
+        };
+        parts_heap(long, approx::count(self.len()), approx::count(bytes))
     }
 }
 
@@ -211,8 +218,10 @@ fn offset(end: u32) -> usize {
 }
 
 /// The heap `pages` fence parts of one column take, given `bytes`, what
-/// their byte parts hold together; `long` for a column of long parts,
-/// which hold no bytes (`Parts::heap_bytes`).
+/// their byte parts hold together: a long per long part, and per byte part
+/// its bytes and where it ends; `long` for a column of long parts, which
+/// hold no bytes. The footer's estimate and the built fences' exact charge
+/// (`Parts::heap_bytes`) are both this.
 pub(super) fn parts_heap(long: bool, pages: u64, bytes: u64) -> u64 {
     if long {
         pages.saturating_mul(approx::count(size_of::<i64>()))
@@ -283,10 +292,7 @@ impl GroupFencesBuilder {
 
     /// The fences recorded.
     pub(super) fn len(&self) -> usize {
-        match &self.keys {
-            PartsBuilder::Longs(values) => values.len(),
-            PartsBuilder::Bytes { ends, .. } => ends.len(),
-        }
+        self.keys.len()
     }
 
     /// The fences, held with no spare capacity.
@@ -394,16 +400,11 @@ impl OrderFences {
     /// One binary search over the row groups, each step past the row groups
     /// without rows before the next with pages.
     pub fn row_group_of(&self, pair: Pair<'_>) -> Option<usize> {
-        // The first fence at or after `row_group`, which only rises with the
-        // row group: the predicate holds for a prefix of the row groups.
-        let first_from = |row_group: usize| {
-            self.groups[row_group..]
-                .iter()
-                .find(|group| group.len() > 0)
-                .map(|group| group.get(0))
-        };
+        // The first fence from a row group only rises with the row group:
+        // the predicate holds for a prefix of the row groups.
         let reached = partition_point(self.groups.len(), |row_group| {
-            first_from(row_group).is_some_and(|first| first <= pair)
+            self.first_fence_from(row_group)
+                .is_some_and(|first| first <= pair)
         });
         // The row group before `reached` reaches `pair` and the one at
         // `reached` does not, so the first with pages from it is itself.
@@ -427,12 +428,19 @@ impl OrderFences {
         let next = if page + 1 < group.len() {
             Some(group.get(page + 1))
         } else {
-            self.groups[row_group + 1..]
-                .iter()
-                .find(|later| later.len() > 0)
-                .map(|later| later.get(0))
+            self.first_fence_from(row_group + 1)
         };
         (group.get(page), next)
+    }
+
+    /// The first fence of the first row group with pages at or after
+    /// `row_group`, which is at most `row_groups`; `None` when no later row
+    /// group has pages.
+    fn first_fence_from(&self, row_group: usize) -> Option<Pair<'_>> {
+        self.groups[row_group..]
+            .iter()
+            .find(|group| group.len() > 0)
+            .map(|group| group.get(0))
     }
 
     /// The heap the fences hold: each row group's entry, and its parts.
