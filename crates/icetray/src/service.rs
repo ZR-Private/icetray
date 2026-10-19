@@ -316,7 +316,7 @@ const REPEATED_FIELD_TAG: u32 = 1;
 /// the bound, `Oversize` says how many rows, the longest prefix with `more`
 /// set, would fit.
 fn scan_within_bound(lookup: ScanLookup, bound: usize) -> Result<(ScanResponse, usize), Oversize> {
-    let (rows, more) = scanned_wire(lookup.scanned);
+    let v1::ScanResult { rows, more } = scanned_wire(lookup.scanned);
     let response = ScanResponse {
         rows,
         more,
@@ -344,14 +344,7 @@ fn multi_scan_within_bound(
     lookup: MultiScanLookup,
     bound: usize,
 ) -> Result<(MultiScanResponse, usize), Oversize> {
-    let results = lookup
-        .results
-        .into_iter()
-        .map(|scanned| {
-            let (rows, more) = scanned_wire(scanned);
-            v1::ScanResult { rows, more }
-        })
-        .collect();
+    let results = lookup.results.into_iter().map(scanned_wire).collect();
     let response = MultiScanResponse {
         results,
         snapshot_id: lookup.snapshot_id.0,
@@ -581,7 +574,7 @@ fn order_value_wire(value: OrderValue) -> v1::OrderValue {
 /// One Scan's answer on the wire: each row's order value and one value per
 /// column, in the order the rows were read, and whether rows remain. The
 /// values' bytes are the Scan's own, moved into the message, not copied.
-fn scanned_wire(scanned: Scanned) -> (Vec<v1::ScanRow>, bool) {
+fn scanned_wire(scanned: Scanned) -> v1::ScanResult {
     let rows = scanned
         .rows
         .into_iter()
@@ -590,7 +583,10 @@ fn scanned_wire(scanned: Scanned) -> (Vec<v1::ScanRow>, bool) {
             values: values.into_iter().map(column_value_wire).collect(),
         })
         .collect();
-    (rows, scanned.more)
+    v1::ScanResult {
+        rows,
+        more: scanned.more,
+    }
 }
 
 /// The order column's type on the wire, and the width of a `fixed` one, 0
@@ -1505,7 +1501,7 @@ mod tests {
             ],
             more: true,
         };
-        let (rows, more) = scanned_wire(scanned);
+        let v1::ScanResult { rows, more } = scanned_wire(scanned);
         assert!(more);
         let orders: Vec<_> = rows
             .iter()
@@ -1587,7 +1583,7 @@ mod tests {
 
     /// The `ScanResponse` the sample answer is sent as.
     fn sample_response(rows: usize, more: bool) -> ScanResponse {
-        let (rows, more) = scanned_wire(sample_scanned(rows, more));
+        let v1::ScanResult { rows, more } = scanned_wire(sample_scanned(rows, more));
         ScanResponse {
             rows,
             more,
@@ -1691,10 +1687,7 @@ mod tests {
         let response = |keys: usize| MultiScanResponse {
             results: results[..keys]
                 .iter()
-                .map(|&rows| {
-                    let (rows, more) = scanned_wire(sample_scanned(rows, rows > 0));
-                    v1::ScanResult { rows, more }
-                })
+                .map(|&rows| scanned_wire(sample_scanned(rows, rows > 0)))
                 .collect(),
             snapshot_id: SAMPLE_SNAPSHOT,
         };
