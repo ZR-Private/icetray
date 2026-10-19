@@ -1147,6 +1147,12 @@ impl TableShape {
         self.value_bytes * self.whole_reads().len()
     }
 
+    /// The order column of an ordered table; refused for a key-value one.
+    fn order(self) -> BenchResult<Ordered> {
+        self.ordered
+            .ok_or_else(|| format!("{} has no order column", self.table_name()).into())
+    }
+
     /// Rows per key of the first commit: one in a key-value table, and in
     /// an ordered table as many as its first key has, which every key has.
     fn rows_per_key(self) -> u64 {
@@ -1480,9 +1486,7 @@ async fn write_table(
 /// one another without a shared pair, while each append's order range
 /// overlaps the one before it by the offsets.
 fn overlapping_rows(shape: TableShape, append: u64) -> BenchResult<Vec<(u64, i64)>> {
-    let ordered = shape
-        .ordered
-        .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+    let ordered = shape.order()?;
     let mut rows = Vec::with_capacity(approx::length(shape.rows * SHORT_RUN_ROWS));
     for id in 0..shape.rows {
         let first = append * SHORT_RUN_ROWS + id % SHORT_RUN_ROWS;
@@ -2076,9 +2080,7 @@ struct ScanCase {
 impl ScanCase {
     /// The case of `test` over `shape`, which must be an ordered table.
     fn of(shape: TableShape, test: TestScan) -> BenchResult<Self> {
-        let ordered = shape
-            .ordered
-            .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+        let ordered = shape.order()?;
         let rows = ordered.orders_of(0)?.into_iter().map(|order| (order, ()));
         let (rows, more) = scan_model(rows, &test);
         Ok(Self {
@@ -2323,9 +2325,7 @@ async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<
         Op::Scan { keys, cases, .. } | Op::MultiScan { keys, cases, .. } => (keys, cases),
         Op::Get { .. } | Op::MultiGet { .. } => return Ok(()),
     };
-    let ordered = shape
-        .ordered
-        .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+    let ordered = shape.order()?;
     let ids = hit_ids(shape);
     for i in 0..VERIFIED_OPS {
         let at = op.pool_range(i);
@@ -2991,9 +2991,7 @@ fn bounded_page() -> BenchResult<TestScan> {
 /// `shape` (`WINDOW_MARGIN_DIVISOR`), `BOUND_POOL` of them, so a bound
 /// lands anywhere in a run's pages.
 fn bounded_in_run(shape: TableShape) -> BenchResult<Vec<TestScan>> {
-    let ordered = shape
-        .ordered
-        .ok_or_else(|| format!("{} has no order column", shape.table_name()))?;
+    let ordered = shape.order()?;
     let orders = ordered.orders_of(0)?;
     let margin = orders.len() / WINDOW_MARGIN_DIVISOR;
     let mut rng = StdRng::seed_from_u64(BOUND_SEED);
