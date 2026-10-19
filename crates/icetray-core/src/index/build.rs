@@ -1264,13 +1264,14 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// every key page's before the row group's first decode
 /// (`check_page_headers`) and, in an ordered file, every order page's
 /// (`check_order_page_headers`); a reader of a file's edge keys its key
-/// page's (`check_key_page_headers`); a Scan the order pages' it decodes
-/// (`check_order_pages`); and every value decode, a lookup's, a Scan's, and
-/// the doctor's, its value pages' and their dictionary page's
+/// page's (`check_key_page_headers`); a Scan, those of the order pages it
+/// decodes (`check_order_pages`); and every value decode, a lookup's, a
+/// Scan's, and the doctor's, its value pages' and their dictionary page's
 /// (`checked_values`). A key page decoded by a lookup or a Scan is one
 /// `verify` checked at load, read from the resident chunks, the chunk file,
-/// or, in the Bloom tier, the data file again. A delta-length or delta byte-array page sizes its lengths
-/// by the count in its encoded data, which no check reads.
+/// or, in the Bloom tier, the data file again. A delta-length or delta
+/// byte-array page sizes its lengths by the count in its encoded data,
+/// which no check reads.
 ///
 /// Parquet panics on some page bodies the headers do not reveal: a
 /// byte-array page holding fewer values than its header counts, a

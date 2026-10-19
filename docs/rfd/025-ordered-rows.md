@@ -86,9 +86,10 @@ direction under a limit and optional bounds on the order value.
   `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
   above `before`, a MultiScan above `max_multi_scan_values`, or a call
   of the wrong kind for the table. The server checks a call's kind
-  against the table's configuration before anything else about the
-  call, so a call of the wrong kind is `INVALID_ARGUMENT` even while the
-  table loads, and never the retryable `UNAVAILABLE`. A value that is not
+  against the table's configuration before the table's readiness and
+  before the call's key, direction, or bounds, so a call of the wrong
+  kind is `INVALID_ARGUMENT` even while the table loads, and never the
+  retryable `UNAVAILABLE`. A value that is not
   the protobuf its column declares is `FAILED_PRECONDITION` as for `Get`
   (RFD 024), naming the order value of its row, and so is a response
   above `server.max_scan_bytes` (Limits).
@@ -179,11 +180,12 @@ direction under a limit and optional bounds on the order value.
   ends first may have read row groups ahead that it never reached, and a
   read error on a row group read ahead fails the load as any read error
   does, even where the merge would have refused first. Each run of
-  consecutive chosen pages costs one GET or local read per column, and a
+  consecutive chosen pages costs one GET or local read for the order
+  column, and under `disk` and `bloom` one for the key column, and a
   dictionary page one more. The load refuses a live pair present twice
   as `duplicate_rows`, naming the later file in file order, as
-  `duplicate_keys` does. A refresh that appends later
-  rows therefore reads only its new files, files a compaction rolled by
+  `duplicate_keys` does. A refresh that appends later rows therefore
+  reads only its new files, files a compaction rolled by
   size cost the pages at the edge keys they share, and an append of rows
   inside an existing file's order range costs the pages those rows fall
   among, in the new file and the old.

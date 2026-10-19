@@ -21,7 +21,8 @@
 > a `more` flag, a MultiScan failing whole as a MultiGet does. TableInfo
 > reports the order column, its type, and the scan limits, and a call of
 > the wrong kind for the table is `INVALID_ARGUMENT` even while the table
-> loads. Their errors are as RFD 025 (Wire, Limits) sets them out.
+> loads. Scan's and MultiScan's errors are those RFD 025 (Wire, Limits)
+> states.
 
 ## Problem
 

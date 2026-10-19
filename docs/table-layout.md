@@ -339,7 +339,8 @@ ALTER TABLE db.events WRITE LOCALLY ORDERED BY key, ts;
   places its bounds, and a refresh chooses the order pages it compares,
   by the order fences icetray records from the rows at load, one per
   order page, so neither depends on whether the writer keeps the order
-  column's column index whole, truncates it, or leaves it out.
+  column's column index whole, truncates it, or leaves it out, and the
+  column index draws no finding.
 
 ### Requirements of an ordered table
 
