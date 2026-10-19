@@ -288,13 +288,13 @@ pub fn order_value_from_wire(
 fn scan_bounds_from_wire(
     direction: i32,
     limit: u32,
-    after: Option<v1::OrderValue>,
+    from: Option<v1::OrderValue>,
     before: Option<v1::OrderValue>,
 ) -> Result<ScanBounds, WireScanFault> {
     Ok(ScanBounds {
         direction: direction_from_wire(direction)?,
         limit,
-        after: order_value_from_wire(after, BoundSide::After)?,
+        from: order_value_from_wire(from, BoundSide::From)?,
         before: order_value_from_wire(before, BoundSide::Before)?,
     })
 }
@@ -303,15 +303,23 @@ fn scan_bounds_from_wire(
 /// the repeated field each response is mostly made of.
 const REPEATED_FIELD_TAG: u32 = 1;
 
-/// A Scan response over `bound` bytes, its refusal, or the response and its
-/// size. The response is measured as the message that would be sent; past
-/// the bound, `Oversize` says how many rows, the longest prefix with `more`
-/// set, would fit.
-fn scan_within_bound(lookup: ScanLookup, bound: usize) -> Result<(ScanResponse, usize), Oversize> {
-    let v1::ScanResult { rows, more } = scanned_wire(lookup.scanned);
+/// The field number of `ScanResponse.next`.
+const NEXT_FIELD_TAG: u32 = 2;
+
+/// A Scan response read in `direction` over `bound` bytes, its refusal, or
+/// the response and its size. The response is measured as the message that
+/// would be sent; past the bound, `Oversize` says how many rows would fit:
+/// the longest prefix whose response, as a Scan at that limit answers it
+/// with its `next`, is within the bound.
+fn scan_within_bound(
+    lookup: ScanLookup,
+    direction: Direction,
+    bound: usize,
+) -> Result<(ScanResponse, usize), Oversize> {
+    let v1::ScanResult { rows, next } = scanned_wire(lookup.scanned);
     let response = ScanResponse {
         rows,
-        more,
+        next,
         snapshot_id: lookup.snapshot_id.0,
     };
     let bytes = response.encoded_len();
@@ -320,13 +328,30 @@ fn scan_within_bound(lookup: ScanLookup, bound: usize) -> Result<(ScanResponse, 
     }
     let fixed = ScanResponse {
         rows: Vec::new(),
-        more: true,
+        next: None,
         snapshot_id: response.snapshot_id,
+    };
+    // A Scan at a limit of `taken` rows, fewer than the response's,
+    // answers them with a `next`: oldest first the order value of the row
+    // after them, newest first that of the last of them. At all of the
+    // response's rows it answers the response's own.
+    let rows = &response.rows;
+    let next_of = |taken: usize| {
+        let next = if taken == rows.len() {
+            response.next.as_ref()
+        } else {
+            let row = match direction {
+                Direction::OldestFirst => rows.get(taken),
+                Direction::NewestFirst => taken.checked_sub(1).and_then(|last| rows.get(last)),
+            };
+            row.and_then(|row| row.order.as_ref())
+        };
+        next.map_or(0, |order| message::encoded_len(NEXT_FIELD_TAG, order))
     };
     Err(Oversize {
         bytes,
         bound,
-        fits: Fits::Rows(fitting_prefix(&response.rows, fixed.encoded_len(), bound)),
+        fits: Fits::Rows(fitting_prefix(rows, fixed.encoded_len(), bound, next_of)),
     })
 }
 
@@ -356,19 +381,27 @@ fn multi_scan_within_bound(
             &response.results,
             fixed.encoded_len(),
             bound,
+            |_| 0,
         )),
     })
 }
 
 /// How many of `items`, the repeated field of a response whose other
-/// fields encode to `fixed` bytes, fit in `bound` bytes, taken in order.
-fn fitting_prefix<M: Message>(items: &[M], fixed: usize, bound: usize) -> usize {
+/// fields encode to `fixed` bytes, fit in `bound` bytes, taken in order,
+/// a response of the first `n` of them carrying `tail(n)` bytes more.
+fn fitting_prefix<M: Message>(
+    items: &[M],
+    fixed: usize,
+    bound: usize,
+    tail: impl Fn(usize) -> usize,
+) -> usize {
     let mut size = fixed;
     items
         .iter()
-        .take_while(|item| {
+        .enumerate()
+        .take_while(|(at, item)| {
             size += message::encoded_len(REPEATED_FIELD_TAG, *item);
-            size <= bound
+            size + tail(at + 1) <= bound
         })
         .count()
 }
@@ -564,7 +597,7 @@ fn order_value_wire(value: OrderValue) -> v1::OrderValue {
 }
 
 /// One Scan's answer on the wire: each row's order value and one value per
-/// column, in the order the rows were read, and whether rows remain. The
+/// column, in the order the rows were read, and the next page's bound. The
 /// values' bytes are the Scan's own, moved into the message, not copied.
 fn scanned_wire(scanned: Scanned) -> v1::ScanResult {
     let rows = scanned
@@ -577,7 +610,7 @@ fn scanned_wire(scanned: Scanned) -> v1::ScanResult {
         .collect();
     v1::ScanResult {
         rows,
-        more: scanned.more,
+        next: scanned.next.map(order_value_wire),
     }
 }
 
@@ -663,14 +696,17 @@ impl Service {
         let bounds = scan_bounds_from_wire(
             request.direction,
             request.limit,
-            request.after,
+            request.from,
             request.before,
         )?;
         let (lookup, receipt) = table
             .scan_receipt(&key, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        settle(receipt, scan_within_bound(lookup, table.max_scan_bytes()))
+        settle(
+            receipt,
+            scan_within_bound(lookup, bounds.direction, table.max_scan_bytes()),
+        )
     }
 
     /// `MultiScan` inside its deadline.
@@ -684,7 +720,7 @@ impl Service {
         let bounds = scan_bounds_from_wire(
             request.direction,
             request.limit,
-            request.after,
+            request.from,
             request.before,
         )?;
         let (lookup, receipt) = table
@@ -1115,13 +1151,14 @@ mod tests {
     fn scan_cases() -> Vec<(Error, Code)> {
         let (limit, max) = (SAMPLE_LIMIT_U32 + 1, SAMPLE_LIMIT_U32);
         [
+            ScanRequestFault::LimitZero { max },
             ScanRequestFault::LimitAboveMax { limit, max },
             ScanRequestFault::BoundVariant {
-                bound: BoundSide::After,
+                bound: BoundSide::From,
                 expected: OrderVariant::Long,
                 got: OrderVariant::Str,
             },
-            ScanRequestFault::BoundsInverted,
+            ScanRequestFault::EmptyWindow,
             ScanRequestFault::TooManyValues {
                 keys: SAMPLE_LIMIT,
                 limit,
@@ -1443,12 +1480,12 @@ mod tests {
         for (wire, order) in cases {
             let bound = v1::OrderValue { value: Some(wire) };
             assert_eq!(
-                order_value_from_wire(Some(bound), BoundSide::After),
+                order_value_from_wire(Some(bound), BoundSide::From),
                 Ok(Some(order))
             );
         }
         assert_eq!(order_value_from_wire(None, BoundSide::Before), Ok(None));
-        for which in [BoundSide::After, BoundSide::Before] {
+        for which in [BoundSide::From, BoundSide::Before] {
             assert_eq!(
                 order_value_from_wire(Some(v1::OrderValue { value: None }), which),
                 Err(WireScanFault::EmptyBound { bound: which })
@@ -1461,7 +1498,7 @@ mod tests {
         let faults = [
             WireScanFault::Direction { number: 0 },
             WireScanFault::EmptyBound {
-                bound: BoundSide::After,
+                bound: BoundSide::From,
             },
         ];
         for fault in faults {
@@ -1478,14 +1515,14 @@ mod tests {
         ];
         for value in values {
             assert_eq!(
-                order_value_from_wire(Some(order_value_wire(value.clone())), BoundSide::After),
+                order_value_from_wire(Some(order_value_wire(value.clone())), BoundSide::From),
                 Ok(Some(value))
             );
         }
     }
 
     #[test]
-    fn test_scanned_wire_keeps_each_row_in_order_with_its_values_and_more() {
+    fn test_scanned_wire_keeps_each_row_in_order_with_its_values_and_next() {
         let bytes = Bytes::from_static(STR_VALUE.as_bytes());
         let scanned = Scanned {
             rows: vec![
@@ -1498,13 +1535,16 @@ mod tests {
                     values: vec![Some(Bytes::new()), None],
                 },
             ],
-            more: true,
+            next: Some(OrderValue::Long(LONG_VALUE - 1)),
         };
-        let v1::ScanResult { rows, more } = scanned_wire(scanned);
-        assert!(more);
+        let v1::ScanResult { rows, next } = scanned_wire(scanned);
+        assert_eq!(
+            order_value_from_wire(next, BoundSide::Before),
+            Ok(Some(OrderValue::Long(LONG_VALUE - 1)))
+        );
         let orders: Vec<_> = rows
             .iter()
-            .map(|row| order_value_from_wire(row.order.clone(), BoundSide::After))
+            .map(|row| order_value_from_wire(row.order.clone(), BoundSide::From))
             .collect();
         assert_eq!(
             orders,
@@ -1565,35 +1605,61 @@ mod tests {
     const SAMPLE_SNAPSHOT: i64 = 0x3fff_ffff_ffff_fff1;
 
     /// A Scan answer of `SAMPLE_VALUE_LENS`' rows, the first `rows` of
-    /// them, each with a long order value and one value.
-    fn sample_scanned(rows: usize, more: bool) -> Scanned {
+    /// them, each with a long order value and one value, and `next`.
+    fn sample_scanned(rows: usize, next: Option<i64>) -> Scanned {
         Scanned {
             rows: SAMPLE_VALUE_LENS[..rows]
                 .iter()
                 .zip(0_i64..)
                 .map(|(&len, order)| ScanRow {
-                    order: OrderValue::Long(order * 100),
+                    order: OrderValue::Long(order * SAMPLE_ORDER_STEP),
                     values: vec![Some(Bytes::from(vec![7u8; len]))],
                 })
                 .collect(),
-            more,
+            next: next.map(OrderValue::Long),
         }
     }
 
+    /// The step between the sample rows' order values: wide enough that
+    /// their varints grow from one byte to two.
+    const SAMPLE_ORDER_STEP: i64 = 100;
+
     /// The `ScanResponse` the sample answer is sent as.
-    fn sample_response(rows: usize, more: bool) -> ScanResponse {
-        let v1::ScanResult { rows, more } = scanned_wire(sample_scanned(rows, more));
+    fn sample_response(rows: usize, next: Option<i64>) -> ScanResponse {
+        let v1::ScanResult { rows, next } = scanned_wire(sample_scanned(rows, next));
         ScanResponse {
             rows,
-            more,
+            next,
             snapshot_id: SAMPLE_SNAPSHOT,
         }
     }
 
-    fn sample_lookup(rows: usize, more: bool) -> ScanLookup {
+    fn sample_lookup(rows: usize, next: Option<i64>) -> ScanLookup {
         ScanLookup {
-            scanned: sample_scanned(rows, more),
+            scanned: sample_scanned(rows, next),
             snapshot_id: icetray_core::SnapshotId(SAMPLE_SNAPSHOT),
+        }
+    }
+
+    /// The response a Scan read in `direction` at a limit of `taken` rows
+    /// sends, where one at a larger limit sent `response`: its first
+    /// `taken` rows, and the next page's bound, oldest first the order value
+    /// of the row after them and newest first that of the last of them, or
+    /// at all of the rows the response's own.
+    fn at_limit(response: &ScanResponse, taken: usize, direction: Direction) -> ScanResponse {
+        let next = if taken == response.rows.len() {
+            response.next.clone()
+        } else {
+            let row = match direction {
+                Direction::OldestFirst => response.rows.get(taken),
+                Direction::NewestFirst => taken.checked_sub(1).map(|last| &response.rows[last]),
+            };
+            row.and_then(|row| row.order.clone())
+        };
+        ScanResponse {
+            rows: response.rows[..taken].to_vec(),
+            next,
+            snapshot_id: response.snapshot_id,
         }
     }
 
@@ -1602,13 +1668,16 @@ mod tests {
     #[test]
     fn test_scan_within_bound_sends_at_the_bound_and_refuses_one_byte_over() {
         let rows = SAMPLE_VALUE_LENS.len();
-        let size = sample_response(rows, false).encoded_len();
-        let (response, bytes) = scan_within_bound(sample_lookup(rows, false), size).unwrap();
+        let direction = Direction::NewestFirst;
+        let size = sample_response(rows, None).encoded_len();
+        let (response, bytes) =
+            scan_within_bound(sample_lookup(rows, None), direction, size).unwrap();
         assert_eq!(bytes, size);
-        assert_eq!(response, sample_response(rows, false));
+        assert_eq!(response, sample_response(rows, None));
 
-        let refused = scan_within_bound(sample_lookup(rows, false), size - 1).unwrap_err();
-        let fits = fits_rows(&sample_response(rows, false), size - 1);
+        let refused =
+            scan_within_bound(sample_lookup(rows, None), direction, size - 1).unwrap_err();
+        let fits = fits_rows(&sample_response(rows, None), direction, size - 1);
         assert_eq!(
             refused,
             Oversize {
@@ -1620,55 +1689,56 @@ mod tests {
         assert_eq!(fits, rows - 1, "only the last row does not fit");
     }
 
-    /// The most leading rows of `response`, sent with `more` set, whose
-    /// encoded size is within `bound`, found by encoding each prefix.
-    fn fits_rows(response: &ScanResponse, bound: usize) -> usize {
+    /// The most leading rows of `response`, sent as a Scan in `direction`
+    /// at that limit sends them, with its `next`, whose encoded size is
+    /// within `bound`, found by encoding each prefix.
+    fn fits_rows(response: &ScanResponse, direction: Direction, bound: usize) -> usize {
         (0..=response.rows.len())
-            .take_while(|&rows| {
-                ScanResponse {
-                    rows: response.rows[..rows].to_vec(),
-                    more: true,
-                    snapshot_id: response.snapshot_id,
-                }
-                .encoded_len()
-                    <= bound
-            })
+            .take_while(|&rows| at_limit(response, rows, direction).encoded_len() <= bound)
             .count()
             .saturating_sub(1)
     }
 
-    /// For a bound at, one under, and one over each prefix's size, the rows
-    /// reported to fit are the longest prefix whose encoding is within it,
-    /// none when not even the empty response is.
+    /// For a bound at, one under, and one over each prefix's size, sent with
+    /// the `next` a Scan at that limit sends in either direction, with and
+    /// without rows past the response, the rows reported to fit are the
+    /// longest prefix whose encoding is within it, none when not even the
+    /// empty response is.
     #[test]
     fn test_scan_within_bound_counts_the_longest_prefix_that_fits() {
         let rows = SAMPLE_VALUE_LENS.len();
-        let response = sample_response(rows, false);
-        let mut reported = std::collections::BTreeSet::new();
-        for prefix in 0..=rows {
-            let size = ScanResponse {
-                rows: response.rows[..prefix].to_vec(),
-                more: true,
-                snapshot_id: SAMPLE_SNAPSHOT,
-            }
-            .encoded_len();
-            for bound in [size - 1, size, size + 1] {
-                if bound >= response.encoded_len() {
-                    continue;
+        let past = i64::try_from(rows).unwrap() * SAMPLE_ORDER_STEP;
+        for direction in [Direction::OldestFirst, Direction::NewestFirst] {
+            for next in [None, Some(past)] {
+                let response = sample_response(rows, next);
+                let mut reported = std::collections::BTreeSet::new();
+                for prefix in 0..=rows {
+                    let size = at_limit(&response, prefix, direction).encoded_len();
+                    for bound in [size - 1, size, size + 1] {
+                        if bound >= response.encoded_len() {
+                            continue;
+                        }
+                        let Err(oversize) =
+                            scan_within_bound(sample_lookup(rows, next), direction, bound)
+                        else {
+                            panic!("bound {bound} is below the response's size");
+                        };
+                        let expected = fits_rows(&response, direction, bound);
+                        assert_eq!(
+                            oversize.fits,
+                            Fits::Rows(expected),
+                            "{direction:?} {next:?} bound {bound}"
+                        );
+                        reported.insert(expected);
+                    }
                 }
-                let Err(oversize) = scan_within_bound(sample_lookup(rows, false), bound) else {
-                    panic!("bound {bound} is below the response's size");
-                };
-                let expected = fits_rows(&response, bound);
-                assert_eq!(oversize.fits, Fits::Rows(expected), "bound {bound}");
-                reported.insert(expected);
+                assert_eq!(
+                    reported,
+                    (0..rows).collect(),
+                    "{direction:?} {next:?}: every count from none to all but one is reported"
+                );
             }
         }
-        assert_eq!(
-            reported,
-            (0..rows).collect(),
-            "every count from none to all but one is reported"
-        );
     }
 
     /// A `MultiScan` response reports the leading results that fit, a key
@@ -1676,17 +1746,19 @@ mod tests {
     #[test]
     fn test_multi_scan_within_bound_counts_the_leading_results_that_fit() {
         let results = [2, 0, 3, 2];
+        let past =
+            |rows: usize| (rows > 0).then(|| i64::try_from(rows).unwrap() * SAMPLE_ORDER_STEP);
         let lookup = || MultiScanLookup {
             results: results
                 .iter()
-                .map(|&rows| sample_scanned(rows, rows > 0))
+                .map(|&rows| sample_scanned(rows, past(rows)))
                 .collect(),
             snapshot_id: icetray_core::SnapshotId(SAMPLE_SNAPSHOT),
         };
         let response = |keys: usize| MultiScanResponse {
             results: results[..keys]
                 .iter()
-                .map(|&rows| scanned_wire(sample_scanned(rows, rows > 0)))
+                .map(|&rows| scanned_wire(sample_scanned(rows, past(rows))))
                 .collect(),
             snapshot_id: SAMPLE_SNAPSHOT,
         };

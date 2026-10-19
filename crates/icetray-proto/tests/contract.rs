@@ -63,7 +63,8 @@ const FIXED_WIDTH: u32 = 16;
 const FIELD_1_LEN_TAG: u8 = 0x0a;
 
 /// The tag byte that opens a length-delimited field 2, `(2 << 3) | 2`:
-/// `ColumnValue.null_value` and `GetResponse.values`.
+/// `ColumnValue.null_value`, `GetResponse.values`, and
+/// `ScanResponse.next`.
 const FIELD_2_LEN_TAG: u8 = 0x12;
 
 /// The tag byte that opens a length-delimited field 3, `(3 << 3) | 2`:
@@ -95,7 +96,7 @@ const FIELD_4_VARINT_TAG: u8 = 0x20;
 const FIELD_5_VARINT_TAG: u8 = 0x28;
 
 /// The tag byte that opens a length-delimited field 6, `(6 << 3) | 2`:
-/// `ScanRequest.after`.
+/// `ScanRequest.from`.
 const FIELD_6_LEN_TAG: u8 = 0x32;
 
 /// The tag byte that opens a length-delimited field 7, `(7 << 3) | 2`:
@@ -482,7 +483,7 @@ fn test_round_trip_order_value_every_variant() {
 
 #[test]
 fn test_round_trip_scan_request_every_direction() {
-    let [after, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [from, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     for &(direction, _) in DIRECTION_NUMBERS {
         let request = ScanRequest {
             table: TABLE.to_owned(),
@@ -490,7 +491,7 @@ fn test_round_trip_scan_request_every_direction() {
             columns: columns(),
             direction: i32::from(direction),
             limit: SCAN_LIMIT,
-            after: Some(after.clone()),
+            from: Some(from.clone()),
             before: Some(before.clone()),
         };
         assert_round_trips(&request);
@@ -506,11 +507,12 @@ fn test_round_trip_scan_row_every_order_variant() {
 }
 
 #[test]
-fn test_round_trip_scan_response_with_more_and_snapshot() {
-    for more in [false, true] {
+fn test_round_trip_scan_response_with_next_and_snapshot() {
+    let nexts = std::iter::once(None).chain(order_values().into_iter().map(Some));
+    for next in nexts {
         assert_round_trips(&ScanResponse {
             rows: scan_rows(),
-            more,
+            next,
             snapshot_id: SNAPSHOT_ID,
         });
     }
@@ -518,25 +520,25 @@ fn test_round_trip_scan_response_with_more_and_snapshot() {
 
 #[test]
 fn test_round_trip_multi_scan_request_every_key_variant() {
-    let [after, before, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [from, before, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     assert_round_trips(&MultiScanRequest {
         table: TABLE.to_owned(),
         keys: vec![long_key(), str_key(), bin_key()],
         columns: columns(),
         direction: i32::from(Direction::OldestFirst),
         limit: SCAN_LIMIT,
-        after: Some(after),
+        from: Some(from),
         before: Some(before),
     });
 }
 
 #[test]
 fn test_round_trip_multi_scan_response_one_result_per_key() {
-    let results = [false, true]
+    let results = [None, order_values().pop()]
         .into_iter()
-        .map(|more| ScanResult {
+        .map(|next| ScanResult {
             rows: scan_rows(),
-            more,
+            next,
         })
         .collect();
     let response = MultiScanResponse {
@@ -764,11 +766,11 @@ fn varint(value: i64) -> Vec<u8> {
 /// limit as varint fields 4 and 5, and leaves an unset bound off the wire.
 #[test]
 fn test_encode_scan_request_bounds_exact_bytes() {
-    let [after, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [from, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     let request = ScanRequest {
         direction: i32::from(Direction::NewestFirst),
         limit: SCAN_LIMIT,
-        after: Some(after.clone()),
+        from: Some(from.clone()),
         before: Some(before.clone()),
         ..ScanRequest::default()
     };
@@ -783,14 +785,14 @@ fn test_encode_scan_request_bounds_exact_bytes() {
     .concat();
     let wire = [
         head.clone(),
-        delimited(FIELD_6_LEN_TAG, &after.encode_to_vec()),
+        delimited(FIELD_6_LEN_TAG, &from.encode_to_vec()),
         delimited(FIELD_7_LEN_TAG, &before.encode_to_vec()),
     ]
     .concat();
     assert_eq!(request.encode_to_vec(), wire);
     assert_eq!(ScanRequest::decode(wire.as_slice()).unwrap(), request);
     let unbounded = ScanRequest {
-        after: None,
+        from: None,
         before: None,
         ..request
     };
@@ -801,15 +803,15 @@ fn test_encode_scan_request_bounds_exact_bytes() {
     );
 }
 
-/// A scan answer carries each row as field 1, `more` as field 2, and the
+/// A scan answer carries each row as field 1, `next` as field 2, and the
 /// snapshot id as field 3; a row carries its order value as field 1 and
-/// each value as field 2.
+/// each value as field 2. An unset `next` is absent from the wire.
 #[test]
 fn test_encode_scan_response_exact_bytes() {
-    let order = order_values().remove(0);
+    let [order, next, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     let response = ScanResponse {
         rows: vec![scan_row(order.clone())],
-        more: true,
+        next: Some(next.clone()),
         snapshot_id: i64::from(SMALL_SNAPSHOT_ID),
     };
     let row = [
@@ -818,29 +820,43 @@ fn test_encode_scan_response_exact_bytes() {
         delimited(FIELD_2_LEN_TAG, &[FIELD_2_LEN_TAG, EMPTY_LEN]),
     ]
     .concat();
+    let snapshot = vec![FIELD_3_VARINT_TAG, SMALL_SNAPSHOT_ID];
     let wire = [
         delimited(FIELD_1_LEN_TAG, &row),
-        vec![FIELD_2_VARINT_TAG, 1],
-        vec![FIELD_3_VARINT_TAG, SMALL_SNAPSHOT_ID],
+        delimited(FIELD_2_LEN_TAG, &next.encode_to_vec()),
+        snapshot.clone(),
     ]
     .concat();
     assert_eq!(response.encode_to_vec(), wire);
     assert_eq!(ScanResponse::decode(wire.as_slice()).unwrap(), response);
+    let last = ScanResponse {
+        next: None,
+        ..response
+    };
+    assert_eq!(
+        last.encode_to_vec(),
+        [delimited(FIELD_1_LEN_TAG, &row), snapshot].concat(),
+        "an unset next is absent from the wire"
+    );
 }
 
 /// A `MultiScan` answer carries each key's result as field 1 and the snapshot
-/// id as field 2, a result its rows as field 1 and `more` as field 2.
+/// id as field 2, a result its rows as field 1 and `next` as field 2.
 #[test]
 fn test_encode_multi_scan_response_exact_bytes() {
+    let next = order_values().remove(0);
     let response = MultiScanResponse {
         results: vec![ScanResult {
             rows: Vec::new(),
-            more: true,
+            next: Some(next.clone()),
         }],
         snapshot_id: i64::from(SMALL_SNAPSHOT_ID),
     };
     let wire = [
-        delimited(FIELD_1_LEN_TAG, &[FIELD_2_VARINT_TAG, 1]),
+        delimited(
+            FIELD_1_LEN_TAG,
+            &delimited(FIELD_2_LEN_TAG, &next.encode_to_vec()),
+        ),
         vec![FIELD_2_VARINT_TAG, SMALL_SNAPSHOT_ID],
     ]
     .concat();

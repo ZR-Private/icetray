@@ -1,8 +1,9 @@
 //! What a Scan answers and what makes a Scan request malformed (RFD 025,
-//! Wire, Limits): the rows of one key in the requested direction with the
-//! `more` flag, the answers of a `MultiScan` from one snapshot, the checks a
-//! request meets before any read, and the merge of the rows each file holding
-//! the key gave into one answer. A key-value table never reaches this module.
+//! Wire, Paging, Limits): the rows of one key in the requested direction
+//! with the bound of the next page, the answers of a `MultiScan` from one
+//! snapshot, the checks a request meets before any read, and the merge of
+//! the rows each file holding the key gave into one answer. A key-value
+//! table never reaches this module.
 
 use std::fmt;
 
@@ -23,14 +24,19 @@ pub struct ScanRow {
 }
 
 /// What a Scan of one key answers: the rows in the requested direction, at
-/// most the limit, and whether live rows remain inside the bounds past the
-/// last row returned. A key with no rows answers none, with `more` unset.
+/// most the limit, and the next page's bound, present exactly when live
+/// rows remain inside the bounds past the last row returned. A key with no
+/// rows answers none, with no `next`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scanned {
     /// The rows, in the requested direction.
     pub rows: Vec<ScanRow>,
-    /// Whether live rows remain inside the bounds past the last row.
-    pub more: bool,
+    /// The bound of the next page in the same direction, present exactly
+    /// when live rows remain inside the bounds past the last row: reading
+    /// oldest first, the order value of the first such row, the next
+    /// page's `from`; reading newest first, the order value of the oldest
+    /// row returned, the next page's `before`.
+    pub next: Option<OrderValue>,
 }
 
 /// One Scan's answer and the snapshot it came from.
@@ -97,8 +103,8 @@ impl fmt::Display for Oversize {
 /// field's name in the contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundSide {
-    /// `after`: exclusive, below every row returned.
-    After,
+    /// `from`: inclusive, at or below every row returned.
+    From,
     /// `before`: exclusive, above every row returned.
     Before,
 }
@@ -106,7 +112,7 @@ pub enum BoundSide {
 impl fmt::Display for BoundSide {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::After => "after",
+            Self::From => "from",
             Self::Before => "before",
         })
     }
@@ -117,6 +123,12 @@ impl fmt::Display for BoundSide {
 /// `Error::ScanRequest`'s message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanRequestFault {
+    /// The limit is 0: a Scan and each key of a `MultiScan` sets the most
+    /// rows it reads, from 1 to the table's `max_scan_rows`.
+    LimitZero {
+        /// The table's `max_scan_rows`.
+        max: u32,
+    },
     /// The limit is above the table's `max_scan_rows`.
     LimitAboveMax {
         /// The limit asked.
@@ -134,11 +146,11 @@ pub enum ScanRequestFault {
         /// The variant the bound carries.
         got: OrderVariant,
     },
-    /// `after` is at or above `before`, so no row lies between them.
-    BoundsInverted,
-    /// A `MultiScan`'s keys times its limit, a limit of 0 counting as the
-    /// table's `max_scan_rows`, times one more than its requested columns,
-    /// is above `server.max_multi_scan_values`.
+    /// `from` is at or above `before`, an empty window: no order value
+    /// is at or above the one and below the other.
+    EmptyWindow,
+    /// A `MultiScan`'s keys times its limit times one more than its
+    /// requested columns is above `server.max_multi_scan_values`.
     TooManyValues {
         /// The keys asked.
         keys: usize,
@@ -157,6 +169,10 @@ pub enum ScanRequestFault {
 impl fmt::Display for ScanRequestFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LimitZero { max } => write!(
+                f,
+                "limit is 0: a Scan or MultiScan sets the most rows it reads per key, at most max_scan_rows {max}"
+            ),
             Self::LimitAboveMax { limit, max } => {
                 write!(f, "limit {limit} is above max_scan_rows {max}")
             }
@@ -170,7 +186,9 @@ impl fmt::Display for ScanRequestFault {
                 variant_name(*got),
                 variant_name(*expected)
             ),
-            Self::BoundsInverted => f.write_str("after is at or above before"),
+            Self::EmptyWindow => {
+                f.write_str("from is at or above before, so the window holds no order value")
+            }
             Self::TooManyValues {
                 keys,
                 limit,
@@ -210,15 +228,16 @@ fn variant_of(value: &OrderValue) -> OrderVariant {
     }
 }
 
-/// The limit `bounds` asks for resolved against `max_scan_rows`: 0 reads up
-/// to `max_scan_rows`, and a limit above it is
+/// The limit `bounds` asks for, checked against `max_scan_rows`: a limit of
+/// 0 is `ScanRequestFault::LimitZero`, since a Scan and each key of a
+/// `MultiScan` sets the rows it reads, and a limit above `max_scan_rows` is
 /// `ScanRequestFault::LimitAboveMax`.
-pub(crate) fn resolve_limit(
+pub(crate) fn check_limit(
     bounds: &ScanBounds,
     max_scan_rows: u32,
 ) -> Result<u32, ScanRequestFault> {
     match bounds.limit {
-        0 => Ok(max_scan_rows),
+        0 => Err(ScanRequestFault::LimitZero { max: max_scan_rows }),
         limit if limit > max_scan_rows => Err(ScanRequestFault::LimitAboveMax {
             limit,
             max: max_scan_rows,
@@ -228,7 +247,7 @@ pub(crate) fn resolve_limit(
 }
 
 /// `ScanRequestFault::BoundVariant` for a bound of another variant than
-/// `expected`, and `ScanRequestFault::BoundsInverted` for an `after` at or
+/// `expected`, and `ScanRequestFault::EmptyWindow` for a `from` at or
 /// above `before`. A bound past the range of an `int` or `date` column is
 /// no fault: it admits every row on its side.
 pub(crate) fn check_bounds(
@@ -236,7 +255,7 @@ pub(crate) fn check_bounds(
     expected: OrderVariant,
 ) -> Result<(), ScanRequestFault> {
     for (side, bound) in [
-        (BoundSide::After, &bounds.after),
+        (BoundSide::From, &bounds.from),
         (BoundSide::Before, &bounds.before),
     ] {
         if let Some(bound) = bound
@@ -249,15 +268,15 @@ pub(crate) fn check_bounds(
             });
         }
     }
-    if let (Some(after), Some(before)) = (&bounds.after, &bounds.before)
-        && after >= before
+    if let (Some(from), Some(before)) = (&bounds.from, &bounds.before)
+        && from >= before
     {
-        return Err(ScanRequestFault::BoundsInverted);
+        return Err(ScanRequestFault::EmptyWindow);
     }
     Ok(())
 }
 
-/// `ScanRequestFault::TooManyValues` when `keys` keys at the resolved
+/// `ScanRequestFault::TooManyValues` when `keys` keys at the checked
 /// `limit` naming `columns` columns ask for more than `max` values, each row
 /// counting its order value and one value per column (RFD 025, Limits).
 pub(crate) fn check_multi_scan_values(
@@ -283,46 +302,90 @@ pub(crate) fn check_multi_scan_values(
 }
 
 /// What one file holding the key answered: up to `limit` rows in the
-/// Scan's direction, and the order value of its next live row inside the
-/// bounds past them, if any.
+/// Scan's direction, and what lies past them inside the bounds.
 pub(crate) struct FileAnswer {
     /// The rows taken, in the Scan's direction.
     pub(crate) rows: Vec<ScanRow>,
-    /// The next live row's order value past the rows taken.
-    pub(crate) next: Option<OrderValue>,
+    /// The file's next live row inside the bounds past the rows taken.
+    pub(crate) past: Past,
+}
+
+/// What lies past the rows one file gave, inside the bounds, in the Scan's
+/// direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Past {
+    /// No live row.
+    Nothing,
+    /// A live row, read newest first. The next page's bound is the oldest
+    /// row returned, so the row's order value is not needed.
+    Row,
+    /// A live row at this order value, read oldest first: the next page's
+    /// `from` unless another file's row precedes it.
+    At(OrderValue),
 }
 
 /// The rows every file holding the key answered merged into one Scan's
 /// answer: ordered by order value in `direction`, cut to `limit`, with
-/// `more` set when a row was cut or any file has a live row inside the
-/// bounds past those it gave. Live pairs are unique across files (RFD 025,
-/// Uniqueness), so no row is dropped as a repeat, and a file's next row
-/// lies past every row it gave, so it lies past the last returned when
-/// nothing was cut. One file's rows, as a compacted table's key answers,
-/// are already in `direction` and at most `limit`, so they are the answer
-/// as given.
+/// `next` set when a row was cut or any file has a live row inside the
+/// bounds past those it gave (`Scanned::next`). Live pairs are unique
+/// across files (RFD 025, Uniqueness), so no row is dropped as a repeat. A
+/// file has a row past those it gave only when it gave `limit` rows, so
+/// that row lies past the last returned, and every live row past the last
+/// returned is a row cut or at or past some file's next row: oldest first,
+/// the least of the first row cut and the files' next rows is the first
+/// live row past the page. One file's rows, as a compacted table's key
+/// answers, are already in `direction` and at most `limit`, so they are
+/// the answer as given.
 pub(crate) fn merge(mut files: Vec<FileAnswer>, direction: Direction, limit: u32) -> Scanned {
     if files.len() == 1
         && let Some(file) = files.pop()
     {
+        let next = match file.past {
+            Past::Nothing => None,
+            Past::Row => file.rows.last().map(|row| row.order.clone()),
+            Past::At(next) => Some(next),
+        };
         return Scanned {
-            more: file.next.is_some(),
             rows: file.rows,
+            next,
         };
     }
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let more_in_a_file = files.iter().any(|file| file.next.is_some());
-    let mut rows: Vec<ScanRow> = files.into_iter().flat_map(|file| file.rows).collect();
+    let mut rows: Vec<ScanRow> = Vec::with_capacity(files.iter().map(|file| file.rows.len()).sum());
+    let mut past_a_file = false;
+    let mut least_next: Option<OrderValue> = None;
+    for file in files {
+        rows.extend(file.rows);
+        match file.past {
+            Past::Nothing => {}
+            Past::Row => past_a_file = true,
+            Past::At(next) => {
+                past_a_file = true;
+                least_next = Some(match least_next {
+                    Some(least) => least.min(next),
+                    None => next,
+                });
+            }
+        }
+    }
     match direction {
         Direction::OldestFirst => rows.sort_by(|a, b| a.order.cmp(&b.order)),
         Direction::NewestFirst => rows.sort_by(|a, b| b.order.cmp(&a.order)),
     }
-    let cut = rows.len() > limit;
+    let first_cut = (rows.len() > limit).then(|| rows.swap_remove(limit));
     rows.truncate(limit);
-    Scanned {
-        rows,
-        more: cut || more_in_a_file,
-    }
+    let next = match direction {
+        Direction::OldestFirst => match (first_cut, least_next) {
+            (Some(cut), Some(least)) => Some(cut.order.min(least)),
+            (Some(cut), None) => Some(cut.order),
+            (None, least) => least,
+        },
+        Direction::NewestFirst if first_cut.is_some() || past_a_file => {
+            rows.last().map(|row| row.order.clone())
+        }
+        Direction::NewestFirst => None,
+    };
+    Scanned { rows, next }
 }
 
 #[cfg(test)]
@@ -335,11 +398,11 @@ mod tests {
     /// A limit under `MAX`.
     const UNDER: u32 = 3;
 
-    fn bounds(limit: u32, after: Option<OrderValue>, before: Option<OrderValue>) -> ScanBounds {
+    fn bounds(limit: u32, from: Option<OrderValue>, before: Option<OrderValue>) -> ScanBounds {
         ScanBounds {
             direction: Direction::NewestFirst,
             limit,
-            after,
+            from,
             before,
         }
     }
@@ -363,12 +426,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_limit_reads_zero_as_max_and_refuses_above_it() {
-        assert_eq!(resolve_limit(&bounds(0, None, None), MAX), Ok(MAX));
-        assert_eq!(resolve_limit(&bounds(UNDER, None, None), MAX), Ok(UNDER));
-        assert_eq!(resolve_limit(&bounds(MAX, None, None), MAX), Ok(MAX));
+    fn test_check_limit_refuses_zero_and_above_max() {
         assert_eq!(
-            resolve_limit(&bounds(MAX + 1, None, None), MAX),
+            check_limit(&bounds(0, None, None), MAX),
+            Err(ScanRequestFault::LimitZero { max: MAX })
+        );
+        assert_eq!(check_limit(&bounds(1, None, None), MAX), Ok(1));
+        assert_eq!(check_limit(&bounds(UNDER, None, None), MAX), Ok(UNDER));
+        assert_eq!(check_limit(&bounds(MAX, None, None), MAX), Ok(MAX));
+        assert_eq!(
+            check_limit(&bounds(MAX + 1, None, None), MAX),
             Err(ScanRequestFault::LimitAboveMax {
                 limit: MAX + 1,
                 max: MAX
@@ -377,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_bounds_refuses_another_variant_and_inverted_bounds() {
+    fn test_check_bounds_refuses_another_variant_and_an_empty_window() {
         let long = |value| Some(OrderValue::Long(value));
         assert_eq!(
             check_bounds(&bounds(0, long(1), long(2)), OrderVariant::Long),
@@ -400,18 +467,29 @@ mod tests {
                 OrderVariant::Str
             ),
             Err(ScanRequestFault::BoundVariant {
-                bound: BoundSide::After,
+                bound: BoundSide::From,
                 expected: OrderVariant::Str,
                 got: OrderVariant::Bin,
             })
         );
-        for (after, before) in [(2, 2), (3, 2)] {
+        for (from, before) in [(2, 2), (3, 2), (i64::MAX, i64::MAX), (i64::MAX, i64::MIN)] {
             assert_eq!(
-                check_bounds(&bounds(0, long(after), long(before)), OrderVariant::Long),
-                Err(ScanRequestFault::BoundsInverted),
-                "{after} {before}"
+                check_bounds(&bounds(0, long(from), long(before)), OrderVariant::Long),
+                Err(ScanRequestFault::EmptyWindow),
+                "{from} {before}"
             );
         }
+        let text = |value: &str| Some(OrderValue::Str(value.to_string()));
+        assert_eq!(
+            check_bounds(&bounds(0, text("a"), text("a")), OrderVariant::Str),
+            Err(ScanRequestFault::EmptyWindow),
+            "a window of one string holds nothing: before excludes what from includes"
+        );
+        assert_eq!(
+            check_bounds(&bounds(0, text("a"), text("a\0")), OrderVariant::Str),
+            Ok(()),
+            "the least string above \"a\" admits \"a\" alone"
+        );
         assert_eq!(
             check_bounds(
                 &bounds(0, long(i64::MIN), long(i64::MAX)),
@@ -461,52 +539,128 @@ mod tests {
     /// A row of the second file past those it gave oldest first.
     const SECOND_NEXT: i64 = 12;
 
+    /// `FIRST_FILE` and `SECOND_FILE` as answers read in `direction`,
+    /// nothing past either.
+    fn two_files(direction: Direction) -> Vec<FileAnswer> {
+        [FIRST_FILE, SECOND_FILE]
+            .into_iter()
+            .map(|orders| {
+                let mut rows: Vec<ScanRow> = orders.into_iter().map(row).collect();
+                if direction == Direction::OldestFirst {
+                    rows.reverse();
+                }
+                FileAnswer {
+                    rows,
+                    past: Past::Nothing,
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_merge_orders_across_files_and_sets_more_from_a_cut_or_a_next_row() {
-        let files = || {
-            [FIRST_FILE, SECOND_FILE]
-                .into_iter()
-                .map(|orders| FileAnswer {
-                    rows: orders.into_iter().map(row).collect(),
-                    next: None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let all = merge(files(), Direction::NewestFirst, MAX);
+    fn test_merge_orders_across_files_and_sets_next_from_a_cut_or_a_files_next_row() {
+        let all = merge(
+            two_files(Direction::NewestFirst),
+            Direction::NewestFirst,
+            MAX,
+        );
         assert_eq!(orders(&all), MERGED);
-        assert!(!all.more);
-        let cut = merge(files(), Direction::NewestFirst, UNDER);
-        assert_eq!(orders(&cut), MERGED[..usize::try_from(UNDER).unwrap()]);
-        assert!(cut.more, "a row was cut");
-        let mut oldest = files();
-        for file in &mut oldest {
-            file.rows.reverse();
-        }
-        oldest[1].next = Some(OrderValue::Long(SECOND_NEXT));
-        let with_next = merge(oldest, Direction::OldestFirst, MAX);
+        assert_eq!(all.next, None);
+        let under = usize::try_from(UNDER).unwrap();
+        let cut = merge(
+            two_files(Direction::NewestFirst),
+            Direction::NewestFirst,
+            UNDER,
+        );
+        assert_eq!(orders(&cut), MERGED[..under]);
+        assert_eq!(
+            cut.next,
+            Some(OrderValue::Long(MERGED[under - 1])),
+            "newest first, a cut sets next to the oldest row returned"
+        );
         let mut ascending = MERGED;
         ascending.reverse();
+        let oldest_cut = merge(
+            two_files(Direction::OldestFirst),
+            Direction::OldestFirst,
+            UNDER,
+        );
+        assert_eq!(orders(&oldest_cut), ascending[..under]);
+        assert_eq!(
+            oldest_cut.next,
+            Some(OrderValue::Long(ascending[under])),
+            "oldest first, a cut sets next to the first row cut"
+        );
+        let mut with_next = two_files(Direction::OldestFirst);
+        with_next[1].past = Past::At(OrderValue::Long(SECOND_NEXT));
+        let with_next = merge(with_next, Direction::OldestFirst, MAX);
         assert_eq!(orders(&with_next), ascending);
-        assert!(with_next.more, "a file holds a row past those it gave");
+        assert_eq!(
+            with_next.next,
+            Some(OrderValue::Long(SECOND_NEXT)),
+            "a file holds a row past those it gave"
+        );
+        let mut newest_past = two_files(Direction::NewestFirst);
+        newest_past[0].past = Past::Row;
+        let newest_past = merge(newest_past, Direction::NewestFirst, MAX);
+        assert_eq!(orders(&newest_past), MERGED);
+        assert_eq!(newest_past.next, Some(OrderValue::Long(MERGED[3])));
         let none = merge(Vec::new(), Direction::OldestFirst, MAX);
-        assert!(none.rows.is_empty() && !none.more);
+        assert!(none.rows.is_empty() && none.next.is_none());
+    }
+
+    /// Oldest first, the next page starts at the least row past the page
+    /// in any file: here a file's next row, below the first row cut.
+    #[test]
+    fn test_merge_oldest_first_next_is_the_least_row_past_the_page_in_any_file() {
+        let limit = 3;
+        let file = |orders: [i64; 3], next: i64| FileAnswer {
+            rows: orders.into_iter().map(row).collect(),
+            past: Past::At(OrderValue::Long(next)),
+        };
+        let first_next = 4;
+        let merged = merge(
+            vec![file([1, 2, 3], first_next), file([5, 6, 7], 8)],
+            Direction::OldestFirst,
+            limit,
+        );
+        assert_eq!(orders(&merged), [1, 2, 3]);
+        assert_eq!(merged.next, Some(OrderValue::Long(first_next)));
+        let first_cut = 4;
+        let merged = merge(
+            vec![file([1, 5, 9], 10), file([2, 3, first_cut], 6)],
+            Direction::OldestFirst,
+            limit,
+        );
+        assert_eq!(orders(&merged), [1, 2, 3]);
+        assert_eq!(merged.next, Some(OrderValue::Long(first_cut)));
     }
 
     #[test]
     fn test_merge_answers_one_files_rows_as_given() {
-        let file = |next| FileAnswer {
+        let file = |past| FileAnswer {
             rows: FIRST_FILE.into_iter().map(row).collect(),
-            next,
+            past,
         };
-        let alone = merge(vec![file(None)], Direction::NewestFirst, MAX);
+        let alone = merge(vec![file(Past::Nothing)], Direction::NewestFirst, MAX);
         assert_eq!(orders(&alone), FIRST_FILE);
-        assert!(!alone.more);
-        let with_next = merge(
-            vec![file(Some(OrderValue::Long(SECOND_NEXT)))],
-            Direction::NewestFirst,
+        assert_eq!(alone.next, None);
+        let newest = merge(vec![file(Past::Row)], Direction::NewestFirst, MAX);
+        assert_eq!(orders(&newest), FIRST_FILE);
+        assert_eq!(
+            newest.next,
+            Some(OrderValue::Long(FIRST_FILE[1])),
+            "newest first, the next page ends below the oldest row returned"
+        );
+        let oldest = merge(
+            vec![file(Past::At(OrderValue::Long(SECOND_NEXT)))],
+            Direction::OldestFirst,
             MAX,
         );
-        assert_eq!(orders(&with_next), FIRST_FILE);
-        assert!(with_next.more, "the file holds a row past those it gave");
+        assert_eq!(
+            oldest.next,
+            Some(OrderValue::Long(SECOND_NEXT)),
+            "oldest first, the next page starts at the file's next row"
+        );
     }
 }

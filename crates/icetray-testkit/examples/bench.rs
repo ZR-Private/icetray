@@ -804,8 +804,8 @@ const LARGE_VALUE_ROWS: u64 = 100_000;
 const LARGE_VALUE_APPENDED_ROWS: u64 = LARGE_VALUE_ROWS / APPEND_DIVISOR;
 
 /// Rows per key of the ordered table: a time series of 100 points, a
-/// tenth of the default `max_scan_rows`, so a Scan of limit 0 returns the
-/// whole run, and a run of 100-byte values lies in one or two of the
+/// tenth of the default `max_scan_rows`, so a Scan at that limit returns
+/// the whole run, and a run of 100-byte values lies in one or two of the
 /// contract's 1,000-row value pages.
 const ORDERED_ROWS_PER_KEY: u64 = 100;
 
@@ -2073,8 +2073,9 @@ struct ScanCase {
     bounds: ScanBounds,
     /// The order value of each row the model returns, in order.
     orders: Vec<OrderValue>,
-    /// Whether the model leaves live rows inside the bounds past the last.
-    more: bool,
+    /// The next page's bound the model answers, present when live rows
+    /// remain inside the bounds past the last.
+    next: Option<OrderValue>,
 }
 
 impl ScanCase {
@@ -2082,14 +2083,14 @@ impl ScanCase {
     fn of(shape: TableShape, test: TestScan) -> BenchResult<Self> {
         let ordered = shape.order()?;
         let rows = ordered.orders_of(0)?.into_iter().map(|order| (order, ()));
-        let (rows, more) = scan_model(rows, &test);
+        let (rows, next) = scan_model(rows, &test);
         Ok(Self {
             bounds: test.bounds(ordered.kind),
             orders: rows
                 .into_iter()
                 .map(|(order, ())| order_value(ordered.kind, order))
                 .collect(),
-            more,
+            next: next.map(|next| order_value(ordered.kind, next)),
             test,
         })
     }
@@ -2106,17 +2107,17 @@ impl ScanCase {
     }
 
     /// The value bytes `scanned` returned, or what in it disagrees with the
-    /// model: another `more`, another row count or order value, or a row
+    /// model: another `next`, another row count or order value, or a row
     /// without one value of `value_bytes` bytes. Allocates nothing when it
     /// agrees, so the check costs a measured operation no allocation.
     fn check(&self, scanned: &Scanned, value_bytes: usize) -> Result<usize, String> {
-        if scanned.more != self.more || scanned.rows.len() != self.orders.len() {
+        if scanned.next != self.next || scanned.rows.len() != self.orders.len() {
             return Err(format!(
-                "{} rows, more {}, where the model has {} rows, more {}",
+                "{} rows, next {:?}, where the model has {} rows, next {:?}",
                 scanned.rows.len(),
-                scanned.more,
+                scanned.next,
                 self.orders.len(),
-                self.more
+                self.next
             ));
         }
         let mut returned = 0;
@@ -2157,7 +2158,7 @@ fn modeled_scan(
         );
         (order, value)
     });
-    let (rows, more) = scan_model(rows, test);
+    let (rows, next) = scan_model(rows, test);
     Ok(Scanned {
         rows: rows
             .into_iter()
@@ -2166,7 +2167,7 @@ fn modeled_scan(
                 values: vec![Some(value.into())],
             })
             .collect(),
-        more,
+        next: next.map(|next| order_value(ordered.kind, next)),
     })
 }
 
@@ -2722,15 +2723,18 @@ async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
             Some(_) => {
                 let mut page = ScanBounds {
                     direction: Direction::NewestFirst,
-                    limit: 0,
-                    after: None,
+                    limit: table
+                        .config()
+                        .scan_rows()
+                        .ok_or("an ordered table has a max_scan_rows")?,
+                    from: None,
                     before: None,
                 };
                 loop {
                     let scanned = table.scan(&key, shape.whole_reads(), &page).await?.scanned;
-                    match scanned.rows.last() {
-                        Some(oldest) if scanned.more => page.before = Some(oldest.order.clone()),
-                        Some(_) | None => break,
+                    match scanned.next {
+                        Some(next) => page.before = Some(next),
+                        None => break,
                     }
                 }
             }
@@ -2964,19 +2968,18 @@ async fn measure_modes(
     Ok(runs)
 }
 
-/// The bounded Scan's request: `SCAN_PAGE_ROWS` rows, newest first,
-/// strictly between the order values of the rows a quarter and three
-/// quarters into a key's run (`WINDOW_MARGIN_DIVISOR`), counted oldest
-/// first.
+/// The bounded Scan's request: `SCAN_PAGE_ROWS` rows, newest first, from
+/// the order value of the row just past a quarter into a key's run up to
+/// that of the row three quarters in, left out (`WINDOW_MARGIN_DIVISOR`),
+/// counted oldest first.
 fn bounded_page() -> BenchResult<TestScan> {
     let orders = ORDERED.orders_of(0)?;
     let margin = orders.len() / WINDOW_MARGIN_DIVISOR;
     Ok(TestScan {
         direction: Direction::NewestFirst,
         limit: SCAN_PAGE_ROWS,
-        after: Some(orders[margin]),
+        from: Some(orders[margin + 1]),
         before: Some(orders[orders.len() - margin]),
-        ..TestScan::default()
     })
 }
 

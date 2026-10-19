@@ -18,8 +18,8 @@ use icetray_core::approx::{self, count};
 use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::metric::{self, LookupResult};
 use icetray_core::{
-    ColumnMismatch, Direction, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason,
-    Row, ScanBounds, TableFault, TableSource, TableState, diagnose, examine,
+    ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
+    TableFault, TableSource, TableState, diagnose, examine,
 };
 use icetray_testkit::fixture::{
     IDS_2K, KEY_FIELD_ID, NAMESPACE, OLD_ID, SECOND_VALUE_COLUMN, SECOND_VALUE_FIELD_ID, STRAY_IDS,
@@ -1080,22 +1080,17 @@ async fn test_the_order_column_resolves_by_name_and_field_id_like_a_value_column
     let served = verify::serve(config, source, verify::storage_config_for_tests()).await?;
     for id in FIRST_BUILD_SAMPLE {
         let key = fixture.key(id);
-        let (rows, more) = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
+        let (rows, next) = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
         let [(_order, values)] = &rows[..] else {
             panic!("one row per key, got {rows:?}");
         };
-        assert!(!more);
+        assert_eq!(next, None);
         let scanned = served
             .table
             .scan(
                 &key,
                 &verify::whole(&[VALUE_COLUMN]),
-                &ScanBounds {
-                    direction: Direction::NewestFirst,
-                    limit: 0,
-                    after: None,
-                    before: None,
-                },
+                &TestScan::default().bounds(OrderKind::Long),
             )
             .await?
             .scanned;
@@ -1110,7 +1105,7 @@ async fn test_the_order_column_resolves_by_name_and_field_id_like_a_value_column
                 .collect::<Vec<_>>()],
             "{id}"
         );
-        assert!(!scanned.more);
+        assert_eq!(scanned.next, None);
     }
     let order_field_id = fixture
         .order_field_id()

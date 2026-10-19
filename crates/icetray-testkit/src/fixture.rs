@@ -795,19 +795,25 @@ impl Fixture {
     /// What a Scan of `key` naming `columns`, each `VALUE_COLUMN` or
     /// `SECOND_VALUE_COLUMN`, answers on this ordered fixture: the naive
     /// sort of `key`'s live rows (`scan_model`), each as its raw order value
-    /// and one value per column, `None` for a null, and whether live rows
-    /// remain inside the bounds past the last one returned. A key the
-    /// fixture holds no row for answers no rows.
+    /// and one value per column, `None` for a null, and the raw order
+    /// value of the next page's bound when live rows remain inside the
+    /// bounds past the last one returned. A key the fixture holds no row
+    /// for answers no rows and no bound.
     ///
     /// Panics on a fixture whose specification names no order column, and
     /// on a column the fixture writes no value for.
-    pub fn expected_scan(&self, key: &Key, columns: &[&str], scan: &TestScan) -> (ScanRows, bool) {
+    pub fn expected_scan(
+        &self,
+        key: &Key,
+        columns: &[&str],
+        scan: &TestScan,
+    ) -> (ScanRows, Option<i64>) {
         assert!(
             self.spec.ordered.is_some(),
             "expected_scan is for a fixture with an order column"
         );
         let Some(id) = id_of(key, self.spec.key_pad, self.spec.key_shape) else {
-            return (Vec::new(), false);
+            return (Vec::new(), None);
         };
         let rows = self.rows.of_id(id).map(|(order, version)| {
             let value = (!self.spec.is_null(id)).then(|| {
@@ -833,7 +839,7 @@ impl Fixture {
     ///
     /// Panics as `expected_scan` does.
     pub fn expected_scanned(&self, key: &Key, columns: &[&str], scan: &TestScan) -> Scanned {
-        let (rows, more) = self.expected_scan(key, columns, scan);
+        let (rows, next) = self.expected_scan(key, columns, scan);
         let kind = self
             .spec
             .ordered
@@ -850,7 +856,7 @@ impl Fixture {
                         .collect(),
                 })
                 .collect(),
-            more,
+            next: next.map(|next| order_value(kind, next)),
         }
     }
 

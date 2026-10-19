@@ -1068,7 +1068,7 @@ impl Drop for ScanReceipt {
 
 /// A Scan request checked against the generation and the table's entry
 /// before any read (`Table::check_scan`): the columns it reads and its
-/// limit, resolved.
+/// limit, checked.
 #[derive(Clone)]
 struct CheckedScan {
     selection: Selection,
@@ -1629,12 +1629,12 @@ impl Table {
     }
 
     /// One Scan of `key` against the serving generation (RFD 025): its live
-    /// rows inside `bounds`' exclusive `after` and `before`, in the
-    /// direction asked, at most the limit, a limit of 0 reading up to the
-    /// table's `max_scan_rows`, each its order value and one value per
+    /// rows at or above `bounds`' `from` and below its `before`, in the
+    /// direction asked, at most the limit, which is from 1 to the table's
+    /// `max_scan_rows`, each its order value and one value per
     /// column of `columns`, trimmed to the fields its read names as `get`
-    /// trims them, and `more` set when live rows remain inside the bounds
-    /// past the last returned. Raised before any read:
+    /// trims them, and the next page's bound, `Scanned::next`, when live
+    /// rows remain inside the bounds past the last returned. Raised before any read:
     /// `Error::WrongTableKind` on a key-value table, whether or not it has
     /// loaded, then `Error::NotReady` with no generation, and the faults
     /// `check_scan` names. Every file holding the
@@ -1682,7 +1682,7 @@ impl Table {
     /// answers it, in key order, a key listed twice at each position (RFD
     /// 025). Every key's type, the columns, the limit, and the bounds are
     /// checked before any read, as `scan` checks them, and so is the
-    /// request's size: keys times the resolved limit times one more than
+    /// request's size: keys times the limit times one more than
     /// the columns above `server.max_multi_scan_values` is
     /// `Error::ScanRequest` with `ScanRequestFault::TooManyValues`. A key
     /// listed more than once is read once and its answer given at each
@@ -2598,10 +2598,10 @@ impl Table {
     /// A Scan of `keys` reading `columns` under `bounds` checked against
     /// `generation` and the table's entry before any read (RFD 025, Wire):
     /// `Error::KeyType` for a key of another type; `Error::ColumnRequest` as
-    /// `get` checks the columns; and `Error::ScanRequest` for a limit above
-    /// `max_scan_rows`, a bound of another variant than the order type's, an
-    /// `after` at or above `before`, and, for a `MultiScan` (`multi`), keys
-    /// times the resolved limit times one more than the columns above
+    /// `get` checks the columns; and `Error::ScanRequest` for a limit of 0
+    /// or above `max_scan_rows`, a bound of another variant than the order
+    /// type's, a `from` at or above `before`, and, for a `MultiScan`
+    /// (`multi`), keys times the limit times one more than the columns above
     /// `max_multi_scan_values`, in that order. Every position the selection
     /// holds is one of the generation's columns, which every file's index
     /// holds a slot for.
@@ -2632,7 +2632,7 @@ impl Table {
             table: self.name.clone(),
             fault,
         };
-        let limit = scan::resolve_limit(bounds, max_scan_rows).map_err(refused)?;
+        let limit = scan::check_limit(bounds, max_scan_rows).map_err(refused)?;
         scan::check_bounds(bounds, order.order_type.variant()).map_err(refused)?;
         if multi {
             scan::check_multi_scan_values(
@@ -6887,12 +6887,12 @@ mod tests {
         }
     }
 
-    /// Every row, oldest first, at the table's `max_scan_rows`.
+    /// Every row, oldest first, at the test tables' `max_scan_rows`.
     fn oldest_first() -> ScanBounds {
         ScanBounds {
             direction: Direction::OldestFirst,
-            limit: 0,
-            after: None,
+            limit: DEFAULT_MAX_SCAN_ROWS,
+            from: None,
             before: None,
         }
     }
@@ -6932,7 +6932,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answered.scanned.rows, scanned_both(&rows));
-        assert!(!answered.scanned.more);
+        assert_eq!(answered.scanned.next, None);
         assert_eq!(
             fixture.gets() - before,
             approx::count(rows.len() * gets_per_row_group),
@@ -7094,8 +7094,8 @@ mod tests {
 
     /// An ordered table's `max_scan_rows` of zero in a configuration built
     /// by hand, which no validation saw, is refused as validation refuses
-    /// it, by the load and by a retune, so no Scan answers no rows with
-    /// `more` set.
+    /// it, by the load and by a retune, so no Scan answers no rows with a
+    /// `next` bound.
     #[tokio::test]
     async fn test_load_and_retune_refuse_a_max_scan_rows_of_zero() {
         let is_zero = |error: &Error| {
@@ -7330,6 +7330,55 @@ mod tests {
         ));
     }
 
+    /// The fault of `error`, a refused Scan request of the test table.
+    fn scan_request_fault(error: Error) -> ScanRequestFault {
+        let Error::ScanRequest { table, fault } = error else {
+            panic!("expected a scan request fault, got {error:?}");
+        };
+        assert_eq!(table, TABLE);
+        fault
+    }
+
+    /// A limit of 0 and one above `max_scan_rows` are refused before any
+    /// read, by a Scan and by a `MultiScan` alike, each of which sets its
+    /// limit per key (RFD 025, Wire).
+    #[tokio::test]
+    async fn test_scan_and_multi_scan_refuse_a_limit_of_zero_or_above_max_before_any_read() {
+        let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
+        let (table, fixture, _gauged) =
+            ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
+        let key = Key::Long(KEY_STEP);
+        let max = DEFAULT_MAX_SCAN_ROWS;
+        let before = fixture.gets();
+        for (limit, expected) in [
+            (0, ScanRequestFault::LimitZero { max }),
+            (
+                max + 1,
+                ScanRequestFault::LimitAboveMax {
+                    limit: max + 1,
+                    max,
+                },
+            ),
+        ] {
+            let bounds = ScanBounds {
+                limit,
+                ..oldest_first()
+            };
+            let scan = table.scan(&key, &BOTH_READS, &bounds).await.unwrap_err();
+            assert_eq!(scan_request_fault(scan), expected, "Scan limit {limit}");
+            let multi = table
+                .multi_scan(std::slice::from_ref(&key), &BOTH_READS, &bounds)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                scan_request_fault(multi),
+                expected,
+                "MultiScan limit {limit}"
+            );
+        }
+        assert_eq!(fixture.gets(), before, "no request read anything");
+    }
+
     /// A malformed Scan request is refused before any read, as
     /// `Error::ScanRequest` for its fault, after the key and the columns
     /// are checked as `get` checks them (RFD 025, Wire, Limits).
@@ -7341,26 +7390,9 @@ mod tests {
         let key = Key::Long(KEY_STEP);
         let max = DEFAULT_MAX_SCAN_ROWS;
         let before = fixture.gets();
-        let fault = |error: Error| {
-            let Error::ScanRequest { table, fault } = error else {
-                panic!("expected a scan request fault, got {error:?}");
-            };
-            assert_eq!(table, TABLE);
-            fault
-        };
-        let above = ScanBounds {
-            limit: max + 1,
-            ..oldest_first()
-        };
-        assert_eq!(
-            fault(table.scan(&key, &BOTH_READS, &above).await.unwrap_err()),
-            ScanRequestFault::LimitAboveMax {
-                limit: max + 1,
-                max
-            }
-        );
+        let fault = scan_request_fault;
         let wrong_variant = ScanBounds {
-            after: Some(OrderValue::Str("a".to_string())),
+            from: Some(OrderValue::Str("a".to_string())),
             ..oldest_first()
         };
         assert_eq!(
@@ -7371,19 +7403,19 @@ mod tests {
                     .unwrap_err()
             ),
             ScanRequestFault::BoundVariant {
-                bound: BoundSide::After,
+                bound: BoundSide::From,
                 expected: OrderVariant::Long,
                 got: OrderVariant::Str,
             }
         );
-        let inverted = ScanBounds {
-            after: Some(OrderValue::Long(ORDER_START)),
+        let empty = ScanBounds {
+            from: Some(OrderValue::Long(ORDER_START)),
             before: Some(OrderValue::Long(ORDER_START)),
             ..oldest_first()
         };
         assert_eq!(
-            fault(table.scan(&key, &BOTH_READS, &inverted).await.unwrap_err()),
-            ScanRequestFault::BoundsInverted
+            fault(table.scan(&key, &BOTH_READS, &empty).await.unwrap_err()),
+            ScanRequestFault::EmptyWindow
         );
         let max_values = ServerConfig::default().max_multi_scan_values;
         let keys_at_the_full_limit = max_values / (2 * approx::length(max)) + 1;
@@ -7509,7 +7541,7 @@ mod tests {
                 .scan(&Key::Long(KEY_STEP + 1), &BOTH_READS, &oldest_first())
                 .await
                 .unwrap();
-            assert!(absent.scanned.rows.is_empty() && !absent.scanned.more);
+            assert!(absent.scanned.rows.is_empty() && absent.scanned.next.is_none());
             let lookup = &table.lookups.cache;
             let scan_cache = &table.scans.as_ref().unwrap().cache;
             (lookup.fetches() + lookup.hits(), scan_cache.fetches())
@@ -7669,7 +7701,7 @@ mod tests {
     const SPREAD_REPEATS: usize = 8;
 
     /// The answer test's limit: below `SCAN_ROWS_PER_KEY`, so every key
-    /// held answers with `more` set, and small enough that the listed keys
+    /// held answers with a `next` bound, and small enough that the listed keys
     /// stay within `max_multi_scan_values`.
     const SPREAD_LIMIT: usize = 4;
 
@@ -7772,7 +7804,7 @@ mod tests {
 
     /// A `MultiScan` of more than `MULTI_SCAN_TASK_KEYS_MIN` keys answers
     /// spread over idle workers exactly as on its own task, in either
-    /// direction: every key's rows and `more` in key order, a key listed
+    /// direction: every key's rows and `next` in key order, a key listed
     /// twice at each position, and a key no file holds empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_multi_scan_answers_spread_over_workers_as_on_its_own_task() {
@@ -7785,7 +7817,7 @@ mod tests {
             let bounds = ScanBounds {
                 direction,
                 limit: u32::try_from(SPREAD_LIMIT).unwrap(),
-                after: None,
+                from: None,
                 before: None,
             };
             let expected: Vec<Scanned> = asked
@@ -7797,17 +7829,21 @@ mod tests {
                     if key == ABSENT_KEY {
                         return Scanned {
                             rows: Vec::new(),
-                            more: false,
+                            next: None,
                         };
                     }
                     let mut rows = ordered_rows(&[key], SCAN_ROWS_PER_KEY);
                     if direction == Direction::NewestFirst {
                         rows.reverse();
                     }
+                    let (_, next) = match direction {
+                        Direction::OldestFirst => rows[SPREAD_LIMIT],
+                        Direction::NewestFirst => rows[SPREAD_LIMIT - 1],
+                    };
                     rows.truncate(SPREAD_LIMIT);
                     Scanned {
                         rows: scanned_both(&rows),
-                        more: true,
+                        next: Some(OrderValue::Long(next)),
                     }
                 })
                 .collect();

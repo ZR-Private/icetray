@@ -36,9 +36,10 @@ service Icetray {
   // FAILED_PRECONDITION error recurs on every retry.
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   // Read the rows of one key in one ordered table, in order-value order,
-  // one page at a time. The response carries the id of the snapshot the
-  // server read it from. A response whose encoded size is above
-  // TableInfoResponse.max_scan_bytes is never sent: the call is a
+  // one page at a time: a caller pages by passing the response's `next`
+  // back as the next request's bound. The response carries the id of the
+  // snapshot the server read it from. A response whose encoded size is
+  // above TableInfoResponse.max_scan_bytes is never sent: the call is a
   // FAILED_PRECONDITION error, the same on every attempt, whose message
   // names the response's size, that bound, and how many rows would have
   // fit, and the caller sets a smaller `limit` or lists fewer columns.
@@ -259,13 +260,14 @@ enum OrderType {
   ORDER_TYPE_FIXED = 10;
 }
 
-// The value of an ordered table's order column: a bound of a Scan, or the
-// position of a returned row. The variant must match the order type, which
-// TableInfoResponse.order_type reports: `long` for the integer, date, and
-// timestamp types, `str` for ORDER_TYPE_STRING, and `bin` for
-// ORDER_TYPE_BINARY and ORDER_TYPE_FIXED. A bound that sets no variant or
-// another one is an INVALID_ARGUMENT error. A bound outside an `int` or
-// `date` column's range is valid: it admits every row on its side.
+// The value of an ordered table's order column: a bound of a Scan, the
+// position of a returned row, or the bound of the next page. The variant
+// must match the order type, which TableInfoResponse.order_type reports:
+// `long` for the integer, date, and timestamp types, `str` for
+// ORDER_TYPE_STRING, and `bin` for ORDER_TYPE_BINARY and ORDER_TYPE_FIXED.
+// A bound that sets no variant or another one is an INVALID_ARGUMENT
+// error. A bound outside an `int` or `date` column's range is valid: it
+// admits every row on its side.
 message OrderValue {
   // Exactly one variant is set.
   oneof value {
@@ -298,9 +300,11 @@ enum Direction {
 // sets a variant that does not match the table's key type, lists a value
 // column the table does not serve or lists one twice, lists fields of a
 // column in a way ColumnRead does not allow, sets no direction, sets a
-// limit above TableInfoResponse.max_scan_rows, sets a bound of another
-// variant than the table's order type takes or one with no variant, or
-// sets `after` at or above `before`.
+// limit of 0 or one above TableInfoResponse.max_scan_rows, sets a bound of
+// another variant than the table's order type takes or one with no
+// variant, or sets `from` at or above `before`, an empty window. The
+// bounds are half-open: a row is read when its order value is at or above
+// `from` and below `before`.
 message ScanRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error, and the name of a table that
@@ -317,19 +321,21 @@ message ScanRequest {
   repeated ColumnRead columns = 3;
   // The direction the rows are returned in. It must be set.
   Direction direction = 4;
-  // The most rows to return. 0 reads up to TableInfoResponse.max_scan_rows;
-  // a limit above it is an INVALID_ARGUMENT error. A response must also fit
+  // The most rows to return, from 1 to TableInfoResponse.max_scan_rows. It
+  // must be set: a limit of 0 or one above max_scan_rows is an
+  // INVALID_ARGUMENT error, and a caller reading as many rows as one
+  // response may hold sets it to max_scan_rows. A response must also fit
   // the server's limit on its encoded size (see Scan), so a caller whose
   // values are large sets a limit that fits.
   uint32 limit = 5;
-  // When set, only rows whose order value is above this one, exclusive. A
-  // caller reading oldest first pages by setting it to the newest order
-  // value of the previous response.
-  OrderValue after = 6;
+  // When set, only rows whose order value is at or above this one,
+  // inclusive. A caller reading oldest first pages by setting it to the
+  // previous response's `next`.
+  OrderValue from = 6;
   // When set, only rows whose order value is below this one, exclusive. A
-  // caller reading newest first pages by setting it to the oldest order
-  // value of the previous response. When both bounds are set, `after` must
-  // be below `before`.
+  // caller reading newest first pages by setting it to the previous
+  // response's `next`. When both bounds are set, `from` must be below
+  // `before`.
   OrderValue before = 7;
 }
 
@@ -350,9 +356,15 @@ message ScanResponse {
   // successful response, never an error. No two rows of one response
   // share an order value.
   repeated ScanRow rows = 1;
-  // Whether the key has rows within the bounds past the last one returned,
-  // in the requested direction. Unset for a key with no rows.
-  bool more = 2;
+  // The bound of the next page in the same direction, set exactly when the
+  // key has rows within the bounds past the last one returned. Reading
+  // oldest first it is the order value of the first such row, which the
+  // next request sets as `from`; reading newest first it is the order value
+  // of the oldest row returned, which the next request sets as `before`.
+  // The next request keeps the other bound, the direction, and the limit.
+  // Unset for a key with no rows, and for a response whose last row is the
+  // key's last within the bounds, even one at the limit.
+  OrderValue next = 2;
   // The id of the Iceberg snapshot the server read the response from. Two
   // responses carrying different ids were read from different snapshots of
   // the table, and a page read after the table advanced is read from the
@@ -364,9 +376,8 @@ message ScanResponse {
 // limit, and bounds, all read from one snapshot. The request is an
 // INVALID_ARGUMENT error for every reason a ScanRequest is, for a key of
 // any position, and when its keys times its limit times one more than its
-// columns exceed TableInfoResponse.max_multi_scan_values, a limit of 0
-// counting as TableInfoResponse.max_scan_rows; the server refuses that
-// before it reads any key.
+// columns exceed TableInfoResponse.max_multi_scan_values; the server
+// refuses each before it reads any key.
 message MultiScanRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error, and the name of a table that
@@ -382,12 +393,13 @@ message MultiScanRequest {
   repeated ColumnRead columns = 3;
   // The direction every key's rows are returned in. It must be set.
   Direction direction = 4;
-  // The most rows to return per key, as ScanRequest.limit. The whole
-  // response must fit the server's limit on its encoded size (see
-  // MultiScan).
+  // The most rows to return per key, from 1 to
+  // TableInfoResponse.max_scan_rows, as ScanRequest.limit: a limit of 0 is
+  // an INVALID_ARGUMENT error. The whole response must fit the server's
+  // limit on its encoded size (see MultiScan).
   uint32 limit = 5;
-  // The exclusive lower bound on every key's rows, as ScanRequest.after.
-  OrderValue after = 6;
+  // The inclusive lower bound on every key's rows, as ScanRequest.from.
+  OrderValue from = 6;
   // The exclusive upper bound on every key's rows, as ScanRequest.before.
   OrderValue before = 7;
 }
@@ -397,9 +409,10 @@ message MultiScanRequest {
 message ScanResult {
   // The key's rows, as ScanResponse.rows.
   repeated ScanRow rows = 1;
-  // Whether the key has rows past the last one returned, as
-  // ScanResponse.more.
-  bool more = 2;
+  // The bound of the key's next page, set exactly when the key has rows
+  // within the bounds past the last one returned, as ScanResponse.next. A
+  // caller continues one key's rows with a Scan of that key.
+  OrderValue next = 2;
 }
 
 // The response to a MultiScan. The call fails as a whole when the read of
@@ -513,14 +526,13 @@ message TableInfoResponse {
   // The bytes of every order value of an ORDER_TYPE_FIXED column; 0 for
   // every other type.
   uint32 order_width = 11;
-  // The most rows one Scan may ask for, and what a limit of 0 reads; 0
-  // for a table with no order column.
+  // The most rows one Scan or one key of a MultiScan may ask for, the
+  // largest limit either takes; 0 for a table with no order column.
   uint32 max_scan_rows = 12;
   // The most values one MultiScan may ask for: its keys times its limit
-  // times one more than its columns, where a limit of 0 counts as
-  // max_scan_rows. A MultiScan above it is an INVALID_ARGUMENT error before
-  // any key is read, so a caller sizes its keys and limit by it; 0 for a
-  // table with no order column.
+  // times one more than its columns. A MultiScan above it is an
+  // INVALID_ARGUMENT error before any key is read, so a caller sizes its
+  // keys and limit by it; 0 for a table with no order column.
   uint64 max_multi_scan_values = 13;
   // The most bytes one Scan or MultiScan response may encode to. The server
   // refuses a larger response as a FAILED_PRECONDITION error that carries

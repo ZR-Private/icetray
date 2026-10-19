@@ -233,8 +233,12 @@ async fn test_a_malformed_value_fails_a_scan_naming_the_key_and_the_row() -> Res
     }];
     let bounds = ScanBounds {
         direction: Direction::OldestFirst,
-        limit: 0,
-        after: None,
+        limit: served
+            .table
+            .config()
+            .scan_rows()
+            .expect("an ordered table has a max_scan_rows"),
+        from: None,
         before: None,
     };
     let mut refused = 0;
@@ -254,14 +258,7 @@ async fn test_a_malformed_value_fails_a_scan_naming_the_key_and_the_row() -> Res
             panic!("a long order column's value is a long, got {order:?}");
         };
         assert_eq!(*named, key);
-        let (rows, _) = fixture.expected_scan(
-            &key,
-            &[VALUE_COLUMN],
-            &TestScan {
-                limit: 0,
-                ..TestScan::default()
-            },
-        );
+        let (rows, _) = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
         assert!(
             rows.iter().any(|(held, _)| *held == order),
             "{order} is an order value of {key}'s rows"

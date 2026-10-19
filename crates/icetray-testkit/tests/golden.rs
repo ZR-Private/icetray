@@ -832,10 +832,11 @@ fn ordered_sample(extra: &BTreeSet<u64>) -> BTreeSet<u64> {
     ids
 }
 
-/// The Scans checked on a key holding `rows`, in both directions: its whole
-/// run, a cut one, bounds on rows and beside them, a page past a bound, and
-/// bounds that leave nothing.
-fn ordered_scans(rows: &[OrderedRow]) -> Vec<TestScan> {
+/// The Scans checked on a key holding `rows` of a table whose
+/// `max_scan_rows` is `max`, in both directions: its whole run, a cut one,
+/// bounds on rows and beside them, a page from a bound, a window of one
+/// row, and bounds that leave nothing.
+fn ordered_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
     let orders: Vec<i64> = rows.iter().map(|row| row.order).collect();
     let (first, last) = (orders[0], orders[orders.len() - 1]);
     let (quarter, middle, three_quarters) = (
@@ -845,24 +846,24 @@ fn ordered_scans(rows: &[OrderedRow]) -> Vec<TestScan> {
     );
     let mut scans = Vec::new();
     for direction in [Direction::NewestFirst, Direction::OldestFirst] {
-        let scan = |limit, after, before| TestScan {
+        let scan = |limit, from, before| TestScan {
             direction,
             limit,
-            after,
+            from,
             before,
-            max_scan_rows: DEFAULT_MAX_SCAN_ROWS,
         };
         scans.extend([
-            scan(0, None, None),
+            scan(max, None, None),
             scan(SHORT_LIMIT, None, None),
-            scan(0, Some(quarter), Some(three_quarters)),
+            scan(max, Some(quarter), Some(three_quarters)),
             scan(SHORT_LIMIT, Some(quarter), Some(three_quarters)),
             scan(PAGE_LIMIT, Some(middle), None),
             scan(PAGE_LIMIT, None, Some(middle + 1)),
-            scan(0, Some(middle - 1), Some(middle + 1)),
-            scan(0, Some(last), None),
-            scan(0, None, Some(first)),
-            scan(0, Some(first - 1), Some(last + 1)),
+            scan(max, Some(middle), Some(middle + 1)),
+            scan(max, Some(last), None),
+            scan(max, Some(last + 1), None),
+            scan(max, None, Some(first)),
+            scan(max, Some(first - 1), Some(last + 1)),
         ]);
     }
     scans
@@ -872,7 +873,7 @@ fn ordered_scans(rows: &[OrderedRow]) -> Vec<TestScan> {
 /// derivation of the key's rows.
 fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestScan) -> Scanned {
     let live = rows.iter().map(|row| (row.order, row.version));
-    let (answer, more) = scan_model(live, scan);
+    let (answer, next) = scan_model(live, scan);
     Scanned {
         rows: answer
             .into_iter()
@@ -883,7 +884,7 @@ fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestSca
                 )))],
             })
             .collect(),
-        more,
+        next: next.map(|next| golden::ordered_order_value(table, id, next)),
     }
 }
 
@@ -899,10 +900,15 @@ async fn assert_ordered_scans_match_the_derivation(
     let (mut cut, mut empty) = (0_u64, 0_u64);
     for residency in Residency::ALL {
         let served = open_in(table, residency, scratch.path()).await?;
+        let max = served
+            .table
+            .config()
+            .scan_rows()
+            .expect("an ordered table has a max_scan_rows");
         for id in ordered_sample(extra) {
             let key = golden::ordered_key(table, id);
             let rows = golden::ordered_rows(table, id);
-            for scan in ordered_scans(&rows) {
+            for scan in ordered_scans(&rows, max) {
                 let want = derived_scan(table, id, &rows, &scan);
                 let got = served
                     .table
@@ -915,7 +921,7 @@ async fn assert_ordered_scans_match_the_derivation(
                     .scanned;
                 assert_eq!(got, want, "{table} {residency} {key} {scan:?}");
                 compared += count(want.rows.len());
-                cut += u64::from(want.more);
+                cut += u64::from(want.next.is_some());
                 empty += u64::from(want.rows.is_empty());
             }
         }
@@ -927,14 +933,17 @@ async fn assert_ordered_scans_match_the_derivation(
                 &[ColumnRead::whole(VALUE_COLUMN)],
                 &ScanBounds {
                     direction: Direction::NewestFirst,
-                    limit: 0,
-                    after: None,
+                    limit: max,
+                    from: None,
                     before: None,
                 },
             )
             .await?
             .scanned;
-        assert!(none.rows.is_empty() && !none.more, "{table} {residency}");
+        assert!(
+            none.rows.is_empty() && none.next.is_none(),
+            "{table} {residency}"
+        );
     }
     assert!(compared > 0, "{table}: the scans compared rows");
     assert!(cut > 0, "{table}: some scans left rows past their limit");

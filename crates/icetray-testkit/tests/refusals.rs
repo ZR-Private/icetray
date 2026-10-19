@@ -24,9 +24,10 @@ use icetray_core::config::{
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, Capping, ColumnMismatch, Direction, Error, ErrorKind, FindingCode, FindingLog, Key,
-    KeyType, Level, OrderType, OrderValue, RefusalReason, Row, ScanBounds, ScanRow, Storage,
-    TableSource, TableState, UnsupportedDelete, UnsupportedFormat, bucket,
+    Budget, Capping, ColumnMismatch, DEFAULT_MAX_SCAN_ROWS, Direction, Error, ErrorKind,
+    FindingCode, FindingLog, Key, KeyType, Level, OrderType, OrderValue, RefusalReason, Row,
+    ScanBounds, ScanRow, Storage, TableSource, TableState, UnsupportedDelete, UnsupportedFormat,
+    bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -1236,8 +1237,8 @@ async fn test_int_order_promoted_to_long_is_served() -> Result<()> {
     .await?;
     let every_row = ScanBounds {
         direction: Direction::OldestFirst,
-        limit: 0,
-        after: None,
+        limit: DEFAULT_MAX_SCAN_ROWS,
+        from: None,
         before: None,
     };
     for ((&key, value), &order) in RAW_KEYS.iter().zip(raw_values()).zip(&RAW_INT_ORDERS) {
@@ -1254,7 +1255,7 @@ async fn test_int_order_promoted_to_long_is_served() -> Result<()> {
             }],
             "{key}"
         );
-        assert!(!scanned.more);
+        assert_eq!(scanned.next, None);
     }
     Ok(())
 }

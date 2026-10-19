@@ -607,16 +607,16 @@ impl Generation {
         Ok((Row::Absent, LookupResult::Miss))
     }
 
-    /// One Scan of `key` (RFD 025, Cost): its live rows inside `bounds`'
-    /// exclusive `after` and `before`, in `bounds.direction`, at most
-    /// `limit` of them (the table resolved a limit of 0 to its
-    /// `max_scan_rows`; `bounds.limit` is not read), each with one value per
-    /// position of `columns` in the layout, and `more` set when live rows
-    /// remain inside the bounds past the last returned. Every candidate
+    /// One Scan of `key` (RFD 025, Cost): its live rows at or above
+    /// `bounds`' `from` and below its `before`, in `bounds.direction`, at
+    /// most `limit` of them (the limit the table checked; `bounds.limit` is
+    /// not read), each with one value per
+    /// position of `columns` in the layout, and the next page's bound when
+    /// live rows remain inside the bounds past the last returned. Every candidate
     /// file whose exact key range covers the key (`candidates`) finds the
     /// key's run (`FileIndex::locate_run`), and each file that holds it
     /// reads its candidate rows (`FileIndex::read_run`), up to `limit` live
-    /// ones from the direction's end and the order value of one more, its
+    /// ones from the direction's end and one more past them, its
     /// rows counted live against the file's deletes with no I/O (RFD 021);
     /// the files are read together, each reading as soon as its run is
     /// found, so the read is one round across them, and under Bloom one
@@ -626,7 +626,7 @@ impl Generation {
     /// pairs being unique across files (RFD 025, Uniqueness), and cut to
     /// `limit` (`scan::merge`). A file written before a column was added
     /// answers that column's default (RFD 023). A key no file holds
-    /// answers no rows, `more` unset, with no read beyond finding that.
+    /// answers no rows and no `next`, with no read beyond finding that.
     pub(crate) async fn scan(
         &self,
         key: &Key,

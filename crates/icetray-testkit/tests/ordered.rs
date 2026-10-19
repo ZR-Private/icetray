@@ -1,8 +1,8 @@
 //! Scan and `MultiScan` of ordered tables (RFD 025) in every residency tier:
 //! the answers of randomly drawn tables, changed by appends, deletes, and
 //! updates, against the naive-sort model (`Fixture::expected_scan`); paging
-//! by order value; `more` over deleted rows; exclusive bounds at the
-//! extremes of the order types; the GETs of a cold Scan; the files a Scan
+//! by `next`; `next` over deleted rows; half-open bounds at the extremes of
+//! the order types; the GETs of a cold Scan; the files a Scan
 //! reads; the calls each table kind refuses; and the cache a Scan's pages
 //! stay in.
 
@@ -266,7 +266,7 @@ fn random_ordered_spec(rng: &mut StdRng, name: &str) -> (FixtureSpec, u32) {
 fn live_orders(fixture: &Fixture, id: u64) -> Vec<i64> {
     let all = TestScan {
         direction: Direction::OldestFirst,
-        max_scan_rows: u32::MAX,
+        limit: u32::MAX,
         ..TestScan::default()
     };
     fixture
@@ -422,19 +422,19 @@ fn random_scan(drawn: &Drawn, rng: &mut StdRng) -> (Key, Vec<&'static str>, Test
     let live = live_orders(fixture, id);
     let held = u32::try_from(live.len()).expect("a key's rows fit u32");
     let limit = match rng.random_range(0..5) {
-        0 => 0,
+        0 => drawn.max_scan_rows,
         1 => held,
         2 => held.saturating_sub(1),
         3 => 1,
-        _ => rng.random_range(0..=drawn.max_scan_rows),
+        _ => rng.random_range(1..=drawn.max_scan_rows),
     }
-    .min(drawn.max_scan_rows);
-    let mut after = rng.random_bool(0.4).then(|| random_bound(rng, &live));
+    .clamp(1, drawn.max_scan_rows);
+    let mut from = rng.random_bool(0.4).then(|| random_bound(rng, &live));
     let before = rng.random_bool(0.4).then(|| random_bound(rng, &live));
-    if let (Some(low), Some(high)) = (after, before)
+    if let (Some(low), Some(high)) = (from, before)
         && low >= high
     {
-        after = None;
+        from = None;
     }
     let scan = TestScan {
         direction: if rng.random_bool(0.5) {
@@ -443,9 +443,8 @@ fn random_scan(drawn: &Drawn, rng: &mut StdRng) -> (Key, Vec<&'static str>, Test
             Direction::OldestFirst
         },
         limit,
-        after,
+        from,
         before,
-        max_scan_rows: drawn.max_scan_rows,
     };
     (key, columns, scan)
 }
@@ -459,13 +458,16 @@ fn reads<'a>(columns: &[&'a str]) -> Vec<ColumnRead<'a>> {
 }
 
 /// Every drawn table, served in every tier, answers every drawn Scan as
-/// the naive sort of its live rows does: the rows, their values, and
-/// `more`.
+/// the naive sort of its live rows does under half-open bounds: the rows,
+/// their values, and `next`, in either direction, a key's rows in one file
+/// or across several.
 #[tokio::test]
 async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
     let mut rng = StdRng::seed_from_u64(SCAN_SEED);
     let mut rows_compared = 0;
-    let mut more_set = 0;
+    // Scans that left rows past the page, by direction, and of those, the
+    // scans whose key's live rows lie in two or more files.
+    let (mut next_newest, mut next_oldest, mut next_across_files) = (0, 0, 0);
     let mut kinds = Vec::new();
     let (mut truncated, mut unindexed) = (false, false);
     // Scans whose key's live rows lie in two or more data files, scans of
@@ -496,7 +498,6 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
                 );
             }
             rows_compared += want.rows.len();
-            more_set += usize::from(want.more);
             let copies = oracle.copies(&key);
             let files: HashSet<&str> = copies
                 .iter()
@@ -504,6 +505,13 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
                 .map(|copy| copy.path.as_str())
                 .collect();
             across_files += usize::from(files.len() >= 2);
+            if want.next.is_some() {
+                match scan.direction {
+                    Direction::NewestFirst => next_newest += 1,
+                    Direction::OldestFirst => next_oldest += 1,
+                }
+                next_across_files += usize::from(files.len() >= 2);
+            }
             of_changed += usize::from(drawn.changed);
             past_deleted += usize::from(copies.iter().any(|copy| copy.deleted));
         }
@@ -518,7 +526,14 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
         "some scans read a key with a deleted copy"
     );
     assert!(rows_compared > 0, "the scans compared rows");
-    assert!(more_set > 0, "some scans left rows past the limit");
+    assert!(
+        next_newest > 0 && next_oldest > 0,
+        "some scans in each direction left rows past the limit"
+    );
+    assert!(
+        next_across_files > 0,
+        "some scans across files left rows past the limit"
+    );
     assert_eq!(
         kinds.len(),
         ORDER_KINDS.len(),
@@ -758,80 +773,92 @@ async fn history_table(
 /// The page size the paging test reads a history in.
 const PAGE_LIMIT: u32 = 3;
 
-/// A key's whole history, read in pages by order value as a caller pages
-/// (RFD 025, Paging), each request setting `before` to the oldest value of
-/// the last page reading newest first and `after` to the newest reading
-/// oldest first, returns every live row once, in order, across the files
-/// an append and an update left and around deleted rows, the last page
-/// with `more` unset.
+/// A key's whole history, read in pages as a caller pages (RFD 025,
+/// Paging), each request passing the previous response's `next` back, as
+/// `before` reading newest first and as `from` reading oldest first,
+/// returns every live row once, in order, across the files an append and an
+/// update left, across row groups, and around deleted rows, in a long and a
+/// string order column: each page is the model's for the request that read
+/// it, and the last page carries no `next`.
 #[tokio::test]
-async fn test_paging_by_order_value_returns_the_whole_history_once() -> Result<()> {
-    let (_dir, catalog, mut fixture) = history_table("paged", OrderKind::Long).await?;
-    let id = 3;
-    let last = ORDER_START + HISTORY_STEP * i64::try_from(HISTORY_ROWS - 1).unwrap();
-    fixture
-        .append_ordered(
-            catalog.as_ref(),
-            &[
-                (id, ORDER_START + 1),
-                (id, ORDER_START + HISTORY_STEP + 1),
-                (id, last + 1),
-            ],
-            "between",
-        )
-        .await?;
-    fixture
-        .delete_rows(
-            &[(id, ORDER_START), (id, ORDER_START + 2 * HISTORY_STEP)],
-            DeleteForm::Vectors,
-            "gone",
-        )
-        .await?;
-    fixture
-        .update_rows(&[(id, ORDER_START + 1)], DeleteForm::Vectors, "rewritten")
-        .await?;
-    let key = fixture.key(id);
-    let columns = [VALUE_COLUMN, SECOND_VALUE_COLUMN];
-    let all = |direction| TestScan {
-        direction,
-        ..TestScan::default()
-    };
-    let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
-    for direction in [Direction::NewestFirst, Direction::OldestFirst] {
-        let whole = fixture.expected_scanned(&key, &columns, &all(direction));
-        assert!(whole.rows.len() > usize::try_from(PAGE_LIMIT).unwrap() * 2);
-        for (residency, served) in tiers.all() {
-            let mut bounds = ScanBounds {
+async fn test_paging_by_next_returns_every_live_row_once() -> Result<()> {
+    for kind in [OrderKind::Long, OrderKind::Str] {
+        let (_dir, catalog, mut fixture) = history_table(&format!("paged_{kind:?}"), kind).await?;
+        let id = 3;
+        let last = ORDER_START + HISTORY_STEP * i64::try_from(HISTORY_ROWS - 1).unwrap();
+        fixture
+            .append_ordered(
+                catalog.as_ref(),
+                &[
+                    (id, ORDER_START + 1),
+                    (id, ORDER_START + HISTORY_STEP + 1),
+                    (id, last + 1),
+                ],
+                "between",
+            )
+            .await?;
+        fixture
+            .delete_rows(
+                &[(id, ORDER_START), (id, ORDER_START + 2 * HISTORY_STEP)],
+                DeleteForm::Vectors,
+                "gone",
+            )
+            .await?;
+        fixture
+            .update_rows(&[(id, ORDER_START + 1)], DeleteForm::Vectors, "rewritten")
+            .await?;
+        assert!(fixture.file_count() > 1, "the key's rows span files");
+        let key = fixture.key(id);
+        let columns = [VALUE_COLUMN, SECOND_VALUE_COLUMN];
+        let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
+        for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+            let all = TestScan {
                 direction,
-                limit: PAGE_LIMIT,
-                after: None,
-                before: None,
+                ..TestScan::default()
             };
-            let mut read: Vec<ScanRow> = Vec::new();
-            loop {
-                let page = served.table.scan(&key, &reads(&columns), &bounds).await?;
-                let last_row = page.scanned.rows.last().map(|row| row.order.clone());
-                read.extend(page.scanned.rows);
-                if !page.scanned.more {
-                    break;
+            let whole = fixture.expected_scanned(&key, &columns, &all);
+            let page_rows = usize::try_from(PAGE_LIMIT).unwrap();
+            assert!(whole.rows.len() > page_rows * 2);
+            assert!(
+                whole.rows.len() > HISTORY_GROUP_ROWS,
+                "the history spans row groups"
+            );
+            for (residency, served) in tiers.all() {
+                let mut scan = TestScan {
+                    direction,
+                    limit: PAGE_LIMIT,
+                    ..TestScan::default()
+                };
+                let mut read: Vec<ScanRow> = Vec::new();
+                loop {
+                    let page = served
+                        .table
+                        .scan(&key, &reads(&columns), &scan.bounds(kind))
+                        .await?
+                        .scanned;
+                    let want = fixture.expected_scanned(&key, &columns, &scan);
+                    assert_eq!(page, want, "{kind:?} {residency} {scan:?}");
+                    read.extend(page.rows);
+                    let Some(next) = fixture.expected_scan(&key, &[], &scan).1 else {
+                        assert_eq!(page.next, None);
+                        break;
+                    };
+                    assert_eq!(page.next, Some(order_value(kind, next)));
+                    scan = scan.after_page(next);
                 }
-                match direction {
-                    Direction::NewestFirst => bounds.before = last_row,
-                    Direction::OldestFirst => bounds.after = last_row,
-                }
+                assert_eq!(read, whole.rows, "{kind:?} {residency} {direction:?}");
             }
-            assert_eq!(read, whole.rows, "{residency} {direction:?}");
         }
     }
     Ok(())
 }
 
-/// `more` counts live rows alone: with rows deleted at
-/// both edges of a key's run and inside it, a limit of the run's live
-/// rows leaves `more` unset in either direction, one less sets it, and
-/// the deleted rows at the edge are never returned or counted.
+/// `next` counts live rows alone: with rows deleted at both edges of a
+/// key's run and inside it, a limit of the run's live rows leaves no
+/// `next` in either direction, one less sets it, and the deleted rows at
+/// the edge are never returned or counted.
 #[tokio::test]
-async fn test_scan_more_counts_live_rows_only() -> Result<()> {
+async fn test_scan_next_counts_live_rows_only() -> Result<()> {
     let (_dir, _catalog, mut fixture) = history_table("edges", OrderKind::Long).await?;
     let id = 5;
     let held = live_orders(&fixture, id);
@@ -845,11 +872,11 @@ async fn test_scan_more_counts_live_rows_only() -> Result<()> {
     let key = fixture.key(id);
     let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
     for direction in [Direction::NewestFirst, Direction::OldestFirst] {
-        for (limit, more) in [(live, false), (live - 1, true)] {
+        for (limit, next) in [(live, false), (live - 1, true)] {
             let bounds = ScanBounds {
                 direction,
                 limit,
-                after: None,
+                from: None,
                 before: None,
             };
             for (residency, served) in tiers.all() {
@@ -858,7 +885,11 @@ async fn test_scan_more_counts_live_rows_only() -> Result<()> {
                     .scan(&key, &reads(&[VALUE_COLUMN]), &bounds)
                     .await?
                     .scanned;
-                assert_eq!(got.more, more, "{residency} {direction:?} limit {limit}");
+                assert_eq!(
+                    got.next.is_some(),
+                    next,
+                    "{residency} {direction:?} limit {limit}"
+                );
                 assert_eq!(got.rows.len(), usize::try_from(limit).unwrap());
                 assert!(
                     got.rows.iter().all(|row| !deleted
@@ -875,13 +906,14 @@ async fn test_scan_more_counts_live_rows_only() -> Result<()> {
 /// A bound beyond the 32-bit range of an `int` or `date` column.
 const PAST_32_BITS: i64 = 1 << 40;
 
-/// Bounds are exclusive at the extremes: `after` at
-/// `i64::MIN` and `before` at `i64::MAX` admit every row of a long column,
-/// an `int` or `date` bound beyond the 32-bit range admits every row on its
-/// side, and a bound equal to a stored value, long or string, excludes that
-/// row and admits the rest on its side.
+/// Bounds are half-open at the extremes: `from` at `i64::MIN` and `before`
+/// at `i64::MAX` admit every row of a long column, and `from` at `i64::MAX`
+/// or `before` at `i64::MIN` none; an `int` or `date` bound beyond the
+/// 32-bit range admits every row on its side or none; and a bound equal to
+/// a stored value, long or string, includes that row as `from` and
+/// excludes it as `before`, admitting the rest on its side.
 #[tokio::test]
-async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
+async fn test_scan_bounds_are_half_open_at_the_extremes() -> Result<()> {
     let id = 2;
     let columns = [VALUE_COLUMN];
     for kind in [
@@ -895,9 +927,9 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
         let held = live_orders(&fixture, id);
         let stored = held[held.len() / 2];
         let stored_value = order_value(kind, stored);
-        let oldest = |after: Option<i64>, before: Option<i64>| TestScan {
+        let oldest = |from: Option<i64>, before: Option<i64>| TestScan {
             direction: Direction::OldestFirst,
-            after,
+            from,
             before,
             ..TestScan::default()
         };
@@ -913,39 +945,52 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
             | OrderKind::Bin
             | OrderKind::Fixed(_) => None,
         };
-        // Each case: the bounds as sent, the model's scan, and whether the
-        // stored value is a bound, which excludes its row.
-        let mut cases: Vec<(ScanBounds, TestScan, bool)> = Vec::new();
+        // Each case: the bounds as sent, the model's scan, and the rows it
+        // admits.
+        let mut cases: Vec<(ScanBounds, TestScan, Admits)> = Vec::new();
         if let Some((low, high)) = extreme {
-            for (after, before) in [
-                (Some(low), None),
-                (None, Some(high)),
-                (Some(low), Some(high)),
+            for (from, before, admits) in [
+                (Some(low), None, Admits::Every),
+                (None, Some(high), Admits::Every),
+                (Some(low), Some(high), Admits::Every),
+                (Some(high), None, Admits::None),
+                (None, Some(low), Admits::None),
             ] {
-                let scan = oldest(after, before);
+                let scan = oldest(from, before);
                 let bounds = ScanBounds {
-                    after: after.map(OrderValue::Long),
+                    from: from.map(OrderValue::Long),
                     before: before.map(OrderValue::Long),
                     ..oldest(None, None).bounds(kind)
                 };
-                cases.push((bounds, scan, false));
+                cases.push((bounds, scan, admits));
             }
         }
-        for (after, before) in [(Some(stored), None), (None, Some(stored))] {
-            let scan = oldest(after, before);
-            cases.push((scan.bounds(kind), scan, true));
+        for (from, before, admits) in [
+            (Some(stored), None, Admits::Stored),
+            (None, Some(stored), Admits::AllBelowStored),
+        ] {
+            let scan = oldest(from, before);
+            cases.push((scan.bounds(kind), scan, admits));
         }
         let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
-        for (bounds, scan, at_stored) in cases {
+        for (bounds, scan, admits) in cases {
             let want = fixture.expected_scanned(&key, &columns, &scan);
-            assert!(!want.rows.is_empty(), "{kind:?} {scan:?} admits rows");
-            if at_stored {
-                assert!(
-                    want.rows.iter().all(|row| row.order != stored_value),
-                    "a bound at a stored value excludes its row"
-                );
-            } else {
-                assert_eq!(want.rows.len(), held.len(), "an extreme admits every row");
+            let orders: Vec<&OrderValue> = want.rows.iter().map(|row| &row.order).collect();
+            match admits {
+                Admits::Every => assert_eq!(orders.len(), held.len(), "{kind:?} {scan:?}"),
+                Admits::None => assert!(orders.is_empty(), "{kind:?} {scan:?}"),
+                Admits::Stored => assert_eq!(
+                    orders.first(),
+                    Some(&&stored_value),
+                    "{kind:?}: from at a stored value includes its row"
+                ),
+                Admits::AllBelowStored => {
+                    assert!(!orders.is_empty(), "{kind:?} {scan:?}");
+                    assert!(
+                        !orders.contains(&&stored_value),
+                        "{kind:?}: before at a stored value excludes its row"
+                    );
+                }
             }
             for (residency, served) in tiers.all() {
                 let got = served.table.scan(&key, &reads(&columns), &bounds).await?;
@@ -954,6 +999,19 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What an extreme or stored bound of the half-open bounds test admits.
+#[derive(Clone, Copy, Debug)]
+enum Admits {
+    /// Every row of the key.
+    Every,
+    /// No row.
+    None,
+    /// The rows from the stored value up, its own first.
+    Stored,
+    /// Some rows, all below the stored value.
+    AllBelowStored,
 }
 
 /// Ids of the compacted tables, `COMPACTED_ROWS` rows each, over two

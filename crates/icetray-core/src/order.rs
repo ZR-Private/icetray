@@ -368,16 +368,17 @@ pub enum Direction {
     OldestFirst,
 }
 
-/// What one Scan of a key asks for. `limit` 0 means the table's
-/// `max_scan_rows`; `after` and `before` are exclusive.
+/// What one Scan of a key asks for. `limit` is from 1 to the table's
+/// `max_scan_rows`, and 0 is refused; the bounds are half-open, `from`
+/// inclusive and `before` exclusive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanBounds {
     /// The direction the rows are returned in.
     pub direction: Direction,
-    /// The most rows to return; 0 reads up to `max_scan_rows`.
+    /// The most rows to return.
     pub limit: u32,
-    /// Only rows whose order value is above this.
-    pub after: Option<OrderValue>,
+    /// Only rows whose order value is at or above this.
+    pub from: Option<OrderValue>,
     /// Only rows whose order value is below this.
     pub before: Option<OrderValue>,
 }

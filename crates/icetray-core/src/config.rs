@@ -131,8 +131,8 @@ const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
 /// A single-pod guess, to revisit with measurement (RFD 013).
 const DEFAULT_MAX_MULTI_GET_VALUES: usize = 1000;
 
-/// The most rows one Scan of an ordered table returns, and what a limit of
-/// zero reads, when its entry sets no `max_scan_rows`: 1,000 (RFD 025). A
+/// The most rows one Scan of an ordered table returns, the largest limit it
+/// takes, when its entry sets no `max_scan_rows`: 1,000 (RFD 025). A
 /// quarter of `DEFAULT_MAX_MULTI_SCAN_VALUES`, so a `MultiScan` of one key at
 /// the full limit fits with up to three columns.
 pub const DEFAULT_MAX_SCAN_ROWS: u32 = 1_000;
@@ -1385,9 +1385,8 @@ pub struct ServerConfig {
     /// 018).
     pub batch_fan_out: usize,
     /// Values one `MultiScan` may ask for: its keys times its limit times
-    /// one more than its requested columns, a limit of 0 counting as the
-    /// table's `max_scan_rows`; more is `INVALID_ARGUMENT` before any key
-    /// is read (RFD 025).
+    /// one more than its requested columns; more is `INVALID_ARGUMENT`
+    /// before any key is read (RFD 025).
     pub max_multi_scan_values: usize,
     /// How long a `Scan` may run before it is `DEADLINE_EXCEEDED`, and how
     /// long each span GET of it may run (RFD 025).
@@ -1735,9 +1734,9 @@ pub struct TableConfig {
     /// for a key-value table. Setting, changing, or removing it reloads the
     /// whole table.
     pub order_column: Option<String>,
-    /// The most rows one Scan of an ordered table returns, and what a limit
-    /// of zero reads (RFD 025); above zero, and set only on an ordered
-    /// table. `None` there takes `DEFAULT_MAX_SCAN_ROWS`
+    /// The most rows one Scan of an ordered table, or one key of a
+    /// `MultiScan`, returns, the largest limit either takes (RFD 025);
+    /// above zero, and set only on an ordered table. `None` there takes `DEFAULT_MAX_SCAN_ROWS`
     /// (`TableConfig::scan_rows`). A change applies in place.
     pub max_scan_rows: Option<u32>,
     /// Whether falling below `lookups` for a reason in the snapshot's

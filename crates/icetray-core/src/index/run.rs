@@ -29,7 +29,7 @@ use crate::key::Key;
 use crate::local::DiskChunks;
 use crate::order::{Direction, OrderValue, ScanBounds};
 use crate::parquet_io::Segments;
-use crate::scan::{FileAnswer, ScanRow};
+use crate::scan::{FileAnswer, Past, ScanRow};
 use crate::storage::HedgeWindow;
 
 /// The rows of a key's run in one row group.
@@ -253,8 +253,8 @@ impl FileIndex {
 
     /// The candidate rows of the run for one Scan: up to `limit` live rows
     /// from the direction's end, cut by the bounds, plus one more live
-    /// row's order value to set `more`; `bounds.limit` is not read, since
-    /// `limit` is the one the table resolved. Live rows are counted against
+    /// row past them (`Past`); `bounds.limit` is not read, since
+    /// `limit` is the one the table checked. Live rows are counted against
     /// `deleted` with no I/O.
     ///
     /// The order fences place each bound on the one order page that holds
@@ -266,8 +266,10 @@ impl FileIndex {
     /// with its values while fewer than `limit` rows have counted, and
     /// counts nothing. Once `limit` rows have counted, the next live row is
     /// taken up for its order value alone, and since a row known inside
-    /// then lies behind it, that row sets `more` whichever side of the far
-    /// bound it lies on. So beyond the rows taken, a read takes up the
+    /// then lies behind it, that row tells whether a live row lies past the
+    /// rows taken whichever side of the far bound it lies on: oldest first
+    /// its order value is the file's `Past::At`, and newest first only its
+    /// presence is kept, `Past::Row`. So beyond the rows taken, a read takes up the
     /// values of at most as many rows as the pages that hold a bound hold
     /// of the run (RFD 025, Cost).
     ///
@@ -312,7 +314,7 @@ impl FileIndex {
     ) -> Result<FileRows> {
         let order = self.order_leaf_of();
         let cut = Cut {
-            after: bounds.after.as_ref(),
+            from: bounds.from.as_ref(),
             before: bounds.before.as_ref(),
         };
         let pieces = self.pieces(run, cut);
@@ -354,19 +356,21 @@ impl FileIndex {
         )?;
         let orders = known.and(read);
         let mut rows = Vec::new();
-        let mut next = None;
+        let mut past = Past::Nothing;
         for walked in &walked {
             let (values_of, at) = orders.at(walked.row);
             if cut.fit_at(values_of, at) != Fit::Inside {
                 continue;
             }
-            let value = values_of.value(at);
             if rows.len() == limit {
-                next = Some(value);
+                past = match bounds.direction {
+                    Direction::OldestFirst => Past::At(values_of.value(at)),
+                    Direction::NewestFirst => Past::Row,
+                };
                 break;
             }
             rows.push(ScanRow {
-                order: value,
+                order: values_of.value(at),
                 values: values
                     .iter()
                     .map(|column| column.as_ref().and_then(|column| column.value(walked.row)))
@@ -374,7 +378,7 @@ impl FileIndex {
             });
         }
         Ok(FileRows {
-            answer: FileAnswer { rows, next },
+            answer: FileAnswer { rows, past },
             from_store: orders.from_store
                 || values.iter().flatten().any(|column| column.from_store),
         })
@@ -386,26 +390,30 @@ impl FileIndex {
     /// 025, Cost). The fences place each bound, paired with the run's key,
     /// on the one page of the file whose pairs' range holds it
     /// (`OrderFences::place`), a page's pairs lying from its fence up to the
-    /// next page's. Every pair on a page before `after`'s lies below that
-    /// pair, so every run row there is at or below `after`, and every pair
-    /// on a page past it above, so every run row there is above `after`; so
-    /// too for `before`, whose page holds no run row below it where its
-    /// fence is the pair itself, since a page's rows lie at or above its
-    /// fence. The work is one binary search over the fences per bound and a
-    /// step per row group the run spans, whatever the run's length.
+    /// next page's. Both bounds cut between the pairs below their pair and
+    /// those at or above it: every pair on a page before the bound's lies
+    /// below that pair, so every run row there is below the bound, and
+    /// every pair on a page past it above, so every run row there is at or
+    /// above it. A page's rows lie at or above its fence, so where the
+    /// bound's fence is the pair itself its page holds no run row below the
+    /// bound, and the page is wholly at or above `from` or wholly at or
+    /// above `before`. The work is one binary search over the fences per
+    /// bound and a step per row group the run spans, whatever the run's
+    /// length.
     fn pieces(&self, run: &Run<'_>, cut: Cut<'_>) -> Vec<Piece> {
         let fences = self
             .order_fences()
             .expect("a Scan reads an ordered file, whose index holds its order fences");
-        let after = cut
-            .after
-            .map(|after| fences.place(Pair::of(run.key, after)));
-        let before = cut.before.map(|before| {
-            let pair = Pair::of(run.key, before);
+        // The page that holds the bound's pair, and whether that page also
+        // holds run rows below the bound.
+        let place = |bound: &OrderValue| {
+            let pair = Pair::of(run.key, bound);
             fences
                 .place(pair)
                 .map(|(row_group, page)| (row_group, page, fences.fence(row_group, page) < pair))
-        });
+        };
+        let from = cut.from.map(place);
+        let before = cut.before.map(place);
         let mut pieces = Vec::new();
         for part in &run.parts {
             let chunk = self.order_chunk(part.row_group);
@@ -414,11 +422,11 @@ impl FileIndex {
                 first: chunk.page_holding(row_index(part.rows.start)),
                 last: chunk.page_holding(row_index(part.rows.end - 1)),
             };
-            let low = match after {
+            let low = match from {
                 None | Some(None) => Some((pages.first, false)),
-                Some(Some(at)) => match pages.locate(at) {
+                Some(Some((row_group, page, across))) => match pages.locate((row_group, page)) {
                     PageWhere::Before => Some((pages.first, false)),
-                    PageWhere::On(page) => Some((page, true)),
+                    PageWhere::On(page) => Some((page, across)),
                     PageWhere::After => None,
                 },
             };
@@ -792,10 +800,11 @@ fn pages_holding(chunk: ColumnChunk<'_>, rows: &Range<i64>) -> Range<usize> {
     chunk.page_holding(row_index(rows.start))..chunk.page_holding(row_index(rows.end - 1)) + 1
 }
 
-/// A Scan's exclusive bounds on the order value.
+/// A Scan's half-open bounds on the order value: `from` inclusive,
+/// `before` exclusive.
 #[derive(Clone, Copy)]
 struct Cut<'a> {
-    after: Option<&'a OrderValue>,
+    from: Option<&'a OrderValue>,
     before: Option<&'a OrderValue>,
 }
 
@@ -804,8 +813,8 @@ impl Cut<'_> {
     /// place.
     fn fit_at(self, values: &OrderRun, at: usize) -> Fit {
         if self
-            .after
-            .is_some_and(|after| values.cmp_value(at, after).is_le())
+            .from
+            .is_some_and(|from| values.cmp_value(at, from).is_lt())
         {
             Fit::Below
         } else if self
@@ -819,12 +828,12 @@ impl Cut<'_> {
     }
 }
 
-/// Where an order value lies against a Scan's exclusive bounds.
+/// Where an order value lies against a Scan's half-open bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fit {
-    /// At or below `after`.
+    /// Below `from`.
     Below,
-    /// Above `after` and below `before`.
+    /// At or above `from` and below `before`.
     Inside,
     /// At or above `before`.
     Above,
@@ -1484,8 +1493,18 @@ mod tests {
         ScanBounds {
             direction,
             limit: 0,
-            after: None,
+            from: None,
             before: None,
+        }
+    }
+
+    /// What a read in `direction` reports past its rows when the next live
+    /// row past them is at `next`: that order value oldest first, and the
+    /// row alone newest first.
+    fn past_at(direction: Direction, next: OrderValue) -> Past {
+        match direction {
+            Direction::OldestFirst => Past::At(next),
+            Direction::NewestFirst => Past::Row,
         }
     }
 
@@ -1559,7 +1578,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(oldest.answer.rows, all, "{residency}");
-            assert_eq!(oldest.answer.next, None);
+            assert_eq!(oldest.answer.past, Past::Nothing);
             let newest = reads
                 .read(
                     &index,
@@ -1573,7 +1592,7 @@ mod tests {
                 newest.answer.rows,
                 all.into_iter().rev().collect::<Vec<_>>()
             );
-            assert_eq!(newest.answer.next, None);
+            assert_eq!(newest.answer.past, Past::Nothing);
         }
     }
 
@@ -1694,7 +1713,10 @@ mod tests {
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
                 .collect();
             assert_eq!(got.answer.rows, expected, "{residency}");
-            assert_eq!(got.answer.next, Some(order_at(9 - FIRST_RUN_ROW)));
+            assert_eq!(
+                got.answer.past,
+                past_at(Direction::NewestFirst, order_at(9 - FIRST_RUN_ROW))
+            );
             assert!(got.from_store);
             let order_gets = u64::from(residency != Residency::Disk);
             assert_eq!(stats.gets() - before, order_gets + 1, "{residency}");
@@ -1714,16 +1736,21 @@ mod tests {
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
                 .collect();
             assert_eq!(oldest.answer.rows, expected, "{residency}");
-            assert_eq!(oldest.answer.next, Some(order_at(4 - FIRST_RUN_ROW)));
+            assert_eq!(
+                oldest.answer.past,
+                past_at(Direction::OldestFirst, order_at(4 - FIRST_RUN_ROW))
+            );
             assert_eq!(stats.gets() - before, order_gets + 1, "{residency}");
         }
     }
 
-    /// `next` is the next live row past deleted ones, read on an order page
-    /// no row taken lies on, with no value page of it; a limit that takes
-    /// every live row leaves it unset; a read again is warm.
+    /// The row past those taken is the next live row past deleted ones,
+    /// read on an order page no row taken lies on, with no value page of
+    /// it; a limit that takes every live row leaves none; a read again is
+    /// warm. Oldest first, the row past a page of rows before the deleted
+    /// ones is the first live row after them.
     #[tokio::test]
-    async fn test_read_run_reports_the_next_live_row_for_more() {
+    async fn test_read_run_reports_the_next_live_row_past_the_rows_taken() {
         let opened = store(&one_long_run(0)).await;
         let deleted: BTreeSet<u64> = (8..=12).collect();
         let file_deletes = FileDeletes::of_rows(deleted.iter().copied());
@@ -1744,8 +1771,8 @@ mod tests {
                 .collect();
             assert_eq!(got.answer.rows, expected, "{residency}");
             assert_eq!(
-                got.answer.next,
-                Some(order_at(7 - FIRST_RUN_ROW)),
+                got.answer.past,
+                past_at(Direction::NewestFirst, order_at(7 - FIRST_RUN_ROW)),
                 "{residency}"
             );
             // Order pages 1 and 3 are two spans, page 2 between them all
@@ -1759,7 +1786,7 @@ mod tests {
             let before = costs(&stats);
             let again = reads.read(&index, &run, &newest, 2, &is_deleted).await;
             assert_eq!(again.answer.rows, got.answer.rows);
-            assert_eq!(again.answer.next, got.answer.next);
+            assert_eq!(again.answer.past, got.answer.past);
             assert_eq!(since(&stats, before).0, 0, "{residency}: warm");
             assert!(!again.from_store, "{residency}");
 
@@ -1773,10 +1800,24 @@ mod tests {
                 )
                 .await;
             assert_eq!(whole.answer.rows.len(), live);
-            assert_eq!(whole.answer.next, None, "{residency}");
+            assert_eq!(whole.answer.past, Past::Nothing, "{residency}");
             let none = reads.read(&index, &run, &newest, 0, &is_deleted).await;
             assert_eq!(none.answer.rows, []);
-            assert_eq!(none.answer.next, Some(order_at(14 - FIRST_RUN_ROW)));
+            assert_eq!(none.answer.past, Past::Row);
+            let oldest = bounds(Direction::OldestFirst);
+            let before_deleted = u32::try_from(*deleted.first().unwrap()).unwrap() - 1;
+            let got = reads
+                .read(&index, &run, &oldest, before_deleted, &is_deleted)
+                .await;
+            assert_eq!(
+                got.answer.rows.len(),
+                usize::try_from(before_deleted).unwrap()
+            );
+            assert_eq!(
+                got.answer.past,
+                Past::At(order_at(13 - FIRST_RUN_ROW)),
+                "{residency}: the first live row after the deleted ones"
+            );
         }
     }
 
@@ -1939,8 +1980,11 @@ mod tests {
                 .collect();
             assert_eq!(got.answer.rows, expected, "{case}");
             assert_eq!(
-                got.answer.next,
-                Some(order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW)),
+                got.answer.past,
+                past_at(
+                    Direction::NewestFirst,
+                    order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW)
+                ),
                 "{case}"
             );
             let value_leaf = index.value_leaf(0).unwrap();
@@ -2023,10 +2067,10 @@ mod tests {
     }
 
     /// What a read of `columns` value columns of `bounded_run` answers
-    /// oldest first after the order value of the run's row 19, limit 2:
-    /// rows 20 and 21 of the run.
-    fn after_answer(columns: usize) -> Vec<ScanRow> {
-        [20, 21]
+    /// oldest first from the order value of the run's row 19, limit 2:
+    /// rows 19 and 20 of the run.
+    fn from_answer(columns: usize) -> Vec<ScanRow> {
+        [19, 20]
             .into_iter()
             .map(|j| row_answer(j + FIRST_RUN_ROW, j, columns))
             .collect()
@@ -2054,19 +2098,19 @@ mod tests {
             let run = reads.run(&index).await;
             gauged.fill_to(together);
             let got = tokio::time::timeout(DEADLINE_GUARD, async {
-                let after = ScanBounds {
-                    after: Some(order_at(19)),
+                let from = ScanBounds {
+                    from: Some(order_at(19)),
                     ..bounds(Direction::OldestFirst)
                 };
                 index
-                    .read_run(&run, &after, 2, &columns, &none_deleted, reads.source())
+                    .read_run(&run, &from, 2, &columns, &none_deleted, reads.source())
                     .await
                     .unwrap()
             })
             .await
             .expect("every GET of the read is in flight at once");
-            assert_eq!(got.answer.rows, after_answer(columns.len()), "{residency}");
-            assert_eq!(got.answer.next, Some(order_at(22)));
+            assert_eq!(got.answer.rows, from_answer(columns.len()), "{residency}");
+            assert_eq!(got.answer.past, Past::At(order_at(21)));
             assert_eq!(gauged.high_water(), together, "{residency}");
             assert_eq!(
                 stats.gets() - before,
@@ -2104,7 +2148,10 @@ mod tests {
                 .map(|j| row_answer(j + FIRST_RUN_ROW, j, 1))
                 .collect();
             assert_eq!(got.answer.rows, expected, "{residency}");
-            assert_eq!(got.answer.next, Some(order_at(7)));
+            assert_eq!(
+                got.answer.past,
+                past_at(Direction::NewestFirst, order_at(7))
+            );
             let (gets, local) = since(&stats, before);
             match residency {
                 Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
@@ -2191,7 +2238,10 @@ mod tests {
                 })
                 .collect();
             assert_eq!(got.answer.rows, expected, "{residency}");
-            assert_eq!(got.answer.next, Some(order_at(11 - FIRST_RUN_ROW)));
+            assert_eq!(
+                got.answer.past,
+                past_at(Direction::NewestFirst, order_at(11 - FIRST_RUN_ROW))
+            );
             let (gets, local) = since(&stats, before);
             match residency {
                 Residency::Full | Residency::Bloom => assert_eq!((gets, local), (4, 0)),
@@ -2438,9 +2488,9 @@ mod tests {
             .collect()
     }
 
-    /// Whether `value` lies inside `scan`'s exclusive bounds.
+    /// Whether `value` lies inside `scan`'s half-open bounds.
     fn inside(scan: &ScanBounds, value: &OrderValue) -> bool {
-        scan.after.as_ref().is_none_or(|after| value > after)
+        scan.from.as_ref().is_none_or(|from| value >= from)
             && scan.before.as_ref().is_none_or(|before| value < before)
     }
 
@@ -2453,11 +2503,12 @@ mod tests {
         walk
     }
 
-    /// What the model answers one read of a run: the rows and `next` the
-    /// read answers, and the run positions of the rows taken.
+    /// What the model answers one read of a run: the rows and what lies
+    /// past them that the read answers, and the run positions of the rows
+    /// taken.
     struct Model {
         rows: Vec<ScanRow>,
-        next: Option<OrderValue>,
+        past: Past,
         taken: Vec<usize>,
     }
 
@@ -2488,7 +2539,9 @@ mod tests {
         };
         Model {
             rows: taken.iter().map(|&at| answer(at)).collect(),
-            next: live.get(limit).map(|&at| orders[at].clone()),
+            past: live.get(limit).map_or(Past::Nothing, |&at| {
+                past_at(scan.direction, orders[at].clone())
+            }),
             taken,
         }
     }
@@ -2503,7 +2556,7 @@ mod tests {
         let leaf = index.order_leaf().unwrap();
         let run_pages = pages_of(index, leaf, rows);
         let mut held = BTreeSet::new();
-        for bound in [&scan.after, &scan.before].into_iter().flatten() {
+        for bound in [&scan.from, &scan.before].into_iter().flatten() {
             let pair = Pair::of(&RUN_KEY, bound);
             let Some(&page) = run_pages
                 .iter()
@@ -2600,8 +2653,8 @@ mod tests {
     /// of them that a read fetches with them (`with_bridged_gaps`). Rows
     /// the fences cannot place count nothing toward the limit, so beyond
     /// the rows taken a read takes up at most as many rows as the bound's
-    /// page holds, and in the order column the one row past them that sets
-    /// `more`. A walk takes up every live row between two it takes up, so
+    /// page holds, and in the order column the one row past them that
+    /// tells whether rows remain. A walk takes up every live row between two it takes up, so
     /// the pages between two of those rows' pages hold deleted rows alone.
     fn promised(read: &ReadOf<'_>, leaf: usize, taken: usize, past: usize) -> BTreeSet<PageAt> {
         let bound = bound_rows(read.index, read.rows, read.scan);
@@ -2665,7 +2718,7 @@ mod tests {
 
     /// Every bounded read the cost model runs at `points`, ascending order
     /// values whose first lies below and whose last above every value of
-    /// the run: in each direction, each point as `after` and as `before`,
+    /// the run: in each direction, each point as `from` and as `before`,
     /// each with the other bound at the extreme point beyond it, which
     /// excludes nothing, and each pair `BOUND_GAPS` apart as both.
     fn bounded_scans(points: &[OrderValue]) -> Vec<ScanBounds> {
@@ -2685,8 +2738,8 @@ mod tests {
         [Direction::OldestFirst, Direction::NewestFirst]
             .into_iter()
             .flat_map(|direction| {
-                cuts.iter().map(move |(after, before)| ScanBounds {
-                    after: after.clone(),
+                cuts.iter().map(move |(from, before)| ScanBounds {
+                    from: from.clone(),
                     before: before.clone(),
                     ..bounds(direction)
                 })
@@ -2913,7 +2966,7 @@ mod tests {
                         let (got, ranges) = probe.read(&scan, limit, &is_deleted).await;
                         let decoded = data_pages_decoded() - decoded_before;
                         assert_eq!(got.answer.rows, expected.rows, "{case}");
-                        assert_eq!(got.answer.next, expected.next, "{case}");
+                        assert_eq!(got.answer.past, expected.past, "{case}");
                         let read = ReadOf {
                             index,
                             rows: &rows,
@@ -3121,7 +3174,11 @@ mod tests {
                 );
                 assert_eq!(expected.taken, taken);
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
-                assert_eq!(got.answer.next, Some(value(PAGE_START_ROW - 4)), "{case}");
+                assert_eq!(
+                    got.answer.past,
+                    past_at(Direction::NewestFirst, value(PAGE_START_ROW - 4)),
+                    "{case}"
+                );
                 let value_leaf = index.value_leaf(0).unwrap();
                 let held: BTreeSet<PageAt> =
                     pages_of(index, value_leaf, &rows[PAGE_START_ROW - 4..PAGE_START_ROW])
@@ -3163,7 +3220,7 @@ mod tests {
     /// too, so in every residency one round reads the value pages the rows
     /// taken lie on, 476 bytes of string values where the column index's
     /// placement read the run's last page too, 640, and the order pages
-    /// from the bound's page to the row that sets `more`.
+    /// from the bound's page to the row past those taken.
     #[tokio::test]
     async fn test_read_run_beside_a_straddling_run_edge_page_reads_the_taken_rows_pages() {
         let limit = 3;
@@ -3193,7 +3250,11 @@ mod tests {
                     limit,
                 );
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
-                assert_eq!(got.answer.next, Some(value(NEAR_THE_END_ROW - 4)), "{case}");
+                assert_eq!(
+                    got.answer.past,
+                    past_at(Direction::NewestFirst, value(NEAR_THE_END_ROW - 4)),
+                    "{case}"
+                );
                 let (held, needed) = taken_bytes(index, &rows, &expected.taken);
                 assert_eq!(held.len(), 2, "{case}");
                 if order_type == OrderType::String {
@@ -3257,7 +3318,7 @@ mod tests {
                     limit,
                 );
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
-                assert_eq!(got.answer.next, expected.next, "{case}");
+                assert_eq!(got.answer.past, expected.past, "{case}");
                 let (held, needed) = taken_bytes(index, &rows, &expected.taken);
                 assert_eq!(held.len(), 1, "{case}");
                 assert_eq!(needed, page_value_bytes, "{case}");
@@ -3351,7 +3412,7 @@ mod tests {
                 .read_through(&reads, &scan, limit, &none_deleted)
                 .await;
             assert_eq!(warm.answer.rows, expected.rows, "{case}");
-            assert_eq!(warm.answer.next, expected.next, "{case}");
+            assert_eq!(warm.answer.past, expected.past, "{case}");
             assert_eq!(fetched(index, value_leaf, &ranges), held, "{case}");
             let orders_fetched = fetched(index, order_leaf, &ranges);
             assert!(
@@ -3387,20 +3448,20 @@ mod tests {
         let limit = 1;
         let (opened, gauged) = store_gauged(&runs_of(&[(1, 3), (2, 4), (3, 3)], 10)).await;
         let first_run_row = 3;
-        let after_ten = ScanBounds {
-            after: Some(order_at(1)),
+        let from_one = ScanBounds {
+            from: Some(order_at(1)),
             ..bounds(Direction::OldestFirst)
         };
         for residency in Residency::ALL {
             let probe = Probe::open(&opened, &gauged, residency, OrderType::Long).await;
             let index = &probe.index;
-            let (got, ranges) = probe.read(&after_ten, limit, &none_deleted).await;
+            let (got, ranges) = probe.read(&from_one, limit, &none_deleted).await;
             assert_eq!(
                 got.answer.rows,
-                [row_answer(first_run_row + 2, 2, 1)],
+                [row_answer(first_run_row + 1, 1, 1)],
                 "{residency}"
             );
-            assert_eq!(got.answer.next, Some(order_at(3)), "{residency}");
+            assert_eq!(got.answer.past, Past::At(order_at(2)), "{residency}");
             let order_gets = usize::from(residency != Residency::Disk);
             assert_eq!(ranges.len(), 1 + order_gets, "{residency}");
             let value_leaf = index.value_leaf(0).unwrap();
@@ -3411,7 +3472,7 @@ mod tests {
             );
             let case = residency.to_string();
             probe
-                .assert_one_round(&after_ten, limit, &none_deleted, ranges.len(), &case)
+                .assert_one_round(&from_one, limit, &none_deleted, ranges.len(), &case)
                 .await;
         }
     }
@@ -3420,9 +3481,9 @@ mod tests {
     /// place the bounds, not the column index. Under a string or binary
     /// order column whose every value of a long run shares a 32-byte prefix
     /// with the bound, with the index full length, truncated short of that
-    /// prefix, or none, oldest first after the run's first value and newest
+    /// prefix, or none, oldest first from the run's second value and newest
     /// first before its last read the value pages of the rows taken alone,
-    /// and the order pages from the bound's to the row that sets `more`, in
+    /// and the order pages from the bound's to the row past those taken, in
     /// one round, in every residency; under a long order column, with the
     /// index whole or none, so does a bounded read
     /// (`assert_long_read_whatever_the_index`).
@@ -3449,7 +3510,7 @@ mod tests {
                     let cases = [
                         (
                             ScanBounds {
-                                after: Some(value(0)),
+                                from: Some(value(1)),
                                 ..bounds(Direction::OldestFirst)
                             },
                             [1, 2, 3],
@@ -3492,7 +3553,11 @@ mod tests {
                             );
                             assert_eq!(expected.taken, taken, "{case}");
                             assert_eq!(got.answer.rows, expected.rows, "{case}");
-                            assert_eq!(got.answer.next, Some(value(*next)), "{case}");
+                            assert_eq!(
+                                got.answer.past,
+                                past_at(scan.direction, value(*next)),
+                                "{case}"
+                            );
                             let (held, needed) = taken_bytes(index, &rows, &expected.taken);
                             let values = fetched(index, value_leaf, &ranges);
                             assert!(needed > 0, "{case}");
@@ -3532,13 +3597,13 @@ mod tests {
     }
 
     /// Under a long order column, with the column index whole or none,
-    /// oldest first after the order value of `bounded_run`'s row 19 with a
-    /// limit of 2 answers rows 20 and 21 and row 22's order value, in one
+    /// oldest first from the order value of `bounded_run`'s row 19 with a
+    /// limit of 2 answers rows 19 and 20 and row 21's order value, in one
     /// round: a GET of the value pages and one of the order pages, the
     /// order pages read locally under Disk.
     async fn assert_long_read_whatever_the_index() {
-        let after = ScanBounds {
-            after: Some(order_at(19)),
+        let from = ScanBounds {
+            from: Some(order_at(19)),
             ..bounds(Direction::OldestFirst)
         };
         for statistics in [
@@ -3561,13 +3626,13 @@ mod tests {
                 gauged.fill_to(together);
                 let before = costs(&stats);
                 let (got, _) =
-                    tokio::time::timeout(DEADLINE_GUARD, probe.read(&after, 2, &none_deleted))
+                    tokio::time::timeout(DEADLINE_GUARD, probe.read(&from, 2, &none_deleted))
                         .await
                         .unwrap_or_else(|_| {
                             panic!("{case}: every GET of the read is in flight at once")
                         });
-                assert_eq!(got.answer.rows, after_answer(1), "{case}");
-                assert_eq!(got.answer.next, Some(order_at(22)), "{case}");
+                assert_eq!(got.answer.rows, from_answer(1), "{case}");
+                assert_eq!(got.answer.past, Past::At(order_at(21)), "{case}");
                 let expected = match residency {
                     Residency::Full | Residency::Bloom => (2, 0),
                     Residency::Disk => (1, 1),
@@ -3584,16 +3649,16 @@ mod tests {
     }
 
     /// The run position, in `two_low_pages`, of the bound of the reads of
-    /// `test_read_run_with_two_low_pages_after_a_bound_reads_one_round`.
+    /// `test_read_run_with_two_low_pages_from_a_bound_reads_one_round`.
     const LOW_BOUND_ROW: usize = 5;
 
-    /// Under a 16-byte truncated index, oldest first after a value of the
+    /// Under a 16-byte truncated index, oldest first from a value of the
     /// run's low prefix, whose two whole pages share one truncated entry:
     /// the fences place the bound on one page, so the read is one round and
     /// reads the value pages of the rows taken, and a `before` bound that
     /// excludes nothing changes neither.
     #[tokio::test]
-    async fn test_read_run_with_two_low_pages_after_a_bound_reads_one_round() {
+    async fn test_read_run_with_two_low_pages_from_a_bound_reads_one_round() {
         let limit = 3;
         let fixture = prefixed_run_of(
             Some(TRUNCATED_INDEX_BYTES),
@@ -3603,15 +3668,15 @@ mod tests {
         let (opened, gauged) = store_gauged(&fixture).await;
         for order_type in [OrderType::String, OrderType::Binary] {
             let value = |j: usize| travelling(order_type, two_low_pages(j));
-            let after = ScanBounds {
-                after: Some(value(LOW_BOUND_ROW)),
+            let from = ScanBounds {
+                from: Some(value(LOW_BOUND_ROW)),
                 ..bounds(Direction::OldestFirst)
             };
             let both = ScanBounds {
                 before: Some(travelling(order_type, vec![ABOVE_EVERY_PREFIX])),
-                ..after.clone()
+                ..from.clone()
             };
-            let taken = [LOW_BOUND_ROW + 1, LOW_BOUND_ROW + 2, LOW_BOUND_ROW + 3];
+            let taken = [LOW_BOUND_ROW, LOW_BOUND_ROW + 1, LOW_BOUND_ROW + 2];
             for residency in Residency::ALL {
                 let probe = Probe::open(&opened, &gauged, residency, order_type).await;
                 let (index, run) = (&probe.index, &probe.run);
@@ -3620,7 +3685,7 @@ mod tests {
                 let (held, needed) = taken_bytes(index, &rows, &taken);
                 assert!(needed > 0);
                 let value_leaf = index.value_leaf(0).unwrap();
-                for scan in [&after, &both] {
+                for scan in [&from, &both] {
                     let case = format!("{residency} {order_type} {scan:?}");
                     let (got, ranges) = probe.read(scan, limit, &none_deleted).await;
                     let expected = model(
@@ -3634,7 +3699,11 @@ mod tests {
                     );
                     assert_eq!(expected.taken, taken, "{case}");
                     assert_eq!(got.answer.rows, expected.rows, "{case}");
-                    assert_eq!(got.answer.next, Some(value(LOW_BOUND_ROW + 4)), "{case}");
+                    assert_eq!(
+                        got.answer.past,
+                        Past::At(value(LOW_BOUND_ROW + 3)),
+                        "{case}"
+                    );
                     let values = fetched(index, value_leaf, &ranges);
                     assert_eq!(
                         values, held,
@@ -3651,10 +3720,10 @@ mod tests {
     /// Under a 16-byte truncated index whose every entry is one prefix,
     /// oldest first before a value of the run's second half, with a limit
     /// that the rows before the bound's page fill: the row past the limit
-    /// sets `more`, and no order page past the one it lies on is read,
-    /// however many pages share the prefix past it.
+    /// is the next page's `from`, and no order page past the one it lies on
+    /// is read, however many pages share the prefix past it.
     #[tokio::test]
-    async fn test_read_run_reads_one_row_past_the_limit_for_more() {
+    async fn test_read_run_reads_one_row_past_the_limit_for_the_next_page() {
         let limit = LOW_PREFIX_ROWS;
         let before_row = 20;
         let fixture = prefixed_run_of(Some(TRUNCATED_INDEX_BYTES), PREFIXED_RUN_ROWS, halved);
@@ -3671,7 +3740,7 @@ mod tests {
             let rows = rows_of(run);
             let (got, ranges) = probe.read(&scan, limit_u32(limit), &none_deleted).await;
             assert_eq!(got.answer.rows.len(), limit, "{residency}");
-            assert_eq!(got.answer.next, Some(value(limit)), "{residency}");
+            assert_eq!(got.answer.past, Past::At(value(limit)), "{residency}");
             let order_leaf = index.order_leaf().unwrap();
             let walked: BTreeSet<PageAt> = pages_of(index, order_leaf, &rows[..=limit])
                 .into_iter()
