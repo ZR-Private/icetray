@@ -1364,6 +1364,12 @@ pub(crate) mod testing {
             self.high_water.load(Ordering::SeqCst)
         }
 
+        /// The GETs in flight now: started, and neither answered nor
+        /// dropped.
+        pub(crate) fn in_flight(&self) -> usize {
+            self.in_flight.load(Ordering::SeqCst)
+        }
+
         /// Starts the high-water mark again from the GETs in flight now and
         /// holds every GET until `fill` of them are in flight at once.
         pub(crate) fn fill_to(&self, fill: usize) {

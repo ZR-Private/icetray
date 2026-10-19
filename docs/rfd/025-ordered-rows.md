@@ -179,15 +179,17 @@ direction under a limit and optional bounds on the order value.
   the pages of any other file that meet a page of a checked file. It
   reads each such page at most once: by GET under `full`, from the
   ordered chunk file under `disk`, and with the key pages they span
-  under `bloom`. It reads each file's next row group when the merge
-  reaches it, whatever that takes, and beyond those reads later row
-  groups ahead of need, across the group's files in the order the merge
-  reaches them, while the bytes it holds and has in flight stay within a
-  fixed read-ahead bound ([Ordered
-  tables](../operating.md#ordered-tables) gives it). It therefore holds
-  at most that bound beyond one row group's chosen pages per file, and a
-  file whose row groups are larger than the bound merges a row group at
-  a time. Where a group's chosen pages fit within the bound, and its
+  under `bloom`. The overlap groups merge at once, and refuse as a
+  serial check would: the first group in group order that refuses names
+  the refusal, and the groups after it stop. Each merge reads a file's
+  next row group when it reaches it, whatever that takes, and beyond
+  those reads later row groups ahead of need, across its files in the
+  order it reaches them, while the bytes every merge of the load holds
+  and has in flight stay within one fixed read-ahead bound ([Ordered
+  tables](../operating.md#ordered-tables) gives it). The load therefore
+  holds at most that bound beyond one row group's chosen pages per file,
+  and a file whose row groups are larger than the bound merges a row
+  group at a time. Where a group's chosen pages fit within the bound, and its
   reads within the load's concurrency, a merge over files of several row
   groups waits on about the rounds of GETs a merge over files of one row
   group does. A merge that refuses or ends first may have read row

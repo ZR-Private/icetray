@@ -597,9 +597,10 @@ key and order value. An ordered table's load also logs `checked ordered
 rows across files` with `merges`, the same count; `compared`, the
 comparisons the check made, of files' ranges and buckets, of pages'
 pairs, and of pairs in the merge; and `held_bytes`, the most bytes of
-chosen pages one merge held and had in flight at once, which leaves out
-the key chunks `full` keeps resident. A merge holds at most 64 MiB beyond
-one row group's chosen pages per file.
+chosen pages the load's merges held and had in flight at once, which
+leaves out the key chunks `full` keeps resident. The overlap groups merge
+at once and share one read-ahead bound, so a load holds at most 64 MiB
+beyond one row group's chosen pages per file.
 
 ## Deploying
 
