@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use icetray_core::config::{ConfigError, schema_detail};
 use icetray_core::key::UUID_BYTES;
-use icetray_core::{CacheError, ErrorKind, KeyType, LocationError};
+use icetray_core::{BoundSide, CacheError, ErrorKind, KeyType, LocationError};
 
 use crate::cli::{ConfigPath, ENV_CONFIG};
 use crate::serve::PeriodicTask;
@@ -207,26 +207,6 @@ pub enum WireKeyFault {
     },
 }
 
-/// A Scan's bound on the wire: the field a `WireScanFault` names.
-/// Display gives the field's name in the contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireBound {
-    /// `ScanRequest.after`: exclusive, below every row returned.
-    After,
-    /// `ScanRequest.before`: exclusive, above every row returned.
-    Before,
-}
-
-impl fmt::Display for WireBound {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::After => "after",
-            Self::Before => "before",
-        };
-        f.write_str(name)
-    }
-}
-
 /// Why a Scan's direction or bound from the wire is not one (RFD 025). The
 /// variant a bound takes and the order between the bounds are core's to
 /// check against the table (`ScanRequestFault`). Every variant is the
@@ -243,7 +223,7 @@ pub enum WireScanFault {
     #[error("the {bound} bound sets no variant")]
     EmptyBound {
         /// The bound that set none.
-        bound: WireBound,
+        bound: BoundSide,
     },
 }
 

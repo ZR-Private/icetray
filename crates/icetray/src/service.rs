@@ -27,8 +27,8 @@ use bytes::Bytes;
 use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{
-    CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup, Opened,
-    OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanRow, Scanned, Table,
+    BoundSide, CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup,
+    Opened, OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanRow, Scanned, Table,
     TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
 };
 use icetray_proto::v1;
@@ -43,7 +43,7 @@ use prost::encoding::message;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tonic::{Request, Response, Status};
 
-use crate::error::{CallFault, WireBound, WireKeyFault, WireScanFault};
+use crate::error::{CallFault, WireKeyFault, WireScanFault};
 
 /// The in-flight slots every call but `TableInfo` holds together, at most
 /// `server.max_in_flight`: what admits a call, and what
@@ -251,7 +251,7 @@ pub fn direction_from_wire(number: i32) -> Result<Direction, WireScanFault> {
 /// one the table's order type takes is core's check (`ScanRequestFault`).
 pub fn order_value_from_wire(
     bound: Option<v1::OrderValue>,
-    which: WireBound,
+    which: BoundSide,
 ) -> Result<Option<OrderValue>, WireScanFault> {
     let Some(bound) = bound else {
         return Ok(None);
@@ -275,8 +275,8 @@ fn scan_bounds_from_wire(
     Ok(ScanBounds {
         direction: direction_from_wire(direction)?,
         limit,
-        after: order_value_from_wire(after, WireBound::After)?,
-        before: order_value_from_wire(before, WireBound::Before)?,
+        after: order_value_from_wire(after, BoundSide::After)?,
+        before: order_value_from_wire(before, BoundSide::Before)?,
     })
 }
 
@@ -1451,12 +1451,12 @@ mod tests {
         for (wire, order) in cases {
             let bound = v1::OrderValue { value: Some(wire) };
             assert_eq!(
-                order_value_from_wire(Some(bound), WireBound::After),
+                order_value_from_wire(Some(bound), BoundSide::After),
                 Ok(Some(order))
             );
         }
-        assert_eq!(order_value_from_wire(None, WireBound::Before), Ok(None));
-        for which in [WireBound::After, WireBound::Before] {
+        assert_eq!(order_value_from_wire(None, BoundSide::Before), Ok(None));
+        for which in [BoundSide::After, BoundSide::Before] {
             assert_eq!(
                 order_value_from_wire(Some(v1::OrderValue { value: None }), which),
                 Err(WireScanFault::EmptyBound { bound: which })
@@ -1469,7 +1469,7 @@ mod tests {
         let faults = [
             WireScanFault::Direction { number: 0 },
             WireScanFault::EmptyBound {
-                bound: WireBound::After,
+                bound: BoundSide::After,
             },
         ];
         for fault in faults {
@@ -1486,7 +1486,7 @@ mod tests {
         ];
         for value in values {
             assert_eq!(
-                order_value_from_wire(Some(order_value_wire(value.clone())), WireBound::After),
+                order_value_from_wire(Some(order_value_wire(value.clone())), BoundSide::After),
                 Ok(Some(value))
             );
         }
@@ -1512,7 +1512,7 @@ mod tests {
         assert!(more);
         let orders: Vec<_> = rows
             .iter()
-            .map(|row| order_value_from_wire(row.order.clone(), WireBound::After))
+            .map(|row| order_value_from_wire(row.order.clone(), BoundSide::After))
             .collect();
         assert_eq!(
             orders,
