@@ -90,9 +90,42 @@ python3 dev/golden-tables.py --warehouse "file://$PWD/target/golden-warehouse"
 
 The first run of either downloads the Iceberg runtime from Maven
 Central. The groups together are about 4.4 GB, most of it the two
-tables of 16 KiB values. The tables are also the quickest way to try the
-binary: `icetray get --location target/golden-warehouse/db/long_2m
---value-column value --column value 42` answers from one of them, and
+tables of 16 KiB values.
+
+A full run leaves out one more group, `reference`: four ordered tables
+near a production table's size, which `--only reference` writes. Each
+holds 200,000 long keys in 64 buckets and about 20 million rows: most
+keys hold 1 to 20 rows, about one in ten holds hundreds, and about one in
+170 holds 1,000 to 10,000. Each row's order value is a microsecond
+instant, and its value 128 bytes of hex digests; the testkit's
+`golden.rs` derives every row from its key's index, and the tests read
+the key count from the table property `golden.reference-keys`. Spark
+writes each table as an initial load and four appends of later rows of
+some keys, then `ref_compacted`, `ref_string`, and `ref_large_files`
+compact it with a sort by key and order value:
+
+- `ref_compacted`: the recipe's sizes, one file of one row group a bucket.
+- `ref_appended`: the writes uncompacted, five files a bucket.
+- `ref_string`: `ref_compacted` with each instant as ISO-8601 UTC text.
+- `ref_large_files`: row groups of 6 MiB, about four in each bucket's file.
+
+On the 4-CPU, 8 GiB colima VM `dev/runtime.sh` starts, the group takes
+about four minutes, about a minute a table, and the warehouse grows by
+about 12 GB, the files each compaction replaced included. The VM's disk
+also grows while Spark spills, and does not shrink, so keep about twice
+that free before writing the group. `--reference-keys` writes fewer keys
+for a quick run, and the tests derive the rows of whatever count the
+tables record. The group's tests run with the others under
+`dev/test-golden.sh`, which fails them until the group is written:
+
+```sh
+dev/golden-tables.sh --only reference
+dev/golden-tables.sh --only reference --reference-keys 20000
+```
+
+The tables are also the quickest way to try the binary: `icetray get
+--location target/golden-warehouse/db/long_2m --value-column value
+--column value 42` answers from one of them, and
 the README's [Try it locally](../README.md#try-it-locally) walks through
 `get`, `doctor`, and `serve`.
 

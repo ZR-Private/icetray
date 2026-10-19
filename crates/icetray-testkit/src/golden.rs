@@ -5,7 +5,7 @@
 //! without it fails on `Precondition::GoldenUnset` rather than passing.
 
 use std::fmt::{self, Write as _};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
 use icetray_core::config::{Config, ServerConfig, SourceConfig, StorageConfig, TableConfig};
 use icetray_core::key::HEX_DIGITS_PER_BYTE;
@@ -135,6 +135,73 @@ const ORDER_STRING_DIGITS: usize = 16;
 /// The padding of a string order value's prefix, as `lpad(.., 64, 'k')`.
 const ORDER_PREFIX_PAD: char = 'k';
 
+/// The recipe's `REFERENCE_KEYS`: the keys of a reference table at its full
+/// size. `--reference-keys` writes fewer, and the table records the count
+/// under `REFERENCE_KEYS_PROPERTY`.
+pub const REFERENCE_KEYS: u64 = 200_000;
+
+/// The recipe's `REFERENCE_KEYS_PROPERTY`: the table property holding the
+/// key count of a reference table, so a test derives a scaled table's rows.
+pub const REFERENCE_KEYS_PROPERTY: &str = "golden.reference-keys";
+
+/// The recipe's `REFERENCE_ROWS`: a reference table's rows at
+/// `REFERENCE_KEYS`, every key's `reference_rows_of` summed.
+pub const REFERENCE_ROWS: u64 = 19_938_958;
+
+/// The key indexes of a reference table's three longest runs at
+/// `REFERENCE_KEYS`, longest first.
+pub const REFERENCE_HEAVIEST_IDS: [u64; 3] = [109_154, 74_792, 183_946];
+
+/// The recipe's `REFERENCE_BUCKETS`.
+const REFERENCE_BUCKETS: u32 = 64;
+
+/// The recipe's `REFERENCE_REPEATS`: a reference value concatenates this
+/// many distinct digests.
+const REFERENCE_REPEATS: usize = 2;
+
+/// The recipe's `TIER_SCALE`: the hash of a key's index, modulo this, picks
+/// the key's tier, and the hash divided by it the count within the tier.
+const TIER_SCALE: u64 = 1_000;
+
+/// The recipe's `HEAVY_TIER` and `MEDIUM_TIER`: a tier below the first is
+/// heavy, below the second medium, and any other light.
+const HEAVY_TIER: u64 = 6;
+const MEDIUM_TIER: u64 = 110;
+
+/// The recipe's `HEAVY_ROWS`: the row counts of a heavy key, the fewest
+/// keys.
+pub const HEAVY_ROWS: RangeInclusive<u64> = 1_000..=10_000;
+
+/// The recipe's `MEDIUM_ROWS`: the row counts of a medium key.
+pub const MEDIUM_ROWS: RangeInclusive<u64> = 100..=999;
+
+/// The recipe's `LIGHT_ROWS`: the row counts of a light key, the most keys.
+pub const LIGHT_ROWS: RangeInclusive<u64> = 1..=20;
+
+/// The recipe's `APPEND_TAIL_DIVISOR`: one in this many of a key's rows,
+/// rounded down, are its tail, the rows the appends write.
+const APPEND_TAIL_DIVISOR: u64 = 5;
+
+/// The recipe's `APPEND_BATCHES`: the appends after a reference table's
+/// initial load, which split each key's tail evenly in order.
+pub const APPEND_BATCHES: u64 = 4;
+
+/// The recipe's `TS_START`: 2026-01-01T00:00:00Z in microseconds, the
+/// earliest instant of a reference table.
+const TS_START: i64 = 1_767_225_600_000_000;
+
+/// The recipe's `TS_STEP`: the microseconds per row index, and the bound
+/// of a row's jitter, so a key's instants strictly increase.
+const TS_STEP: i64 = 1_000_000;
+
+/// The recipe's `ROW_SLOTS`: at least any key's row count, so
+/// `id * ROW_SLOTS + j` is unique to the row whose jitter it hashes.
+const ROW_SLOTS: u64 = *HEAVY_ROWS.end();
+
+/// The recipe's `ISO_INSTANT` as a strftime pattern: fixed-width ISO-8601
+/// UTC text to the microsecond.
+const ISO_INSTANT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
+
 /// The ASCII bytes of one hex SHA-256 digest: the digest's width in hex
 /// digits.
 pub const HEX_DIGEST_BYTES: usize =
@@ -201,6 +268,17 @@ pub enum GoldenTable {
     /// `ordered_string_100k`: a string order column whose values share a
     /// 64-byte prefix per key, compacted by a sorting compaction.
     OrderedString100k,
+    /// `ref_compacted`: a reference table, an initial load and
+    /// `APPEND_BATCHES` appends, then a sorting compaction to the recipe's
+    /// sizes.
+    RefCompacted,
+    /// `ref_appended`: the same writes, left uncompacted.
+    RefAppended,
+    /// `ref_string`: `ref_compacted` with each instant as ISO-8601 UTC text.
+    RefString,
+    /// `ref_large_files`: `ref_compacted` with each bucket's file in row
+    /// groups of about a quarter of it.
+    RefLargeFiles,
 }
 
 impl GoldenTable {
@@ -216,6 +294,19 @@ impl GoldenTable {
         Self::OrderedString100k,
     ];
 
+    /// Every table the recipe's `reference` group writes.
+    pub const REFERENCE: [Self; 4] = [
+        Self::RefCompacted,
+        Self::RefAppended,
+        Self::RefString,
+        Self::RefLargeFiles,
+    ];
+
+    /// Whether the recipe's `reference` group writes the table.
+    pub fn is_reference(self) -> bool {
+        Self::REFERENCE.contains(&self)
+    }
+
     /// The order column's type, or `None` for a key-value table.
     pub fn order_kind(self) -> Option<OrderKind> {
         match self {
@@ -225,8 +316,11 @@ impl GoldenTable {
             | Self::OrderedOverlap100k
             | Self::OrderedMergeV2_100k
             | Self::OrderedMergeV3_100k
-            | Self::OrderedMergeV3Compacted100k => Some(OrderKind::Long),
-            Self::OrderedString100k => Some(OrderKind::Str),
+            | Self::OrderedMergeV3Compacted100k
+            | Self::RefCompacted
+            | Self::RefAppended
+            | Self::RefLargeFiles => Some(OrderKind::Long),
+            Self::OrderedString100k | Self::RefString => Some(OrderKind::Str),
             Self::Long2m
             | Self::Str2m
             | Self::Bin16_500k
@@ -262,7 +356,11 @@ impl GoldenTable {
             | Self::OrderedMergeV2_100k
             | Self::OrderedMergeV3_100k
             | Self::OrderedMergeV3Compacted100k
-            | Self::OrderedString100k => KeyType::Long,
+            | Self::OrderedString100k
+            | Self::RefCompacted
+            | Self::RefAppended
+            | Self::RefString
+            | Self::RefLargeFiles => KeyType::Long,
             Self::Str2m => KeyType::String,
             Self::Bin16_500k => KeyType::Binary,
         }
@@ -289,10 +387,14 @@ impl GoldenTable {
             | Self::OrderedString100k => FOUR_BUCKETS,
             Self::LongWide250k | Self::Overlap250k | Self::OrderedOverlap100k => TWO_BUCKETS,
             Self::Unpartitioned500k => UNPARTITIONED,
+            Self::RefCompacted | Self::RefAppended | Self::RefString | Self::RefLargeFiles => {
+                REFERENCE_BUCKETS
+            }
         }
     }
 
-    /// The rows the recipe filled the table with, before any change.
+    /// The rows the recipe filled the table with, before any change; for a
+    /// reference table, every row its writes hold at `REFERENCE_KEYS`.
     pub fn rows(self) -> u64 {
         match self {
             Self::Long2m | Self::Str2m => ROWS_2M,
@@ -312,6 +414,9 @@ impl GoldenTable {
             | Self::OrderedMergeV3_100k
             | Self::OrderedMergeV3Compacted100k
             | Self::OrderedString100k => ROWS_100K,
+            Self::RefCompacted | Self::RefAppended | Self::RefString | Self::RefLargeFiles => {
+                REFERENCE_ROWS
+            }
         }
     }
 }
@@ -339,6 +444,10 @@ impl fmt::Display for GoldenTable {
             Self::OrderedMergeV3_100k => "ordered_merge_v3_100k",
             Self::OrderedMergeV3Compacted100k => "ordered_merge_v3_compacted_100k",
             Self::OrderedString100k => "ordered_string_100k",
+            Self::RefCompacted => "ref_compacted",
+            Self::RefAppended => "ref_appended",
+            Self::RefString => "ref_string",
+            Self::RefLargeFiles => "ref_large_files",
         };
         f.write_str(name)
     }
@@ -401,8 +510,14 @@ pub fn string_key(id: u64) -> Key {
 
 /// The recipe's `PERMUTED_KEY` for `id`, in `u64` arithmetic.
 pub fn permuted_key(id: u64) -> Key {
-    let value = (id * PERMUTATION_MULTIPLIER) % PERMUTATION_MODULUS;
-    Key::Long(i64::try_from(value).expect("a value below the modulus fits i64"))
+    Key::Long(i64::try_from(keyed_hash(id)).expect("a value below the modulus fits i64"))
+}
+
+/// The recipe's `keyed_hash` of `value`, `PERMUTED_KEY`'s arithmetic: a
+/// bijection below the modulus, exact for the values the recipe hashes,
+/// whose product stays below 2^63 as Spark's ANSI arithmetic requires.
+fn keyed_hash(value: u64) -> u64 {
+    (value * PERMUTATION_MULTIPLIER) % PERMUTATION_MODULUS
 }
 
 /// A contract table's value for the key whose Spark string form is
@@ -480,7 +595,11 @@ fn is_merged(table: GoldenTable) -> bool {
         | GoldenTable::OrderedRolled100k
         | GoldenTable::OrderedAppended100k
         | GoldenTable::OrderedOverlap100k
-        | GoldenTable::OrderedString100k => false,
+        | GoldenTable::OrderedString100k
+        | GoldenTable::RefCompacted
+        | GoldenTable::RefAppended
+        | GoldenTable::RefString
+        | GoldenTable::RefLargeFiles => false,
     }
 }
 
@@ -496,7 +615,11 @@ pub fn ordered_key(table: GoldenTable, id: u64) -> Key {
         | GoldenTable::OrderedMergeV2_100k
         | GoldenTable::OrderedMergeV3_100k
         | GoldenTable::OrderedMergeV3Compacted100k
-        | GoldenTable::OrderedString100k => long_key(id),
+        | GoldenTable::OrderedString100k
+        | GoldenTable::RefCompacted
+        | GoldenTable::RefAppended
+        | GoldenTable::RefString
+        | GoldenTable::RefLargeFiles => long_key(id),
         GoldenTable::Long2m
         | GoldenTable::Str2m
         | GoldenTable::Bin16_500k
@@ -513,12 +636,21 @@ pub fn ordered_key(table: GoldenTable, id: u64) -> Key {
 }
 
 /// The live rows of the key at key index `id` in an ordered golden table
-/// once the recipe's commands ran, ascending by order value: the
+/// once the recipe's commands ran, ascending by order value: in a reference
+/// table its `reference_rows_of` rows at `reference_ts`; otherwise the
 /// `ORDERED_ROWS_PER_KEY` rows of the first fill, `APPEND_ROWS_PER_KEY` more
 /// after them in the appended table, and in a merged table, for a key in
 /// `MERGE_KEY_IDS`, the matched rows at `MOR_UPDATE_VERSION` and the
 /// inserted ones between.
 pub fn ordered_rows(table: GoldenTable, id: u64) -> Vec<OrderedRow> {
+    if table.is_reference() {
+        return (0..reference_rows_of(id))
+            .map(|index| OrderedRow {
+                order: reference_ts(id, index),
+                version: MOR_FIRST_VERSION,
+            })
+            .collect();
+    }
     let appended = if table == GoldenTable::OrderedAppended100k {
         APPEND_ROWS_PER_KEY
     } else {
@@ -547,11 +679,14 @@ pub fn ordered_rows(table: GoldenTable, id: u64) -> Vec<OrderedRow> {
 }
 
 /// The text of the order value with raw value `order` for the key at key
-/// index `id`: its decimal digits in a long order column, and in
-/// `ordered_string_100k` the recipe's `ORDER_PREFIX_LEN` bytes of the key's
-/// text left-padded with `k`, then the raw value zero-padded to
-/// `ORDER_STRING_DIGITS`.
+/// index `id`: its decimal digits in a long order column, in `ref_string`
+/// the instant's `iso_instant`, and in `ordered_string_100k` the recipe's
+/// `ORDER_PREFIX_LEN` bytes of the key's text left-padded with `k`, then
+/// the raw value zero-padded to `ORDER_STRING_DIGITS`.
 pub fn ordered_order_text(table: GoldenTable, id: u64, order: i64) -> String {
+    if table == GoldenTable::RefString {
+        return iso_instant(order);
+    }
     if table != GoldenTable::OrderedString100k {
         return order.to_string();
     }
@@ -565,27 +700,75 @@ pub fn ordered_order_text(table: GoldenTable, id: u64, order: i64) -> String {
 /// The order value a Scan states or returns for raw order value `order` of
 /// the key at key index `id`: a long, or the string `ordered_order_text`.
 pub fn ordered_order_value(table: GoldenTable, id: u64, order: i64) -> OrderValue {
-    assert!(
-        table.order_kind().is_some(),
-        "{table} is not an ordered table"
-    );
-    if table == GoldenTable::OrderedString100k {
-        OrderValue::Str(ordered_order_text(table, id, order))
-    } else {
-        OrderValue::Long(order)
+    match table.order_kind() {
+        Some(OrderKind::Str) => OrderValue::Str(ordered_order_text(table, id, order)),
+        Some(_) => OrderValue::Long(order),
+        None => panic!("{table} is not an ordered table"),
     }
 }
 
 /// An ordered golden table's value for the row at raw order value `order`
-/// of the key at key index `id`, written at `version`: `value` of
+/// of the key at key index `id`, written at `version`, from the text
 /// `v{version}:{key}:{order text}`, the recipe's `value_expr(...,
-/// order_expr=...)`.
+/// order_expr=...)`: `value` of it, or in a reference table
+/// `REFERENCE_REPEATS` distinct digests of it.
 pub fn ordered_value(table: GoldenTable, id: u64, order: i64, version: u64) -> Vec<u8> {
     let key = long_key_text_of(&ordered_key(table, id));
-    versioned_value(
-        &format!("{key}:{}", ordered_order_text(table, id, order)),
-        version,
-    )
+    let text = format!("{key}:{}", ordered_order_text(table, id, order));
+    if table.is_reference() {
+        digests(&format!("v{version}:{text}"), REFERENCE_REPEATS)
+    } else {
+        versioned_value(&text, version)
+    }
+}
+
+/// The recipe's `reference_rows`: the rows the key at key index `id` holds
+/// in a reference table, by the tier its hash picks.
+pub fn reference_rows_of(id: u64) -> u64 {
+    let hash = keyed_hash(id);
+    let (tier, spread) = (hash % TIER_SCALE, hash / TIER_SCALE);
+    let rows = if tier < HEAVY_TIER {
+        HEAVY_ROWS
+    } else if tier < MEDIUM_TIER {
+        MEDIUM_ROWS
+    } else {
+        LIGHT_ROWS
+    };
+    rows.start() + spread % (rows.end() - rows.start() + 1)
+}
+
+/// The recipe's `reference_insert` ranges: the half-open row indexes of
+/// the key at key index `id` that each write holds, the initial load first
+/// and then each of the `APPEND_BATCHES` appends. An append's range is
+/// empty for a key whose tail it holds none of.
+pub fn reference_writes(id: u64) -> Vec<Range<u64>> {
+    let rows = reference_rows_of(id);
+    let tail = rows / APPEND_TAIL_DIVISOR;
+    let base = rows - tail;
+    let cuts: Vec<u64> = std::iter::once(0)
+        .chain((0..=APPEND_BATCHES).map(|batch| base + tail * batch / APPEND_BATCHES))
+        .collect();
+    cuts.windows(2).map(|pair| pair[0]..pair[1]).collect()
+}
+
+/// The recipe's `reference_ts`: the microsecond instant of row `index` of the
+/// key at key index `id`, `TS_STEP` per index after `TS_START` plus a
+/// jitter below `TS_STEP` hashed from the row.
+pub fn reference_ts(id: u64, index: u64) -> i64 {
+    let jitter = keyed_hash(id * ROW_SLOTS + index) % TS_STEP.unsigned_abs();
+    TS_START
+        + i64::try_from(index).expect("row indexes are below ROW_SLOTS") * TS_STEP
+        + i64::try_from(jitter).expect("the jitter is below TS_STEP")
+}
+
+/// The instant `micros` microseconds after the epoch as the recipe's
+/// `ISO_INSTANT`: fixed-width ISO-8601 UTC text, which sorts as the
+/// instants do.
+pub fn iso_instant(micros: i64) -> String {
+    jiff::Timestamp::from_microsecond(micros)
+        .expect("a reference instant is within jiff's range")
+        .strftime(ISO_INSTANT)
+        .to_string()
 }
 
 /// The decimal text Spark casts a long `key` to.
@@ -596,11 +779,16 @@ fn long_key_text_of(key: &Key) -> String {
     value.to_string()
 }
 
-/// A wide table's value for `key_text`: the hex SHA-256 of `{key_text}:{i}`
-/// for `i` in `1..=WIDE_REPEATS`, concatenated, as ASCII bytes.
+/// A wide table's value for `key_text`: `WIDE_REPEATS` digests of it.
 pub fn wide_value(key_text: &str) -> Vec<u8> {
-    (1..=WIDE_REPEATS)
-        .map(|i| hex_digest(&format!("{key_text}:{i}")))
+    digests(key_text, WIDE_REPEATS)
+}
+
+/// The recipe's incompressible `value_expr` of `text`: the hex SHA-256 of
+/// `{text}:{i}` for `i` in `1..=repeats`, concatenated, as ASCII bytes.
+fn digests(text: &str, repeats: usize) -> Vec<u8> {
+    (1..=repeats)
+        .map(|i| hex_digest(&format!("{text}:{i}")))
         .collect::<String>()
         .into_bytes()
 }
@@ -621,9 +809,10 @@ fn hex_digest(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::keys::{STRING_KEY_FIXED_BYTES, STRING_PAD};
+    use icetray_core::approx::count;
 
     /// Every table, beside the name the recipe writes it under.
-    const NAMES: [(GoldenTable, &str); 20] = [
+    const NAMES: [(GoldenTable, &str); 24] = [
         (GoldenTable::Long2m, "long_2m"),
         (GoldenTable::Str2m, "str_2m"),
         (GoldenTable::Bin16_500k, "bin16_500k"),
@@ -653,6 +842,10 @@ mod tests {
             "ordered_merge_v3_compacted_100k",
         ),
         (GoldenTable::OrderedString100k, "ordered_string_100k"),
+        (GoldenTable::RefCompacted, "ref_compacted"),
+        (GoldenTable::RefAppended, "ref_appended"),
+        (GoldenTable::RefString, "ref_string"),
+        (GoldenTable::RefLargeFiles, "ref_large_files"),
     ];
 
     /// Ids the permutation is checked over: small next to the modulus, so
@@ -845,5 +1038,133 @@ mod tests {
         }
         let config = table_config("file:///w", GoldenTable::Long2m, false);
         assert_eq!(config.order_column, None);
+    }
+
+    /// A light key, and a row of it, whose derivation is pinned by hand.
+    const PINNED_ID: u64 = 1;
+    const PINNED_INDEX: u64 = 3;
+
+    /// The keys of each tier at `REFERENCE_KEYS`, heavy, medium, and light.
+    const TIER_KEYS: [u64; 3] = [1_197, 20_805, 177_998];
+
+    /// The rows each write holds at `REFERENCE_KEYS`: the initial load,
+    /// then each append.
+    const WRITE_ROWS: [u64; 5] = [16_031_167, 901_945, 1_001_949, 951_947, 1_051_950];
+
+    fn reference_ids() -> Range<u64> {
+        0..REFERENCE_KEYS
+    }
+
+    #[test]
+    fn test_reference_rows_of_sums_to_the_recipe_rows_over_heavy_tailed_tiers() {
+        assert_eq!(
+            [0, 1, 2].map(reference_rows_of),
+            [1_000, 16, 12],
+            "the hash of 0 is 0, a heavy tier"
+        );
+        let counts: Vec<u64> = reference_ids().map(reference_rows_of).collect();
+        assert_eq!(counts.iter().sum::<u64>(), REFERENCE_ROWS);
+        let tiers = [&HEAVY_ROWS, &MEDIUM_ROWS, &LIGHT_ROWS]
+            .map(|rows| count(counts.iter().filter(|n| rows.contains(n)).count()));
+        assert_eq!(tiers, TIER_KEYS);
+    }
+
+    #[test]
+    fn test_reference_heaviest_ids_hold_the_longest_runs() {
+        let mut ids: Vec<u64> = reference_ids().collect();
+        ids.sort_by_key(|&id| std::cmp::Reverse(reference_rows_of(id)));
+        assert_eq!(ids[..REFERENCE_HEAVIEST_IDS.len()], REFERENCE_HEAVIEST_IDS);
+        assert_eq!(reference_rows_of(REFERENCE_HEAVIEST_IDS[0]), 9_998);
+    }
+
+    #[test]
+    fn test_reference_writes_tile_each_key_s_rows_in_order() {
+        let mut totals = [0_u64; 5];
+        for id in reference_ids() {
+            let writes = reference_writes(id);
+            assert_eq!(writes.len(), totals.len());
+            assert_eq!(writes[0].start, 0, "{id}");
+            assert!(
+                writes.windows(2).all(|pair| pair[0].end == pair[1].start),
+                "{id} {writes:?}"
+            );
+            let rows = reference_rows_of(id);
+            assert_eq!(writes[writes.len() - 1].end, rows, "{id}");
+            assert_eq!(writes[0].end, rows - rows / APPEND_TAIL_DIVISOR, "{id}");
+            for (total, write) in totals.iter_mut().zip(&writes) {
+                *total += write.end - write.start;
+            }
+        }
+        assert_eq!(totals, WRITE_ROWS);
+    }
+
+    #[test]
+    fn test_reference_ts_strictly_increases_within_two_steps() {
+        assert_eq!(reference_ts(0, 0), TS_START, "the hash of 0 is 0");
+        assert_eq!(reference_ts(PINNED_ID, PINNED_INDEX), 1_767_225_603_731_419);
+        let id = REFERENCE_HEAVIEST_IDS[0];
+        let instants: Vec<i64> = (0..reference_rows_of(id))
+            .map(|index| reference_ts(id, index))
+            .collect();
+        assert!(
+            instants
+                .windows(2)
+                .all(|pair| pair[0] < pair[1] && pair[1] - pair[0] < 2 * TS_STEP)
+        );
+    }
+
+    #[test]
+    fn test_iso_instant_is_fixed_width_utc_text_that_sorts_as_the_instants() {
+        assert_eq!(iso_instant(TS_START), "2026-01-01T00:00:00.000000Z");
+        let pinned = reference_ts(PINNED_ID, PINNED_INDEX);
+        assert_eq!(iso_instant(pinned), "2026-01-01T00:00:03.731419Z");
+        let id = REFERENCE_HEAVIEST_IDS[0];
+        let texts: Vec<String> = (0..reference_rows_of(id))
+            .map(|index| iso_instant(reference_ts(id, index)))
+            .collect();
+        assert!(texts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(texts.iter().all(|text| text.len() == texts[0].len()));
+    }
+
+    #[test]
+    fn test_reference_value_is_two_digests_of_key_and_order_text() {
+        let order = reference_ts(PINNED_ID, PINNED_INDEX);
+        let long = ordered_value(
+            GoldenTable::RefCompacted,
+            PINNED_ID,
+            order,
+            MOR_FIRST_VERSION,
+        );
+        assert_eq!(long.len(), REFERENCE_REPEATS * HEX_DIGEST_BYTES);
+        assert_eq!(
+            &long[..HEX_DIGEST_BYTES],
+            hex_digest("v1:3:1767225603731419:1").as_bytes()
+        );
+        assert!(long[HEX_DIGEST_BYTES..].starts_with(b"5a18283958290e70"));
+        let text = ordered_value(GoldenTable::RefString, PINNED_ID, order, MOR_FIRST_VERSION);
+        assert!(text.starts_with(b"c5d2dcfe069b40f9"));
+        assert_eq!(
+            ordered_order_value(GoldenTable::RefString, PINNED_ID, order),
+            OrderValue::Str("2026-01-01T00:00:03.731419Z".to_string())
+        );
+        assert_eq!(
+            ordered_order_value(GoldenTable::RefLargeFiles, PINNED_ID, order),
+            OrderValue::Long(order)
+        );
+    }
+
+    #[test]
+    fn test_ordered_rows_of_a_reference_table_are_its_instants() {
+        for table in GoldenTable::REFERENCE {
+            let rows = ordered_rows(table, PINNED_ID);
+            assert_eq!(count(rows.len()), reference_rows_of(PINNED_ID), "{table}");
+            assert_eq!(
+                rows[usize::try_from(PINNED_INDEX).unwrap()].order,
+                reference_ts(PINNED_ID, PINNED_INDEX)
+            );
+            assert!(rows.iter().all(|row| row.version == MOR_FIRST_VERSION));
+            assert_eq!(ordered_key(table, PINNED_ID), long_key(PINNED_ID));
+            assert!(table.is_reference() && !GoldenTable::ORDERED.contains(&table));
+        }
     }
 }

@@ -23,7 +23,8 @@ use icetray_core::{
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MERGE_KEY_IDS, MOR_DELETED_IDS,
-    MOR_UPDATED_IDS, ORDERED_KEYS, ORDERED_ROWS_PER_KEY, OrderedRow, WIDE_REPEATS,
+    MOR_UPDATED_IDS, ORDERED_KEYS, ORDERED_ROWS_PER_KEY, OrderedRow, REFERENCE_HEAVIEST_IDS,
+    WIDE_REPEATS,
 };
 use icetray_testkit::keys::KEY_STEP;
 use icetray_testkit::layout::VALUE_COLUMN;
@@ -591,16 +592,22 @@ fn assert_plan_names_the_update_s_copy(table: GoldenTable, full: &Generation) {
     }
 }
 
+/// The table metadata of the snapshot `golden` serves, as Iceberg's own
+/// reader parses it.
+async fn served_metadata(golden: &Golden) -> Result<TableMetadata> {
+    Ok(serde_json::from_slice(
+        &golden
+            .storage
+            .read_all(&golden.current().metadata_location)
+            .await?,
+    )?)
+}
+
 /// The live delete entries of the snapshot `golden` serves, from its
 /// manifests as Iceberg's own reader parses them.
 async fn listed_deletes(golden: &Golden) -> Result<Vec<DataFile>> {
     let generation = golden.current();
-    let metadata: TableMetadata = serde_json::from_slice(
-        &golden
-            .storage
-            .read_all(&generation.metadata_location)
-            .await?,
-    )?;
+    let metadata = served_metadata(golden).await?;
     let snapshot = metadata
         .current_snapshot()
         .expect("a served table has a current snapshot");
@@ -870,11 +877,17 @@ fn ordered_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
 }
 
 /// What a Scan of key index `id` answers under `scan`, from the recipe's
-/// derivation of the key's rows.
-fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestScan) -> Scanned {
+/// derivation of the key's rows, and the raw order value of the last row
+/// when rows remain past it.
+fn derived_scan(
+    table: GoldenTable,
+    id: u64,
+    rows: &[OrderedRow],
+    scan: &TestScan,
+) -> (Scanned, Option<i64>) {
     let live = rows.iter().map(|row| (row.order, row.version));
     let (answer, next) = scan_model(live, scan);
-    Scanned {
+    let scanned = Scanned {
         rows: answer
             .into_iter()
             .map(|(order, version)| ScanRow {
@@ -890,7 +903,8 @@ fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestSca
                 scan.direction,
             )
         }),
-    }
+    };
+    (scanned, next)
 }
 
 /// Every sampled key of `table`, and the key indexes in `extra`, answers
@@ -914,7 +928,7 @@ async fn assert_ordered_scans_match_the_derivation(
             let key = golden::ordered_key(table, id);
             let rows = golden::ordered_rows(table, id);
             for scan in ordered_scans(&rows, max) {
-                let want = derived_scan(table, id, &rows, &scan);
+                let (want, _) = derived_scan(table, id, &rows, &scan);
                 let got = served
                     .table
                     .scan(
@@ -1331,6 +1345,418 @@ async fn test_golden_ordered_merge_records_the_deletes_of_its_format_version() -
         }
         let listed_rows: u64 = deletes.iter().map(DataFile::record_count).sum();
         assert_eq!(listed_rows, matched_rows, "{table}");
+    }
+    Ok(())
+}
+
+/// The keys a reference table was written with, from the table property
+/// the recipe records: `golden::REFERENCE_KEYS`, or fewer under
+/// `--reference-keys`.
+async fn reference_keys(golden: &Golden) -> Result<u64> {
+    let metadata = served_metadata(golden).await?;
+    let keys = metadata
+        .properties()
+        .get(golden::REFERENCE_KEYS_PROPERTY)
+        .unwrap_or_else(|| {
+            panic!(
+                "dev/golden-tables.py records {} on every reference table; regenerate it",
+                golden::REFERENCE_KEYS_PROPERTY
+            )
+        });
+    Ok(keys
+        .parse()
+        .expect("the recipe records the key count in decimal digits"))
+}
+
+/// Keys sampled evenly through a reference table, beside the keys
+/// `reference_sample` names.
+const REFERENCE_STRIDE_SAMPLES: u64 = 16;
+
+/// The key indexes below `keys` whose Scans a reference table is checked
+/// on: a stride through the table, its first and last key, its heaviest,
+/// the first key of each tier, the first key with no appended rows, with
+/// rows in some appends only, and with rows in every append, and `extra`.
+fn reference_sample(keys: u64, extra: &BTreeSet<u64>) -> BTreeSet<u64> {
+    let stride = usize::try_from((keys / REFERENCE_STRIDE_SAMPLES).max(1))
+        .expect("a stride below the key count fits usize");
+    let mut sample: BTreeSet<u64> = (0..keys).step_by(stride).collect();
+    sample.insert(keys - 1);
+    sample.extend(REFERENCE_HEAVIEST_IDS.iter().filter(|&&id| id < keys));
+    for tier in [golden::HEAVY_ROWS, golden::MEDIUM_ROWS, golden::LIGHT_ROWS] {
+        sample.extend((0..keys).find(|&id| tier.contains(&golden::reference_rows_of(id))));
+    }
+    let appended = |id: u64| -> Vec<bool> {
+        golden::reference_writes(id)[1..]
+            .iter()
+            .map(|write| !write.is_empty())
+            .collect()
+    };
+    let shapes: [fn(&[bool]) -> bool; 3] = [
+        |batches| batches.iter().all(|&held| !held),
+        |batches| batches.iter().any(|&held| held) && batches.iter().any(|&held| !held),
+        |batches| batches.iter().all(|&held| held),
+    ];
+    for shape in shapes {
+        sample.extend((0..keys).find(|&id| shape(&appended(id))));
+    }
+    sample.extend(extra.iter().filter(|&&id| id < keys));
+    sample
+}
+
+/// The limit of a reference Scan that pages a long run: prime, so pages end
+/// at varied offsets within the order pages.
+const REFERENCE_PAGE_LIMIT: u32 = 251;
+
+/// The Scans paged through on a key holding `rows` of a table whose
+/// `max_scan_rows` is `max`, in both directions at `max` and at
+/// `REFERENCE_PAGE_LIMIT`: the whole run, a window over its middle half,
+/// everything from its middle row, and everything before it.
+fn reference_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
+    let orders: Vec<i64> = rows.iter().map(|row| row.order).collect();
+    let (quarter, middle, three_quarters) = (
+        orders[orders.len() / 4],
+        orders[orders.len() / 2],
+        orders[orders.len() * 3 / 4],
+    );
+    let mut scans = Vec::new();
+    for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+        for limit in [max, REFERENCE_PAGE_LIMIT] {
+            let scan = |start, before| TestScan {
+                direction,
+                limit,
+                start,
+                before,
+            };
+            scans.extend([
+                scan(None, None),
+                scan(Some(quarter), Some(three_quarters + 1)),
+                scan(Some(middle), None),
+                scan(None, Some(middle)),
+            ]);
+        }
+    }
+    scans
+}
+
+/// Pages `first` through the key at key index `id` of `served`, passing
+/// each response's `next` back unchanged until a response has none; every
+/// page equals the derivation's, and the pages together hold every row
+/// the derivation puts inside `first`'s bounds. Returns the pages read.
+async fn page_through(
+    served: &Golden,
+    table: GoldenTable,
+    id: u64,
+    rows: &[OrderedRow],
+    first: TestScan,
+) -> Result<u64> {
+    let key = golden::ordered_key(table, id);
+    let columns = [ColumnRead::whole(VALUE_COLUMN)];
+    let mut scan = first;
+    let mut bounds = first.bounds_by(|order| golden::ordered_order_value(table, id, order));
+    let mut read = Vec::new();
+    let mut pages = 0;
+    loop {
+        let got = served.table.scan(&key, &columns, &bounds).await?.scanned;
+        let (want, last) = derived_scan(table, id, rows, &scan);
+        assert_eq!(got, want, "{table} {key} {first:?} page {pages}");
+        pages += 1;
+        read.extend(got.rows);
+        let (Some(next), Some(last)) = (got.next, last) else {
+            break;
+        };
+        scan = scan.after_page(last);
+        match scan.direction {
+            Direction::NewestFirst => bounds.before = Some(next),
+            Direction::OldestFirst => bounds.start = Some(next),
+        }
+    }
+    let whole = TestScan {
+        limit: u32::MAX,
+        ..first
+    };
+    let (want, _) = derived_scan(table, id, rows, &whole);
+    assert_eq!(
+        read, want.rows,
+        "{table} {key} {first:?}: the pages tile the window"
+    );
+    Ok(pages)
+}
+
+/// The keys of the `MultiScan`s `assert_multi_scan_matches_scans` sends, the
+/// absent key and a repeated one included, and their limit:
+/// `server.max_multi_scan_values` holds their keys times the limit times
+/// one more than the one column.
+const REFERENCE_MULTI_KEYS: usize = 16;
+const REFERENCE_MULTI_LIMIT: u32 = 100;
+
+/// The row indexes whose instants bound the windowed `MultiScan`s, from the
+/// heaviest sampled key: past the first rows of most keys, and before
+/// the last rows of the medium and heavy ones.
+const REFERENCE_MULTI_WINDOW: (usize, usize) = (2, 40);
+
+/// A `MultiScan` of the first sampled keys, the absent key, and the first
+/// key again, in both directions with and without a window, answers each
+/// key as its own Scan does, and each sampled key as the derivation says.
+/// Returns the rows compared.
+async fn assert_multi_scan_matches_scans(
+    served: &Golden,
+    table: GoldenTable,
+    sample: &BTreeSet<u64>,
+) -> Result<u64> {
+    let ids: Vec<u64> = sample
+        .iter()
+        .copied()
+        .take(REFERENCE_MULTI_KEYS - 2)
+        .collect();
+    let mut keys: Vec<Key> = ids
+        .iter()
+        .map(|&id| golden::ordered_key(table, id))
+        .collect();
+    keys.push(Key::Long(ABSENT_ORDERED_KEY));
+    keys.push(keys[0].clone());
+    let heaviest = *ids
+        .iter()
+        .max_by_key(|&&id| golden::reference_rows_of(id))
+        .expect("the sample is not empty");
+    let rows = golden::ordered_rows(table, heaviest);
+    let window = (
+        Some(rows[REFERENCE_MULTI_WINDOW.0].order),
+        Some(rows[REFERENCE_MULTI_WINDOW.1].order),
+    );
+    let columns = [ColumnRead::whole(VALUE_COLUMN)];
+    let mut compared = 0;
+    for direction in [Direction::NewestFirst, Direction::OldestFirst] {
+        for (start, before) in [(None, None), window] {
+            let scan = TestScan {
+                direction,
+                limit: REFERENCE_MULTI_LIMIT,
+                start,
+                before,
+            };
+            let bounds =
+                scan.bounds_by(|order| golden::ordered_order_value(table, heaviest, order));
+            let multi = served.table.multi_scan(&keys, &columns, &bounds).await?;
+            assert_eq!(multi.results.len(), keys.len(), "{table}");
+            for (key, result) in keys.iter().zip(&multi.results) {
+                let alone = served.table.scan(key, &columns, &bounds).await?;
+                assert_eq!(alone.snapshot_id, multi.snapshot_id, "{table}");
+                assert_eq!(result, &alone.scanned, "{table} {key} {scan:?}");
+                compared += count(result.rows.len());
+            }
+            for (&id, result) in ids.iter().zip(&multi.results) {
+                let (want, _) = derived_scan(table, id, &golden::ordered_rows(table, id), &scan);
+                assert_eq!(result, &want, "{table} {id} {scan:?}");
+            }
+            let absent = &multi.results[ids.len()];
+            assert!(absent.rows.is_empty() && absent.next.is_none(), "{table}");
+        }
+    }
+    Ok(compared)
+}
+
+/// Every sampled key of reference table `table` pages every Scan of
+/// `reference_scans` to the end as the derivation says, and `MultiScan`s of
+/// sampled keys answer as Scans of each, in every tier. The sample takes
+/// the keys files of one bucket share as an edge.
+async fn assert_reference_serves(table: GoldenTable) -> Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let (mut pages, mut multi_rows) = (0_u64, 0_u64);
+    for residency in Residency::ALL {
+        let served = open_in(table, residency, scratch.path()).await?;
+        let keys = reference_keys(&served).await?;
+        let max = served
+            .table
+            .config()
+            .scan_rows()
+            .expect("an ordered table has a max_scan_rows");
+        let sample = reference_sample(keys, &shared_edge_ids(&served));
+        for &id in &sample {
+            let rows = golden::ordered_rows(table, id);
+            for scan in reference_scans(&rows, max) {
+                pages += page_through(&served, table, id, &rows, scan).await?;
+            }
+        }
+        multi_rows += assert_multi_scan_matches_scans(&served, table, &sample).await?;
+    }
+    let heaviest = golden::reference_rows_of(REFERENCE_HEAVIEST_IDS[0]);
+    assert!(
+        pages > heaviest / u64::from(REFERENCE_PAGE_LIMIT),
+        "{table}: the heaviest key paged through many pages, {pages} in all"
+    );
+    assert!(multi_rows > 0, "{table}: the MultiScans compared rows");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_compacted_pages_match_the_derived_rows() -> Result<()> {
+    assert_reference_serves(GoldenTable::RefCompacted).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_appended_pages_match_the_derived_rows() -> Result<()> {
+    assert_reference_serves(GoldenTable::RefAppended).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_string_pages_match_the_derived_rows() -> Result<()> {
+    assert_reference_serves(GoldenTable::RefString).await
+}
+
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_large_files_pages_match_the_derived_rows() -> Result<()> {
+    assert_reference_serves(GoldenTable::RefLargeFiles).await
+}
+
+/// What the doctor reports of a reference table as Spark wrote it.
+struct ReferenceLayout {
+    table: GoldenTable,
+    level: Level,
+    /// The distinct capping codes.
+    capping: &'static [FindingCode],
+    /// The distinct advice codes, in code order.
+    advice: &'static [FindingCode],
+    /// Whether a sorting compaction rewrote the appends into one file a
+    /// bucket; otherwise a bucket holds a file per write.
+    compacted: bool,
+    /// Whether each file holds more than one row group.
+    row_groups_per_file_above_one: bool,
+}
+
+/// Advice every reference table draws: runs past the default
+/// `max_scan_rows`, and Iceberg's default bloom filter of 1 MiB per row
+/// group, sized for more keys than a file of a few thousand holds.
+const REFERENCE_ADVICE: [FindingCode; 2] = [FindingCode::LongRuns, FindingCode::BloomOversized];
+
+/// The reference tables as Spark writes them at the full size. A sorting
+/// compaction leaves one file in each bucket, as Spark sizes it for the
+/// target file size, so a Scan reads one file: `optimal`, with a file of
+/// one row group at the recipe's sizes and of several at
+/// `ref_large_files`'. The appends add up to a file a bucket each over the
+/// initial load's key range: `permissive` under `overlapping_files`, with
+/// more files than a bucket's bytes fill.
+const REFERENCE_LAYOUTS: [ReferenceLayout; 4] = [
+    ReferenceLayout {
+        table: GoldenTable::RefCompacted,
+        level: Level::Optimal,
+        capping: &[],
+        advice: &REFERENCE_ADVICE,
+        compacted: true,
+        row_groups_per_file_above_one: false,
+    },
+    ReferenceLayout {
+        table: GoldenTable::RefAppended,
+        level: Level::Permissive,
+        capping: &[FindingCode::OverlappingFiles],
+        advice: &[
+            FindingCode::LongRuns,
+            FindingCode::ManyFilesPerBucket,
+            FindingCode::BloomOversized,
+        ],
+        compacted: false,
+        row_groups_per_file_above_one: false,
+    },
+    ReferenceLayout {
+        table: GoldenTable::RefString,
+        level: Level::Optimal,
+        capping: &[],
+        advice: &REFERENCE_ADVICE,
+        compacted: true,
+        row_groups_per_file_above_one: false,
+    },
+    ReferenceLayout {
+        table: GoldenTable::RefLargeFiles,
+        level: Level::Optimal,
+        capping: &[],
+        advice: &REFERENCE_ADVICE,
+        compacted: true,
+        row_groups_per_file_above_one: true,
+    },
+];
+
+/// The longest run a reference table of `keys` keys holds in one file:
+/// a key's whole run once compacted, and otherwise the longest one write
+/// holds.
+fn longest_reference_run(keys: u64, compacted: bool) -> u64 {
+    let ids = 0..keys;
+    let longest = if compacted {
+        ids.map(golden::reference_rows_of).max()
+    } else {
+        ids.flat_map(golden::reference_writes)
+            .map(|write| write.end - write.start)
+            .max()
+    };
+    longest.expect("a reference table has keys")
+}
+
+/// Each reference table earns the level and findings `REFERENCE_LAYOUTS`
+/// gives, holds every derived row, and reports the longest run its files
+/// hold.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_reference_layouts_earn_their_level_and_findings() -> Result<()> {
+    for layout in REFERENCE_LAYOUTS {
+        let table = layout.table;
+        let golden = open_golden(table, false).await?;
+        let keys = reference_keys(&golden).await?;
+        let report = golden.report();
+        assert_eq!(report.summary.level, layout.level, "{table}");
+        assert_eq!(codes_of(&report), layout.capping, "{table}");
+        let advice: BTreeSet<FindingCode> = advice_codes(&golden).into_iter().collect();
+        assert_eq!(
+            advice.into_iter().collect::<Vec<_>>(),
+            layout.advice,
+            "{table}"
+        );
+        let records: u64 = (0..keys).map(golden::reference_rows_of).sum();
+        assert_eq!(report.summary.records, records, "{table}");
+        if keys == golden::REFERENCE_KEYS {
+            assert_eq!(records, table.rows(), "{table}");
+        }
+        let buckets = usize::try_from(table.buckets()).unwrap();
+        let files_per_bucket = if layout.compacted {
+            1
+        } else {
+            1 + usize::try_from(golden::APPEND_BATCHES).unwrap()
+        };
+        assert_eq!(report.summary.buckets_with_files, buckets, "{table}");
+        assert_eq!(
+            report.summary.max_files_per_bucket, files_per_bucket,
+            "{table}"
+        );
+        assert_eq!(
+            report.summary.file_count,
+            buckets * files_per_bucket,
+            "{table}"
+        );
+        assert_eq!(
+            report.files.iter().all(|file| file.row_groups > 1),
+            layout.row_groups_per_file_above_one,
+            "{table}: dev/golden-tables.py writes ref_large_files in row groups of a quarter \
+             of a bucket and the others in one; regenerate the table"
+        );
+        let order = report.summary.order.as_ref().expect("an ordered table");
+        let expected_type = if table == GoldenTable::RefString {
+            OrderType::String
+        } else {
+            OrderType::Long
+        };
+        assert_eq!(order.order_type, expected_type, "{table}");
+        assert_eq!(order.files_probed, files_per_bucket, "{table}");
+        assert_eq!(
+            order.longest_run,
+            longest_reference_run(keys, layout.compacted),
+            "{table}"
+        );
+        assert_eq!(
+            Some(order.gets_per_scan),
+            golden.current().gets_per_scan,
+            "{table}: the doctor and the gauge predict one Scan"
+        );
+        assert_eq!(report.summary.deletes.rows, 0, "{table}");
     }
     Ok(())
 }

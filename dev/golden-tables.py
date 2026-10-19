@@ -7,13 +7,17 @@ findings RFD 016 reports, and contract tables Spark then changes with
 merge-on-read (RFD 021): position deletes in format version 2, deletion
 vectors in version 3, and ordered tables (RFD 025): many rows per key,
 each with an order value, written by appends, skew-split writes, a MERGE,
-and a sorting compaction. Run it against any object store or local
-directory; the tests locate the result through ICETRAY_GOLDEN_WAREHOUSE.
+and a sorting compaction. The reference group, written only when --only
+names it, holds ordered tables near a production table's size: about 20
+million rows each, about 10 GB together. Run it against any object store
+or local directory; the tests locate the result through
+ICETRAY_GOLDEN_WAREHOUSE.
 
     pip install 'pyspark==4.1.*'
     python3 dev/golden-tables.py --warehouse s3a://bucket/prefix/warehouse
     python3 dev/golden-tables.py --warehouse file:///tmp/icetray-golden
     python3 dev/golden-tables.py --only long_2m --warehouse file:///tmp/icetray-golden
+    python3 dev/golden-tables.py --only reference --reference-keys 20000 --warehouse file:///tmp/icetray-golden
 
 Without Spark on the host, dev/golden-tables.sh runs this script with Spark in
 a container against a warehouse under target/.
@@ -170,6 +174,57 @@ SPLIT_PARTITION_BYTES = 1_048_576
 # a bucket's bytes, so the compaction writes several files per bucket.
 ROLLED_TARGET_FILE_BYTES = 524_288
 
+# The reference tables: ordered tables near a production table's size,
+# every row a function of its key's index `id` and its row index `j`
+# within the key, in integer arithmetic the testkit's golden.rs mirrors.
+# Keys are `LONG_KEY` of the index. The table property names the key count
+# the recipe wrote, so a test derives a table `--reference-keys` scaled down.
+REFERENCE_KEYS = 200_000
+REFERENCE_BUCKETS = 64
+REFERENCE_KEYS_PROPERTY = "golden.reference-keys"
+# A reference value is two distinct digests, 128 bytes that zstd reduces
+# about twofold.
+REFERENCE_REPEATS = 2
+# Rows per key, heavy-tailed: `PERMUTED_KEY` of the index, below
+# `TIER_SCALE`, picks the tier, and the hash's higher digits pick the count
+# within the tier's inclusive range. About 0.6% of keys are heavy, 10% hold
+# hundreds of rows, and the rest at most twenty; about 20 million rows.
+TIER_SCALE = 1_000
+HEAVY_TIER = 6
+MEDIUM_TIER = 110
+HEAVY_ROWS = (1_000, 10_000)
+MEDIUM_ROWS = (100, 999)
+LIGHT_ROWS = (1, 20)
+# Each key's last rows (one in `APPEND_TAIL_DIVISOR`, rounded down, so keys
+# of fewer rows have none) are written by `APPEND_BATCHES` appends after the
+# initial load, the tail split evenly in order among them, so an append
+# holds later rows of some keys only.
+APPEND_TAIL_DIVISOR = 5
+APPEND_BATCHES = 4
+# A row's order value in microseconds: `TS_START`, 2026-01-01T00:00:00Z,
+# plus `TS_STEP` per row index plus a jitter below `TS_STEP` hashed from the
+# row, so a key's values strictly increase with gaps under two steps.
+# `ROW_SLOTS` is at least any key's row count, so the value hashed,
+# `id * ROW_SLOTS + j`, is unique to the row.
+TS_START = 1_767_225_600_000_000
+TS_STEP = 1_000_000
+ROW_SLOTS = HEAVY_ROWS[1]
+# The most keys whose row hash stays below 2^63 before its `pmod`, as Spark's
+# ANSI arithmetic requires.
+REFERENCE_KEYS_MAX = (2**63 - 1) // PERMUTATION_MULTIPLIER // ROW_SLOTS
+# Rows of a reference table at `REFERENCE_KEYS`, the sum of every key's
+# count; golden.rs pins the same sum.
+REFERENCE_ROWS = 19_938_958
+# A string order value: the instant as fixed-width ISO-8601 UTC text, to the
+# microsecond, which sorts as the instants do. Rendered in the session's
+# zone, which the session sets to UTC.
+ISO_INSTANT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'"
+# `ref_large_files` keeps each bucket, about 24 MB of data at 20 million
+# rows, in one file below this target, in row groups of about a quarter of
+# it, so the file holds about four.
+LARGE_FILE_BYTES = 33_554_432
+LARGE_ROW_GROUP_BYTES = 6_291_456
+
 LONG_KEY = f"id * {KEY_STEP}"
 STRING_KEY = (
     f"concat(repeat('p', {STRING_PREFIX_LEN}), 'user:', "
@@ -242,17 +297,35 @@ class OrderShape(NamedTuple):
     # order rows are written in, instead of spaced by `KEY_STEP`.
     permuted: bool = False
     # The order column is a string: a prefix derived from the key, then the
-    # raw order value zero-padded.
+    # raw order value zero-padded; for a timed shape, the instant's ISO text.
     string: bool = False
+    # The reference tables' shape: a microsecond instant per row
+    # (`reference_ts`), and a varying row count per key.
+    timed: bool = False
+
+
+def keyed_hash(expr):
+    """`PERMUTED_KEY` of `expr`: a stable hash for values below the modulus,
+    exact in BIGINT for values below 2^63 over the multiplier."""
+    return f"pmod(({expr}) * {PERMUTATION_MULTIPLIER}, {PERMUTATION_MODULUS})"
+
+
+def reference_ts(key_index, row_index):
+    """The microsecond instant of row `row_index` of the key at `key_index`
+    in a reference table."""
+    jitter = f"{keyed_hash(f'({key_index}) * {ROW_SLOTS} + ({row_index})')} % {TS_STEP}"
+    return f"({TS_START} + ({row_index}) * {TS_STEP} + {jitter})"
 
 
 def ordered_exprs(shape, key_index, row_index, offset=0):
     """The key and order expressions of row `row_index` of the key at
     `key_index`, its raw order value `offset` above the row's own."""
-    if shape.permuted:
-        key = f"pmod(({key_index}) * {PERMUTATION_MULTIPLIER}, {PERMUTATION_MODULUS})"
-    else:
-        key = f"({key_index}) * {KEY_STEP}"
+    key = keyed_hash(key_index) if shape.permuted else f"({key_index}) * {KEY_STEP}"
+    if shape.timed:
+        raw = reference_ts(key_index, row_index)
+        if not shape.string:
+            return key, raw
+        return key, f"date_format(timestamp_micros({raw}), \"{ISO_INSTANT}\")"
     raw = f"({ORDER_START} + ({row_index}) * {ORDER_STEP} + {offset})"
     if not shape.string:
         return key, raw
@@ -260,12 +333,13 @@ def ordered_exprs(shape, key_index, row_index, offset=0):
     return key, f"concat({prefix}, lpad(CAST({raw} AS STRING), {ORDER_STRING_DIGITS}, '0'))"
 
 
-def ordered_select(table, key_index, row_index, rows, version, offset=0):
-    """The rows of an ordered table: `rows` ids, each with the key index and
-    row index the expressions of `id` give, at `version`."""
+def ordered_select(table, key_index, row_index, source, version, offset=0):
+    """The rows of an ordered table, one per row of the query `source`, each
+    with the key index and row index the expressions over its columns give,
+    at `version`."""
     key, order = ordered_exprs(table.order, key_index, row_index, offset)
     value = value_expr(key, table.repeats, table.incompressible, version, order_expr=order)
-    return f"SELECT {key} AS key, {order} AS {ORDER_COLUMN}, {value} AS value FROM range({rows})"
+    return f"SELECT {key} AS key, {order} AS {ORDER_COLUMN}, {value} AS value FROM {source}"
 
 
 def fill_ordered(spark, name, table):
@@ -275,10 +349,59 @@ def fill_ordered(spark, name, table):
         table,
         f"id DIV {ORDERED_ROWS_PER_KEY}",
         f"id % {ORDERED_ROWS_PER_KEY}",
-        table.rows,
+        f"range({table.rows})",
         MOR_FIRST_VERSION,
     )
     spark.sql(f"INSERT INTO {name} {select}")
+
+
+def reference_rows():
+    """A reference key's row count from its hash `h`, by tier."""
+    tier = f"h % {TIER_SCALE}"
+    spread = f"h DIV {TIER_SCALE}"
+
+    def within(rows):
+        low, high = rows
+        return f"{low} + {spread} % {high - low + 1}"
+
+    return (
+        f"CASE WHEN {tier} < {HEAVY_TIER} THEN {within(HEAVY_ROWS)} "
+        f"WHEN {tier} < {MEDIUM_TIER} THEN {within(MEDIUM_ROWS)} "
+        f"ELSE {within(LIGHT_ROWS)} END"
+    )
+
+
+def reference_insert(spark, name, table, write):
+    """An INSERT of each reference key's rows in the half-open row index
+    range that `write` (0 the initial load, `b` the `b`th append) holds, at
+    `MOR_FIRST_VERSION`: the initial load the rows below the key's tail,
+    and each append its share of the tail."""
+    tail = f"(r DIV {APPEND_TAIL_DIVISOR})"
+    base = f"(r - {tail})"
+    if write == 0:
+        low, high = "0", base
+    else:
+        batch = write - 1
+        low = f"({base} + {tail} * {batch} DIV {APPEND_BATCHES})"
+        high = f"({base} + {tail} * {batch + 1} DIV {APPEND_BATCHES})"
+    counts = f"(SELECT id AS k, {reference_rows()} AS r FROM (SELECT id, {keyed_hash('id')} AS h FROM range({table.keys})))"
+    source = (
+        f"(SELECT k, explode(sequence({low}, {high} - 1)) AS j FROM {counts} WHERE {high} > {low})"
+    )
+    select = ordered_select(table, "k", "j", source, MOR_FIRST_VERSION)
+    spark.sql(f"INSERT INTO {name} {select}")
+
+
+def fill_reference(spark, name, table):
+    """A reference table's initial load: most of every key's rows."""
+    reference_insert(spark, name, table, 0)
+
+
+def append_batches(spark, name, table):
+    """`APPEND_BATCHES` INSERTs of later rows of the keys with a tail: up to
+    a file per bucket each, over the bucket's earlier files' key range."""
+    for write in range(1, APPEND_BATCHES + 1):
+        reference_insert(spark, name, table, write)
 
 
 def summarize(spark, name, started):
@@ -344,7 +467,7 @@ def append_later(spark, name, table):
         table,
         f"id DIV {APPEND_ROWS_PER_KEY}",
         f"{ORDERED_ROWS_PER_KEY} + id % {APPEND_ROWS_PER_KEY}",
-        ORDERED_KEYS * APPEND_ROWS_PER_KEY,
+        f"range({ORDERED_KEYS * APPEND_ROWS_PER_KEY})",
         MOR_FIRST_VERSION,
     )
     spark.sql(f"INSERT INTO {name} {select}")
@@ -362,14 +485,14 @@ def merge_rows(spark, name, table):
         table,
         f"{MERGE_KEY_IDS.start} + id DIV {updated}",
         f"(id % {updated}) * {MERGE_UPDATE_EVERY}",
-        keys * updated,
+        f"range({keys * updated})",
         MOR_UPDATE_VERSION,
     )
     new = ordered_select(
         table,
         f"{MERGE_KEY_IDS.start} + id DIV {inserted}",
         f"(id % {inserted}) * {MERGE_INSERT_EVERY}",
-        keys * inserted,
+        f"range({keys * inserted})",
         MOR_UPDATE_VERSION,
         offset=MERGE_INSERT_OFFSET,
     )
@@ -428,6 +551,8 @@ CONTRACT_GROUP = "contract"
 OFF_CONTRACT_GROUP = "off-contract"
 MOR_GROUP = "mor"
 ORDERED_GROUP = "ordered"
+# Written only when `--only` names it or one of its tables: about 10 GB.
+REFERENCE_GROUP = "reference"
 
 
 class Golden(NamedTuple):
@@ -449,6 +574,9 @@ class Golden(NamedTuple):
     # Set on an ordered table, whose `key_expr` is unused: how its keys and
     # order values are derived, and so the order column's type.
     order: Optional[OrderShape] = None
+    # A reference table's key count, `--reference-keys`; its `rows` is the
+    # total at `REFERENCE_KEYS`, for the summary to be read against.
+    keys: int = 0
 
 
 # Every golden table, in the order a full run writes them.
@@ -674,6 +802,65 @@ TABLES = [
         changes=(rewrite_sorted,),
         order=OrderShape(string=True),
     ),
+    # The reference tables: `REFERENCE_KEYS` keys in `REFERENCE_BUCKETS`
+    # buckets, an initial load and `APPEND_BATCHES` appends of later rows,
+    # then a sorting compaction to the recipe's sizes.
+    Golden(
+        "ref_compacted",
+        REFERENCE_GROUP,
+        "BIGINT",
+        REFERENCE_BUCKETS,
+        REFERENCE_ROWS,
+        None,
+        REFERENCE_REPEATS,
+        incompressible=True,
+        changes=(append_batches, rewrite_sorted),
+        order=OrderShape(timed=True),
+    ),
+    # The same writes left uncompacted: up to one file a bucket per write.
+    Golden(
+        "ref_appended",
+        REFERENCE_GROUP,
+        "BIGINT",
+        REFERENCE_BUCKETS,
+        REFERENCE_ROWS,
+        None,
+        REFERENCE_REPEATS,
+        incompressible=True,
+        changes=(append_batches,),
+        order=OrderShape(timed=True),
+    ),
+    # `ref_compacted` with each instant as ISO-8601 text.
+    Golden(
+        "ref_string",
+        REFERENCE_GROUP,
+        "BIGINT",
+        REFERENCE_BUCKETS,
+        REFERENCE_ROWS,
+        None,
+        REFERENCE_REPEATS,
+        incompressible=True,
+        changes=(append_batches, rewrite_sorted),
+        order=OrderShape(timed=True, string=True),
+    ),
+    # `ref_compacted` with each bucket's file in row groups of about a
+    # quarter of it.
+    Golden(
+        "ref_large_files",
+        REFERENCE_GROUP,
+        "BIGINT",
+        REFERENCE_BUCKETS,
+        REFERENCE_ROWS,
+        None,
+        REFERENCE_REPEATS,
+        extra={
+            "write.target-file-size-bytes": str(LARGE_FILE_BYTES),
+            "write.parquet.row-group-size-bytes": str(LARGE_ROW_GROUP_BYTES),
+        },
+        incompressible=True,
+        changes=(append_batches, rewrite_sorted),
+        order=OrderShape(timed=True),
+    ),
 ]
 
 
@@ -683,10 +870,13 @@ def write(spark, table):
     order_type = None
     if table.order:
         order_type = "STRING" if table.order.string else "BIGINT"
-    name = create(
-        spark, table.name, table.key_type, table.buckets, extra=table.extra, order_type=order_type
-    )
-    if table.order:
+    extra = table.extra
+    if table.group == REFERENCE_GROUP:
+        extra = dict(extra or {}, **{REFERENCE_KEYS_PROPERTY: str(table.keys)})
+    name = create(spark, table.name, table.key_type, table.buckets, extra=extra, order_type=order_type)
+    if table.order and table.order.timed:
+        fill_reference(spark, name, table)
+    elif table.order:
         fill_ordered(spark, name, table)
     else:
         version = MOR_FIRST_VERSION if table.changes else None
@@ -709,12 +899,27 @@ def main():
     parser.add_argument("--warehouse", required=True, help="s3a://bucket/prefix/warehouse or file:///path")
     parser.add_argument(
         "--only",
-        choices=[CONTRACT_GROUP, OFF_CONTRACT_GROUP, MOR_GROUP, ORDERED_GROUP, *(table.name for table in TABLES)],
-        help="write one group, or one table by name, instead of every table",
+        choices=[
+            CONTRACT_GROUP,
+            OFF_CONTRACT_GROUP,
+            MOR_GROUP,
+            ORDERED_GROUP,
+            REFERENCE_GROUP,
+            *(table.name for table in TABLES),
+        ],
+        help=f"write one group, or one table by name, instead of every table but the {REFERENCE_GROUP} group",
+    )
+    parser.add_argument(
+        "--reference-keys",
+        type=int,
+        default=REFERENCE_KEYS,
+        help=f"the keys of each {REFERENCE_GROUP} table, fewer for a quick run; its rows scale with them",
     )
     parser.add_argument("--packages", default=ICEBERG_PACKAGE, help="Maven coordinates for the Iceberg runtime; empty if it is already on the classpath")
     parser.add_argument("--shuffle-partitions", type=int, default=64)
     args = parser.parse_args()
+    if not 0 < args.reference_keys <= REFERENCE_KEYS_MAX:
+        parser.error(f"--reference-keys must be from 1 to {REFERENCE_KEYS_MAX}")
 
     from pyspark.sql import SparkSession
 
@@ -725,6 +930,7 @@ def main():
         .config(f"spark.sql.catalog.{CATALOG}.type", "hadoop")
         .config(f"spark.sql.catalog.{CATALOG}.warehouse", args.warehouse)
         .config("spark.sql.shuffle.partitions", str(args.shuffle_partitions))
+        .config("spark.sql.session.timeZone", "UTC")
     )
     if args.packages:
         builder = builder.config("spark.jars.packages", args.packages)
@@ -734,8 +940,9 @@ def main():
     print(f"spark {spark.version}, warehouse {args.warehouse}", flush=True)
 
     for table in TABLES:
-        if args.only in (None, table.group, table.name):
-            write(spark, table)
+        default = args.only is None and table.group != REFERENCE_GROUP
+        if default or args.only in (table.group, table.name):
+            write(spark, table._replace(keys=args.reference_keys))
 
     print(f"\nset ICETRAY_GOLDEN_WAREHOUSE={args.warehouse} for the golden tests", flush=True)
     spark.stop()

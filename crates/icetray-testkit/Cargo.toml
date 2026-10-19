@@ -21,6 +21,7 @@ hyper-util = { workspace = true }
 iceberg = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 icetray-core = { workspace = true }
+jiff.workspace = true
 object_store = { workspace = true }
 parquet = { workspace = true }
 pin-project-lite = { workspace = true }
