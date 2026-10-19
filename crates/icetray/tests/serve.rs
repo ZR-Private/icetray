@@ -39,7 +39,7 @@ use icetray_testkit::protobuf;
 use icetray_testkit::verify::{expected_cold_gets, series_sum, series_value};
 use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MemoryCatalog, Nulls, OrderKind, Ordered,
-    S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
+    RowsPerKey, S3Fixture, ScanRows, TestScan, ValueKind, memory_catalog_s3, write_fixture,
 };
 use prost::Message;
 use tokio::task::JoinHandle;
@@ -582,11 +582,6 @@ fn wire_key(key: &Key) -> v1::Key {
     v1::Key { key: Some(variant) }
 }
 
-/// The rows every key of the ordered fixtures has.
-fn seven_rows(_: u64) -> u64 {
-    u64::try_from(ROWS_PER_KEY).expect("a row count fits u64")
-}
-
 /// An ordered table named `name` of `ORDERED_IDS` keys, each with
 /// `ROWS_PER_KEY` rows of a long order column.
 fn ordered_spec(name: &str) -> FixtureSpec {
@@ -598,7 +593,9 @@ fn ordered_spec(name: &str) -> FixtureSpec {
             KeyType::Long,
             Ordered {
                 kind: OrderKind::Long,
-                rows_per_key: seven_rows,
+                rows_per_key: RowsPerKey::Each(
+                    u64::try_from(ROWS_PER_KEY).expect("a row count fits u64"),
+                ),
                 start: ORDER_START,
                 step: ORDER_STEP,
             },

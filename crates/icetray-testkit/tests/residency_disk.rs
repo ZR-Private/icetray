@@ -28,7 +28,8 @@ use icetray_testkit::fixture::{
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{
-    Fixture, FixtureSpec, HandSnapshot, OrderKind, Ordered, Result, TestkitError, write_fixture,
+    Fixture, FixtureSpec, HandSnapshot, OrderKind, Ordered, Result, RowsPerKey, TestkitError,
+    write_fixture,
 };
 
 /// The two tables sharing one local directory in the retain test.
@@ -246,7 +247,7 @@ async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read(
     let scratch = tempfile::tempdir()?;
     let ordered = Ordered {
         kind: OrderKind::PaddedStr(PADDED_ORDER_DIGITS),
-        rows_per_key: a_few_rows,
+        rows_per_key: RowsPerKey::By(a_few_rows),
         start: 0,
         step: 1,
     };
@@ -281,10 +282,6 @@ async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read(
 /// order page on each side of it.
 const ROLLED_IDS: std::ops::Range<u64> = 0..200;
 const ROLLED_ROWS_PER_KEY: u64 = 3;
-
-fn rolled_rows(_id: u64) -> u64 {
-    ROLLED_ROWS_PER_KEY
-}
 
 /// Rows per page of the rolled fixture, which its writer writes a batch
 /// at a time, and the file size it rolls at: about a dozen batches, so
@@ -333,7 +330,7 @@ async fn test_disk_restart_of_a_rolled_ordered_table_reads_only_edge_pages() -> 
     let scratch = tempfile::tempdir()?;
     let ordered = Ordered {
         kind: OrderKind::Long,
-        rows_per_key: rolled_rows,
+        rows_per_key: RowsPerKey::Each(ROLLED_ROWS_PER_KEY),
         start: 0,
         step: 1,
     };
@@ -582,9 +579,7 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
 
 /// One row per key: an ordered fixture of this shape also loads under a
 /// key-value entry, which refuses a repeated key.
-fn one_row(_id: u64) -> u64 {
-    1
-}
+const ONE_ROW: RowsPerKey = RowsPerKey::Each(1);
 
 /// The two entries of `fixture`, an ordered fixture whose root is
 /// followed, on one local directory under `dir`: `TABLE_A` a key-value
@@ -637,7 +632,7 @@ async fn test_disk_entries_of_both_kinds_keep_their_own_chunk_files() -> Result<
     let scratch = tempfile::tempdir()?;
     let ordered = Ordered {
         kind: OrderKind::Long,
-        rows_per_key: one_row,
+        rows_per_key: ONE_ROW,
         start: 0,
         step: 1,
     };

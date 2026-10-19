@@ -34,7 +34,7 @@ use icetray_testkit::verify::{
 };
 use icetray_testkit::{
     DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, ORDER_COLUMN, OrderKind, Ordered,
-    RawFile, Result, TestScan, value_for, write_fixture,
+    RawFile, Result, RowsPerKey, TestScan, value_for, write_fixture,
 };
 
 /// The long keys of a raw file, ascending.
@@ -1036,9 +1036,7 @@ async fn test_a_fixed_value_column_at_another_width_is_refused() -> Result<()> {
 
 /// One row per id: the rows per key of the ordered fixtures the resolution
 /// tests write.
-fn one_row(_id: u64) -> u64 {
-    1
-}
+const ONE_ROW: RowsPerKey = RowsPerKey::Each(1);
 
 /// A two-bucket ordered fixture of `IDS_2K` named `name`, one `long` order
 /// value per key, with `SECOND_VALUE_COLUMN` when `second_value`.
@@ -1046,7 +1044,7 @@ async fn ordered_fixture(name: &str, second_value: bool) -> Result<(tempfile::Te
     let (dir, catalog) = local_catalog().await?;
     let ordered = Ordered {
         kind: OrderKind::Long,
-        rows_per_key: one_row,
+        rows_per_key: ONE_ROW,
         start: 0,
         step: 1,
     };

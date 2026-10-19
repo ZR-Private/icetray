@@ -33,7 +33,7 @@ use icetray_testkit::verify::{
 };
 use icetray_testkit::{
     CountingStore, DeleteForm, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle, OrderKind,
-    Ordered, Result, Statistics, TestkitError, write_fixture,
+    Ordered, Result, RowsPerKey, Statistics, TestkitError, write_fixture,
 };
 use object_store::ObjectStore;
 use roaring::RoaringTreemap;
@@ -592,18 +592,10 @@ const ORDERED_PAGE_ROWS: usize = 4;
 /// The id the ordered tests append beside, update, and repeat.
 const AN_ID: u64 = 17;
 
-fn ordered_rows_per_key(_id: u64) -> u64 {
-    ORDERED_ROWS_PER_KEY
-}
-
 /// Rows per key of the late-row fixture: a run of many pages, each page's
 /// order values a narrow slice of it, so the order fences rule out every
 /// page of the run but those a late row can fall among.
 const LONG_RUN_ROWS: u64 = 40;
-
-fn long_runs(_id: u64) -> u64 {
-    LONG_RUN_ROWS
-}
 
 /// The raw order value of a key's `index`-th row.
 fn order_of(index: u64) -> i64 {
@@ -612,10 +604,10 @@ fn order_of(index: u64) -> i64 {
 
 /// `ORDERED_IDS` over two buckets, `rows_per_key` long order values per
 /// key, in pages of `ORDERED_PAGE_ROWS` rows.
-fn ordered_spec(name: &str, rows_per_key: fn(u64) -> u64) -> FixtureSpec {
+fn ordered_spec(name: &str, rows_per_key: u64) -> FixtureSpec {
     let ordered = Ordered {
         kind: OrderKind::Long,
-        rows_per_key,
+        rows_per_key: RowsPerKey::Each(rows_per_key),
         start: ORDER_START,
         step: ORDER_STEP,
     };
@@ -685,7 +677,7 @@ fn gets_by_path(generation: &Generation, counting: &CountingStore) -> Vec<(Strin
 async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
-        let spec = ordered_spec(&format!("ord_later_{at}"), ordered_rows_per_key);
+        let spec = ordered_spec(&format!("ord_later_{at}"), ORDERED_ROWS_PER_KEY);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
         fixture.write_hint().await?;
         let local = tempfile::tempdir()?;
@@ -734,7 +726,7 @@ async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Resu
 #[tokio::test]
 async fn test_refresh_reads_only_the_order_pages_late_rows_fall_among() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
-        let spec = ordered_spec(&format!("ord_late_{at}"), long_runs);
+        let spec = ordered_spec(&format!("ord_late_{at}"), LONG_RUN_ROWS);
         let late = refresh_with_a_late_row(spec, residency).await?;
         assert_eq!(
             late.other_gets, 0,
@@ -771,8 +763,9 @@ async fn test_refresh_reads_only_the_order_pages_late_rows_fall_among() -> Resul
 #[tokio::test]
 async fn test_refresh_reads_the_same_order_pages_without_a_column_index() -> Result<()> {
     let indexed =
-        refresh_with_a_late_row(ordered_spec("ord_indexed", long_runs), Residency::Full).await?;
-    let spec = ordered_spec("ord_unindexed", long_runs);
+        refresh_with_a_late_row(ordered_spec("ord_indexed", LONG_RUN_ROWS), Residency::Full)
+            .await?;
+    let spec = ordered_spec("ord_unindexed", LONG_RUN_ROWS);
     let spec = FixtureSpec {
         layout: Layout {
             order_statistics: Statistics::None,
@@ -800,7 +793,7 @@ async fn test_refresh_reads_the_same_order_pages_without_a_column_index() -> Res
 async fn test_refresh_reads_the_order_dictionary_with_the_pages_late_rows_fall_among() -> Result<()>
 {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
-        let spec = ordered_spec(&format!("ord_dictionary_{at}"), long_runs);
+        let spec = ordered_spec(&format!("ord_dictionary_{at}"), LONG_RUN_ROWS);
         let spec = FixtureSpec {
             layout: Layout {
                 order_dictionary: true,
@@ -839,10 +832,10 @@ const ONE_ORDER_PAGE: u64 = 1;
 #[tokio::test]
 async fn test_late_rows_read_each_touched_old_page_once() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
-        let spec = ordered_spec(&format!("ord_late_once_{at}"), long_runs);
+        let spec = ordered_spec(&format!("ord_late_once_{at}"), LONG_RUN_ROWS);
         let lates = one_page_lates();
         let one = refresh_with_late_rows(spec, residency, &lates[..1]).await?;
-        let spec = ordered_spec(&format!("ord_late_twice_{at}"), long_runs);
+        let spec = ordered_spec(&format!("ord_late_twice_{at}"), LONG_RUN_ROWS);
         let two = refresh_with_late_rows(spec, residency, &lates).await?;
         assert_eq!(two.other_gets, 0, "{residency:?}");
         match residency {
@@ -934,7 +927,7 @@ async fn refresh_with_late_rows(
 async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
-        let spec = ordered_spec(&format!("ord_twice_{at}"), ordered_rows_per_key);
+        let spec = ordered_spec(&format!("ord_twice_{at}"), ORDERED_ROWS_PER_KEY);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
         fixture.write_hint().await?;
         let local = tempfile::tempdir()?;
@@ -987,7 +980,7 @@ async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Resul
 async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
-        let spec = ordered_spec(&format!("ord_updated_{at}"), ordered_rows_per_key);
+        let spec = ordered_spec(&format!("ord_updated_{at}"), ORDERED_ROWS_PER_KEY);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
         fixture.write_hint().await?;
         let local = tempfile::tempdir()?;
@@ -1021,7 +1014,7 @@ async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
 async fn test_a_pair_whose_new_copy_is_deleted_is_served() -> Result<()> {
     for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
-        let spec = ordered_spec(&format!("ord_new_deleted_{at}"), ordered_rows_per_key);
+        let spec = ordered_spec(&format!("ord_new_deleted_{at}"), ORDERED_ROWS_PER_KEY);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
         fixture.write_hint().await?;
         let local = tempfile::tempdir()?;

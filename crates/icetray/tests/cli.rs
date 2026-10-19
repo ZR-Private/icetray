@@ -36,8 +36,8 @@ use icetray_testkit::layout::{Layout, VALUE_COLUMN};
 use icetray_testkit::protobuf;
 use icetray_testkit::verify::{data_files, remove_data_files, series_value, zero_column_chunks};
 use icetray_testkit::{
-    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, ValueKind,
-    memory_catalog_local, write_fixture,
+    DeleteForm, Fixture, FixtureSpec, Nulls, ORDER_COLUMN, Order, OrderKind, Ordered, RowsPerKey,
+    ValueKind, memory_catalog_local, write_fixture,
 };
 use serde_json::Value as Json;
 use tonic::transport::Channel;
@@ -603,11 +603,6 @@ const ORDER_STEP: i64 = 10;
 /// and within `server.max_multi_scan_values`.
 const CONFIGURED_SCAN_ROWS: u32 = 50;
 
-/// The rows per key of an ordered fixture that repeats every pair.
-fn seven_rows(_id: u64) -> u64 {
-    ORDER_ROWS_PER_KEY
-}
-
 /// An ordered fixture of `IDS_2K` in `TWO_BUCKETS`, each key with
 /// `ORDER_ROWS_PER_KEY` timestamps `ORDER_STEP` apart from `ORDER_START`,
 /// or all at `ORDER_START` when `step` is zero, which repeats every pair.
@@ -625,7 +620,7 @@ fn ordered_spec_of(name: &str, kind: OrderKind, start: i64, step: i64) -> Fixtur
             KeyType::Long,
             Ordered {
                 kind,
-                rows_per_key: seven_rows,
+                rows_per_key: RowsPerKey::Each(ORDER_ROWS_PER_KEY),
                 start,
                 step,
             },

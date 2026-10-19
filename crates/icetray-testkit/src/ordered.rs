@@ -212,15 +212,15 @@ pub fn row_value(key: &Key, order: i64, len: usize, kind: ValueKind, version: u6
     value_of_version(&Key::Bytes(pair), len, kind, version)
 }
 
-/// The rows an ordered fixture writes per id: id `i` gets `rows_per_key(i)`
-/// rows whose order values are `start + step * j` for `j` below that count,
-/// written in `kind`'s encoding.
-#[derive(Clone, Copy, Debug)]
+/// The rows an ordered fixture writes per id: id `i` gets
+/// `rows_per_key.of(i)` rows whose order values are `start + step * j` for
+/// `j` below that count, written in `kind`'s encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ordered {
     /// The order column's type.
     pub kind: OrderKind,
-    /// How many rows id `i` has.
-    pub rows_per_key: fn(u64) -> u64,
+    /// How many rows each id has.
+    pub rows_per_key: RowsPerKey,
     /// The first row's raw order value.
     pub start: i64,
     /// The raw distance between a key's consecutive rows; a negative step
@@ -228,25 +228,45 @@ pub struct Ordered {
     pub step: i64,
 }
 
-impl PartialEq for Ordered {
-    /// Equal when every field is, the row count function by the address
-    /// the two specifications were given: the same function value, as a
-    /// copied specification holds.
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && std::ptr::fn_addr_eq(self.rows_per_key, other.rows_per_key)
-            && self.start == other.start
-            && self.step == other.step
+/// How many rows each id of an ordered fixture has.
+#[derive(Clone, Copy, Debug)]
+pub enum RowsPerKey {
+    /// The same count for every id.
+    Each(u64),
+    /// A count that varies by id.
+    By(fn(u64) -> u64),
+}
+
+impl RowsPerKey {
+    /// The rows id `id` has.
+    pub fn of(self, id: u64) -> u64 {
+        match self {
+            Self::Each(rows) => rows,
+            Self::By(rows) => rows(id),
+        }
     }
 }
 
-impl Eq for Ordered {}
+impl PartialEq for RowsPerKey {
+    /// Equal when both are the same count, or the same function by the
+    /// address the two specifications were given: the same function value,
+    /// as a copied specification holds.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Each(one), Self::Each(other)) => one == other,
+            (Self::By(one), Self::By(other)) => std::ptr::fn_addr_eq(*one, *other),
+            (Self::Each(_), Self::By(_)) | (Self::By(_), Self::Each(_)) => false,
+        }
+    }
+}
+
+impl Eq for RowsPerKey {}
 
 impl Ordered {
     /// The raw order values of `id`'s rows, in the order they are written;
     /// one past the largest long is `SpecFault::OrderOverflow`.
     pub fn orders_of(&self, id: u64) -> Result<Vec<i64>> {
-        (0..(self.rows_per_key)(id))
+        (0..self.rows_per_key.of(id))
             .map(|index| {
                 i64::try_from(index)
                     .ok()
@@ -607,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_orders_of_counts_the_rows_and_refuses_an_overflow() {
-        let spec = ordered(OrderKind::Long, three);
+        let spec = ordered(OrderKind::Long, THREE_ROWS);
         let expected: Vec<i64> = (0..THREE).map(order_of).collect();
         assert_eq!(spec.orders_of(0).unwrap(), expected);
         let overflowing = Ordered {
@@ -660,9 +680,8 @@ mod tests {
         ORDER_START + ORDER_STEP * i64::try_from(index).unwrap()
     }
 
-    fn three(_: u64) -> u64 {
-        u64::try_from(THREE).unwrap()
-    }
+    /// `THREE` rows for every id.
+    const THREE_ROWS: RowsPerKey = RowsPerKey::Each(THREE as u64);
 
     /// Rows per key of the row group test: more than a row group holds.
     const SIX: usize = 6;
@@ -670,9 +689,8 @@ mod tests {
     /// Rows per row group of the row group test.
     const ROW_GROUP_ROWS: usize = 4;
 
-    fn six(_: u64) -> u64 {
-        u64::try_from(SIX).unwrap()
-    }
+    /// `SIX` rows for every id.
+    const SIX_ROWS: RowsPerKey = RowsPerKey::Each(SIX as u64);
 
     /// An id whose order values overflow.
     const OVERFLOWING_ID: u64 = 5;
@@ -683,7 +701,7 @@ mod tests {
     }
 
     /// `rows_per_key` rows of kind `kind` for every id.
-    fn ordered(kind: OrderKind, rows_per_key: fn(u64) -> u64) -> Ordered {
+    fn ordered(kind: OrderKind, rows_per_key: RowsPerKey) -> Ordered {
         Ordered {
             kind,
             rows_per_key,
@@ -693,7 +711,7 @@ mod tests {
     }
 
     /// A small ordered spec: `IDS` over two buckets.
-    fn spec(name: &str, kind: OrderKind, rows_per_key: fn(u64) -> u64) -> FixtureSpec {
+    fn spec(name: &str, kind: OrderKind, rows_per_key: RowsPerKey) -> FixtureSpec {
         FixtureSpec {
             ids: IDS,
             buckets: TWO_BUCKETS,
@@ -734,7 +752,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_fixture_writes_each_key_s_rows_sorted_by_order() -> Result<()> {
-        let (_dir, _catalog, fixture) = written(spec("events", OrderKind::Long, three)).await?;
+        let (_dir, _catalog, fixture) =
+            written(spec("events", OrderKind::Long, THREE_ROWS)).await?;
         let oracle = MergeOracle::read(&fixture).await?;
         let key = fixture.key(SAMPLE[0]);
         let copies = oracle.copies(&key);
@@ -752,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_fixture_writes_every_file_sorted_by_key_then_order() -> Result<()> {
         let (_dir, _catalog, fixture) =
-            written(spec("sorted", OrderKind::Long, up_to_four)).await?;
+            written(spec("sorted", OrderKind::Long, RowsPerKey::By(up_to_four))).await?;
         let oracle = MergeOracle::read(&fixture).await?;
         let mut by_file: BTreeMap<String, Vec<(u64, Key, Option<OrderValue>)>> = BTreeMap::new();
         for key in oracle.keys() {
@@ -798,7 +817,7 @@ mod tests {
         for (at, kind) in kinds.into_iter().enumerate() {
             let spec = FixtureSpec {
                 format_version: FormatVersion::V3,
-                ..spec(&format!("kind_{at}"), kind, three)
+                ..spec(&format!("kind_{at}"), kind, THREE_ROWS)
             };
             let (_dir, _catalog, fixture) = written(spec).await?;
             let schema = fixture.metadata().current_schema();
@@ -832,9 +851,9 @@ mod tests {
         let spec = FixtureSpec {
             ordered: Some(Ordered {
                 start: -1,
-                ..ordered(OrderKind::Str, three)
+                ..ordered(OrderKind::Str, THREE_ROWS)
             }),
-            ..spec("negative", OrderKind::Str, three)
+            ..spec("negative", OrderKind::Str, THREE_ROWS)
         };
         let refused = write_fixture(catalog.as_ref(), NAMESPACE, spec).await;
         assert!(
@@ -854,7 +873,7 @@ mod tests {
     async fn test_write_fixture_declares_the_order_column_and_its_sort() -> Result<()> {
         let spec = FixtureSpec {
             second_value: true,
-            ..spec("declared", OrderKind::Long, three)
+            ..spec("declared", OrderKind::Long, THREE_ROWS)
         };
         let (_dir, _catalog, fixture) = written(spec).await?;
         let metadata = fixture.metadata();
@@ -927,7 +946,7 @@ mod tests {
                 row_group_rows: Some(ROW_GROUP_ROWS),
                 ..Layout::contract()
             },
-            ..spec("groups", OrderKind::Long, six)
+            ..spec("groups", OrderKind::Long, SIX_ROWS)
         };
         let (_dir, _catalog, fixture) = written(spec).await?;
         let oracle = MergeOracle::read(&fixture).await?;
@@ -958,7 +977,7 @@ mod tests {
         };
         let (_dir, _catalog, fixture) = written(FixtureSpec {
             layout,
-            ..spec("layout", OrderKind::Long, three)
+            ..spec("layout", OrderKind::Long, THREE_ROWS)
         })
         .await?;
         let file = fixture.files()[0].file_path().to_string();
@@ -1001,7 +1020,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_admits_a_key_repeated_and_refuses_a_live_pair_repeated() -> Result<()> {
-        let (_dir, catalog, mut fixture) = written(spec("pairs", OrderKind::Long, three)).await?;
+        let (_dir, catalog, mut fixture) =
+            written(spec("pairs", OrderKind::Long, THREE_ROWS)).await?;
         let key = fixture.key(AN_ID);
         let new_order = order_of(THREE);
         fixture
@@ -1027,7 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_admits_a_pair_whose_older_copy_is_deleted() -> Result<()> {
         let (_dir, _catalog, mut fixture) =
-            written(spec("updated", OrderKind::Long, three)).await?;
+            written(spec("updated", OrderKind::Long, THREE_ROWS)).await?;
         let key = fixture.key(AN_ID);
         fixture
             .update_rows(&[(AN_ID, order_of(1))], DeleteForm::Vectors, "update")
@@ -1059,7 +1079,11 @@ mod tests {
             let spec = FixtureSpec {
                 second_value: true,
                 nulls: Nulls::EveryNth(NULL_EVERY),
-                ..spec(&format!("changes_{at}"), OrderKind::Long, up_to_four)
+                ..spec(
+                    &format!("changes_{at}"),
+                    OrderKind::Long,
+                    RowsPerKey::By(up_to_four),
+                )
             };
             let (_dir, catalog, mut fixture) = written(spec).await?;
             let [appended, deleted_from, updated, other_updated, emptied] = CHANGED_IDS;
@@ -1183,7 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_rows_refuses_a_pair_that_is_not_live() -> Result<()> {
         let (_dir, _catalog, mut fixture) =
-            written(spec("not_live", OrderKind::Long, three)).await?;
+            written(spec("not_live", OrderKind::Long, THREE_ROWS)).await?;
         let missing = order_of(THREE);
         let refused = fixture
             .delete_rows(&[(AN_ID, missing)], DeleteForm::Vectors, "gone")
@@ -1230,7 +1254,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_ref_returns_an_ordered_fixture_to_the_rows_it_listed() -> Result<()> {
-        let (_dir, _catalog, mut fixture) = written(spec("moved", OrderKind::Long, three)).await?;
+        let (_dir, _catalog, mut fixture) =
+            written(spec("moved", OrderKind::Long, THREE_ROWS)).await?;
         let key = fixture.key(AN_ID);
         let before = fixture.snapshot_id().unwrap();
         let all = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
@@ -1253,7 +1278,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_expected_scan_of_a_key_the_fixture_does_not_hold_has_no_rows() -> Result<()> {
-        let (_dir, _catalog, fixture) = written(spec("absent", OrderKind::Long, three)).await?;
+        let (_dir, _catalog, fixture) =
+            written(spec("absent", OrderKind::Long, THREE_ROWS)).await?;
         for key in [fixture.absent_near(AN_ID), fixture.key(IDS.end)] {
             assert_eq!(
                 fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default()),

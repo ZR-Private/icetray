@@ -38,7 +38,7 @@ use icetray_testkit::layout::{KEY_COLUMN, VALUE_COLUMN};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS};
 use icetray_testkit::{
     Bloom, DeleteForm, Dictionary, Fixture, FixtureSpec, HandSnapshot, Layout, MergeOracle,
-    ORDER_COLUMN, Order, OrderKind, Ordered, RawFile, Result, TestkitError, value_for,
+    ORDER_COLUMN, Order, OrderKind, Ordered, RawFile, Result, RowsPerKey, TestkitError, value_for,
     write_fixture,
 };
 
@@ -795,9 +795,7 @@ const FENCE_BUDGET_TRUNCATE: usize = 16;
 
 /// Rows per key of the fence budget fixture; every key holds the same
 /// order values, so the order column's dictionary is small.
-fn thirty_rows(_id: u64) -> u64 {
-    30
-}
+const FENCE_BUDGET_ROWS: u64 = 30;
 
 /// An ordered table whose order column is dictionary-encoded, its values
 /// long strings repeated across keys, under a truncated column index: no
@@ -818,7 +816,7 @@ async fn fence_budget_fixture(catalog: &Arc<dyn Catalog>, name: &str) -> Result<
             KeyType::Long,
             Ordered {
                 kind: OrderKind::PaddedStr(FENCE_BUDGET_DIGITS),
-                rows_per_key: thirty_rows,
+                rows_per_key: RowsPerKey::Each(FENCE_BUDGET_ROWS),
                 start: 0,
                 step: 1,
             },
@@ -1330,17 +1328,16 @@ async fn test_file_written_before_the_order_column_is_refused_as_column_mismatch
     Ok(())
 }
 
-/// Two rows per id: every key of an ordered fixture of this shape repeats.
-fn two_rows(_id: u64) -> u64 {
-    2
-}
+/// Rows per id: two, so every key of an ordered fixture of this shape
+/// repeats.
+const REPEATED_ROWS: u64 = 2;
 
 /// A one-bucket ordered fixture of `IDS_2K` named `name`, two `long` order
 /// values per key `step` apart from zero.
 async fn two_row_fixture(catalog: &Arc<dyn Catalog>, name: &str, step: i64) -> Result<Fixture> {
     let ordered = Ordered {
         kind: OrderKind::Long,
-        rows_per_key: two_rows,
+        rows_per_key: RowsPerKey::Each(REPEATED_ROWS),
         start: 0,
         step,
     };

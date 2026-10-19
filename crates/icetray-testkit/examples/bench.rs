@@ -70,9 +70,9 @@ use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
 use icetray_testkit::{
-    FixtureSpec, KeyShape, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered, RoundsStore, TestScan,
-    ValueKind, absent_key_from, key_at_shaped, order_value, row_value, scan_model, value_of_kind,
-    write_fixture,
+    FixtureSpec, KeyShape, MemoryCatalog, ORDER_COLUMN, OrderKind, Ordered, RoundsStore,
+    RowsPerKey, TestScan, ValueKind, absent_key_from, key_at_shaped, order_value, row_value,
+    scan_model, value_of_kind, write_fixture,
 };
 use object_store::ObjectStore;
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
@@ -977,15 +977,10 @@ const ORDER_STEP: i64 = 60_000_000;
 /// scenario's every key (`ScanCase`).
 const ORDERED: Ordered = Ordered {
     kind: OrderKind::Timestamp,
-    rows_per_key: ordered_rows_per_key,
+    rows_per_key: RowsPerKey::Each(ORDERED_ROWS_PER_KEY),
     start: ORDER_START,
     step: ORDER_STEP,
 };
-
-/// `ORDERED_ROWS_PER_KEY` for every id.
-fn ordered_rows_per_key(_: u64) -> u64 {
-    ORDERED_ROWS_PER_KEY
-}
 
 /// Rows per key of the long-run tables: ten times the default
 /// `max_scan_rows`, so a run spans ten of the contract's 1,000-row order
@@ -1000,15 +995,10 @@ const LONG_RUN_KEYS: u64 = ROWS / LONG_RUN_ROWS;
 /// Keys a long-run table's second build appends, each with its whole run.
 const LONG_RUN_APPENDED_KEYS: u64 = LONG_RUN_KEYS / APPEND_DIVISOR;
 
-/// `LONG_RUN_ROWS` for every id.
-fn long_run_rows(_: u64) -> u64 {
-    LONG_RUN_ROWS
-}
-
 /// The order column of the long-run and rolled tables: `ORDERED`'s
 /// timestamps, `LONG_RUN_ROWS` of them a key.
 const LONG_RUN: Ordered = Ordered {
-    rows_per_key: long_run_rows,
+    rows_per_key: RowsPerKey::Each(LONG_RUN_ROWS),
     ..ORDERED
 };
 
@@ -1054,16 +1044,11 @@ const SHORT_RUN_ROWS: u64 = 20;
 /// bucket in all.
 const OVERLAPPING_APPENDS: u64 = 4;
 
-/// `SHORT_RUN_ROWS` for every id.
-fn short_run_rows(_: u64) -> u64 {
-    SHORT_RUN_ROWS
-}
-
 /// The order column of the appended table's first commit: `ORDERED`'s
 /// timestamps, `SHORT_RUN_ROWS` of them a key; the appends that follow
 /// write later ones (`overlapping_rows`).
 const SHORT_RUN: Ordered = Ordered {
-    rows_per_key: short_run_rows,
+    rows_per_key: RowsPerKey::Each(SHORT_RUN_ROWS),
     ..ORDERED
 };
 
@@ -1312,7 +1297,7 @@ impl TableShape {
     /// Rows per key of the first commit: one in a key-value table, and in
     /// an ordered table as many as its first key has, which every key has.
     fn rows_per_key(self) -> u64 {
-        self.ordered.map_or(1, |ordered| (ordered.rows_per_key)(0))
+        self.ordered.map_or(1, |ordered| ordered.rows_per_key.of(0))
     }
 
     /// The appends of every key's later rows the first build makes after

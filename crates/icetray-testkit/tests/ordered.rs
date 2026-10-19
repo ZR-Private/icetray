@@ -27,7 +27,7 @@ use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{self, Served};
 use icetray_testkit::{
     DeleteForm, Dictionary, Fixture, FixtureSpec, Layout, MergeOracle, Nulls, OrderKind, Ordered,
-    Result, Statistics, TestScan, order_value, write_fixture,
+    Result, RowsPerKey, Statistics, TestScan, order_value, write_fixture,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
@@ -96,15 +96,12 @@ const ORDER_KINDS: [OrderKind; 9] = [
 const TRUNCATE_INDEX: usize = 6;
 
 /// The row counts per key a draw takes.
-const ROWS_PER_KEY: [fn(u64) -> u64; 4] = [one_row, three_rows, up_to_five, up_to_nine];
-
-fn one_row(_: u64) -> u64 {
-    1
-}
-
-fn three_rows(_: u64) -> u64 {
-    3
-}
+const ROWS_PER_KEY: [RowsPerKey; 4] = [
+    RowsPerKey::Each(1),
+    RowsPerKey::Each(3),
+    RowsPerKey::By(up_to_five),
+    RowsPerKey::By(up_to_nine),
+];
 
 /// Zero to four rows, so some keys have none.
 fn up_to_five(id: u64) -> u64 {
@@ -751,10 +748,6 @@ const HISTORY_STEP: i64 = 4;
 /// Ids of the hand-built tables.
 const HISTORY_IDS: Range<u64> = 0..8;
 
-fn history_rows(_: u64) -> u64 {
-    HISTORY_ROWS
-}
-
 /// A hand-built ordered table of `kind`: `HISTORY_IDS`, `HISTORY_ROWS`
 /// each, in small pages and row groups, two value columns, written to a
 /// fresh catalog.
@@ -778,7 +771,7 @@ async fn history_table(
             KeyType::Long,
             Ordered {
                 kind,
-                rows_per_key: history_rows,
+                rows_per_key: RowsPerKey::Each(HISTORY_ROWS),
                 start: ORDER_START,
                 step: HISTORY_STEP,
             },
@@ -990,13 +983,10 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
     Ok(())
 }
 
-/// Ids of the compacted tables, three rows each, over two buckets, so a
-/// middle key's run lies inside one key page of one row group.
+/// Ids of the compacted tables, `COMPACTED_ROWS` rows each, over two
+/// buckets, so a middle key's run lies inside one key page of one row group.
 const COMPACTED_IDS: Range<u64> = 0..40;
-
-fn compacted_rows(_: u64) -> u64 {
-    3
-}
+const COMPACTED_ROWS: u64 = 3;
 
 /// A compacted ordered table of `COMPACTED_IDS` in the contract layout: one
 /// file per bucket, one row group, no dictionary-encoded column, both value
@@ -1012,7 +1002,7 @@ async fn compacted_table(name: &str) -> Result<(TempDir, Arc<dyn Catalog>, Fixtu
             KeyType::Long,
             Ordered {
                 kind: OrderKind::Long,
-                rows_per_key: compacted_rows,
+                rows_per_key: RowsPerKey::Each(COMPACTED_ROWS),
                 start: ORDER_START,
                 step: HISTORY_STEP,
             },
@@ -1114,7 +1104,7 @@ async fn test_scan_reads_only_files_that_hold_the_key() -> Result<()> {
             KeyType::Long,
             Ordered {
                 kind: OrderKind::Long,
-                rows_per_key: compacted_rows,
+                rows_per_key: RowsPerKey::Each(COMPACTED_ROWS),
                 start: ORDER_START,
                 step: HISTORY_STEP,
             },
@@ -1333,7 +1323,7 @@ async fn test_scan_answers_a_column_added_after_a_file_with_its_default() -> Res
             KeyType::Long,
             Ordered {
                 kind: OrderKind::Long,
-                rows_per_key: compacted_rows,
+                rows_per_key: RowsPerKey::Each(COMPACTED_ROWS),
                 start: ORDER_START,
                 step: HISTORY_STEP,
             },

@@ -38,8 +38,8 @@ use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::layout::{OVERSIZED_FPP, UNDERSIZED_FPP};
 use icetray_testkit::verify::{self, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served};
 use icetray_testkit::{
-    Bloom, Dictionary, Fixture, FixtureSpec, Layout, OrderKind, Ordered, Result, Statistics,
-    TestkitError, write_fixture,
+    Bloom, Dictionary, Fixture, FixtureSpec, Layout, OrderKind, Ordered, Result, RowsPerKey,
+    Statistics, TestkitError, write_fixture,
 };
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
@@ -765,10 +765,6 @@ const ORDER_STEP: i64 = 10;
 /// file's distinct keys holds a third of its bits per row.
 const ROWS_PER_KEY: u64 = 3;
 
-fn three_rows(_: u64) -> u64 {
-    ROWS_PER_KEY
-}
-
 /// An ordered table named `name` of `IDS_2K` in `TWO_BUCKETS`, each key
 /// with `ROWS_PER_KEY` rows of a `kind` order column, in the contract
 /// layout: one file per bucket, one row group each.
@@ -781,7 +777,7 @@ fn ordered_spec(name: &str, kind: OrderKind) -> FixtureSpec {
             KeyType::Long,
             Ordered {
                 kind,
-                rows_per_key: three_rows,
+                rows_per_key: RowsPerKey::Each(ROWS_PER_KEY),
                 start: ORDER_START,
                 step: ORDER_STEP,
             },
@@ -1173,7 +1169,7 @@ async fn test_long_runs_is_advice_above_one_thousand_rows() -> Result<()> {
     let spec = FixtureSpec {
         ordered: Some(Ordered {
             kind: OrderKind::Long,
-            rows_per_key: one_long_run,
+            rows_per_key: RowsPerKey::By(one_long_run),
             start: ORDER_START,
             step: ORDER_STEP,
         }),

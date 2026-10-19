@@ -23,7 +23,7 @@ use icetray_testkit::protobuf::{
 };
 use icetray_testkit::verify::{self, ColdCosts};
 use icetray_testkit::{
-    Fixture, FixtureSpec, Nulls, OrderKind, Ordered, Result, TestScan, ValueKind,
+    Fixture, FixtureSpec, Nulls, OrderKind, Ordered, Result, RowsPerKey, TestScan, ValueKind,
     memory_catalog_local, write_fixture,
 };
 
@@ -202,10 +202,6 @@ const SCAN_ROWS: u64 = 4;
 const ORDER_START: i64 = 1_000;
 const ORDER_STEP: i64 = 10;
 
-fn scan_rows(_: u64) -> u64 {
-    SCAN_ROWS
-}
-
 /// A malformed value a Scan reads fails the call, naming the key and the
 /// order value of the row that holds it, so a caller paging the key's rows
 /// can step past it.
@@ -220,7 +216,7 @@ async fn test_a_malformed_value_fails_a_scan_naming_the_key_and_the_row() -> Res
             KeyType::Long,
             Ordered {
                 kind: OrderKind::Long,
-                rows_per_key: scan_rows,
+                rows_per_key: RowsPerKey::Each(SCAN_ROWS),
                 start: ORDER_START,
                 step: ORDER_STEP,
             },
