@@ -604,27 +604,54 @@ pub(super) async fn verify_rows(
     deletes: &Arc<[Option<Arc<FileDeletes>>]>,
     read_ahead: u64,
 ) -> Result<RowCheck> {
-    let spans: Vec<OrderedSpan<'_>> = files.iter().map(|file| OrderedSpan::of(file)).collect();
-    let checked: Vec<bool> = members
-        .iter()
-        .map(|member| !member.reused || member.shrank)
-        .collect();
-    let mut compared = 0;
-    let mut merges = Vec::new();
-    for group in groups {
-        if !group.iter().any(|&at| checked[at]) {
-            continue;
-        }
-        let counterparts = meetings(&spans, &checked, group, &mut compared);
-        let reads = chosen_pages(&spans, files, group, &counterparts, &mut compared);
-        if !reads.is_empty() {
-            merges.push(reads);
-        }
-    }
+    let GroupMerges {
+        checked,
+        merges,
+        compared,
+    } = GroupMerges::of(members, files, groups);
     let mut check =
         refuse_duplicate_rows(table, files, &checked, merges, deletes, read_ahead).await?;
     check.compared += compared;
     Ok(check)
+}
+
+/// What `verify_rows` merges: which files of `files` it checks, the chosen
+/// pages of each overlap group that merges, in group order, and the
+/// comparisons choosing them took.
+struct GroupMerges {
+    checked: Vec<bool>,
+    merges: Vec<Vec<(usize, Vec<GroupPages>)>>,
+    compared: u64,
+}
+
+impl GroupMerges {
+    /// The merges of `groups`, `members` saying which of `files` are
+    /// checked: per group that holds a checked file, the sweep and then the
+    /// chosen pages, a group where no page is chosen left out.
+    fn of(members: &[Member], files: &[Arc<LoadedFile>], groups: &[Vec<usize>]) -> Self {
+        let spans: Vec<OrderedSpan<'_>> = files.iter().map(|file| OrderedSpan::of(file)).collect();
+        let checked: Vec<bool> = members
+            .iter()
+            .map(|member| !member.reused || member.shrank)
+            .collect();
+        let mut compared = 0;
+        let mut merges = Vec::new();
+        for group in groups {
+            if !group.iter().any(|&at| checked[at]) {
+                continue;
+            }
+            let counterparts = meetings(&spans, &checked, group, &mut compared);
+            let reads = chosen_pages(&spans, files, group, &counterparts, &mut compared);
+            if !reads.is_empty() {
+                merges.push(reads);
+            }
+        }
+        Self {
+            checked,
+            merges,
+            compared,
+        }
+    }
 }
 
 /// One row group of a cursor's file as read: the cursor, the row group's
@@ -672,10 +699,12 @@ type Stepped = (
 /// before it has passed, else every merge's pass. Once a merge fails, every
 /// merge after it stops, its outcome no longer able to change the load's:
 /// its step ends before its next pair, its reads under way are aborted, and
-/// what it holds is dropped. A read that fails, ahead of need or not, fails
-/// its merge at once, even where the merge would have refused before it
-/// reached that row group. A canceled step is `Error::VerifyCanceled` for
-/// its merge's first checked file.
+/// what it holds is dropped. A step under way when the outcome is known
+/// runs on the blocking pool after this returns, up to its next stop
+/// check, and holds its row groups until then. A read that fails, ahead of
+/// need or not, fails its merge at once, even where the merge would have
+/// refused before it reached that row group. A canceled step is
+/// `Error::VerifyCanceled` for its merge's first checked file.
 async fn refuse_duplicate_rows(
     table: &str,
     files: &[Arc<LoadedFile>],
@@ -685,49 +714,9 @@ async fn refuse_duplicate_rows(
     read_ahead: u64,
 ) -> Result<RowCheck> {
     let mut ahead = ReadAhead::new(files, &merges, read_ahead, load_concurrency());
-    let mut run = Merges::new(table, files, checked, merges, deletes);
-    let mut steps: FuturesUnordered<BoxFuture<'static, Stepped>> = FuturesUnordered::new();
-    let most_steps = shard::workers();
-    loop {
-        if let Some(outcome) = run.settled() {
-            return outcome.map(|compared| RowCheck {
-                merges: run.states.len(),
-                compared,
-                held: ahead.most_taken,
-            });
-        }
-        run.hand_over(&mut ahead);
-        ahead.start();
-        let room = ahead.room();
-        while steps.len() < most_steps {
-            let Some((merge, mut state)) = run.next_step(&ahead) else {
-                break;
-            };
-            let batch = std::mem::take(&mut ahead.landed[merge]);
-            steps.push(Box::pin(async move {
-                let stepped = blocking::on_blocking_pool(move || {
-                    let progress = state.resume(batch, room);
-                    (state, progress)
-                })
-                .await;
-                (merge, stepped)
-            }));
-        }
-        if steps.is_empty() {
-            let one = ahead
-                .in_flight
-                .next()
-                .await
-                .expect("a row group a merge waits on is being read");
-            run.land(one, &mut ahead);
-            continue;
-        }
-        tokio::select! {
-            biased;
-            Some((merge, stepped)) = steps.next() => run.stepped(merge, stepped, &mut ahead),
-            Some(one) = ahead.in_flight.next() => run.land(one, &mut ahead),
-        }
-    }
+    Merges::new(table, files, checked, merges, deletes)
+        .drive(&mut ahead)
+        .await
 }
 
 /// The merges of `refuse_duplicate_rows`, in group order, between their
@@ -750,6 +739,8 @@ struct Merges {
     failed: Option<(usize, Error)>,
     /// The comparisons of the merges that passed.
     compared: u64,
+    /// The steps under way on the blocking pool.
+    steps: FuturesUnordered<BoxFuture<'static, Stepped>>,
 }
 
 impl Merges {
@@ -792,6 +783,54 @@ impl Merges {
             firsts,
             failed: None,
             compared: 0,
+            steps: FuturesUnordered::new(),
+        }
+    }
+
+    /// Runs the merges, reading through `ahead`, until the outcome is known
+    /// (`settled`): starts the reads they want and the steps that can go
+    /// on, then takes the next step to return or read to land.
+    async fn drive(&mut self, ahead: &mut ReadAhead) -> Result<RowCheck> {
+        let most_steps = shard::workers();
+        loop {
+            if let Some(outcome) = self.settled() {
+                return outcome.map(|compared| RowCheck {
+                    merges: self.states.len(),
+                    compared,
+                    held: ahead.most_taken,
+                });
+            }
+            self.hand_over(ahead);
+            ahead.start();
+            let room = ahead.room();
+            while self.steps.len() < most_steps {
+                let Some((merge, mut state)) = self.next_step(ahead) else {
+                    break;
+                };
+                let batch = std::mem::take(&mut ahead.landed[merge]);
+                self.steps.push(Box::pin(async move {
+                    let stepped = blocking::on_blocking_pool(move || {
+                        let progress = state.resume(batch, room);
+                        (state, progress)
+                    })
+                    .await;
+                    (merge, stepped)
+                }));
+            }
+            if self.steps.is_empty() {
+                let one = ahead
+                    .in_flight
+                    .next()
+                    .await
+                    .expect("a row group a merge waits on is being read");
+                self.land(one, ahead);
+                continue;
+            }
+            tokio::select! {
+                biased;
+                Some((merge, stepped)) = self.steps.next() => self.stepped(merge, stepped, ahead),
+                Some(one) = ahead.in_flight.next() => self.land(one, ahead),
+            }
         }
     }
 
@@ -1917,28 +1956,101 @@ mod tests {
         gone: &[Vec<u64>],
         read_ahead: u64,
     ) -> (Vec<Vec<usize>>, Result<RowCheck>) {
-        let files: Vec<Arc<LoadedFile>> = built.iter().map(|one| Arc::clone(&one.file)).collect();
-        let deletes: Arc<[Option<Arc<FileDeletes>>]> = gone
-            .iter()
-            .map(|rows| {
-                (!rows.is_empty()).then(|| Arc::new(FileDeletes::of_rows(rows.iter().copied())))
-            })
-            .collect();
-        let members: Vec<Member> = files
-            .iter()
-            .zip(reused.iter().zip(shrank))
-            .zip(deletes.iter())
-            .map(|((file, (&reused, &shrank)), deletes)| Member {
-                file: Arc::clone(file),
-                reused,
-                deletes: deletes.clone(),
-                shrank,
-            })
-            .collect();
-        let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
-        let groups = overlap_groups(&spans, &routes(&spans));
-        let check = verify_rows(TABLE, &members, &files, &groups, &deletes, read_ahead).await;
-        (groups, check)
+        let generation = Checked::of(built, reused, shrank, gone);
+        let check = verify_rows(
+            TABLE,
+            &generation.members,
+            &generation.files,
+            &generation.groups,
+            &generation.deletes,
+            read_ahead,
+        )
+        .await;
+        (generation.groups, check)
+    }
+
+    /// The generation the check across files of a test sees: its files,
+    /// their members, each file's deleted rows, and the overlap groups.
+    struct Checked {
+        files: Vec<Arc<LoadedFile>>,
+        members: Vec<Member>,
+        deletes: Arc<[Option<Arc<FileDeletes>>]>,
+        groups: Vec<Vec<usize>>,
+    }
+
+    impl Checked {
+        /// The generation of `built`, which are in file order, each reused
+        /// where `reused` says so, with deletes that shrank where `shrank`
+        /// says so, and the rows at the positions of `gone` deleted.
+        fn of(built: &[Built], reused: &[bool], shrank: &[bool], gone: &[Vec<u64>]) -> Self {
+            let files: Vec<Arc<LoadedFile>> =
+                built.iter().map(|one| Arc::clone(&one.file)).collect();
+            let deletes: Arc<[Option<Arc<FileDeletes>>]> = gone
+                .iter()
+                .map(|rows| {
+                    (!rows.is_empty()).then(|| Arc::new(FileDeletes::of_rows(rows.iter().copied())))
+                })
+                .collect();
+            let members: Vec<Member> = files
+                .iter()
+                .zip(reused.iter().zip(shrank))
+                .zip(deletes.iter())
+                .map(|((file, (&reused, &shrank)), deletes)| Member {
+                    file: Arc::clone(file),
+                    reused,
+                    deletes: deletes.clone(),
+                    shrank,
+                })
+                .collect();
+            let spans: Vec<Span<'_>> = files.iter().map(|file| Span::of(file)).collect();
+            let groups = overlap_groups(&spans, &routes(&spans));
+            Self {
+                files,
+                members,
+                deletes,
+                groups,
+            }
+        }
+
+        /// The check of every group at once, as `verify_rows` runs it, and
+        /// then everything it left under way let end: its steps return and
+        /// its reads land, and both are dropped. With the bytes `ReadAhead`
+        /// still counts taken after that, which the end of every merge
+        /// hands back, so none.
+        async fn check_released(&self, read_ahead: u64) -> (Result<RowCheck>, u64) {
+            let GroupMerges {
+                checked, merges, ..
+            } = GroupMerges::of(&self.members, &self.files, &self.groups);
+            let mut ahead = ReadAhead::new(&self.files, &merges, read_ahead, load_concurrency());
+            let mut run = Merges::new(TABLE, &self.files, &checked, merges, &self.deletes);
+            let check = run.drive(&mut ahead).await;
+            while let Some((merge, stepped)) = run.steps.next().await {
+                run.stepped(merge, stepped, &mut ahead);
+            }
+            while let Some(one) = ahead.in_flight.next().await {
+                run.land(one, &mut ahead);
+            }
+            (check, ahead.taken)
+        }
+
+        /// The outcome of checking the groups one at a time, in group
+        /// order: the first group's failure, or the merges of all.
+        async fn check_serially(&self, read_ahead: u64) -> Result<usize> {
+            let mut merges = 0;
+            for group in 0..self.groups.len() {
+                let check = verify_rows(
+                    TABLE,
+                    &self.members,
+                    &self.files,
+                    &self.groups[group..=group],
+                    &self.deletes,
+                    read_ahead,
+                )
+                .await?;
+                merges += check.merges;
+            }
+            Ok(merges)
+        }
     }
 
     /// Files a first load of an appended bucket holds: one per append, each
@@ -2746,7 +2858,7 @@ mod tests {
     /// once than any one group's chosen pages, so they merge together, and
     /// no more than the budget beyond one row group of each file of every
     /// group: the budget is the load's, not each merge's. Every page is
-    /// read once.
+    /// read once, and every merge hands back the bytes it took.
     #[tokio::test]
     async fn test_verify_rows_holds_every_group_within_one_budget() {
         for residency in Residency::ALL {
@@ -2764,10 +2876,11 @@ mod tests {
             let before: Vec<[u64; 4]> = files.iter().map(io).collect();
             let reused = vec![false; files.len()];
             let none = vec![Vec::new(); files.len()];
-            let (groups, check) =
-                check_rows_deleting(&files, &reused, &reused, &none, budget).await;
+            let generation = Checked::of(&files, &reused, &reused, &none);
+            let (check, taken) = generation.check_released(budget).await;
             let check = check.unwrap();
-            assert_eq!(groups.len(), MERGED_GROUPS, "{residency:?}");
+            assert_eq!(taken, 0, "{residency:?}: every merge hands back its bytes");
+            assert_eq!(generation.groups.len(), MERGED_GROUPS, "{residency:?}");
             assert_eq!(check.merges, MERGED_GROUPS, "{residency:?}");
             let read = io_since(&files, &before);
             assert_eq!(
@@ -3368,6 +3481,219 @@ mod tests {
                 && seen.shrank_refusals > 0
                 && seen.several_groups > 0
                 && seen.corner_refusals > 0,
+            "{seen:?}"
+        );
+    }
+
+    /// Worker threads of the runtime of the wide drawn check: several, so
+    /// that several merges step at once (`shard::workers`).
+    const WIDE_WORKERS: usize = 4;
+
+    /// Cases of the wide drawn check, the seed of its draws, and the files
+    /// per case: at least the fewest, and up to the more beyond them.
+    const WIDE_CASES: u64 = 160;
+    const WIDE_SEED: u64 = 17;
+    const FEWEST_WIDE_FILES: u64 = 4;
+    const MORE_WIDE_FILES: u64 = 24;
+
+    /// The keys and order values a wide case draws from, at least the
+    /// fewest and up to the more beyond them, and the most keys after its
+    /// first a wide file spans.
+    const FEWEST_WIDE_KEYS: u64 = 32;
+    const MORE_WIDE_KEYS: u64 = 64;
+    const FEWEST_WIDE_ORDERS: u64 = 4;
+    const MORE_WIDE_ORDERS: u64 = 16;
+    const WIDE_FILE_KEYS: u64 = 6;
+
+    /// One in how many wide cases may hold an unbucketed file, which joins
+    /// every bucket's files in one overlap group.
+    const UNBUCKETED_ONE_IN: u64 = 4;
+
+    /// Buckets of the third bucketing of the wide check: one key falls in
+    /// buckets congruent modulo two and four under the other two.
+    const EIGHT: u32 = 8;
+
+    /// Where wide drawn files are filed: unbucketed, and every bucket of
+    /// three bucketings.
+    const WIDE_PLACES: [Place; 15] = [
+        None,
+        Some((TWO, 0)),
+        Some((TWO, 1)),
+        Some((FOUR, 0)),
+        Some((FOUR, 1)),
+        Some((FOUR, 2)),
+        Some((FOUR, 3)),
+        Some((EIGHT, 0)),
+        Some((EIGHT, 1)),
+        Some((EIGHT, 2)),
+        Some((EIGHT, 3)),
+        Some((EIGHT, 4)),
+        Some((EIGHT, 5)),
+        Some((EIGHT, 6)),
+        Some((EIGHT, 7)),
+    ];
+
+    /// Files drawn from a wide pair universe by `draw`, in file order: many
+    /// files over many keys in buckets of three bucketings, each over a few
+    /// keys, so a case has many overlap groups, several of which can
+    /// refuse, and one in `UNBUCKETED_ONE_IN` cases may file some
+    /// unbucketed.
+    fn draw_wide_files(draw: &mut impl FnMut(u64) -> u64) -> Vec<DrawnFile> {
+        let count = FEWEST_WIDE_FILES + draw(MORE_WIDE_FILES);
+        let all_keys = FEWEST_WIDE_KEYS + draw(MORE_WIDE_KEYS);
+        let orders = FEWEST_WIDE_ORDERS + draw(MORE_WIDE_ORDERS);
+        let unbucketed = draw(UNBUCKETED_ONE_IN) == 0;
+        let places = approx::count(WIDE_PLACES.len());
+        let mut drawn: Vec<DrawnFile> = (0..count)
+            .map(|_| {
+                let pick = if unbucketed {
+                    draw(places)
+                } else {
+                    1 + draw(places - 1)
+                };
+                let place = WIDE_PLACES[usize::try_from(pick).unwrap()];
+                let keys: Vec<u64> = (0..all_keys)
+                    .filter(|&key| {
+                        place.is_none_or(|(of, bucket)| key % u64::from(of) == u64::from(bucket))
+                    })
+                    .collect();
+                let first = usize::try_from(draw(approx::count(keys.len()))).unwrap();
+                let last = (first + usize::try_from(draw(1 + WIDE_FILE_KEYS)).unwrap())
+                    .min(keys.len() - 1);
+                let low = draw(orders);
+                let high = low + draw(orders - low);
+                let one_in = 1 + draw(SPARSEST_ONE_IN);
+                let mut rows: Vec<(u64, u64)> = keys[first..=last]
+                    .iter()
+                    .flat_map(|&key| (low..=high).map(move |order| (key, order)))
+                    .filter(|_| draw(one_in) == 0)
+                    .collect();
+                if rows.is_empty() {
+                    rows.push((keys[first], low));
+                }
+                let deleted = (0..approx::count(rows.len()))
+                    .filter(|_| draw(DELETED_ONE_IN) == 0)
+                    .collect();
+                let checked = draw(CHECKED_ONE_IN) == 0;
+                let page_rows = 1 + draw(MOST_DRAWN_PAGE_ROWS);
+                DrawnFile {
+                    place,
+                    rows,
+                    checked,
+                    shrank: checked && draw(SHRANK_ONE_IN) == 0,
+                    deleted,
+                    page_rows: usize::try_from(page_rows).unwrap(),
+                    group_rows: usize::try_from(page_rows + draw(MOST_DRAWN_GROUP_ROWS)).unwrap(),
+                }
+            })
+            .collect();
+        drawn.sort_by_key(|file| (file.place, file.rows[0].0));
+        drawn
+    }
+
+    /// What the wide drawn check saw across its cases, each a count that
+    /// must be above zero for the check to prove anything.
+    #[derive(Debug, Default)]
+    struct WideSeen {
+        refusals: usize,
+        serves: usize,
+        several_groups: usize,
+        several_refusing: usize,
+    }
+
+    /// On a runtime of `WIDE_WORKERS` workers, so several merges step at
+    /// once, the check across wide drawn files, of many overlap groups in
+    /// buckets of three bucketings, several of which can refuse, under
+    /// budgets that bind and one that does not, in every tier, refuses
+    /// exactly what a scan of every file's live pairs refuses, the pair of
+    /// the first group in group order that holds one, and what checking
+    /// the groups one at a time refuses, and passes where they pass. Each
+    /// case's merges hand back every byte they took, groups stopped after
+    /// a refusal included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_verify_rows_merging_groups_on_several_workers_refuses_what_a_scan_refuses() {
+        assert_eq!(shard::workers(), WIDE_WORKERS, "several steps at once");
+        let mut state = WIDE_SEED;
+        let mut draw = |below: u64| {
+            state = state.wrapping_mul(MIX).wrapping_add(STEP);
+            (state >> 33) % below
+        };
+        let budgets: Vec<u64> = DRAWN_BUDGETS
+            .into_iter()
+            .chain([MERGE_READ_AHEAD_BYTES])
+            .collect();
+        let residencies = Residency::ALL;
+        let kinds = (Written::Long, Written::Long);
+        let mut seen = WideSeen::default();
+        for case in 0..WIDE_CASES {
+            let at = usize::try_from(case).unwrap();
+            let residency = residencies[at % residencies.len()];
+            let budget = budgets[(at / residencies.len()) % budgets.len()];
+            let drawn = draw_wide_files(&mut draw);
+            let mut files = Vec::new();
+            for (at, file) in drawn.iter().enumerate() {
+                files.push(built_drawn(&format!("d-{at:02}"), file, kinds, residency).await);
+            }
+            let reused: Vec<bool> = drawn
+                .iter()
+                .map(|file| !file.checked || file.shrank)
+                .collect();
+            let shrank: Vec<bool> = drawn.iter().map(|file| file.shrank).collect();
+            let gone: Vec<Vec<u64>> = drawn.iter().map(|file| file.deleted.clone()).collect();
+            let generation = Checked::of(&files, &reused, &shrank, &gone);
+            let groups = &generation.groups;
+            let (check, taken) = generation.check_released(budget).await;
+            let serial = generation.check_serially(budget).await;
+            let what = format!("case {case}, {residency:?}, budget {budget}");
+            assert_eq!(taken, 0, "{what}: every merge hands back its bytes");
+            seen.several_groups += usize::from(groups.len() > 1);
+            let refusing = groups
+                .iter()
+                .filter(|&group| {
+                    scan_live_pairs(&drawn, std::slice::from_ref(group))
+                        .refused
+                        .is_some()
+                })
+                .count();
+            seen.several_refusing += usize::from(refusing > 1);
+            let Some(((key, order), latest)) = scan_live_pairs(&drawn, groups).refused else {
+                let merges = check
+                    .unwrap_or_else(|error| panic!("{what}: {error:?}"))
+                    .merges;
+                assert_eq!(Ok(merges), serial.map_err(|_| ()), "{what}: serially");
+                seen.serves += 1;
+                continue;
+            };
+            let expected = (
+                format!("d-{latest:02}"),
+                drawn_key(kinds.0, key),
+                drawn_order(kinds.1, order),
+            );
+            for (outcome, how) in [
+                (check.map(|_| ()), "at once"),
+                (serial.map(|_| ()), "serially"),
+            ] {
+                let RefusalReason::DuplicateRows {
+                    path,
+                    key: refused_key,
+                    order: refused_order,
+                } = refusal_of(outcome)
+                else {
+                    panic!("{what}: expected duplicate_rows {how}");
+                };
+                assert_eq!(
+                    (path, refused_key, *refused_order),
+                    expected,
+                    "{what}: {how}"
+                );
+            }
+            seen.refusals += 1;
+        }
+        assert!(
+            seen.refusals > 0
+                && seen.serves > 0
+                && seen.several_groups > 0
+                && seen.several_refusing > 0,
             "{seen:?}"
         );
     }
