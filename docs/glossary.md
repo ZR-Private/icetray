@@ -68,9 +68,11 @@ level](configuration.md#choosing-a-level).
 
 **Next bound.** The order value a `Scan` response, or each key's result
 of a `MultiScan`, carries as `next` when the key has rows inside the
-bounds past the last row returned, and leaves unset otherwise. A caller
-reading oldest first sends it as the next request's `from`, and one
-reading newest first as its `before`. See [Paging with
+bounds past the last row returned, and leaves unset otherwise. It
+follows the last row returned: reading newest first it is that row's
+order value, sent as the next request's `before`, and reading oldest
+first the least order value above it, sent as the next request's
+`start`. See [Paging with
 `next`](calling.md#paging-with-next).
 
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
@@ -107,7 +109,7 @@ that can hold a pair another file holds. See
 **Ordered table.** A table configured with an order column, which holds
 many rows per key and which `Scan` and `MultiScan` read, newest or oldest
 first, under a limit and optional half-open bounds on the order value:
-`from` inclusive and `before` exclusive. Its writer
+`start` inclusive and `before` exclusive. Its writer
 sorts each file by key and then order value. Every other table is a
 key-value table, which holds at most one row per key and which `Get` and
 `MultiGet` read. See [Ordered tables](table-layout.md#ordered-tables).

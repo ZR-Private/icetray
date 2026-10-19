@@ -65,7 +65,7 @@ direction under a limit and optional bounds on the order value.
 - **Wire.** `Scan` takes a table, a key, the value columns to read as
   `Get` takes them, a direction (`NEWEST_FIRST` or `OLDEST_FIRST`), a
   limit from 1 to `max_scan_rows`, and optional half-open bounds on the
-  order value, `from` inclusive and `before` exclusive. A Scan and each
+  order value, `start` inclusive and `before` exclusive. A Scan and each
   key of a MultiScan set their limit: there is no default, so the rows a
   call asks for, and the values a MultiScan counts against
   `server.max_multi_scan_values`, are what its request states. The
@@ -87,7 +87,7 @@ direction under a limit and optional bounds on the order value.
   follow RFD 010 (Transport and client contract) as for `Get` and
   `MultiGet`, and a malformed request is `INVALID_ARGUMENT`: an
   unspecified direction, a limit of 0 or above `max_scan_rows`, a key
-  or bound of the wrong variant, a `from` at or above `before`, which
+  or bound of the wrong variant, a `start` at or above `before`, which
   is an empty window, a MultiScan above `max_multi_scan_values`, or a
   call of the wrong kind for the table. The server checks a call's kind
   against the table's configuration before the table's readiness and
@@ -98,19 +98,21 @@ direction under a limit and optional bounds on the order value.
   (RFD 024), naming the order value of its row, and so is a response
   above `server.max_scan_bytes` (Limits).
 - **Paging.** A caller pages by passing `next` back unchanged, every
-  other field of the request as it was: reading oldest first, `next` is
-  the order value of the first live row past the page, which the server
-  reads in any case to know whether rows remain, and the next request
-  sets `from` to it; reading newest first, `next` is the order value of
-  the oldest row returned, and the next request sets `before` to it. The
-  caller stops at a response without `next`, so it never asks for a page
-  past the last row, and never computes an order value's successor,
-  which a string or bytes order type does not make simple. Within one
-  snapshot, uniqueness makes the next response exact, and paging is
-  stateless on the server. After a refresh between two requests the
-  server responds from the new snapshot, whose id the response carries,
-  and a row committed on the side the caller has already read appears in
-  a Scan that starts over.
+  other field of the request as it was. `next` follows the last row
+  returned: reading newest first it is that row's order value, and the
+  next request sets `before` to it; reading oldest first it is the least
+  order value above that row's, one more for an integer or time type and
+  the value with one zero byte appended for a string, binary, or fixed
+  type, and the next request sets `start` to it. The server sets `next`
+  only when it has read a live row past the page, so a caller stops at a
+  response without one and never asks for a page past the last row.
+  Within one snapshot, uniqueness makes the next response exact, and
+  paging is stateless on the server. After a refresh between two requests
+  the server responds from the new snapshot, whose id the response
+  carries: the next page holds every row of the new snapshot past the
+  last row returned, a row committed there included, so nothing between
+  two pages is skipped, and a row committed on the side the caller has
+  already read appears only to a Scan that starts over.
 - **Layout.** The optimal layout for an ordered table is RFD 002's with
   two changes: each file is sorted locally by key and then order value,
   ascending, and a key may repeat within a file. A key's rows in one
@@ -393,10 +395,10 @@ is one entry, and the fences bound the key pages a Scan needs.
 
 Exclusive bounds on both sides, `after` and `before`, with a flag for
 whether rows remain, a caller paging by the last order value it was
-returned. Rejected: half-open bounds tile a key's rows, a window ending
-where the next begins with no row in both or in neither, and a `next`
-the server sets lets a caller page without reading the last row or
-knowing the order type's encoding.
+returned. Rejected: half-open windows tile a key's rows, a window ending
+where the next begins with no row in both or in neither, and the common
+request, the rows at or after a time, is a `start` as the caller states
+it.
 
 A limit of 0 that reads up to `max_scan_rows`. Rejected: a request that
 leaves its limit unset would ask for as many rows as the table's

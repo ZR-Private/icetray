@@ -236,13 +236,11 @@ grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
   `TableInfo` reports. The response must also fit `server.max_scan_bytes`
   ([Response size](#response-size)), so a caller whose values are large
   sets a limit that fits.
-- **Bounds.** The bounds are half-open: `from` is inclusive and `before`
+- **Bounds.** The bounds are half-open: `start` is inclusive and `before`
   exclusive, so a row is returned when its order value is at or above
-  `from` and below `before`. Either may be left unset. When both are set,
-  `from` must be below `before`: a `from` at or above `before` is an
-  empty window, and `INVALID_ARGUMENT`. In Python, `from` is a keyword,
-  so a caller sets and reads the field with `setattr` and `getattr`, or
-  passes it in a dict.
+  `start` and below `before`. Either may be left unset. When both are set,
+  `start` must be below `before`: a `start` at or above `before` is an
+  empty window, and `INVALID_ARGUMENT`.
 - **Order values.** An order value is an `OrderValue` whose variant
   follows the order type: `long` for `int`, `long`, `date`, and the
   timestamp types, `str` for `string`, and `bin` for `binary` and
@@ -314,10 +312,13 @@ A caller reads a history longer than one response in pages. Each
 response that leaves rows behind carries `next`, the bound of the next
 page, and the caller passes it back unchanged:
 
-- **Newest first,** `next` is the order value of the oldest row returned,
-  and the next request sets `before` to it.
-- **Oldest first,** `next` is the order value of the first row past the
-  page, and the next request sets `from` to it.
+- **Newest first,** `next` is the order value of the last row returned,
+  the oldest, and the next request sets `before` to it.
+- **Oldest first,** `next` is the least order value above the last row
+  returned, the newest: one more for an integer or time type, and the
+  row's value with one zero byte appended for a string, binary, or
+  `fixed` type, so for `fixed` it is one byte longer than the width. The
+  next request sets `start` to it.
 
 Every other field, the other bound included, stays the same. The caller
 stops when a response has no `next`, so it never asks for a page past
@@ -342,7 +343,7 @@ for {
 	if resp.GetNext() == nil {
 		return nil
 	}
-	req.Before = resp.GetNext() // reading oldest first: req.From = resp.GetNext()
+	req.Before = resp.GetNext() // reading oldest first: req.Start = resp.GetNext()
 }
 ```
 
@@ -351,19 +352,21 @@ for every order type, a string or bytes order value included.
 
 A key and order value appear together at most once among a snapshot's
 live rows, so within one snapshot `next` is an exact cursor: the next
-page starts at the next row, with no row repeated or skipped, and the
-server keeps no state between requests. A refresh between two requests
-moves the next page to the new snapshot, whose id the response carries.
-A row the writer committed on the side the caller has already read
-appears only to a `Scan` that starts over, so a caller that needs every
-row of one snapshot compares the ids and starts over when they differ.
+page starts at the row after the last one returned, with no row repeated
+or skipped, and the server keeps no state between requests. A refresh
+between two requests moves the next page to the new snapshot, whose id
+the response carries. The next page holds every row of the new snapshot
+past the last row returned, a row the writer committed there included,
+so nothing between two pages is skipped. A row the writer committed on
+the side the caller has already read appears only to a `Scan` that
+starts over, so a caller that needs every row of one snapshot compares
+the ids and starts over when they differ.
 
 A caller that steps past one row, such as a row whose value is not the
 protobuf its column declares (`FAILED_PRECONDITION`, which names the
-row's order value), sets `before` to that order value reading newest
-first. Reading oldest first it sets `from` to the least value above it:
-one more for an integer or time type, and the value with a zero byte
-appended for a string or bytes.
+row's order value), builds the bound as `next` is built: `before` set to
+that order value reading newest first, and `start` set to the least
+value above it reading oldest first.
 
 ## Scanning many keys
 
@@ -423,7 +426,7 @@ its `limit`.
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
-| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, sets a limit of 0 or one above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or a `from` at or above `before` (an empty window), or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
+| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, sets a limit of 0 or one above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or a `start` at or above `before` (an empty window), or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` ([Response size](#response-size)). | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
