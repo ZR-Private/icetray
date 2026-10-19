@@ -777,13 +777,7 @@ impl LookupMetrics {
         let per_column = |name: &'static str| -> Vec<Counter> {
             columns
                 .iter()
-                .map(|&column| {
-                    metrics::counter!(
-                        name,
-                        metric::LABEL_TABLE => table.to_string(),
-                        metric::LABEL_COLUMN => column.to_string()
-                    )
-                })
+                .map(|&column| column_counter(name, table, column))
                 .collect()
         };
         Self {
@@ -845,6 +839,15 @@ impl LookupMetrics {
             publish(returned, shards().map(|bytes| taken(&bytes.returned)).sum());
         }
     }
+}
+
+/// The counter `name` of `column` of `table`.
+fn column_counter(name: &'static str, table: &str, column: &str) -> Counter {
+    metrics::counter!(
+        name,
+        metric::LABEL_TABLE => table.to_string(),
+        metric::LABEL_COLUMN => column.to_string()
+    )
 }
 
 impl Drop for LookupMetrics {
@@ -920,11 +923,7 @@ impl ScanMetrics {
             ),
             cold: seconds(Temperature::Cold),
             warm: seconds(Temperature::Warm),
-            order_gets: metrics::counter!(
-                metric::VALUE_PAGE_GETS_TOTAL,
-                metric::LABEL_TABLE => table.to_string(),
-                metric::LABEL_COLUMN => order_column.to_string()
-            ),
+            order_gets: column_counter(metric::VALUE_PAGE_GETS_TOTAL, table, order_column),
         }
     }
 

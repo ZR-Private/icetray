@@ -113,26 +113,13 @@ impl FileHandle {
             .await
     }
 
-    /// One byte range on the lookup path hedged against `window` and
-    /// recorded into it, rather than the handle's own: a Scan's span GET of
-    /// `pages` pages, which a table hedges in a window of its own, whose
-    /// delay scales with a span's pages, since a span's latency grows with
-    /// them (RFD 013, RFD 025, `Storage::read_span_hedged`). One lookup GET,
-    /// plus one more when a hedge is issued.
-    pub(crate) async fn read_span(
-        &self,
-        range: Range<u64>,
-        pages: u32,
-        window: &HedgeWindow,
-    ) -> Result<Bytes> {
-        self.storage
-            .read_span_hedged(&self.located, range, pages, window)
-            .await
-    }
-
     /// Pages of the file through `cache` (`PageCache::get_span`): each run of
-    /// pages it does not hold whose ranges meet is one span GET by
-    /// `read_span` under `window`, answering to `issue`, and each page is
+    /// pages it does not hold whose ranges meet is one span GET, a lookup
+    /// GET hedged against `window` and recorded into it rather than the
+    /// handle's own window, since a table hedges its Scans' spans in a
+    /// window of their own whose delay scales with a span's pages (RFD 013,
+    /// RFD 025, `Storage::read_span_hedged`), plus one more GET when a
+    /// hedge is issued. Each GET answers to `issue`, and each page is
     /// cached as its own entry at its offset, as `read_page` keys a page.
     pub(crate) async fn read_pages(
         &self,
@@ -143,7 +130,8 @@ impl FileHandle {
     ) -> Result<(Vec<Bytes>, PageOrigin)> {
         cache
             .get_span(&self.file_id, pages, issue, |span, held| {
-                self.read_span(span, held, window)
+                self.storage
+                    .read_span_hedged(&self.located, span, held, window)
             })
             .await
     }
