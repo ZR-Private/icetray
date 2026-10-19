@@ -444,6 +444,7 @@ mod tests {
     };
     use crate::layout::{KEY_COLUMN, Layout, Statistics, VALUE_COLUMN};
     use crate::merge_oracle::{MergeOracle, RowCopy};
+    use icetray_core::approx::length;
 
     /// Order values of the hand-built key: five rows.
     const ORDERS: [i64; 5] = [10, 20, 30, 40, 50];
@@ -646,7 +647,7 @@ mod tests {
     #[test]
     fn test_orders_of_counts_the_rows_and_refuses_an_overflow() {
         let spec = ordered(OrderKind::Long, THREE_ROWS);
-        let expected: Vec<i64> = (0..THREE).map(order_of).collect();
+        let expected: Vec<i64> = (0..length(THREE)).map(order_of).collect();
         assert_eq!(spec.orders_of(0).unwrap(), expected);
         let overflowing = Ordered {
             start: i64::MAX - 1,
@@ -681,7 +682,7 @@ mod tests {
     }
 
     /// Rows per key of the fixtures most tests write.
-    const THREE: usize = 3;
+    const THREE: u64 = 3;
 
     /// The first raw order value and the distance between a key's rows.
     const ORDER_START: i64 = 1_000;
@@ -699,16 +700,16 @@ mod tests {
     }
 
     /// `THREE` rows for every id.
-    const THREE_ROWS: RowsPerKey = RowsPerKey::Each(THREE as u64);
+    const THREE_ROWS: RowsPerKey = RowsPerKey::Each(THREE);
 
     /// Rows per key of the row group test: more than a row group holds.
-    const SIX: usize = 6;
+    const SIX: u64 = 6;
 
     /// Rows per row group of the row group test.
     const ROW_GROUP_ROWS: usize = 4;
 
     /// `SIX` rows for every id.
-    const SIX_ROWS: RowsPerKey = RowsPerKey::Each(SIX as u64);
+    const SIX_ROWS: RowsPerKey = RowsPerKey::Each(SIX);
 
     /// An id whose order values overflow.
     const OVERFLOWING_ID: u64 = 5;
@@ -775,11 +776,11 @@ mod tests {
         let oracle = MergeOracle::read(&fixture).await?;
         let key = fixture.key(SAMPLE[0]);
         let copies = oracle.copies(&key);
-        assert_eq!(copies.len(), THREE);
+        assert_eq!(copies.len(), length(THREE));
         assert!(copies.windows(2).all(|pair| pair[0].order < pair[1].order));
         let orders: Vec<Option<OrderValue>> =
             copies.iter().map(|copy| copy.order.clone()).collect();
-        let expected: Vec<Option<OrderValue>> = (0..THREE)
+        let expected: Vec<Option<OrderValue>> = (0..length(THREE))
             .map(|index| Some(OrderValue::Long(order_of(index))))
             .collect();
         assert_eq!(orders, expected);
@@ -854,7 +855,7 @@ mod tests {
                     .iter()
                     .map(|copy| copy.order.clone())
                     .collect();
-                let expected: Vec<Option<OrderValue>> = (0..THREE)
+                let expected: Vec<Option<OrderValue>> = (0..length(THREE))
                     .map(|index| Some(order_value(kind, order_of(index))))
                     .collect();
                 assert_eq!(read, expected, "{kind:?} id {id}");
@@ -975,7 +976,7 @@ mod tests {
                 .iter()
                 .map(|copy| copy.position / u64::try_from(ROW_GROUP_ROWS).unwrap())
                 .collect();
-            assert_eq!(oracle.copies(key).len(), SIX);
+            assert_eq!(oracle.copies(key).len(), length(SIX));
             straddling += usize::from(groups.len() > 1);
         }
         assert!(straddling > 0, "some run spans two row groups");
@@ -1041,12 +1042,12 @@ mod tests {
         let (_dir, catalog, mut fixture) =
             written(spec("pairs", OrderKind::Long, THREE_ROWS)).await?;
         let key = fixture.key(AN_ID);
-        let new_order = order_of(THREE);
+        let new_order = order_of(length(THREE));
         fixture
             .append_ordered(catalog.as_ref(), &[(AN_ID, new_order)], "later")
             .await?;
         let oracle = MergeOracle::read(&fixture).await?;
-        assert_eq!(oracle.copies(&key).len(), THREE + 1);
+        assert_eq!(oracle.copies(&key).len(), length(THREE + 1));
         let again = fixture
             .append_ordered(catalog.as_ref(), &[(AN_ID, new_order)], "again")
             .await;
@@ -1074,7 +1075,7 @@ mod tests {
         let copies = oracle.copies(&key);
         assert_eq!(
             copies.len(),
-            THREE + 1,
+            length(THREE + 1),
             "the deleted copy and its replacement"
         );
         let at_pair: Vec<&RowCopy> = copies
@@ -1226,7 +1227,7 @@ mod tests {
     async fn test_delete_rows_refuses_a_pair_that_is_not_live() -> Result<()> {
         let (_dir, _catalog, mut fixture) =
             written(spec("not_live", OrderKind::Long, THREE_ROWS)).await?;
-        let missing = order_of(THREE);
+        let missing = order_of(length(THREE));
         let refused = fixture
             .delete_rows(&[(AN_ID, missing)], DeleteForm::Vectors, "gone")
             .await;
@@ -1284,7 +1285,7 @@ mod tests {
             .delete_rows(&[(AN_ID, order_of(1))], DeleteForm::Vectors, "delete")
             .await?;
         let changed = fixture.expected_scan(&key, &[VALUE_COLUMN], &TestScan::default());
-        assert_eq!(changed.0.len(), THREE - 1);
+        assert_eq!(changed.0.len(), length(THREE - 1));
         assert_ne!(changed, all);
         fixture.move_ref(before).await?;
         assert_eq!(
@@ -1306,7 +1307,7 @@ mod tests {
         }
         let held =
             fixture.expected_scan(&fixture.key(AN_ID), &[VALUE_COLUMN], &TestScan::default());
-        assert_eq!(held.0.len(), THREE);
+        assert_eq!(held.0.len(), length(THREE));
         Ok(())
     }
 }
