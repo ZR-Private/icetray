@@ -511,7 +511,7 @@ impl PageCache {
         // it, is built as well for a page that reached memory while the
         // permit was awaited, a page on the disk level, and a fetch joined,
         // none of which runs it (`Issue` says when each frees the permit).
-        let run = self.run(key.clone(), issue.permit().await, issue);
+        let run = self.run_for(key.clone(), issue.permit().await, issue);
         // foyer's `get_or_fetch` and not its `get` past memory: `get`
         // reports a disk level that fails to read as an error while
         // `get_or_fetch` moves on to the fetch, which is what a disposable
@@ -661,7 +661,7 @@ impl PageCache {
         let run = claim.run.clone();
         let span = pages[run.start].start..pages[run.end - 1].end;
         let fetched = fetch(span.clone(), u32::try_from(run.len()).unwrap_or(u32::MAX));
-        let run_of = self.run(PageKey(Arc::clone(file), span.start), permit, issue);
+        let run_of = self.run_for(PageKey(Arc::clone(file), span.start), permit, issue);
         let outcome = match run_of.run(fetched, std::convert::identity).await {
             Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
             Err(failed) => Err(failed),
@@ -905,7 +905,12 @@ impl PageCache {
 
     /// What a fetch for `page` runs with through this handle: its permit
     /// `permit`, taken of `issue`, and `issue`'s counter.
-    fn run(&self, page: PageKey, permit: Option<OwnedSemaphorePermit>, issue: Issue<'_>) -> Run {
+    fn run_for(
+        &self,
+        page: PageKey,
+        permit: Option<OwnedSemaphorePermit>,
+        issue: Issue<'_>,
+    ) -> Run {
         Run {
             page,
             fetches: Arc::clone(&self.fetches),

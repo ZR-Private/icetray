@@ -87,11 +87,11 @@ fn plain_chunk(chunk: ColumnChunk<'_>) -> Option<bool> {
 /// `ColumnChunk::check_pages_read` accepts for the row group's rows.
 /// Anything the pages fault on ends this read with nothing reported, so
 /// the column reader meets the fault and reports it (`read_plain`).
-pub(super) fn checked_run(
-    chunk: ColumnChunk<'_>,
+pub(super) fn checked_run<'c>(
+    chunk: ColumnChunk<'c>,
     keys: ByteKeys,
-    segments: Arc<Segments>,
-) -> Option<RunCheck<'_>> {
+    segments: &Arc<Segments>,
+) -> Option<RunCheck<'c>> {
     let rows = 0..row_index(chunk.rows());
     read_plain(chunk, rows, segments, |pages, required| {
         let mut run = RunCheck::new(chunk);
@@ -114,10 +114,11 @@ pub(super) fn checked_run(
 fn read_plain<T>(
     chunk: ColumnChunk<'_>,
     rows: Range<usize>,
-    segments: Arc<Segments>,
+    segments: &Arc<Segments>,
     read: impl FnOnce(ChunkPages, bool) -> Option<(T, usize)>,
 ) -> Option<T> {
     let required = plain_chunk(chunk)?;
+    let segments = Arc::clone(segments);
     let tally = Arc::new(Mutex::new(PageTally::default()));
     // Unwind-safe: the pages are built inside the call and dropped with a
     // panic, the footer `chunk` borrows is only read, and what `read` and
@@ -194,7 +195,6 @@ pub(super) fn value_rows(
     segments: &Arc<Segments>,
 ) -> Option<PlainValues> {
     let rows = row_index(rows.start)..row_index(rows.end);
-    let segments = Arc::clone(segments);
     read_plain(chunk, rows.clone(), segments, |pages, required| {
         let values = read_value_pages(pages, rows, required)?;
         let decoded = values.rows.len();

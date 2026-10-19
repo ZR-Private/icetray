@@ -994,7 +994,7 @@ fn check_run(
     };
     if decoder == KeyDecoder::Plain
         && let Some(keys) = byte_keys
-        && let Some(run) = plain::checked_run(chunk, keys, Arc::clone(&chunks))
+        && let Some(run) = plain::checked_run(chunk, keys, &chunks)
     {
         return Ok((run, KeyDecoder::Plain));
     }
