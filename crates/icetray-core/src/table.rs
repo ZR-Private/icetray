@@ -1391,6 +1391,18 @@ impl Table {
         self.config.load_full()
     }
 
+    /// `server.max_multi_scan_values`, which `multi_scan` holds a request to
+    /// and `TableInfo` reports.
+    pub fn max_multi_scan_values(&self) -> usize {
+        self.max_multi_scan_values
+    }
+
+    /// `server.max_scan_bytes`, the encoded size above which a Scan or
+    /// `MultiScan` response is refused and `TableInfo` reports.
+    pub fn max_scan_bytes(&self) -> usize {
+        self.max_scan_bytes
+    }
+
     /// First load: resolves the source, builds the snapshot the ref names,
     /// runs the doctor on it, and swaps it in, within the load deadline;
     /// past it the load is dropped as `Error::LoadDeadline`. `Err` leaves

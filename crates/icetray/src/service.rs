@@ -107,12 +107,6 @@ pub struct Service {
     slots: Slots,
     /// The most values one `MultiGet` may ask for.
     max_multi_get_values: usize,
-    /// `server.max_multi_scan_values`, which core holds a `MultiScan` to and
-    /// `TableInfo` reports.
-    max_multi_scan_values: usize,
-    /// `server.max_scan_bytes`: the encoded size above which a Scan or
-    /// `MultiScan` response is refused, which `TableInfo` reports.
-    max_scan_bytes: usize,
 }
 
 impl Service {
@@ -127,8 +121,6 @@ impl Service {
             multi_scan_deadline: server.multi_scan_deadline,
             slots: Slots::new(server.max_in_flight),
             max_multi_get_values: server.max_multi_get_values,
-            max_multi_scan_values: server.max_multi_scan_values,
-            max_scan_bytes: server.max_scan_bytes,
         }
     }
 
@@ -679,7 +671,7 @@ impl Service {
             .scan_receipt(&key, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        settle(receipt, scan_within_bound(lookup, self.max_scan_bytes))
+        settle(receipt, scan_within_bound(lookup, table.max_scan_bytes()))
     }
 
     /// `MultiScan`. Its keys times its limit times its columns plus one are
@@ -704,7 +696,7 @@ impl Service {
             .map_err(|error| status_from(&error))?;
         settle(
             receipt,
-            multi_scan_within_bound(lookup, self.max_scan_bytes),
+            multi_scan_within_bound(lookup, table.max_scan_bytes()),
         )
     }
 
@@ -731,6 +723,7 @@ impl Service {
         let table = table(&tables, &request.table)?;
         let generation = table.serving().map_err(|error| status_from(&error))?;
         let entry = table.config();
+        let limits = entry.scan_limits(table.max_scan_bytes());
         let order = generation.layout.order.as_ref();
         let (order_type, order_width) = order.map_or((v1::OrderType::Unspecified, 0), |order| {
             order_type_wire(order.order_type)
@@ -750,13 +743,10 @@ impl Service {
             order_column: order.map_or_else(String::new, |order| order.name.clone()),
             order_type: i32::from(order_type),
             order_width,
-            max_scan_rows: entry.scan_rows().unwrap_or(0),
-            max_multi_scan_values: entry
-                .scan_rows()
-                .map_or(0, |_| approx::count(self.max_multi_scan_values)),
-            max_scan_bytes: entry
-                .scan_rows()
-                .map_or(0, |_| approx::count(self.max_scan_bytes)),
+            max_scan_rows: limits.map_or(0, |limits| limits.max_scan_rows),
+            max_multi_scan_values: limits
+                .map_or(0, |_| approx::count(table.max_multi_scan_values())),
+            max_scan_bytes: limits.map_or(0, |limits| approx::count(limits.max_scan_bytes)),
         }))
     }
 }
