@@ -1327,11 +1327,7 @@ mod tests {
                 orders.push(i64::try_from(j).unwrap() * ORDER_STEP);
             }
         }
-        let mut fixture = Fixture::ordered(&keys, long_orders(&orders));
-        fixture.layout.page_rows = PAGE;
-        fixture.layout.write_batch = PAGE;
-        fixture.layout.row_group_rows = group;
-        fixture
+        Fixture::ordered(&keys, long_orders(&orders)).in_pages(PAGE, group)
     }
 
     /// `fixture` with `extra` more value columns, written and served after
@@ -1368,9 +1364,10 @@ mod tests {
                 .value_columns
                 .push(binary_column(&format!("{EXTRA_COLUMN}{at}"), field_id));
         }
-        let local = generation_testing::local_dir(dir, opened.stats(), None);
-        let local = (residency == Residency::Disk).then_some(&local);
-        opened.build_under(&layout, residency, local).await.unwrap()
+        opened
+            .build_under_in(&layout, residency, dir)
+            .await
+            .unwrap()
     }
 
     /// What a read runs through: a fresh Scan cache and span window.
@@ -2313,10 +2310,7 @@ mod tests {
                 orders.push(Some(value(j)));
             }
         }
-        let mut fixture = Fixture::ordered(&keys, Orders::Bytes(orders));
-        fixture.layout.page_rows = PAGE;
-        fixture.layout.write_batch = PAGE;
-        fixture.layout.row_group_rows = keys.len();
+        let mut fixture = Fixture::ordered(&keys, Orders::Bytes(orders)).in_pages(PAGE, keys.len());
         fixture.layout.truncate = truncate;
         fixture
     }

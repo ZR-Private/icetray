@@ -1276,7 +1276,7 @@ mod tests {
     use super::*;
     use crate::approx;
     use crate::config::{Residency, ServerConfig};
-    use crate::index::testing as index_testing;
+    use crate::index::testing::{self as index_testing, long_pair};
     use crate::key::{Key, KeyType};
     use crate::manifest::{self, DataFileEntry};
     use crate::order::OrderType;
@@ -1531,14 +1531,7 @@ mod tests {
         page_rows: usize,
         group_rows: usize,
     ) -> index_testing::Fixture {
-        let keys: Vec<i64> = rows.iter().map(|&(key, _)| key).collect();
-        let orders: Vec<i64> = rows.iter().map(|&(_, order)| order).collect();
-        let mut fixture =
-            index_testing::Fixture::ordered(&keys, index_testing::long_orders(&orders));
-        fixture.layout.page_rows = page_rows;
-        fixture.layout.write_batch = page_rows;
-        fixture.layout.row_group_rows = group_rows;
-        fixture
+        index_testing::Fixture::of_long_pairs(rows).in_pages(page_rows, group_rows)
     }
 
     /// `fixture`, an ordered file served under `layout`, as file `name`
@@ -2710,9 +2703,7 @@ mod tests {
             ),
         };
         fixture.orders = Some(column);
-        fixture.layout.page_rows = file.page_rows;
-        fixture.layout.write_batch = file.page_rows;
-        fixture.layout.row_group_rows = file.group_rows;
+        let fixture = fixture.in_pages(file.page_rows, file.group_rows);
         let layout = index_testing::ordered_layout(key_type, order_type);
         built_of(name, &fixture, &layout, file.place, residency).await
     }
@@ -2883,14 +2874,6 @@ mod tests {
                 && seen.corner_refusals > 0,
             "{seen:?}"
         );
-    }
-
-    /// A long pair of a test.
-    fn long_pair(key: i64, order: i64) -> Pair<'static> {
-        Pair {
-            key: PairPart::Long(key),
-            order: PairPart::Long(order),
-        }
     }
 
     /// The shared range of the `may_hold` test: keys 2 to 5, order values

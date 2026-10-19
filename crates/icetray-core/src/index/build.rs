@@ -1637,10 +1637,9 @@ mod tests {
     use crate::index::testing::{
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
         Opened, Orders, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows,
-        fault_of, group_rows, header_at, key_for, location, long_orders, longs, moved_by_header,
-        ordered_layout, pages_of, predicted_of, row_of, stepped, store, store_file,
-        with_column_chunk, with_dictionary_one_entry_short, with_group_rows, with_header_claims,
-        with_pages,
+        fault_of, group_rows, header_at, key_for, location, longs, moved_by_header, ordered_layout,
+        pages_of, predicted_of, row_of, stepped, store, store_file, with_column_chunk,
+        with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
     };
     use crate::index::{
         ChunkPage, Column, DecodedPart, FileFault, HeaderField, KeyShape, PageHeaderFault, RowRef,
@@ -3775,14 +3774,6 @@ mod tests {
         assert_eq!(taken, [KeyDecoder::ColumnReader]);
     }
 
-    /// The long keys and orders of an ordered fixture as `(key, order)`
-    /// pairs, one row each.
-    fn ordered_of(pairs: &[(i64, i64)]) -> Fixture {
-        let keys: Vec<i64> = pairs.iter().map(|(key, _)| *key).collect();
-        let orders: Vec<i64> = pairs.iter().map(|(_, order)| *order).collect();
-        Fixture::ordered(&keys, long_orders(&orders))
-    }
-
     /// The refusal a build of `opened` under a `long` order column ends in,
     /// the same in every tier.
     async fn ordered_refusal(opened: &Opened) -> RefusalReason {
@@ -3807,7 +3798,7 @@ mod tests {
     /// rules is still `duplicate_keys`.
     #[tokio::test]
     async fn test_verify_ordered_admits_a_key_repeated_with_rising_order() {
-        let opened = store(&ordered_of(&[(1, 1), (1, 2), (1, 3), (2, 1)])).await;
+        let opened = store(&Fixture::of_long_pairs(&[(1, 1), (1, 2), (1, 3), (2, 1)])).await;
         for residency in Residency::ALL {
             let dir = tempfile::tempdir().unwrap();
             let index = opened
@@ -3831,7 +3822,7 @@ mod tests {
     /// both (RFD 025, Uniqueness).
     #[tokio::test]
     async fn test_verify_ordered_refuses_an_equal_pair_as_duplicate_rows() {
-        let opened = store(&ordered_of(&[(1, 2), (1, 2)])).await;
+        let opened = store(&Fixture::of_long_pairs(&[(1, 2), (1, 2)])).await;
         assert_eq!(
             ordered_refusal(&opened).await,
             RefusalReason::DuplicateRows {
@@ -3845,7 +3836,7 @@ mod tests {
     /// A key's order value falling is `unsorted`, as a key falling is.
     #[tokio::test]
     async fn test_verify_ordered_refuses_a_falling_order_as_unsorted() {
-        let falling = store(&ordered_of(&[(1, 3), (1, 2)])).await;
+        let falling = store(&Fixture::of_long_pairs(&[(1, 3), (1, 2)])).await;
         assert_eq!(
             ordered_refusal(&falling).await,
             RefusalReason::Unsorted {
@@ -3853,7 +3844,7 @@ mod tests {
                 row_group: 0,
             }
         );
-        let key_falling = store(&ordered_of(&[(2, 1), (1, 2)])).await;
+        let key_falling = store(&Fixture::of_long_pairs(&[(2, 1), (1, 2)])).await;
         assert_eq!(
             ordered_refusal(&key_falling).await,
             RefusalReason::Unsorted {
@@ -3869,7 +3860,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_ordered_checks_pairs_across_row_groups() {
         let in_groups = |pairs: &[(i64, i64)]| {
-            let mut fixture = ordered_of(pairs);
+            let mut fixture = Fixture::of_long_pairs(pairs);
             fixture.layout.row_group_rows = TINY_GROUP_ROWS;
             fixture
         };
@@ -3906,7 +3897,7 @@ mod tests {
     /// A null order value is `null_order`, in the row group holding it.
     #[tokio::test]
     async fn test_verify_ordered_refuses_null_order() {
-        let mut fixture = ordered_of(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
+        let mut fixture = Fixture::of_long_pairs(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
         fixture.layout.row_group_rows = TINY_GROUP_ROWS;
         fixture.orders = Some(Orders::Long(vec![Some(1), Some(1), Some(1), None]));
         let opened = store(&fixture).await;
@@ -3923,7 +3914,7 @@ mod tests {
     /// string key that is not is.
     #[tokio::test]
     async fn test_verify_ordered_refuses_a_string_order_that_is_not_utf8() {
-        let mut fixture = ordered_of(&[(1, 0), (2, 0)]);
+        let mut fixture = Fixture::of_long_pairs(&[(1, 0), (2, 0)]);
         fixture.orders = Some(Orders::Bytes(vec![
             Some(b"a".to_vec()),
             Some(vec![u8::MAX]),
@@ -3987,7 +3978,7 @@ mod tests {
     /// truncated leaves the facts exact.
     #[tokio::test]
     async fn test_verify_ordered_ignores_the_order_column_index() {
-        let opened = store(&ordered_of(&[(1, 100), (1, 200), (2, 100)])).await;
+        let opened = store(&Fixture::of_long_pairs(&[(1, 100), (1, 200), (2, 100)])).await;
         let loaded = opened.handle.load_metadata().await.unwrap();
         let schema = loaded.file_metadata().schema_descr();
         let leaf_of = |name: &str| {
@@ -4011,7 +4002,7 @@ mod tests {
 
         let long_text =
             |n: usize| Some(format!("{:a>len$}{n}", "", len = LONG_ORDER_BYTES).into_bytes());
-        let mut truncated = ordered_of(&[(1, 0), (1, 0), (2, 0)]);
+        let mut truncated = Fixture::of_long_pairs(&[(1, 0), (1, 0), (2, 0)]);
         truncated.orders = Some(Orders::Bytes(vec![
             long_text(1),
             long_text(2),
@@ -4043,7 +4034,7 @@ mod tests {
     /// refused before parquet reserves them, naming the order page.
     #[tokio::test]
     async fn test_verify_ordered_refuses_an_order_page_header_over_the_ceiling() {
-        let opened = store(&ordered_of(&[(1, 1), (1, 2), (2, 1)])).await;
+        let opened = store(&Fixture::of_long_pairs(&[(1, 1), (1, 2), (2, 1)])).await;
         let loaded = opened.handle.load_metadata().await.unwrap();
         let layout = ordered_layout(KeyType::Long, OrderType::Long);
         let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), &layout)
@@ -4108,7 +4099,8 @@ mod tests {
     /// from a reused Disk-tier chunk file alike.
     #[tokio::test]
     async fn test_verify_ordered_records_min_max_distinct_keys_and_longest_run() {
-        let mut fixture = ordered_of(&[(1, 5), (1, 6), (1, 7), (1, 8), (2, -3), (2, 9), (3, 0)]);
+        let mut fixture =
+            Fixture::of_long_pairs(&[(1, 5), (1, 6), (1, 7), (1, 8), (2, -3), (2, 9), (3, 0)]);
         fixture.layout.row_group_rows = 3;
         let opened = store(&fixture).await;
         let expected = OrderFacts {
@@ -4154,7 +4146,7 @@ mod tests {
         let pairs: Vec<(i64, i64)> = (0..i64::try_from(contract_rows()).unwrap())
             .map(|i| (i / 2, i % 2))
             .collect();
-        let mut fixture = ordered_of(&pairs);
+        let mut fixture = Fixture::of_long_pairs(&pairs);
         fixture.layout.row_group_rows = group_rows();
         let opened = store(&fixture).await;
         let dir = tempfile::tempdir().unwrap();
@@ -4357,10 +4349,10 @@ mod tests {
             DrawnOrder::Str | DrawnOrder::Bin => Orders::Bytes(bytes()),
             DrawnOrder::Fixed => Orders::Fixed(i32::try_from(FIXED_ORDER_BYTES).unwrap(), bytes()),
         });
-        fixture.layout.page_rows = FENCE_PAGE_ROWS;
-        fixture.layout.write_batch = FENCE_PAGE_ROWS;
-        fixture.layout.row_group_rows = FENCE_GROUP_ROWS;
-        (fixture, ordered_layout(key_type, order.order_type()))
+        (
+            fixture.in_pages(FENCE_PAGE_ROWS, FENCE_GROUP_ROWS),
+            ordered_layout(key_type, order.order_type()),
+        )
     }
 
     /// What the fence property test saw across its fixtures: order pages,
@@ -4517,7 +4509,7 @@ mod tests {
         let pairs: Vec<(i64, i64)> = (0..i64::try_from(rows).unwrap())
             .map(|i| (i, i % 2))
             .collect();
-        let mut fixture = ordered_of(&pairs);
+        let mut fixture = Fixture::of_long_pairs(&pairs);
         fixture.layout.row_group_rows = rows;
         fixture.layout.dictionary = Dictionary::All;
         let opened = store(&fixture).await;
@@ -4707,7 +4699,7 @@ mod tests {
         let pairs: Vec<(i64, i64)> = (0..i64::try_from(contract_rows()).unwrap())
             .map(|i| (i / 3, i % 3))
             .collect();
-        let opened = store(&ordered_of(&pairs)).await;
+        let opened = store(&Fixture::of_long_pairs(&pairs)).await;
         let oracle = opened
             .build_under(&layout, Residency::Full, None)
             .await
@@ -4792,10 +4784,8 @@ mod tests {
         let orders = (0..rows)
             .map(|i| Some(format!("{shared}{:06}", i % run).into_bytes()))
             .collect();
-        let mut fixture = Fixture::ordered(&keys, Orders::Bytes(orders));
-        fixture.layout.page_rows = page_rows;
-        fixture.layout.write_batch = page_rows;
-        fixture.layout.row_group_rows = BUDGET_ROWS / 2;
+        let mut fixture =
+            Fixture::ordered(&keys, Orders::Bytes(orders)).in_pages(page_rows, BUDGET_ROWS / 2);
         edit(&mut fixture.layout);
         fixture
     }

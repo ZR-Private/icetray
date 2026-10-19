@@ -493,20 +493,13 @@ fn partition_point(len: usize, below: impl Fn(usize) -> bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::testing::long_pair;
 
     /// A pair of a long key and a byte order value.
     fn bytes_pair(key: i64, order: &[u8]) -> Pair<'_> {
         Pair {
             key: PairPart::Long(key),
             order: PairPart::Bytes(order),
-        }
-    }
-
-    /// A pair of a long key and a long order value.
-    fn long_pair(key: i64, order: i64) -> Pair<'static> {
-        Pair {
-            key: PairPart::Long(key),
-            order: PairPart::Long(order),
         }
     }
 

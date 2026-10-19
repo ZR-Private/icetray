@@ -35,7 +35,9 @@ use crate::index::page_header::{
     NUM_VALUES_FIELD, PageBody, PageHeader, REPETITION_LEVELS_BYTE_LENGTH_FIELD, TYPE_FIELD,
     UNCOMPRESSED_PAGE_SIZE_FIELD,
 };
-use crate::index::{ChunkPage, FileFault, FileIndex, HeaderField, ResidentBytes, RowRef, WireType};
+use crate::index::{
+    ChunkPage, FileFault, FileIndex, HeaderField, Pair, PairPart, ResidentBytes, RowRef, WireType,
+};
 use crate::key::testing::UUID_HALF_BYTES;
 use crate::key::{Key, KeyType, UUID_BYTES};
 use crate::local::LocalDir;
@@ -194,6 +196,14 @@ impl Orders {
                 .unwrap(),
             ),
         }
+    }
+}
+
+/// A pair of a long key and a long order value.
+pub(crate) fn long_pair(key: i64, order: i64) -> Pair<'static> {
+    Pair {
+        key: PairPart::Long(key),
+        order: PairPart::Long(order),
     }
 }
 
@@ -358,6 +368,23 @@ impl Fixture {
         }
     }
 
+    /// `ordered` of long keys and long order values, one row per `(key,
+    /// order)` pair.
+    pub(crate) fn of_long_pairs(pairs: &[(i64, i64)]) -> Self {
+        let keys: Vec<i64> = pairs.iter().map(|&(key, _)| key).collect();
+        let orders: Vec<i64> = pairs.iter().map(|&(_, order)| order).collect();
+        Self::ordered(&keys, long_orders(&orders))
+    }
+
+    /// The fixture written in pages of `page_rows` rows, a write batch a
+    /// page, and row groups of `group_rows`.
+    pub(crate) fn in_pages(mut self, page_rows: usize, group_rows: usize) -> Self {
+        self.layout.page_rows = page_rows;
+        self.layout.write_batch = page_rows;
+        self.layout.row_group_rows = group_rows;
+        self
+    }
+
     pub(super) fn write(&self) -> Bytes {
         let key_nullable = self.nullable_key || self.keys.iter().any(Option::is_none);
         let value_nullable = self.values.iter().any(Option::is_none);
@@ -498,32 +525,40 @@ impl Opened {
         FileIndex::build(TABLE, Arc::clone(&self.handle), layout, residency, local).await
     }
 
-    /// A build of long keys under `ordered_layout` with an order column of
-    /// `order_type`, in `residency`, with a local directory under `dir` for
-    /// the Disk tier and none for the others.
+    /// A build under `layout` in `residency`, with a local directory under
+    /// `dir` for the Disk tier and none for the others.
+    pub(crate) async fn build_under_in(
+        &self,
+        layout: &TableLayout,
+        residency: Residency,
+        dir: &Path,
+    ) -> Result<FileIndex> {
+        let local = testing::local_dir(dir, self.stats(), None);
+        let local = (residency == Residency::Disk).then_some(&local);
+        self.build_under(layout, residency, local).await
+    }
+
+    /// `build_under_in` of long keys under `ordered_layout` with an order
+    /// column of `order_type`.
     pub(crate) async fn build_ordered_in(
         &self,
         order_type: OrderType,
         residency: Residency,
         dir: &Path,
     ) -> Result<FileIndex> {
-        let local = testing::local_dir(dir, self.stats(), None);
-        let local = (residency == Residency::Disk).then_some(&local);
-        self.build_under(&ordered_layout(KeyType::Long, order_type), residency, local)
+        self.build_under_in(&ordered_layout(KeyType::Long, order_type), residency, dir)
             .await
     }
 
-    /// A build in `residency`, with a local directory under `dir` for
-    /// the Disk tier and none for the others.
+    /// `build_under_in` of `key_type` keys under the key-value layout.
     pub(super) async fn build_in(
         &self,
         key_type: KeyType,
         residency: Residency,
         dir: &Path,
     ) -> Result<FileIndex> {
-        let local = testing::local_dir(dir, self.stats(), None);
-        let local = (residency == Residency::Disk).then_some(&local);
-        self.build(key_type, residency, local).await
+        self.build_under_in(&manifest_testing::layout(key_type, None), residency, dir)
+            .await
     }
 
     pub(super) async fn index(&self, key_type: KeyType) -> FileIndex {
