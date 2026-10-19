@@ -793,6 +793,17 @@ impl OrderShape {
         }
     }
 
+    /// The bytes every order value of this shape takes: eight for an
+    /// integer, read as a long, and the width for a fixed-width value;
+    /// `None` for a byte array, whose values vary.
+    fn fixed_bytes(self) -> Option<u64> {
+        match self {
+            Self::Int32 | Self::Int64 => Some(approx::count(size_of::<i64>())),
+            Self::Fixed(width) => Some(u64::from(width)),
+            Self::Str | Self::Bin => None,
+        }
+    }
+
     /// How the order values decode into a `Keys` run.
     fn run_shape(self) -> RunShape {
         match self {

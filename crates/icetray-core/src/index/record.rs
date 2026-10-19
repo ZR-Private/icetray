@@ -558,12 +558,10 @@ pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
     let keys = approx::count(fences).saturating_add(approx::count(groups));
     let order_bytes = order.map_or(0, |order| {
         let order_column = column.with_leaf(order.leaf);
-        let value = |chunk: ColumnChunk<'_>| match order.shape {
-            OrderShape::Int32 | OrderShape::Int64 => approx::count(size_of::<i64>()),
-            OrderShape::Fixed(width) => u64::from(width),
-            OrderShape::Str | OrderShape::Bin => {
+        let value = |chunk: ColumnChunk<'_>| {
+            order.shape.fixed_bytes().unwrap_or_else(|| {
                 approx::measured(chunk.metadata().uncompressed_size()).min(MOST_VALUE_PAGE_BYTES)
-            }
+            })
         };
         let chunks = || (0..groups).map(|row_group| order_column.group(row_group));
         let largest = chunks().map(value).max().unwrap_or(0);
@@ -576,15 +574,12 @@ pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
         let fence = |chunk: ColumnChunk<'_>| {
             let pages = approx::count(chunk.page_locations().len());
             let framing = (approx::count(MAX_KEY_BYTES) + field).saturating_add(field);
-            let values = match (order.shape, chunk.dictionary_range()) {
-                (OrderShape::Str | OrderShape::Bin, None) => {
+            let values = match (order.shape.fixed_bytes(), chunk.dictionary_range()) {
+                (None, None) => {
                     let chunk_bytes = approx::measured(chunk.metadata().uncompressed_size());
                     chunk_bytes.min(pages.saturating_mul(MOST_VALUE_PAGE_BYTES))
                 }
-                (OrderShape::Str | OrderShape::Bin, Some(_))
-                | (OrderShape::Int32 | OrderShape::Int64 | OrderShape::Fixed(_), _) => {
-                    pages.saturating_mul(value(chunk))
-                }
+                (None, Some(_)) | (Some(_), _) => pages.saturating_mul(value(chunk)),
             };
             pages
                 .saturating_mul(framing)

@@ -627,10 +627,11 @@ impl ResidentSet {
             .collect();
         let key_chunks = saturating_sum(placed.iter().map(|range| range.end - range.start));
         let mut stored = placed;
+        let key_fences = estimated_fence_keys(metadata, key_leaf);
         let mut record = record::estimated_len(
-            estimated_fence_keys(metadata, key_leaf)
-                .into_iter()
-                .map(|(pages, key_bytes)| (approx::count(pages), key_bytes)),
+            key_fences
+                .iter()
+                .map(|&(pages, key_bytes)| (approx::count(pages), key_bytes)),
         );
         let (mut order_facts, mut order_fences) = (0, 0);
         if let Some(order) = order {
@@ -641,7 +642,7 @@ impl ResidentSet {
                     .filter_map(|group| chunk_range(group.column(order.leaf), file_size)),
             );
             let values = estimated_order_bytes(metadata, order);
-            let fences = estimated_order_fences(metadata, key_leaf, order);
+            let fences = estimated_order_fences(metadata, &key_fences, order);
             record = record.saturating_add(record::estimated_order_len(
                 metadata
                     .row_groups()
@@ -682,7 +683,7 @@ impl ResidentSet {
                 record,
             ),
             fences: built.map_or_else(
-                || estimated_fence_bytes(metadata, key_leaf),
+                || estimated_fence_bytes(metadata, key_leaf, &key_fences),
                 |(fences, _)| exact_fence_bytes(fences),
             ),
             order_facts,
@@ -780,62 +781,52 @@ fn exact_order_fact_bytes(facts: &OrderFacts) -> u64 {
 /// kept holds no order column index (RFD 025, Load); for a fixed-width
 /// column its width; for an integer the eight bytes of a long.
 fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 2] {
-    match order.shape {
-        OrderShape::Int32 | OrderShape::Int64 => [approx::count(size_of::<i64>()); 2],
-        OrderShape::Fixed(width) => [u64::from(width); 2],
-        OrderShape::Str | OrderShape::Bin => {
-            let chunks = || {
-                metadata
-                    .row_groups()
-                    .iter()
-                    .map(|group| group.column(order.leaf))
-            };
-            let encoded =
-                saturating_sum(chunks().map(|chunk| approx::measured(chunk.uncompressed_size())));
-            let values = saturating_sum(chunks().map(|chunk| approx::measured(chunk.num_values())));
-            // A column of no values has no mean.
-            [encoded.checked_div(values).unwrap_or(0); 2]
-        }
-    }
+    let bytes = order.shape.fixed_bytes().unwrap_or_else(|| {
+        let chunks = || {
+            metadata
+                .row_groups()
+                .iter()
+                .map(|group| group.column(order.leaf))
+        };
+        let encoded =
+            saturating_sum(chunks().map(|chunk| approx::measured(chunk.uncompressed_size())));
+        let values = saturating_sum(chunks().map(|chunk| approx::measured(chunk.num_values())));
+        // A column of no values has no mean.
+        encoded.checked_div(values).unwrap_or(0)
+    });
+    [bytes; 2]
 }
 
 /// Per row group, the order fences of the file `order` is the order column
 /// of, before any is decoded, as the record stores them (`FenceBytes`): a
 /// fence per order page from the offset index, its key at the mean bytes
-/// the row group's key fences are estimated at per key page
-/// (`estimated_fence_keys`), and its order value at eight bytes for an
-/// integer, the width for a fixed-width value, and for a byte array at the
-/// chunk's uncompressed bytes per value (`byte_array_order_fence_heap`).
-/// The built fences are charged exactly (RFD 025, Load), since no footer
-/// number bounds a dictionary-encoded column's.
+/// the row group's key fences, `key_fences` (`estimated_fence_keys`), are
+/// estimated at per key page, and its order value at the bytes every value
+/// of the shape takes (`OrderShape::fixed_bytes`), or for a byte array at
+/// the chunk's uncompressed bytes per value (`mean_value_bytes`). A fence
+/// keeps a prefix of its page's first value; the chunk's bytes per value
+/// covers a plain chunk's values on average, and a dictionary-encoded
+/// chunk's values only as far as its dictionary holds them, so the built
+/// fences are charged exactly (RFD 025, Load).
 fn estimated_order_fences(
     metadata: &ParquetMetaData,
-    key_leaf: usize,
+    key_fences: &[(usize, u64)],
     order: OrderLeaf,
 ) -> Vec<FenceBytes> {
-    let key_fences = estimated_fence_keys(metadata, key_leaf);
     metadata
         .row_groups()
         .iter()
         .zip(key_fences)
         .enumerate()
-        .map(|(row_group, (group, (key_pages, key_bytes)))| {
-            let pages = metadata
-                .offset_index()
-                .and_then(|index| index.get(row_group))
-                .and_then(|columns| columns.get(order.leaf))
-                .map_or(0, |column| column.page_locations().len());
-            let count = approx::count(pages);
+        .map(|(row_group, (group, &(key_pages, key_bytes)))| {
+            let count = approx::count(offset_pages(metadata, row_group, order.leaf));
             let key_mean = key_bytes.checked_div(approx::count(key_pages)).unwrap_or(0);
-            let orders = match order.shape {
-                OrderShape::Int32 | OrderShape::Int64 => {
-                    count.saturating_mul(approx::count(size_of::<i64>()))
-                }
-                OrderShape::Fixed(width) => count.saturating_mul(u64::from(width)),
-                OrderShape::Str | OrderShape::Bin => {
-                    byte_array_order_fence_heap(group.column(order.leaf), pages)
-                }
-            };
+            let orders = count.saturating_mul(
+                order
+                    .shape
+                    .fixed_bytes()
+                    .unwrap_or_else(|| mean_value_bytes(group.column(order.leaf))),
+            );
             FenceBytes {
                 pages: count,
                 keys: count.saturating_mul(key_mean),
@@ -858,21 +849,6 @@ fn order_fence_bytes(groups: &[FenceBytes], long_keys: bool, long_orders: bool) 
         })
 }
 
-/// The heap the order values of the fences of one row group of a
-/// `BYTE_ARRAY` order column would hold, `pages` of them: per page the
-/// chunk's uncompressed bytes per value. A fence keeps a prefix of its
-/// page's first value; the chunk's bytes per value covers a plain chunk's
-/// values on average, and a dictionary-encoded chunk's values only as far
-/// as its dictionary holds them, so the built fences are charged exactly
-/// (RFD 025, Load).
-fn byte_array_order_fence_heap(chunk: &ColumnChunkMetaData, pages: usize) -> u64 {
-    let encoded = approx::measured(chunk.uncompressed_size());
-    let values = approx::measured(chunk.num_values());
-    // A chunk of no values has no mean.
-    let mean = encoded.checked_div(values).unwrap_or(0);
-    approx::count(pages).saturating_mul(mean)
-}
-
 /// The fence array's bytes: one `Key` per key page plus what each key holds
 /// on the heap. The fences are built with exact allocations.
 fn exact_fence_bytes(fences: &[Vec<Key>]) -> u64 {
@@ -893,24 +869,27 @@ fn exact_fence_bytes(fences: &[Vec<Key>]) -> u64 {
 /// The fence array's bytes before the keys are decoded: one `Key` per key
 /// page from the offset index plus, per page, the heap a first key of the
 /// column's physical type would hold, as `predicted_resident_bytes`
-/// documents: its encoded bytes (`estimated_fence_keys`), but none for a
-/// long, which a `Key` holds inline.
-fn estimated_fence_bytes(metadata: &ParquetMetaData, key_leaf: usize) -> u64 {
+/// documents: its encoded bytes, `key_fences` (`estimated_fence_keys`),
+/// but none for a long, which a `Key` holds inline.
+fn estimated_fence_bytes(
+    metadata: &ParquetMetaData,
+    key_leaf: usize,
+    key_fences: &[(usize, u64)],
+) -> u64 {
     let inline = metadata
         .file_metadata()
         .schema_descr()
         .column(key_leaf)
         .physical_type()
         == PhysicalType::INT64;
-    estimated_fence_keys(metadata, key_leaf).into_iter().fold(
-        0,
-        |total: u64, (pages, key_bytes)| {
+    key_fences
+        .iter()
+        .fold(0, |total: u64, &(pages, key_bytes)| {
             let heap = if inline { 0 } else { key_bytes };
             total
                 .saturating_add(approx::count(pages * size_of::<Key>()))
                 .saturating_add(heap)
-        },
-    )
+        })
 }
 
 /// Per row group, its key pages from the offset index and the bytes the
@@ -921,11 +900,7 @@ fn estimated_fence_keys(metadata: &ParquetMetaData, key_leaf: usize) -> Vec<(usi
     let descr = metadata.file_metadata().schema_descr().column(key_leaf);
     let mut groups = Vec::with_capacity(metadata.num_row_groups());
     for (row_group, group) in metadata.row_groups().iter().enumerate() {
-        let pages = metadata
-            .offset_index()
-            .and_then(|index| index.get(row_group))
-            .and_then(|columns| columns.get(key_leaf))
-            .map_or(0, |column| column.page_locations().len());
+        let pages = offset_pages(metadata, row_group, key_leaf);
         let column_index = metadata
             .column_index()
             .and_then(|index| index.get(row_group))
@@ -973,14 +948,26 @@ fn byte_array_fence_heap(
             | ColumnIndexMetaData::FLOAT(_)
             | ColumnIndexMetaData::DOUBLE(_)
             | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_),
-        ) => {
-            let encoded = approx::measured(chunk.uncompressed_size());
-            let values = approx::measured(chunk.num_values());
-            // A chunk of no values has no mean, and no heap per fence.
-            let mean = encoded.checked_div(values).unwrap_or(0);
-            approx::count(pages).saturating_mul(mean)
-        }
+        ) => approx::count(pages).saturating_mul(mean_value_bytes(chunk)),
     }
+}
+
+/// The pages of column `leaf` of `row_group` in `metadata`'s offset index;
+/// none where the offset index does not hold them.
+fn offset_pages(metadata: &ParquetMetaData, row_group: usize, leaf: usize) -> usize {
+    metadata
+        .offset_index()
+        .and_then(|index| index.get(row_group))
+        .and_then(|columns| columns.get(leaf))
+        .map_or(0, |column| column.page_locations().len())
+}
+
+/// The mean uncompressed bytes per value of `chunk`; zero for a chunk of
+/// no values, which has no mean.
+fn mean_value_bytes(chunk: &ColumnChunkMetaData) -> u64 {
+    let encoded = approx::measured(chunk.uncompressed_size());
+    let values = approx::measured(chunk.num_values());
+    encoded.checked_div(values).unwrap_or(0)
 }
 
 #[cfg(test)]
