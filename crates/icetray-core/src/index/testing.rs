@@ -491,8 +491,19 @@ pub(crate) async fn store_gauged(fixture: &Fixture) -> (Opened, Arc<Gauged>) {
 }
 
 async fn store_file_hedged_by(file: Bytes, window: Arc<HedgeWindow>) -> Opened {
+    store_file_at(&location(), file, window).await
+}
+
+/// `store` under `key` in place of the fixture's usual file key, so two
+/// stored files have two chunk file names.
+pub(super) async fn store_as(fixture: &Fixture, key: &str) -> Opened {
+    let window = Arc::new(HedgeWindow::new(&HedgeConfig::default()));
+    store_file_at(&format!("{MEM_PREFIX}{key}"), fixture.write(), window).await
+}
+
+async fn store_file_at(location: &str, file: Bytes, window: Arc<HedgeWindow>) -> Opened {
     let mem = MemStore::new();
-    let handle = mem.open(&location(), file.clone(), window).await;
+    let handle = mem.open(location, file.clone(), window).await;
     Opened {
         storage: mem.storage,
         handle,

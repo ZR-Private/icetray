@@ -369,7 +369,10 @@ struct ChunkFileTarget<'a> {
 /// file is checked twice; `None` looks now. The write runs on the blocking
 /// pool (`on_blocking_pool`) and holds `reservation` until it ends, so
 /// bytes it lands after its caller stopped waiting stay reserved until
-/// they are on disk. An ordered file's chunk file, whose order fences no
+/// they are on disk; once they are, the `estimated` bytes the load reserved
+/// for the file are released, since `index_bytes_in_use` counts them. A
+/// file written over a chunk file already there releases none: the
+/// load may have reserved nothing for it. An ordered file's chunk file, whose order fences no
 /// footer number bounds, is charged its exact length before it is written:
 /// beyond the `estimated` length the load reserved, the rest is reserved
 /// too (`LocalDir::reserve`) and held with the load's hold, or the build is
@@ -413,13 +416,18 @@ async fn disk_chunks(
     };
     let (local, reservation, written_path) =
         (Arc::clone(local), reservation.cloned(), path.clone());
+    let estimated = target.estimated;
     let disk = on_blocking_pool(move || {
+        let was_absent = !path.exists();
         let written = local.write_chunks(
             &identity,
             under,
             &verification,
             chunks.parts().iter().cloned(),
         );
+        if let (Some(reservation), true) = (&reservation, was_absent) {
+            reservation.release(estimated);
+        }
         drop((reservation, rest));
         written
     })
@@ -1638,7 +1646,7 @@ mod tests {
         FEW_ROWS, FIXED_KEY_BYTES, Fixture, INFLATED_GROUP_ROWS, ORDER_COLUMN, ORDER_FIELD_ID,
         Opened, Orders, PAGES_PER_GROUP, ROW_GROUPS, SMALL_BATCH, absent_after, contract_rows,
         fault_of, group_rows, header_at, key_for, location, longs, moved_by_header, ordered_layout,
-        pages_of, predicted_of, row_of, stepped, store, store_file, with_column_chunk,
+        pages_of, predicted_of, row_of, stepped, store, store_as, store_file, with_column_chunk,
         with_dictionary_one_entry_short, with_group_rows, with_header_claims, with_pages,
     };
     use crate::index::{
@@ -4975,5 +4983,69 @@ mod tests {
         let (built, written) = build_within(exact).await;
         built.unwrap();
         assert_eq!(written, exact);
+    }
+
+    /// A chunk file that has landed counts once, as bytes on disk, not again
+    /// in the load's reservation: of two ordered files whose chunk files fill
+    /// the budget exactly, the second is charged its exact length beside the
+    /// first's file on disk, not beside the first's file and its estimate.
+    /// A budget a byte short still refuses the second.
+    #[tokio::test]
+    async fn test_disk_tier_counts_a_landed_chunk_file_once() {
+        let layout = ordered_layout(KeyType::Long, OrderType::String);
+        let mut files = Vec::new();
+        for (key, rows) in [
+            ("first.parquet", DICTIONARY_ROWS),
+            ("second.parquet", DICTIONARY_ROWS + DICTIONARY_RUN_ROWS),
+        ] {
+            let fixture = budget_fixture(
+                rows,
+                DICTIONARY_RUN_ROWS,
+                DICTIONARY_PREFIX_BYTES,
+                DICTIONARY_PAGE_ROWS,
+                |layout| layout.dictionary = Dictionary::All,
+            );
+            let opened = store_as(&fixture, key).await;
+            let (_, [estimate, exact]) = budget_of(&opened).await;
+            assert!(exact > estimate, "the exact charge reserves a rest");
+            files.push((opened, estimate, exact));
+        }
+        let estimates: u64 = files.iter().map(|(_, estimate, _)| estimate).sum();
+        let exacts: u64 = files.iter().map(|(_, _, exact)| exact).sum();
+        let load_within = |budget: u64| {
+            let (files, layout) = (&files, &layout);
+            async move {
+                let dir = tempfile::tempdir().unwrap();
+                let local = testing::local_dir(dir.path(), files[0].0.stats(), Some(budget));
+                let reservation = Arc::new(local.reserve(TABLE, estimates).unwrap());
+                let mut result = Ok(());
+                for (opened, _, _) in files {
+                    let inspected = FileIndex::inspect(TABLE, Arc::clone(&opened.handle), layout)
+                        .await
+                        .unwrap();
+                    let built = inspected
+                        .build(Residency::Disk, Some(&local), Some(&reservation))
+                        .await;
+                    if let Err(error) = built {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                drop(reservation);
+                (result, local.index_bytes_in_use().unwrap())
+            }
+        };
+        let (loaded, written) = load_within(exacts).await;
+        loaded.unwrap();
+        assert_eq!(written, exacts);
+        let (refused, _) = load_within(exacts - 1).await;
+        assert_eq!(
+            refusal_of(refused),
+            RefusalReason::OverBudget {
+                of: crate::error::Budget::Index,
+                needed: exacts,
+                budget: exacts - 1,
+            }
+        );
     }
 }

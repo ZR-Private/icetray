@@ -385,16 +385,18 @@ impl LocalDir {
     /// refused. A load holds its reservation until it has finished writing,
     /// and each chunk file write it starts holds it too, so a write that
     /// outlives a load dropped mid-build keeps its bytes reserved until it
-    /// ends: a chunk file that has landed, or is being written, is counted
-    /// by `index_bytes_in_use` and by the reservation both until it drops.
-    /// That double count errs toward refusal: it can refuse a load that
-    /// would have fit. With no budget nothing is refused, `index/` is not
-    /// listed, and nothing is held.
+    /// ends. A chunk file is counted by `index_bytes_in_use` from the moment
+    /// its temporary file is created, so the write releases the file's share
+    /// of the reservation (`Reservation::release`) once the file has landed.
+    /// A file written over a chunk file already on disk releases nothing,
+    /// since the load may have reserved nothing for it: those bytes can count
+    /// twice until the load ends, which errs toward refusal. With no budget
+    /// nothing is refused, `index/` is not listed, and nothing is held.
     pub(crate) fn reserve(self: &Arc<Self>, table: &str, needed: u64) -> Result<Reservation> {
         let Some(budget) = self.index_budget else {
             return Ok(Reservation {
                 local: Arc::clone(self),
-                bytes: 0,
+                bytes: AtomicU64::new(0),
             });
         };
         let mut reserved = self.lock_reserved();
@@ -407,7 +409,7 @@ impl LocalDir {
                 *reserved += needed;
                 Ok(Reservation {
                     local: Arc::clone(self),
-                    bytes: needed,
+                    bytes: AtomicU64::new(needed),
                 })
             }
             Some(_) | None => Err(Error::refused(
@@ -545,16 +547,29 @@ impl Drop for InFlight<'_> {
 }
 
 /// Bytes of `index/` that `LocalDir::reserve` holds for one disk-tier
-/// load, released when this drops.
+/// load, released when this drops, or in part by `release`.
 #[derive(Debug)]
 pub(crate) struct Reservation {
     local: Arc<LocalDir>,
-    bytes: u64,
+    bytes: AtomicU64,
+}
+
+impl Reservation {
+    /// Stops holding `bytes` of what this holds, or all of it when it holds
+    /// less. Called once a chunk file the bytes were held for has landed,
+    /// when `index_bytes_in_use` counts them as bytes on disk.
+    pub(crate) fn release(&self, bytes: u64) {
+        let mut reserved = self.local.lock_reserved();
+        let held = self.bytes.load(Ordering::Relaxed);
+        let released = held.min(bytes);
+        self.bytes.store(held - released, Ordering::Relaxed);
+        *reserved -= released;
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        *self.local.lock_reserved() -= self.bytes;
+        *self.local.lock_reserved() -= *self.bytes.get_mut();
     }
 }
 
@@ -1271,6 +1286,24 @@ mod tests {
             }
         );
         drop(second);
+    }
+
+    /// A release frees part of a hold for the next reserve, never more than
+    /// the hold, and the drop frees only what is left.
+    #[test]
+    fn test_release_frees_part_of_a_hold_and_drop_frees_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, stats) = open(dir.path());
+        let local = local_dir(dir.path(), stats, Some(10));
+        let hold = local.reserve(TABLE, 10).unwrap();
+        hold.release(4);
+        let freed = local.reserve(TABLE, 4).unwrap();
+        assert!(local.reserve(TABLE, 1).is_err());
+        drop(freed);
+        hold.release(100);
+        let all = local.reserve(TABLE, 10).unwrap();
+        drop((hold, all));
+        assert_eq!(*local.lock_reserved(), 0);
     }
 
     #[test]
