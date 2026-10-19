@@ -28,8 +28,8 @@ use icetray_core::config::ServerConfig;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::{
     BoundSide, CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup,
-    Opened, OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanRow, Scanned, Table,
-    TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
+    Opened, OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanReceipt, ScanRow,
+    Scanned, Table, TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -159,17 +159,36 @@ fn table<'a>(tables: &'a Tables, name: &str) -> Result<&'a Arc<Table>, Status> {
 /// kind the call serves: a table of the other kind is `INVALID_ARGUMENT`
 /// whether or not it has loaded, so a call made to the wrong kind of table
 /// is never answered `UNAVAILABLE`, which a caller retries, and is refused
-/// before the call reads its key, direction, or bounds off the wire.
+/// before the call reads its key, direction, or bounds off the wire. The
+/// table's key type is read after that check, so a table that has not
+/// loaded is `UNAVAILABLE` only to a call of its own kind.
 fn table_serving<'a>(
     tables: &'a Tables,
     name: &str,
     served: TableKind,
-) -> Result<&'a Arc<Table>, Status> {
+) -> Result<(&'a Arc<Table>, KeyType), Status> {
     let table = table(tables, name)?;
     table
         .check_kind(served)
         .map_err(|error| status_from(&error))?;
-    Ok(table)
+    let key_type = table.key_type().map_err(|error| status_from(&error))?;
+    Ok((table, key_type))
+}
+
+/// A scan's response as measured against `server.max_scan_bytes`: sent, with
+/// its size recorded, or refused as `Error::ResponseTooLarge` with every key
+/// read counted an error (`ScanReceipt`).
+fn settle<R>(
+    receipt: ScanReceipt,
+    measured: Result<(R, usize), Oversize>,
+) -> Result<Response<R>, Status> {
+    match measured {
+        Ok((response, bytes)) => {
+            receipt.sent(bytes);
+            Ok(Response::new(response))
+        }
+        Err(oversize) => Err(status_from(&receipt.refused(oversize))),
+    }
 }
 
 /// The variant a wire `Key` carries (RFD 010), the closed set the `oneof`
@@ -231,6 +250,14 @@ pub fn key_from_wire(key: Option<v1::Key>, key_type: KeyType) -> Result<Key, Wir
             })
         }
     }
+}
+
+/// A batch's keys from the wire, each as `key_from_wire` reads one; the
+/// first fault ends the batch.
+fn keys_from_wire(keys: Vec<v1::Key>, key_type: KeyType) -> Result<Vec<Key>, WireKeyFault> {
+    keys.into_iter()
+        .map(|key| key_from_wire(Some(key), key_type))
+        .collect()
 }
 
 /// A Scan's direction from the wire: `Direction::try_from` of the number a
@@ -597,8 +624,7 @@ impl Service {
     /// `Get`.
     async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let tables = self.serving();
-        let table = table_serving(&tables, &request.table, TableKind::KeyValue)?;
-        let key_type = table.key_type().map_err(|error| status_from(&error))?;
+        let (table, key_type) = table_serving(&tables, &request.table, TableKind::KeyValue)?;
         let key = key_from_wire(request.key, key_type)?;
         let lookup = table
             .get(&key, &reads(&request.columns))
@@ -618,13 +644,8 @@ impl Service {
         request: MultiGetRequest,
     ) -> Result<Response<MultiGetResponse>, Status> {
         let tables = self.serving();
-        let table = table_serving(&tables, &request.table, TableKind::KeyValue)?;
-        let key_type = table.key_type().map_err(|error| status_from(&error))?;
-        let keys = request
-            .keys
-            .into_iter()
-            .map(|key| key_from_wire(Some(key), key_type))
-            .collect::<Result<Vec<Key>, WireKeyFault>>()?;
+        let (table, key_type) = table_serving(&tables, &request.table, TableKind::KeyValue)?;
+        let keys = keys_from_wire(request.keys, key_type)?;
         let lookup = table
             .multi_get(&keys, &reads(&request.columns))
             .await
@@ -650,8 +671,7 @@ impl Service {
     /// before any read (`Table::scan`).
     async fn scan_rows(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
         let tables = self.serving();
-        let table = table_serving(&tables, &request.table, TableKind::Ordered)?;
-        let key_type = table.key_type().map_err(|error| status_from(&error))?;
+        let (table, key_type) = table_serving(&tables, &request.table, TableKind::Ordered)?;
         let key = key_from_wire(request.key, key_type)?;
         let bounds = scan_bounds_from_wire(
             request.direction,
@@ -663,13 +683,7 @@ impl Service {
             .scan_receipt(&key, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        match scan_within_bound(lookup, self.max_scan_bytes) {
-            Ok((response, bytes)) => {
-                receipt.sent(bytes);
-                Ok(Response::new(response))
-            }
-            Err(oversize) => Err(status_from(&receipt.refused(oversize))),
-        }
+        settle(receipt, scan_within_bound(lookup, self.max_scan_bytes))
     }
 
     /// `MultiScan`. Its keys times its limit times its columns plus one are
@@ -680,13 +694,8 @@ impl Service {
         request: MultiScanRequest,
     ) -> Result<Response<MultiScanResponse>, Status> {
         let tables = self.serving();
-        let table = table_serving(&tables, &request.table, TableKind::Ordered)?;
-        let key_type = table.key_type().map_err(|error| status_from(&error))?;
-        let keys = request
-            .keys
-            .into_iter()
-            .map(|key| key_from_wire(Some(key), key_type))
-            .collect::<Result<Vec<Key>, WireKeyFault>>()?;
+        let (table, key_type) = table_serving(&tables, &request.table, TableKind::Ordered)?;
+        let keys = keys_from_wire(request.keys, key_type)?;
         let bounds = scan_bounds_from_wire(
             request.direction,
             request.limit,
@@ -697,13 +706,10 @@ impl Service {
             .multi_scan_receipt(&keys, &reads(&request.columns), &bounds)
             .await
             .map_err(|error| status_from(&error))?;
-        match multi_scan_within_bound(lookup, self.max_scan_bytes) {
-            Ok((response, bytes)) => {
-                receipt.sent(bytes);
-                Ok(Response::new(response))
-            }
-            Err(oversize) => Err(status_from(&receipt.refused(oversize))),
-        }
+        settle(
+            receipt,
+            multi_scan_within_bound(lookup, self.max_scan_bytes),
+        )
     }
 
     /// The future `work` builds, run inside `deadline` once a slot admits
