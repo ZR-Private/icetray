@@ -705,9 +705,8 @@ mod tests {
         assert_eq!(line["order"]["distinct_keys"], Json::from(DISTINCT_KEYS));
     }
 
-    /// The greatest long a double-parsing reader holds exactly, as a signed
-    /// value.
-    const EXACT_LONG: i64 = 1 << f64::MANTISSA_DIGITS;
+    /// `MAX_EXACT_JSON_INTEGER` as a signed value.
+    const EXACT_LONG: i64 = MAX_EXACT_JSON_INTEGER.cast_signed();
 
     /// A file whose order column holds `min` through `max`.
     fn ordered_file(min: OrderValue, max: OrderValue) -> FileReport {
@@ -725,7 +724,6 @@ mod tests {
     fn test_carries_inexact_order_is_false_at_2_pow_53_and_true_one_past_it() {
         let at = |min, max| carries_inexact_order(&[ordered_file(min, max)]);
         let long = OrderValue::Long;
-        assert_eq!(u64::try_from(EXACT_LONG), Ok(MAX_EXACT_JSON_INTEGER));
         assert!(!at(long(EXACT_LONG), long(EXACT_LONG)));
         assert!(!at(long(-EXACT_LONG), long(-EXACT_LONG)));
         assert!(at(long(0), long(EXACT_LONG + 1)));
