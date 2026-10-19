@@ -96,7 +96,7 @@ const FIELD_4_VARINT_TAG: u8 = 0x20;
 const FIELD_5_VARINT_TAG: u8 = 0x28;
 
 /// The tag byte that opens a length-delimited field 6, `(6 << 3) | 2`:
-/// `ScanRequest.from`.
+/// `ScanRequest.start`.
 const FIELD_6_LEN_TAG: u8 = 0x32;
 
 /// The tag byte that opens a length-delimited field 7, `(7 << 3) | 2`:
@@ -483,7 +483,7 @@ fn test_round_trip_order_value_every_variant() {
 
 #[test]
 fn test_round_trip_scan_request_every_direction() {
-    let [from, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [start, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     for &(direction, _) in DIRECTION_NUMBERS {
         let request = ScanRequest {
             table: TABLE.to_owned(),
@@ -491,7 +491,7 @@ fn test_round_trip_scan_request_every_direction() {
             columns: columns(),
             direction: i32::from(direction),
             limit: SCAN_LIMIT,
-            from: Some(from.clone()),
+            start: Some(start.clone()),
             before: Some(before.clone()),
         };
         assert_round_trips(&request);
@@ -520,14 +520,14 @@ fn test_round_trip_scan_response_with_next_and_snapshot() {
 
 #[test]
 fn test_round_trip_multi_scan_request_every_key_variant() {
-    let [from, before, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [start, before, _] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     assert_round_trips(&MultiScanRequest {
         table: TABLE.to_owned(),
         keys: vec![long_key(), str_key(), bin_key()],
         columns: columns(),
         direction: i32::from(Direction::OldestFirst),
         limit: SCAN_LIMIT,
-        from: Some(from),
+        start: Some(start),
         before: Some(before),
     });
 }
@@ -766,11 +766,11 @@ fn varint(value: i64) -> Vec<u8> {
 /// limit as varint fields 4 and 5, and leaves an unset bound off the wire.
 #[test]
 fn test_encode_scan_request_bounds_exact_bytes() {
-    let [from, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
+    let [start, _, before] = <[OrderValue; 3]>::try_from(order_values()).unwrap();
     let request = ScanRequest {
         direction: i32::from(Direction::NewestFirst),
         limit: SCAN_LIMIT,
-        from: Some(from.clone()),
+        start: Some(start.clone()),
         before: Some(before.clone()),
         ..ScanRequest::default()
     };
@@ -785,14 +785,14 @@ fn test_encode_scan_request_bounds_exact_bytes() {
     .concat();
     let wire = [
         head.clone(),
-        delimited(FIELD_6_LEN_TAG, &from.encode_to_vec()),
+        delimited(FIELD_6_LEN_TAG, &start.encode_to_vec()),
         delimited(FIELD_7_LEN_TAG, &before.encode_to_vec()),
     ]
     .concat();
     assert_eq!(request.encode_to_vec(), wire);
     assert_eq!(ScanRequest::decode(wire.as_slice()).unwrap(), request);
     let unbounded = ScanRequest {
-        from: None,
+        start: None,
         before: None,
         ..request
     };

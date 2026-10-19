@@ -293,6 +293,33 @@ pub enum OrderValue {
     Bytes(Vec<u8>),
 }
 
+impl OrderValue {
+    /// The least order value above this one, in the order a Scan compares
+    /// them: one more for a long, and for a string or bytes the value with
+    /// one zero byte appended, which sorts after it and before every other
+    /// value above it, whatever its length, so of a `fixed` type it is one
+    /// byte longer than the type's width. `None` for `i64::MAX`, which no
+    /// long lies above.
+    #[must_use]
+    pub fn successor(&self) -> Option<Self> {
+        match self {
+            Self::Long(value) => value.checked_add(1).map(Self::Long),
+            Self::Str(text) => {
+                let mut next = String::with_capacity(text.len() + 1);
+                next.push_str(text);
+                next.push('\0');
+                Some(Self::Str(next))
+            }
+            Self::Bytes(bytes) => {
+                let mut next = Vec::with_capacity(bytes.len() + 1);
+                next.extend_from_slice(bytes);
+                next.push(0);
+                Some(Self::Bytes(next))
+            }
+        }
+    }
+}
+
 impl fmt::Display for OrderValue {
     /// A long as the integer, a string quoted with `Debug` escaping, bytes
     /// as `0x`-prefixed lowercase hex, as `Key` displays its variants.
@@ -369,7 +396,7 @@ pub enum Direction {
 }
 
 /// What one Scan of a key asks for. `limit` is from 1 to the table's
-/// `max_scan_rows`, and 0 is refused; the bounds are half-open, `from`
+/// `max_scan_rows`, and 0 is refused; the bounds are half-open, `start`
 /// inclusive and `before` exclusive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanBounds {
@@ -378,7 +405,7 @@ pub struct ScanBounds {
     /// The most rows to return.
     pub limit: u32,
     /// Only rows whose order value is at or above this.
-    pub from: Option<OrderValue>,
+    pub start: Option<OrderValue>,
     /// Only rows whose order value is below this.
     pub before: Option<OrderValue>,
 }
@@ -430,6 +457,28 @@ mod tests {
         ];
         for iceberg in refused {
             assert_eq!(OrderType::from_iceberg(&iceberg), None, "{iceberg}");
+        }
+    }
+
+    #[test]
+    fn test_successor_is_the_least_value_above() {
+        assert_eq!(OrderValue::Long(-1).successor(), Some(OrderValue::Long(0)));
+        assert_eq!(OrderValue::Long(i64::MAX).successor(), None);
+        let text = OrderValue::Str("ab".to_string());
+        let next = text.successor().unwrap();
+        assert_eq!(next, OrderValue::Str("ab\0".to_string()));
+        for above in ["ab\0\0", "ab\u{1}", "abc", "b", "ac"] {
+            let above = OrderValue::Str(above.to_string());
+            assert!(text < next && next <= above, "{above}");
+        }
+        // Of a fixed width: one byte longer, below every other value of the
+        // width above the one it follows.
+        let fixed = OrderValue::Bytes(vec![1, 0xff]);
+        let next = fixed.successor().unwrap();
+        assert_eq!(next, OrderValue::Bytes(vec![1, 0xff, 0]));
+        for above in [vec![2, 0], vec![1, 0xff, 0], vec![0xff, 0xff]] {
+            let above = OrderValue::Bytes(above);
+            assert!(fixed < next && next <= above, "{above}");
         }
     }
 

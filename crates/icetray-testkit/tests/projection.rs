@@ -238,7 +238,7 @@ async fn test_a_malformed_value_fails_a_scan_naming_the_key_and_the_row() -> Res
             .config()
             .scan_rows()
             .expect("an ordered table has a max_scan_rows"),
-        from: None,
+        start: None,
         before: None,
     };
     let mut refused = 0;

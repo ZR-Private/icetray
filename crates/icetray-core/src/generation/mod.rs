@@ -608,15 +608,15 @@ impl Generation {
     }
 
     /// One Scan of `key` (RFD 025, Cost): its live rows at or above
-    /// `bounds`' `from` and below its `before`, in `bounds.direction`, at
-    /// most `limit` of them (the limit the table checked; `bounds.limit` is
-    /// not read), each with one value per
-    /// position of `columns` in the layout, and the next page's bound when
-    /// live rows remain inside the bounds past the last returned. Every candidate
-    /// file whose exact key range covers the key (`candidates`) finds the
-    /// key's run (`FileIndex::locate_run`), and each file that holds it
-    /// reads its candidate rows (`FileIndex::read_run`), up to `limit` live
-    /// ones from the direction's end and one more past them, its
+    /// `bounds`' `start` and below its `before`, in `bounds.direction`, at
+    /// most `bounds.limit` of them, which the table checked, each with one
+    /// value per position of `columns` in the layout, and the next page's
+    /// bound when live rows remain inside the bounds past the last
+    /// returned. Every candidate file whose exact key range covers the key
+    /// (`candidates`) finds the key's run (`FileIndex::locate_run`), and
+    /// each file that holds it reads its candidate rows
+    /// (`FileIndex::read_run`), up to the limit's live rows from the
+    /// direction's end and whether one more lies past them, its
     /// rows counted live against the file's deletes with no I/O (RFD 021);
     /// the files are read together, each reading as soon as its run is
     /// found, so the read is one round across them, and under Bloom one
@@ -624,7 +624,7 @@ impl Generation {
     /// `source.fan_out`, goes through `source.cache`, and counts in its
     /// column's counter. The files' rows are merged by order value, live
     /// pairs being unique across files (RFD 025, Uniqueness), and cut to
-    /// `limit` (`scan::merge`). A file written before a column was added
+    /// the limit (`scan::merge`). A file written before a column was added
     /// answers that column's default (RFD 023). A key no file holds
     /// answers no rows and no `next`, with no read beyond finding that.
     pub(crate) async fn scan(
@@ -632,7 +632,6 @@ impl Generation {
         key: &Key,
         columns: &[usize],
         bounds: &ScanBounds,
-        limit: u32,
         source: RunSource<'_>,
     ) -> Result<(Scanned, ScanRead)> {
         let reads = self.ranked_candidates(key).map(|(at, file)| async move {
@@ -642,7 +641,7 @@ impl Generation {
             let deleted = self.deletes[at].as_deref();
             let rows = file
                 .index
-                .read_run(&run, bounds, limit, columns, &deleted, source)
+                .read_run(&run, bounds, columns, &deleted, source)
                 .await?;
             Ok(Some((file, rows)))
         });
@@ -667,10 +666,7 @@ impl Generation {
             answers.push(rows.answer);
         }
         let files = answers.len();
-        Ok((
-            scan::merge(answers, bounds.direction, limit),
-            ScanRead { files, from_store },
-        ))
+        Ok((scan::merge(answers, bounds), ScanRead { files, from_store }))
     }
 
     /// `lookup` naming the layout's first value column, alone and

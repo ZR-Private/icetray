@@ -1238,7 +1238,7 @@ async fn test_int_order_promoted_to_long_is_served() -> Result<()> {
     let every_row = ScanBounds {
         direction: Direction::OldestFirst,
         limit: DEFAULT_MAX_SCAN_ROWS,
-        from: None,
+        start: None,
         before: None,
     };
     for ((&key, value), &order) in RAW_KEYS.iter().zip(raw_values()).zip(&RAW_INT_ORDERS) {

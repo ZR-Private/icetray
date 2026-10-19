@@ -256,7 +256,9 @@ enum OrderType {
   // bytewise.
   ORDER_TYPE_BINARY = 9;
   // Iceberg `fixed`: every value is `TableInfoResponse.order_width` bytes.
-  // Bounds and order values are OrderValue.bin, compared bytewise.
+  // Bounds and order values are OrderValue.bin, compared bytewise. A bound
+  // may be of another length: a `next` reading oldest first is one byte
+  // longer than the width.
   ORDER_TYPE_FIXED = 10;
 }
 
@@ -302,9 +304,9 @@ enum Direction {
 // column in a way ColumnRead does not allow, sets no direction, sets a
 // limit of 0 or one above TableInfoResponse.max_scan_rows, sets a bound of
 // another variant than the table's order type takes or one with no
-// variant, or sets `from` at or above `before`, an empty window. The
+// variant, or sets `start` at or above `before`, an empty window. The
 // bounds are half-open: a row is read when its order value is at or above
-// `from` and below `before`.
+// `start` and below `before`.
 message ScanRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error, and the name of a table that
@@ -331,10 +333,10 @@ message ScanRequest {
   // When set, only rows whose order value is at or above this one,
   // inclusive. A caller reading oldest first pages by setting it to the
   // previous response's `next`.
-  OrderValue from = 6;
+  OrderValue start = 6;
   // When set, only rows whose order value is below this one, exclusive. A
   // caller reading newest first pages by setting it to the previous
-  // response's `next`. When both bounds are set, `from` must be below
+  // response's `next`. When both bounds are set, `start` must be below
   // `before`.
   OrderValue before = 7;
 }
@@ -358,12 +360,16 @@ message ScanResponse {
   repeated ScanRow rows = 1;
   // The bound of the next page in the same direction, set exactly when the
   // key has rows within the bounds past the last one returned. Reading
-  // oldest first it is the order value of the first such row, which the
-  // next request sets as `from`; reading newest first it is the order value
-  // of the oldest row returned, which the next request sets as `before`.
-  // The next request keeps the other bound, the direction, and the limit.
-  // Unset for a key with no rows, and for a response whose last row is the
-  // key's last within the bounds, even one at the limit.
+  // newest first it is the order value of the last row returned, the
+  // oldest, which the next request sets as `before`. Reading oldest first it
+  // is the least order value above the last row returned, the newest: one
+  // more for an integer, date, or timestamp type, and that row's value with
+  // one zero byte appended for a string, binary, or fixed type. The next
+  // request sets it as `start`, so a row a later snapshot adds above the
+  // last row returned is read. The next request keeps the other bound, the
+  // direction, and the limit. Unset for a key with no rows, and for a
+  // response whose last row is the key's last within the bounds, even one
+  // at the limit.
   OrderValue next = 2;
   // The id of the Iceberg snapshot the server read the response from. Two
   // responses carrying different ids were read from different snapshots of
@@ -398,8 +404,8 @@ message MultiScanRequest {
   // an INVALID_ARGUMENT error. The whole response must fit the server's
   // limit on its encoded size (see MultiScan).
   uint32 limit = 5;
-  // The inclusive lower bound on every key's rows, as ScanRequest.from.
-  OrderValue from = 6;
+  // The inclusive lower bound on every key's rows, as ScanRequest.start.
+  OrderValue start = 6;
   // The exclusive upper bound on every key's rows, as ScanRequest.before.
   OrderValue before = 7;
 }

@@ -632,7 +632,7 @@ fn scan_of(table: &str, key: &Key, limit: u32) -> ScanRequest {
         columns: wire_columns(&[VALUE_COLUMN]),
         direction: i32::from(v1::Direction::NewestFirst),
         limit,
-        from: None,
+        start: None,
         before: None,
     }
 }
@@ -646,7 +646,7 @@ fn multi_scan_of(table: &str, keys: &[Key], limit: u32) -> MultiScanRequest {
         columns: one.columns,
         direction: one.direction,
         limit: one.limit,
-        from: None,
+        start: None,
         before: None,
     }
 }
@@ -683,14 +683,17 @@ fn every_row(max_scan_rows: u32) -> TestScan {
     }
 }
 
-/// The raw order value a Scan response's `next` carries, if any.
+/// The `next` the model says a Scan under `scan` answers after a page
+/// whose last row is at raw order value `last`, as the wire carries it: the
+/// order value newest first and one above it oldest first
+/// (`TestScan::next_after`), in the fixtures' long order column.
 ///
-/// Panics on an order value that is not a long.
-fn raw_next(next: Option<&v1::OrderValue>) -> Option<i64> {
-    next.map(|next| match next.value {
-        Some(v1::order_value::Value::Long(order)) => order,
-        Some(v1::order_value::Value::Str(_) | v1::order_value::Value::Bin(_)) | None => {
-            panic!("a long order value: {next:?}")
+/// Panics on a next that is not a long.
+fn model_next(scan: &TestScan, last: Option<i64>) -> Option<v1::OrderValue> {
+    last.map(|last| match scan.next_after(OrderKind::Long, last) {
+        icetray_core::OrderValue::Long(next) => wire_order(next),
+        other @ (icetray_core::OrderValue::Str(_) | icetray_core::OrderValue::Bytes(_)) => {
+            panic!("a long next: {other:?}")
         }
     })
 }
@@ -3124,7 +3127,7 @@ async fn test_scan_returns_rows_next_and_the_snapshot_id() -> TestResult {
     assert_eq!(rows.len(), PAGE_ROWS as usize);
     assert!(next.is_some(), "the key has rows past the page");
     assert_eq!(scan_rows_of(&response.rows), rows);
-    assert_eq!(raw_next(response.next.as_ref()), next);
+    assert_eq!(response.next, model_next(&scan, next));
     assert_eq!(response.snapshot_id, snapshot);
     assert!(stack.stats.gets() > gets, "a cold Scan reads the store");
 
@@ -3158,9 +3161,10 @@ async fn test_scan_returns_rows_next_and_the_snapshot_id() -> TestResult {
 }
 
 /// Paging by `next` over the wire, in either direction, returns every row
-/// of the key once and in order: each request passes the previous
-/// response's `next` back, as `from` reading oldest first and as `before`
-/// reading newest first, until a response carries none (RFD 025, Paging).
+/// of the key once and in order: each `next` follows the page's last row,
+/// itself newest first and one above it oldest first, and each request
+/// passes it back, as `start` reading oldest first and as `before` reading
+/// newest first, until a response carries none (RFD 025, Paging).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scan_paging_by_next_returns_every_row_once_in_either_direction() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -3186,10 +3190,24 @@ async fn test_scan_paging_by_next_returns_every_row_once_in_either_direction() -
         loop {
             let page = stack.scan(request.clone()).await?;
             requests += 1;
-            paged.extend(scan_rows_of(&page.rows));
-            let Some(next) = page.next else { break };
+            let rows = scan_rows_of(&page.rows);
+            let Some(next) = page.next else {
+                paged.extend(rows);
+                break;
+            };
+            let (last, _) = rows.last().expect("a page with a next ends at a row");
+            let follows = match direction {
+                icetray_core::Direction::NewestFirst => *last,
+                icetray_core::Direction::OldestFirst => last + 1,
+            };
+            assert_eq!(
+                next,
+                wire_order(follows),
+                "{direction:?}: next follows the last row"
+            );
+            paged.extend(rows);
             match direction {
-                icetray_core::Direction::OldestFirst => request.from = Some(next),
+                icetray_core::Direction::OldestFirst => request.start = Some(next),
                 icetray_core::Direction::NewestFirst => request.before = Some(next),
             }
         }
@@ -3278,14 +3296,14 @@ async fn test_scan_with_a_limit_of_zero_or_above_max_scan_rows_is_invalid_argume
     assert_eq!(rows.len(), SCAN_CAP as usize);
     assert_eq!(scan_rows_of(&response.rows), rows);
     assert!(next.is_some());
-    assert_eq!(raw_next(response.next.as_ref()), next);
+    assert_eq!(response.next, model_next(&every_row(max), next));
     Ok(())
 }
 
-/// A `from` at or above `before`, an empty window, a bound of another
+/// A `start` at or above `before`, an empty window, a bound of another
 /// variant than the order type takes, and a bound that sets no variant are
-/// `INVALID_ARGUMENT` before any read; a window in order is answered, its
-/// `from` row included and its `before` row left out.
+/// `INVALID_ARGUMENT` before any read, for a Scan and a `MultiScan` alike; a window in order is answered, its
+/// `start` row included and its `before` row left out.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scan_with_an_empty_window_is_invalid_argument() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -3306,28 +3324,38 @@ async fn test_scan_with_an_empty_window_is_invalid_argument() -> TestResult {
         (Some(no_variant.clone()), None),
         (None, Some(no_variant)),
     ];
-    for (from, before) in refused {
+    for (start, before) in refused {
         let request = ScanRequest {
-            from: from.clone(),
+            start: start.clone(),
             before: before.clone(),
             ..scan_of(ORDERED_TABLE, &key, max)
         };
         assert_eq!(
             code_of(stack.scan(request).await),
             Code::InvalidArgument,
-            "{from:?} {before:?}"
+            "Scan {start:?} {before:?}"
+        );
+        let multi = MultiScanRequest {
+            start: start.clone(),
+            before: before.clone(),
+            ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key), max)
+        };
+        assert_eq!(
+            code_of(stack.multi_scan(multi).await),
+            Code::InvalidArgument,
+            "MultiScan {start:?} {before:?}"
         );
     }
-    assert_eq!(stack.stats.gets(), gets, "a refused Scan issues no GET");
+    assert_eq!(stack.stats.gets(), gets, "a refused call issues no GET");
 
     let request = ScanRequest {
-        from: Some(wire_order(low)),
+        start: Some(wire_order(low)),
         before: Some(wire_order(high)),
         ..scan_of(ORDERED_TABLE, &key, max)
     };
     let response = stack.scan(request).await?;
     let scan = TestScan {
-        from: Some(low),
+        start: Some(low),
         before: Some(high),
         ..every_row(max)
     };
@@ -3336,11 +3364,11 @@ async fn test_scan_with_an_empty_window_is_invalid_argument() -> TestResult {
     assert_eq!(
         orders.last(),
         Some(&low),
-        "newest first, the from row is last"
+        "newest first, the start row is last"
     );
     assert!(!orders.contains(&high), "the before row is left out");
     assert_eq!(scan_rows_of(&response.rows), rows);
-    assert_eq!(raw_next(response.next.as_ref()), next);
+    assert_eq!(response.next, model_next(&scan, next));
     Ok(())
 }
 
@@ -3431,7 +3459,7 @@ async fn test_scan_and_multi_get_requests_the_table_refuses_are_invalid_argument
     let empty_bound = v1::OrderValue { value: None };
     let cases = vec![
         Refused::Scan(ScanRequest {
-            from: Some(str_bound.clone()),
+            start: Some(str_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
         Refused::Scan(ScanRequest {
@@ -3439,11 +3467,11 @@ async fn test_scan_and_multi_get_requests_the_table_refuses_are_invalid_argument
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
         Refused::MultiScan(MultiScanRequest {
-            from: Some(str_bound),
+            start: Some(str_bound),
             ..multi_scan_of(ORDERED_TABLE, std::slice::from_ref(&key), PAGE_ROWS)
         }),
         Refused::Scan(ScanRequest {
-            from: Some(empty_bound.clone()),
+            start: Some(empty_bound.clone()),
             ..scan_of(ORDERED_TABLE, &key, PAGE_ROWS)
         }),
         Refused::Scan(ScanRequest {
@@ -3608,7 +3636,7 @@ async fn test_multi_scan_over_max_values_is_invalid_argument_before_any_read() -
     for (key, result) in fits.iter().zip(&response.results) {
         let (rows, next) = expected(stack.ordered(), key, &every_row(max));
         assert_eq!(scan_rows_of(&result.rows), rows, "{key}");
-        assert_eq!(raw_next(result.next.as_ref()), next, "{key}");
+        assert_eq!(result.next, model_next(&every_row(max), next), "{key}");
     }
     assert!(stack.stats.gets() > gets, "the calls at the bound read");
     assert_eq!(
@@ -3642,7 +3670,7 @@ async fn test_multi_scan_answers_a_repeated_key_at_each_position() -> TestResult
     for (position, (key, result)) in keys.iter().zip(&response.results).enumerate() {
         let (rows, next) = expected(stack.ordered(), key, &scan);
         assert_eq!(scan_rows_of(&result.rows), rows, "position {position}");
-        assert_eq!(raw_next(result.next.as_ref()), next, "position {position}");
+        assert_eq!(result.next, model_next(&scan, next), "position {position}");
     }
     assert_eq!(response.results[0], response.results[2]);
     assert_ne!(response.results[0], response.results[1]);
@@ -3702,7 +3730,7 @@ fn model_scan_response(fixture: &Fixture, key: &Key) -> ScanResponse {
     let (rows, next) = expected(fixture, key, &whole_key());
     ScanResponse {
         rows: model_wire_rows(rows),
-        next: next.map(wire_order),
+        next: model_next(&whole_key(), next),
         snapshot_id: fixture.snapshot_id().expect("a committed table"),
     }
 }
@@ -3717,7 +3745,7 @@ fn model_multi_scan_response(fixture: &Fixture, keys: &[Key]) -> MultiScanRespon
                 let (rows, next) = expected(fixture, key, &whole_key());
                 v1::ScanResult {
                     rows: model_wire_rows(rows),
-                    next: next.map(wire_order),
+                    next: model_next(&whole_key(), next),
                 }
             })
             .collect(),

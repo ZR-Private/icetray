@@ -796,9 +796,10 @@ impl Fixture {
     /// `SECOND_VALUE_COLUMN`, answers on this ordered fixture: the naive
     /// sort of `key`'s live rows (`scan_model`), each as its raw order value
     /// and one value per column, `None` for a null, and the raw order
-    /// value of the next page's bound when live rows remain inside the
-    /// bounds past the last one returned. A key the fixture holds no row
-    /// for answers no rows and no bound.
+    /// value of the last row returned when live rows remain inside the
+    /// bounds past it, which the next page's bound follows
+    /// (`TestScan::next_after`). A key the fixture holds no row for answers
+    /// no rows and no such value.
     ///
     /// Panics on a fixture whose specification names no order column, and
     /// on a column the fixture writes no value for.
@@ -856,7 +857,7 @@ impl Fixture {
                         .collect(),
                 })
                 .collect(),
-            next: next.map(|next| order_value(kind, next)),
+            next: next.map(|last| scan.next_after(kind, last)),
         }
     }
 

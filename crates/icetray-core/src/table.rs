@@ -1066,15 +1066,6 @@ impl Drop for ScanReceipt {
     }
 }
 
-/// A Scan request checked against the generation and the table's entry
-/// before any read (`Table::check_scan`): the columns it reads and its
-/// limit, checked.
-#[derive(Clone)]
-struct CheckedScan {
-    selection: Selection,
-    limit: u32,
-}
-
 /// A Scan call checked and ready to read (`Table::scan_call`).
 struct ScanCall {
     reads: ScanReads,
@@ -1083,7 +1074,8 @@ struct ScanCall {
 
 /// What every key's Scan of one `scan` or `multi_scan` call reads through:
 /// the generation, the table's lookup and scan handles and span hedge
-/// window, the checked request, the call's fan-out, and its counts. Each
+/// window, the columns the checked request reads, the call's fan-out, and
+/// its counts. Each
 /// run a spread `multi_scan` spawns reads through a clone of its own, as
 /// each run of a `multi_get` holds its own handles.
 #[derive(Clone)]
@@ -1092,7 +1084,7 @@ struct ScanReads {
     lookups: Arc<Lookups>,
     scans: Arc<Scans>,
     window: Arc<HedgeWindow>,
-    checked: CheckedScan,
+    selection: Selection,
     fan_out: Arc<Semaphore>,
     counts: Arc<ScanCounts>,
 }
@@ -1122,17 +1114,11 @@ impl ScanThrough<'_> {
             value_gets: &reads.lookups.metrics.value_page_gets,
             order_gets: Some(&metrics.order_gets),
         };
-        let selection = &reads.checked.selection;
+        let selection = &reads.selection;
         let answered = async {
             let (mut scanned, read) = reads
                 .generation
-                .scan(
-                    key,
-                    &selection.positions,
-                    self.bounds,
-                    reads.checked.limit,
-                    source,
-                )
+                .scan(key, &selection.positions, self.bounds, source)
                 .await?;
             for row in &mut scanned.rows {
                 reads.lookups.project(
@@ -1629,7 +1615,7 @@ impl Table {
     }
 
     /// One Scan of `key` against the serving generation (RFD 025): its live
-    /// rows at or above `bounds`' `from` and below its `before`, in the
+    /// rows at or above `bounds`' `start` and below its `before`, in the
     /// direction asked, at most the limit, which is from 1 to the table's
     /// `max_scan_rows`, each its order value and one value per
     /// column of `columns`, trimmed to the fields its read names as `get`
@@ -1797,7 +1783,7 @@ impl Table {
     ) -> Result<ScanCall> {
         let scans = self.ordered()?;
         let generation = self.serving()?;
-        let checked = self.check_scan(&generation, keys, columns, bounds, multi)?;
+        let selection = self.check_scan(&generation, keys, columns, bounds, multi)?;
         let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
         let receipt = ScanReceipt::new(&self.name, &scans.metrics);
         Ok(ScanCall {
@@ -1806,7 +1792,7 @@ impl Table {
                 lookups: Arc::clone(&self.lookups),
                 scans: Arc::clone(scans),
                 window: Arc::clone(&self.span_hedge),
-                checked,
+                selection,
                 fan_out,
                 counts: Arc::clone(&receipt.counts),
             },
@@ -2600,7 +2586,7 @@ impl Table {
     /// `Error::KeyType` for a key of another type; `Error::ColumnRequest` as
     /// `get` checks the columns; and `Error::ScanRequest` for a limit of 0
     /// or above `max_scan_rows`, a bound of another variant than the order
-    /// type's, a `from` at or above `before`, and, for a `MultiScan`
+    /// type's, a `start` at or above `before`, and, for a `MultiScan`
     /// (`multi`), keys times the limit times one more than the columns above
     /// `max_multi_scan_values`, in that order. Every position the selection
     /// holds is one of the generation's columns, which every file's index
@@ -2612,7 +2598,7 @@ impl Table {
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
         multi: bool,
-    ) -> Result<CheckedScan> {
+    ) -> Result<Selection> {
         let config = self.config.load();
         // An ordered table's generation and entry both name its order
         // column; one that does not is not served as ordered.
@@ -2632,18 +2618,18 @@ impl Table {
             table: self.name.clone(),
             fault,
         };
-        let limit = scan::check_limit(bounds, max_scan_rows).map_err(refused)?;
+        scan::check_limit(bounds, max_scan_rows).map_err(refused)?;
         scan::check_bounds(bounds, order.order_type.variant()).map_err(refused)?;
         if multi {
             scan::check_multi_scan_values(
                 keys.len(),
-                limit,
+                bounds.limit,
                 selection.positions.len(),
                 self.max_multi_scan_values,
             )
             .map_err(refused)?;
         }
-        Ok(CheckedScan { selection, limit })
+        Ok(selection)
     }
 
     /// `Error::KeyType` for a key of another type than the generation's.
@@ -6892,7 +6878,7 @@ mod tests {
         ScanBounds {
             direction: Direction::OldestFirst,
             limit: DEFAULT_MAX_SCAN_ROWS,
-            from: None,
+            start: None,
             before: None,
         }
     }
@@ -7392,7 +7378,7 @@ mod tests {
         let before = fixture.gets();
         let fault = scan_request_fault;
         let wrong_variant = ScanBounds {
-            from: Some(OrderValue::Str("a".to_string())),
+            start: Some(OrderValue::Str("a".to_string())),
             ..oldest_first()
         };
         assert_eq!(
@@ -7403,13 +7389,13 @@ mod tests {
                     .unwrap_err()
             ),
             ScanRequestFault::BoundVariant {
-                bound: BoundSide::From,
+                bound: BoundSide::Start,
                 expected: OrderVariant::Long,
                 got: OrderVariant::Str,
             }
         );
         let empty = ScanBounds {
-            from: Some(OrderValue::Long(ORDER_START)),
+            start: Some(OrderValue::Long(ORDER_START)),
             before: Some(OrderValue::Long(ORDER_START)),
             ..oldest_first()
         };
@@ -7817,7 +7803,7 @@ mod tests {
             let bounds = ScanBounds {
                 direction,
                 limit: u32::try_from(SPREAD_LIMIT).unwrap(),
-                from: None,
+                start: None,
                 before: None,
             };
             let expected: Vec<Scanned> = asked
@@ -7836,9 +7822,10 @@ mod tests {
                     if direction == Direction::NewestFirst {
                         rows.reverse();
                     }
-                    let (_, next) = match direction {
-                        Direction::OldestFirst => rows[SPREAD_LIMIT],
-                        Direction::NewestFirst => rows[SPREAD_LIMIT - 1],
+                    let (_, last) = rows[SPREAD_LIMIT - 1];
+                    let next = match direction {
+                        Direction::OldestFirst => last + 1,
+                        Direction::NewestFirst => last,
                     };
                     rows.truncate(SPREAD_LIMIT);
                     Scanned {

@@ -30,6 +30,7 @@ use icetray_core::{
     BoundSide, CacheError, ColumnRead, Direction, Error, Fits, Key, KeyType, MultiScanLookup,
     Opened, OrderType, OrderValue, Oversize, Row, ScanBounds, ScanLookup, ScanReceipt, ScanRow,
     Scanned, Table, TableConfig, TableKind, TableLayout, Tables, ValueFormat, ValueType, approx,
+    next_bound,
 };
 use icetray_proto::v1;
 use icetray_proto::v1::icetray_server::Icetray;
@@ -275,11 +276,18 @@ pub fn order_value_from_wire(
     let Some(bound) = bound else {
         return Ok(None);
     };
-    match bound.value {
-        Some(order_value::Value::Long(value)) => Ok(Some(OrderValue::Long(value))),
-        Some(order_value::Value::Str(text)) => Ok(Some(OrderValue::Str(text))),
-        Some(order_value::Value::Bin(bytes)) => Ok(Some(OrderValue::Bytes(bytes))),
-        None => Err(WireScanFault::EmptyBound { bound: which }),
+    order_of_wire(bound.value)
+        .map(Some)
+        .ok_or(WireScanFault::EmptyBound { bound: which })
+}
+
+/// The order value a wire `OrderValue`'s variant carries, `None` for one
+/// that sets no variant.
+fn order_of_wire(value: Option<order_value::Value>) -> Option<OrderValue> {
+    match value? {
+        order_value::Value::Long(value) => Some(OrderValue::Long(value)),
+        order_value::Value::Str(text) => Some(OrderValue::Str(text)),
+        order_value::Value::Bin(bytes) => Some(OrderValue::Bytes(bytes)),
     }
 }
 
@@ -288,13 +296,13 @@ pub fn order_value_from_wire(
 fn scan_bounds_from_wire(
     direction: i32,
     limit: u32,
-    from: Option<v1::OrderValue>,
+    start: Option<v1::OrderValue>,
     before: Option<v1::OrderValue>,
 ) -> Result<ScanBounds, WireScanFault> {
     Ok(ScanBounds {
         direction: direction_from_wire(direction)?,
         limit,
-        from: order_value_from_wire(from, BoundSide::From)?,
+        start: order_value_from_wire(start, BoundSide::Start)?,
         before: order_value_from_wire(before, BoundSide::Before)?,
     })
 }
@@ -332,21 +340,25 @@ fn scan_within_bound(
         snapshot_id: response.snapshot_id,
     };
     // A Scan at a limit of `taken` rows, fewer than the response's,
-    // answers them with a `next`: oldest first the order value of the row
-    // after them, newest first that of the last of them. At all of the
-    // response's rows it answers the response's own.
+    // answers them with the `next` that follows the last of them
+    // (`next_bound`), since a row lies past it. At all of the response's
+    // rows it answers the response's own.
     let rows = &response.rows;
     let next_of = |taken: usize| {
-        let next = if taken == rows.len() {
-            response.next.as_ref()
-        } else {
-            let row = match direction {
-                Direction::OldestFirst => rows.get(taken),
-                Direction::NewestFirst => taken.checked_sub(1).and_then(|last| rows.get(last)),
-            };
-            row.and_then(|row| row.order.as_ref())
-        };
-        next.map_or(0, |order| message::encoded_len(NEXT_FIELD_TAG, order))
+        if taken == rows.len() {
+            return response
+                .next
+                .as_ref()
+                .map_or(0, |next| message::encoded_len(NEXT_FIELD_TAG, next));
+        }
+        taken
+            .checked_sub(1)
+            .and_then(|last| rows[last].order.as_ref())
+            .and_then(|order| order_of_wire(order.value.clone()))
+            .map_or(0, |last| {
+                let next = order_value_wire(next_bound(&last, direction));
+                message::encoded_len(NEXT_FIELD_TAG, &next)
+            })
     };
     Err(Oversize {
         bytes,
@@ -696,7 +708,7 @@ impl Service {
         let bounds = scan_bounds_from_wire(
             request.direction,
             request.limit,
-            request.from,
+            request.start,
             request.before,
         )?;
         let (lookup, receipt) = table
@@ -720,7 +732,7 @@ impl Service {
         let bounds = scan_bounds_from_wire(
             request.direction,
             request.limit,
-            request.from,
+            request.start,
             request.before,
         )?;
         let (lookup, receipt) = table
@@ -1154,7 +1166,7 @@ mod tests {
             ScanRequestFault::LimitZero { max },
             ScanRequestFault::LimitAboveMax { limit, max },
             ScanRequestFault::BoundVariant {
-                bound: BoundSide::From,
+                bound: BoundSide::Start,
                 expected: OrderVariant::Long,
                 got: OrderVariant::Str,
             },
@@ -1480,12 +1492,12 @@ mod tests {
         for (wire, order) in cases {
             let bound = v1::OrderValue { value: Some(wire) };
             assert_eq!(
-                order_value_from_wire(Some(bound), BoundSide::From),
+                order_value_from_wire(Some(bound), BoundSide::Start),
                 Ok(Some(order))
             );
         }
         assert_eq!(order_value_from_wire(None, BoundSide::Before), Ok(None));
-        for which in [BoundSide::From, BoundSide::Before] {
+        for which in [BoundSide::Start, BoundSide::Before] {
             assert_eq!(
                 order_value_from_wire(Some(v1::OrderValue { value: None }), which),
                 Err(WireScanFault::EmptyBound { bound: which })
@@ -1498,7 +1510,7 @@ mod tests {
         let faults = [
             WireScanFault::Direction { number: 0 },
             WireScanFault::EmptyBound {
-                bound: BoundSide::From,
+                bound: BoundSide::Start,
             },
         ];
         for fault in faults {
@@ -1515,7 +1527,7 @@ mod tests {
         ];
         for value in values {
             assert_eq!(
-                order_value_from_wire(Some(order_value_wire(value.clone())), BoundSide::From),
+                order_value_from_wire(Some(order_value_wire(value.clone())), BoundSide::Start),
                 Ok(Some(value))
             );
         }
@@ -1544,7 +1556,7 @@ mod tests {
         );
         let orders: Vec<_> = rows
             .iter()
-            .map(|row| order_value_from_wire(row.order.clone(), BoundSide::From))
+            .map(|row| order_value_from_wire(row.order.clone(), BoundSide::Start))
             .collect();
         assert_eq!(
             orders,
@@ -1642,19 +1654,26 @@ mod tests {
     }
 
     /// The response a Scan read in `direction` at a limit of `taken` rows
-    /// sends, where one at a larger limit sent `response`: its first
-    /// `taken` rows, and the next page's bound, oldest first the order value
-    /// of the row after them and newest first that of the last of them, or
-    /// at all of the rows the response's own.
+    /// sends, where one at a larger limit sent `response`, whose rows carry
+    /// long order values: its first `taken` rows, and the next page's bound
+    /// after the last of them, newest first its order value and oldest
+    /// first one more, or at all of the rows the response's own.
     fn at_limit(response: &ScanResponse, taken: usize, direction: Direction) -> ScanResponse {
         let next = if taken == response.rows.len() {
             response.next.clone()
         } else {
-            let row = match direction {
-                Direction::OldestFirst => response.rows.get(taken),
-                Direction::NewestFirst => taken.checked_sub(1).map(|last| &response.rows[last]),
-            };
-            row.and_then(|row| row.order.clone())
+            taken.checked_sub(1).map(|last| {
+                let Some(v1::OrderValue {
+                    value: Some(order_value::Value::Long(order)),
+                }) = response.rows[last].order
+                else {
+                    panic!("a sample row has a long order value");
+                };
+                order_value_wire(OrderValue::Long(match direction {
+                    Direction::NewestFirst => order,
+                    Direction::OldestFirst => order + 1,
+                }))
+            })
         };
         ScanResponse {
             rows: response.rows[..taken].to_vec(),

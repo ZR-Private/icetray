@@ -2090,7 +2090,7 @@ impl ScanCase {
                 .into_iter()
                 .map(|(order, ())| order_value(ordered.kind, order))
                 .collect(),
-            next: next.map(|next| order_value(ordered.kind, next)),
+            next: next.map(|last| test.next_after(ordered.kind, last)),
             test,
         })
     }
@@ -2167,7 +2167,7 @@ fn modeled_scan(
                 values: vec![Some(value.into())],
             })
             .collect(),
-        next: next.map(|next| order_value(ordered.kind, next)),
+        next: next.map(|last| test.next_after(ordered.kind, last)),
     })
 }
 
@@ -2727,7 +2727,7 @@ async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
                         .config()
                         .scan_rows()
                         .ok_or("an ordered table has a max_scan_rows")?,
-                    from: None,
+                    start: None,
                     before: None,
                 };
                 loop {
@@ -2978,7 +2978,7 @@ fn bounded_page() -> BenchResult<TestScan> {
     Ok(TestScan {
         direction: Direction::NewestFirst,
         limit: SCAN_PAGE_ROWS,
-        from: Some(orders[margin + 1]),
+        start: Some(orders[margin + 1]),
         before: Some(orders[orders.len() - margin]),
     })
 }

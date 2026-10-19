@@ -95,8 +95,8 @@ pub enum Error {
         fault: ColumnRequestFault,
     },
     /// A Scan or `MultiScan` request is malformed (RFD 025, Wire): a limit
-    /// above `max_scan_rows`, a bound of the wrong variant, a `from` at or
-    /// above `before`, or a `MultiScan` asking for more than
+    /// of 0 or above `max_scan_rows`, a bound of the wrong variant, a
+    /// `start` at or above `before`, or a `MultiScan` asking for more than
     /// `max_multi_scan_values`; checked before any read.
     #[error("table {table}: scan request: {fault}")]
     ScanRequest {

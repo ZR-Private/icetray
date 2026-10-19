@@ -692,7 +692,7 @@ async fn test_disk_entries_of_both_kinds_keep_their_own_chunk_files() -> Result<
             .config()
             .scan_rows()
             .expect("an ordered table has a max_scan_rows"),
-        from: None,
+        start: None,
         before: None,
     };
     let scanned = tables[1].scan(&key, &reads_of, &every_row).await?.scanned;

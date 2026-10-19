@@ -75,6 +75,7 @@ pub use order::{
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
 pub use scan::{
     BoundSide, Fits, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, ScanRow, Scanned,
+    next_bound,
 };
 pub use snapshot::{SequenceNumber, SnapshotId};
 pub use storage::{FILE_PREFIX, IoStats, LocationError, LocationFault, Storage};

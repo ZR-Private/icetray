@@ -15,7 +15,7 @@ use arrow::array::{
 };
 use arrow::buffer::Buffer;
 use iceberg::spec::PrimitiveType;
-use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue, ScanBounds};
+use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue, ScanBounds, next_bound};
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{FIRST_VERSION, ValueKind, value_of_version};
@@ -357,7 +357,7 @@ pub struct TestScan {
     /// refused.
     pub limit: u32,
     /// Only rows whose order value is at or above this.
-    pub from: Option<i64>,
+    pub start: Option<i64>,
     /// Only rows whose order value is below this.
     pub before: Option<i64>,
 }
@@ -369,7 +369,7 @@ impl Default for TestScan {
         Self {
             direction: Direction::NewestFirst,
             limit: DEFAULT_MAX_SCAN_ROWS,
-            from: None,
+            start: None,
             before: None,
         }
     }
@@ -382,7 +382,7 @@ impl TestScan {
         ScanBounds {
             direction: self.direction,
             limit: self.limit,
-            from: self.from.map(&order),
+            start: self.start.map(&order),
             before: self.before.map(&order),
         }
     }
@@ -392,30 +392,39 @@ impl TestScan {
         self.bounds_by(|raw| order_value(kind, raw))
     }
 
-    /// The request for the page after one that answered `next` (RFD 025,
-    /// Paging): oldest first `from` set to it, newest first `before`, the
-    /// other bound, the direction, and the limit kept.
+    /// The request for the page after one whose last row is at raw order
+    /// value `last` (RFD 025, Paging), the other bound, the direction, and
+    /// the limit kept: newest first `before` set to `last`, and oldest first
+    /// `start` set to one above it, which admits the rows the server's
+    /// `next`, the successor of `last`'s encoding, admits.
     #[must_use]
-    pub fn after_page(&self, next: i64) -> Self {
+    pub fn after_page(&self, last: i64) -> Self {
         match self.direction {
             Direction::OldestFirst => Self {
-                from: Some(next),
+                start: Some(last + 1),
                 ..*self
             },
             Direction::NewestFirst => Self {
-                before: Some(next),
+                before: Some(last),
                 ..*self
             },
         }
     }
+
+    /// The `next` a Scan of this request answers after a page whose last
+    /// row is at raw order value `last`, in the encoding of `kind`
+    /// (`next_bound`).
+    pub fn next_after(&self, kind: OrderKind, last: i64) -> OrderValue {
+        next_bound(&order_value(kind, last), self.direction)
+    }
 }
 
 /// What a Scan answers over a key's live `rows`, as (order, payload): the
-/// rows at or above `scan.from` and below `scan.before`, sorted by order
-/// value, in the direction asked, cut to the limit, and the next page's
-/// bound, present exactly when live rows remain inside the bounds past the
-/// last one returned: oldest first the order value of the first such row,
-/// newest first that of the oldest row returned.
+/// rows at or above `scan.start` and below `scan.before`, sorted by order
+/// value, in the direction asked, cut to the limit, and the raw order value
+/// of the last row returned, present exactly when live rows remain inside
+/// the bounds past it: the row the next page's bound follows
+/// (`TestScan::next_after`, `TestScan::after_page`).
 ///
 /// Panics on a limit of 0, which a Scan refuses before any read.
 pub fn scan_model<T>(
@@ -426,7 +435,7 @@ pub fn scan_model<T>(
     let mut inside: Vec<(i64, T)> = rows
         .into_iter()
         .filter(|(order, _)| {
-            scan.from.is_none_or(|from| *order >= from)
+            scan.start.is_none_or(|start| *order >= start)
                 && scan.before.is_none_or(|before| *order < before)
         })
         .collect();
@@ -435,13 +444,10 @@ pub fn scan_model<T>(
         inside.reverse();
     }
     let limit = usize::try_from(scan.limit).expect("a scan limit fits usize");
-    let past = inside.get(limit).map(|(order, _)| *order);
+    let beyond = inside.len() > limit;
     inside.truncate(limit);
-    let next = past.and_then(|past| match scan.direction {
-        Direction::OldestFirst => Some(past),
-        Direction::NewestFirst => inside.last().map(|(order, _)| *order),
-    });
-    (inside, next)
+    let last = inside.last().filter(|_| beyond).map(|(order, _)| *order);
+    (inside, last)
 }
 
 #[cfg(test)]
@@ -527,7 +533,7 @@ mod tests {
     fn test_scan_model_bounds_are_half_open() {
         let scan = TestScan {
             direction: Direction::OldestFirst,
-            from: Some(SECOND),
+            start: Some(SECOND),
             before: Some(ORDERS[3]),
             ..TestScan::default()
         };
@@ -535,7 +541,7 @@ mod tests {
         assert_eq!(
             orders_of(&answer),
             [SECOND, THIRD],
-            "from includes its row, before excludes its"
+            "start includes its row, before excludes its"
         );
         assert_eq!(answer.1, None);
     }
@@ -573,11 +579,11 @@ mod tests {
             };
             let short = scan_model(rows(), &one_short);
             assert_eq!(short.0.len(), all - 1);
-            let next = match direction {
+            let last = match direction {
                 Direction::NewestFirst => ORDERS[1],
-                Direction::OldestFirst => ORDERS[all - 1],
+                Direction::OldestFirst => ORDERS[all - 2],
             };
-            assert_eq!(short.1, Some(next), "{direction:?}");
+            assert_eq!(short.1, Some(last), "{direction:?}");
         }
     }
 
@@ -591,10 +597,10 @@ mod tests {
             };
             let mut read = Vec::new();
             loop {
-                let (page, next) = scan_model(rows(), &scan);
+                let (page, last) = scan_model(rows(), &scan);
                 read.extend(page.into_iter().map(|(order, _)| order));
-                match next {
-                    Some(next) => scan = scan.after_page(next),
+                match last {
+                    Some(last) => scan = scan.after_page(last),
                     None => break,
                 }
             }
@@ -603,6 +609,27 @@ mod tests {
             }
             assert_eq!(read, ORDERS, "{direction:?}");
         }
+    }
+
+    /// Oldest first, the page after one ending at a row starts just above
+    /// it, so a row added between that row and the next one the first page
+    /// left out is read, as a refresh between two pages may add it.
+    #[test]
+    fn test_scan_model_oldest_first_next_page_reads_a_row_added_after_the_last() {
+        let scan = TestScan {
+            direction: Direction::OldestFirst,
+            limit: 2,
+            ..TestScan::default()
+        };
+        let (first, last) = scan_model(rows(), &scan);
+        assert_eq!(first.len(), 2);
+        let last = last.expect("rows remain past the first page");
+        assert_eq!(last, SECOND);
+        let added = SECOND + 1;
+        let mut later = rows();
+        later.push((added, added));
+        let (second, _) = scan_model(later, &scan.after_page(last));
+        assert_eq!(second.first().map(|(order, _)| *order), Some(added));
     }
 
     #[test]
@@ -1207,11 +1234,11 @@ mod tests {
         for id in IDS {
             let key = fixture.key(id);
             let read = oracle_rows(&oracle, &key);
-            for (direction, limit, from, before) in scans(&read) {
+            for (direction, limit, start, before) in scans(&read) {
                 let scan = TestScan {
                     direction,
                     limit,
-                    from,
+                    start,
                     before,
                 };
                 let (rows, next) = fixture.expected_scan(&key, &[VALUE_COLUMN], &scan);
@@ -1250,14 +1277,14 @@ mod tests {
         let mut scans = Vec::new();
         for direction in [Direction::NewestFirst, Direction::OldestFirst] {
             for limit in [DEFAULT_MAX_SCAN_ROWS, ONE, ONE + 1] {
-                for (from, before) in [
+                for (start, before) in [
                     (None, None),
                     (Some(first), None),
                     (None, Some(last)),
                     (Some(first - 1), Some(last + 1)),
                     (Some(first), Some(last)),
                 ] {
-                    scans.push((direction, limit, from, before));
+                    scans.push((direction, limit, start, before));
                 }
             }
         }

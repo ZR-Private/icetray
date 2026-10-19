@@ -19,7 +19,7 @@ use icetray_core::config::{Config, LocalConfig, ServerConfig, StorageConfig, Val
 use icetray_core::{
     DEFAULT_MAX_SCAN_ROWS, Direction, Error, Finding, FindingCode, FindingLog, Generation, Key,
     Level, LookupCost, OrderType, RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned,
-    Storage, Table, TableReport, diagnose, open,
+    Storage, Table, TableReport, diagnose, next_bound, open,
 };
 use icetray_testkit::golden::{
     self, CONTRACT_REPEATS, GoldenTable, HEX_DIGEST_BYTES, MERGE_KEY_IDS, MOR_DELETED_IDS,
@@ -846,10 +846,10 @@ fn ordered_scans(rows: &[OrderedRow], max: u32) -> Vec<TestScan> {
     );
     let mut scans = Vec::new();
     for direction in [Direction::NewestFirst, Direction::OldestFirst] {
-        let scan = |limit, from, before| TestScan {
+        let scan = |limit, start, before| TestScan {
             direction,
             limit,
-            from,
+            start,
             before,
         };
         scans.extend([
@@ -884,7 +884,12 @@ fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestSca
                 )))],
             })
             .collect(),
-        next: next.map(|next| golden::ordered_order_value(table, id, next)),
+        next: next.map(|last| {
+            next_bound(
+                &golden::ordered_order_value(table, id, last),
+                scan.direction,
+            )
+        }),
     }
 }
 
@@ -934,7 +939,7 @@ async fn assert_ordered_scans_match_the_derivation(
                 &ScanBounds {
                     direction: Direction::NewestFirst,
                     limit: max,
-                    from: None,
+                    start: None,
                     before: None,
                 },
             )
