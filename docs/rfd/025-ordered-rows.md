@@ -64,27 +64,32 @@ direction under a limit and optional bounds on the order value.
   with a counter.
 - **Wire.** `Scan` takes a table, a key, the value columns to read as
   `Get` takes them, a direction (`NEWEST_FIRST` or `OLDEST_FIRST`), a
-  limit, and optional exclusive bounds `after` and `before`. A limit of
-  0 reads up to `max_scan_rows`. The response carries the rows in the
-  requested direction, each its order value and one value per requested
-  column, a `more` flag set when live rows remain inside the bounds past
-  the last row returned, and the snapshot id. For a key with no rows the
-  server returns no rows with `more` unset. An order value travels as an
-  `OrderValue`, a long, a string, or bytes, with time types sent as a
-  long in Iceberg's unit, so a bound past an `int` or `date` column's
-  range admits every row on its side. A MultiScan carries one set of
-  columns, direction, limit, and bounds for many keys; the server
-  returns one result per key, each with its own rows and `more`, in
-  request order from one snapshot, a key listed twice answered at each
-  position as `MultiGet` answers it, and fails the whole call when any
-  key fails, as for `MultiGet`. `TableInfo` reports the order column,
-  its type, `max_scan_rows`, `server.max_multi_scan_values`, and
-  `server.max_scan_bytes`. Errors follow RFD 010 (Transport and
-  client contract) as for `Get` and `MultiGet`, and a malformed request
-  is `INVALID_ARGUMENT`: an unspecified direction, a limit above
-  `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
-  above `before`, a MultiScan above `max_multi_scan_values`, or a call
-  of the wrong kind for the table. The server checks a call's kind
+  limit from 1 to `max_scan_rows`, and optional half-open bounds on the
+  order value, `from` inclusive and `before` exclusive. A Scan and each
+  key of a MultiScan set their limit: there is no default, so the rows a
+  call asks for, and the values a MultiScan counts against
+  `server.max_multi_scan_values`, are what its request states. The
+  response carries the rows in the requested direction, each its order
+  value and one value per requested column, `next`, the bound of the
+  next page (Paging), set exactly when live rows remain inside the
+  bounds past the last row returned, and the snapshot id. For a key with
+  no rows the server returns no rows and no `next`. An order value
+  travels as an `OrderValue`, a long, a string, or bytes, with time
+  types sent as a long in Iceberg's unit, so a bound past an `int` or
+  `date` column's range admits every row on its side. A MultiScan
+  carries one set of columns, direction, limit, and bounds for many
+  keys; the server returns one result per key, each with its own rows
+  and `next`, in request order from one snapshot, a key listed twice
+  answered at each position as `MultiGet` answers it, and fails the
+  whole call when any key fails, as for `MultiGet`. `TableInfo` reports
+  the order column, its type, `max_scan_rows`,
+  `server.max_multi_scan_values`, and `server.max_scan_bytes`. Errors
+  follow RFD 010 (Transport and client contract) as for `Get` and
+  `MultiGet`, and a malformed request is `INVALID_ARGUMENT`: an
+  unspecified direction, a limit of 0 or above `max_scan_rows`, a key
+  or bound of the wrong variant, a `from` at or above `before`, which
+  is an empty window, a MultiScan above `max_multi_scan_values`, or a
+  call of the wrong kind for the table. The server checks a call's kind
   against the table's configuration before the table's readiness and
   before the call's key, direction, or bounds, so a call of the wrong
   kind is `INVALID_ARGUMENT` even while the table loads, and never the
@@ -92,9 +97,15 @@ direction under a limit and optional bounds on the order value.
   the protobuf its column declares is `FAILED_PRECONDITION` as for `Get`
   (RFD 024), naming the order value of its row, and so is a response
   above `server.max_scan_bytes` (Limits).
-- **Paging.** A caller pages by order value: reading newest first, the
-  next request sets `before` to the oldest order value of the previous
-  response, and reading oldest first, `after` to the newest. Within one
+- **Paging.** A caller pages by passing `next` back unchanged, every
+  other field of the request as it was: reading oldest first, `next` is
+  the order value of the first live row past the page, which the server
+  reads in any case to know whether rows remain, and the next request
+  sets `from` to it; reading newest first, `next` is the order value of
+  the oldest row returned, and the next request sets `before` to it. The
+  caller stops at a response without `next`, so it never asks for a page
+  past the last row, and never computes an order value's successor,
+  which a string or bytes order type does not make simple. Within one
   snapshot, uniqueness makes the next response exact, and paging is
   stateless on the server. After a refresh between two requests the
   server responds from the new snapshot, whose id the response carries,
@@ -219,7 +230,7 @@ direction under a limit and optional bounds on the order value.
   the server decodes it first and reads only the value pages of the rows
   taken, at no more rounds to object storage. A Scan's work follows its
   limit, not its run's length. Across K files that hold the key, a Scan
-  with limit L reads up to K·L rows and returns L; to set `more`
+  with limit L reads up to K·L rows and returns L; to set `next`
   exactly, the server reads the order value of one more live row in each
   file. A Scan of a key held in one file, with none of its pages cached,
   no dictionary-encoded column, and its run in one row group, costs one
@@ -254,10 +265,9 @@ direction under a limit and optional bounds on the order value.
   MultiScan's latency for more CPU per key, spent only while cores would
   otherwise sit idle. `server.max_multi_scan_values` bounds a
   MultiScan's keys times its limit times one more than its requested
-  columns, a limit of 0 counting as `max_scan_rows`, and the server
-  rejects a larger call before it reads any key. A configuration whose
-  `max_multi_scan_values` is below twice an ordered table's
-  `max_scan_rows` is refused, so a MultiScan of one key at the full
+  columns, and the server rejects a larger call before it reads any
+  key. A configuration whose `max_multi_scan_values` is below twice an
+  ordered table's `max_scan_rows` is refused, so a MultiScan of one key at the full
   limit and one column is always valid. That limit applies to a
   MultiScan of one key as to any other, and a caller reading one key's
   full limit over many columns uses Scan. `server.scan_deadline` bounds
@@ -381,16 +391,29 @@ a file in another unit comes from a migration that a rewrite repairs.
 filter covers a column's distinct values, so a key repeated across rows
 is one entry, and the fences bound the key pages a Scan needs.
 
+Exclusive bounds on both sides, `after` and `before`, with a flag for
+whether rows remain, a caller paging by the last order value it was
+returned. Rejected: half-open bounds tile a key's rows, a window ending
+where the next begins with no row in both or in neither, and a `next`
+the server sets lets a caller page without reading the last row or
+knowing the order type's encoding.
+
+A limit of 0 that reads up to `max_scan_rows`. Rejected: a request that
+leaves its limit unset would ask for as many rows as the table's
+configuration allows at the time, and a MultiScan would count that
+against `server.max_multi_scan_values` for every key, so a caller sets
+the limit it means.
+
 Truncation by response bytes. Rejected in favor of a row limit the owner
 sizes against value size, a response bound above which the server
 refuses, and an advice finding for runs too large for that bound: a
-truncated response would hand a caller that does not check `more` fewer
+truncated response would hand a caller that does not check `next` fewer
 rows than it asked for, with no sign.
 
 Bounds per key in a MultiScan. Deferred: one set of bounds serves the
 common call, the newest rows of many keys after one order value, and a
 caller paging several keys' histories continues with a Scan per key
-whose result shows `more`, which costs the server what the MultiScan
+whose result carries `next`, which costs the server what the MultiScan
 would. Optional bounds per key that replace the shared ones can be added
 later without changing a caller.
 

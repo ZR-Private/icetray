@@ -16,9 +16,9 @@
 > a deterministic failure the caller does not retry. See RFD 024.
 
 > Updated 2026-10-15: an ordered table is read through Scan and
-> MultiScan, which take a direction, a limit, and optional exclusive
+> MultiScan, which take a direction, a limit, and optional half-open
 > bounds as an `OrderValue` and return rows with their order values and
-> a `more` flag, a MultiScan failing whole as a MultiGet does. TableInfo
+> the next page's bound, a MultiScan failing whole as a MultiGet does. TableInfo
 > reports the order column, its type, and the scan limits, and a call of
 > the wrong kind for the table is `INVALID_ARGUMENT` even while the table
 > loads. Scan's and MultiScan's errors are those RFD 025 (Wire, Limits)
@@ -145,8 +145,7 @@ one per key. A larger batch is `INVALID_ARGUMENT` before any lookup
 runs, which bounds the value reads one call can ask for (RFD 013 (Tail
 latency)). A MultiScan carries at most `server.max_multi_scan_values`
 values, counted as its keys times its limit times one more than the
-columns it names, a limit of 0 counting as the table's `max_scan_rows`,
-and a larger call is `INVALID_ARGUMENT` before any key is read (RFD
+columns it names, and a larger call is `INVALID_ARGUMENT` before any key is read (RFD
 025). The MultiGet limit's default is a single-pod guess. How lookups
 behave under concurrent load, MultiGet fan-out included, is an open
 question ([prototype findings, what was not

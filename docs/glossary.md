@@ -66,6 +66,13 @@ table's is its dearest column's, and `icetray_table_below_level` reads 1
 while a table is below its configured level. See [Choosing a
 level](configuration.md#choosing-a-level).
 
+**Next bound.** The order value a `Scan` response, or each key's result
+of a `MultiScan`, carries as `next` when the key has rows inside the
+bounds past the last row returned, and leaves unset otherwise. A caller
+reading oldest first sends it as the next request's `from`, and one
+reading newest first as its `before`. See [Paging with
+`next`](calling.md#paging-with-next).
+
 **One-shot.** A subcommand that opens tables, prints JSON lines, and exits:
 `doctor`, `get`, and `info`. Each loads its tables the way `serve` does.
 See [the command line](configuration.md#the-command-line).
@@ -84,7 +91,8 @@ rows are sorted after the key, configured as `order_column`: an Iceberg
 `int`, `long`, `date`, timestamp, `string`, `binary`, or `fixed` column,
 such as a timestamp, a sequence number, or a version. A key and order
 value appear together at most once among a table's live rows, so a
-caller pages by order value. See
+caller pages by order value, with the next bound each response carries.
+See
 [Reading an ordered table](calling.md#reading-an-ordered-table).
 
 **Order fence.** For each order page of an ordered table's data file,
@@ -98,7 +106,8 @@ that can hold a pair another file holds. See
 
 **Ordered table.** A table configured with an order column, which holds
 many rows per key and which `Scan` and `MultiScan` read, newest or oldest
-first, under a limit and optional bounds on the order value. Its writer
+first, under a limit and optional half-open bounds on the order value:
+`from` inclusive and `before` exclusive. Its writer
 sorts each file by key and then order value. Every other table is a
 key-value table, which holds at most one row per key and which `Get` and
 `MultiGet` read. See [Ordered tables](table-layout.md#ordered-tables).

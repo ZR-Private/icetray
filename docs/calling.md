@@ -221,7 +221,7 @@ grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
     {"order": {"long": "1760400060000000"}, "values": [{"value": "CgVjbGljaw…"}]},
     {"order": {"long": "1760400000000000"}, "values": [{"value": "CgR2aWV3…"}]}
   ],
-  "more": true,
+  "next": {"long": "1760400000000000"},
   "snapshotId": "7128216514704790069"
 }
 ```
@@ -229,13 +229,20 @@ grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
 - **Direction.** `DIRECTION_NEWEST_FIRST` returns the highest order
   values first, `DIRECTION_OLDEST_FIRST` the lowest. The request must set
   one.
-- **Limit.** The most rows to return, at most the table's
-  `max_scan_rows`. A limit of 0 reads up to `max_scan_rows`. The response
-  must also fit `server.max_scan_bytes` ([Response size](#response-size)),
-  so a caller whose values are large sets a limit that fits.
-- **Bounds.** `after` and `before` are exclusive: a row is returned only
-  when its order value is above `after` and below `before`. Either may
-  be left unset, and when both are set `after` must be below `before`.
+- **Limit.** The most rows to return, from 1 to the table's
+  `max_scan_rows`. The request must set it: a limit of 0, like one above
+  `max_scan_rows`, is `INVALID_ARGUMENT`, and a caller that wants as many
+  rows as one response may hold sets it to the `max_scan_rows` that
+  `TableInfo` reports. The response must also fit `server.max_scan_bytes`
+  ([Response size](#response-size)), so a caller whose values are large
+  sets a limit that fits.
+- **Bounds.** The bounds are half-open: `from` is inclusive and `before`
+  exclusive, so a row is returned when its order value is at or above
+  `from` and below `before`. Either may be left unset. When both are set,
+  `from` must be below `before`: a `from` at or above `before` is an
+  empty window, and `INVALID_ARGUMENT`. In Python, `from` is a keyword,
+  so a caller sets and reads the field with `setattr` and `getattr`, or
+  passes it in a dict.
 - **Order values.** An order value is an `OrderValue` whose variant
   follows the order type: `long` for `int`, `long`, `date`, and the
   timestamp types, `str` for `string`, and `bin` for `binary` and
@@ -248,11 +255,13 @@ grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \
 The response carries the key's rows in the requested direction, each
 with its order value and one value per requested column, in the order
 requested, read as a `Get` response's values are. No two rows of one
-response share an order value. `more` is set when the key has rows
-within the bounds past the last row returned. For a key with no rows,
-the server returns no rows and leaves `more` unset, and that is a
-successful call. A request that lists no columns returns the order
-values alone.
+response share an order value. `next` is set exactly when the key has
+rows within the bounds past the last row returned, and it is the bound
+of the next page ([Paging with `next`](#paging-with-next)). A response
+whose last row is the key's last within the bounds leaves it unset, even
+when it holds `limit` rows. For a key with no rows, the server returns
+no rows and leaves `next` unset, and that is a successful call. A
+request that lists no columns returns the order values alone.
 
 The same call in Go:
 
@@ -287,24 +296,32 @@ exact encoded size of the response message, which is what a client's
 message limit measures.
 
 Nothing about the same request changes on a retry, so the caller lowers
-its `limit` or requests fewer columns, and sets `limit` explicitly: a
-limit of 0 reads up to `max_scan_rows`, which for large values may not
-fit. A caller that sets a limit of 100 and pages by order value (below)
-reads the same history in pages of at most 100 rows, each of which fits
-when 100 rows of the requested columns come to less than the bound. An
+its `limit` or requests fewer columns. The rows reported to fit are
+counted with the `next` a response of that many rows would carry, so a
+`Scan` at that limit is within the bound. A caller that sets a limit of
+100 and pages with `next` (below) reads the same history in pages of at
+most 100 rows, each of which fits when 100 rows of the requested columns
+come to less than the bound. An
 owner whose clients accept larger messages raises `server.max_scan_bytes`
 ([Configuration](configuration.md#server)) and the clients raise their
 own receive limit to match, as grpc-go's `MaxCallRecvMsgSize` does; the
 doctor's `large_runs` advice tells the owner which tables would be
 refused at the full limit.
 
-## Paging by order value
+## Paging with `next`
 
-A caller reads a history longer than one response by paging on the order
-value. Reading newest first, the next request sets `before` to the order
-value of the last row of the previous response; reading oldest first, it
-sets `after` to it. Every other field stays the same. The caller stops
-when a response has `more` unset:
+A caller reads a history longer than one response in pages. Each
+response that leaves rows behind carries `next`, the bound of the next
+page, and the caller passes it back unchanged:
+
+- **Newest first,** `next` is the order value of the oldest row returned,
+  and the next request sets `before` to it.
+- **Oldest first,** `next` is the order value of the first row past the
+  page, and the next request sets `from` to it.
+
+Every other field, the other bound included, stays the same. The caller
+stops when a response has no `next`, so it never asks for a page past
+the last row:
 
 ```go
 req := &icetrayv1.ScanRequest{
@@ -319,33 +336,41 @@ for {
 	if err != nil {
 		return err
 	}
-	rows := resp.GetRows()
-	for _, row := range rows {
+	for _, row := range resp.GetRows() {
 		use(row.GetOrder().GetLong(), row.GetValues()[0])
 	}
-	if !resp.GetMore() {
+	if resp.GetNext() == nil {
 		return nil
 	}
-	req.Before = rows[len(rows)-1].GetOrder()
+	req.Before = resp.GetNext() // reading oldest first: req.From = resp.GetNext()
 }
 ```
 
+The caller does not compute the bound itself, so paging works the same
+for every order type, a string or bytes order value included.
+
 A key and order value appear together at most once among a snapshot's
-live rows, so within one snapshot the order value is an exact cursor: the
-next page starts at the next row, with no row repeated or skipped, and
-the server keeps no state between requests. A refresh between two
-requests moves the next page to the new snapshot, whose id the response
-carries. A row the writer committed on the side the caller has already
-read appears only to a `Scan` that starts over, so a caller that needs
-every row of one snapshot compares the ids and starts over when they
-differ.
+live rows, so within one snapshot `next` is an exact cursor: the next
+page starts at the next row, with no row repeated or skipped, and the
+server keeps no state between requests. A refresh between two requests
+moves the next page to the new snapshot, whose id the response carries.
+A row the writer committed on the side the caller has already read
+appears only to a `Scan` that starts over, so a caller that needs every
+row of one snapshot compares the ids and starts over when they differ.
+
+A caller that steps past one row, such as a row whose value is not the
+protobuf its column declares (`FAILED_PRECONDITION`, which names the
+row's order value), sets `before` to that order value reading newest
+first. Reading oldest first it sets `from` to the least value above it:
+one more for an integer or time type, and the value with a zero byte
+appended for a string or bytes.
 
 ## Scanning many keys
 
 A `MultiScan` request carries a list of keys and one set of columns,
 direction, limit, and bounds, applied to every key. The server reads
 every key from one snapshot and returns one result per key in request
-order, each with its own rows and `more`, with one snapshot id for the
+order, each with its own rows and `next`, with one snapshot id for the
 call. For a key listed twice, the server returns a result at each
 position. When the read of any key fails, the whole call fails, as for
 `MultiGet`.
@@ -353,15 +378,15 @@ position. When the read of any key fails, the whole call fails, as for
 A `MultiScan` may request up to `server.max_multi_scan_values` values,
 4,000 by default, which `TableInfo` reports in `max_multi_scan_values`.
 They are counted as its keys times its limit times one more
-than its columns, the one being the order value; a limit of 0 counts as
-the table's `max_scan_rows`, so a `MultiScan` that leaves `limit` unset
-asks for the most each key can return and is refused for more than a few
-keys. The server rejects a larger call as
+than its columns, the one being the order value. A `MultiScan` sets its
+limit per key, as a `Scan` does: a limit of 0 is `INVALID_ARGUMENT`. The
+server rejects a larger call as
 `INVALID_ARGUMENT` before it reads any key. At the defaults, a
 `MultiScan` at the full limit of 1,000 rows with one column covers two
 keys, and one with a limit of 20 and one column covers 100. A caller
 reading many keys requests a smaller limit and pages each key whose
-result has `more` set, and a caller reading one key's full limit over
+result has `next` set with a `Scan` of that key, passing that `next` as
+its bound, and a caller reading one key's full limit over
 several columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in
 flight are capped at `server.batch_fan_out`, 64 by default, as for
 `MultiGet`.
@@ -398,7 +423,7 @@ its `limit`.
 | Code | Meaning | Retry |
 |---|---|---|
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
-| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, asks for a limit above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or an `after` at or above `before`, or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
+| `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, sets a limit of 0 or one above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or a `from` at or above `before` (an empty window), or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` ([Response size](#response-size)). | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
 | `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
