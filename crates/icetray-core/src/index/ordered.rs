@@ -13,7 +13,8 @@ use super::build::{DECODE_BATCH_RECORDS, RunBatches, RunCheck, keys_are_utf8};
 use super::order_fences::{GroupFences, GroupFencesBuilder, OrderFences, Pair, PairPart};
 use super::page_header::check_order_page_headers;
 use super::{
-    Column, ColumnChunk, FileFault, KeyShape, Keys, OrderLeaf, OrderShape, file_fault, row_index,
+    Column, ColumnChunk, FileFault, KeyShape, Keys, OrderLeaf, OrderShape, PageStarts, file_fault,
+    row_index,
 };
 use crate::error::{Error, RefusalReason, Result};
 use crate::key::Key;
@@ -176,8 +177,6 @@ struct GroupState {
     started: bool,
     distinct: u64,
     not_utf8: bool,
-    /// The order page whose fence is next to be recorded.
-    fence_page: usize,
     disorder: Option<Disorder>,
 }
 
@@ -250,6 +249,7 @@ impl<'a> PairCheck<'a> {
         let window = row_index(DECODE_BATCH_RECORDS);
         let mut run = RunCheck::ordered(chunk);
         let mut fences = GroupFencesBuilder::new(shape, self.shape, pages);
+        let mut fence_pages = PageStarts::of(order_chunk);
         let mut key_batches = RunBatches::open(chunk, shape.run_shape(), chunks)?;
         let mut order_batches = RunBatches::open(order_chunk, self.shape.run_shape(), chunks)?;
         let mut start = 0;
@@ -272,7 +272,7 @@ impl<'a> PairCheck<'a> {
                 keys: &keys,
                 orders: &orders,
             };
-            self.visit(order_chunk, &batch, run.not_utf8(), &mut fences);
+            self.visit(&mut fence_pages, &batch, run.not_utf8(), &mut fences);
             start += wanted;
         }
         key_batches.finish()?;
@@ -323,7 +323,7 @@ impl<'a> PairCheck<'a> {
     /// before it.
     fn visit(
         &mut self,
-        order_chunk: ColumnChunk<'a>,
+        fence_pages: &mut PageStarts<'_>,
         window: &Window<'_>,
         keys_not_utf8: bool,
         fences: &mut GroupFencesBuilder,
@@ -343,37 +343,30 @@ impl<'a> PairCheck<'a> {
             return;
         }
         if self.group.disorder.is_none() {
-            self.record_fences(order_chunk, window, fences);
+            self.record_fences(fence_pages, window, fences);
             self.check_pairs(keys, orders);
         }
     }
 
-    /// The fence of each order page of `chunk` whose first row lies in
-    /// `window`, after the pair before that row: the window's row before
-    /// it, or for the window's first row the last pair compared, of the
-    /// window, row group, or file before (`Pair::fence`). Every row
+    /// The fence of each order page among `fence_pages` whose first row
+    /// lies in `window`, after the pair before that row: the window's row
+    /// before it, or for the window's first row the last pair compared, of
+    /// the window, row group, or file before (`Pair::fence`). Every row
     /// counts, a row a delete names included, since fences bound positions.
     fn record_fences(
-        &mut self,
-        chunk: ColumnChunk<'a>,
+        &self,
+        fence_pages: &mut PageStarts<'_>,
         window: &Window<'_>,
         fences: &mut GroupFencesBuilder,
     ) {
         if fences.overflowed() {
             return;
         }
-        let locations = chunk.page_locations();
         let pair = |at: usize| Pair {
             key: window.keys.part(at),
             order: window.orders.part(at),
         };
-        while let Some(location) = locations.get(self.group.fence_page) {
-            let Some(at) = row_index(location.first_row_index)
-                .checked_sub(window.base)
-                .filter(|at| *at < window.rows)
-            else {
-                break;
-            };
+        for at in fence_pages.within(window.base, window.rows) {
             let previous = match at.checked_sub(1) {
                 Some(before) => Some(pair(before)),
                 None => self.last.as_ref().map(|(key, order)| Pair::of(key, order)),
@@ -381,7 +374,6 @@ impl<'a> PairCheck<'a> {
             if fences.push(Pair::fence(previous, pair(at))).is_err() {
                 return;
             }
-            self.group.fence_page += 1;
         }
     }
 

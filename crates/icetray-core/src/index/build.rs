@@ -19,7 +19,6 @@ use parquet::data_type::{
     FixedLenByteArrayType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::page_index::offset_index::PageLocation;
 
 use super::inspect::{bloom_ranges, column_chunk_ranges, rules_of};
 use super::ordered::{OrderVerified, PairCheck};
@@ -29,8 +28,8 @@ use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, OrderLeaf, RunShape, ValueShape, file_fault, group_starts, identity_of,
-    row_index, unless_panicked, value_bytes,
+    KeyShape, Keys, OrderLeaf, PageStarts, RunShape, ValueShape, file_fault, group_starts,
+    identity_of, row_index, unless_panicked, value_bytes,
 };
 use crate::approx;
 use crate::blocking::on_blocking_pool;
@@ -872,10 +871,8 @@ pub(super) struct RunCheck<'a> {
     first: Option<Key>,
     last: Option<Key>,
     fences: Vec<Key>,
-    /// The first rows of the pages whose key is a fence, in order, and how
-    /// many of them have been taken.
-    fence_rows: &'a [PageLocation],
-    fences_taken: usize,
+    /// The pages whose first key is a fence.
+    fence_pages: PageStarts<'a>,
     not_utf8: bool,
     /// Whether the keys must strictly increase, as the key-value rules
     /// require; under the ordered rules a key repeats, and `PairCheck`
@@ -888,15 +885,13 @@ pub(super) struct RunCheck<'a> {
 impl<'a> RunCheck<'a> {
     /// A check of `chunk`'s keys under the key-value rules.
     pub(super) fn new(chunk: ColumnChunk<'a>) -> Self {
-        let fence_rows = chunk.page_locations();
         Self {
             values: 0,
             longest: 0,
             first: None,
             last: None,
-            fences: Vec::with_capacity(fence_rows.len()),
-            fence_rows,
-            fences_taken: 0,
+            fences: Vec::with_capacity(chunk.page_locations().len()),
+            fence_pages: PageStarts::of(chunk),
             not_utf8: false,
             strict: true,
             disorder: None,
@@ -946,13 +941,8 @@ impl<'a> RunCheck<'a> {
                 return;
             }
         }
-        while let Some(location) = self.fence_rows.get(self.fences_taken) {
-            let row = row_index(location.first_row_index);
-            if row >= self.values {
-                break;
-            }
-            self.fences.push(keys.key(row - base));
-            self.fences_taken += 1;
+        for at in self.fence_pages.within(base, keys.len()) {
+            self.fences.push(keys.key(at));
         }
         self.last = Some(keys.key(keys.len() - 1));
         self.first.get_or_insert(head);

@@ -1874,6 +1874,36 @@ impl<'a> ColumnChunk<'a> {
     }
 }
 
+/// A column chunk's page starts, taken in page order as a check decodes
+/// the chunk a window of rows at a time.
+struct PageStarts<'a> {
+    locations: &'a [PageLocation],
+    /// The page whose start is taken next.
+    next: usize,
+}
+
+impl<'a> PageStarts<'a> {
+    fn of(chunk: ColumnChunk<'a>) -> Self {
+        Self {
+            locations: chunk.page_locations(),
+            next: 0,
+        }
+    }
+
+    /// The pages not yet taken that start in the `rows` rows from row
+    /// `base`, each as its first row's offset among them, taken as yielded.
+    fn within(&mut self, base: usize, rows: usize) -> impl Iterator<Item = usize> {
+        std::iter::from_fn(move || {
+            let location = self.locations.get(self.next)?;
+            let at = row_index(location.first_row_index)
+                .checked_sub(base)
+                .filter(|at| *at < rows)?;
+            self.next += 1;
+            Some(at)
+        })
+    }
+}
+
 /// A decoded value as `Bytes`: a slice of the fetched page in `segments`
 /// when parquet decoded it in place there, as it does from an uncompressed
 /// page, so the value shares the page's buffer and holds it only while the
