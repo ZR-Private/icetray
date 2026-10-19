@@ -97,8 +97,8 @@ than 15.
 At most 1024 requests run at once, and one more is refused with
 `RESOURCE_EXHAUSTED` rather than queued. A `MultiGet` carries at most
 1000 values, its keys times the columns it names with a presence-only
-call counting one per key, and holds at most 32 GETs in flight across
-the batch: each GET a lookup issues, a key page under `bloom`, a value
+call counting one per key, and holds at most `server.batch_fan_out`
+GETs in flight across the batch: each GET a lookup issues, a key page under `bloom`, a value
 page, and a dictionary page alike, holds one slot from before it starts
 until it ends, and none waits for a slot while holding one, so a batch
 holds no more GETs open whatever its keys and columns, each with at most
