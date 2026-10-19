@@ -22,24 +22,19 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 
-use super::{LoadedFile, Member, buckets_may_share_a_key, load_concurrency};
+use super::{LoadedFile, Member, Span, buckets_may_share_a_key, load_concurrency};
 use crate::blocking;
 use crate::deletes::FileDeletes;
 use crate::error::{Error, RefusalReason, Result};
-use crate::index::{OrderFences, Pair, PairChunks, PairPart, PairRead, Pairs, RowPosition};
-use crate::key::Key;
-use crate::manifest::Bucketing;
+use crate::index::{DeletedRows as _, OrderFences, Pair, PairChunks, PairPart, PairRead, Pairs};
 use crate::order::OrderValue;
 
-/// One file as the check across files sees it: the bucket its manifest
-/// entry files it under, its exact first and last key, and its least and
-/// greatest order value. A span's position in its slice stands for the
-/// file's.
+/// One file as the check across files sees it: its span as the overlap
+/// sweep sees it (`Span`), and its least and greatest order value. A
+/// span's position in its slice stands for the file's.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct OrderedSpan<'a> {
-    pub(super) bucketing: Option<Bucketing>,
-    pub(super) bucket: u32,
-    pub(super) keys: (&'a Key, &'a Key),
+    pub(super) span: Span<'a>,
     pub(super) orders: (&'a OrderValue, &'a OrderValue),
 }
 
@@ -52,9 +47,7 @@ impl<'a> OrderedSpan<'a> {
             .order_facts()
             .expect("every file of an ordered table records its order facts");
         Self {
-            bucketing: file.entry.bucketing,
-            bucket: file.entry.bucket,
-            keys: file.index.key_range(),
+            span: Span::of(file),
             orders: (&facts.min, &facts.max),
         }
     }
@@ -62,10 +55,11 @@ impl<'a> OrderedSpan<'a> {
     /// The rows both `self` and `other` can hold: the key range and the
     /// order range they share, as fences compare them.
     fn shared(self, other: Self) -> Shared<'a> {
+        let (ours, theirs) = (self.span, other.span);
         Shared {
             keys: (
-                PairPart::of_key(self.keys.0.max(other.keys.0)),
-                PairPart::of_key(self.keys.1.min(other.keys.1)),
+                PairPart::of_key(ours.first.max(theirs.first)),
+                PairPart::of_key(ours.last.min(theirs.last)),
             ),
             orders: (
                 PairPart::of_order(self.orders.0.max(other.orders.0)),
@@ -92,7 +86,7 @@ struct Shared<'a> {
 /// across files holds beyond one row group per file.
 pub(super) const MERGE_READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// What a load's check across files did.
+/// What a load's check across files did, or one merge of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RowCheck {
     /// The overlap groups whose check merged files.
@@ -250,12 +244,12 @@ fn meetings(
     let mut by_first: Vec<usize> = (0..group.len()).collect();
     by_first.sort_by(|&a, &b| {
         *compared += 1;
-        span(a).keys.0.cmp(span(b).keys.0)
+        span(a).span.first.cmp(span(b).span.first)
     });
     let mut by_last: Vec<usize> = (0..group.len()).collect();
     by_last.sort_by(|&a, &b| {
         *compared += 1;
-        span(a).keys.1.cmp(span(b).keys.1)
+        span(a).span.last.cmp(span(b).span.last)
     });
     let mut every = OpenRanges::new(distinct, group.len());
     let mut of_checked = OpenRanges::new(distinct, group.len());
@@ -266,7 +260,7 @@ fn meetings(
         let ours = span(member);
         while let Some(&next) = by_last.get(closing) {
             *compared += 1;
-            if span(next).keys.1 >= ours.keys.0 {
+            if span(next).span.last >= ours.span.first {
                 break;
             }
             every.close(next);
@@ -283,10 +277,7 @@ fn meetings(
         for theirs in met.drain(..) {
             *compared += 1;
             let other = span(theirs);
-            if buckets_may_share_a_key(
-                (ours.bucketing, ours.bucket),
-                (other.bucketing, other.bucket),
-            ) {
+            if buckets_may_share_a_key(ours.span.place(), other.span.place()) {
                 found[member].push(theirs);
                 found[theirs].push(member);
             }
@@ -494,7 +485,7 @@ fn chosen_pages(
                 .order_fences()
                 .expect("every file of an ordered table records its order fences");
             let span = spans[group[member]];
-            PageWalk::first(fences, Pair::of(span.keys.1, span.orders.1))
+            PageWalk::first(fences, Pair::of(span.span.last, span.orders.1))
         };
         if let Some(walk) = &walk {
             heap.push((walk.range().low, member), counted(compared));
@@ -579,20 +570,21 @@ pub(super) async fn verify_rows(
         if reads.is_empty() {
             continue;
         }
-        let merged =
-            refuse_duplicate_rows(table, files, &checked, reads, deletes, read_ahead).await?;
-        check.compared += merged.compared;
-        check.held = check.held.max(merged.held);
-        check.merges += 1;
+        check.absorb(
+            refuse_duplicate_rows(table, files, &checked, reads, deletes, read_ahead).await?,
+        );
     }
     Ok(check)
 }
 
-/// What one merge did: its comparisons of two cursors' pairs, and the most
-/// bytes of chosen pages it held and had in flight at once.
-struct Merged {
-    compared: u64,
-    held: u64,
+impl RowCheck {
+    /// `other` after `self`: the merges and comparisons of both, and the
+    /// most either held, since a load's merges run one at a time.
+    fn absorb(&mut self, other: Self) {
+        self.merges += other.merges;
+        self.compared += other.compared;
+        self.held = self.held.max(other.held);
+    }
 }
 
 /// One row group of a cursor's file as read: the cursor, the row group's
@@ -623,7 +615,7 @@ async fn refuse_duplicate_rows(
     reads: Vec<(usize, Vec<GroupPages>)>,
     deletes: &Arc<[Option<Arc<FileDeletes>>]>,
     read_ahead: u64,
-) -> Result<Merged> {
+) -> Result<RowCheck> {
     let first = reads
         .iter()
         .find(|(at, _)| checked[*at])
@@ -667,7 +659,8 @@ async fn refuse_duplicate_rows(
         match progress? {
             Progress::Waiting | Progress::Room => {}
             Progress::Done => {
-                return Ok(Merged {
+                return Ok(RowCheck {
+                    merges: 1,
                     compared: merge.heads.compared,
                     held: ahead.most_taken,
                 });
@@ -889,14 +882,6 @@ enum Head {
     Done,
 }
 
-/// Whether the row at `position` of the file at `at` is one `deletes`
-/// removes.
-fn deleted(deletes: &[Option<Arc<FileDeletes>>], at: usize, position: RowPosition) -> bool {
-    deletes[at]
-        .as_ref()
-        .is_some_and(|rows| rows.contains(position))
-}
-
 /// A cursor over the live pairs of one file's chosen pages, in file order,
 /// one row group's pages current and one run of them decoded at a time,
 /// passing over deleted rows, with the row groups read ahead of it.
@@ -967,7 +952,11 @@ impl PairCursor {
         mut head: Head,
         deletes: &[Option<Arc<FileDeletes>>],
     ) -> Result<Head> {
-        while head == Head::Live && deleted(deletes, self.at, self.pairs.position(self.offset)) {
+        while head == Head::Live
+            && deletes[self.at]
+                .as_deref()
+                .deleted(self.pairs.position(self.offset))
+        {
             head = self.step()?;
         }
         Ok(head)
@@ -1295,7 +1284,7 @@ mod tests {
     use crate::approx;
     use crate::config::{Residency, ServerConfig};
     use crate::index::testing as index_testing;
-    use crate::key::KeyType;
+    use crate::key::{Key, KeyType};
     use crate::manifest::{self, DataFileEntry};
     use crate::order::OrderType;
     use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -1311,11 +1300,14 @@ mod tests {
     /// key can fall in both their buckets (`buckets_may_share_a_key`) and their
     /// key ranges and order ranges both meet, ends included.
     fn is_counterpart(ours: OrderedSpan<'_>, theirs: OrderedSpan<'_>) -> bool {
-        buckets_may_share_a_key(
-            (ours.bucketing, ours.bucket),
-            (theirs.bucketing, theirs.bucket),
-        ) && meet(ours.keys, theirs.keys)
+        buckets_may_share_a_key(ours.span.place(), theirs.span.place())
+            && meet(keys(ours), keys(theirs))
             && meet(ours.orders, theirs.orders)
+    }
+
+    /// The key range of the file `span` spans.
+    fn keys(span: OrderedSpan<'_>) -> (&Key, &Key) {
+        (span.span.first, span.span.last)
     }
 
     /// Bucket counts of a table before and after a spec evolution: one key
@@ -1333,9 +1325,13 @@ mod tests {
     fn span(described: &Described) -> OrderedSpan<'_> {
         let (place, keys, orders) = described;
         OrderedSpan {
-            bucketing: place.map(|(count, _)| bucketing(count)),
-            bucket: place.map_or(0, |(_, bucket)| bucket),
-            keys: (&keys.0, &keys.1),
+            span: Span {
+                bucketing: place.map(|(count, _)| bucketing(count)),
+                bucket: place.map_or(0, |(_, bucket)| bucket),
+                first: &keys.0,
+                last: &keys.1,
+                added_by: SnapshotId(0),
+            },
             orders: (&orders.0, &orders.1),
         }
     }
@@ -1363,16 +1359,7 @@ mod tests {
     /// The overlap groups of `spans`, which are in file order, as
     /// `assemble` finds them.
     fn groups_of(spans: &[OrderedSpan<'_>]) -> Vec<Vec<usize>> {
-        let swept: Vec<Span<'_>> = spans
-            .iter()
-            .map(|span| Span {
-                bucketing: span.bucketing,
-                bucket: span.bucket,
-                first: span.keys.0,
-                last: span.keys.1,
-                added_by: SnapshotId(0),
-            })
-            .collect();
+        let swept: Vec<Span<'_>> = spans.iter().map(|span| span.span).collect();
         overlap_groups(&swept, &routes(&swept))
     }
 
@@ -1493,7 +1480,7 @@ mod tests {
             .flat_map(|at| (0..spans.len()).map(move |other| (at, other)))
             .filter(|&(at, other)| {
                 at != other
-                    && meet(spans[at].keys, spans[other].keys)
+                    && meet(keys(spans[at]), keys(spans[other]))
                     && !meet(spans[at].orders, spans[other].orders)
             })
             .count();

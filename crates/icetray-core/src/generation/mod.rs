@@ -2319,11 +2319,8 @@ async fn verify_groups(
         let owned_table = table.to_string();
         let removed = Arc::clone(deletes);
         blocking::on_blocking_pool(move || {
-            let gone = move |at: usize, position: RowPosition| {
-                removed[at]
-                    .as_ref()
-                    .is_some_and(|rows| rows.contains(position))
-            };
+            let gone =
+                move |at: usize, position: RowPosition| removed[at].as_deref().deleted(position);
             refuse_duplicates(&owned_table, &members, Some(&gone))
         })
         .await
