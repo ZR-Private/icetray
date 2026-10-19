@@ -32,9 +32,9 @@ pub const LATENCY_BUCKETS: [f64; 14] = [
 ];
 
 /// Histogram bucket bounds in seconds for `scan_seconds`: `LATENCY_BUCKETS`
-/// extended to 10 seconds, since one Scan of one key may read a span of
-/// pages in several rounds and `server.scan_deadline` is 5 seconds by
-/// default.
+/// extended to 10 seconds. A cold Scan waits on its slowest span GET across
+/// every file that holds the key, after the key-page round under `bloom`
+/// (RFD 025, Cost), and `server.scan_deadline` is 5 seconds by default.
 pub const SCAN_LATENCY_BUCKETS: [f64; 16] = [
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
     5.0, 10.0,
