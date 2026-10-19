@@ -660,6 +660,15 @@ impl Keys {
         }
     }
 
+    /// Compares key `at` with key `other_at` of this run in served order.
+    pub(crate) fn cmp_within(&self, at: usize, other_at: usize) -> Ordering {
+        match self {
+            Self::Long(run) => run[at].cmp(&run[other_at]),
+            Self::Str(run) | Self::Bin(run) => run[at].data().cmp(run[other_at].data()),
+            Self::Uuid(run) => run[at].cmp(&run[other_at]),
+        }
+    }
+
     /// The length in bytes of the longest key: eight for longs, sixteen for
     /// uuids, the longest value otherwise, and zero for an empty run.
     pub(crate) fn max_len(&self) -> usize {

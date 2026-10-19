@@ -1165,7 +1165,10 @@ fn bridged<'c>(
 /// one does, `of` giving a span's row group, first row, and row count:
 /// spans in file order, by row group and then first row, no two holding
 /// one row, so one binary search finds it, and a lookup visits a number of
-/// spans logarithmic in theirs, however many spans a read decoded.
+/// spans logarithmic in theirs, however many spans a read decoded. Inline,
+/// as `Spans::find` is: a Scan looks up each row it walks up to three
+/// times, and a call per lookup is a measurable share of a bounded Scan.
+#[inline]
 fn span_holding<S>(
     spans: &[S],
     row: RowRef,
@@ -1220,6 +1223,7 @@ impl<T> Default for Spans<T> {
 impl<T: SpanValues> Spans<T> {
     /// The decoded values holding `row` and its position among them, where
     /// a span holds it.
+    #[inline]
     fn find(&self, row: RowRef) -> Option<(&T, usize)> {
         span_holding(&self.spans, row, |(row_group, start, values)| {
             (*row_group, *start, values.rows())

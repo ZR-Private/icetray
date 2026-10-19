@@ -9,6 +9,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use parquet::data_type::ByteArray;
+
 use super::build::{DECODE_BATCH_RECORDS, RunBatches, RunCheck, keys_are_utf8};
 use super::order_fences::{GroupFences, GroupFencesBuilder, OrderFences, Pair, PairPart};
 use super::page_header::check_order_page_headers;
@@ -56,8 +58,8 @@ impl OrderRun {
         self.0.part(at)
     }
 
-    /// Value `at` against value `other_at` of `other`, this run or a run of
-    /// the same column in another file (`Keys::cmp_at`).
+    /// Value `at` against value `other_at` of `other`, a run of the same
+    /// column in another file (`Keys::cmp_at`).
     pub(super) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
         self.0.cmp_at(at, &other.0, other_at)
     }
@@ -78,12 +80,20 @@ impl OrderRun {
     }
 
     /// The positions of the least and the greatest value; `None` for an
-    /// empty run.
+    /// empty run. The variant is matched once, outside the loops, which
+    /// compare every value of a verify window twice.
     fn extremes(&self) -> Option<(usize, usize)> {
-        let positions = 0..self.len();
-        let least = positions.clone().min_by(|&a, &b| self.cmp_at(a, self, b))?;
-        let greatest = positions.max_by(|&a, &b| self.cmp_at(a, self, b))?;
-        Some((least, greatest))
+        fn of<T, V: Ord + ?Sized>(run: &[T], value: impl Fn(&T) -> &V) -> Option<(usize, usize)> {
+            let cmp = |a: &usize, b: &usize| value(&run[*a]).cmp(value(&run[*b]));
+            let least = (0..run.len()).min_by(cmp)?;
+            let greatest = (0..run.len()).max_by(cmp)?;
+            Some((least, greatest))
+        }
+        match &self.0 {
+            Keys::Long(run) => of(run, |value| value),
+            Keys::Str(run) | Keys::Bin(run) => of(run, ByteArray::data),
+            Keys::Uuid(run) => of(run, |value| value),
+        }
     }
 }
 
@@ -386,7 +396,7 @@ impl<'a> PairCheck<'a> {
             let key = if at == 0 {
                 self.last.as_ref().map(|(key, _)| keys.get(0).cmp(key))
             } else {
-                Some(keys.cmp_at(at, keys, at - 1))
+                Some(keys.cmp_within(at, at - 1))
             };
             let continues = match key {
                 None | Some(Ordering::Greater) => false,
@@ -397,7 +407,7 @@ impl<'a> PairCheck<'a> {
                 Some(Ordering::Equal) => {
                     let order = match (at, &self.last) {
                         (0, Some((_, last))) => orders.cmp_value(0, last),
-                        _ => orders.cmp_at(at, orders, at - 1),
+                        _ => orders.0.cmp_within(at, at - 1),
                     };
                     match order {
                         Ordering::Greater => true,
