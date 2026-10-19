@@ -954,7 +954,7 @@ impl FileIndex {
     /// Parquet type its order type does not admit is
     /// `RefusalReason::OrderTypeMismatch`, and one without its offset index
     /// is `FileFault::MissingPageIndex`; once its chunks are decoded beside
-    /// the keys under the ordered rules (`verify_ordered`), a key may
+    /// the keys under the ordered rules (`build::Rules::Ordered`), a key may
     /// repeat, and a key and order value together twice is
     /// `RefusalReason::DuplicateRows`, one below the pair before it
     /// `RefusalReason::Unsorted`, a null order value

@@ -296,10 +296,7 @@ impl KeysToVerify {
                 leaf,
                 path: &handle.location,
             };
-            match order {
-                None => verify(&table, &column, shape, &chunks),
-                Some(order) => verify_ordered(&table, &column, shape, order, &chunks),
-            }
+            verify(&table, &column, shape, Rules::of(order), &chunks)
         })
         .await
         .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?
@@ -660,81 +657,77 @@ pub(super) struct Verified {
     pub(super) order: Option<OrderVerified>,
 }
 
+/// The rules `verify` checks a file's rows under.
+#[derive(Clone, Copy)]
+enum Rules {
+    /// The key-value rules (RFD 007): every key above the one before it
+    /// within a row group and across row groups, so a key equal to the one
+    /// before it is a duplicate and a key below it is unsorted. A string or
+    /// binary key chunk of `PLAIN` pages without a dictionary is read in
+    /// place where the decoder is `KeyDecoder::Plain` (`plain::checked_run`),
+    /// and any other chunk, or one of those holding a page it does not read
+    /// exactly, by parquet's column reader (`check_run`); either way the
+    /// keys and every refusal and fault are the column reader's. The
+    /// decoder is chosen here so that tests can hold the plain decoder to
+    /// the column reader's answers.
+    KeyValue(KeyDecoder),
+    /// The ordered rules (RFD 025, Load) of this order column, decoded
+    /// from the chunks beside the keys a window at a time (`PairCheck`): a
+    /// key may repeat, and every row's key and order value must be above
+    /// the row's before it, within a row group and across row groups,
+    /// deleted rows included, so an equal pair is
+    /// `RefusalReason::DuplicateRows` naming the key and the order value
+    /// and a falling one `RefusalReason::Unsorted`; a null order value is
+    /// `RefusalReason::NullOrder`, and a `string` order value that is not
+    /// UTF-8 `FileFault::OrderNotUtf8`. Every order page header is checked
+    /// as a value page's is before its row group decodes. Within a row
+    /// group, a decode fault stands before a null key, a null key before a
+    /// null order value, that before a key and then an order value that is
+    /// not UTF-8, and those before a pair out of order. Records the order
+    /// facts and the order fences besides. The keys are read by parquet's
+    /// column reader alone.
+    Ordered(OrderLeaf),
+}
+
+impl Rules {
+    /// The rules a file with order column `order` is verified under: the
+    /// ordered rules with one, and without one the key-value rules, keys
+    /// read in place where the plain decoder reads them.
+    fn of(order: Option<OrderLeaf>) -> Self {
+        order.map_or(Self::KeyValue(KeyDecoder::Plain), Self::Ordered)
+    }
+}
+
 /// Decodes every key of every row group from `chunks` and checks what the
-/// contract requires of them (RFD 007): no null, UTF-8 in a string column,
-/// every key above the one before it within a row group and across row
-/// groups (a key equal to the one before it is a duplicate, a key below
-/// it is unsorted), none over `contract::MAX_KEY_BYTES`. Every key page
-/// header of a row group is checked against what its page can hold before
-/// the row group is decoded (`check_page_headers`), and every key page
-/// against the rows its offset index gives it on the way. Records
-/// the exact first and last key of the file and of every row group, the
-/// longest key, and the fences. Nothing here consults column statistics.
-/// A row group's keys are checked a decode batch at a time (`RunCheck`),
-/// so at most one batch of them is held however long the row group is. A
-/// string or binary key chunk of `PLAIN` pages without a dictionary is
-/// read in place (`plain::checked_run`), and any other chunk, or one of
-/// those holding a page it does not read exactly, by parquet's column
-/// reader (`check_run`); either way the keys and every refusal and fault
-/// are the column reader's.
+/// contract requires of them under `rules`: no null, UTF-8 in a string
+/// column, the order `rules` give, none over `contract::MAX_KEY_BYTES`.
+/// Every key page header of a row group is checked against what its page
+/// can hold before the row group is decoded (`check_page_headers`), and
+/// every key page against the rows its offset index gives it on the way.
+/// Records the exact first and last key of the file and of every row
+/// group, the longest key, and the fences. Nothing here consults column
+/// statistics. A row group's keys are checked a decode batch at a time
+/// (`RunCheck`), so at most one batch of them is held however long the row
+/// group is.
 fn verify(
     table: &str,
     column: &Column<'_>,
     shape: KeyShape,
+    rules: Rules,
     chunks: &Arc<Segments>,
-) -> Result<Verified> {
-    verify_with(table, column, shape, None, chunks, KeyDecoder::Plain)
-}
-
-/// `verify` under the ordered rules (RFD 025, Load), the order column
-/// `order` decoded from `chunks` beside the keys a window at a time
-/// (`PairCheck`): a key may repeat, and every row's key and order value
-/// must be above the row's before it, within a row group and across row
-/// groups, deleted rows included, so an equal pair is
-/// `RefusalReason::DuplicateRows` naming the key and the order value and a
-/// falling one `RefusalReason::Unsorted`; a null order value is
-/// `RefusalReason::NullOrder`, and a `string` order value that is not
-/// UTF-8 `FileFault::OrderNotUtf8`. Every order page header is checked as a
-/// value page's is before its row group decodes. Within a row group, a
-/// decode fault stands before a null key, a null key before a null order
-/// value, that before a key and then an order value that is not UTF-8, and
-/// those before a pair out of order. Records the order facts and the order fences
-/// besides what `verify` records. The keys are read by parquet's column
-/// reader alone.
-fn verify_ordered(
-    table: &str,
-    column: &Column<'_>,
-    shape: KeyShape,
-    order: OrderLeaf,
-    chunks: &Arc<Segments>,
-) -> Result<Verified> {
-    verify_with(
-        table,
-        column,
-        shape,
-        Some(order),
-        chunks,
-        KeyDecoder::ColumnReader,
-    )
-}
-
-/// `verify`, or `verify_ordered` given `order`, each row group decoded by
-/// `decoder` where it can be (`check_run`). The decoder is a parameter so
-/// that tests can hold the plain decoder to the column reader's answers.
-fn verify_with(
-    table: &str,
-    column: &Column<'_>,
-    shape: KeyShape,
-    order: Option<OrderLeaf>,
-    chunks: &Arc<Segments>,
-    decoder: KeyDecoder,
 ) -> Result<Verified> {
     let path = column.path;
     let total = column.metadata.num_row_groups();
     let mut fences = Vec::with_capacity(total);
     let mut groups: Vec<GroupRange> = Vec::with_capacity(total);
     let mut longest = 0;
-    let mut pairs = order.map(|order| PairCheck::new(column, order));
+    let (decoder, mut pairs) = match rules {
+        Rules::KeyValue(decoder) => (decoder, None),
+        Rules::Ordered(order) => (
+            KeyDecoder::ColumnReader,
+            Some(PairCheck::new(column, order)),
+        ),
+    };
     for row_group in 0..total {
         let chunk = column.group(row_group);
         let rows = chunk.rows();
@@ -1953,7 +1946,8 @@ mod tests {
         };
         assert_eq!(
             fault_of(
-                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups)
+                verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks)
+                    .map(|verified| verified.groups)
             ),
             FileFault::PageRowsMismatch {
                 row_group: 0,
@@ -1992,7 +1986,8 @@ mod tests {
                 leaf: key_leaf,
                 path: &path,
             };
-            verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups.len())
+            verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks)
+                .map(|verified| verified.groups.len())
         };
         assert_eq!(verify_with(&loaded).unwrap(), ROW_GROUPS);
         // A row group without rows, and so without pages, reads no page and
@@ -2088,7 +2083,7 @@ mod tests {
             leaf: key_leaf,
             path: &path,
         };
-        verify(TABLE, &column, shape, chunks).map(|verified| verified.groups.len())
+        verify(TABLE, &column, shape, Rules::of(None), chunks).map(|verified| verified.groups.len())
     }
 
     /// A key page whose header claims more values than the rows its offset
@@ -2117,8 +2112,8 @@ mod tests {
                 leaf: key_leaf,
                 path: &path,
             };
-            let verified =
-                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups);
+            let verified = verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks)
+                .map(|verified| verified.groups);
             if claimed == span {
                 assert_eq!(verified.unwrap().len(), ROW_GROUPS, "the count as written");
                 continue;
@@ -2178,7 +2173,8 @@ mod tests {
         };
         assert_eq!(
             fault_of(
-                verify(TABLE, &column, KeyShape::Long, &chunks).map(|verified| verified.groups)
+                verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks)
+                    .map(|verified| verified.groups)
             ),
             FileFault::PageRowsMismatch {
                 row_group: 0,
@@ -3273,21 +3269,19 @@ mod tests {
             leaf: KEY_LEAF,
             path: &path,
         };
-        let plain = outcome(verify_with(
+        let plain = outcome(verify(
             TABLE,
             &column,
             shape,
-            None,
+            Rules::KeyValue(KeyDecoder::Plain),
             chunks,
-            KeyDecoder::Plain,
         ));
-        let reader = outcome(verify_with(
+        let reader = outcome(verify(
             TABLE,
             &column,
             shape,
-            None,
+            Rules::KeyValue(KeyDecoder::ColumnReader),
             chunks,
-            KeyDecoder::ColumnReader,
         ));
         assert_eq!(plain, reader, "the plain decoder against the column reader");
         let taken = (0..metadata.num_row_groups())
@@ -3968,7 +3962,7 @@ mod tests {
         );
     }
 
-    /// `verify_ordered` of `opened`'s file over `metadata`, a footer edited
+    /// `verify` under the ordered rules of `opened`'s file over `metadata`, a footer edited
     /// from its own, with the key and order chunks fetched.
     async fn verify_ordered_over(
         opened: &Opened,
@@ -3991,7 +3985,13 @@ mod tests {
             leaf: inspected.layout.key_leaf,
             path: &path,
         };
-        verify_ordered(TABLE, &column, KeyShape::Long, order, &chunks)
+        verify(
+            TABLE,
+            &column,
+            KeyShape::Long,
+            Rules::Ordered(order),
+            &chunks,
+        )
     }
 
     /// Verification never reads the order column's column index (RFD 025,
@@ -4095,11 +4095,11 @@ mod tests {
             path: &path,
         };
         assert_eq!(
-            fault_of(verify_ordered(
+            fault_of(verify(
                 TABLE,
                 &column,
                 KeyShape::Long,
-                order,
+                Rules::Ordered(order),
                 &chunks
             )),
             over_bound(
@@ -4563,7 +4563,14 @@ mod tests {
         let data_pages = key_chunk.page_locations().len() + order_chunk.page_locations().len();
         let handed = || HANDED.with(std::cell::Cell::get);
         let before = handed();
-        verify_ordered(TABLE, &column, KeyShape::Long, order, &chunks).unwrap();
+        verify(
+            TABLE,
+            &column,
+            KeyShape::Long,
+            Rules::Ordered(order),
+            &chunks,
+        )
+        .unwrap();
         let after = handed();
         assert_eq!(
             Handed {
@@ -4576,7 +4583,7 @@ mod tests {
             }
         );
         let before = handed();
-        verify(TABLE, &column, KeyShape::Long, &chunks).unwrap();
+        verify(TABLE, &column, KeyShape::Long, Rules::of(None), &chunks).unwrap();
         let after = handed();
         assert_eq!(
             Handed {
