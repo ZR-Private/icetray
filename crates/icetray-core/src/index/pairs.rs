@@ -15,8 +15,8 @@ use super::build::{
 };
 use super::ordered::OrderRun;
 use super::{
-    Column, ColumnChunk, FileFault, FileIndex, KeyResidency, Keys, OrderLeaf, RowPosition, RowRef,
-    file_fault, row_index,
+    ColumnChunk, FileFault, FileIndex, KeyResidency, Keys, RowPosition, RowRef, file_fault,
+    row_index,
 };
 use crate::approx;
 use crate::error::Result;
@@ -129,22 +129,6 @@ impl Pairs {
 }
 
 impl FileIndex {
-    /// The order column of an ordered file.
-    pub(super) fn order_leaf_of(&self) -> OrderLeaf {
-        self.layout
-            .order
-            .expect("only an ordered table's files are read as pairs")
-    }
-
-    /// The order column as the decoders see it.
-    pub(super) fn order_values(&self, order: OrderLeaf) -> Column<'_> {
-        Column {
-            metadata: &self.metadata,
-            leaf: order.leaf,
-            path: &self.handle.location,
-        }
-    }
-
     /// The reads order pages `pages` of `row_group`, ascending, decode
     /// from, without I/O: each run of consecutive pages (`RowSpan`) as one
     /// range of the order chunk and one of the key pages its rows span,
@@ -152,7 +136,7 @@ impl FileIndex {
     /// ranges and holds its key chunks; Disk and Bloom read the order and
     /// key ranges together.
     pub(crate) fn pair_read(&self, row_group: usize, pages: &[usize]) -> PairRead {
-        let order_chunk = self.order_values(self.order_leaf_of()).group(row_group);
+        let order_chunk = self.order_chunk(row_group);
         let key_chunk = self.key_column().group(row_group);
         let spans = page_runs(order_chunk, pages);
         let mut ranges = Vec::new();
@@ -219,9 +203,8 @@ impl FileIndex {
     /// and a string order value that is not `FileFault::OrderNotUtf8`.
     pub(crate) fn decode_pairs(&self, chunks: &PairChunks, at: usize) -> Result<Pairs> {
         let span = &chunks.spans[at];
-        let order = self.order_leaf_of();
         let key_chunk = self.key_column().group(span.row_group);
-        let order_chunk = self.order_values(order).group(span.row_group);
+        let order_chunk = self.order_chunk(span.row_group);
         let keys = decode_run(
             key_chunk,
             self.layout.key_shape.run_shape(),
@@ -231,7 +214,7 @@ impl FileIndex {
         check_utf8(key_chunk, &keys)?;
         let orders = OrderRun(decode_run(
             order_chunk,
-            order.shape.run_shape(),
+            self.order_leaf_of().shape.run_shape(),
             span.rows.clone(),
             Arc::clone(&chunks.chunks),
         )?);

@@ -207,10 +207,7 @@ impl<'a> PairCheck<'a> {
     /// column of.
     pub(super) fn new(keys: &Column<'a>, order: OrderLeaf) -> Self {
         Self {
-            column: Column {
-                leaf: order.leaf,
-                ..*keys
-            },
+            column: keys.with_leaf(order.leaf),
             shape: order.shape,
             min: None,
             max: None,

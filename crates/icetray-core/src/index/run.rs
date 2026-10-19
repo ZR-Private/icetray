@@ -315,7 +315,7 @@ impl FileIndex {
             after: bounds.after.as_ref(),
             before: bounds.before.as_ref(),
         };
-        let pieces = self.pieces(run, order, cut);
+        let pieces = self.pieces(run, cut);
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let walk = Walk {
             index: self,
@@ -393,7 +393,7 @@ impl FileIndex {
     /// fence is the pair itself, since a page's rows lie at or above its
     /// fence. The work is one binary search over the fences per bound and a
     /// step per row group the run spans, whatever the run's length.
-    fn pieces(&self, run: &Run<'_>, order: OrderLeaf, cut: Cut<'_>) -> Vec<Piece> {
+    fn pieces(&self, run: &Run<'_>, cut: Cut<'_>) -> Vec<Piece> {
         let fences = self
             .order_fences()
             .expect("a Scan reads an ordered file, whose index holds its order fences");
@@ -408,7 +408,7 @@ impl FileIndex {
         });
         let mut pieces = Vec::new();
         for part in &run.parts {
-            let chunk = self.order_values(order).group(part.row_group);
+            let chunk = self.order_chunk(part.row_group);
             let pages = PartPages {
                 row_group: part.row_group,
                 first: chunk.page_holding(row_index(part.rows.start)),
@@ -507,7 +507,7 @@ impl FileIndex {
         let mut spans = Vec::new();
         for at in bound_pieces {
             let piece = &pieces[at];
-            let chunk = self.order_values(order).group(piece.row_group);
+            let chunk = self.order_chunk(piece.row_group);
             let pages = pages_holding(chunk, &piece.rows);
             let Some(segments) = self.cached_pages(chunk, pages.clone(), source) else {
                 continue;
@@ -535,7 +535,7 @@ impl FileIndex {
     ) -> impl Future<Output = Result<Spans<OrderRun>>> + use<'a> {
         self.read_spans(
             rows,
-            move |row_group| self.order_values(*order).group(row_group),
+            move |row_group| self.order_chunk(row_group),
             self.disk_chunks(),
             source,
             source.order_gets,
@@ -773,9 +773,7 @@ pub(super) mod testing {
 
     /// A walk steps on `row` of `index`.
     pub(super) fn visit_row(index: &FileIndex, row: RowRef) {
-        let chunk = index
-            .order_values(index.order_leaf_of())
-            .group(row.row_group);
+        let chunk = index.order_chunk(row.row_group);
         let page = (row.row_group, chunk.page_holding(row_index(row.row)));
         if LAST.replace(Some(page)) != Some(page) {
             PAGES.set(PAGES.get() + 1);
@@ -950,10 +948,7 @@ impl Walk<'_> {
     /// with no I/O (`DeletedRows::all_deleted`).
     fn walk_piece(&self, at: usize, known: &Spans<OrderRun>, walk: &mut Taking) -> Walking {
         let piece = &self.pieces[at];
-        let chunk = self
-            .index
-            .order_values(self.index.order_leaf_of())
-            .group(piece.row_group);
+        let chunk = self.index.order_chunk(piece.row_group);
         let (mut row, step) = match self.direction {
             Direction::OldestFirst => (piece.rows.start, 1),
             Direction::NewestFirst => (piece.rows.end - 1, -1),
@@ -3483,7 +3478,7 @@ mod tests {
     /// a Scan that read it leaves it.
     async fn reads_holding(index: &FileIndex, (row_group, page): PageAt) -> Reads {
         let reads = Reads::new().await;
-        let chunk = index.order_values(index.order_leaf_of()).group(row_group);
+        let chunk = index.order_chunk(row_group);
         index
             .handle()
             .read_pages(

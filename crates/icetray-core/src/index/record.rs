@@ -381,10 +381,7 @@ fn order_fences(
     if stored.len() != total {
         return Err(RecordFault::OrderFences { row_group: total });
     }
-    let order_column = Column {
-        leaf: order.leaf,
-        ..*column
-    };
+    let order_column = column.with_leaf(order.leaf);
     let mut ranges = keys.groups.iter().peekable();
     let mut groups = Vec::with_capacity(total);
     let mut previous: Option<(Key, Vec<u8>)> = None;
@@ -560,10 +557,7 @@ pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
     let field = FIELD_KEY_BYTES + MOST_VARINT_BYTES;
     let keys = approx::count(fences).saturating_add(approx::count(groups));
     let order_bytes = order.map_or(0, |order| {
-        let order_column = Column {
-            leaf: order.leaf,
-            ..*column
-        };
+        let order_column = column.with_leaf(order.leaf);
         let value = |chunk: ColumnChunk<'_>| match order.shape {
             OrderShape::Int32 | OrderShape::Int64 => approx::count(size_of::<i64>()),
             OrderShape::Fixed(width) => u64::from(width),

@@ -1577,20 +1577,33 @@ impl FileIndex {
         }
     }
 
-    fn key_column(&self) -> Column<'_> {
+    /// The file's column `leaf` as the decoders see it.
+    fn column(&self, leaf: usize) -> Column<'_> {
         Column {
             metadata: &self.metadata,
-            leaf: self.layout.key_leaf,
+            leaf,
             path: &self.handle.location,
         }
     }
 
+    fn key_column(&self) -> Column<'_> {
+        self.column(self.layout.key_leaf)
+    }
+
     fn value_column(&self, value: ValueColumn) -> Column<'_> {
-        Column {
-            metadata: &self.metadata,
-            leaf: value.leaf,
-            path: &self.handle.location,
-        }
+        self.column(value.leaf)
+    }
+
+    /// The order column of an ordered file.
+    fn order_leaf_of(&self) -> OrderLeaf {
+        self.layout
+            .order
+            .expect("a Scan or a pair read reads an ordered file")
+    }
+
+    /// The order column's chunk in `row_group` of an ordered file.
+    fn order_chunk(&self, row_group: usize) -> ColumnChunk<'_> {
+        self.column(self.order_leaf_of().leaf).group(row_group)
     }
 
     /// The row group and key page that can hold `key`, from the exact keys
@@ -1741,6 +1754,11 @@ impl<'a> Column<'a> {
             .file_metadata()
             .schema_descr()
             .column(self.leaf)
+    }
+
+    /// Column `leaf` of the same file.
+    fn with_leaf(self, leaf: usize) -> Self {
+        Self { leaf, ..self }
     }
 
     /// The column's chunk in `row_group`, which is below the footer's row
