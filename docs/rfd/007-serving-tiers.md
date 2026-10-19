@@ -64,14 +64,15 @@ than Parquet, unsorted files, null or duplicate keys, keys outside their
 file's recorded bucket, a key column whose physical type does not match
 the schema, a configured column a data file does not hold as the schema
 means it, a configured value column that is not binary, fixed, or
-string, equality deletes and unreadable deletes that may apply, keys over
-4,096 bytes, and the residency refusals of RFD 017 (Residency tiers))
-will be refused at load with a named reason; a table it
-can serve only inefficiently (a dictionary-encoded value column, key pages
-over 2,000 rows, no bucket partition, overlapping files in a bucket) will
-be served with its penalty measured and reported, and each such finding
-caps the table's lookup level (RFD 020); tuning advice will never affect
-whether a table serves.
+string, equality deletes and unreadable deletes that may apply, keys
+over the length cap of RFD 008 (Keys), and the residency refusals of RFD
+017 (Residency tiers)) will be refused at load with a named reason; a
+table it can serve only inefficiently (a dictionary-encoded value
+column, key pages over the `large_key_pages` threshold, no bucket
+partition, overlapping files in a bucket) will be served with its
+penalty measured and reported, and each such finding caps the table's
+lookup level (RFD 020); tuning advice will never affect whether a table
+serves.
 
 The tiers are refusal, inefficient, and advice, and the line between them
 is what a client could observe. A refusal means icetray cannot serve the
@@ -81,7 +82,9 @@ requires. An inefficient finding means every answer is right and some
 lookups do more work. It carries its penalty in one of three units: extra
 GETs per hit, key bytes or rows decoded per lookup, or files probed per
 lookup. Advice concerns memory, load time, or tuning, and nothing it flags
-can make a lookup's answer wrong.
+can make a lookup's answer wrong. The optimal layout's
+[requirements](../table-layout.md#requirements) give the thresholds, the
+key-length cap among them.
 
 Placements settled elsewhere:
 
@@ -111,14 +114,14 @@ Placements settled elsewhere:
   per row, seconds to minutes on a large table, so the doctor is the one
   that hashes every key, and it refuses such a file under the same reason
   (RFD 016).
-- Value pages whose mean uncompressed size is above the lookup's 64 MiB
-  value page ceiling (RFD 004) are advice. A lookup into a page over the
-  ceiling is refused with a file fault instead of being answered, so every
-  answer given is right and there is nothing for a penalty unit to measure.
-  The trigger is also a file's mean page size, which can miss one
-  oversized page and can be pushed above the ceiling by a large value
-  dictionary. It cannot name the lookups that will be refused, so it does
-  not decide whether the table serves (RFD 016).
+- Value pages whose mean uncompressed size is above the lookup's
+  value-page ceiling (RFD 004) are advice. A lookup into a page over the
+  ceiling is refused with a file fault instead of being answered, so
+  every answer given is right and there is nothing for a penalty unit to
+  measure. The trigger is also a file's mean page size, which can miss
+  one oversized page and can be pushed above the ceiling by a large
+  value dictionary. It cannot name the lookups that will be refused, so
+  it does not decide whether the table serves (RFD 016).
 - A configured value column that is not binary, fixed, or string is
   refused as `value_type_unsupported`, naming the column, because the
   wire carries a value as opaque bytes (RFD 010 (Transport and client

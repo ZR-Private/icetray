@@ -155,19 +155,20 @@ outcome depend on load order and on neighbors. The page cache is the one
 server condition a level depends on today:
 
 - While a `disk` table serves, icetray samples which of its chunk-file
-  pages are resident, every 15 seconds. The table falls below `optimal`
-  when the resident fraction drops below 0.95 and recovers when it rises
-  above 0.99, so the flag does not flap. The fractions are fixed by
-  icetray, not configured, and track the 90th percentile: in a sweep
-  over uniform keys with pages evicted at random, the worst case for a
-  cache, a miss's p90 moved from the page cache to the device once one
-  page in twenty was missing, and from 0.97 up only the p99 was on the
-  device. Under skewed access the kernel evicts the coldest pages first,
-  so at a given fraction fewer lookups pay and the cap is conservative.
-  The cap says whether a table's chunk files still fit in memory, and
-  `icetray_lookup_seconds` reports tail latency itself. The sample
-  decides; when residency cannot be observed, this condition is not
-  judged and the table reads the level of its layout.
+  pages are resident, every 15 seconds, about one Prometheus scrape
+  interval, so a scrape reads a sample at most one interval old. The
+  table falls below `optimal` when the resident fraction drops below
+  0.95 and recovers when it rises above 0.99, so the flag does not flap.
+  The fractions are fixed by icetray, not configured, and track the 90th
+  percentile: in a sweep over uniform keys with pages evicted at random,
+  the worst case for a cache, a miss's p90 moved from the page cache to
+  the device once one page in twenty was missing, and from 0.97 up only
+  the p99 was on the device. Under skewed access the kernel evicts the
+  coldest pages first, so at a given fraction fewer lookups pay and the
+  cap is conservative. The cap says whether a table's chunk files still
+  fit in memory, and `icetray_lookup_seconds` reports tail latency
+  itself. The sample decides; when residency cannot be observed, this
+  condition is not judged and the table reads the level of its layout.
 - At load, icetray compares what every `disk` table's chunk files and the
   page cache's disk level need with the room under the memory limit (the
   cgroup's, or the host's) less the process's resident set. A shortfall

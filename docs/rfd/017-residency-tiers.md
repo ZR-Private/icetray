@@ -10,10 +10,10 @@
 > chunk files are no longer synced when written.
 
 > Updated 2026-10-04: the descriptor rule counts the page cache's disk
-> level, one descriptor per 4 MiB block, apart from the headroom, and
-> counts one load's concurrent reads for each configured table, since
-> every table loads at once at start; icetray raises its soft open-file
-> limit to the hard limit at start.
+> level, one descriptor per block, apart from the headroom, and counts
+> one load's concurrent reads for each configured table, since every
+> table loads at once at start; icetray raises its soft open-file limit
+> to the hard limit at start.
 
 > Updated 2026-10-05: a snapshot that a strict table refuses for its
 > level writes no chunk files, since the level is judged from manifests,
@@ -222,23 +222,25 @@ the file's access-time update. Under `relatime` that update comes on the
 first read after the file is written and at most once a day after that,
 and a directory mounted `noatime` makes none.
 
-The disk tier holds one open file descriptor per chunk file, one per data
-file and rule set, for the life of its generation, and twice that while
-a refresh that rewrote the table loads beside the serving generation. The page cache's disk level holds one
-descriptor per 4 MiB block for the life of the process, 2,048 for an 8 GiB
-level, and a load keeps up to 128 reads in flight per worker thread, at
-most 1,024, each a descriptor. Every configured table loads at once at
-start, and each load keeps its own reads in flight. A deployment
-therefore sizes its descriptor limit to at least twice its disk-tier chunk
-files, plus `page_cache_disk_bytes` / 4 MiB, plus one load's concurrent
-reads, up to 1,024, for each configured table, plus a headroom for
-sockets and the one chunk file that retention opens at a time. The disk
-level is a term of its own rather than part of the headroom, because at a
-few gigabytes it alone exceeds any fixed headroom, and so is each table's
+The disk tier holds one open file descriptor per chunk file, one per
+data file and rule set, for the life of its generation, and twice that
+while a refresh that rewrote the table loads beside the serving
+generation. The page cache's disk level holds one descriptor per block
+of the level for the life of the process, and a load keeps a number of
+reads in flight per worker thread, up to a cap, each a descriptor
+([Operating icetray](../operating.md#file-descriptors) gives the block
+size and both counts). Every configured table loads at once at start,
+and each load keeps its own reads in flight. A deployment therefore
+sizes its descriptor limit to at least twice its disk-tier chunk files,
+plus `page_cache_disk_bytes` over the block size, plus one load's
+concurrent reads for each configured table, plus a headroom for sockets
+and the one chunk file that retention opens at a time. The disk level is
+a term of its own rather than part of the headroom, because at a few
+gigabytes it alone exceeds any fixed headroom, and so is each table's
 load, because a configuration of many tables multiplies it. icetray
-raises its soft limit to the hard limit at start, so the hard limit is the
-one a deployment sets, and the server warns at start when that limit is
-below what the disk level and a load of every table need.
+raises its soft limit to the hard limit at start, so the hard limit is
+the one a deployment sets, and the server warns at start when that limit
+is below what the disk level and a load of every table need.
 
 Load peaks differ by tier. The disk tier holds one overlap group's chunks
 at a time, since a group is verified by reading pages back from the chunk
@@ -350,10 +352,10 @@ way until it swaps them in or drops them (RFD 018 (Configuration
 reload)), and deletions run one at a time. The cost is that a slow table
 holds the deletion up, and with it the next refresh of every table whose
 lock the deletion already holds. A refresh gives its lock up once its
-deadline under RFD 013 (Tail latency) has passed, five minutes by
-default and thirty for a first load, so one slow table holds the others
-up at most that long. When several are slow, a table early in the order
-can wait one deadline for each slow table after it, since a table whose
-lock is not yet taken can start a refresh in the meantime. The cost is
-accepted, because a live set computed without the locks could miss a
-load in flight.
+deadline under RFD 013 (Tail latency) has passed,
+`server.refresh_deadline`, or `server.load_deadline` for a first load,
+so one slow table holds the others up at most that long. When several
+are slow, a table early in the order can wait one deadline for each slow
+table after it, since a table whose lock is not yet taken can start a
+refresh in the meantime. The cost is accepted, because a live set
+computed without the locks could miss a load in flight.

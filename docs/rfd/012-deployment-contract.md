@@ -162,18 +162,18 @@ full, the process held about a third more than the cache and index
 together, most of it allocator overhead on the cache's small pages.
 
 The limit backs up the load checks without replacing them, catching the
-allocations they do not cover. RFD 004 (Resident key-chunk index) refuses a
-key page header at load, and a value page header at lookup, that declares
-more than its page can hold or more than a 64 MiB ceiling that does not
-rest on the footer, but the lengths inside a delta-encoded page still size
-buffers from the file. A file
-that trips the limit takes down every replica that loads it, because all
-of them load the same snapshot and restart into the same file. A limit
-alone would turn one bad file into a fleet-wide crash loop, which is why
-the cases the checks know are refused instead and, on a refresh, the last
-good generation keeps serving. A panic inside parquet's decoding of a file
-would crash-loop the fleet the same way, so the index catches it and
-refuses the file as a fault too.
+allocations they do not cover. RFD 004 (Resident key-chunk index)
+refuses a key page header at load, and a value page header at lookup,
+that declares more than its page can hold or more than a ceiling that
+does not rest on the footer, but the lengths inside a delta-encoded page
+still size buffers from the file. A file that trips the limit takes down
+every replica that loads it, because all of them load the same snapshot
+and restart into the same file. A limit alone would turn one bad file
+into a fleet-wide crash loop, which is why the cases the checks know are
+refused instead and, on a refresh, the last good generation keeps
+serving. A panic inside parquet's decoding of a file would crash-loop
+the fleet the same way, so the index catches it and refuses the file as
+a fault too.
 
 Conveniences a given platform expects, such as its metric naming, its
 secret injection, or any log structure beyond renamed fields, are the

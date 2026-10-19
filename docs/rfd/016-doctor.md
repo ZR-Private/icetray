@@ -66,19 +66,21 @@ report the lookup level a table's layout achieves, the inefficient
 findings that cap it with their penalties, and its advice with the writer property to change, against
 thresholds that are measured defaults kept in one documented table.
 
-The refusal reasons and inefficient findings are RFD 007's lists, grouped
-by its tiers, and the doctor reports each inefficient finding with the
-penalty RFD 007 assigns it. The advice covers missing or truncated
-manifest bounds, value pages over 1 MiB, value pages over the lookup's 64 MiB value page ceiling
-(RFD 004 (Resident key-chunk index)), keys over 128 bytes, data files over
-128 MiB, a truncated column index, more files per bucket than the table's
-size and file-size target explain, a key bloom filter that is absent,
-oversized, or undersized for its row group's key count, reported as the
-filter's bits per key, and data files written before a value column was
-added, which answer its default (RFD 023 (Column resolution)). Such a
-file does not hold that column, so it draws no finding for it, and its
-rows cost no value-page GET for it, which the level and the cost gauges,
-predicting the worst case, leave out.
+The refusal reasons and inefficient findings are RFD 007's lists,
+grouped by its tiers, and the doctor reports each inefficient finding
+with the penalty RFD 007 assigns it. The advice covers missing or
+truncated manifest bounds, large value pages, value pages over the
+lookup's value-page ceiling (RFD 004 (Resident key-chunk index)), long
+keys, large data files, a truncated column index, more files per bucket
+than the table's size and file-size target explain, a key bloom filter
+that is absent, oversized, or undersized for its row group's key count,
+reported as the filter's bits per key, and data files written before a
+value column was added, which answer its default (RFD 023 (Column
+resolution)). Such a file does not hold that column, so it draws no
+finding for it, and its rows cost no value-page GET for it, which the
+level and the cost gauges, predicting the worst case, leave out. The
+optimal layout's [requirements](../table-layout.md#requirements) are the
+documented table, and they give each threshold.
 
 A table serves the value columns its configuration lists (RFD 022
 (Value columns)), and
@@ -101,21 +103,22 @@ walks the default the column states (RFD 023), with no GET, and every
 value on the first value page of the first file that holds the column,
 one GET past the page cache (two for a dictionary-encoded chunk), as a
 projection would, passing to the next file that holds the column when
-that page holds only nulls, up to three files. A value or default that
-does not walk is the advice `malformed_protobuf`, naming the column and,
-for a page, the file, which catches a column declared protobuf that
-holds another format. A page the command cannot read is reported for
-its column, and the table's report and judgement stand without it. A
-malformed value on a page the walk does not read is found by the first
-lookup that names fields of it. The check at every load reads no value
-page, so it does not walk, and the `findings` gauge carries no series
-for that code.
+that page holds only nulls, up to a fixed number of files ([the command
+line](../configuration.md#the-command-line) gives it). A value or
+default that does not walk is the advice `malformed_protobuf`, naming
+the column and, for a page, the file, which catches a column declared
+protobuf that holds another format. A page the command cannot read is
+reported for its column, and the table's report and judgment stand
+without it. A malformed value on a page the walk does not read is found
+by the first lookup that names fields of it. The check at every load
+reads no value page, so it does not walk, and the `findings` gauge
+carries no series for that code.
 
 The value-page line concerns bytes fetched per hit. That cost grows
 linearly with the page's size and has no step anywhere, so the line is
 drawn where the transfer itself reaches the order of a round trip
-instead of at the optimal layout's 64 KiB bound. The bound remains the
-recipe for large values, where a row limit alone leaves pages of
+instead of at the optimal layout's value-page bound. The bound remains
+the recipe for large values, where a row limit alone leaves pages of
 megabytes, and the doctor reports each column's mean value size beside
 its mean page size so an owner sees how many values a hit fetches for
 the one it wanted.
@@ -194,11 +197,11 @@ site.
 ## Consequences
 
 Table builders get a verdict and a fix before a table ships, and a
-pipeline gets a loud failure from the exit code before the table reaches a
-server, where `strict` would refuse it at load. Key pages between the
-optimal layout's 1,000 rows and the 2,000-row inefficient threshold draw
-no finding. The slack is a chosen margin, so a writer whose page rounding
-overshoots the optimal layout does not trip the doctor.
+pipeline gets a loud failure from the exit code before the table reaches
+a server, where `strict` would refuse it at load. Key pages above the
+optimal layout's 1,000 rows and within the `large_key_pages` threshold
+draw no finding. The slack is a chosen margin, so a writer whose page
+rounding overshoots the optimal layout does not trip the doctor.
 
 The thresholds rest on a few measurements from limited vantage points
 ([range-GET latency, what this does and does not establish](../analysis/2026-09-10-s3-range-get-latency.md#what-this-does-and-does-not-establish)).

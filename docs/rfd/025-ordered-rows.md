@@ -36,10 +36,9 @@ direction under a limit and optional bounds on the order value.
   key column or a value column as the order column is a configuration
   error. Setting, changing, or removing `order_column` reloads the whole
   table under RFD 018 (Configuration reload). `max_scan_rows`, set only
-  on an ordered table, is the most rows one Scan returns, 1,000 by
-  default, and a change to it applies in place. `value_columns` and
-  their formats follow RFD 022 (Value columns) and RFD 024 (Field
-  projection).
+  on an ordered table, is the most rows one Scan returns, and a change
+  to it applies in place. `value_columns` and their formats follow RFD
+  022 (Value columns) and RFD 024 (Field projection).
 - **Order values.** The order column is Iceberg `int`, `long`, `date`,
   `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`,
   `string`, `binary`, or `fixed`, and the load refuses any other type as
@@ -129,7 +128,7 @@ direction under a limit and optional bounds on the order value.
   per file are those facts, the fences, and the order column's offset
   index. A file without an order column offset index is a file fault, as
   a key or value column without one is. Order pages get RFD 004's
-  value-page header checks and its 64 MiB ceiling, at load and in a
+  value-page header checks and its value-page ceiling, at load and in a
   Scan. Under `disk` every chunk file is named by its data file and the
   rules it was verified under, the key-value rules or the ordered rules
   with the order column's field id, and its verification record names
@@ -141,15 +140,15 @@ direction under a limit and optional bounds on the order value.
   chunk-file budget and the resident budget reserve an ordered file from
   the footer's sizes, estimating string and binary order values, in the
   facts and in each order fence, at the order chunk's uncompressed bytes
-  per value. No footer number bounds the fences of a
-  dictionary-encoded order column, so the exact fences are charged once a
-  file is built: the chunk file's exact length is reserved before it is
-  written, a `full` table's exact resident bytes are checked against its
-  budget, and a load over either is refused as `over_budget`. Column
-  resolution under RFD 023 (Column resolution) applies to the order
-  column, and a file written before the order column was added is
-  refused as `column_mismatch`, since its default would give every row
-  of the file one order value.
+  per value. No footer number bounds the fences of a dictionary-encoded
+  order column, so the exact fences are charged once a file is built:
+  the chunk file's exact length is reserved before it is written, a
+  `full` table's exact resident bytes are checked against its budget,
+  and a load over either is refused as `over_budget`. Column resolution
+  under RFD 023 (Column resolution) applies to the order column, and a
+  file written before the order column was added is refused as
+  `column_mismatch`, since its default would give every row of the file
+  one order value.
 - **Refresh.** Across files, the load checks for a repeated live pair
   only among files where one can occur. A file is checked when it is
   new, or reused with deletes that shrank: deleted rows that are not a
@@ -170,25 +169,26 @@ direction under a limit and optional bounds on the order value.
   under `bloom`. It reads each file's next row group when the merge
   reaches it, whatever that takes, and beyond those reads later row
   groups ahead of need, across the group's files in the order the merge
-  reaches them, while the bytes it holds and has in flight stay within
-  64 MiB (67,108,864 bytes). It therefore holds at most 64 MiB beyond
-  one row group's chosen pages per file, and a file whose row groups are
-  larger than that merges a row group at a time. Where a group's chosen
-  pages fit within 64 MiB, and its reads within the load's concurrency,
-  a merge over files of several row groups waits on about the rounds of
-  GETs a merge over files of one row group does. A merge that refuses or
-  ends first may have read row groups ahead that it never reached, and a
-  read error on a row group read ahead fails the load as any read error
-  does, even where the merge would have refused first. Each run of
-  consecutive chosen pages costs one GET or local read for the order
-  column, and under `disk` and `bloom` one for the key column, and a
-  dictionary page one more. The load refuses a live pair present twice
-  as `duplicate_rows`, naming the later file in file order, as
-  `duplicate_keys` does. A refresh that appends later rows therefore
-  reads only its new files, files a compaction rolled by
-  size cost the pages at the edge keys they share, and an append of rows
-  inside an existing file's order range costs the pages those rows fall
-  among, in the new file and the old.
+  reaches them, while the bytes it holds and has in flight stay within a
+  fixed read-ahead bound ([Ordered
+  tables](../operating.md#ordered-tables) gives it). It therefore holds
+  at most that bound beyond one row group's chosen pages per file, and a
+  file whose row groups are larger than the bound merges a row group at
+  a time. Where a group's chosen pages fit within the bound, and its
+  reads within the load's concurrency, a merge over files of several row
+  groups waits on about the rounds of GETs a merge over files of one row
+  group does. A merge that refuses or ends first may have read row
+  groups ahead that it never reached, and a read error on a row group
+  read ahead fails the load as any read error does, even where the merge
+  would have refused first. Each run of consecutive chosen pages costs
+  one GET or local read for the order column, and under `disk` and
+  `bloom` one for the key column, and a dictionary page one more. The
+  load refuses a live pair present twice as `duplicate_rows`, naming the
+  later file in file order, as `duplicate_keys` does. A refresh that
+  appends later rows therefore reads only its new files, files a
+  compaction rolled by size cost the pages at the edge keys they share,
+  and an append of rows inside an existing file's order range costs the
+  pages those rows fall among, in the new file and the old.
 - **Cost.** Per file that holds the key, a Scan finds the run, then
   reads the order column and each requested column over the run's rows,
   in one round across all files:
@@ -207,13 +207,14 @@ direction under a limit and optional bounds on the order value.
   oldest live rows, counted against the resident deleted rows without
   I/O. It passes over a whole order page of deleted rows in one step and
   decodes no page that holds none of the rows it reads, so such pages
-  split a column's span; where the pages between two spans take at most
-  256 KiB, one GET fetches them with both spans, a bound set so that
-  fetching those pages costs less than the GET it saves. With a bound, a
-  binary search over the run's fences places the bound on one order
-  page, and the server reads that page with the value pages in the same
-  round, so beyond the rows the limit selects, a bounded Scan reads in
-  each requested column at most the rows of the order page that holds
+  split a column's span; where the pages between two spans are few
+  enough bytes that fetching them costs less than the GET it saves, one
+  GET fetches them with both spans ([What a Scan
+  costs](../performance.md#what-a-scan-costs) gives the size). With a
+  bound, a binary search over the run's fences places the bound on one
+  order page, and the server reads that page with the value pages in the
+  same round, so beyond the rows the limit selects, a bounded Scan reads
+  in each requested column at most the rows of the order page that holds
   the bound. Where that page is local, under `disk`, or already cached,
   the server decodes it first and reads only the value pages of the rows
   taken, at no more rounds to object storage. A Scan's work follows its
@@ -228,41 +229,42 @@ direction under a limit and optional bounds on the order value.
   and the values' size.
 - **Caching and hedging.** Each page a span GET fetches is cached as its
   own entry, keyed by file and offset, in a memory cache for ordered
-  tables, bounded by `server.scan_page_cache_bytes`, 256 MiB by default,
-  and kept out of the disk level, so a scan evicts only other scans'
-  pages. Concurrent Scans that need one page issue one GET for it, as
-  concurrent lookups do. A span GET takes its fan-out slot before it
-  claims its pages, as a lookup's GET does, so a Scan of another call
-  waits only on pages a GET is fetching, never on a GET still waiting
-  for its slot. Span GETs are hedged under RFD 013 (Tail latency) in a
-  window of their own per table, whose delay scales with a span's pages,
-  since a span's latency grows with its size; key-page GETs under
-  `bloom` use the table's lookup window.
+  tables, bounded by `server.scan_page_cache_bytes`, and kept out of the
+  disk level, so a scan evicts only other scans' pages. Concurrent Scans
+  that need one page issue one GET for it, as concurrent lookups do. A
+  span GET takes its fan-out slot before it claims its pages, as a
+  lookup's GET does, so a Scan of another call waits only on pages a GET
+  is fetching, never on a GET still waiting for its slot. Span GETs are
+  hedged under RFD 013 (Tail latency) in a window of their own per
+  table, whose delay scales with a span's pages, since a span's latency
+  grows with its size; key-page GETs under `bloom` use the table's
+  lookup window.
 - **Limits.** `server.batch_fan_out` bounds the GETs one MultiGet, one
   Scan, or one MultiScan holds in flight. A MultiScan spreads its keys
   across idle worker threads as a MultiGet does: while fewer calls than
-  worker threads are in flight, its distinct keys are split in order
-  and evenly into one run for each 32 distinct keys or part of 32, up to
-  one run per worker, and the runs are read on several cores at once under the
-  one bound. A MultiScan of 32 distinct keys or fewer, or one that
-  arrives while as many calls as worker threads are in flight, reads its
-  keys on one task. Its answers, their order, its counts, and the
-  response bound are the same either way. Spreading cuts a lone
+  worker threads are in flight, its distinct keys are split in order and
+  evenly into as many runs as a fixed count of distinct keys per run
+  requires, up to one run per worker ([MultiScan across worker
+  threads](../performance.md#multiscan-across-worker-threads) gives the
+  count), and the runs are read on several cores at once under the one
+  bound. A MultiScan of no more distinct keys than that count, or one
+  that arrives while as many calls as worker threads are in flight,
+  reads its keys on one task. Its answers, their order, its counts, and
+  the response bound are the same either way. Spreading cuts a lone
   MultiScan's latency for more CPU per key, spent only while cores would
-  otherwise sit idle. `server.max_multi_scan_values`, 4,000 by default,
-  bounds a MultiScan's keys times its limit times one more than its
-  requested columns, a limit of 0 counting as `max_scan_rows`, and the
-  server rejects a larger call before it reads any key. A configuration
-  whose `max_multi_scan_values` is below twice an ordered table's
+  otherwise sit idle. `server.max_multi_scan_values` bounds a
+  MultiScan's keys times its limit times one more than its requested
+  columns, a limit of 0 counting as `max_scan_rows`, and the server
+  rejects a larger call before it reads any key. A configuration whose
+  `max_multi_scan_values` is below twice an ordered table's
   `max_scan_rows` is refused, so a MultiScan of one key at the full
   limit and one column is always valid. That limit applies to a
   MultiScan of one key as to any other, and a caller reading one key's
-  full limit over many columns uses Scan. `server.scan_deadline`, 5 s by
-  default, bounds one Scan and each span GET, and
-  `server.multi_scan_deadline`, 15 s by default, one MultiScan.
-  `server.max_scan_bytes`, 4 MiB by default, a gRPC client's default
-  message limit, bounds the encoded size of one Scan or MultiScan
-  response. The server refuses a larger response as
+  full limit over many columns uses Scan. `server.scan_deadline` bounds
+  one Scan and each span GET, and `server.multi_scan_deadline` one
+  MultiScan. `server.max_scan_bytes`, 4 MiB by default, a gRPC client's
+  default message limit, bounds the encoded size of one Scan or
+  MultiScan response. The server refuses a larger response as
   `FAILED_PRECONDITION`, returning no rows and naming its size, the
   bound, and the rows that would fit, and counts it as an error; a
   caller lowers its limit, and an owner whose clients accept larger
@@ -291,12 +293,13 @@ direction under a limit and optional bounds on the order value.
   `full` and `bloom`, `dictionary_encoded_order` caps the table at
   `balanced`, for a dictionary-encoded order column, whose dictionary
   page every Scan also fetches; under `disk` the dictionary page is a
-  local read. The advice `long_runs` reports a file holding a run of
-  more than 1,000 rows, and `large_runs` a file where `max_scan_rows`
-  rows of the configured value columns, at the footer's uncompressed
-  bytes per row, would exceed `server.max_scan_bytes`, so a Scan at the
-  full limit would be refused. The bloom findings divide a row
-  group's filter bits by its distinct keys, which the load counts.
+  local read. The advice `long_runs` reports a file holding a run longer
+  than the default `max_scan_rows`, which a caller reads in more than
+  one Scan, and `large_runs` a file where `max_scan_rows` rows of the
+  configured value columns, at the footer's uncompressed bytes per row,
+  would exceed `server.max_scan_bytes`, so a Scan at the full limit
+  would be refused. The bloom findings divide a row group's filter bits
+  by its distinct keys, which the load counts.
 - **Metrics.** `icetray_scans_total` by table and result (`rows`,
   `empty`, or `error`), `icetray_scan_rows` and `icetray_scan_files` as
   histograms, `icetray_scan_seconds`, cold and warm, and
@@ -419,12 +422,13 @@ each Scan reads. Under `disk`, the residency sample of RFD 020 covers an
 ordered chunk file's order chunks with its key chunks, since every Scan
 reads both. A long run costs bytes in proportion to the rows read, a run
 the cache holds in part costs one GET per uncached span, and under
-`bloom` a Scan waits on a key-page round before its row round. At the
-defaults, a MultiScan at the full limit with one value column covers two
-keys, so a caller reading many keys requests a smaller limit. The span
-hedge window scales its delay with a span's pages; whether a span GET's
-latency on object storage follows its pages or a fixed first-byte time
-is to be measured by span size before the window changes.
+`bloom` a Scan waits on a key-page round before its row round. A
+MultiScan at the full limit with one value column covers
+`max_multi_scan_values` over twice `max_scan_rows` keys, few at the
+defaults, so a caller reading many keys requests a smaller limit. The
+span hedge window scales its delay with a span's pages; whether a span
+GET's latency on object storage follows its pages or a fixed first-byte
+time is to be measured by span size before the window changes.
 
 A load reads the order column once per row group, so a file costs one
 more GET per row group than RFD 004 (Resident key-chunk index) counts,

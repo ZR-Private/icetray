@@ -19,11 +19,11 @@ present key turns into a miss.
 
 ## Decision
 
-A table will have one key column of Iceberg type long, string, binary, or
-uuid, with `fixed` columns served as binary; a composite key is the
-caller's encoding into that column, and icetray moves its bytes in and out
-unchanged; keys over 4,096 bytes are refused at load, and keys over 128
-bytes draw advice.
+A table will have one key column of Iceberg type long, string, binary,
+or uuid, with `fixed` columns served as binary; a composite key is the
+caller's encoding into that column, and icetray moves its bytes in and
+out unchanged; keys longer than a length cap are refused at load, and
+keys longer than a lower advice threshold draw advice.
 
 Comparison follows the type. Long keys compare numerically, string keys as
 their UTF-8 bytes, binary and `fixed` keys bytewise, and uuid keys in the
@@ -39,11 +39,14 @@ Routing hashes the key with the Iceberg bucket transform's murmur3,
 conformance-tested against the Iceberg library for every admitted type, so
 a key is looked up in the bucket the writer assigned it.
 
-Both thresholds are tiers under RFD 007 (Serving tiers). The 4,096-byte cap
-is a refusal because resident bytes per key scale with key length, and the
-cap is what bounds the index. The 128-byte threshold is advice because its
-price is memory, which none of RFD 007's penalties measure. Both numbers
-are sizing judgments and may move with the measured bytes per key.
+Both thresholds are tiers under RFD 007 (Serving tiers). The cap is a
+refusal because resident bytes per key scale with key length, and the
+cap is what bounds the index. The lower threshold draws advice because
+its price is memory, which none of RFD 007's penalties measure. Both
+lengths are sizing judgments and may move with the measured bytes per
+key. The code holds them as `MAX_KEY_BYTES` and `KEY_BYTES_ADVICE`, and
+the optimal layout's [requirements](../table-layout.md#requirements)
+list both, under `key_too_long` and `long_keys`.
 
 icetray treats a key's value as opaque and relies only on its type and
 order. The documented guidance, which icetray does not enforce, is to
@@ -75,23 +78,24 @@ length
 ([prototype findings, finding 2](../analysis/2026-09-10-prototype-findings.md#2-resident-index-size)),
 so an unbounded key means an unbounded index.
 
-Refusing keys over 128 bytes. Rejected because such keys serve at one GET
-per hit
-([prototype findings, finding 13](../analysis/2026-09-10-prototype-findings.md#13-key-length)).
-Their price is resident memory, which none of RFD 007's penalties measure,
-so the finding is advice.
+Refusing keys past the advice threshold. Rejected because such keys
+serve at one GET per hit ([prototype findings, finding
+13](../analysis/2026-09-10-prototype-findings.md#13-key-length)). Their
+price is resident memory, which none of RFD 007's penalties measure, so
+the finding is advice.
 
 ## Consequences
 
 Long keys push a table toward the disk or bloom residency of RFD 017
 (Residency tiers), because as bytes per key grow the resident key chunks
-stop fitting the memory budget. The 128-byte advice is the early warning of
-that drift. Shape matters as much as length. Sorted random bytes barely
-compress, so a hashed 64-bit id costs several times a sequential one, and a
-UUID as text costs more than the same UUID as sixteen bytes
-([key bytes by shape, results](../analysis/2026-09-10-key-bytes-by-shape.md#results)).
-Prefer integers or binary to their text renderings, and put a composite
-key's shared part first and its random part last.
+stop fitting the memory budget. The long-key advice is the early warning
+of that drift. Shape matters as much as length. Sorted random bytes
+barely compress, so a hashed 64-bit id costs several times a sequential
+one, and a UUID as text costs more than the same UUID as sixteen bytes
+([key bytes by shape,
+results](../analysis/2026-09-10-key-bytes-by-shape.md#results)). Prefer
+integers or binary to their text renderings, and put a composite key's
+shared part first and its random part last.
 
 The caller owns its encoding. A delimiter-joined key whose fields contain
 the delimiter collides, and icetray cannot tell.

@@ -1,7 +1,7 @@
 # Transport and client contract
 
-> Updated 2026-09-24: a MultiGet carries at most `server.max_multi_get_keys`
-> keys, 1000 by default. See RFD 013.
+> Updated 2026-09-24: a MultiGet carries at most
+> `server.max_multi_get_keys` keys. See RFD 013.
 
 > Updated 2026-10-07: Get and MultiGet name the value columns to read,
 > and a present result carries one value per named column, each its bytes
@@ -139,18 +139,18 @@ subcommands of RFD 012 (Deployment contract) and reads their JSON.
 Because every answer names its snapshot, a caller can tell when two answers
 straddle a generation swap. A single MultiGet batch never straddles one.
 
-A MultiGet carries at most `server.max_multi_get_values` values, 1000 by
-default, counted as its keys times the columns it names, a presence-only
-call counting one per key. A larger batch is `INVALID_ARGUMENT` before any
-lookup runs, which bounds the value reads one call can ask for (RFD 013
-(Tail latency)). A MultiScan carries at most
-`server.max_multi_scan_values` values, 4,000 by default, counted as its
-keys times its limit times one more than the columns it names, a limit
-of 0 counting as the table's `max_scan_rows`, and a larger call is
-`INVALID_ARGUMENT` before any key is read (RFD 025). The MultiGet's
-1000 is a single-pod guess. How lookups behave under concurrent load,
-MultiGet fan-out included, is an open question
-([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
+A MultiGet carries at most `server.max_multi_get_values` values, counted
+as its keys times the columns it names, a presence-only call counting
+one per key. A larger batch is `INVALID_ARGUMENT` before any lookup
+runs, which bounds the value reads one call can ask for (RFD 013 (Tail
+latency)). A MultiScan carries at most `server.max_multi_scan_values`
+values, counted as its keys times its limit times one more than the
+columns it names, a limit of 0 counting as the table's `max_scan_rows`,
+and a larger call is `INVALID_ARGUMENT` before any key is read (RFD
+025). The MultiGet limit's default is a single-pod guess. How lookups
+behave under concurrent load, MultiGet fan-out included, is an open
+question ([prototype findings, what was not
+verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)),
 and its answer may move the limit.
 
 A Scan or MultiScan response that would encode to more than

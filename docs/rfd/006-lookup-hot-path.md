@@ -14,8 +14,8 @@
 > and each requested column over the rows it reads, one GET per
 > contiguous span of uncached pages, in one round. Whole pages of
 > deleted rows between the rows it reads split a column's span, and one
-> GET fetches them, undecoded, with the spans beside them when they take
-> at most 256 KiB. See RFD 025.
+> GET fetches them, undecoded, with the spans beside them when fetching
+> them costs less than the GET it saves. See RFD 025.
 
 > Updated 2026-10-14: a lookup and a Scan read a value page of plain
 > byte arrays, in a column neither nested nor repeated and with no

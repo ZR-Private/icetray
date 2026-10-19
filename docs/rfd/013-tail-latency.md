@@ -5,16 +5,16 @@
 
 > Updated 2026-10-07: a hit reads one value page per column it names,
 > each GET hedged on its own, and the hedge-rate ceiling counts GETs. A
-> MultiGet carries at most 1000 values, keys times columns, and its
-> fan-out bounds GETs in flight across the batch rather than lookups.
-> See RFD 022.
+> MultiGet carries at most `server.max_multi_get_values` values, keys
+> times columns, and its fan-out bounds GETs in flight across the batch
+> rather than lookups. See RFD 022.
 
 > Updated 2026-10-08: the MultiGet fan-out is configuration,
-> `server.multi_get_fan_out`, default 64, which a restart applies like
-> every server setting (RFD 018). Measured against S3, a lone cold batch
-> stops getting faster near 128 and concurrent batches share the
-> process's GET throughput by 64; see
-> [the measurements](../analysis/2026-10-08-multi-get-fan-out.md).
+> `server.multi_get_fan_out`, which a restart applies like every server
+> setting (RFD 018). Measured against S3, a lone cold batch stops
+> getting faster near 128 and concurrent batches share the process's GET
+> throughput by 64; see [the
+> measurements](../analysis/2026-10-08-multi-get-fan-out.md).
 
 > Updated 2026-10-14: the fan-out is `server.batch_fan_out` and bounds
 > the GETs of a Scan and a MultiScan as of a MultiGet; a Scan has
@@ -80,61 +80,71 @@ A hedge cuts the tail of a store that answers. A store or catalog that
 stops answering is bounded instead, on two paths that share one S3 client
 per bucket.
 
-The live path, a gRPC request, fails fast. A `Get` has 5 seconds and a
-`MultiGet` 15 seconds whatever its size, and expiry is
-`DEADLINE_EXCEEDED`, which drops the lookup. The gRPC layer, rather than
-icetray, enforces a deadline the client sends: the client's library ends
-the call at it and reports the expiry as the client's own, and tonic's
-server drops the call at the same deadline, which frees its slot. A page
-fetch the lookup started runs on its own task inside the page cache, so
-dropping the lookup leaves the fetch running. The fetch instead has the
-`Get` deadline from its own start. At that deadline the GET is dropped,
-which cancels the request; every lookup waiting on the fetch fails, and
-nothing is cached. A `MultiGet`'s page fetches have the same 5 seconds, so
-over a store that has stopped answering a batch fails at 5 seconds rather
-than 15.
+The live path, a gRPC request, fails fast. A `Get` has
+`server.get_deadline` and a `MultiGet` `server.multi_get_deadline`,
+whatever its size, and expiry is `DEADLINE_EXCEEDED`, which drops the
+lookup. The gRPC layer, rather than icetray, enforces a deadline the
+client sends: the client's library ends the call at it and reports the
+expiry as the client's own, and tonic's server drops the call at the
+same deadline, which frees its slot. A page fetch the lookup started
+runs on its own task inside the page cache, so dropping the lookup
+leaves the fetch running. The fetch instead has the `Get` deadline from
+its own start. At that deadline the GET is dropped, which cancels the
+request; every lookup waiting on the fetch fails, and nothing is cached.
+A `MultiGet`'s page fetches have the same `Get` deadline, so over a
+store that has stopped answering a batch fails at that deadline rather
+than its own.
 
-At most 1024 requests run at once, and one more is refused with
-`RESOURCE_EXHAUSTED` rather than queued. A `MultiGet` carries at most
-1000 values, its keys times the columns it names with a presence-only
-call counting one per key, and holds at most `server.batch_fan_out`
-GETs in flight across the batch: each GET a lookup issues, a key page under `bloom`, a value
-page, and a dictionary page alike, holds one slot from before it starts
-until it ends, and none waits for a slot while holding one, so a batch
-holds no more GETs open whatever its keys and columns, each with at most
-one hedge beside it. A live lookup expects well under 200 ms, so 5
-seconds is already a failure, and the refusals keep a wedged store from
-piling up requests until the process runs out of memory. The cap counts
-requests, and a page GET can outlast the request that started it by at
-most one `Get` deadline: the request was open when the fetch began, and
-the fetch ends 5 seconds after that.
+At most `server.max_in_flight` requests run at once, and one more is
+refused with `RESOURCE_EXHAUSTED` rather than queued. A `MultiGet`
+carries at most `server.max_multi_get_values` values, its keys times the
+columns it names with a presence-only call counting one per key, and
+holds at most `server.batch_fan_out` GETs in flight across the batch:
+each GET a lookup issues, a key page under `bloom`, a value page, and a
+dictionary page alike, holds one slot from before it starts until it
+ends, and none waits for a slot while holding one, so a batch holds no
+more GETs open whatever its keys and columns, each with at most one
+hedge beside it. A live lookup expects well under 200 ms, so a deadline
+of seconds is already a failure, and the refusals keep a wedged store
+from piling up requests until the process runs out of memory. The cap
+counts requests, and a page GET can outlast the request that started it
+by at most one `Get` deadline: the request was open when the fetch
+began, and the fetch ends one deadline after that.
 
 The background path, loads and refreshes, is patient but bounded. A
-catalog call has 30 seconds, a first load 30 minutes, and a refresh 5
-minutes. Past its bound the work fails, the table is degraded, and the
-next poll tries again, so no load holds its table's lock longer than that.
-The two load bounds differ because the work does. A first load, or any
-build while no generation serves, reads every file's footer and key
-chunks, where a refresh reuses every file the new snapshot still names and
-reads only the rest. A first load from real S3 of a table of over a
-billion rows in tens of thousands of files runs past a five-minute bound
-when few files are in flight. At 128 files per worker thread it is bound
-by CPU instead and takes a fraction of that.
+catalog call has `storage.catalog_timeout`, a first load
+`server.load_deadline`, and a refresh `server.refresh_deadline`. Past
+its bound the work fails, the table is degraded, and the next poll tries
+again, so no load holds its table's lock longer than that. The two load
+bounds differ because the work does. A first load, or any build while no
+generation serves, reads every file's footer and key chunks, where a
+refresh reuses every file the new snapshot still names and reads only
+the rest. A first load from real S3 of a table of over a billion rows in
+tens of thousands of files runs past a refresh's bound when few files
+are in flight. At the load's full concurrency, a fixed number of files
+per worker thread ([Load time](../performance.md#load-time)), it is
+bound by CPU instead and takes a fraction of that.
 
-Both paths share the S3 client's bounds: two retries, none started more
-than a minute after the first attempt, a 1-second connect timeout, and 30
-seconds per attempt. Together they end inside the two minutes a cached
-credential is kept short of its expiry (RFD 003). Shutdown waits 20
-seconds for open requests, which the 15-second cap lets finish, and leaves
-time to flush the page cache before an orchestrator's usual 30-second
-kill.
+Both paths share the S3 client's bounds: `storage.max_retries` retries,
+none started later than a retry window after the first attempt,
+`storage.connect_timeout` to connect, and a timeout per attempt. The
+window, one backoff, and one attempt end inside the margin by which a
+cached credential is refreshed ahead of its expiry (RFD 003), so no
+retry is signed with an expired credential. Shutdown waits
+`server.drain_deadline` for open requests. Its default outlasts the
+`MultiGet` deadline's, so open requests finish, and leaves time to flush
+the page cache before an orchestrator's usual 30-second kill.
 
 The deadlines, the two limits, the fan-out, the retry count, and the
-connect and catalog timeouts are configuration with these defaults (RFD
-011). The retry window and the per-attempt timeout are constants, because
-the credential margin bounds their sum.
-The 1024 requests in flight and 1000 values per batch are single-pod
-guesses, and how they hold under concurrent load is open.
+connect and catalog timeouts are configuration (RFD 011), and [the
+configuration reference](../configuration.md) gives their defaults. The
+retry window and the per-attempt timeout are constants, because the
+credential margin bounds their sum. The storage layer holds the three as
+`S3_RETRY_TIMEOUT`, `S3_REQUEST_TIMEOUT`, and
+`CREDENTIAL_REFRESH_MARGIN`, and a compile-time assertion checks the
+sum. The defaults of `server.max_in_flight` and
+`server.max_multi_get_values` are single-pod guesses, and how they hold
+under concurrent load is open.
 
 ## Alternatives Considered
 
