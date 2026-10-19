@@ -953,12 +953,11 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
 const COMPACTED_IDS: Range<u64> = 0..40;
 const COMPACTED_ROWS: u64 = 3;
 
-/// A compacted ordered table of `COMPACTED_IDS` in the contract layout: one
-/// file per bucket, one row group, no dictionary-encoded column, both value
-/// columns.
-async fn compacted_table(name: &str) -> Result<(TempDir, Arc<dyn Catalog>, Fixture)> {
-    let (dir, catalog) = local_catalog().await?;
-    let spec = FixtureSpec {
+/// A compacted ordered spec named `name`: `COMPACTED_IDS` in the contract
+/// layout, one file per bucket, one row group, no dictionary-encoded
+/// column, both value columns.
+fn compacted_spec(name: &str) -> FixtureSpec {
+    FixtureSpec {
         ids: COMPACTED_IDS,
         buckets: TWO_BUCKETS,
         second_value: true,
@@ -972,9 +971,18 @@ async fn compacted_table(name: &str) -> Result<(TempDir, Arc<dyn Catalog>, Fixtu
                 step: HISTORY_STEP,
             },
         )
-    };
-    let fixture =
-        write_fixture(catalog.as_ref(), icetray_testkit::fixture::NAMESPACE, spec).await?;
+    }
+}
+
+/// `compacted_spec(name)` written to a fresh catalog.
+async fn compacted_table(name: &str) -> Result<(TempDir, Arc<dyn Catalog>, Fixture)> {
+    let (dir, catalog) = local_catalog().await?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        icetray_testkit::fixture::NAMESPACE,
+        compacted_spec(name),
+    )
+    .await?;
     Ok((dir, catalog, fixture))
 }
 
@@ -1008,6 +1016,19 @@ const ORDER_SPAN: u64 = 1;
 /// that page, which is decoded once.
 const KEY_PAGES_OF_A_MIDDLE_RUN: u64 = 1;
 
+/// The GETs a cold Scan of a middle key reading `columns` value columns
+/// costs in one compacted file, each a page the scan cache fetches: one per
+/// column and one for the order column, after the key page's under
+/// `bloom`; under `disk` the key page and the order column are read from
+/// the chunk file instead.
+fn cold_scan_gets(residency: Residency, columns: u64) -> u64 {
+    match residency {
+        Residency::Full => columns + ORDER_SPAN,
+        Residency::Disk => columns,
+        Residency::Bloom => KEY_PAGES_OF_A_MIDDLE_RUN + columns + ORDER_SPAN,
+    }
+}
+
 /// A cold Scan of a key held in one file, in one row group, with no
 /// dictionary-encoded column and nothing cached, costs per tier (RFD 025,
 /// Cost): under `full` one GET per requested column and
@@ -1038,12 +1059,15 @@ async fn test_cold_scan_of_a_compacted_table_costs_one_get_per_column_and_one_fo
             fixture.expected_scanned(&key, &BOTH, &TestScan::default())
         );
         let (gets, local_reads) = (stats.gets() - before.0, stats.local_reads() - before.1);
-        let (want_gets, want_local) = match residency {
-            Residency::Full => (columns + ORDER_SPAN, 0),
-            Residency::Disk => (columns, KEY_PAGES_OF_A_MIDDLE_RUN + ORDER_SPAN),
-            Residency::Bloom => (KEY_PAGES_OF_A_MIDDLE_RUN + columns + ORDER_SPAN, 0),
+        let want_local = match residency {
+            Residency::Full | Residency::Bloom => 0,
+            Residency::Disk => KEY_PAGES_OF_A_MIDDLE_RUN + ORDER_SPAN,
         };
-        assert_eq!(gets, want_gets, "{residency} GETs");
+        assert_eq!(
+            gets,
+            cold_scan_gets(*residency, columns),
+            "{residency} GETs"
+        );
         assert_eq!(local_reads, want_local, "{residency} local reads");
     }
     Ok(())
@@ -1060,20 +1084,9 @@ const STRIDE: u64 = 2;
 async fn test_scan_reads_only_files_that_hold_the_key() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
-        ids: COMPACTED_IDS,
         id_stride: STRIDE,
         buckets: ONE_BUCKET,
-        second_value: true,
-        ..FixtureSpec::ordered(
-            "files",
-            KeyType::Long,
-            Ordered {
-                kind: OrderKind::Long,
-                rows_per_key: RowsPerKey::Each(COMPACTED_ROWS),
-                start: ORDER_START,
-                step: HISTORY_STEP,
-            },
-        )
+        ..compacted_spec("files")
     };
     let mut fixture =
         write_fixture(catalog.as_ref(), icetray_testkit::fixture::NAMESPACE, spec).await?;
@@ -1112,14 +1125,9 @@ async fn test_scan_reads_only_files_that_hold_the_key() -> Result<()> {
                 .scan(&key, &reads(&BOTH), &scan.bounds(OrderKind::Long))
                 .await?;
             assert_eq!(got.scanned, fixture.expected_scanned(&key, &BOTH, &scan));
-            let per_file = match residency {
-                Residency::Full => columns + ORDER_SPAN,
-                Residency::Disk => columns,
-                Residency::Bloom => KEY_PAGES_OF_A_MIDDLE_RUN + columns + ORDER_SPAN,
-            };
             assert_eq!(
                 stats.gets() - before,
-                files * per_file,
+                files * cold_scan_gets(*residency, columns),
                 "{residency} {key}: the files holding the key alone"
             );
         }
@@ -1215,14 +1223,9 @@ async fn test_scan_pages_stay_out_of_the_key_value_cache() -> Result<()> {
             0,
             "{residency}: the lookup cache saw no page"
         );
-        let fetched = match residency {
-            Residency::Full => columns + ORDER_SPAN,
-            Residency::Disk => columns,
-            Residency::Bloom => KEY_PAGES_OF_A_MIDDLE_RUN + columns + ORDER_SPAN,
-        };
         assert_eq!(
             served.scan_cache.fetches(),
-            fetched,
+            cold_scan_gets(*residency, columns),
             "{residency}: every fetched page went through the scan cache"
         );
     }
@@ -1277,19 +1280,9 @@ const ADDED_DEFAULT: &[u8] = b"added later";
 async fn test_scan_answers_a_column_added_after_a_file_with_its_default() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let spec = FixtureSpec {
-        ids: COMPACTED_IDS,
-        buckets: TWO_BUCKETS,
         format_version: FormatVersion::V3,
-        ..FixtureSpec::ordered(
-            "added",
-            KeyType::Long,
-            Ordered {
-                kind: OrderKind::Long,
-                rows_per_key: RowsPerKey::Each(COMPACTED_ROWS),
-                start: ORDER_START,
-                step: HISTORY_STEP,
-            },
-        )
+        second_value: false,
+        ..compacted_spec("added")
     };
     let mut fixture =
         write_fixture(catalog.as_ref(), icetray_testkit::fixture::NAMESPACE, spec).await?;
