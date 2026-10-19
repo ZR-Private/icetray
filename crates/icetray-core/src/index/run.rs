@@ -513,7 +513,7 @@ impl FileIndex {
                 continue;
             };
             let values = self.decode_order_span(chunk, order, pages, &piece.rows, segments)?;
-            spans.push((piece.row_group, piece.rows.clone(), values));
+            spans.push((piece.row_group, piece.rows.start, values));
         }
         Ok(Spans {
             spans,
@@ -654,7 +654,7 @@ impl FileIndex {
                             .map(|rows| {
                                 let values =
                                     decode(chunk, pages_holding(chunk, rows), rows, &segments)?;
-                                Ok((fetch.row_group, rows.clone(), values))
+                                Ok((fetch.row_group, rows.start, values))
                             })
                             .collect::<Result<Vec<_>>>()?;
                         Ok::<_, Error>((spans, from_store))
@@ -1162,31 +1162,49 @@ fn bridged<'c>(
 }
 
 /// The span of `spans` that holds `row`, and `row`'s position in it, where
-/// one does, `of` giving a span's row group and rows: spans in file order,
-/// by row group and then first row, no two holding one row, so one binary
-/// search finds it, and a lookup visits a number of spans logarithmic in
-/// theirs, however many spans a read decoded.
+/// one does, `of` giving a span's row group, first row, and row count:
+/// spans in file order, by row group and then first row, no two holding
+/// one row, so one binary search finds it, and a lookup visits a number of
+/// spans logarithmic in theirs, however many spans a read decoded.
 fn span_holding<S>(
     spans: &[S],
     row: RowRef,
-    of: impl Fn(&S) -> (usize, Range<i64>),
+    of: impl Fn(&S) -> (usize, i64, usize),
 ) -> Option<(&S, usize)> {
     let past = spans.partition_point(|span| {
-        let (row_group, rows) = of(span);
-        (row_group, rows.start) <= (row.row_group, row.row)
+        let (row_group, start, _) = of(span);
+        (row_group, start) <= (row.row_group, row.row)
     });
     let span = &spans[past.checked_sub(1)?];
-    let (row_group, rows) = of(span);
-    (row_group == row.row_group && rows.contains(&row.row))
-        .then(|| (span, row_index(row.row - rows.start)))
+    let (row_group, start, rows) = of(span);
+    let at = (row_group == row.row_group).then(|| row_index(row.row - start))?;
+    (at < rows).then_some((span, at))
+}
+
+/// Values a read decoded over a span of rows, one per row.
+trait SpanValues {
+    /// The rows decoded.
+    fn rows(&self) -> usize;
+}
+
+impl SpanValues for OrderRun {
+    fn rows(&self) -> usize {
+        self.len()
+    }
+}
+
+impl SpanValues for ValueRows {
+    fn rows(&self) -> usize {
+        self.len()
+    }
 }
 
 /// One column's values a read decoded: spans of rows, each its row group,
-/// its rows, and their values, one per row, in file order, as
-/// `span_holding` finds them; and whether any page they decode from came
-/// from object storage.
+/// its first row, and the values from it on, one per row, in file order,
+/// as `span_holding` finds them; and whether any page they decode from
+/// came from object storage.
 struct Spans<T> {
-    spans: Vec<(usize, Range<i64>, T)>,
+    spans: Vec<(usize, i64, T)>,
     from_store: bool,
 }
 
@@ -1199,12 +1217,12 @@ impl<T> Default for Spans<T> {
     }
 }
 
-impl<T> Spans<T> {
+impl<T: SpanValues> Spans<T> {
     /// The decoded values holding `row` and its position among them, where
     /// a span holds it.
     fn find(&self, row: RowRef) -> Option<(&T, usize)> {
-        span_holding(&self.spans, row, |(row_group, rows, _)| {
-            (*row_group, rows.clone())
+        span_holding(&self.spans, row, |(row_group, start, values)| {
+            (*row_group, *start, values.rows())
         })
         .map(|((_, _, values), at)| (values, at))
     }
@@ -1232,8 +1250,7 @@ impl Spans<OrderRun> {
     /// knew before its round and those it read in it, each in file order
     /// and holding rows the other does not.
     fn and(mut self, other: Self) -> Self {
-        let file_order =
-            |(row_group, rows, _): &(usize, Range<i64>, OrderRun)| (*row_group, rows.start);
+        let file_order = |(row_group, start, _): &(usize, i64, OrderRun)| (*row_group, *start);
         debug_assert!(
             self.spans.is_sorted_by_key(file_order) && other.spans.is_sorted_by_key(file_order),
             "a read decodes spans in file order"
@@ -1781,11 +1798,11 @@ mod tests {
     #[test]
     fn test_span_holding_finds_every_row_among_many_spans_in_a_binary_search() {
         let stride = LOOKUP_SPAN_ROWS + LOOKUP_GAP_ROWS;
-        let spans: Vec<(usize, Range<i64>)> = (0..LOOKUP_ROW_GROUPS)
+        let spans: Vec<(usize, i64, usize)> = (0..LOOKUP_ROW_GROUPS)
             .flat_map(|row_group| {
                 (0..LOOKUP_SPANS).map(move |at| {
                     let start = i64::try_from(at).unwrap() * stride + LOOKUP_GAP_ROWS;
-                    (row_group, start..start + LOOKUP_SPAN_ROWS)
+                    (row_group, start, row_index(LOOKUP_SPAN_ROWS))
                 })
             })
             .collect();
@@ -1793,9 +1810,9 @@ mod tests {
         // them, and the lookup then reads the one before where it ended.
         let most_visits = usize::try_from(spans.len().next_power_of_two().ilog2()).unwrap() + 2;
         let visited = std::cell::Cell::new(0);
-        let of = |span: &(usize, Range<i64>)| {
+        let of = |span: &(usize, i64, usize)| {
             visited.set(visited.get() + 1);
-            span.clone()
+            *span
         };
         let rows = i64::try_from(LOOKUP_SPANS).unwrap() * stride + LOOKUP_GAP_ROWS;
         let mut found = 0;
