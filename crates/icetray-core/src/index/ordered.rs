@@ -2,9 +2,7 @@
 //! order column decoded beside its key column, every row's key and order
 //! value strictly above the row's before it, across pages and row groups
 //! alike, and the order facts and the order fences (`order_fences`)
-//! recorded on the way. The writer's column index of the order column is
-//! neither read nor checked: the fences place every pair whatever it holds.
-//! A key-value table never reaches this module.
+//! recorded on the way. A key-value table never reaches this module.
 
 use std::cmp::Ordering;
 use std::sync::Arc;

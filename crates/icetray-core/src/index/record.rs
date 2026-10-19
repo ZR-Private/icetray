@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     /// The bound on a stored record follows the footer for string and
-    /// binary order values too (load review M7): each value at most the
+    /// binary order values too: each value at most the
     /// uncompressed bytes of its order chunk, not `MOST_VALUE_PAGE_BYTES`
     /// for each of the least and greatest whatever the file.
     #[tokio::test]

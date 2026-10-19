@@ -413,7 +413,8 @@ stated in what a lookup costs, so it means the same on every table:
   bloom filter, larger key pages, or key pages read from the device
   instead of the page cache. The exception is a `Scan` of an edge key
   shared by files one snapshot added, as a compaction that rolls files
-  by size writes them, which reads every file that holds the key.
+  by size writes them, which reads every file that holds the key
+  ([Levels of an ordered table](table-layout.md#levels-of-an-ordered-table)).
 - `permissive`: any snapshot icetray serves correctly, including one where
   a lookup probes more than one file.
 
@@ -440,9 +441,7 @@ The line between `balanced` and `permissive` is the one that matters for
 operations. A cost within one file follows from how the files are written
 and stays constant. Extra files probed follow from how writers commit to
 the table, and their number grows with every append until a compaction
-merges the files. The files that share an edge key were written by one
-snapshot, so how many a `Scan` of that key reads is fixed when they are
-written, and that cost stays `balanced`.
+merges the files.
 
 Choose the level from the latency the table's readers need and the
 layout its writer can produce:

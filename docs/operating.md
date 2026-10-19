@@ -563,80 +563,41 @@ An [ordered table](table-layout.md#ordered-tables) serves `Scan` and
 `MultiScan` beside the key-value tables of the same process. It shares
 `server.max_in_flight`, `server.batch_fan_out`, the process's GET
 throughput, and its resident memory with them, and reads its pages
-through a cache of its own.
+through [the scan cache](performance.md#the-scan-cache), a cache of its
+own.
 
-**The scan cache.** Each page a `Scan`'s span GET fetches is cached as
-its own entry, keyed by file and offset, in a memory cache bounded by
-`server.scan_page_cache_bytes`, 256 MiB by default. It has no disk level,
-and no key-value lookup reads it, so a `Scan` of a long run evicts only
-other scans' pages. The page-cache metrics carry the `cache` label:
-`icetray_page_cache_hits_total{cache="scan"}` against
-`icetray_page_cache_fetches_total{cache="scan"}` gives its hit rate, where
-a span GET counts one fetch however many pages it holds, and
-`icetray_page_cache_bytes{cache="scan"}` its fill.
+**The scan cache.** `icetray_page_cache_hits_total{cache="scan"}` against
+`icetray_page_cache_fetches_total{cache="scan"}` gives its hit rate, and
+`icetray_page_cache_bytes{cache="scan"}` its fill against
+`server.scan_page_cache_bytes`.
 
-**Levels and findings.** An ordered table's level is read for a `Scan`
-of one key ([Levels of an ordered
-table](table-layout.md#levels-of-an-ordered-table)). A table whose
-writer appends between compactions is `permissive` under
-`overlapping_files`, so its owner configures `lookups = "permissive"`;
-left at the default, icetray reports such a table below its level after
-every append. `icetray_scan_files` shows how many files each `Scan`
-reads, and its rise between compactions measures what the appends cost.
-Four finding codes apply to ordered tables alone:
+**Levels.** A table whose writer appends between compactions is
+`permissive` under `overlapping_files`, so its owner configures
+`lookups = "permissive"`; left at the default, icetray reports such a
+table below its level after every append. `icetray_scan_files` shows how
+many files each `Scan` reads, and its rise between compactions measures
+what the appends cost. The levels an ordered table reaches, and the
+findings that cap them, are in [Levels of an ordered
+table](table-layout.md#levels-of-an-ordered-table) and [Requirements of
+an ordered table](table-layout.md#requirements-of-an-ordered-table).
 
-- `shared_edge_keys` caps the level at `balanced`: files one snapshot
-  added, as a compaction that rolls files by size writes them, meet
-  where one file's last key is the next file's first, and a `Scan` of
-  such an edge key reads every file that holds it. Its penalty is in
-  `files_probed_per_lookup`, the most files one edge key spans.
-- `dictionary_encoded_order` caps the level at `balanced` under `full`
-  and `bloom`: every `Scan` fetches the order column's dictionary page.
-  Its penalty is in `extra_gets_per_hit`, which on an ordered table
-  counts the extra GETs of one `Scan` in each file it reads, here one.
-  Under `disk` the dictionary page is a local read.
-- `long_runs` and `large_runs` are advice.
-
-A `Scan` places its bounds by the order fences icetray records at load,
-so the order column's column index, which the writer may truncate or
-leave out, draws no finding.
-
-**Refresh.** A refresh checks a key and order value for repeats only
-where they can occur: a new file, or a reused one whose deletes shrank,
-against the files of its overlap group whose key ranges and order ranges
-both meet its own. A file that meets none, as an append of later rows
-does, is merged with nothing and read no further. Within an overlap
-group that holds a file to check, one merge reads only the order pages
-that can hold a pair another file of the group also holds, as the order
-fences bound each page's pairs: the pages of a checked file that meet a
-page of another file, and the pages of the other files that meet a page
-of a checked file. It reads each such page at most once: under `full`
-the order pages by GET, under `bloom` the order pages and the key pages
-they span by GET, and under `disk` both from the chunk file, locally. It
-reads each file's next row group when the merge reaches it, and reads
-later row groups ahead of need, in the order the merge reaches them,
-while the bytes it holds and has in flight stay within 64 MiB, so a
-merge holds at most 64 MiB beyond one row group's chosen pages per file.
-Where a group's chosen pages fit within 64 MiB, and its reads within the
-load's concurrency, a merge over files of several row groups waits on
-about the rounds of GETs a merge over files of one row group does. A
-read error on a row group read ahead fails the load as any read error
-does, even where the merge would have refused first. Each run of
-consecutive chosen pages costs one GET or local read per column, and a
-dictionary page one more. A refresh that appends later rows therefore
-reads only its new files; one that adds files a compaction rolled by
-size reads the pages at the edge keys they share; and an append of rows
-inside an existing file's order range reads the order pages those rows
-fall among, in the new file and the old. With
-`RUST_LOG=icetray_core=debug`, each load logs `assembled generation`
-with `overlap_groups_verified`, the overlap groups it merged, which on
-an ordered table counts the groups merged by key and order value. An
-ordered table's load also logs `checked ordered rows across files` with
-`merges`, the same count; `compared`, the comparisons the check made, of
-files' ranges and buckets, of pages' pairs, and of pairs in the merge;
-and `held_bytes`, the most bytes of chosen pages one merge held and had
-in flight at once, which leaves out the key chunks `full` keeps
-resident.
+**Refresh.** A refresh merges a file only with the files that can share
+a live pair of key and order value with it, and reads only the order
+pages that can hold one ([RFD 025](rfd/025-ordered-rows.md), Refresh).
+A refresh that appends later rows therefore reads only its new files;
+one that adds files a compaction rolled by size reads the pages at the
+edge keys they share; and an append of rows inside an existing file's
+order range reads the order pages those rows fall among, in the new file
+and the old. With `RUST_LOG=icetray_core=debug`, each load logs
+`assembled generation` with `overlap_groups_verified`, the overlap
+groups it merged, which on an ordered table counts the groups merged by
+key and order value. An ordered table's load also logs `checked ordered
+rows across files` with `merges`, the same count; `compared`, the
+comparisons the check made, of files' ranges and buckets, of pages'
+pairs, and of pairs in the merge; and `held_bytes`, the most bytes of
+chosen pages one merge held and had in flight at once, which leaves out
+the key chunks `full` keeps resident. A merge holds at most 64 MiB beyond
+one row group's chosen pages per file.
 
 ## Deploying
 

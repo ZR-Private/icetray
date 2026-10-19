@@ -495,10 +495,11 @@ struct GenerationGauges {
 /// one value column, by that column (`FindingCode::per_column`).
 type FindingCounts = BTreeMap<Capping, u64>;
 
-/// What a lookup needs beside its generation: the table's page cache
-/// handle, its lookup metrics, and the calls in flight it counts among.
-/// Behind an `Arc`, so the tasks a `multi_get` spawns hold it for as long
-/// as they run.
+/// What a lookup or a Scan needs beside its generation: the table's page
+/// cache handle, which a lookup reads through, its lookup metrics, whose
+/// value page GET counters a Scan's GETs count in too, and the calls in
+/// flight both count among. Behind an `Arc`, so the tasks a `multi_get` or
+/// `multi_scan` spawns hold it for as long as they run.
 struct Lookups {
     /// The process's page cache, through a handle whose fetches end at the
     /// table's `get_deadline`.

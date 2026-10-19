@@ -37,10 +37,10 @@ service Icetray {
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   // Read the rows of one key in one ordered table, in order-value order,
   // one page at a time. The response carries the id of the snapshot the
-  // server read it from. A response whose encoded size is above the
-  // server's limit on one, 4 MiB by default, is never sent: the call is a
+  // server read it from. A response whose encoded size is above
+  // TableInfoResponse.max_scan_bytes is never sent: the call is a
   // FAILED_PRECONDITION error, the same on every attempt, whose message
-  // names the response's size, the limit, and how many rows would have
+  // names the response's size, that bound, and how many rows would have
   // fit, and the caller sets a smaller `limit` or lists fewer columns.
   rpc Scan(ScanRequest) returns (ScanResponse);
   // Read the rows of many keys in one ordered table, each as a Scan reads
@@ -49,8 +49,8 @@ service Icetray {
   // read of any key fails, the whole call fails, so a response always
   // covers every key of the request. A caller that retries resends the
   // whole call; a FAILED_PRECONDITION error recurs on every retry. As for
-  // Scan, a response above the server's limit on a response's encoded size
-  // is a FAILED_PRECONDITION error; its message names how many leading
+  // Scan, a response above TableInfoResponse.max_scan_bytes is a
+  // FAILED_PRECONDITION error; its message names how many leading
   // keys' results would have fit, and the caller lists fewer keys, sets a
   // smaller `limit`, or lists fewer columns.
   rpc MultiScan(MultiScanRequest) returns (MultiScanResponse);
@@ -299,8 +299,8 @@ enum Direction {
 // column the table does not serve or lists one twice, lists fields of a
 // column in a way ColumnRead does not allow, sets no direction, sets a
 // limit above TableInfoResponse.max_scan_rows, sets a bound of another
-// variant than the table's order type takes or one with no variant, sets
-// `after` at or above `before`, or names a table that has no order column.
+// variant than the table's order type takes or one with no variant, or
+// sets `after` at or above `before`.
 message ScanRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error, and the name of a table that
@@ -363,11 +363,10 @@ message ScanResponse {
 // Several Scans in one ordered table with one set of columns, direction,
 // limit, and bounds, all read from one snapshot. The request is an
 // INVALID_ARGUMENT error for every reason a ScanRequest is, for a key of
-// any position, when it names a table that has no order column, and when
-// its keys times its limit times one more than its
-// columns exceed the server's limit, a limit of 0 counting as
-// TableInfoResponse.max_scan_rows; the server refuses that before it reads
-// any key.
+// any position, and when its keys times its limit times one more than its
+// columns exceed TableInfoResponse.max_multi_scan_values, a limit of 0
+// counting as TableInfoResponse.max_scan_rows; the server refuses that
+// before it reads any key.
 message MultiScanRequest {
   // The name the server is configured to serve the table under. A name the
   // server does not serve is a NOT_FOUND error, and the name of a table that

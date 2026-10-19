@@ -85,8 +85,13 @@ direction under a limit and optional bounds on the order value.
   is `INVALID_ARGUMENT`: an unspecified direction, a limit above
   `max_scan_rows`, a key or bound of the wrong variant, an `after` at or
   above `before`, a MultiScan above `max_multi_scan_values`, or a call
-  of the wrong kind for the table. A response above
-  `server.max_scan_bytes` is `FAILED_PRECONDITION` (Limits).
+  of the wrong kind for the table. The server checks a call's kind
+  against the table's configuration before anything else about the
+  call, so a call of the wrong kind is `INVALID_ARGUMENT` even while the
+  table loads, and never the retryable `UNAVAILABLE`. A value that is not
+  the protobuf its column declares is `FAILED_PRECONDITION` as for `Get`
+  (RFD 024), naming the order value of its row, and so is a response
+  above `server.max_scan_bytes` (Limits).
 - **Paging.** A caller pages by order value: reading newest first, the
   next request sets `before` to the oldest order value of the previous
   response, and reading oldest first, `after` to the newest. Within one
@@ -173,9 +178,11 @@ direction under a limit and optional bounds on the order value.
   GETs a merge over files of one row group does. A merge that refuses or
   ends first may have read row groups ahead that it never reached, and a
   read error on a row group read ahead fails the load as any read error
-  does, even where the merge would have refused first. The load refuses
-  a live pair present twice as `duplicate_rows`, naming the later file
-  in file order, as `duplicate_keys` does. A refresh that appends later
+  does, even where the merge would have refused first. Each run of
+  consecutive chosen pages costs one GET or local read per column, and a
+  dictionary page one more. The load refuses a live pair present twice
+  as `duplicate_rows`, naming the later file in file order, as
+  `duplicate_keys` does. A refresh that appends later
   rows therefore reads only its new files, files a compaction rolled by
   size cost the pages at the edge keys they share, and an append of rows
   inside an existing file's order range costs the pages those rows fall
@@ -187,7 +194,7 @@ direction under a limit and optional bounds on the order value.
   | Step | `full` | `disk` | `bloom` |
   |---|---|---|---|
   | Find the run | decode of at most two key pages per row group it spans, from memory | the same, read from the local file | the filter screens the file, then GETs of those key pages, concurrently, and of the key column's dictionary page when it has one |
-  | Read the rows | per column and row group, one GET per contiguous span of uncached pages over the rows read, with the pages of deleted rows between two spans in the same GET when they take at most 256 KiB, and the column's dictionary page when it is dictionary-encoded | the same, with the order column read from the local chunk file | the same as `full` |
+  | Read the rows | per column and row group, one GET per contiguous span of uncached pages over the rows read, and the column's dictionary page when it is dictionary-encoded | the same, with the order column read from the local chunk file | the same as `full` |
   | A file without the key | one key-page decode | one local read | a key-page GET at the filter's false-positive rate |
 
   Within a row group, the run lies between the first and last key pages
@@ -221,17 +228,20 @@ direction under a limit and optional bounds on the order value.
   own entry, keyed by file and offset, in a memory cache for ordered
   tables, bounded by `server.scan_page_cache_bytes`, 256 MiB by default,
   and kept out of the disk level, so a scan evicts only other scans'
-  pages. Span GETs are hedged under RFD 013 (Tail latency) in a window
-  of their own per table, whose delay scales with a span's pages, since
-  a span's latency grows with its size; key-page GETs under `bloom` use
-  the table's lookup window.
-- **Limits.** `server.batch_fan_out`, renamed from
-  `server.multi_get_fan_out`, bounds the GETs one MultiGet, one Scan, or
-  one MultiScan holds in flight. A MultiScan spreads its keys across
-  idle worker threads as a MultiGet does: while fewer calls than worker
-  threads are in flight, its distinct keys are split in order and evenly
-  into one run for each 32 distinct keys or part of 32, up to one run
-  per worker, and the runs are read on several cores at once under the
+  pages. Concurrent Scans that need one page issue one GET for it, as
+  concurrent lookups do. A span GET takes its fan-out slot before it
+  claims its pages, as a lookup's GET does, so a Scan of another call
+  waits only on pages a GET is fetching, never on a GET still waiting
+  for its slot. Span GETs are hedged under RFD 013 (Tail latency) in a
+  window of their own per table, whose delay scales with a span's pages,
+  since a span's latency grows with its size; key-page GETs under
+  `bloom` use the table's lookup window.
+- **Limits.** `server.batch_fan_out` bounds the GETs one MultiGet, one
+  Scan, or one MultiScan holds in flight. A MultiScan spreads its keys
+  across idle worker threads as a MultiGet does: while fewer calls than
+  worker threads are in flight, its distinct keys are split in order
+  and evenly into one run for each 32 distinct keys or part of 32, up to
+  one run per worker, and the runs are read on several cores at once under the
   one bound. A MultiScan of 32 distinct keys or fewer, or one that
   arrives while as many calls as worker threads are in flight, reads its
   keys on one task. Its answers, their order, its counts, and the

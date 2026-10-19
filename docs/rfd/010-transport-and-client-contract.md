@@ -15,26 +15,13 @@
 > protobuf its column declares fails the call as `FAILED_PRECONDITION`,
 > a deterministic failure the caller does not retry. See RFD 024.
 
-> Updated 2026-10-14: an ordered table is read through Scan and
+> Updated 2026-10-15: an ordered table is read through Scan and
 > MultiScan, which take a direction, a limit, and optional exclusive
 > bounds as an `OrderValue` and return rows with their order values and
-> a `more` flag; TableInfo reports the order column, its type, and
-> `max_scan_rows`. A call of the wrong kind for the table, an unspecified
-> direction, a limit above `max_scan_rows`, a bound of the wrong variant
-> or of none, an `after` at or above `before`, or a MultiScan above
-> `server.max_multi_scan_values` is `INVALID_ARGUMENT`, and a MultiScan
-> fails whole as a MultiGet does. A Scan or MultiScan response that would
-> encode to more than `server.max_scan_bytes` is `FAILED_PRECONDITION`,
-> and the server sends none of its rows. See RFD 025.
-
-> Updated 2026-10-15: the kind of a call is checked against the table
-> first, before the table's readiness and before the request's key,
-> direction, and bounds are read, so a call of the wrong kind is
-> `INVALID_ARGUMENT` even while the table loads and is never the retryable
-> `UNAVAILABLE`. TableInfo reports `max_multi_scan_values`, the most values
-> a MultiScan may ask for, and `max_scan_bytes`, the most bytes a Scan or
-> MultiScan response may encode to. A malformed value a Scan reads names
-> the order value of its row. See RFD 025.
+> a `more` flag, a MultiScan failing whole as a MultiGet does. TableInfo
+> reports the order column, its type, and the scan limits, and a call of
+> the wrong kind for the table is `INVALID_ARGUMENT` even while the table
+> loads. Their errors are as RFD 025 (Wire, Limits) sets them out.
 
 ## Problem
 

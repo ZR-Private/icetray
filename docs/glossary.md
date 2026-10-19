@@ -58,12 +58,10 @@ residency keeps them in memory and `disk` residency in a chunk file.
 `optimal` means one GET per column a hit reads and none per miss, with a
 lookup probing one file and decoding one key page of ordinary size;
 `balanced` means one file probed at a fixed extra cost, except a Scan of
-an edge key shared by files one snapshot added, as a compaction that
-rolls files by size writes them, which reads every file that holds the
-key; `permissive` covers any snapshot icetray serves correctly,
-including one where a lookup probes several files. Residency, the
-doctor's capping findings, and, for a serving `disk` table, the kernel's
-page cache set the level reached. Each value column has a level, the
+a shared edge key; `permissive` covers any snapshot icetray serves
+correctly, including one where a lookup probes several files. Residency,
+the doctor's capping findings, and, for a serving `disk` table, the
+kernel's page cache set the level reached. Each value column has a level, the
 table's is its dearest column's, and `icetray_table_below_level` reads 1
 while a table is below its configured level. See [Choosing a
 level](configuration.md#choosing-a-level).

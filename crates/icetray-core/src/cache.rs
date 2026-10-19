@@ -1163,31 +1163,33 @@ fn weigh(_: &PageKey, value: &PageValue) -> usize {
     value.0.len() + ENTRY_OVERHEAD_BYTES
 }
 
-/// What a lookup's GET answers to beside the fetch deadline of the handle
-/// it goes through (RFD 013, RFD 022). A page served from memory takes
-/// nothing of it; any other page takes the permit on the lookup's own task
-/// before the page cache is asked for it, and the GET counts as it is
-/// issued.
+/// What a GET of a lookup or a Scan answers to beside the fetch deadline
+/// of the handle it goes through (RFD 013, RFD 022). A page served from
+/// memory takes nothing of it; any other page takes the permit on the
+/// reader's own task before the page cache is asked for it, and the GET
+/// counts as it is issued.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Issue<'a> {
-    /// The fan-out of the `multi_get` the lookup is one of
-    /// (`TableHandles::batch_fan_out`): one of its permits is taken before the page
-    /// cache is asked, so a lookup still waiting for one has nothing queued
-    /// there for another call to join, and the wait is not charged against
-    /// the deadline. The permit moves into the fetch and is held until the
-    /// GET ends, on the task the GET runs on, so a lookup dropped first
-    /// frees nothing while its GET runs on; its hedge runs under the same
-    /// permit. A page the disk level serves, or one another caller fetched
-    /// meanwhile, drops it unused, and so does a lookup that joins a fetch
-    /// in flight, save the first to join: foyer keeps that one's fetch
-    /// beside the running one until it ends, and the permit with it. That
-    /// permit narrows the batch's GETs in flight and cannot stall them,
-    /// since the fetch it waits on took its own before it started. `None`
+    /// The fan-out of the call the read is part of
+    /// (`TableHandles::batch_fan_out`), a `multi_get`, `scan`, or
+    /// `multi_scan`: one of its permits is taken before the page cache is
+    /// asked, so a read still waiting for one has nothing queued there for
+    /// another call to join, and the wait is not charged against the
+    /// deadline. The permit moves into the fetch and is held until the GET
+    /// ends, on the task the GET runs on, so a read dropped first frees
+    /// nothing while its GET runs on; its hedge runs under the same permit.
+    /// Through `PageCache::get_or_fetch`, a page the disk level serves, or
+    /// one another caller fetched meanwhile, drops it unused, and so does a
+    /// read that joins a fetch in flight, save the first to join: foyer
+    /// keeps that one's fetch beside the running one until it ends, and the
+    /// permit with it. That permit narrows the batch's GETs in flight and
+    /// cannot stall them, since the fetch it waits on took its own before it
+    /// started. `PageCache::get_span` takes a permit per run of pages. `None`
     /// for a `get`, one call of its own.
     pub(crate) fan_out: Option<&'a Arc<Semaphore>>,
-    /// Counted once as the GET is issued, its hedge not: a value column's
-    /// `value_page_gets_total` for the column's value or dictionary page,
-    /// `None` for a key page.
+    /// Counted once as the GET is issued, its hedge not: a value or order
+    /// column's `value_page_gets_total` for the column's value or dictionary
+    /// page, `None` for a key page.
     pub(crate) counted: Option<&'a Counter>,
 }
 

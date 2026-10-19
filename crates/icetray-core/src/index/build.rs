@@ -623,10 +623,6 @@ async fn read_bloom_filters(handle: &FileHandle, ranges: &[Range<u64>]) -> Resul
 /// or loosened, `contract::MAX_KEY_BYTES`, how a fence is chosen. A record
 /// of any other version is stale and the file is verified again from
 /// object storage, so a result computed under other rules is never trusted.
-/// Version 2 verifies an ordered table's rows by key and order value and
-/// records its order facts (RFD 025); version 3 records its order fences
-/// besides; version 4 no longer checks the order column's values against
-/// the writer's column index.
 pub(super) const VERIFIER_VERSION: u32 = 4;
 
 /// The verification context of this build for keys of `key_type` under
@@ -1266,11 +1262,14 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// parquet decodes into. The callers read those headers ahead of the page
 /// reader and refuse one that declares more than its page can hold: `verify`
 /// every key page's before the row group's first decode
-/// (`check_page_headers`), and `FileIndex::read_column` the value page's
-/// and its dictionary page's before they decode (`checked_values`).
-/// A key page decoded at lookup is one `verify` checked at load, read from
-/// the resident chunks, the chunk file, or, in the Bloom tier, the data
-/// file again. A delta-length or delta byte-array page sizes its lengths
+/// (`check_page_headers`) and, in an ordered file, every order page's
+/// (`check_order_page_headers`); a reader of a file's edge keys its key
+/// page's (`check_key_page_headers`); a Scan the order pages' it decodes
+/// (`check_order_pages`); and every value decode, a lookup's, a Scan's, and
+/// the doctor's, its value pages' and their dictionary page's
+/// (`checked_values`). A key page decoded by a lookup or a Scan is one
+/// `verify` checked at load, read from the resident chunks, the chunk file,
+/// or, in the Bloom tier, the data file again. A delta-length or delta byte-array page sizes its lengths
 /// by the count in its encoded data, which no check reads.
 ///
 /// Parquet panics on some page bodies the headers do not reveal: a
@@ -1278,7 +1277,7 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// dictionary page among them, and others. The decode, decompression
 /// included, runs under `catch_unwind`, so a panic is
 /// `FileFault::DecoderPanicked` at the last page the page reader took up,
-/// and ends this load or lookup rather than the task running it.
+/// and ends this load, lookup, or Scan rather than the task running it.
 pub(super) fn read_column<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -4497,7 +4496,7 @@ mod tests {
 
     /// Verification decodes each column's dictionary once per row group,
     /// and each page once, under the ordered rules as under the key-value
-    /// rules (load review M3): a row group of several decode windows, over
+    /// rules: a row group of several decode windows, over
     /// dictionary-encoded key and order columns, hands each column reader
     /// its dictionary page once.
     #[tokio::test]
@@ -4577,8 +4576,8 @@ mod tests {
     }
 
     /// A file whose writer left out the order column's column index loads
-    /// in every tier, with the fences the same rows get with one (Review
-    /// Focus 2): the fences come from the rows, not from the index.
+    /// in every tier, with the fences the same rows get with one: the
+    /// fences come from the rows, not from the index.
     #[tokio::test]
     async fn test_build_ordered_without_an_order_column_index_gets_its_fences_from_the_rows() {
         let mut rng = StdRng::seed_from_u64(FENCE_SEEDS);

@@ -867,12 +867,12 @@ struct GroupRange {
     last: Key,
 }
 
-/// Where a read's page bytes come from: for a lookup, the store through
-/// the page cache (the value page in every tier, the key page in the Bloom
-/// tier), each GET answering to the issue given (`Issue`), or the disk
-/// tier's chunk file; for the doctor, the store on the load path, one
-/// unhedged load GET per page that feeds no table's hedge window (RFD 013,
-/// RFD 024).
+/// Where a read's page bytes come from: for a lookup, and for a Scan's key
+/// pages, the store through the page cache (a lookup's value page in every
+/// tier, the key page in the Bloom tier), each GET answering to the issue
+/// given (`Issue`), or the disk tier's chunk file; for the doctor, the
+/// store on the load path, one unhedged load GET per page that feeds no
+/// table's hedge window (RFD 013, RFD 024).
 #[derive(Clone, Copy)]
 enum PageSource<'a> {
     Store(Option<&'a PageCache>, Issue<'a>),

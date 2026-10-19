@@ -170,8 +170,7 @@ impl Layout {
     /// is a byte array, the order column's is one its order type admits
     /// (`order_leaf`), the file has rows and its row counts agree, and the
     /// key column, the order column, and every value column the file holds
-    /// have an offset index that describes their pages. Whether the order
-    /// column has a column index is not checked here.
+    /// have an offset index that describes their pages.
     pub(super) fn inspect(
         table: &str,
         handle: &FileHandle,
