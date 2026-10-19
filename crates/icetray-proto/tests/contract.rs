@@ -318,6 +318,51 @@ fn unknown_number<E: Copy>(numbers: &[(E, i32)]) -> i32 {
         + 1
 }
 
+/// Each variant in `numbers` has its proto number, and converts back from
+/// it; the number past the highest is no variant.
+fn assert_numbers<E>(numbers: &[(E, i32)])
+where
+    E: Copy + Debug + PartialEq + TryFrom<i32, Error = UnknownEnumValue>,
+    i32: From<E>,
+{
+    for &(variant, number) in numbers {
+        assert_eq!(i32::from(variant), number);
+        assert_eq!(E::try_from(number), Ok(variant));
+    }
+    let unknown = unknown_number(numbers);
+    assert_eq!(E::try_from(unknown), Err(UnknownEnumValue(unknown)));
+}
+
+#[test]
+fn test_presence_numbers_match_proto() {
+    assert_numbers(PRESENCE_NUMBERS);
+}
+
+#[test]
+fn test_key_type_numbers_match_proto() {
+    assert_numbers(KEY_TYPE_NUMBERS);
+}
+
+#[test]
+fn test_value_type_numbers_match_proto() {
+    assert_numbers(VALUE_TYPE_NUMBERS);
+}
+
+#[test]
+fn test_value_format_numbers_match_proto() {
+    assert_numbers(VALUE_FORMAT_NUMBERS);
+}
+
+#[test]
+fn test_direction_numbers_match_proto() {
+    assert_numbers(DIRECTION_NUMBERS);
+}
+
+#[test]
+fn test_order_type_numbers_match_proto() {
+    assert_numbers(ORDER_TYPE_NUMBERS);
+}
+
 #[test]
 fn test_round_trip_key_long() {
     assert_round_trips(&long_key());
@@ -570,65 +615,6 @@ fn test_decode_key_bin_exact_bytes() {
     assert_eq!(Key::decode(key_bin_wire().as_slice()).unwrap(), bin_key());
 }
 
-#[test]
-fn test_presence_as_i32_matches_proto() {
-    for &(presence, number) in PRESENCE_NUMBERS {
-        assert_eq!(presence as i32, number);
-        assert_eq!(Presence::try_from(number), Ok(presence));
-    }
-}
-
-#[test]
-fn test_presence_try_from_unknown_is_err() {
-    let unknown = unknown_number(PRESENCE_NUMBERS);
-    assert_eq!(Presence::try_from(unknown), Err(UnknownEnumValue(unknown)));
-}
-
-#[test]
-fn test_key_type_as_i32_matches_proto() {
-    for &(key_type, number) in KEY_TYPE_NUMBERS {
-        assert_eq!(key_type as i32, number);
-        assert_eq!(KeyType::try_from(number), Ok(key_type));
-    }
-}
-
-#[test]
-fn test_key_type_try_from_unknown_is_err() {
-    let unknown = unknown_number(KEY_TYPE_NUMBERS);
-    assert_eq!(KeyType::try_from(unknown), Err(UnknownEnumValue(unknown)));
-}
-
-#[test]
-fn test_value_type_as_i32_matches_proto() {
-    for &(value_type, number) in VALUE_TYPE_NUMBERS {
-        assert_eq!(value_type as i32, number);
-        assert_eq!(ValueType::try_from(number), Ok(value_type));
-    }
-}
-
-#[test]
-fn test_value_type_try_from_unknown_is_err() {
-    let unknown = unknown_number(VALUE_TYPE_NUMBERS);
-    assert_eq!(ValueType::try_from(unknown), Err(UnknownEnumValue(unknown)));
-}
-
-#[test]
-fn test_value_format_as_i32_matches_proto() {
-    for &(format, number) in VALUE_FORMAT_NUMBERS {
-        assert_eq!(format as i32, number);
-        assert_eq!(ValueFormat::try_from(number), Ok(format));
-    }
-}
-
-#[test]
-fn test_value_format_try_from_unknown_is_err() {
-    let unknown = unknown_number(VALUE_FORMAT_NUMBERS);
-    assert_eq!(
-        ValueFormat::try_from(unknown),
-        Err(UnknownEnumValue(unknown))
-    );
-}
-
 /// A null and a value of zero length are distinct on the wire and read back
 /// as what was sent: a null is the empty `null_value` message, a
 /// zero-length value is `value` holding nothing, and a value with neither
@@ -749,34 +735,6 @@ fn test_encode_table_info_value_column_exact_bytes() {
         TableInfoResponse::decode(wire.as_slice()).unwrap(),
         response
     );
-}
-
-#[test]
-fn test_direction_as_i32_matches_proto() {
-    for &(direction, number) in DIRECTION_NUMBERS {
-        assert_eq!(direction as i32, number);
-        assert_eq!(Direction::try_from(number), Ok(direction));
-    }
-}
-
-#[test]
-fn test_direction_try_from_unknown_is_err() {
-    let unknown = unknown_number(DIRECTION_NUMBERS);
-    assert_eq!(Direction::try_from(unknown), Err(UnknownEnumValue(unknown)));
-}
-
-#[test]
-fn test_order_type_as_i32_matches_proto() {
-    for &(order_type, number) in ORDER_TYPE_NUMBERS {
-        assert_eq!(order_type as i32, number);
-        assert_eq!(OrderType::try_from(number), Ok(order_type));
-    }
-}
-
-#[test]
-fn test_order_type_try_from_unknown_is_err() {
-    let unknown = unknown_number(ORDER_TYPE_NUMBERS);
-    assert_eq!(OrderType::try_from(unknown), Err(UnknownEnumValue(unknown)));
 }
 
 /// Each `OrderValue` variant is its own field, 1 to 3, so a long, a
