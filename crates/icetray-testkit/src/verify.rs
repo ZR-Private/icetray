@@ -144,18 +144,64 @@ pub async fn build_in(
     cache_bytes: usize,
 ) -> Result<Served> {
     let storage = Arc::new(Storage::new(storage_config_for_tests()));
-    let local = match config.residency {
-        Residency::Disk => Some(Arc::new(LocalDir::open(
-            &LocalConfig {
-                dir: dir.to_path_buf(),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            storage.stats(),
-        )?)),
-        Residency::Full | Residency::Bloom => None,
-    };
+    let local = local_for(config.residency, dir, &storage)?;
     build(storage, config, source, local, cache_bytes).await
+}
+
+/// A local directory under `dir` over `storage`'s counters, with `budget`
+/// on its chunk files and `page_cache_disk_bytes` as its page cache's disk
+/// level.
+pub fn local_dir(
+    dir: &Path,
+    storage: &Storage,
+    budget: Option<u64>,
+    page_cache_disk_bytes: u64,
+) -> Result<Arc<LocalDir>> {
+    Ok(Arc::new(LocalDir::open(
+        &LocalConfig {
+            dir: dir.to_path_buf(),
+            index_budget_bytes: budget,
+            page_cache_disk_bytes,
+        },
+        storage.stats(),
+    )?))
+}
+
+/// The local directory a table in `residency` is served over: in the Disk
+/// tier `local_dir` under `dir` with no index budget and no disk page
+/// cache, in the others none.
+pub fn local_for(
+    residency: Residency,
+    dir: &Path,
+    storage: &Storage,
+) -> Result<Option<Arc<LocalDir>>> {
+    match residency {
+        Residency::Disk => local_dir(dir, storage, None, 0).map(Some),
+        Residency::Full | Residency::Bloom => Ok(None),
+    }
+}
+
+/// `config` of `fixture` served through `catalog` over a fresh hedge-free
+/// storage and a local directory under `dir` with `budget` on its chunk
+/// files. The storage and the directory come back beside the outcome, so a
+/// test reads what the load wrote whether or not it was refused.
+pub async fn serve_disk(
+    fixture: &Fixture,
+    catalog: &Arc<dyn Catalog>,
+    config: TableConfig,
+    dir: &Path,
+    budget: Option<u64>,
+) -> Result<(Arc<Storage>, Arc<LocalDir>, Result<Served>)> {
+    let storage = Arc::new(Storage::new(storage_config_for_tests()));
+    let local = local_dir(dir, &storage, budget, 0)?;
+    let served = serve_over(
+        Arc::clone(&storage),
+        config,
+        fixture.catalog_source(Arc::clone(catalog)),
+        Some(Arc::clone(&local)),
+    )
+    .await;
+    Ok((storage, local, served))
 }
 
 /// `build_in` with a `TEST_PAGE_CACHE_BYTES` cache over the source

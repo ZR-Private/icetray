@@ -18,15 +18,15 @@ use iceberg::spec::{DataFile, DataFileFormat, PrimitiveType, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{
-    Config, ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, TableConfig,
-    ValueColumnConfig, ValueFormat,
+    Config, ConfigError, ConfigViolation, Residency, ServerConfig, TableConfig, ValueColumnConfig,
+    ValueFormat,
 };
 use icetray_core::contract::MAX_KEY_BYTES;
 use icetray_core::open::open_with;
 use icetray_core::{
     Budget, Capping, ColumnMismatch, Direction, Error, ErrorKind, FindingCode, FindingLog, Key,
-    KeyType, Level, LocalDir, OrderType, OrderValue, RefusalReason, Row, ScanBounds, ScanRow,
-    Storage, TableSource, TableState, UnsupportedDelete, UnsupportedFormat, bucket,
+    KeyType, Level, OrderType, OrderValue, RefusalReason, Row, ScanBounds, ScanRow, Storage,
+    TableSource, TableState, UnsupportedDelete, UnsupportedFormat, bucket,
 };
 use icetray_testkit::fixture::{
     DATA_DIR, IDS_2K, IDS_4K, NAMESPACE, ONE_BUCKET, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS,
@@ -877,22 +877,9 @@ async fn test_disk_tier_charges_the_exact_ordered_chunk_file_once_built() -> Res
         let catalog = &catalog;
         async move {
             let scratch = tempfile::tempdir()?;
-            let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-            let local = Arc::new(LocalDir::open(
-                &LocalConfig {
-                    dir: scratch.path().to_path_buf(),
-                    index_budget_bytes: budget,
-                    page_cache_disk_bytes: 0,
-                },
-                storage.stats(),
-            )?);
-            let served = verify::serve_over(
-                storage,
-                fixture.config(Residency::Disk, false),
-                fixture.catalog_source(Arc::clone(catalog)),
-                Some(Arc::clone(&local)),
-            )
-            .await;
+            let config = fixture.config(Residency::Disk, false);
+            let (_storage, local, served) =
+                verify::serve_disk(fixture, catalog, config, scratch.path(), budget).await?;
             Ok::<_, TestkitError>((served, local.index_bytes_in_use()?, scratch))
         }
     };
@@ -1050,22 +1037,9 @@ async fn test_strict_disk_table_with_overlapping_files_writes_no_chunk_file() ->
     fixture
         .append(catalog.as_ref(), residue_class(SECOND_CLASS), "half")
         .await?;
-    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = Arc::new(LocalDir::open(
-        &LocalConfig {
-            dir: scratch.path().to_path_buf(),
-            index_budget_bytes: None,
-            page_cache_disk_bytes: 0,
-        },
-        storage.stats(),
-    )?);
-    let served = verify::serve_over(
-        storage,
-        fixture.config(Residency::Disk, true),
-        fixture.catalog_source(Arc::clone(&catalog)),
-        Some(Arc::clone(&local)),
-    )
-    .await;
+    let config = fixture.config(Residency::Disk, true);
+    let (_storage, local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let Err(TestkitError::Core(Error::Refused {
         reason:
             RefusalReason::BelowLevel {
@@ -1514,17 +1488,7 @@ async fn test_refresh_refuses_a_pair_revived_by_dropped_deletes() -> Result<()> 
         let source = fixture.root_source();
         let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
         let scratch = tempfile::tempdir()?;
-        let local = match residency {
-            Residency::Disk => Some(Arc::new(LocalDir::open(
-                &LocalConfig {
-                    dir: scratch.path().to_path_buf(),
-                    index_budget_bytes: None,
-                    page_cache_disk_bytes: 0,
-                },
-                storage.stats(),
-            )?)),
-            Residency::Full | Residency::Bloom => None,
-        };
+        let local = verify::local_for(residency, scratch.path(), &storage)?;
         let served = verify::serve_over(
             storage,
             TableConfig {

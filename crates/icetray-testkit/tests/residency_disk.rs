@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use iceberg::Catalog;
 use icetray_core::ColumnRead;
 use icetray_core::approx::count;
 use icetray_core::config::{
@@ -19,8 +18,8 @@ use icetray_core::config::{
 use icetray_core::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, PAGE_ROWS};
 use icetray_core::open::open_with;
 use icetray_core::{
-    Budget, DataFileIdentity, Direction, Error, FindingLog, KeyType, LocalDir, OrderFences,
-    RefusalReason, Row, ScanBounds, Storage,
+    Budget, DataFileIdentity, Direction, Error, FindingLog, KeyType, OrderFences, RefusalReason,
+    Row, ScanBounds, Storage,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_4K, NAMESPACE, ONE_BUCKET, SAMPLE, TINY_BUDGET, local_catalog,
@@ -41,44 +40,6 @@ const TABLE_B: &str = "b";
 /// fetches overflow it and spill to the disk level.
 const SMALL_CACHE_BYTES: usize = 384 * 1024;
 
-/// A local directory under `dir` over `storage`'s counters, with `budget`
-/// on its chunk files and `page_cache_disk_bytes` as its page cache level.
-fn local_dir(
-    dir: &Path,
-    storage: &Storage,
-    budget: Option<u64>,
-    page_cache_disk_bytes: u64,
-) -> Result<Arc<LocalDir>> {
-    Ok(Arc::new(LocalDir::open(
-        &LocalConfig {
-            dir: dir.to_path_buf(),
-            index_budget_bytes: budget,
-            page_cache_disk_bytes,
-        },
-        storage.stats(),
-    )?))
-}
-
-/// `fixture` served in the Disk tier through its catalog over a fresh
-/// storage and a local directory under `dir`.
-async fn serve_disk(
-    fixture: &Fixture,
-    catalog: &Arc<dyn Catalog>,
-    dir: &Path,
-    budget: Option<u64>,
-) -> Result<(Arc<Storage>, Arc<LocalDir>, Result<Served>)> {
-    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = local_dir(dir, &storage, budget, 0)?;
-    let served = verify::serve_over(
-        Arc::clone(&storage),
-        fixture.config(Residency::Disk, false),
-        fixture.catalog_source(Arc::clone(catalog)),
-        Some(Arc::clone(&local)),
-    )
-    .await;
-    Ok((storage, local, served))
-}
-
 #[tokio::test]
 async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -95,7 +56,9 @@ async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() 
         &fixture.keys_at(&SAMPLE),
         &[VALUE_COLUMN],
     )?;
-    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let served = served?;
     assert_eq!(served.current().residency, Residency::Disk);
     let stats = storage.stats();
@@ -172,7 +135,9 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
     )
     .await?;
     let files = count(fixture.file_count());
-    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (_storage, local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let served = served?;
     let identities = served.current().identities();
     assert_eq!(count(identities.len()), files);
@@ -183,7 +148,9 @@ async fn test_disk_restart_reuses_chunk_files_and_fetches_footers_only() -> Resu
     drop(served);
     drop(local);
 
-    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let served = served?;
     assert_eq!(
         storage.stats().gets(),
@@ -254,7 +221,9 @@ async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read(
     let spec = FixtureSpec::ordered("ordered_disk_restart", KeyType::String, ordered);
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     let files = count(fixture.file_count());
-    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (_storage, local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let first = fences_of(&served?);
     assert_eq!(count(first.len()), files);
     assert!(
@@ -265,7 +234,9 @@ async fn test_disk_restart_restores_identical_order_fences_without_a_chunk_read(
     );
     drop(local);
 
-    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let restarted = fences_of(&served?);
     assert_eq!(
         storage.stats().gets(),
@@ -345,11 +316,15 @@ async fn test_disk_restart_of_a_rolled_ordered_table_reads_only_edge_pages() -> 
         ..FixtureSpec::ordered("ordered_disk_rolled", KeyType::Long, ordered)
     };
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-    let (_storage, local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (_storage, local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     drop(served?);
     drop(local);
 
-    let (storage, _local, served) = serve_disk(&fixture, &catalog, scratch.path(), None).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let served = served?;
     let generation = served.current();
     let files = &generation.files;
@@ -397,8 +372,15 @@ async fn test_disk_over_budget_is_refused_before_any_chunk_is_written() -> Resul
         FixtureSpec::small("kv_disk_budget", KeyType::Long),
     )
     .await?;
-    let (storage, local, served) =
-        serve_disk(&fixture, &catalog, scratch.path(), Some(TINY_BUDGET)).await?;
+    let config = fixture.config(Residency::Disk, false);
+    let (storage, local, served) = verify::serve_disk(
+        &fixture,
+        &catalog,
+        config,
+        scratch.path(),
+        Some(TINY_BUDGET),
+    )
+    .await?;
     let error = served.err().unwrap();
     assert!(
         matches!(
@@ -509,7 +491,7 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     )
     .await?;
     let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = local_dir(scratch.path(), &storage, None, PAGE_CACHE_DISK_BLOCK_BYTES)?;
+    let local = verify::local_dir(scratch.path(), &storage, None, PAGE_CACHE_DISK_BLOCK_BYTES)?;
     let config = fixture.config(Residency::Full, false);
     let source = || fixture.catalog_source(Arc::clone(&catalog));
 

@@ -23,11 +23,10 @@ use icetray_core::check::thresholds::{
     FILE_BYTES_ADVICE, FILES_PER_BUCKET_FACTOR, KEY_PAGE_ROWS_LARGE, MOST_VALUE_PAGE_BYTES,
     RUN_ROWS_ADVICE,
 };
-use icetray_core::config::{LocalConfig, Residency, ServerConfig, TableConfig, ValueFormat};
+use icetray_core::config::{Residency, ServerConfig, TableConfig, ValueFormat};
 use icetray_core::{
     Capping, Error, FILE_PREFIX, FileFault, Finding, FindingCode, HeaderField, KeyType, Level,
-    LocalDir, OrderValue, RefusalReason, Row, ScanLimits, Storage, TableReport, WriterProperty,
-    diagnose,
+    OrderValue, RefusalReason, Row, ScanLimits, TableReport, WriterProperty, diagnose,
 };
 use icetray_testkit::fixture::{
     FOUR_BUCKETS, IDS_2K, IDS_4K, LONG_KEY_BYTES, LONG_KEY_PAD, NAMESPACE, ONE_BUCKET, SAMPLE,
@@ -43,7 +42,6 @@ use icetray_testkit::{
 };
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use tempfile::TempDir;
 
 /// Rows per key page of the large-key-page fixture: twice the threshold, so
 /// the finding caps the level and is not the chosen margin.
@@ -827,35 +825,6 @@ fn assert_two_files_share_an_edge_key(served: &Served) {
     assert_eq!(last, next, "the files meet at one edge key");
 }
 
-/// `config` of `fixture` served through `catalog` over a fresh local
-/// directory, which the returned directory keeps alive; the local
-/// directory comes back beside the outcome, so a test reads what the load
-/// wrote there whether or not it was refused.
-async fn serve_on_disk(
-    fixture: &Fixture,
-    catalog: &Arc<dyn Catalog>,
-    config: TableConfig,
-) -> Result<(Result<Served>, Arc<LocalDir>, TempDir)> {
-    let dir = tempfile::tempdir()?;
-    let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
-    let local = Arc::new(LocalDir::open(
-        &LocalConfig {
-            dir: dir.path().to_path_buf(),
-            index_budget_bytes: None,
-            page_cache_disk_bytes: 0,
-        },
-        storage.stats(),
-    )?);
-    let served = verify::serve_over(
-        storage,
-        config,
-        fixture.catalog_source(Arc::clone(catalog)),
-        Some(Arc::clone(&local)),
-    )
-    .await;
-    Ok((served, local, dir))
-}
-
 /// Files one snapshot added that meet where one's last key is the next
 /// one's first, as a compaction that rolls files by size writes them, cap
 /// the table at `balanced` and name the most files one edge key spans;
@@ -1010,8 +979,10 @@ async fn test_dictionary_encoded_order_leaves_disk_optimal() -> Result<()> {
         },
     );
     let fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-    let (served, _local, _scratch) =
-        serve_on_disk(&fixture, &catalog, fixture.config(Residency::Disk, true)).await?;
+    let scratch = tempfile::tempdir()?;
+    let config = fixture.config(Residency::Disk, true);
+    let (_storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let report = diagnose(
         &served?.current(),
         Level::Optimal,
@@ -1335,8 +1306,10 @@ async fn test_strict_gate_judges_shared_edges_before_any_chunk() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let fixture =
         write_fixture(catalog.as_ref(), NAMESPACE, rolled_spec("ord_rolled_gate")).await?;
-    let (served, local, _scratch) =
-        serve_on_disk(&fixture, &catalog, fixture.config(Residency::Disk, true)).await?;
+    let scratch = tempfile::tempdir()?;
+    let config = fixture.config(Residency::Disk, true);
+    let (_storage, local, served) =
+        verify::serve_disk(&fixture, &catalog, config, scratch.path(), None).await?;
     let Err(TestkitError::Core(Error::Refused {
         reason:
             RefusalReason::BelowLevel {
@@ -1364,7 +1337,9 @@ async fn test_strict_gate_judges_shared_edges_before_any_chunk() -> Result<()> {
         lookups: Some(Level::Balanced),
         ..fixture.config(Residency::Disk, true)
     };
-    let (served, _local, _scratch) = serve_on_disk(&fixture, &catalog, balanced).await?;
+    let scratch = tempfile::tempdir()?;
+    let (_storage, _local, served) =
+        verify::serve_disk(&fixture, &catalog, balanced, scratch.path(), None).await?;
     let served = served?;
     assert_two_files_share_an_edge_key(&served);
     assert_eq!(served.current().level, Level::Balanced);

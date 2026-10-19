@@ -14,11 +14,11 @@ use std::sync::Arc;
 use iceberg::spec::{DataFileFormat, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx;
-use icetray_core::config::{LocalConfig, Residency, TableConfig};
+use icetray_core::config::{Residency, TableConfig};
 use icetray_core::metric;
 use icetray_core::{
     Capping, Error, ErrorKind, FILE_PREFIX, FindingCode, Generation, KeyType, Level, LoadedFile,
-    LocalDir, OrderValue, RefusalReason, Row, Storage, TableSource, TableState, UnsupportedFormat,
+    OrderValue, RefusalReason, Row, Storage, TableSource, TableState, UnsupportedFormat,
 };
 use icetray_testkit::delete_files::{Vector, write_vectors};
 use icetray_testkit::fixture::{
@@ -635,17 +635,7 @@ async fn serve_counted(
     let storage = Arc::new(Storage::new(verify::storage_config_for_tests()));
     let store: Arc<dyn ObjectStore> = Arc::<CountingStore>::clone(&counting);
     storage.register(FILE_PREFIX, store);
-    let local = match residency {
-        Residency::Disk => Some(Arc::new(LocalDir::open(
-            &LocalConfig {
-                dir: dir.to_path_buf(),
-                index_budget_bytes: None,
-                page_cache_disk_bytes: 0,
-            },
-            storage.stats(),
-        )?)),
-        Residency::Full | Residency::Bloom => None,
-    };
+    let local = verify::local_for(residency, dir, &storage)?;
     let source = fixture.root_source();
     let config = TableConfig {
         source: source.clone(),
