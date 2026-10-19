@@ -325,302 +325,155 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 33] = [
-        Self::WarmHit,
-        Self::ColdHit,
-        Self::Miss,
-        Self::MultiGet100,
-        Self::MultiGet1000,
-        Self::Load,
-        Self::Refresh,
-        Self::TwoTable,
-        Self::WarmHitBoth,
-        Self::PresenceHit,
-        Self::WarmHitProjectFew,
-        Self::WarmHitProjectMost,
-        Self::MultiGet100Both,
-        Self::MultiGet100Project,
-        Self::ColdHitBoth,
-        Self::ColdHitProjectFew,
-        Self::MultiGet100Cold,
-        Self::MultiGet100ColdBoth,
-        Self::ScanWarm,
-        Self::ScanCold,
-        Self::ScanBounded,
-        Self::MultiScan10,
-        Self::MultiScan10Cold,
-        Self::MultiScan100,
-        Self::MultiScan100Cold,
-        Self::MultiScan1000,
-        Self::MultiScan1000Cold,
-        Self::KvBesideOrdered,
-        Self::ScanBoundedLong,
-        Self::ScanBoundedLongCold,
-        Self::ScanHeadLong,
-        Self::ScanBoundedString,
-        Self::ScanBoundedStringCold,
-    ];
-
-    const LOOKUPS: [Self; 29] = [
-        Self::WarmHit,
-        Self::ColdHit,
-        Self::Miss,
-        Self::MultiGet100,
-        Self::MultiGet1000,
-        Self::WarmHitBoth,
-        Self::PresenceHit,
-        Self::WarmHitProjectFew,
-        Self::WarmHitProjectMost,
-        Self::MultiGet100Both,
-        Self::MultiGet100Project,
-        Self::ColdHitBoth,
-        Self::ColdHitProjectFew,
-        Self::MultiGet100Cold,
-        Self::MultiGet100ColdBoth,
-        Self::ScanWarm,
-        Self::ScanCold,
-        Self::ScanBounded,
-        Self::MultiScan10,
-        Self::MultiScan10Cold,
-        Self::MultiScan100,
-        Self::MultiScan100Cold,
-        Self::MultiScan1000,
-        Self::MultiScan1000Cold,
-        Self::ScanBoundedLong,
-        Self::ScanBoundedLongCold,
-        Self::ScanHeadLong,
-        Self::ScanBoundedString,
-        Self::ScanBoundedStringCold,
-    ];
-
     /// The key-value scenarios `kv-beside-ordered` runs on the long table
     /// beside the ordered table.
     const BESIDE_ORDERED: [Self; 4] = [Self::WarmHit, Self::ColdHit, Self::Miss, Self::MultiGet100];
 
-    /// Whether the scenario measures a page cache primed to hold every
-    /// value page.
-    fn is_warm(self) -> bool {
+    /// What the scenario measures, and what it needs of a table.
+    const fn traits(self) -> Traits {
         match self {
-            Self::WarmHit
-            | Self::MultiGet100
-            | Self::MultiGet1000
-            | Self::TwoTable
-            | Self::WarmHitBoth
-            | Self::PresenceHit
-            | Self::WarmHitProjectFew
-            | Self::WarmHitProjectMost
-            | Self::MultiGet100Both
-            | Self::MultiGet100Project
-            | Self::ScanWarm
-            | Self::ScanBounded
-            | Self::MultiScan10
-            | Self::MultiScan100
-            | Self::MultiScan1000
-            | Self::KvBesideOrdered
-            | Self::ScanBoundedLong
-            | Self::ScanHeadLong
-            | Self::ScanBoundedString => true,
-            Self::ColdHit
-            | Self::Miss
-            | Self::Load
-            | Self::Refresh
-            | Self::ColdHitBoth
-            | Self::ColdHitProjectFew
-            | Self::MultiGet100Cold
-            | Self::MultiGet100ColdBoth
-            | Self::ScanCold
-            | Self::MultiScan10Cold
-            | Self::MultiScan100Cold
-            | Self::MultiScan1000Cold
-            | Self::ScanBoundedLongCold
-            | Self::ScanBoundedStringCold => false,
+            Self::WarmHit => Traits::warm("warm-hit"),
+            Self::ColdHit => Traits::cold("cold-hit"),
+            Self::Miss => Traits::unread("miss"),
+            Self::MultiGet100 => Traits::warm("multi-get-100"),
+            Self::MultiGet1000 => Traits::warm("multi-get-1000"),
+            Self::Load => Traits::unread("load").apart(),
+            Self::Refresh => Traits::unread("refresh").apart(),
+            Self::TwoTable => Traits::warm("two-table").apart(),
+            Self::WarmHitBoth => Traits::warm("warm-hit-both").protobuf(),
+            Self::PresenceHit => Traits::warm("presence-hit"),
+            Self::WarmHitProjectFew => Traits::warm("warm-hit-project-few").projecting(),
+            Self::WarmHitProjectMost => Traits::warm("warm-hit-project-most").projecting(),
+            Self::MultiGet100Both => Traits::warm("multi-get-100-both").protobuf(),
+            Self::MultiGet100Project => Traits::warm("multi-get-100-project").projecting(),
+            Self::ColdHitBoth => Traits::cold("cold-hit-both").protobuf(),
+            Self::ColdHitProjectFew => Traits::cold("cold-hit-project-few").projecting(),
+            Self::MultiGet100Cold => Traits::cold("multi-get-100-cold"),
+            Self::MultiGet100ColdBoth => Traits::cold("multi-get-100-cold-both").protobuf(),
+            Self::ScanWarm => Traits::warm("scan-warm").on(TableName::Ordered),
+            Self::ScanCold => Traits::cold("scan-cold").on(TableName::Ordered),
+            Self::ScanBounded => Traits::warm("scan-bounded").on(TableName::Ordered),
+            Self::MultiScan10 => Traits::warm("multi-scan-10").on(TableName::Ordered),
+            Self::MultiScan10Cold => Traits::cold("multi-scan-10-cold").on(TableName::Ordered),
+            Self::MultiScan100 => Traits::warm("multi-scan-100").on(TableName::Ordered),
+            Self::MultiScan100Cold => Traits::cold("multi-scan-100-cold").on(TableName::Ordered),
+            Self::MultiScan1000 => Traits::warm("multi-scan-1000").on(TableName::Ordered),
+            Self::MultiScan1000Cold => Traits::cold("multi-scan-1000-cold").on(TableName::Ordered),
+            Self::KvBesideOrdered => Traits::warm("kv-beside-ordered").apart(),
+            Self::ScanBoundedLong => Traits::warm("scan-bounded-long").on(TableName::OrderedLong),
+            Self::ScanBoundedLongCold => {
+                Traits::cold("scan-bounded-long-cold").on(TableName::OrderedLong)
+            }
+            Self::ScanHeadLong => Traits::warm("scan-head-long").on(TableName::OrderedLong),
+            Self::ScanBoundedString => {
+                Traits::warm("scan-bounded-string").on(TableName::OrderedString)
+            }
+            Self::ScanBoundedStringCold => {
+                Traits::cold("scan-bounded-string-cold").on(TableName::OrderedString)
+            }
         }
     }
 
-    /// Whether the scenario measures reads through the `COLD_CACHE_BYTES`
-    /// page cache and scan cache, which hold almost none of the table's
-    /// value pages.
-    fn is_cold(self) -> bool {
-        matches!(
-            self,
-            Self::ColdHit
-                | Self::ColdHitBoth
-                | Self::ColdHitProjectFew
-                | Self::MultiGet100Cold
-                | Self::MultiGet100ColdBoth
-                | Self::ScanCold
-                | Self::MultiScan10Cold
-                | Self::MultiScan100Cold
-                | Self::MultiScan1000Cold
-                | Self::ScanBoundedLongCold
-                | Self::ScanBoundedStringCold
-        )
+    /// The scenario's name in the results.
+    const fn name(self) -> &'static str {
+        self.traits().name
     }
+}
 
-    /// A `MultiScan` scenario's request and keys per batch
-    /// (`MULTI_SCAN_BATCHES`); `None` for any other scenario.
-    fn multi_scan_batch(self) -> Option<(TestScan, usize)> {
-        MULTI_SCAN_BATCHES
-            .iter()
-            .find(|(scenario, ..)| *scenario == self)
-            .map(|&(_, request, keys)| (request(), keys))
-    }
-
-    /// Whether the scenario reads `SECOND_VALUE_COLUMN` or projects
-    /// `VALUE_COLUMN`, which only a protobuf table serves.
-    fn needs_protobuf(self) -> bool {
-        match self {
-            Self::WarmHitBoth
-            | Self::WarmHitProjectFew
-            | Self::WarmHitProjectMost
-            | Self::MultiGet100Both
-            | Self::MultiGet100Project
-            | Self::ColdHitBoth
-            | Self::ColdHitProjectFew
-            | Self::MultiGet100ColdBoth => true,
-            Self::WarmHit
-            | Self::ColdHit
-            | Self::Miss
-            | Self::MultiGet100
-            | Self::MultiGet1000
-            | Self::Load
-            | Self::Refresh
-            | Self::TwoTable
-            | Self::PresenceHit
-            | Self::MultiGet100Cold
-            | Self::ScanWarm
-            | Self::ScanCold
-            | Self::ScanBounded
-            | Self::MultiScan10
-            | Self::MultiScan100
-            | Self::MultiScan1000
-            | Self::MultiScan10Cold
-            | Self::MultiScan100Cold
-            | Self::MultiScan1000Cold
-            | Self::KvBesideOrdered
-            | Self::ScanBoundedLong
-            | Self::ScanBoundedLongCold
-            | Self::ScanHeadLong
-            | Self::ScanBoundedString
-            | Self::ScanBoundedStringCold => false,
-        }
-    }
-
-    /// Whether the scenario projects `VALUE_COLUMN`, whose bytes read per
-    /// key are then the whole value's, not what it returns.
-    fn projects(self) -> bool {
-        match self {
-            Self::WarmHitProjectFew
-            | Self::WarmHitProjectMost
-            | Self::MultiGet100Project
-            | Self::ColdHitProjectFew => true,
-            Self::WarmHit
-            | Self::ColdHit
-            | Self::Miss
-            | Self::MultiGet100
-            | Self::MultiGet1000
-            | Self::Load
-            | Self::Refresh
-            | Self::TwoTable
-            | Self::WarmHitBoth
-            | Self::PresenceHit
-            | Self::MultiGet100Both
-            | Self::ColdHitBoth
-            | Self::MultiGet100Cold
-            | Self::MultiGet100ColdBoth
-            | Self::ScanWarm
-            | Self::ScanCold
-            | Self::ScanBounded
-            | Self::MultiScan10
-            | Self::MultiScan100
-            | Self::MultiScan1000
-            | Self::MultiScan10Cold
-            | Self::MultiScan100Cold
-            | Self::MultiScan1000Cold
-            | Self::KvBesideOrdered
-            | Self::ScanBoundedLong
-            | Self::ScanBoundedLongCold
-            | Self::ScanHeadLong
-            | Self::ScanBoundedString
-            | Self::ScanBoundedStringCold => false,
-        }
-    }
-
+/// What a scenario measures, and what it needs of the table it runs on.
+#[derive(Clone, Copy)]
+struct Traits {
+    /// The scenario's name in the results.
+    name: &'static str,
+    /// The page cache it measures.
+    cache: Cache,
+    /// Whether `lookups` measures it, per table and tier; the others are
+    /// loads, refreshes, and the scenarios of two tables, which `main`
+    /// runs on their own.
+    lookup: bool,
+    /// Whether it reads `SECOND_VALUE_COLUMN` or projects `VALUE_COLUMN`,
+    /// which only a protobuf table serves.
+    protobuf: bool,
+    /// Whether it projects `VALUE_COLUMN`, whose bytes read per key are
+    /// then the whole value's, not what it returns.
+    projects: bool,
     /// The ordered table a Scan or `MultiScan` scenario reads, the only one
     /// it runs on; `None` for the other scenarios, which only a key-value
     /// table serves.
-    fn scan_table(self) -> Option<TableName> {
-        match self {
-            Self::ScanWarm
-            | Self::ScanCold
-            | Self::ScanBounded
-            | Self::MultiScan10
-            | Self::MultiScan100
-            | Self::MultiScan1000
-            | Self::MultiScan10Cold
-            | Self::MultiScan100Cold
-            | Self::MultiScan1000Cold => Some(TableName::Ordered),
-            Self::ScanBoundedLong | Self::ScanBoundedLongCold | Self::ScanHeadLong => {
-                Some(TableName::OrderedLong)
-            }
-            Self::ScanBoundedString | Self::ScanBoundedStringCold => Some(TableName::OrderedString),
-            Self::WarmHit
-            | Self::ColdHit
-            | Self::Miss
-            | Self::MultiGet100
-            | Self::MultiGet1000
-            | Self::Load
-            | Self::Refresh
-            | Self::TwoTable
-            | Self::WarmHitBoth
-            | Self::PresenceHit
-            | Self::WarmHitProjectFew
-            | Self::WarmHitProjectMost
-            | Self::MultiGet100Both
-            | Self::MultiGet100Project
-            | Self::ColdHitBoth
-            | Self::ColdHitProjectFew
-            | Self::MultiGet100Cold
-            | Self::MultiGet100ColdBoth
-            | Self::KvBesideOrdered => None,
+    table: Option<TableName>,
+}
+
+/// The page cache a scenario measures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cache {
+    /// One primed to hold every value page, which the table's must fit.
+    Warm,
+    /// The `COLD_CACHE_BYTES` page cache and scan cache, which hold almost
+    /// none of the table's value pages.
+    Cold,
+    /// None it depends on: a miss, served warm, reads no value page, and a
+    /// load or a refresh reads none through it.
+    Unread,
+}
+
+impl Traits {
+    /// A lookup of a key-value table through `cache`.
+    const fn of(name: &'static str, cache: Cache) -> Self {
+        Self {
+            name,
+            cache,
+            lookup: true,
+            protobuf: false,
+            projects: false,
+            table: None,
         }
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::WarmHit => "warm-hit",
-            Self::ColdHit => "cold-hit",
-            Self::Miss => "miss",
-            Self::MultiGet100 => "multi-get-100",
-            Self::MultiGet1000 => "multi-get-1000",
-            Self::Load => "load",
-            Self::Refresh => "refresh",
-            Self::TwoTable => "two-table",
-            Self::WarmHitBoth => "warm-hit-both",
-            Self::PresenceHit => "presence-hit",
-            Self::WarmHitProjectFew => "warm-hit-project-few",
-            Self::WarmHitProjectMost => "warm-hit-project-most",
-            Self::MultiGet100Both => "multi-get-100-both",
-            Self::MultiGet100Project => "multi-get-100-project",
-            Self::ColdHitBoth => "cold-hit-both",
-            Self::ColdHitProjectFew => "cold-hit-project-few",
-            Self::MultiGet100Cold => "multi-get-100-cold",
-            Self::MultiGet100ColdBoth => "multi-get-100-cold-both",
-            Self::ScanWarm => "scan-warm",
-            Self::ScanCold => "scan-cold",
-            Self::ScanBounded => "scan-bounded",
-            Self::MultiScan10 => "multi-scan-10",
-            Self::MultiScan10Cold => "multi-scan-10-cold",
-            Self::MultiScan100 => "multi-scan-100",
-            Self::MultiScan100Cold => "multi-scan-100-cold",
-            Self::MultiScan1000 => "multi-scan-1000",
-            Self::MultiScan1000Cold => "multi-scan-1000-cold",
-            Self::KvBesideOrdered => "kv-beside-ordered",
-            Self::ScanBoundedLong => "scan-bounded-long",
-            Self::ScanBoundedLongCold => "scan-bounded-long-cold",
-            Self::ScanHeadLong => "scan-head-long",
-            Self::ScanBoundedString => "scan-bounded-string",
-            Self::ScanBoundedStringCold => "scan-bounded-string-cold",
+    /// A lookup through the warm cache.
+    const fn warm(name: &'static str) -> Self {
+        Self::of(name, Cache::Warm)
+    }
+
+    /// A lookup through the cold cache.
+    const fn cold(name: &'static str) -> Self {
+        Self::of(name, Cache::Cold)
+    }
+
+    /// A scenario that reads no value page through a cache.
+    const fn unread(name: &'static str) -> Self {
+        Self::of(name, Cache::Unread)
+    }
+
+    /// Not measured by `lookups`.
+    const fn apart(self) -> Self {
+        Self {
+            lookup: false,
+            ..self
+        }
+    }
+
+    /// Reading `SECOND_VALUE_COLUMN`.
+    const fn protobuf(self) -> Self {
+        Self {
+            protobuf: true,
+            ..self
+        }
+    }
+
+    /// Projecting `VALUE_COLUMN`, which only a protobuf table serves.
+    const fn projecting(self) -> Self {
+        Self {
+            protobuf: true,
+            projects: true,
+            ..self
+        }
+    }
+
+    /// A Scan or `MultiScan` of `table`.
+    const fn on(self, table: TableName) -> Self {
+        Self {
+            table: Some(table),
+            ..self
         }
     }
 }
@@ -2161,45 +2014,6 @@ fn returned_bytes(row: &Row, columns: usize) -> Option<usize> {
 /// Keys of a `MultiScan` scenario's batch.
 const MULTI_SCAN_KEYS: usize = 10;
 
-/// A `MultiScan` scenario, the request it makes, and its keys per batch.
-type MultiScanBatch = (Scenario, fn() -> TestScan, usize);
-
-/// Each `MultiScan` scenario's request and keys per batch: whole runs of
-/// `MULTI_SCAN_KEYS` keys, or the newest row of `MULTI_SCAN_100_KEYS` or
-/// `MULTI_SCAN_1000_KEYS`, warm and cold alike.
-const MULTI_SCAN_BATCHES: [MultiScanBatch; 6] = [
-    (
-        Scenario::MultiScan10,
-        multi_scan_whole_runs,
-        MULTI_SCAN_KEYS,
-    ),
-    (
-        Scenario::MultiScan10Cold,
-        multi_scan_whole_runs,
-        MULTI_SCAN_KEYS,
-    ),
-    (
-        Scenario::MultiScan100,
-        multi_scan_heads,
-        MULTI_SCAN_100_KEYS,
-    ),
-    (
-        Scenario::MultiScan100Cold,
-        multi_scan_heads,
-        MULTI_SCAN_100_KEYS,
-    ),
-    (
-        Scenario::MultiScan1000,
-        multi_scan_heads,
-        MULTI_SCAN_1000_KEYS,
-    ),
-    (
-        Scenario::MultiScan1000Cold,
-        multi_scan_heads,
-        MULTI_SCAN_1000_KEYS,
-    ),
-];
-
 /// Keys of the `multi-scan-100` scenarios' batch: a batch of heads a
 /// caller pages through, spread over several workers' runs.
 const MULTI_SCAN_100_KEYS: usize = 100;
@@ -2974,21 +2788,22 @@ async fn lookups(
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let warm = if scenarios.iter().any(|s| !s.is_cold()) {
+    let cold_cache = |scenario: &Scenario| scenario.traits().cache == Cache::Cold;
+    let warm = if scenarios.iter().any(|s| !cold_cache(s)) {
         let served = serve_loaded(prepared, beside, tier, WARM_CACHE_BYTES).await?;
         prime_cache(&served.table, shape).await?;
         Some(served)
     } else {
         None
     };
-    let cold = if scenarios.iter().any(|s| s.is_cold()) {
+    let cold = if scenarios.iter().any(cold_cache) {
         Some(serve_loaded(prepared, beside, tier, COLD_CACHE_BYTES).await?)
     } else {
         None
     };
     let whole = scenarios
         .iter()
-        .any(|s| s.projects())
+        .any(|s| s.traits().projects)
         .then(|| whole_lengths(shape));
     let projected = |columns| Reads::Projected {
         columns,
@@ -3006,52 +2821,46 @@ async fn lookups(
     };
     let mut results = Vec::new();
     for &scenario in scenarios {
-        let (served, op) = match scenario {
-            Scenario::WarmHit => (&warm, get(&hits, true, WHOLE_VALUE)),
-            Scenario::ColdHit => (&cold, get(&hits, true, WHOLE_VALUE)),
-            Scenario::Miss => (&warm, get(&misses, false, WHOLE_VALUE)),
-            Scenario::MultiGet100 => (&warm, multi(&hits, BATCH_100, WHOLE_VALUE)),
-            Scenario::MultiGet1000 => (&warm, multi(&hits, BATCH_1000, WHOLE_VALUE)),
-            Scenario::WarmHitBoth => (&warm, get(&hits, true, Reads::Whole(&BOTH_READS))),
-            Scenario::PresenceHit => (&warm, get(&hits, true, Reads::Whole(&NO_READS))),
-            Scenario::WarmHitProjectFew => (&warm, get(&hits, true, projected(&FEW_READS))),
-            Scenario::WarmHitProjectMost => (&warm, get(&hits, true, projected(&MOST_READS))),
-            Scenario::MultiGet100Both => {
-                (&warm, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
+        let op = match scenario {
+            Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
+            Scenario::Miss => get(&misses, false, WHOLE_VALUE),
+            Scenario::MultiGet100 | Scenario::MultiGet100Cold => {
+                multi(&hits, BATCH_100, WHOLE_VALUE)
             }
-            Scenario::MultiGet100Project => (&warm, multi(&hits, BATCH_100, projected(&FEW_READS))),
-            Scenario::ColdHitBoth => (&cold, get(&hits, true, Reads::Whole(&BOTH_READS))),
-            Scenario::ColdHitProjectFew => (&cold, get(&hits, true, projected(&FEW_READS))),
-            Scenario::MultiGet100Cold => (&cold, multi(&hits, BATCH_100, WHOLE_VALUE)),
-            Scenario::MultiGet100ColdBoth => {
-                (&cold, multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS)))
+            Scenario::MultiGet1000 => multi(&hits, BATCH_1000, WHOLE_VALUE),
+            Scenario::WarmHitBoth | Scenario::ColdHitBoth => {
+                get(&hits, true, Reads::Whole(&BOTH_READS))
             }
-            Scenario::ScanWarm => (&warm, scan_one(TestScan::default())?),
-            Scenario::ScanCold => (&cold, scan_one(TestScan::default())?),
-            Scenario::ScanBounded => (&warm, scan_one(bounded_page()?)?),
-            Scenario::MultiScan10
-            | Scenario::MultiScan10Cold
-            | Scenario::MultiScan100
-            | Scenario::MultiScan100Cold
-            | Scenario::MultiScan1000
-            | Scenario::MultiScan1000Cold => {
-                let served = if scenario.is_cold() { &cold } else { &warm };
-                let (test, keys) = scenario
-                    .multi_scan_batch()
-                    .expect("a MultiScan scenario has a batch");
-                (served, scan_batch(test, keys)?)
+            Scenario::PresenceHit => get(&hits, true, Reads::Whole(&NO_READS)),
+            Scenario::WarmHitProjectFew | Scenario::ColdHitProjectFew => {
+                get(&hits, true, projected(&FEW_READS))
             }
-            Scenario::ScanBoundedLong | Scenario::ScanBoundedString => {
-                (&warm, scan_pool(&bounded_in_run(shape)?)?)
+            Scenario::WarmHitProjectMost => get(&hits, true, projected(&MOST_READS)),
+            Scenario::MultiGet100Both | Scenario::MultiGet100ColdBoth => {
+                multi(&hits, BATCH_100, Reads::Whole(&BOTH_READS))
             }
-            Scenario::ScanBoundedLongCold | Scenario::ScanBoundedStringCold => {
-                (&cold, scan_pool(&bounded_in_run(shape)?)?)
+            Scenario::MultiGet100Project => multi(&hits, BATCH_100, projected(&FEW_READS)),
+            Scenario::ScanWarm | Scenario::ScanCold => scan_one(TestScan::default())?,
+            Scenario::ScanBounded => scan_one(bounded_page()?)?,
+            Scenario::MultiScan10 | Scenario::MultiScan10Cold => {
+                scan_batch(multi_scan_whole_runs(), MULTI_SCAN_KEYS)?
             }
-            Scenario::ScanHeadLong => (&warm, scan_one(head_of_run())?),
+            Scenario::MultiScan100 | Scenario::MultiScan100Cold => {
+                scan_batch(multi_scan_heads(), MULTI_SCAN_100_KEYS)?
+            }
+            Scenario::MultiScan1000 | Scenario::MultiScan1000Cold => {
+                scan_batch(multi_scan_heads(), MULTI_SCAN_1000_KEYS)?
+            }
+            Scenario::ScanBoundedLong
+            | Scenario::ScanBoundedString
+            | Scenario::ScanBoundedLongCold
+            | Scenario::ScanBoundedStringCold => scan_pool(&bounded_in_run(shape)?)?,
+            Scenario::ScanHeadLong => scan_one(head_of_run())?,
             Scenario::Load | Scenario::Refresh | Scenario::TwoTable | Scenario::KvBesideOrdered => {
                 continue;
             }
         };
+        let served = if cold_cache(&scenario) { &cold } else { &warm };
         let served = served
             .as_ref()
             .expect("a table is served for every selected scenario");
@@ -3906,7 +3715,7 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
 /// `shape`: all of them, without the warm ones when the warm cache cannot
 /// hold the table's value pages, without those reading a second column or
 /// a projection when the table is not a protobuf table, and without the
-/// Scan scenarios of another table (`Scenario::scan_table`) or the
+/// Scan scenarios of another table (`Traits::table`) or the
 /// key-value scenarios on an ordered table, each of which it says.
 fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
     let ordered = shape.ordered.is_some();
@@ -3915,7 +3724,8 @@ fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
         .copied()
         .filter(|scenario| {
             scenario
-                .scan_table()
+                .traits()
+                .table
                 .map_or(!ordered, |table| table == shape.name)
         })
         .collect();
@@ -3931,7 +3741,7 @@ fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
     let warm_kept: Vec<Scenario> = scenarios
         .iter()
         .copied()
-        .filter(|scenario| fits || !scenario.is_warm())
+        .filter(|scenario| fits || scenario.traits().cache != Cache::Warm)
         .collect();
     if warm_kept.len() < scenarios.len() {
         eprintln!(
@@ -3942,7 +3752,7 @@ fn lookups_for(shape: TableShape, scenarios: &[Scenario]) -> Vec<Scenario> {
     let kept: Vec<Scenario> = warm_kept
         .iter()
         .copied()
-        .filter(|scenario| protobuf || !scenario.needs_protobuf())
+        .filter(|scenario| protobuf || !scenario.traits().protobuf)
         .collect();
     if kept.len() < warm_kept.len() {
         eprintln!(
@@ -4033,7 +3843,7 @@ async fn main() -> BenchResult<()> {
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
-    let scenarios = or_all(&cli.scenario, &Scenario::ALL);
+    let scenarios = or_all(&cli.scenario, Scenario::value_variants());
     let (measured_shapes, needed) = select_shapes(&cli, &scenarios);
     let prepared = prepare(&cli.data_dir, cli.rewrite, &needed).await?;
     let compression = compression(&prepared)?;
@@ -4065,7 +3875,7 @@ async fn main() -> BenchResult<()> {
     let lookup_scenarios: Vec<Scenario> = scenarios
         .iter()
         .copied()
-        .filter(|s| Scenario::LOOKUPS.contains(s))
+        .filter(|s| s.traits().lookup)
         .collect();
     let tiers = or_all(&cli.tier, &Tier::ALL);
     let tables: Vec<&Prepared> = prepared
