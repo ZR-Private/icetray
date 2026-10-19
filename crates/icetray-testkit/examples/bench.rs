@@ -2084,12 +2084,7 @@ impl ScanCase {
         let rows = ordered.orders_of(0)?.into_iter().map(|order| (order, ()));
         let (rows, more) = scan_model(rows, &test);
         Ok(Self {
-            bounds: ScanBounds {
-                direction: test.direction,
-                limit: test.limit,
-                after: test.after.map(|raw| order_value(ordered.kind, raw)),
-                before: test.before.map(|raw| order_value(ordered.kind, raw)),
-            },
+            bounds: test.bounds(ordered.kind),
             orders: rows
                 .into_iter()
                 .map(|(order, ())| order_value(ordered.kind, order))

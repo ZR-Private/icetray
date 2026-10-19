@@ -887,20 +887,6 @@ fn derived_scan(table: GoldenTable, id: u64, rows: &[OrderedRow], scan: &TestSca
     }
 }
 
-/// `scan` as the bounds a Scan of key index `id` states.
-fn ordered_bounds(table: GoldenTable, id: u64, scan: &TestScan) -> ScanBounds {
-    ScanBounds {
-        direction: scan.direction,
-        limit: scan.limit,
-        after: scan
-            .after
-            .map(|order| golden::ordered_order_value(table, id, order)),
-        before: scan
-            .before
-            .map(|order| golden::ordered_order_value(table, id, order)),
-    }
-}
-
 /// Every sampled key of `table`, and the key indexes in `extra`, answers
 /// every Scan of `ordered_scans` in every tier as the derivation says, and a
 /// key the table lacks answers nothing.
@@ -923,7 +909,7 @@ async fn assert_ordered_scans_match_the_derivation(
                     .scan(
                         &key,
                         &[ColumnRead::whole(VALUE_COLUMN)],
-                        &ordered_bounds(table, id, &scan),
+                        &scan.bounds_by(|order| golden::ordered_order_value(table, id, order)),
                     )
                     .await?
                     .scanned;

@@ -15,7 +15,7 @@ use arrow::array::{
 };
 use arrow::buffer::Buffer;
 use iceberg::spec::PrimitiveType;
-use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue};
+use icetray_core::{DEFAULT_MAX_SCAN_ROWS, Direction, Key, OrderValue, ScanBounds};
 
 use crate::error::{Result, SpecFault};
 use crate::keys::{FIRST_VERSION, ValueKind, value_of_version};
@@ -373,6 +373,24 @@ impl Default for TestScan {
             before: None,
             max_scan_rows: DEFAULT_MAX_SCAN_ROWS,
         }
+    }
+}
+
+impl TestScan {
+    /// The request as the core's bounds, each bound's raw order value
+    /// encoded by `order`.
+    pub fn bounds_by(&self, order: impl Fn(i64) -> OrderValue) -> ScanBounds {
+        ScanBounds {
+            direction: self.direction,
+            limit: self.limit,
+            after: self.after.map(&order),
+            before: self.before.map(&order),
+        }
+    }
+
+    /// The request as the core's bounds over order values of `kind`.
+    pub fn bounds(&self, kind: OrderKind) -> ScanBounds {
+        self.bounds_by(|raw| order_value(kind, raw))
     }
 }
 

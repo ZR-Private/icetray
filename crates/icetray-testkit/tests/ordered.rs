@@ -17,7 +17,7 @@ use icetray_core::approx::count;
 use icetray_core::config::{Residency, TableConfig};
 use icetray_core::{
     ColumnRead, Direction, Error, Key, KeyType, LoadedFile, OrderValue, Pair, ScanBounds, ScanRow,
-    Scanned, TableKind, bucket,
+    TableKind, bucket,
 };
 use icetray_testkit::fixture::{
     HandSnapshot, ONE_BUCKET, SECOND_VALUE_COLUMN, SchemaChange, StatedDefault, TWO_BUCKETS,
@@ -450,41 +450,6 @@ fn random_scan(drawn: &Drawn, rng: &mut StdRng) -> (Key, Vec<&'static str>, Test
     (key, columns, scan)
 }
 
-/// `scan` as the core's bounds over order values of `kind`.
-fn bounds_of(kind: OrderKind, scan: &TestScan) -> ScanBounds {
-    ScanBounds {
-        direction: scan.direction,
-        limit: scan.limit,
-        after: scan.after.map(|raw| order_value(kind, raw)),
-        before: scan.before.map(|raw| order_value(kind, raw)),
-    }
-}
-
-/// What a Scan of `key` reading `columns` under `scan` answers on
-/// `fixture`, by the model, as the core's rows.
-fn expected(
-    fixture: &Fixture,
-    kind: OrderKind,
-    key: &Key,
-    columns: &[&str],
-    scan: &TestScan,
-) -> Scanned {
-    let (rows, more) = fixture.expected_scan(key, columns, scan);
-    Scanned {
-        rows: rows
-            .into_iter()
-            .map(|(order, values)| ScanRow {
-                order: order_value(kind, order),
-                values: values
-                    .into_iter()
-                    .map(|value| value.map(Bytes::from))
-                    .collect(),
-            })
-            .collect(),
-        more,
-    }
-}
-
 /// `columns` as whole-value reads.
 fn reads<'a>(columns: &[&'a str]) -> Vec<ColumnRead<'a>> {
     columns
@@ -519,8 +484,8 @@ async fn test_scan_matches_the_model_in_every_tier() -> Result<()> {
         let tiers = serve_drawn(&drawn).await?;
         for _ in 0..KEYS_PER_INSTANCE {
             let (key, columns, scan) = random_scan(&drawn, &mut rng);
-            let want = expected(&drawn.fixture, drawn.kind, &key, &columns, &scan);
-            let bounds = bounds_of(drawn.kind, &scan);
+            let want = drawn.fixture.expected_scanned(&key, &columns, &scan);
+            let bounds = scan.bounds(drawn.kind);
             for (residency, served) in tiers.all() {
                 let got = served.table.scan(&key, &reads(&columns), &bounds).await?;
                 assert_eq!(
@@ -714,7 +679,7 @@ async fn test_multi_scan_matches_scan_for_each_key_from_one_snapshot() -> Result
         }
         let repeated = keys[0].clone();
         keys.push(repeated);
-        let bounds = bounds_of(drawn.kind, &scan);
+        let bounds = scan.bounds(drawn.kind);
         for (residency, served) in tiers.all() {
             let got = served
                 .table
@@ -727,7 +692,7 @@ async fn test_multi_scan_matches_scan_for_each_key_from_one_snapshot() -> Result
                 assert_eq!(answer, &one.scanned, "{residency} {key}");
                 assert_eq!(
                     answer,
-                    &expected(&drawn.fixture, drawn.kind, key, &columns, &scan),
+                    &drawn.fixture.expected_scanned(key, &columns, &scan),
                     "{residency} {key} {scan:?}"
                 );
             }
@@ -825,7 +790,7 @@ async fn test_paging_by_order_value_returns_the_whole_history_once() -> Result<(
     };
     let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
     for direction in [Direction::NewestFirst, Direction::OldestFirst] {
-        let whole = expected(&fixture, OrderKind::Long, &key, &columns, &all(direction));
+        let whole = fixture.expected_scanned(&key, &columns, &all(direction));
         assert!(whole.rows.len() > usize::try_from(PAGE_LIMIT).unwrap() * 2);
         for (residency, served) in tiers.all() {
             let mut bounds = ScanBounds {
@@ -953,18 +918,18 @@ async fn test_scan_bounds_are_exclusive_at_the_extremes() -> Result<()> {
                 let bounds = ScanBounds {
                     after: after.map(OrderValue::Long),
                     before: before.map(OrderValue::Long),
-                    ..bounds_of(kind, &oldest(None, None))
+                    ..oldest(None, None).bounds(kind)
                 };
                 cases.push((bounds, scan, false));
             }
         }
         for (after, before) in [(Some(stored), None), (None, Some(stored))] {
             let scan = oldest(after, before);
-            cases.push((bounds_of(kind, &scan), scan, true));
+            cases.push((scan.bounds(kind), scan, true));
         }
         let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
         for (bounds, scan, at_stored) in cases {
-            let want = expected(&fixture, kind, &key, &columns, &scan);
+            let want = fixture.expected_scanned(&key, &columns, &scan);
             assert!(!want.rows.is_empty(), "{kind:?} {scan:?} admits rows");
             if at_stored {
                 assert!(
@@ -1065,12 +1030,12 @@ async fn test_cold_scan_of_a_compacted_table_costs_one_get_per_column_and_one_fo
             .scan(
                 &key,
                 &reads(&BOTH),
-                &bounds_of(OrderKind::Long, &TestScan::default()),
+                &TestScan::default().bounds(OrderKind::Long),
             )
             .await?;
         assert_eq!(
             got.scanned,
-            expected(&fixture, OrderKind::Long, &key, &BOTH, &TestScan::default())
+            fixture.expected_scanned(&key, &BOTH, &TestScan::default())
         );
         let (gets, local_reads) = (stats.gets() - before.0, stats.local_reads() - before.1);
         let (want_gets, want_local) = match residency {
@@ -1144,12 +1109,9 @@ async fn test_scan_reads_only_files_that_hold_the_key() -> Result<()> {
             let scan = TestScan::default();
             let got = served
                 .table
-                .scan(&key, &reads(&BOTH), &bounds_of(OrderKind::Long, &scan))
+                .scan(&key, &reads(&BOTH), &scan.bounds(OrderKind::Long))
                 .await?;
-            assert_eq!(
-                got.scanned,
-                expected(&fixture, OrderKind::Long, &key, &BOTH, &scan)
-            );
+            assert_eq!(got.scanned, fixture.expected_scanned(&key, &BOTH, &scan));
             let per_file = match residency {
                 Residency::Full => columns + ORDER_SPAN,
                 Residency::Disk => columns,
@@ -1204,7 +1166,7 @@ async fn test_get_on_an_ordered_table_is_wrong_table_kind() -> Result<()> {
     .await?;
     let kv_tiers = serve_in_every_tier(|residency| kv.config(residency, false)).await?;
     let kv_key = kv.key(COMPACTED_IDS.start);
-    let scan = bounds_of(OrderKind::Long, &TestScan::default());
+    let scan = TestScan::default().bounds(OrderKind::Long);
     for (_, served) in kv_tiers.all() {
         wrong(
             served
@@ -1245,7 +1207,7 @@ async fn test_scan_pages_stay_out_of_the_key_value_cache() -> Result<()> {
             .scan(
                 &key,
                 &reads(&BOTH),
-                &bounds_of(OrderKind::Long, &TestScan::default()),
+                &TestScan::default().bounds(OrderKind::Long),
             )
             .await?;
         assert_eq!(
@@ -1347,7 +1309,7 @@ async fn test_scan_answers_a_column_added_after_a_file_with_its_default() -> Res
         .await?;
     let key = fixture.key(middle_id(&fixture, TWO_BUCKETS));
     let scan = TestScan::default();
-    let mut want = expected(&fixture, OrderKind::Long, &key, &[VALUE_COLUMN], &scan);
+    let mut want = fixture.expected_scanned(&key, &[VALUE_COLUMN], &scan);
     assert!(!want.rows.is_empty());
     for row in &mut want.rows {
         row.values
@@ -1360,7 +1322,7 @@ async fn test_scan_answers_a_column_added_after_a_file_with_its_default() -> Res
         let before = stats.gets();
         let got = served
             .table
-            .scan(&key, &reads(&asked), &bounds_of(OrderKind::Long, &scan))
+            .scan(&key, &reads(&asked), &scan.bounds(OrderKind::Long))
             .await?;
         assert_eq!(got.scanned, want, "{residency}");
         let read_columns = 1;
