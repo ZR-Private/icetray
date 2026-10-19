@@ -2200,54 +2200,6 @@ mod tests {
         }
     }
 
-    /// Without a column index on the order column, the fences place a
-    /// bounded read as they do with one: one round, the order pages and the
-    /// value pages in flight at once, the order pages read locally under
-    /// Disk.
-    #[tokio::test]
-    async fn test_read_run_without_an_order_column_index_reads_one_round() {
-        let mut fixture = bounded_run(0);
-        fixture.layout.statistics = parquet::file::properties::EnabledStatistics::Chunk;
-        let (opened, gauged) = store_gauged(&fixture).await;
-        let loaded = opened.handle.load_metadata().await.unwrap();
-        for residency in Residency::ALL {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_in(&opened, residency, dir.path(), 0).await;
-            let leaf = index.order_leaf_of().leaf;
-            assert!(loaded.column_index().is_none_or(|groups| matches!(
-                groups[0][leaf],
-                parquet::file::page_index::column_index::ColumnIndexMetaData::NONE
-            )));
-            let stats = opened.stats();
-            let reads = Reads::new().await;
-            let run = reads.run(&index).await;
-            let together = 1 + usize::from(residency != Residency::Disk);
-            gauged.fill_to(together);
-            let before = costs(&stats);
-            let got = tokio::time::timeout(DEADLINE_GUARD, read_after_run(&index, &run, &reads))
-                .await
-                .expect("every GET of the read is in flight at once");
-            assert_eq!(got.answer.rows, after_answer(1), "{residency}");
-            assert_eq!(got.answer.next, Some(order_at(22)));
-            let (gets, local) = since(&stats, before);
-            match residency {
-                Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
-                Residency::Disk => assert_eq!((gets, local), (1, 1)),
-            }
-            assert_eq!(gauged.high_water(), together, "{residency}");
-        }
-    }
-
-    /// Oldest first after the order value of the run's row 19, one column:
-    /// rows 20 and 21 of the run, then row 22's order value.
-    async fn read_after_run(index: &FileIndex, run: &Run<'_>, reads: &Reads) -> FileRows {
-        let after = ScanBounds {
-            after: Some(order_at(19)),
-            ..bounds(Direction::OldestFirst)
-        };
-        reads.read(index, run, &after, 2, &none_deleted).await
-    }
-
     /// Every GET of a read counts once in its column's counter, the order
     /// column's in its own, and holds one permit of the fan-out while it
     /// runs, so a fan-out of one runs them one at a time and none waits for
@@ -2306,11 +2258,11 @@ mod tests {
     /// of the order column is one and the same prefix, its maximum that
     /// prefix incremented, above every value of the column.
     const SHARED_PREFIX_BYTES: usize = 32;
-    /// The column index truncation of `prefixed_run`.
+    /// The column index truncation of a truncated `prefixed_run_of`.
     const TRUNCATED_INDEX_BYTES: usize = 16;
     /// The byte the shared prefix repeats.
     const PREFIX_BYTE: u8 = b'p';
-    /// Rows of key 2's run in `prefixed_run`.
+    /// Rows of key 2's run in the short runs of `prefixed_run_of`.
     const PREFIXED_RUN_ROWS: usize = 30;
 
     /// The `j`th byte-array order value of a run in `prefixed_run`: the
@@ -2339,13 +2291,14 @@ mod tests {
 
     /// Key 2's run of `run_rows` rows between one row each of keys 1 and
     /// 3, in pages of `PAGE` in one row group, every key's `j`th row
-    /// ordered by `prefixed(j)`, with the column index truncated to
-    /// `truncate` bytes, `None` leaving it whole.
-    fn prefixed_run(truncate: Option<usize>, run_rows: usize) -> Fixture {
-        prefixed_run_of(truncate, run_rows, prefixed)
+    /// ordered by `prefixed(j)`, with the column index whole.
+    fn prefixed_run(run_rows: usize) -> Fixture {
+        prefixed_run_of(None, run_rows, prefixed)
     }
 
-    /// `prefixed_run` with every key's `j`th row ordered by `value(j)`.
+    /// `prefixed_run` with every key's `j`th row ordered by `value(j)` and
+    /// the column index truncated to `truncate` bytes, `None` leaving it
+    /// whole.
     fn prefixed_run_of(
         truncate: Option<usize>,
         run_rows: usize,
@@ -2366,66 +2319,6 @@ mod tests {
         fixture.layout.row_group_rows = keys.len();
         fixture.layout.truncate = truncate;
         fixture
-    }
-
-    /// A bounded read of a string or binary order column, whole or under a
-    /// truncated column index, answers what the model does in both
-    /// directions: no row inside the bounds is dropped. A truncated entry
-    /// is a bound on its own page alone, never a page's exact extremes, so
-    /// a run-edge page beside it is not ruled out by it.
-    #[tokio::test]
-    async fn test_read_run_bounds_byte_array_orders_under_a_truncated_index() {
-        let limit = 3;
-        let last = PREFIXED_RUN_ROWS - 1;
-        for truncate in [Some(TRUNCATED_INDEX_BYTES), None] {
-            let opened = store(&prefixed_run(truncate, PREFIXED_RUN_ROWS)).await;
-            for order_type in [OrderType::String, OrderType::Binary] {
-                let value = |j: usize| travelling(order_type, prefixed(j));
-                // Newest first below the run's last value, and oldest first
-                // above its first: each bound sits on a run-edge page.
-                let cases = [
-                    (
-                        ScanBounds {
-                            before: Some(value(last)),
-                            ..bounds(Direction::NewestFirst)
-                        },
-                        vec![last - 1, last - 2, last - 3],
-                        last - 4,
-                    ),
-                    (
-                        ScanBounds {
-                            after: Some(value(0)),
-                            ..bounds(Direction::OldestFirst)
-                        },
-                        vec![1, 2, 3],
-                        4,
-                    ),
-                ];
-                for residency in Residency::ALL {
-                    let dir = tempfile::tempdir().unwrap();
-                    let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-                    let reads = Reads::new().await;
-                    let run = reads.run(&index).await;
-                    for (scan, taken, next) in &cases {
-                        let got = reads.read(&index, &run, scan, limit, &none_deleted).await;
-                        let expected: Vec<_> = taken
-                            .iter()
-                            .map(|&j| {
-                                let row = FIRST_RUN_ROW + i64::try_from(j).unwrap();
-                                let value = Bytes::from(value_for(usize::try_from(row).unwrap()));
-                                ScanRow {
-                                    order: travelling(order_type, prefixed(j)),
-                                    values: vec![Some(value)],
-                                }
-                            })
-                            .collect();
-                        let case = format!("{residency} {order_type} {truncate:?} {scan:?}");
-                        assert_eq!(got.answer.rows, expected, "{case}");
-                        assert_eq!(got.answer.next, Some(value(*next)), "{case}");
-                    }
-                }
-            }
-        }
     }
 
     /// Rows of the long runs the bounded probe reads read: many pages
@@ -2845,15 +2738,6 @@ mod tests {
         points: Vec<OrderValue>,
     }
 
-    impl CostFixture {
-        /// The fixture with no column index on any column, the order
-        /// column's included.
-        fn unindexed(mut self) -> Self {
-            self.fixture.layout.statistics = parquet::file::properties::EnabledStatistics::Chunk;
-            self
-        }
-    }
-
     /// The run of `RUN_KEY` in an index whose file is read through
     /// `gauged`, the Disk tier's local directory kept beside it.
     struct Probe<'g> {
@@ -3107,23 +2991,19 @@ mod tests {
         }
     }
 
-    /// The cost fixture of `prefixed_run_of(truncate, rows, value)` read as
-    /// `order_type`.
-    fn byte_cost(
-        truncate: Option<usize>,
-        order_type: OrderType,
-        value: fn(usize) -> Vec<u8>,
-    ) -> CostFixture {
+    /// The cost fixture of `prefixed_run_of(None, PREFIXED_RUN_ROWS, value)`
+    /// read as `order_type`.
+    fn byte_cost(order_type: OrderType, value: fn(usize) -> Vec<u8>) -> CostFixture {
         CostFixture {
-            fixture: prefixed_run_of(truncate, PREFIXED_RUN_ROWS, value),
+            fixture: prefixed_run_of(None, PREFIXED_RUN_ROWS, value),
             order_type,
             value: Box::new(move |j| travelling(order_type, value(j))),
             points: byte_points(order_type, PREFIXED_RUN_ROWS, value),
         }
     }
 
-    /// Under an integer order column, with a column index or none, every
-    /// bounded read is one round within RFD 025's Cost: a run in one row
+    /// Under an integer order column, every bounded read is one round
+    /// within RFD 025's Cost: a run in one row
     /// group between two neighbouring keys' rows, a run over exactly two
     /// pages both shared with a neighbouring key, and a run across three
     /// row groups.
@@ -3131,7 +3011,6 @@ mod tests {
     async fn test_read_run_under_integer_orders_reads_one_round_within_the_promise() {
         let costs = [
             long_cost(bounded_run(0), 30),
-            long_cost(bounded_run(0), 30).unindexed(),
             long_cost(runs_of(&[(1, 3), (2, 4), (3, 3)], 10), 4),
             long_cost(runs_of(&[(1, 5), (2, 16), (3, 3)], 8), 16),
         ];
@@ -3176,24 +3055,18 @@ mod tests {
         );
     }
 
-    /// Under a string or binary order column, whatever its column index,
-    /// full length, truncated short of a prefix every value shares, or
-    /// none, every bounded read is one round within RFD 025's Cost: over a
-    /// run whose values all share a prefix longer than a truncated index
-    /// keeps, one whose two halves have different prefixes, and one whose
-    /// first prefix fills exactly two whole pages.
+    /// Under a string or binary order column, every bounded read is one
+    /// round within RFD 025's Cost: over a run whose values all share a
+    /// long prefix, one whose two halves have different prefixes, and one
+    /// whose first prefix fills exactly two whole pages.
     #[tokio::test]
-    async fn test_read_run_under_byte_orders_reads_one_round_within_the_promise_whatever_the_index()
-    {
+    async fn test_read_run_under_byte_orders_reads_one_round_within_the_promise() {
         let mut seen = Seen::default();
         for order_type in [OrderType::String, OrderType::Binary] {
-            let truncated = Some(TRUNCATED_INDEX_BYTES);
             let costs = [
-                byte_cost(None, order_type, prefixed),
-                byte_cost(None, order_type, prefixed).unindexed(),
-                byte_cost(truncated, order_type, prefixed),
-                byte_cost(truncated, order_type, halved),
-                byte_cost(truncated, order_type, two_low_pages),
+                byte_cost(order_type, prefixed),
+                byte_cost(order_type, halved),
+                byte_cost(order_type, two_low_pages),
             ];
             for cost in &costs {
                 seen += assert_reads_within_the_cost_promise(cost).await;
@@ -3210,10 +3083,10 @@ mod tests {
         );
     }
 
-    /// The run position, in `prefixed_run(None, LONG_PREFIXED_RUN_ROWS)`, of
+    /// The run position, in `prefixed_run(LONG_PREFIXED_RUN_ROWS)`, of
     /// the first row of an order page in the middle of the run.
     const PAGE_START_ROW: usize = 63;
-    /// The run position, in `prefixed_run(None, LONG_PREFIXED_RUN_ROWS)`, of
+    /// The run position, in `prefixed_run(LONG_PREFIXED_RUN_ROWS)`, of
     /// a row in the middle of the page before the run's last page.
     const NEAR_THE_END_ROW: usize = 117;
 
@@ -3224,7 +3097,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_run_newest_first_reads_no_page_past_one_outside_the_bound() {
         let limit = 3;
-        let fixture = prefixed_run(None, LONG_PREFIXED_RUN_ROWS);
+        let fixture = prefixed_run(LONG_PREFIXED_RUN_ROWS);
         let (opened, gauged) = store_gauged(&fixture).await;
         for order_type in [OrderType::String, OrderType::Binary] {
             let value = |j: usize| travelling(order_type, prefixed(j));
@@ -3297,7 +3170,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_run_beside_a_straddling_run_edge_page_reads_the_taken_rows_pages() {
         let limit = 3;
-        let fixture = prefixed_run(None, LONG_PREFIXED_RUN_ROWS);
+        let fixture = prefixed_run(LONG_PREFIXED_RUN_ROWS);
         let (opened, gauged) = store_gauged(&fixture).await;
         let string_value_bytes = 476;
         for order_type in [OrderType::String, OrderType::Binary] {
@@ -3438,7 +3311,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_run_places_a_bound_exactly_from_a_cached_order_page() {
         let limit = 6;
-        let fixture = prefixed_run(None, LONG_PREFIXED_RUN_ROWS);
+        let fixture = prefixed_run(LONG_PREFIXED_RUN_ROWS);
         let (opened, gauged) = store_gauged(&fixture).await;
         let order_type = OrderType::String;
         let value = |j: usize| travelling(order_type, prefixed(j));
