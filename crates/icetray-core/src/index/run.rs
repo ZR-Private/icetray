@@ -1396,6 +1396,31 @@ mod tests {
                 order_gets: None,
             }
         }
+
+        /// The run of `RUN_KEY` in `index`, located through these reads.
+        async fn run(&self, index: &FileIndex) -> Run<'static> {
+            index
+                .locate_run(&RUN_KEY, self.source())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// One read of `run` in `index` through these reads, of the first
+        /// value column.
+        async fn read(
+            &self,
+            index: &FileIndex,
+            run: &Run<'_>,
+            scan: &ScanBounds,
+            limit: u32,
+            deleted: &dyn DeletedRows,
+        ) -> FileRows {
+            index
+                .read_run(run, scan, limit, &[0], deleted, self.source())
+                .await
+                .unwrap()
+        }
     }
 
     /// The GETs and local reads that reading `pages` key pages costs in
@@ -1527,30 +1552,26 @@ mod tests {
             };
             let reads = Reads::new().await;
             let all: Vec<_> = (5..21).map(|row| row_answer(row, row - 5, 1)).collect();
-            let oldest = index
-                .read_run(
+            let oldest = reads
+                .read(
+                    &index,
                     &run,
                     &bounds(Direction::OldestFirst),
                     WHOLE_RUN,
-                    &[0],
                     &none_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             assert_eq!(oldest.answer.rows, all, "{residency}");
             assert_eq!(oldest.answer.next, None);
-            let newest = index
-                .read_run(
+            let newest = reads
+                .read(
+                    &index,
                     &run,
                     &bounds(Direction::NewestFirst),
                     WHOLE_RUN,
-                    &[0],
                     &none_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             assert_eq!(
                 newest.answer.rows,
                 all.into_iter().rev().collect::<Vec<_>>()
@@ -1660,23 +1681,17 @@ mod tests {
             let index = index_in(&opened, residency, dir.path(), 0).await;
             let stats = opened.stats();
             let reads = Reads::new().await;
-            let run = index
-                .locate_run(&Key::Long(2), reads.source())
-                .await
-                .unwrap()
-                .unwrap();
+            let run = reads.run(&index).await;
             let before = stats.gets();
-            let got = index
-                .read_run(
+            let got = reads
+                .read(
+                    &index,
                     &run,
                     &bounds(Direction::NewestFirst),
                     limit,
-                    &[0],
                     &is_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             let expected: Vec<_> = [13, 11, 10]
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
@@ -1688,17 +1703,15 @@ mod tests {
             assert_eq!(stats.gets() - before, order_gets + 1, "{residency}");
 
             let before = stats.gets();
-            let oldest = index
-                .read_run(
+            let oldest = reads
+                .read(
+                    &index,
                     &run,
                     &bounds(Direction::OldestFirst),
                     limit,
-                    &[0],
                     &is_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             let expected: Vec<_> = [1, 2, 3]
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
@@ -1724,17 +1737,10 @@ mod tests {
             let index = index_in(&opened, residency, dir.path(), 0).await;
             let stats = opened.stats();
             let reads = Reads::new().await;
-            let run = index
-                .locate_run(&Key::Long(2), reads.source())
-                .await
-                .unwrap()
-                .unwrap();
+            let run = reads.run(&index).await;
             let newest = bounds(Direction::NewestFirst);
             let before = costs(&stats);
-            let got = index
-                .read_run(&run, &newest, 2, &[0], &is_deleted, reads.source())
-                .await
-                .unwrap();
+            let got = reads.read(&index, &run, &newest, 2, &is_deleted).await;
             let expected: Vec<_> = [14, 13]
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
@@ -1754,32 +1760,24 @@ mod tests {
                 Residency::Disk => assert_eq!((gets, local), (1, 1)),
             }
             let before = costs(&stats);
-            let again = index
-                .read_run(&run, &newest, 2, &[0], &is_deleted, reads.source())
-                .await
-                .unwrap();
+            let again = reads.read(&index, &run, &newest, 2, &is_deleted).await;
             assert_eq!(again.answer.rows, got.answer.rows);
             assert_eq!(again.answer.next, got.answer.next);
             assert_eq!(since(&stats, before).0, 0, "{residency}: warm");
             assert!(!again.from_store, "{residency}");
 
-            let whole = index
-                .read_run(
+            let whole = reads
+                .read(
+                    &index,
                     &run,
                     &newest,
                     u32::try_from(live).unwrap(),
-                    &[0],
                     &is_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             assert_eq!(whole.answer.rows.len(), live);
             assert_eq!(whole.answer.next, None, "{residency}");
-            let none = index
-                .read_run(&run, &newest, 0, &[0], &is_deleted, reads.source())
-                .await
-                .unwrap();
+            let none = reads.read(&index, &run, &newest, 0, &is_deleted).await;
             assert_eq!(none.answer.rows, []);
             assert_eq!(none.answer.next, Some(order_at(14 - FIRST_RUN_ROW)));
         }
@@ -1926,18 +1924,8 @@ mod tests {
         let newest = bounds(Direction::NewestFirst);
         for residency in Residency::ALL {
             let case = format!("{residency}, value bytes {value_bytes:?}");
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_in(&opened, residency, dir.path(), 0).await;
-            let run = index
-                .locate_run(&RUN_KEY, Reads::new().await.source())
-                .await
-                .unwrap()
-                .unwrap();
-            let probe = Probe {
-                index: &index,
-                gauged: &gauged,
-                run: &run,
-            };
+            let probe = Probe::open(&opened, &gauged, residency, OrderType::Long).await;
+            let index = &probe.index;
             testing::take_pages();
             let decoded_before = data_pages_decoded();
             let local_before = opened.stats().local_reads();
@@ -1962,7 +1950,7 @@ mod tests {
             let order_leaf = index.order_leaf().unwrap();
             let pages = |leaf, rows: &[i64]| -> BTreeSet<PageAt> {
                 rows.iter()
-                    .map(|&at| page_of(&index, leaf, row(at)))
+                    .map(|&at| page_of(index, leaf, row(at)))
                     .collect()
             };
             let value_rows = [BELOW_DELETED_ROW, last];
@@ -1976,35 +1964,35 @@ mod tests {
             );
             assert_eq!(walked, order_decoded.len(), "{case}: pages walked");
             let (value_pages, value_gets) = if bridged {
-                (pages_from_first_to_last(&index, value_leaf, &value_rows), 1)
+                (pages_from_first_to_last(index, value_leaf, &value_rows), 1)
             } else {
                 (value_decoded, 2)
             };
             assert_eq!(
-                fetched(&index, value_leaf, &ranges),
+                fetched(index, value_leaf, &ranges),
                 value_pages,
                 "{case}: value pages fetched"
             );
             assert_eq!(
-                gets_of(&index, value_leaf, &ranges),
+                gets_of(index, value_leaf, &ranges),
                 value_gets,
                 "{case}: value GETs"
             );
             let (order_pages, order_gets, order_local) = match residency {
                 Residency::Disk => (BTreeSet::new(), 0, 1),
                 Residency::Full | Residency::Bloom => (
-                    pages_from_first_to_last(&index, order_leaf, &order_rows),
+                    pages_from_first_to_last(index, order_leaf, &order_rows),
                     1,
                     0,
                 ),
             };
             assert_eq!(
-                fetched(&index, order_leaf, &ranges),
+                fetched(index, order_leaf, &ranges),
                 order_pages,
                 "{case}: order pages fetched"
             );
             assert_eq!(
-                gets_of(&index, order_leaf, &ranges),
+                gets_of(index, order_leaf, &ranges),
                 order_gets,
                 "{case}: order GETs"
             );
@@ -2063,11 +2051,7 @@ mod tests {
             let before = stats.gets();
             let together = columns.len() + order_gets;
             gauged.fill_to(key_page_gets.max(1));
-            let run = index
-                .locate_run(&Key::Long(2), reads.source())
-                .await
-                .unwrap()
-                .unwrap();
+            let run = reads.run(&index).await;
             gauged.fill_to(together);
             let got = tokio::time::timeout(DEADLINE_GUARD, async {
                 let after = ScanBounds {
@@ -2105,21 +2089,16 @@ mod tests {
             let index = index_in(&opened, residency, dir.path(), 0).await;
             let stats = opened.stats();
             let reads = Reads::new().await;
-            let run = index
-                .locate_run(&Key::Long(2), reads.source())
-                .await
-                .unwrap()
-                .unwrap();
+            let run = reads.run(&index).await;
             let before_ten = ScanBounds {
                 before: Some(order_at(10)),
                 ..bounds(Direction::NewestFirst)
             };
             let before = costs(&stats);
             let bytes_before = stats.bytes();
-            let got = index
-                .read_run(&run, &before_ten, 2, &[0], &none_deleted, reads.source())
-                .await
-                .unwrap();
+            let got = reads
+                .read(&index, &run, &before_ten, 2, &none_deleted)
+                .await;
             let expected: Vec<_> = [9, 8]
                 .into_iter()
                 .map(|j| row_answer(j + FIRST_RUN_ROW, j, 1))
@@ -2156,11 +2135,7 @@ mod tests {
 
     /// The bytes data pages `pages` of leaf `leaf` take in row group 0.
     fn page_bytes(index: &FileIndex, leaf: usize, pages: Range<usize>) -> u64 {
-        let locations = index.metadata().offset_index().unwrap()[0][leaf].page_locations();
-        locations[pages]
-            .iter()
-            .map(|location| u64::try_from(location.compressed_page_size).unwrap())
-            .sum()
+        bytes_of(index, leaf, &pages.map(|page| (0, page)).collect())
     }
 
     /// Dictionary-encoded columns cost their dictionary page beside each
@@ -2198,17 +2173,15 @@ mod tests {
             };
             let reads = Reads::new().await;
             let before = costs(&stats);
-            let got = index
-                .read_run(
+            let got = reads
+                .read(
+                    &index,
                     &run,
                     &bounds(Direction::NewestFirst),
                     3,
-                    &[0],
                     &none_deleted,
-                    reads.source(),
                 )
-                .await
-                .unwrap();
+                .await;
             let expected: Vec<_> = [14, 13, 12]
                 .into_iter()
                 .map(|row| {
@@ -2247,11 +2220,7 @@ mod tests {
             )));
             let stats = opened.stats();
             let reads = Reads::new().await;
-            let run = index
-                .locate_run(&Key::Long(2), reads.source())
-                .await
-                .unwrap()
-                .unwrap();
+            let run = reads.run(&index).await;
             let together = 1 + usize::from(residency != Residency::Disk);
             gauged.fill_to(together);
             let before = costs(&stats);
@@ -2276,10 +2245,7 @@ mod tests {
             after: Some(order_at(19)),
             ..bounds(Direction::OldestFirst)
         };
-        index
-            .read_run(run, &after, 2, &[0], &none_deleted, reads.source())
-            .await
-            .unwrap()
+        reads.read(index, run, &after, 2, &none_deleted).await
     }
 
     /// Every GET of a read counts once in its column's counter, the order
@@ -2306,11 +2272,7 @@ mod tests {
             order_gets: Some(&handles[2]),
             ..reads.source()
         };
-        let run = index
-            .locate_run(&Key::Long(2), source)
-            .await
-            .unwrap()
-            .unwrap();
+        let run = index.locate_run(&RUN_KEY, source).await.unwrap().unwrap();
         gauged.fill_to(1);
         let before = stats.gets();
         let got = index
@@ -2443,16 +2405,9 @@ mod tests {
                     let dir = tempfile::tempdir().unwrap();
                     let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
                     let reads = Reads::new().await;
-                    let run = index
-                        .locate_run(&Key::Long(2), reads.source())
-                        .await
-                        .unwrap()
-                        .unwrap();
+                    let run = reads.run(&index).await;
                     for (scan, taken, next) in &cases {
-                        let got = index
-                            .read_run(&run, scan, limit, &[0], &none_deleted, reads.source())
-                            .await
-                            .unwrap();
+                        let got = reads.read(&index, &run, scan, limit, &none_deleted).await;
                         let expected: Vec<_> = taken
                             .iter()
                             .map(|&j| {
@@ -2899,18 +2854,38 @@ mod tests {
         }
     }
 
-    /// A run of an index whose file is read through `gauged`.
-    #[derive(Clone, Copy)]
-    struct Probe<'a> {
-        index: &'a FileIndex,
-        gauged: &'a Gauged,
-        run: &'a Run<'a>,
+    /// The run of `RUN_KEY` in an index whose file is read through
+    /// `gauged`, the Disk tier's local directory kept beside it.
+    struct Probe<'g> {
+        index: FileIndex,
+        run: Run<'static>,
+        gauged: &'g Gauged,
+        _dir: tempfile::TempDir,
     }
 
-    impl Probe<'_> {
+    impl<'g> Probe<'g> {
+        /// The run in the index of `opened` in `residency` with an order
+        /// column of `order_type`, located on a fresh cache.
+        async fn open(
+            opened: &Opened,
+            gauged: &'g Gauged,
+            residency: Residency,
+            order_type: OrderType,
+        ) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let index = index_of_type(opened, residency, dir.path(), 0, order_type).await;
+            let run = Reads::new().await.run(&index).await;
+            Self {
+                index,
+                run,
+                gauged,
+                _dir: dir,
+            }
+        }
+
         /// One read on a fresh cache, and the byte ranges of its GETs.
         async fn read(
-            self,
+            &self,
             scan: &ScanBounds,
             limit: u32,
             deleted: &dyn DeletedRows,
@@ -2921,25 +2896,23 @@ mod tests {
 
         /// One read through `reads`, and the byte ranges of its GETs.
         async fn read_through(
-            self,
+            &self,
             reads: &Reads,
             scan: &ScanBounds,
             limit: u32,
             deleted: &dyn DeletedRows,
         ) -> (FileRows, Vec<Range<u64>>) {
             self.gauged.take_ranges();
-            let got = self
-                .index
-                .read_run(self.run, scan, limit, &[0], deleted, reads.source())
-                .await
-                .unwrap();
+            let got = reads
+                .read(&self.index, &self.run, scan, limit, deleted)
+                .await;
             (got, self.gauged.take_ranges())
         }
 
         /// Asserts that the read of `scan` runs its `gets` GETs in one
         /// round, all in flight at once, on a fresh cache.
         async fn assert_one_round(
-            self,
+            &self,
             scan: &ScanBounds,
             limit: u32,
             deleted: &dyn DeletedRows,
@@ -2950,12 +2923,10 @@ mod tests {
             self.gauged.fill_to(gets);
             tokio::time::timeout(
                 DEADLINE_GUARD,
-                self.index
-                    .read_run(self.run, scan, limit, &[0], deleted, reads.source()),
+                reads.read(&self.index, &self.run, scan, limit, deleted),
             )
             .await
-            .unwrap_or_else(|_| panic!("{case}: the read's {gets} GETs are not in flight at once"))
-            .unwrap();
+            .unwrap_or_else(|_| panic!("{case}: the read's {gets} GETs are not in flight at once"));
             self.gauged.take_ranges();
         }
     }
@@ -2993,6 +2964,17 @@ mod tests {
         left_out: usize,
     }
 
+    impl std::ops::AddAssign for Seen {
+        fn add_assign(&mut self, other: Self) {
+            self.values += other.values;
+            self.rounds += other.rounds;
+            self.beyond += other.beyond;
+            self.exact += other.exact;
+            self.bridged += other.bridged;
+            self.left_out += other.left_out;
+        }
+    }
+
     /// Reads `cost`'s run at every bounded read of its points, every limit
     /// of `COST_LIMITS`, with no row deleted, with `some_deleted`, and with
     /// whole pages deleted by `middle_half_deleted` and
@@ -3013,26 +2995,16 @@ mod tests {
         let (opened, gauged) = store_gauged(&cost.fixture).await;
         let mut seen = Seen::default();
         for residency in Residency::ALL {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_of_type(&opened, residency, dir.path(), 0, cost.order_type).await;
-            let run = index
-                .locate_run(&RUN_KEY, Reads::new().await.source())
-                .await
-                .unwrap()
-                .unwrap();
-            let probe = Probe {
-                index: &index,
-                gauged: &gauged,
-                run: &run,
-            };
-            let rows = rows_of(&run);
+            let probe = Probe::open(&opened, &gauged, residency, cost.order_type).await;
+            let (index, run) = (&probe.index, &probe.run);
+            let rows = rows_of(run);
             let orders: Vec<OrderValue> = (0..rows.len()).map(&cost.value).collect();
             let value_leaf = index.value_leaf(0).unwrap();
             let deleted_sets = [
                 BTreeSet::new(),
                 some_deleted(rows.len()),
                 middle_half_deleted(rows.len()),
-                alternate_pages_deleted(&index, value_leaf, &rows),
+                alternate_pages_deleted(index, value_leaf, &rows),
             ];
             for deleted in deleted_sets {
                 let positions: BTreeSet<u64> = deleted
@@ -3048,7 +3020,7 @@ mod tests {
                             cost.order_type
                         );
                         let expected = model(
-                            &index,
+                            index,
                             &rows,
                             &orders,
                             &cost.fixture.values,
@@ -3062,7 +3034,7 @@ mod tests {
                         assert_eq!(got.answer.rows, expected.rows, "{case}");
                         assert_eq!(got.answer.next, expected.next, "{case}");
                         let read = ReadOf {
-                            index: &index,
+                            index,
                             rows: &rows,
                             orders: &orders,
                             deleted: &deleted,
@@ -3165,10 +3137,7 @@ mod tests {
         ];
         let mut seen = Seen::default();
         for cost in &costs {
-            let read = assert_reads_within_the_cost_promise(cost).await;
-            seen.beyond += read.beyond;
-            seen.exact += read.exact;
-            seen.bridged += read.bridged;
+            seen += assert_reads_within_the_cost_promise(cost).await;
         }
         assert!(
             seen.beyond > 0,
@@ -3227,10 +3196,7 @@ mod tests {
                 byte_cost(truncated, order_type, two_low_pages),
             ];
             for cost in &costs {
-                let read = assert_reads_within_the_cost_promise(cost).await;
-                seen.beyond += read.beyond;
-                seen.exact += read.exact;
-                seen.bridged += read.bridged;
+                seen += assert_reads_within_the_cost_promise(cost).await;
             }
         }
         assert!(
@@ -3268,24 +3234,14 @@ mod tests {
             };
             let taken = [PAGE_START_ROW - 1, PAGE_START_ROW - 2, PAGE_START_ROW - 3];
             for residency in Residency::ALL {
-                let dir = tempfile::tempdir().unwrap();
-                let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-                let run = index
-                    .locate_run(&RUN_KEY, Reads::new().await.source())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let probe = Probe {
-                    index: &index,
-                    gauged: &gauged,
-                    run: &run,
-                };
-                let rows = rows_of(&run);
+                let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+                let (index, run) = (&probe.index, &probe.run);
+                let rows = rows_of(run);
                 let case = format!("{residency} {order_type}");
                 let (got, ranges) = probe.read(&scan, limit, &none_deleted).await;
                 let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
                 let expected = model(
-                    &index,
+                    index,
                     &rows,
                     &orders,
                     &fixture.values,
@@ -3297,17 +3253,14 @@ mod tests {
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
                 assert_eq!(got.answer.next, Some(value(PAGE_START_ROW - 4)), "{case}");
                 let value_leaf = index.value_leaf(0).unwrap();
-                let held: BTreeSet<PageAt> = pages_of(
-                    &index,
-                    value_leaf,
-                    &rows[PAGE_START_ROW - 4..PAGE_START_ROW],
-                )
-                .into_iter()
-                .collect();
-                let values = fetched(&index, value_leaf, &ranges);
+                let held: BTreeSet<PageAt> =
+                    pages_of(index, value_leaf, &rows[PAGE_START_ROW - 4..PAGE_START_ROW])
+                        .into_iter()
+                        .collect();
+                let values = fetched(index, value_leaf, &ranges);
                 let (read, needed) = (
-                    bytes_of(&index, value_leaf, &values),
-                    bytes_of(&index, value_leaf, &held),
+                    bytes_of(index, value_leaf, &values),
+                    bytes_of(index, value_leaf, &held),
                 );
                 assert!(needed > 0, "{case}");
                 assert_eq!(
@@ -3316,7 +3269,7 @@ mod tests {
                 );
                 if residency != Residency::Disk {
                     let order_leaf = index.order_leaf().unwrap();
-                    assert_eq!(fetched(&index, order_leaf, &ranges), held, "{case}");
+                    assert_eq!(fetched(index, order_leaf, &ranges), held, "{case}");
                 }
                 probe
                     .assert_one_round(&scan, limit, &none_deleted, ranges.len(), &case)
@@ -3354,24 +3307,14 @@ mod tests {
                 ..bounds(Direction::NewestFirst)
             };
             for residency in Residency::ALL {
-                let dir = tempfile::tempdir().unwrap();
-                let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-                let run = index
-                    .locate_run(&RUN_KEY, Reads::new().await.source())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let probe = Probe {
-                    index: &index,
-                    gauged: &gauged,
-                    run: &run,
-                };
-                let rows = rows_of(&run);
+                let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+                let (index, run) = (&probe.index, &probe.run);
+                let rows = rows_of(run);
                 let case = format!("{residency} {order_type}");
                 let (got, ranges) = probe.read(&scan, limit, &none_deleted).await;
                 let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
                 let expected = model(
-                    &index,
+                    index,
                     &rows,
                     &orders,
                     &fixture.values,
@@ -3381,23 +3324,23 @@ mod tests {
                 );
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
                 assert_eq!(got.answer.next, Some(value(NEAR_THE_END_ROW - 4)), "{case}");
-                let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
+                let (held, needed) = taken_bytes(index, &rows, &expected.taken);
                 assert_eq!(held.len(), 2, "{case}");
                 if order_type == OrderType::String {
                     assert_eq!(needed, string_value_bytes, "{case}");
                 }
                 let value_leaf = index.value_leaf(0).unwrap();
-                assert_eq!(fetched(&index, value_leaf, &ranges), held, "{case}");
+                assert_eq!(fetched(index, value_leaf, &ranges), held, "{case}");
                 if residency != Residency::Disk {
                     let order_leaf = index.order_leaf().unwrap();
                     let walked: BTreeSet<PageAt> = pages_of(
-                        &index,
+                        index,
                         order_leaf,
                         &rows[NEAR_THE_END_ROW - 6..=NEAR_THE_END_ROW + 1],
                     )
                     .into_iter()
                     .collect();
-                    assert_eq!(fetched(&index, order_leaf, &ranges), walked, "{case}");
+                    assert_eq!(fetched(index, order_leaf, &ranges), walked, "{case}");
                 }
                 probe
                     .assert_one_round(&scan, limit, &none_deleted, ranges.len(), &case)
@@ -3418,19 +3361,9 @@ mod tests {
         let page_value_bytes = 238;
         let fixture = bounded_run(0);
         let (opened, gauged) = store_gauged(&fixture).await;
-        let dir = tempfile::tempdir().unwrap();
-        let index = index_in(&opened, Residency::Disk, dir.path(), 0).await;
-        let run = index
-            .locate_run(&RUN_KEY, Reads::new().await.source())
-            .await
-            .unwrap()
-            .unwrap();
-        let probe = Probe {
-            index: &index,
-            gauged: &gauged,
-            run: &run,
-        };
-        let rows = rows_of(&run);
+        let probe = Probe::open(&opened, &gauged, Residency::Disk, OrderType::Long).await;
+        let (index, run) = (&probe.index, &probe.run);
+        let rows = rows_of(run);
         let orders: Vec<OrderValue> = (0..rows.len())
             .map(|j| order_at(i64::try_from(j).unwrap()))
             .collect();
@@ -3445,7 +3378,7 @@ mod tests {
                 let case = format!("before {before}");
                 let (got, ranges) = probe.read(&scan, limit, &none_deleted).await;
                 let expected = model(
-                    &index,
+                    index,
                     &rows,
                     &orders,
                     &fixture.values,
@@ -3455,13 +3388,13 @@ mod tests {
                 );
                 assert_eq!(got.answer.rows, expected.rows, "{case}");
                 assert_eq!(got.answer.next, expected.next, "{case}");
-                let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
+                let (held, needed) = taken_bytes(index, &rows, &expected.taken);
                 assert_eq!(held.len(), 1, "{case}");
                 assert_eq!(needed, page_value_bytes, "{case}");
-                assert_eq!(fetched(&index, value_leaf, &ranges), held, "{case}");
+                assert_eq!(fetched(index, value_leaf, &ranges), held, "{case}");
                 let none = BTreeSet::new();
                 let read = ReadOf {
-                    index: &index,
+                    index,
                     rows: &rows,
                     orders: &orders,
                     deleted: &none,
@@ -3514,22 +3447,12 @@ mod tests {
             ..bounds(Direction::NewestFirst)
         };
         for residency in [Residency::Full, Residency::Bloom] {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-            let run = index
-                .locate_run(&RUN_KEY, Reads::new().await.source())
-                .await
-                .unwrap()
-                .unwrap();
-            let probe = Probe {
-                index: &index,
-                gauged: &gauged,
-                run: &run,
-            };
-            let rows = rows_of(&run);
+            let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+            let (index, run) = (&probe.index, &probe.run);
+            let rows = rows_of(run);
             let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
             let expected = model(
-                &index,
+                index,
                 &rows,
                 &orders,
                 &fixture.values,
@@ -3537,14 +3460,14 @@ mod tests {
                 &scan,
                 limit,
             );
-            let (held, _) = taken_bytes(&index, &rows, &expected.taken);
+            let (held, _) = taken_bytes(index, &rows, &expected.taken);
             let (value_leaf, order_leaf) =
                 (index.value_leaf(0).unwrap(), index.order_leaf().unwrap());
             let case = residency.to_string();
 
             let (cold, ranges) = probe.read(&scan, limit, &none_deleted).await;
             assert_eq!(cold.answer.rows, expected.rows, "{case}");
-            let shifted = fetched(&index, value_leaf, &ranges);
+            let shifted = fetched(index, value_leaf, &ranges);
             assert!(held.is_subset(&shifted), "{case}");
             assert_eq!(
                 shifted.len(),
@@ -3552,15 +3475,15 @@ mod tests {
                 "{case}: {shifted:?} {held:?}"
             );
 
-            let bound_page = page_of(&index, order_leaf, rows[NEAR_THE_END_ROW]);
-            let reads = reads_holding(&index, bound_page).await;
+            let bound_page = page_of(index, order_leaf, rows[NEAR_THE_END_ROW]);
+            let reads = reads_holding(index, bound_page).await;
             let (warm, ranges) = probe
                 .read_through(&reads, &scan, limit, &none_deleted)
                 .await;
             assert_eq!(warm.answer.rows, expected.rows, "{case}");
             assert_eq!(warm.answer.next, expected.next, "{case}");
-            assert_eq!(fetched(&index, value_leaf, &ranges), held, "{case}");
-            let orders_fetched = fetched(&index, order_leaf, &ranges);
+            assert_eq!(fetched(index, value_leaf, &ranges), held, "{case}");
+            let orders_fetched = fetched(index, order_leaf, &ranges);
             assert!(
                 !orders_fetched.contains(&bound_page),
                 "{case}: {orders_fetched:?}"
@@ -3570,7 +3493,7 @@ mod tests {
                 "{case}: the rows past the bound's page"
             );
 
-            let reads = reads_holding(&index, bound_page).await;
+            let reads = reads_holding(index, bound_page).await;
             gauged.fill_to(ranges.len());
             tokio::time::timeout(
                 DEADLINE_GUARD,
@@ -3599,18 +3522,8 @@ mod tests {
             ..bounds(Direction::OldestFirst)
         };
         for residency in Residency::ALL {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_in(&opened, residency, dir.path(), 0).await;
-            let run = index
-                .locate_run(&RUN_KEY, Reads::new().await.source())
-                .await
-                .unwrap()
-                .unwrap();
-            let probe = Probe {
-                index: &index,
-                gauged: &gauged,
-                run: &run,
-            };
+            let probe = Probe::open(&opened, &gauged, residency, OrderType::Long).await;
+            let index = &probe.index;
             let (got, ranges) = probe.read(&after_ten, limit, &none_deleted).await;
             assert_eq!(
                 got.answer.rows,
@@ -3622,7 +3535,7 @@ mod tests {
             assert_eq!(ranges.len(), 1 + order_gets, "{residency}");
             let value_leaf = index.value_leaf(0).unwrap();
             assert_eq!(
-                fetched(&index, value_leaf, &ranges),
+                fetched(index, value_leaf, &ranges),
                 [(0, 1)].into_iter().collect(),
                 "{residency}"
             );
@@ -3681,20 +3594,9 @@ mod tests {
                         ),
                     ];
                     for residency in Residency::ALL {
-                        let dir = tempfile::tempdir().unwrap();
-                        let index =
-                            index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-                        let run = index
-                            .locate_run(&RUN_KEY, Reads::new().await.source())
-                            .await
-                            .unwrap()
-                            .unwrap();
-                        let probe = Probe {
-                            index: &index,
-                            gauged: &gauged,
-                            run: &run,
-                        };
-                        let rows = rows_of(&run);
+                        let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+                        let (index, run) = (&probe.index, &probe.run);
+                        let rows = rows_of(run);
                         let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
                         let order_leaf = index.order_leaf().unwrap();
                         let value_leaf = index.value_leaf(0).unwrap();
@@ -3704,7 +3606,7 @@ mod tests {
                             );
                             let (got, ranges) = probe.read(scan, limit, &none_deleted).await;
                             let expected = model(
-                                &index,
+                                index,
                                 &rows,
                                 &orders,
                                 &fixture.values,
@@ -3715,16 +3617,16 @@ mod tests {
                             assert_eq!(expected.taken, taken, "{case}");
                             assert_eq!(got.answer.rows, expected.rows, "{case}");
                             assert_eq!(got.answer.next, Some(value(*next)), "{case}");
-                            let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
-                            let values = fetched(&index, value_leaf, &ranges);
+                            let (held, needed) = taken_bytes(index, &rows, &expected.taken);
+                            let values = fetched(index, value_leaf, &ranges);
                             assert!(needed > 0, "{case}");
                             assert_eq!(values, held, "{case}");
                             if residency != Residency::Disk {
                                 let walked: BTreeSet<PageAt> =
-                                    pages_of(&index, order_leaf, &rows[order_rows.clone()])
+                                    pages_of(index, order_leaf, &rows[order_rows.clone()])
                                         .into_iter()
                                         .collect();
-                                assert_eq!(fetched(&index, order_leaf, &ranges), walked, "{case}");
+                                assert_eq!(fetched(index, order_leaf, &ranges), walked, "{case}");
                             }
                             probe
                                 .assert_one_round(scan, limit, &none_deleted, ranges.len(), &case)
@@ -3771,28 +3673,18 @@ mod tests {
             };
             let taken = [LOW_BOUND_ROW + 1, LOW_BOUND_ROW + 2, LOW_BOUND_ROW + 3];
             for residency in Residency::ALL {
-                let dir = tempfile::tempdir().unwrap();
-                let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-                let run = index
-                    .locate_run(&RUN_KEY, Reads::new().await.source())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let probe = Probe {
-                    index: &index,
-                    gauged: &gauged,
-                    run: &run,
-                };
-                let rows = rows_of(&run);
+                let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+                let (index, run) = (&probe.index, &probe.run);
+                let rows = rows_of(run);
                 let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
-                let (held, needed) = taken_bytes(&index, &rows, &taken);
+                let (held, needed) = taken_bytes(index, &rows, &taken);
                 assert!(needed > 0);
                 let value_leaf = index.value_leaf(0).unwrap();
                 for scan in [&after, &both] {
                     let case = format!("{residency} {order_type} {scan:?}");
                     let (got, ranges) = probe.read(scan, limit, &none_deleted).await;
                     let expected = model(
-                        &index,
+                        index,
                         &rows,
                         &orders,
                         &fixture.values,
@@ -3803,7 +3695,7 @@ mod tests {
                     assert_eq!(expected.taken, taken, "{case}");
                     assert_eq!(got.answer.rows, expected.rows, "{case}");
                     assert_eq!(got.answer.next, Some(value(LOW_BOUND_ROW + 4)), "{case}");
-                    let values = fetched(&index, value_leaf, &ranges);
+                    let values = fetched(index, value_leaf, &ranges);
                     assert_eq!(
                         values, held,
                         "{case}: value pages {values:?}, taken {held:?}"
@@ -3834,27 +3726,17 @@ mod tests {
             ..bounds(Direction::OldestFirst)
         };
         for residency in [Residency::Full, Residency::Bloom] {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_of_type(&opened, residency, dir.path(), 0, order_type).await;
-            let run = index
-                .locate_run(&RUN_KEY, Reads::new().await.source())
-                .await
-                .unwrap()
-                .unwrap();
-            let probe = Probe {
-                index: &index,
-                gauged: &gauged,
-                run: &run,
-            };
-            let rows = rows_of(&run);
+            let probe = Probe::open(&opened, &gauged, residency, order_type).await;
+            let (index, run) = (&probe.index, &probe.run);
+            let rows = rows_of(run);
             let (got, ranges) = probe.read(&scan, limit_u32(limit), &none_deleted).await;
             assert_eq!(got.answer.rows.len(), limit, "{residency}");
             assert_eq!(got.answer.next, Some(value(limit)), "{residency}");
             let order_leaf = index.order_leaf().unwrap();
-            let walked: BTreeSet<PageAt> = pages_of(&index, order_leaf, &rows[..=limit])
+            let walked: BTreeSet<PageAt> = pages_of(index, order_leaf, &rows[..=limit])
                 .into_iter()
                 .collect();
-            assert_eq!(fetched(&index, order_leaf, &ranges), walked, "{residency}");
+            assert_eq!(fetched(index, order_leaf, &ranges), walked, "{residency}");
         }
     }
 
@@ -3884,11 +3766,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = index_in(&opened, Residency::Full, dir.path(), 0).await;
         let reads = Reads::new().await;
-        let run = index
-            .locate_run(&RUN_KEY, reads.source())
-            .await
-            .unwrap()
-            .unwrap();
+        let run = reads.run(&index).await;
         let scan = scan(rows);
         let read = || index.read_run(&run, &scan, WORK_LIMIT, &[0], &none_deleted, reads.source());
         read().await.unwrap();
@@ -3981,11 +3859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = index_in(&opened, Residency::Full, dir.path(), 0).await;
         let reads = Reads::new().await;
-        let run = index
-            .locate_run(&RUN_KEY, reads.source())
-            .await
-            .unwrap()
-            .unwrap();
+        let run = reads.run(&index).await;
         let newest = bounds(Direction::NewestFirst);
         let order = index.order_leaf_of();
         let rows = [RowRef {
