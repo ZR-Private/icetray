@@ -752,14 +752,7 @@ impl Fixture {
         Row::Present(
             columns
                 .iter()
-                .map(|&column| {
-                    let value = match column {
-                        VALUE_COLUMN => self.value(key),
-                        SECOND_VALUE_COLUMN => self.second_value(key),
-                        other => panic!("the fixture writes no column {other}"),
-                    };
-                    value.map(Bytes::from)
-                })
+                .map(|&column| column_value(column, self.value(key)).map(Bytes::from))
                 .collect(),
         )
     }
@@ -828,11 +821,7 @@ impl Fixture {
             });
             let values = columns
                 .iter()
-                .map(|&column| match column {
-                    VALUE_COLUMN => value.clone(),
-                    SECOND_VALUE_COLUMN => value.clone().map(reversed),
-                    other => panic!("the fixture writes no column {other}"),
-                })
+                .map(|&column| column_value(column, value.clone()))
                 .collect();
             (order, values)
         });
@@ -2292,6 +2281,18 @@ fn batch(
 fn reversed(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.reverse();
     bytes
+}
+
+/// What `column` holds for a row whose `VALUE_COLUMN` holds `value`: the
+/// value itself, or in `SECOND_VALUE_COLUMN` the value reversed.
+///
+/// Panics on a column the fixture writes no value for.
+fn column_value(column: &str, value: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match column {
+        VALUE_COLUMN => value,
+        SECOND_VALUE_COLUMN => value.map(reversed),
+        other => panic!("the fixture writes no column {other}"),
+    }
 }
 
 /// The message of the impossible case: `key_at_shaped` builds every key
