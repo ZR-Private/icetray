@@ -15,8 +15,9 @@
 //! where no file meets a checked one, as an append of later rows does, is
 //! merged with nothing and reads nothing.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -421,6 +422,39 @@ impl<'a> PageWalk<'a> {
     }
 }
 
+/// A member's next page in `chosen_pages`' sweep, in a max-heap that pops
+/// the least fence first, the lesser member first among equal ones, every
+/// comparison counted in `compared`.
+struct Next<'a, 'c> {
+    low: Pair<'a>,
+    member: usize,
+    compared: &'c Cell<u64>,
+}
+
+impl PartialEq for Next<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Next<'_, '_> {}
+
+impl PartialOrd for Next<'_, '_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Next<'_, '_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.compared.set(self.compared.get() + 1);
+        other
+            .low
+            .cmp(&self.low)
+            .then_with(|| other.member.cmp(&self.member))
+    }
+}
+
 /// One row group of a file and the order pages of it a merge reads,
 /// ascending, with the step of `chosen_pages`' sweep that passed the last
 /// of them: the sweep takes pages by fence, in the order the merge takes
@@ -472,10 +506,9 @@ fn chosen_pages(
     counterparts: &[Vec<usize>],
     compared: &mut u64,
 ) -> Vec<(usize, Vec<GroupPages>)> {
+    let counted = Cell::new(0);
     let mut walks: Vec<Option<PageWalk<'_>>> = Vec::with_capacity(group.len());
-    // Each member's next fence and the member: the least fence first, the
-    // lesser member first among equal ones.
-    let mut heap = MinHeap::with_capacity(group.len());
+    let mut heap = BinaryHeap::new();
     for (member, theirs) in counterparts.iter().enumerate() {
         let walk = if theirs.is_empty() {
             None
@@ -488,14 +521,18 @@ fn chosen_pages(
             PageWalk::first(fences, Pair::of(span.span.last, span.orders.1))
         };
         if let Some(walk) = &walk {
-            heap.push((walk.range().low, member), counted(compared));
+            heap.push(Next {
+                low: walk.range().low,
+                member,
+                compared: &counted,
+            });
         }
         walks.push(walk);
     }
     let mut latest: Vec<Option<PageRange<'_>>> = (0..group.len()).map(|_| None).collect();
     let mut reads: Vec<Vec<GroupPages>> = vec![Vec::new(); group.len()];
     let mut step = 0;
-    while let Some((_, member)) = heap.pop(counted(compared)) {
+    while let Some(Next { member, .. }) = heap.pop() {
         step += 1;
         let walk = walks[member]
             .take()
@@ -521,9 +558,15 @@ fn chosen_pages(
         latest[member] = Some(ours);
         walks[member] = walk.next();
         if let Some(walk) = &walks[member] {
-            heap.push((walk.range().low, member), counted(compared));
+            heap.push(Next {
+                low: walk.range().low,
+                member,
+                compared: &counted,
+            });
         }
     }
+    drop(heap);
+    *compared += counted.get();
     for (member, page) in latest.into_iter().enumerate() {
         if let Some(page) = page {
             keep(&mut reads[member], &page, step);
@@ -991,118 +1034,68 @@ impl PairCursor {
     }
 }
 
-/// A binary min-heap whose order is the comparison each push and pop is
-/// passed, so that its items may stand for state it does not hold, which
-/// may change while an item is out of the heap, and so that a caller can
-/// count the comparisons. Every call passes the same order, under which
-/// the items held keep theirs.
-struct MinHeap<T> {
-    items: Vec<T>,
-}
-
-impl<T: Copy> MinHeap<T> {
-    /// No item, with room for `capacity`.
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            items: Vec::with_capacity(capacity),
-        }
-    }
-
-    /// The least item, left in the heap.
-    fn peek(&self) -> Option<T> {
-        self.items.first().copied()
-    }
-
-    /// Puts `item` in the heap by `cmp`.
-    fn push(&mut self, item: T, mut cmp: impl FnMut(T, T) -> Ordering) {
-        self.items.push(item);
-        let mut at = self.items.len() - 1;
-        while at > 0 {
-            let parent = (at - 1) / 2;
-            if cmp(self.items[at], self.items[parent]) != Ordering::Less {
-                break;
-            }
-            self.items.swap(at, parent);
-            at = parent;
-        }
-    }
-
-    /// Takes the least item by `cmp` out of the heap.
-    fn pop(&mut self, mut cmp: impl FnMut(T, T) -> Ordering) -> Option<T> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let least = self.items.swap_remove(0);
-        let mut at = 0;
-        loop {
-            let left = 2 * at + 1;
-            if left >= self.items.len() {
-                break;
-            }
-            let right = left + 1;
-            let mut lesser = left;
-            if right < self.items.len()
-                && cmp(self.items[right], self.items[left]) == Ordering::Less
-            {
-                lesser = right;
-            }
-            if cmp(self.items[lesser], self.items[at]) != Ordering::Less {
-                break;
-            }
-            self.items.swap(at, lesser);
-            at = lesser;
-        }
-        Some(least)
-    }
-}
-
-/// The order of `T`, each comparison counted in `compared`.
-fn counted<T: Ord>(compared: &mut u64) -> impl FnMut(T, T) -> Ordering + '_ {
-    move |a, b| {
-        *compared += 1;
-        a.cmp(&b)
-    }
-}
-
-/// Cursors in a min-heap by head (`MinHeap`), counting the comparisons of
-/// two heads it makes.
+/// Cursors in a binary min-heap by head, counting the comparisons of two
+/// heads it makes.
 struct Heads {
     cursors: Vec<PairCursor>,
     /// Indices into `cursors`, a heap by head.
-    heap: MinHeap<usize>,
+    heap: Vec<usize>,
     compared: u64,
 }
 
 impl Heads {
     /// The head of cursor `a` against that of cursor `b`.
     fn cmp(&mut self, a: usize, b: usize) -> Ordering {
-        by_head(&self.cursors, &mut self.compared, a, b)
+        self.compared += 1;
+        self.cursors[a].cmp_head(&self.cursors[b])
     }
 
     /// The cursor with the least head, left in the heap.
     fn peek(&self) -> Option<usize> {
-        self.heap.peek()
+        self.heap.first().copied()
     }
 
     /// Puts `cursor` in the heap by its head.
     fn push(&mut self, cursor: usize) {
-        self.heap.push(cursor, |a, b| {
-            by_head(&self.cursors, &mut self.compared, a, b)
-        });
+        self.heap.push(cursor);
+        let mut at = self.heap.len() - 1;
+        while at > 0 {
+            let parent = (at - 1) / 2;
+            if self.cmp(self.heap[at], self.heap[parent]) != Ordering::Less {
+                break;
+            }
+            self.heap.swap(at, parent);
+            at = parent;
+        }
     }
 
     /// Takes the cursor with the least head out of the heap.
     fn pop(&mut self) -> Option<usize> {
-        self.heap
-            .pop(|a, b| by_head(&self.cursors, &mut self.compared, a, b))
+        if self.heap.is_empty() {
+            return None;
+        }
+        let least = self.heap.swap_remove(0);
+        let mut at = 0;
+        loop {
+            let left = 2 * at + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let mut lesser = left;
+            if right < self.heap.len()
+                && self.cmp(self.heap[right], self.heap[left]) == Ordering::Less
+            {
+                lesser = right;
+            }
+            if self.cmp(self.heap[lesser], self.heap[at]) != Ordering::Less {
+                break;
+            }
+            self.heap.swap(at, lesser);
+            at = lesser;
+        }
+        Some(least)
     }
-}
-
-/// The head of cursor `a` of `cursors` against that of cursor `b`, counted
-/// in `compared`.
-fn by_head(cursors: &[PairCursor], compared: &mut u64, a: usize, b: usize) -> Ordering {
-    *compared += 1;
-    cursors[a].cmp_head(&cursors[b])
 }
 
 /// Why a step of a merge stopped.
@@ -1146,7 +1139,7 @@ impl MergeState {
             waiting: cursors.len(),
             wants: (0..cursors.len()).map(|cursor| (cursor, 0)).collect(),
             heads: Heads {
-                heap: MinHeap::with_capacity(cursors.len()),
+                heap: Vec::with_capacity(cursors.len()),
                 cursors,
                 compared: 0,
             },
