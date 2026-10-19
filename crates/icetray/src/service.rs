@@ -609,7 +609,7 @@ fn key_type_wire(key_type: KeyType) -> v1::KeyType {
 }
 
 impl Service {
-    /// `Get`.
+    /// `Get` inside its deadline.
     async fn lookup(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let tables = self.serving();
         let (table, key_type) = table_serving(&tables, &request.table, TableKind::KeyValue)?;
@@ -626,7 +626,7 @@ impl Service {
         }))
     }
 
-    /// `MultiGet`, after `check_values` has held it to `max_multi_get_values`.
+    /// `MultiGet` inside its deadline.
     async fn lookup_batch(
         &self,
         request: MultiGetRequest,
@@ -655,8 +655,7 @@ impl Service {
         }))
     }
 
-    /// `Scan`. Its limit, bounds, and columns are checked against the table
-    /// before any read (`Table::scan`).
+    /// `Scan` inside its deadline.
     async fn scan_rows(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
         let tables = self.serving();
         let (table, key_type) = table_serving(&tables, &request.table, TableKind::Ordered)?;
@@ -674,9 +673,7 @@ impl Service {
         settle(receipt, scan_within_bound(lookup, table.max_scan_bytes()))
     }
 
-    /// `MultiScan`. Its keys times its limit times its columns plus one are
-    /// held to `max_multi_scan_values` before any key is read
-    /// (`Table::multi_scan`).
+    /// `MultiScan` inside its deadline.
     async fn scan_batch(
         &self,
         request: MultiScanRequest,
@@ -700,18 +697,39 @@ impl Service {
         )
     }
 
-    /// The future `work` builds, run inside `deadline` once a slot admits
-    /// the call; a full house or a passed deadline ends the call without
-    /// `work`'s answer. `work` is built here, not passed as a future: an
-    /// argument future would sit in this future beside the copy `within`
-    /// owns, and `Get`'s future would grow by half.
-    async fn admitted<T, F: Future<Output = Result<T, Status>>>(
-        &self,
-        deadline: Duration,
-        work: impl FnOnce() -> F,
-    ) -> Result<T, Status> {
+    /// `Get`, admitted and inside its deadline.
+    async fn answer_get(&self, request: GetRequest) -> Result<Response<GetResponse>, Status> {
         let _slot = self.slots.admit()?;
-        within(deadline, work()).await
+        within(self.get_deadline, self.lookup(request)).await
+    }
+
+    /// `MultiGet`, held to `max_multi_get_values` (`check_values`),
+    /// admitted, and inside its deadline.
+    async fn answer_multi_get(
+        &self,
+        request: MultiGetRequest,
+    ) -> Result<Response<MultiGetResponse>, Status> {
+        check_values(&request, self.max_multi_get_values)?;
+        let _slot = self.slots.admit()?;
+        within(self.multi_get_deadline, self.lookup_batch(request)).await
+    }
+
+    /// `Scan`, admitted and inside its deadline. Its limit, bounds, and
+    /// columns are checked against the table before any read (`Table::scan`).
+    async fn answer_scan(&self, request: ScanRequest) -> Result<Response<ScanResponse>, Status> {
+        let _slot = self.slots.admit()?;
+        within(self.scan_deadline, self.scan_rows(request)).await
+    }
+
+    /// `MultiScan`, admitted and inside its deadline. Its keys times its
+    /// limit times its columns plus one are held to `max_multi_scan_values`
+    /// before any key is read (`Table::multi_scan`).
+    async fn answer_multi_scan(
+        &self,
+        request: MultiScanRequest,
+    ) -> Result<Response<MultiScanResponse>, Status> {
+        let _slot = self.slots.admit()?;
+        within(self.multi_scan_deadline, self.scan_batch(request)).await
     }
 
     /// `TableInfo`: the serving generation's description.
@@ -754,34 +772,25 @@ impl Service {
 #[tonic::async_trait]
 impl Icetray for Service {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        self.admitted(self.get_deadline, || self.lookup(request.into_inner()))
-            .await
+        self.answer_get(request.into_inner()).await
     }
 
     async fn multi_get(
         &self,
         request: Request<MultiGetRequest>,
     ) -> Result<Response<MultiGetResponse>, Status> {
-        let request = request.into_inner();
-        // Before a slot is taken, so a batch over the bound holds none.
-        check_values(&request, self.max_multi_get_values)?;
-        self.admitted(self.multi_get_deadline, || self.lookup_batch(request))
-            .await
+        self.answer_multi_get(request.into_inner()).await
     }
 
     async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
-        self.admitted(self.scan_deadline, || self.scan_rows(request.into_inner()))
-            .await
+        self.answer_scan(request.into_inner()).await
     }
 
     async fn multi_scan(
         &self,
         request: Request<MultiScanRequest>,
     ) -> Result<Response<MultiScanResponse>, Status> {
-        self.admitted(self.multi_scan_deadline, || {
-            self.scan_batch(request.into_inner())
-        })
-        .await
+        self.answer_multi_scan(request.into_inner()).await
     }
 
     async fn table_info(
