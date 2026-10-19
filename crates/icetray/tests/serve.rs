@@ -1983,7 +1983,8 @@ async fn test_scan_and_multi_scan_end_at_their_deadlines_over_a_held_store() -> 
 /// A `Scan` and a `MultiScan` hold in-flight slots as `Get` and `MultiGet`
 /// do: with both slots taken by scans held on a stalled store, one more call
 /// of any kind is refused at once with `RESOURCE_EXHAUSTED`, and the held
-/// scans end at their deadlines and give their slots back.
+/// scans end at their deadlines and give their slots back, so the next
+/// Scan is admitted and answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scans_hold_in_flight_slots_and_a_call_beyond_them_is_refused() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -2036,6 +2037,14 @@ async fn test_scans_hold_in_flight_slots_and_a_call_beyond_them_is_refused() -> 
         assert_counted(&before, &after, call, Code::DeadlineExceeded, 1);
     }
     assert_in_flight(&after, 0, IN_FLIGHT_CAP);
+    stack.s3.release();
+    let request = ScanRequest {
+        limit: whole_key().limit,
+        ..scan_of(ORDERED_TABLE, &keys[2])
+    };
+    let response = stack.scan(request).await?;
+    assert_eq!(response, model_scan_response(stack.ordered(), &keys[2]));
+    assert_in_flight(&stack.scrape().await?, 0, IN_FLIGHT_CAP);
     Ok(())
 }
 
@@ -3697,6 +3706,41 @@ fn assert_scans_counted(earlier: &str, later: &str, expected: [u64; 3]) {
     }
 }
 
+/// Asserts what `later` counts beyond `earlier` for one `call` whose
+/// response of `size` bytes the bound sent, `over` zero, or refused, `over`
+/// one: one sample of `size` bytes in the response sizes either way; the
+/// Scans of `scans`, sent or refused, by `ScanResult`; and the call `OK`,
+/// or `FAILED_PRECONDITION` and not `OK`.
+fn assert_bound_counted(
+    earlier: &str,
+    later: &str,
+    over: usize,
+    size: usize,
+    call: Call,
+    [sent, refused]: [[u64; 3]; 2],
+) {
+    let (samples, bytes) = response_bytes(later);
+    let (samples_before, bytes_before) = response_bytes(earlier);
+    assert_eq!(
+        (samples - samples_before).to_bits(),
+        approx::gauge(1).to_bits(),
+        "over {over}: one sample"
+    );
+    assert_eq!(
+        (bytes - bytes_before).to_bits(),
+        approx::gauge_len(size).to_bits(),
+        "over {over}: the size of the response, sent or refused"
+    );
+    if over == 0 {
+        assert_scans_counted(earlier, later, sent);
+        assert_counted(earlier, later, call, Code::Ok, 1);
+    } else {
+        assert_scans_counted(earlier, later, refused);
+        assert_counted(earlier, later, call, Code::FailedPrecondition, 1);
+        assert_counted(earlier, later, call, Code::Ok, 0);
+    }
+}
+
 /// A Scan whose response encodes to exactly `server.max_scan_bytes` is
 /// sent, and one a single byte over is `FAILED_PRECONDITION` with no rows:
 /// the call counts as an `error` in `scans_total` and not as `rows`, the
@@ -3724,29 +3768,14 @@ async fn test_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refused() 
         let answered = stack.scan(request).await;
         let after = stack.scrape().await?;
 
-        let (samples, bytes) = response_bytes(&after);
-        let (samples_before, bytes_before) = response_bytes(&before);
-        assert_eq!(
-            (samples - samples_before).to_bits(),
-            approx::gauge(1).to_bits(),
-            "over {over}: one sample"
-        );
-        assert_eq!(
-            (bytes - bytes_before).to_bits(),
-            approx::gauge_len(size).to_bits(),
-            "over {over}: the size of the response, sent or refused"
-        );
+        let scans = [SCAN_SENT, SCAN_REFUSED];
+        assert_bound_counted(&before, &after, over, size, Call::Scan, scans);
         if over == 0 {
             let response = answered?;
             assert_eq!(response, model_scan_response(stack.ordered(), &key));
             assert_eq!(response.encoded_len(), size);
-            assert_scans_counted(&before, &after, SCAN_SENT);
-            assert_counted(&before, &after, Call::Scan, Code::Ok, 1);
         } else {
             assert_eq!(code_of(answered), Code::FailedPrecondition);
-            assert_scans_counted(&before, &after, SCAN_REFUSED);
-            assert_counted(&before, &after, Call::Scan, Code::FailedPrecondition, 1);
-            assert_counted(&before, &after, Call::Scan, Code::Ok, 0);
         }
     }
     Ok(())
@@ -3784,35 +3813,14 @@ async fn test_multi_scan_response_at_the_bound_is_sent_and_one_byte_over_is_refu
         let answered = stack.multi_scan(request).await;
         let after = stack.scrape().await?;
 
-        let (samples, bytes) = response_bytes(&after);
-        let (samples_before, bytes_before) = response_bytes(&before);
-        assert_eq!(
-            (samples - samples_before).to_bits(),
-            approx::gauge(1).to_bits(),
-            "over {over}: one sample"
-        );
-        assert_eq!(
-            (bytes - bytes_before).to_bits(),
-            approx::gauge_len(size).to_bits(),
-            "over {over}: the size of the response, sent or refused"
-        );
+        let scans = [MULTI_SCAN_SENT, MULTI_SCAN_REFUSED];
+        assert_bound_counted(&before, &after, over, size, Call::MultiScan, scans);
         if over == 0 {
             let response = answered?;
             assert_eq!(response, model_multi_scan_response(stack.ordered(), &keys));
             assert_eq!(response.encoded_len(), size);
-            assert_scans_counted(&before, &after, MULTI_SCAN_SENT);
-            assert_counted(&before, &after, Call::MultiScan, Code::Ok, 1);
         } else {
             assert_eq!(code_of(answered), Code::FailedPrecondition);
-            assert_scans_counted(&before, &after, MULTI_SCAN_REFUSED);
-            assert_counted(
-                &before,
-                &after,
-                Call::MultiScan,
-                Code::FailedPrecondition,
-                1,
-            );
-            assert_counted(&before, &after, Call::MultiScan, Code::Ok, 0);
         }
     }
     Ok(())
