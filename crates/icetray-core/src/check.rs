@@ -1517,14 +1517,13 @@ fn scan_gets(
     findings: &[Finding],
 ) -> u64 {
     let find_run = row.key_page * RUN_EDGE_KEY_PAGES + row.key_dictionary;
-    let order = match residency {
-        Residency::Full | Residency::Bloom => {
-            let dictionary = findings
-                .iter()
-                .any(|finding| finding.code() == FindingCode::DictionaryEncodedOrder);
-            ORDER_SPAN_GETS + if dictionary { DICTIONARY_PAGE_GETS } else { 0 }
-        }
-        Residency::Disk => 0,
+    let order = if order_from_store(residency) {
+        let dictionary = findings
+            .iter()
+            .any(|finding| finding.code() == FindingCode::DictionaryEncodedOrder);
+        ORDER_SPAN_GETS + if dictionary { DICTIONARY_PAGE_GETS } else { 0 }
+    } else {
+        0
     };
     let values: u64 = columns.iter().map(|column| column.gets_per_hit).sum();
     find_run + order + values
@@ -1916,37 +1915,36 @@ fn file_capping_findings(
     }
 }
 
+/// Whether a Scan in `residency` reads an ordered table's order column
+/// from the store: under `full` and `bloom` it does, and under `disk` the
+/// chunk file holds the column, its dictionary page included, at no GET.
+fn order_from_store(residency: Residency) -> bool {
+    match residency {
+        Residency::Full | Residency::Bloom => true,
+        Residency::Disk => false,
+    }
+}
+
 /// An ordered table's per-file capping finding on the order column at leaf
-/// `order` (RFD 025, Levels and findings), under `full` and `bloom` alone:
-/// under `disk` the chunk file holds the order column's dictionary page,
-/// so it costs no GET. A dictionary-encoded order column is
-/// `dictionary_encoded_order`, since every Scan fetches its dictionary
-/// page.
+/// `order` (RFD 025, Levels and findings), where a Scan reads the column
+/// from the store alone (`order_from_store`). A dictionary-encoded order
+/// column is `dictionary_encoded_order`, since every Scan fetches its
+/// dictionary page.
 fn order_capping_findings(
     file: &FileView<'_>,
     order: usize,
     residency: Residency,
     findings: &mut Vec<Finding>,
 ) {
-    match residency {
-        Residency::Full | Residency::Bloom => {}
-        Residency::Disk => return,
-    }
-    let path = &file.entry.path;
-    if column_chunk_facts(file.metadata, order).dictionary {
-        findings.push(Finding::cost(
+    if order_from_store(residency) && column_chunk_facts(file.metadata, order).dictionary {
+        findings.push(dictionary_cost(
             FindingCode::DictionaryEncodedOrder,
-            Some(path),
+            &file.entry.path,
             format!(
                 "the order column is dictionary-encoded; every Scan fetches its dictionary page besides the order pages, {gets} extra GET per file ({property}=false)",
                 gets = DICTIONARY_PAGE_GETS,
                 property = WriterProperty::EnableDictionary,
             ),
-            Penalty {
-                extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
-                ..Penalty::default()
-            },
-            Some(WriterProperty::EnableDictionary),
         ));
     }
 }
@@ -1954,22 +1952,34 @@ fn order_capping_findings(
 /// `dictionary_encoded_value` on value column `column` of the file at
 /// `path`.
 fn dictionary_finding(path: &str, column: &ValueColumnLayout) -> Finding {
-    Finding::cost(
+    dictionary_cost(
         FindingCode::DictionaryEncodedValue,
-        Some(path),
+        path,
         format!(
             "value column {value} is dictionary-encoded; a hit naming it fetches its dictionary page besides the value page, {gets} extra GET ({property}=false)",
             value = column.name,
             gets = DICTIONARY_PAGE_GETS,
             property = WriterProperty::EnableDictionary,
         ),
+    )
+    .with_column(&column.name)
+}
+
+/// The cost finding `code`, saying `message`, on the file at `path` for a
+/// dictionary-encoded column: a hit fetches the column's dictionary page,
+/// `DICTIONARY_PAGE_GETS` more GETs, which writing the column without a
+/// dictionary removes.
+fn dictionary_cost(code: FindingCode, path: &str, message: String) -> Finding {
+    Finding::cost(
+        code,
+        Some(path),
+        message,
         Penalty {
             extra_gets_per_hit: Some(DICTIONARY_PAGE_GETS),
             ..Penalty::default()
         },
         Some(WriterProperty::EnableDictionary),
     )
-    .with_column(&column.name)
 }
 
 /// The per-file advice apart from the bloom filter: bounds, column index,
