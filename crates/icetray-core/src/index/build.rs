@@ -4215,7 +4215,7 @@ mod tests {
     /// The most a drawn key, or a drawn long order value, steps by.
     const MOST_DRAWN_STEP: i64 = 3;
     /// The bytes every drawn string key and string order value starts
-    /// with (Review Focus 3): adjacent pages then differ only past it.
+    /// with: adjacent pages then differ only past it.
     const SHARED_PREFIX_BYTES: usize = 64;
     /// The letters a drawn string order value's suffix is spelled in, and
     /// its longest suffix: few, so one suffix is often a prefix of the next.
@@ -4454,7 +4454,7 @@ mod tests {
         }
     }
 
-    /// Every order fence of random runs (RFD 025, Load; Review Focus 3),
+    /// Every order fence of random runs (RFD 025, Load),
     /// over long and string keys and long, string, binary, and fixed order
     /// values, the byte ones sharing a long prefix, sorts above the last
     /// pair of the page before its page and at or below its page's first
@@ -4629,7 +4629,7 @@ mod tests {
     }
 
     /// A Disk-tier restart over a trusted ordered chunk file restores the
-    /// fences the first load recorded (Review Focus 4), with the footer
+    /// fences the first load recorded, with the footer
     /// the only GET and no chunk read back, so no order value decoded.
     #[tokio::test]
     async fn test_disk_tier_restart_restores_identical_order_fences_without_a_get_or_a_decode() {
@@ -4928,7 +4928,7 @@ mod tests {
 
     /// No footer number bounds a dictionary-encoded order column's fences,
     /// so the Disk tier charges a chunk file's exact length before writing
-    /// it (review 1, Important 1): beyond the footer's estimate, the
+    /// it: beyond the footer's estimate, the
     /// reservation grows by the rest, refused as `OverBudget` where the
     /// budget does not hold it though it held the estimate. The Full tier's
     /// prediction falls as far short, 241,466 bytes for 2,070,894 resident,

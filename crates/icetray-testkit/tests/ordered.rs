@@ -863,7 +863,7 @@ async fn test_paging_by_order_value_returns_the_whole_history_once() -> Result<(
     Ok(())
 }
 
-/// `more` counts live rows alone (Review Focus 2): with rows deleted at
+/// `more` counts live rows alone: with rows deleted at
 /// both edges of a key's run and inside it, a limit of the run's live
 /// rows leaves `more` unset in either direction, one less sets it, and
 /// the deleted rows at the edge are never returned or counted.
@@ -912,7 +912,7 @@ async fn test_scan_more_counts_live_rows_only() -> Result<()> {
 /// A bound beyond the 32-bit range of an `int` or `date` column.
 const PAST_32_BITS: i64 = 1 << 40;
 
-/// Bounds are exclusive at the extremes (Review Focus 5): `after` at
+/// Bounds are exclusive at the extremes: `after` at
 /// `i64::MIN` and `before` at `i64::MAX` admit every row of a long column,
 /// an `int` or `date` bound beyond the 32-bit range admits every row on its
 /// side, and a bound equal to a stored value, long or string, excludes that
@@ -1058,7 +1058,7 @@ const KEY_PAGES_OF_A_MIDDLE_RUN: u64 = 1;
 
 /// A cold Scan of a key held in one file, in one row group, with no
 /// dictionary-encoded column and nothing cached, costs per tier (RFD 025,
-/// Cost; controller ruling): under `full` one GET per requested column and
+/// Cost): under `full` one GET per requested column and
 /// one for the order column; under `disk` one GET per requested column,
 /// the order column and the key page read from the chunk file; under
 /// `bloom` the key page's GET first, then the columns' and the order

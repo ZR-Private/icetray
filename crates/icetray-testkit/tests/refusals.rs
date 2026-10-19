@@ -802,7 +802,7 @@ fn thirty_rows(_id: u64) -> u64 {
 /// An ordered table whose order column is dictionary-encoded, its values
 /// long strings repeated across keys, under a truncated column index: no
 /// footer number bounds its fences, which are many times its chunk's bytes
-/// per value and its index's page minimums (review 1, Important 1).
+/// per value and its index's page minimums.
 async fn fence_budget_fixture(catalog: &Arc<dyn Catalog>, name: &str) -> Result<Fixture> {
     let spec = FixtureSpec {
         ids: FENCE_BUDGET_IDS,
