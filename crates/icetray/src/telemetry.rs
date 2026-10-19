@@ -75,6 +75,17 @@ pub const SCAN_RESPONSE_BUCKETS: [f64; 12] = [
     268_435_456.0,
 ];
 
+/// The bucket bounds of every histogram the binary bounds, by metric name:
+/// what `install` sets, and the one list the tests read.
+const HISTOGRAM_BUCKETS: [(&str, &[f64]); 6] = [
+    (metric::LOOKUP_SECONDS, &LATENCY_BUCKETS),
+    (metric::OBJECT_GET_SECONDS, &LATENCY_BUCKETS),
+    (metric::SCAN_SECONDS, &SCAN_LATENCY_BUCKETS),
+    (metric::SCAN_ROWS, &SCAN_ROWS_BUCKETS),
+    (metric::SCAN_FILES, &SCAN_FILES_BUCKETS),
+    (metric::SCAN_RESPONSE_BYTES, &SCAN_RESPONSE_BUCKETS),
+];
+
 /// How long a gauge no one writes stays in the exposition: none, so a
 /// render drops every gauge left unwritten since the render before it.
 /// Every render writes each live gauge first (`render_after`), so what it
@@ -105,31 +116,11 @@ pub fn install() -> Result<PrometheusHandle, ServeError> {
     if let Some(handle) = HANDLE.get() {
         return Ok(handle.clone());
     }
-    let handle = PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Full(metric::LOOKUP_SECONDS.to_string()),
-            &LATENCY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(metric::OBJECT_GET_SECONDS.to_string()),
-            &LATENCY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(metric::SCAN_SECONDS.to_string()),
-            &SCAN_LATENCY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(metric::SCAN_ROWS.to_string()),
-            &SCAN_ROWS_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(metric::SCAN_FILES.to_string()),
-            &SCAN_FILES_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full(metric::SCAN_RESPONSE_BYTES.to_string()),
-            &SCAN_RESPONSE_BUCKETS,
-        )?
+    let handle = HISTOGRAM_BUCKETS
+        .iter()
+        .try_fold(PrometheusBuilder::new(), |builder, &(name, buckets)| {
+            builder.set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
+        })?
         .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT))
         .install_recorder()?;
     metric::describe();
@@ -559,18 +550,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_buckets_strictly_increase() {
-        for buckets in [
-            &SCAN_LATENCY_BUCKETS[..],
-            &SCAN_ROWS_BUCKETS[..],
-            &SCAN_FILES_BUCKETS[..],
-            &SCAN_RESPONSE_BUCKETS[..],
-        ] {
+    fn test_histogram_buckets_strictly_increase() {
+        for (name, buckets) in HISTOGRAM_BUCKETS {
             assert!(
                 buckets
                     .windows(2)
                     .all(|pair| pair[0].total_cmp(&pair[1]).is_lt()),
-                "{buckets:?}"
+                "{name}: {buckets:?}"
             );
         }
         assert_eq!(
@@ -580,18 +566,13 @@ mod tests {
         );
     }
 
-    /// A scan histogram recorded under a table is exposed as buckets, with
-    /// its own bounds, not as the summary a histogram with no bounds gets.
+    /// A histogram recorded under a table is exposed as buckets, with its
+    /// own bounds, not as the summary a histogram with no bounds gets.
     #[test]
-    fn test_install_buckets_the_scan_histograms() {
-        const TABLE: &str = "icetray_test_scan_buckets";
+    fn test_install_buckets_every_histogram() {
+        const TABLE: &str = "icetray_test_buckets";
         let handle = install().unwrap();
-        for (name, bounds) in [
-            (metric::SCAN_SECONDS, &SCAN_LATENCY_BUCKETS[..]),
-            (metric::SCAN_ROWS, &SCAN_ROWS_BUCKETS[..]),
-            (metric::SCAN_FILES, &SCAN_FILES_BUCKETS[..]),
-            (metric::SCAN_RESPONSE_BYTES, &SCAN_RESPONSE_BUCKETS[..]),
-        ] {
+        for (name, bounds) in HISTOGRAM_BUCKETS {
             metrics::histogram!(name, metric::LABEL_TABLE => TABLE).record(bounds[0]);
             let exposition = render_after(&handle, || {});
             let le = bounds[0].to_string();
