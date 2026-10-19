@@ -69,42 +69,25 @@ pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
     approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
 }
 
-/// `ConfigViolation::PageCacheTooSmall` for a budget of `capacity_bytes`
-/// below `min_memory_bytes` of the shards a cache opened on the caller's
-/// runtime has; `open_with` calls it before it opens the cache, since the
-/// worker count is not known when the configuration is parsed.
-pub(crate) fn check_capacity(capacity_bytes: usize) -> std::result::Result<(), ConfigViolation> {
-    match shortfall(approx::count(capacity_bytes)) {
-        Some((minimum, shards)) => Err(ConfigViolation::PageCacheTooSmall {
-            bytes: approx::count(capacity_bytes),
-            minimum,
-            shards,
-        }),
-        None => Ok(()),
-    }
-}
-
-/// `check_capacity` for the scan cache's budget, `scan_page_cache_bytes`
-/// (RFD 025), which is split over the same shards:
-/// `ConfigViolation::ScanPageCacheTooSmall` below their minimum.
-pub(crate) fn check_scan_capacity(capacity_bytes: u64) -> std::result::Result<(), ConfigViolation> {
-    match shortfall(capacity_bytes) {
-        Some((minimum, shards)) => Err(ConfigViolation::ScanPageCacheTooSmall {
-            bytes: capacity_bytes,
-            minimum,
-            shards,
-        }),
-        None => Ok(()),
-    }
-}
-
-/// The minimum and the shards it is for when `bytes` is below
-/// `min_memory_bytes` of the shards a cache opened on the caller's runtime
-/// has; `None` when it is not.
-fn shortfall(bytes: u64) -> Option<(u64, usize)> {
+/// `ConfigViolation::PageCacheTooSmall` for `cache`'s budget of `bytes` below `min_memory_bytes` of the shards a cache opened on
+/// the caller's runtime has; `open_with` calls it for each cache before it
+/// opens one, since the worker count is not known when the configuration is
+/// parsed.
+pub(crate) fn check_capacity(
+    cache: CacheName,
+    bytes: u64,
+) -> std::result::Result<(), ConfigViolation> {
     let shards = memory_shards();
     let minimum = min_memory_bytes(shards);
-    (bytes < minimum).then_some((minimum, shards))
+    if bytes < minimum {
+        return Err(ConfigViolation::PageCacheTooSmall {
+            cache,
+            bytes,
+            minimum,
+            shards,
+        });
+    }
+    Ok(())
 }
 
 /// The width of the length prefix on an encoded file id: a `u32`, since a
@@ -442,7 +425,7 @@ impl PageCache {
     /// The scan cache (RFD 025, Caching and hedging): `capacity_bytes` of
     /// ordered tables' pages in memory alone, with no disk level, so a scan
     /// evicts only other scans' pages and never a lookup's; `open_with`
-    /// checks the budget first (`check_scan_capacity`). Its series carry
+    /// checks the budget first (`check_capacity`). Its series carry
     /// `cache = "scan"`.
     pub fn for_scans(capacity_bytes: usize) -> Self {
         Self::over(CacheName::Scan, memory_level(capacity_bytes))
@@ -1653,23 +1636,28 @@ mod tests {
             .build()
             .unwrap();
         let minimum = min_memory_bytes(shards);
-        let below = approx::length(minimum - 1);
-        assert_eq!(
-            runtime.block_on(async { check_capacity(below) }),
-            Err(ConfigViolation::PageCacheTooSmall {
-                bytes: minimum - 1,
-                minimum,
-                shards,
-            })
-        );
-        assert_eq!(
-            runtime.block_on(async { check_capacity(approx::length(minimum)) }),
-            Ok(())
-        );
         let single = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        assert_eq!(single.block_on(async { check_capacity(below) }), Ok(()));
+        for cache in [CacheName::Lookup, CacheName::Scan] {
+            assert_eq!(
+                runtime.block_on(async { check_capacity(cache, minimum - 1) }),
+                Err(ConfigViolation::PageCacheTooSmall {
+                    cache,
+                    bytes: minimum - 1,
+                    minimum,
+                    shards,
+                })
+            );
+            assert_eq!(
+                runtime.block_on(async { check_capacity(cache, minimum) }),
+                Ok(())
+            );
+            assert_eq!(
+                single.block_on(async { check_capacity(cache, minimum - 1) }),
+                Ok(())
+            );
+        }
     }
 
     /// A cache's counters are registered at zero when it opens, before

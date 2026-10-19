@@ -424,9 +424,8 @@ pub async fn open(config: &Config, only: Option<&str>, findings: FindingLog) -> 
 /// anything is opened, `page_cache_bytes` is checked against the minimum
 /// of the shards the cache has on the calling runtime, which parsing could
 /// not know: less is `Error::Config` with
-/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`), and the
-/// same for `scan_page_cache_bytes` with
-/// `ConfigViolation::ScanPageCacheTooSmall` (`cache::check_scan_capacity`).
+/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`), for
+/// `scan_page_cache_bytes` as for `page_cache_bytes`.
 /// The scan cache is memory alone, whether or not the lookup cache has a
 /// disk level (RFD 025).
 pub async fn open_with(
@@ -435,9 +434,10 @@ pub async fn open_with(
     storage: Arc<Storage>,
     findings: FindingLog,
 ) -> Result<Opened> {
-    cache::check_capacity(config.server.page_cache_bytes)
-        .and_then(|()| cache::check_scan_capacity(config.server.scan_page_cache_bytes))
-        .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
+    for (cache, bytes) in config.server.cache_budgets() {
+        cache::check_capacity(cache, bytes)
+            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
+    }
     let local = match &config.storage.local {
         Some(local) => Some(Arc::new(LocalDir::open(local, storage.stats())?)),
         None => None,
@@ -536,6 +536,7 @@ mod tests {
     };
     use crate::level::Level;
     use crate::manifest::testing::whole;
+    use crate::metric::CacheName;
     use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::STALL;
@@ -625,7 +626,8 @@ mod tests {
 
     /// A budget `Config::parse` admits, one shard's minimum, is refused
     /// on a runtime of two workers, whose cache has two shards, before any
-    /// table is opened.
+    /// table is opened; the scan cache's budget is held to it as the lookup
+    /// cache's is (RFD 025).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_open_with_refuses_a_page_cache_below_the_runtime_shards_minimum() {
         let workers = 2;
@@ -633,55 +635,34 @@ mod tests {
         let one_shard = cache::min_memory_bytes(1);
         let two_shards = cache::min_memory_bytes(workers);
         let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
-        config.server.page_cache_bytes = approx::length(one_shard);
-        let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
-            .await
-            .err()
-            .expect("a budget below two shards' minimum");
-        assert!(
-            matches!(
-                error,
-                Error::Config(ConfigError::Invalid(ConfigViolation::PageCacheTooSmall {
-                    bytes,
-                    minimum,
-                    shards,
-                })) if bytes == one_shard && minimum == two_shards && shards == workers
-            ),
-            "{error}"
-        );
+        for refused in [CacheName::Lookup, CacheName::Scan] {
+            let (lookup, scan) = match refused {
+                CacheName::Lookup => (one_shard, two_shards),
+                CacheName::Scan => (two_shards, one_shard),
+            };
+            config.server.page_cache_bytes = approx::length(lookup);
+            config.server.scan_page_cache_bytes = scan;
+            let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
+                .await
+                .err()
+                .expect("a budget below two shards' minimum");
+            assert!(
+                matches!(
+                    error,
+                    Error::Config(ConfigError::Invalid(ConfigViolation::PageCacheTooSmall {
+                        cache,
+                        bytes,
+                        minimum,
+                        shards,
+                    })) if cache == refused
+                        && bytes == one_shard
+                        && minimum == two_shards
+                        && shards == workers
+                ),
+                "{error}"
+            );
+        }
         config.server.page_cache_bytes = approx::length(two_shards);
-        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
-            .await
-            .unwrap();
-        assert_eq!(names(&opened), [FIRST_TABLE]);
-    }
-
-    /// The scan cache's budget is held to the runtime's shards as the
-    /// lookup cache's is (RFD 025): one shard's minimum is refused on two
-    /// workers, before any table is opened.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_open_with_refuses_a_scan_page_cache_below_the_runtime_shards_minimum() {
-        let workers = 2;
-        let fixture = two_file_fixture().await;
-        let one_shard = cache::min_memory_bytes(1);
-        let two_shards = cache::min_memory_bytes(workers);
-        let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
-        config.server.scan_page_cache_bytes = one_shard;
-        let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
-            .await
-            .err()
-            .expect("a scan budget below two shards' minimum");
-        assert!(
-            matches!(
-                error,
-                Error::Config(ConfigError::Invalid(ConfigViolation::ScanPageCacheTooSmall {
-                    bytes,
-                    minimum,
-                    shards,
-                })) if bytes == one_shard && minimum == two_shards && shards == workers
-            ),
-            "{error}"
-        );
         config.server.scan_page_cache_bytes = two_shards;
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await

@@ -21,6 +21,7 @@ use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
 use crate::manifest::{self, ColumnRead, ValueType};
+use crate::metric::CacheName;
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -527,36 +528,25 @@ pub enum ConfigViolation {
         /// Its residency.
         residency: Residency,
     },
-    /// The memory budget of the page cache cannot hold one value page in
-    /// every shard of its memory level, so the cache would keep a page per
-    /// shard however small the budget, and the budget would bound nothing
+    /// The memory budget of a page cache, `page_cache_bytes` or
+    /// `scan_page_cache_bytes`, cannot hold one value page in every shard
+    /// of its memory level, so the cache would keep a page per shard
+    /// however small the budget, and the budget would bound nothing
     /// (`cache::min_memory_bytes`). `Config::parse` checks the budget
     /// against one shard, the least any cache has; opening the cache
     /// checks it against the shards it has on the runtime it opens on, one
     /// per worker thread rounded up to a power of two.
     #[error(
-        "server.page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
+        "server.{} {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards",
+        .cache.budget_setting()
     )]
     PageCacheTooSmall {
+        /// The cache whose budget it is.
+        cache: CacheName,
         /// The configured budget.
         bytes: u64,
         /// The smallest budget that holds a value page in every shard: one
         /// contract value page with its entry overhead per shard.
-        minimum: u64,
-        /// The shards the minimum is for.
-        shards: usize,
-    },
-    /// The memory budget of the scan cache, `scan_page_cache_bytes`, cannot
-    /// hold one value page in every shard, as `PageCacheTooSmall` for the
-    /// lookup cache: checked against one shard at parse and against the
-    /// runtime's shards when the cache opens (RFD 025).
-    #[error(
-        "server.scan_page_cache_bytes {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards"
-    )]
-    ScanPageCacheTooSmall {
-        /// The configured budget.
-        bytes: u64,
-        /// The smallest budget that holds a value page in every shard.
         minimum: u64,
         /// The shards the minimum is for.
         shards: usize,
@@ -896,6 +886,14 @@ impl Config {
 }
 
 impl ServerConfig {
+    /// Each page cache with the memory budget it is configured for.
+    pub(crate) fn cache_budgets(&self) -> [(CacheName, u64); 2] {
+        [
+            (CacheName::Lookup, approx::count(self.page_cache_bytes)),
+            (CacheName::Scan, self.scan_page_cache_bytes),
+        ]
+    }
+
     /// The names, in file order, of the settings whose value in `next`
     /// differs from this one's.
     fn differing_settings(&self, next: &Self) -> Vec<&'static str> {
@@ -1050,19 +1048,15 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         return Err(ConfigViolation::IncompleteStaticKeys);
     }
     let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
-    if approx::count(config.server.page_cache_bytes) < minimum {
-        return Err(ConfigViolation::PageCacheTooSmall {
-            bytes: approx::count(config.server.page_cache_bytes),
-            minimum,
-            shards: PARSE_CACHE_SHARDS,
-        });
-    }
-    if config.server.scan_page_cache_bytes < minimum {
-        return Err(ConfigViolation::ScanPageCacheTooSmall {
-            bytes: config.server.scan_page_cache_bytes,
-            minimum,
-            shards: PARSE_CACHE_SHARDS,
-        });
+    for (cache, bytes) in config.server.cache_budgets() {
+        if bytes < minimum {
+            return Err(ConfigViolation::PageCacheTooSmall {
+                cache,
+                bytes,
+                minimum,
+                shards: PARSE_CACHE_SHARDS,
+            });
+        }
     }
     if let Some(local) = &config.storage.local
         && local.page_cache_disk_bytes > 0
@@ -3764,51 +3758,37 @@ locaton = "typo"
     }
 
     #[test]
-    fn test_parse_refuses_page_cache_below_a_value_page_per_shard() {
-        let with_budget = |bytes: u64| {
-            format!(
-                "[server]\npage_cache_bytes = {bytes}\n{}",
-                TOML_MINIMAL.trim_start()
-            )
-        };
+    fn test_parse_refuses_each_page_cache_below_a_value_page_per_shard() {
         let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
-        for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
-            assert_eq!(
-                violation(&with_budget(bytes)),
-                ConfigViolation::PageCacheTooSmall {
-                    bytes,
-                    minimum,
-                    shards: PARSE_CACHE_SHARDS
-                },
-                "{bytes} bytes"
+        for cache in [CacheName::Lookup, CacheName::Scan] {
+            let setting = cache.budget_setting();
+            let with_budget = |bytes: u64| {
+                format!(
+                    "[server]\n{setting} = {bytes}\n{}",
+                    TOML_MINIMAL.trim_start()
+                )
+            };
+            for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
+                assert_eq!(
+                    violation(&with_budget(bytes)),
+                    ConfigViolation::PageCacheTooSmall {
+                        cache,
+                        bytes,
+                        minimum,
+                        shards: PARSE_CACHE_SHARDS
+                    },
+                    "{setting} {bytes} bytes"
+                );
+            }
+            let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
+            assert!(
+                at_minimum
+                    .server
+                    .cache_budgets()
+                    .contains(&(cache, minimum)),
+                "{setting}"
             );
         }
-        let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
-        assert_eq!(approx::count(at_minimum.server.page_cache_bytes), minimum);
-    }
-
-    #[test]
-    fn test_parse_refuses_scan_page_cache_below_a_value_page_per_shard() {
-        let with_budget = |bytes: u64| {
-            format!(
-                "[server]\nscan_page_cache_bytes = {bytes}\n{}",
-                TOML_MINIMAL.trim_start()
-            )
-        };
-        let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
-        for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
-            assert_eq!(
-                violation(&with_budget(bytes)),
-                ConfigViolation::ScanPageCacheTooSmall {
-                    bytes,
-                    minimum,
-                    shards: PARSE_CACHE_SHARDS
-                },
-                "{bytes} bytes"
-            );
-        }
-        let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
-        assert_eq!(at_minimum.server.scan_page_cache_bytes, minimum);
     }
 
     #[test]

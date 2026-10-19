@@ -633,6 +633,16 @@ pub enum CacheName {
     Scan,
 }
 
+impl CacheName {
+    /// The `[server]` setting that budgets the cache's memory.
+    pub(crate) fn budget_setting(self) -> &'static str {
+        match self {
+            Self::Lookup => "page_cache_bytes",
+            Self::Scan => "scan_page_cache_bytes",
+        }
+    }
+}
+
 impl fmt::Display for CacheName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
