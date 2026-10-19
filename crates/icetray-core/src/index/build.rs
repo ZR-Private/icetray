@@ -19,6 +19,7 @@ use parquet::data_type::{
     FixedLenByteArrayType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::ParquetMetaData;
+use tokio::task::JoinError;
 
 use super::inspect::{bloom_ranges, column_chunk_ranges, rules_of};
 use super::ordered::{OrderVerified, PairCheck};
@@ -177,15 +178,8 @@ impl Inspected {
         }
         let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
         let segments = Arc::new(Segments::new(parts, self.handle.size()));
-        let handle = Arc::clone(&self.handle);
-        let metadata = Arc::clone(&self.metadata);
-        let (leaf, shape) = (self.layout.key_leaf, self.layout.key_shape);
-        let edges = on_blocking_pool(move || {
-            let column = Column {
-                metadata: &metadata,
-                leaf,
-                path: &handle.location,
-            };
+        let shape = self.layout.key_shape;
+        let edges = on_column(&self.handle, &self.metadata, column.leaf, move |column| {
             let first = edge_key(column.group(head), shape, 0, &segments, Keys::first)?;
             let last = edge_key(column.group(tail), shape, last_page, &segments, Keys::last)?;
             Ok(first.zip(last))
@@ -285,21 +279,35 @@ impl KeysToVerify {
     /// thread. A canceled task is `Error::VerifyCanceled` for the file.
     async fn verify(&self, chunks: &Arc<Segments>) -> Result<Verified> {
         let table = self.table.clone();
-        let handle = Arc::clone(&self.handle);
-        let metadata = Arc::clone(&self.metadata);
-        let (leaf, shape, order) = (self.leaf, self.shape, self.order);
+        let (shape, order) = (self.shape, self.order);
         let chunks = Arc::clone(chunks);
-        on_blocking_pool(move || {
-            let column = Column {
-                metadata: &metadata,
-                leaf,
-                path: &handle.location,
-            };
-            verify(&table, &column, shape, Rules::of(order), &chunks)
+        on_column(&self.handle, &self.metadata, self.leaf, move |column| {
+            verify(&table, column, shape, Rules::of(order), &chunks)
         })
         .await
         .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?
     }
+}
+
+/// `work` over column `leaf` of the file `handle` opens, whose footer is
+/// `metadata`, on the blocking pool (`on_blocking_pool`), the column built
+/// there from clones of the two. A canceled task is the `JoinError`, which
+/// each caller maps to its own error.
+async fn on_column<T: Send + 'static>(
+    handle: &Arc<FileHandle>,
+    metadata: &Arc<ParquetMetaData>,
+    leaf: usize,
+    work: impl FnOnce(&Column<'_>) -> T + Send + 'static,
+) -> std::result::Result<T, JoinError> {
+    let (handle, metadata) = (Arc::clone(handle), Arc::clone(metadata));
+    on_blocking_pool(move || {
+        work(&Column {
+            metadata: &metadata,
+            leaf,
+            path: &handle.location,
+        })
+    })
+    .await
 }
 
 /// The column chunks of `ranges`, the key chunks and an ordered table's
@@ -456,23 +464,21 @@ async fn trusted(
     disk: DiskChunks,
     path: &std::path::Path,
 ) -> Result<std::result::Result<(DiskChunks, Verified), Stale>> {
-    let handle = Arc::clone(&to_verify.handle);
-    let metadata = Arc::clone(&to_verify.metadata);
-    let (leaf, shape, order) = (to_verify.leaf, to_verify.shape, to_verify.order);
-    on_blocking_pool(move || {
-        let column = Column {
-            metadata: &metadata,
-            leaf,
-            path: &handle.location,
-        };
-        let verification = match disk.checked_verification(record::most_bytes(&column, order))? {
-            Ok(verification) => verification,
-            Err(rejection) => return Ok(Err(Stale::Rejected(rejection))),
-        };
-        Ok(record::decode(&verification, &column, shape, order)
-            .map(|verified| (disk, verified))
-            .map_err(Stale::Record))
-    })
+    let (shape, order) = (to_verify.shape, to_verify.order);
+    on_column(
+        &to_verify.handle,
+        &to_verify.metadata,
+        to_verify.leaf,
+        move |column| {
+            let verification = match disk.checked_verification(record::most_bytes(column, order))? {
+                Ok(verification) => verification,
+                Err(rejection) => return Ok(Err(Stale::Rejected(rejection))),
+            };
+            Ok(record::decode(&verification, column, shape, order)
+                .map(|verified| (disk, verified))
+                .map_err(Stale::Record))
+        },
+    )
     .await
     .map_err(|canceled| Error::Local {
         path: path.to_path_buf(),
