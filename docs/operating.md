@@ -600,7 +600,9 @@ pairs, and of pairs in the merge; and `held_bytes`, the most bytes of
 chosen pages the load's merges held and had in flight at once, which
 leaves out the key chunks `full` keeps resident. The overlap groups merge
 at once and share one read-ahead bound, so a load holds at most 64 MiB
-beyond one row group's chosen pages per file.
+beyond one row group's chosen pages per file. Every group's files read
+their first row group at once, so the most a load holds follows the
+chosen pages of all its files, not of one group's.
 
 ## Deploying
 
