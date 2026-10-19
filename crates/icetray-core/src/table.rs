@@ -1069,85 +1069,42 @@ impl Drop for ScanReceipt {
 /// A Scan request checked against the generation and the table's entry
 /// before any read (`Table::check_scan`): the columns it reads and its
 /// limit, resolved.
+#[derive(Clone)]
 struct CheckedScan {
     selection: Selection,
     limit: u32,
 }
 
 /// A Scan call checked and ready to read (`Table::scan_call`).
-struct ScanCall<'a> {
-    generation: Arc<Generation>,
-    scans: &'a Arc<Scans>,
-    checked: CheckedScan,
-    fan_out: Arc<Semaphore>,
+struct ScanCall {
+    reads: ScanReads,
     receipt: ScanReceipt,
 }
 
-/// What every key's Scan of one `scan` or `multi_scan` call reads through,
-/// borrowed: the generation, the table's lookup and scan handles and span
-/// hedge window, the checked request and its bounds, the call's fan-out,
-/// and its counts. Each run a spread `multi_scan` spawns builds one over
-/// an `OwnedScan` of its own, as each run of a `multi_get` holds its own
-/// handles.
-#[derive(Clone, Copy)]
-struct ScanThrough<'a> {
-    generation: &'a Arc<Generation>,
-    lookups: &'a Arc<Lookups>,
-    scans: &'a Arc<Scans>,
-    window: &'a Arc<HedgeWindow>,
-    checked: &'a CheckedScan,
-    bounds: &'a ScanBounds,
-    fan_out: &'a Arc<Semaphore>,
-    counts: &'a Arc<ScanCounts>,
-}
-
-/// A `ScanThrough`'s handles and request owned, for a run a spread
-/// `multi_scan` spawns, which holds no borrow of the call.
-struct OwnedScan {
+/// What every key's Scan of one `scan` or `multi_scan` call reads through:
+/// the generation, the table's lookup and scan handles and span hedge
+/// window, the checked request, the call's fan-out, and its counts. Each
+/// run a spread `multi_scan` spawns reads through a clone of its own, as
+/// each run of a `multi_get` holds its own handles.
+#[derive(Clone)]
+struct ScanReads {
     generation: Arc<Generation>,
     lookups: Arc<Lookups>,
     scans: Arc<Scans>,
     window: Arc<HedgeWindow>,
     checked: CheckedScan,
-    bounds: ScanBounds,
     fan_out: Arc<Semaphore>,
     counts: Arc<ScanCounts>,
 }
 
-impl OwnedScan {
-    fn through(&self) -> ScanThrough<'_> {
-        ScanThrough {
-            generation: &self.generation,
-            lookups: &self.lookups,
-            scans: &self.scans,
-            window: &self.window,
-            checked: &self.checked,
-            bounds: &self.bounds,
-            fan_out: &self.fan_out,
-            counts: &self.counts,
-        }
-    }
+/// A call's `ScanReads` under the request's bounds.
+#[derive(Clone, Copy)]
+struct ScanThrough<'a> {
+    reads: &'a ScanReads,
+    bounds: &'a ScanBounds,
 }
 
 impl ScanThrough<'_> {
-    /// The handles and request owned, the request's selection and bounds
-    /// cloned.
-    fn owned(self) -> OwnedScan {
-        OwnedScan {
-            generation: Arc::clone(self.generation),
-            lookups: Arc::clone(self.lookups),
-            scans: Arc::clone(self.scans),
-            window: Arc::clone(self.window),
-            checked: CheckedScan {
-                selection: self.checked.selection.clone(),
-                limit: self.checked.limit,
-            },
-            bounds: self.bounds.clone(),
-            fan_out: Arc::clone(self.fan_out),
-            counts: Arc::clone(self.counts),
-        }
-    }
-
     /// One Scan of `key`, its rows trimmed (`Lookups::project`): the one
     /// path `scan` and `multi_scan` share. A failed read counts under
     /// `ScanResult::Error` at once; an answered one is handed to the
@@ -1156,29 +1113,30 @@ impl ScanThrough<'_> {
     /// to count.
     async fn key(self, key: &Key) -> Result<Scanned> {
         let started = Instant::now();
-        let metrics = &self.scans.metrics;
+        let reads = self.reads;
+        let metrics = &reads.scans.metrics;
         let source = RunSource {
-            cache: &self.scans.cache,
-            fan_out: Some(self.fan_out),
-            window: self.window,
-            value_gets: &self.lookups.metrics.value_page_gets,
+            cache: &reads.scans.cache,
+            fan_out: Some(&reads.fan_out),
+            window: &reads.window,
+            value_gets: &reads.lookups.metrics.value_page_gets,
             order_gets: Some(&metrics.order_gets),
         };
-        let selection = &self.checked.selection;
+        let selection = &reads.checked.selection;
         let answered = async {
-            let (mut scanned, read) = self
+            let (mut scanned, read) = reads
                 .generation
                 .scan(
                     key,
                     &selection.positions,
                     self.bounds,
-                    self.checked.limit,
+                    reads.checked.limit,
                     source,
                 )
                 .await?;
             for row in &mut scanned.rows {
-                self.lookups.project(
-                    self.generation,
+                reads.lookups.project(
+                    &reads.generation,
                     key,
                     Some(&row.order),
                     selection,
@@ -1190,7 +1148,7 @@ impl ScanThrough<'_> {
         .await;
         match answered {
             Ok((scanned, read)) => {
-                self.counts.finished(ScanTally {
+                reads.counts.finished(ScanTally {
                     rows: scanned.rows.len(),
                     files: read.files,
                     cold: read.from_store,
@@ -1199,7 +1157,7 @@ impl ScanThrough<'_> {
                 Ok(scanned)
             }
             Err(error) => {
-                self.counts.failed();
+                reads.counts.failed();
                 Err(error)
             }
         }
@@ -1214,7 +1172,7 @@ impl ScanThrough<'_> {
         // lookups, so the returned future stays provably `Send`.
         let scans: Vec<_> = keys.iter().map(|key| self.key(key)).collect();
         stream::iter(scans)
-            .buffered(self.lookups.batch_fan_out)
+            .buffered(self.reads.lookups.batch_fan_out)
             .try_collect()
             .await
     }
@@ -1696,10 +1654,14 @@ impl Table {
     ) -> Result<(ScanLookup, ScanReceipt)> {
         let _in_flight = self.lookups.enter();
         let call = self.scan_call(std::slice::from_ref(key), columns, bounds, false)?;
-        let scanned = self.through(&call, bounds).key(key).await?;
+        let through = ScanThrough {
+            reads: &call.reads,
+            bounds,
+        };
+        let scanned = through.key(key).await?;
         let lookup = ScanLookup {
             scanned,
-            snapshot_id: call.generation.snapshot_id,
+            snapshot_id: call.reads.generation.snapshot_id,
         };
         Ok((lookup, call.receipt))
     }
@@ -1759,17 +1721,25 @@ impl Table {
                 })
             })
             .collect();
-        let through = self.through(&call, bounds);
         let runs = self.lookups.runs(distinct.len(), MULTI_SCAN_TASK_KEYS_MIN);
         let answered: Vec<Scanned> = if runs <= 1 {
+            let through = ScanThrough {
+                reads: &call.reads,
+                bounds,
+            };
             through.keys(&distinct).await?
         } else {
             self.spawned(&distinct, runs, |part| {
-                let owned = through.owned();
+                let reads = call.reads.clone();
+                let bounds = bounds.clone();
                 let part: Vec<Key> = part.iter().map(|&key| key.clone()).collect();
                 async move {
                     let keys: Vec<&Key> = part.iter().collect();
-                    owned.through().keys(&keys).await
+                    let through = ScanThrough {
+                        reads: &reads,
+                        bounds: &bounds,
+                    };
+                    through.keys(&keys).await
                 }
             })
             .await?
@@ -1795,7 +1765,7 @@ impl Table {
             .collect();
         let lookup = MultiScanLookup {
             results,
-            snapshot_id: call.generation.snapshot_id,
+            snapshot_id: call.reads.generation.snapshot_id,
         };
         Ok((lookup, call.receipt))
     }
@@ -1812,31 +1782,24 @@ impl Table {
         columns: &[ColumnRead<'_>],
         bounds: &ScanBounds,
         multi: bool,
-    ) -> Result<ScanCall<'_>> {
+    ) -> Result<ScanCall> {
         let scans = self.ordered()?;
         let generation = self.serving()?;
         let checked = self.check_scan(&generation, keys, columns, bounds, multi)?;
+        let fan_out = Arc::new(Semaphore::new(self.lookups.batch_fan_out));
+        let receipt = ScanReceipt::new(&self.name, &scans.metrics);
         Ok(ScanCall {
-            fan_out: Arc::new(Semaphore::new(self.lookups.batch_fan_out)),
-            receipt: ScanReceipt::new(&self.name, &scans.metrics),
-            generation,
-            scans,
-            checked,
+            reads: ScanReads {
+                generation,
+                lookups: Arc::clone(&self.lookups),
+                scans: Arc::clone(scans),
+                window: Arc::clone(&self.span_hedge),
+                checked,
+                fan_out,
+                counts: Arc::clone(&receipt.counts),
+            },
+            receipt,
         })
-    }
-
-    /// What every key's Scan of `call` reads through, under `bounds`.
-    fn through<'a>(&'a self, call: &'a ScanCall<'a>, bounds: &'a ScanBounds) -> ScanThrough<'a> {
-        ScanThrough {
-            generation: &call.generation,
-            lookups: &self.lookups,
-            scans: call.scans,
-            window: &self.span_hedge,
-            checked: &call.checked,
-            bounds,
-            fan_out: &call.fan_out,
-            counts: &call.receipt.counts,
-        }
     }
 
     /// `keys` split in order into `runs` runs of nearly equal length, each
