@@ -179,11 +179,16 @@ impl Inspected {
         let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
         let segments = Arc::new(Segments::new(parts, self.handle.size()));
         let shape = self.layout.key_shape;
-        let edges = on_column(&self.handle, &self.metadata, column.leaf, move |column| {
-            let first = edge_key(column.group(head), shape, 0, &segments, Keys::first)?;
-            let last = edge_key(column.group(tail), shape, last_page, &segments, Keys::last)?;
-            Ok(first.zip(last))
-        })
+        let edges = on_column(
+            &self.handle,
+            &self.metadata,
+            self.layout.key_leaf,
+            move |column| {
+                let first = edge_key(column.group(head), shape, 0, &segments, Keys::first)?;
+                let last = edge_key(column.group(tail), shape, last_page, &segments, Keys::last)?;
+                Ok(first.zip(last))
+            },
+        )
         .await
         .map_err(|canceled| Error::verify_canceled(&self.handle.location, canceled))?;
         Ok(edges.unwrap_or_else(|fault: Error| {

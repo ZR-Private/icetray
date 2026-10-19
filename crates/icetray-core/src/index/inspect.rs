@@ -799,9 +799,9 @@ fn estimated_order_bytes(metadata: &ParquetMetaData, order: OrderLeaf) -> [u64; 
 
 /// Per row group, the order fences of the file `order` is the order column
 /// of, before any is decoded, as the record stores them (`FenceBytes`): a
-/// fence per order page from the offset index, its key at the mean bytes
-/// the row group's key fences, `key_fences` (`estimated_fence_keys`), are
-/// estimated at per key page, and its order value at the bytes every value
+/// fence per order page from the offset index; its key at the row group's
+/// mean bytes per key fence, which `key_fences` gives
+/// (`estimated_fence_keys`); and its order value at the bytes every value
 /// of the shape takes (`OrderShape::fixed_bytes`), or for a byte array at
 /// the chunk's uncompressed bytes per value (`mean_value_bytes`). A fence
 /// keeps a prefix of its page's first value; the chunk's bytes per value
