@@ -637,6 +637,16 @@ fn toml_ordered_table(name: &str, fixture: &Fixture, max_scan_rows: Option<u32>)
     )
 }
 
+/// A config file `{stem}.toml` under `dir` serving `fixture` alone, as
+/// `TABLE_A` with its order column; its path.
+fn ordered_config(dir: &Path, stem: &str, fixture: &Fixture) -> Result<String, BoxError> {
+    write_file(
+        dir,
+        &format!("{stem}.toml"),
+        &toml_ordered_table(TABLE_A, fixture, None),
+    )
+}
+
 /// The doctor reports an ordered table's order column on its `table` line
 /// and each file's order facts on its `file` line (RFD 025, Doctor): the
 /// column, its type, the effective `max_scan_rows`, and the longest run
@@ -647,11 +657,7 @@ fn toml_ordered_table(name: &str, fixture: &Fixture, max_scan_rows: Option<u32>)
 async fn test_doctor_reports_an_ordered_table_s_order_facts() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = local_fixture(dir.path(), ordered_spec("events_doctor", ORDER_STEP)).await?;
-    let config = write_file(
-        dir.path(),
-        "ordered.toml",
-        &toml_ordered_table(TABLE_A, &fixture, None),
-    )?;
+    let config = ordered_config(dir.path(), "ordered", &fixture)?;
     let output = run(&["doctor", "--config", &config, "--files"], &[]);
     assert_exit(&output, EXIT_OK);
     let report = lines(&output.stdout);
@@ -758,18 +764,34 @@ fn doctor_files(config: &str, extra: &[&str], env: &[(&str, &str)]) -> Output {
 /// and either way stdout carries the value as the exact number.
 #[tokio::test]
 async fn test_doctor_warns_when_a_file_line_carries_an_order_past_2_pow_53() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let cases = [
+    assert_precision_cases(&[
         ("at_limit", EXACT_ORDER, false),
         ("past_limit", EXACT_ORDER + 1, true),
-    ];
-    for (name, last, warns) in cases {
+    ])
+    .await
+}
+
+/// The negative side of the limit: a file whose least order value is
+/// -2^53 does not warn and one at -2^53 - 1 does, and either way stdout
+/// carries the greatest as the exact number.
+#[tokio::test]
+async fn test_doctor_warns_when_a_file_line_carries_an_order_below_minus_2_pow_53() -> TestResult {
+    let span = i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
+    assert_precision_cases(&[
+        ("negative_at_limit", -EXACT_ORDER + span, false),
+        ("negative_past_limit", -EXACT_ORDER - 1 + span, true),
+    ])
+    .await
+}
+
+/// For each case, named, of a `nanosecond_fixture` whose last order value
+/// is `last`: a `doctor --files` run warns of `TABLE_A` exactly when
+/// `warns`, and its `file` line carries `last` as the greatest order value.
+async fn assert_precision_cases(cases: &[(&str, i64, bool)]) -> TestResult {
+    let dir = tempfile::tempdir()?;
+    for &(name, last, warns) in cases {
         let fixture = nanosecond_fixture(dir.path(), name, last).await?;
-        let config = write_file(
-            dir.path(),
-            &format!("{name}.toml"),
-            &toml_ordered_table(TABLE_A, &fixture, None),
-        )?;
+        let config = ordered_config(dir.path(), name, &fixture)?;
         let output = doctor_files(&config, &[], &[]);
         let expected: &[String] = if warns { &[TABLE_A.to_string()] } else { &[] };
         assert_eq!(precision_warnings(&output), expected, "{name}");
@@ -782,30 +804,6 @@ async fn test_doctor_warns_when_a_file_line_carries_an_order_past_2_pow_53() -> 
     Ok(())
 }
 
-/// The negative side of the limit: a file whose least order value is
-/// -2^53 does not warn and one at -2^53 - 1 does.
-#[tokio::test]
-async fn test_doctor_warns_when_a_file_line_carries_an_order_below_minus_2_pow_53() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let span = i64::try_from(ORDER_ROWS_PER_KEY - 1)?;
-    let cases = [
-        ("negative_at_limit", -EXACT_ORDER + span, false),
-        ("negative_past_limit", -EXACT_ORDER - 1 + span, true),
-    ];
-    for (name, last, warns) in cases {
-        let fixture = nanosecond_fixture(dir.path(), name, last).await?;
-        let config = write_file(
-            dir.path(),
-            &format!("{name}.toml"),
-            &toml_ordered_table(TABLE_A, &fixture, None),
-        )?;
-        let output = doctor_files(&config, &[], &[]);
-        let expected: &[String] = if warns { &[TABLE_A.to_string()] } else { &[] };
-        assert_eq!(precision_warnings(&output), expected, "{name}");
-    }
-    Ok(())
-}
-
 /// The warning goes to stderr alone: with the log stream silenced, stdout
 /// is the same bytes, and every stdout line is still one of the output
 /// contract's JSON lines.
@@ -813,11 +811,7 @@ async fn test_doctor_warns_when_a_file_line_carries_an_order_below_minus_2_pow_5
 async fn test_doctor_warning_leaves_stdout_unchanged() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = nanosecond_fixture(dir.path(), "events_wide", EXACT_ORDER + 1).await?;
-    let config = write_file(
-        dir.path(),
-        "wide.toml",
-        &toml_ordered_table(TABLE_A, &fixture, None),
-    )?;
+    let config = ordered_config(dir.path(), "wide", &fixture)?;
     let warned = doctor_files(&config, &[], &[]);
     let silenced = doctor_files(&config, &[], &[("RUST_LOG", "off")]);
     assert_eq!(precision_warnings(&warned), [TABLE_A.to_string()]);
@@ -861,11 +855,7 @@ async fn test_doctor_warns_once_for_each_table_that_carries_an_order_past_2_pow_
 async fn test_doctor_and_info_without_file_lines_never_warn_of_an_order() -> TestResult {
     let dir = tempfile::tempdir()?;
     let fixture = nanosecond_fixture(dir.path(), "events_quiet", EXACT_ORDER + 1).await?;
-    let config = write_file(
-        dir.path(),
-        "quiet.toml",
-        &toml_ordered_table(TABLE_A, &fixture, None),
-    )?;
+    let config = ordered_config(dir.path(), "quiet", &fixture)?;
     let doctor = run(&["doctor", "--config", &config], &[]);
     assert_exit(&doctor, EXIT_OK);
     assert!(precision_warnings(&doctor).is_empty());
@@ -889,11 +879,7 @@ async fn test_doctor_does_not_warn_of_a_string_order() -> TestResult {
         ordered_spec_of("events_text", OrderKind::Str, EXACT_ORDER + 1, 1),
     )
     .await?;
-    let config = write_file(
-        dir.path(),
-        "text.toml",
-        &toml_ordered_table(TABLE_A, &fixture, None),
-    )?;
+    let config = ordered_config(dir.path(), "text", &fixture)?;
     let output = doctor_files(&config, &[], &[]);
     assert!(precision_warnings(&output).is_empty());
     Ok(())
@@ -932,11 +918,7 @@ async fn test_doctor_reports_duplicate_rows_with_exit_failure() -> TestResult {
         ..ordered_spec("events_duplicate", 0)
     };
     let fixture = local_fixture(dir.path(), spec).await?;
-    let config = write_file(
-        dir.path(),
-        "ordered.toml",
-        &toml_ordered_table(TABLE_A, &fixture, None),
-    )?;
+    let config = ordered_config(dir.path(), "ordered", &fixture)?;
     let output = run(&["doctor", "--config", &config], &[]);
     assert_exit(&output, EXIT_FAILURE);
     let report = lines(&output.stdout);
