@@ -2022,6 +2022,9 @@ mod tests {
         with_extra(runs_of(&[(1, 1), (2, 30), (3, 1)], 32), extra)
     }
 
+    /// What a read of `columns` value columns of `bounded_run` answers
+    /// oldest first after the order value of the run's row 19, limit 2:
+    /// rows 20 and 21 of the run.
     fn after_answer(columns: usize) -> Vec<ScanRow> {
         [20, 21]
             .into_iter()

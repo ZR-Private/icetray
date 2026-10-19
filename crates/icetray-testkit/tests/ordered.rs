@@ -713,6 +713,11 @@ const HISTORY_STEP: i64 = 4;
 /// Ids of the hand-built tables.
 const HISTORY_IDS: Range<u64> = 0..8;
 
+/// Rows per page and per row group of the hand-built tables: small, so a
+/// key's `HISTORY_ROWS` rows span several pages and row groups.
+const HISTORY_PAGE_ROWS: usize = 2;
+const HISTORY_GROUP_ROWS: usize = 5;
+
 /// A hand-built ordered table of `kind`: `HISTORY_IDS`, `HISTORY_ROWS`
 /// each, in small pages and row groups, two value columns, written to a
 /// fresh catalog.
@@ -727,8 +732,8 @@ async fn history_table(
         second_value: true,
         value_bytes: DRAWN_VALUE_BYTES,
         layout: Layout {
-            page_rows: 2,
-            row_group_rows: Some(5),
+            page_rows: HISTORY_PAGE_ROWS,
+            row_group_rows: Some(HISTORY_GROUP_ROWS),
             ..Layout::contract()
         },
         ..FixtureSpec::ordered(
