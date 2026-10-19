@@ -16,7 +16,7 @@ use parquet::bloom_filter::Sbbf;
 use parquet::column::reader::ColumnReaderImpl;
 use parquet::data_type::{
     ByteArray, ByteArrayType, DataType as ParquetDataType, FixedLenByteArray,
-    FixedLenByteArrayType, Int64Type,
+    FixedLenByteArrayType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
@@ -29,8 +29,8 @@ use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
 use super::{
     Column, ColumnChunk, DecodedPart, FileFault, FileIndex, GroupRange, Inspected, KeyResidency,
-    KeyShape, Keys, OrderLeaf, ValueShape, file_fault, group_starts, identity_of, row_index,
-    unless_panicked, value_bytes,
+    KeyShape, Keys, OrderLeaf, RunShape, ValueShape, file_fault, group_starts, identity_of,
+    row_index, unless_panicked, value_bytes,
 };
 use crate::approx;
 use crate::blocking::on_blocking_pool;
@@ -236,7 +236,12 @@ fn edge_key(
     pick: fn(&Keys) -> Option<Key>,
 ) -> Result<Option<Key>> {
     check_key_page_headers(chunk, shape, page, segments)?;
-    let keys = decode_run(chunk, shape, chunk.page_rows(page), Arc::clone(segments))?;
+    let keys = decode_run(
+        chunk,
+        shape.run_shape(),
+        chunk.page_rows(page),
+        Arc::clone(segments),
+    )?;
     check_utf8(chunk, &keys)?;
     Ok(pick(&keys))
 }
@@ -735,10 +740,7 @@ fn verify_with(
         let rows = chunk.rows();
         check_page_headers(chunk, shape, chunks)?;
         let (run, outcome) = match &mut pairs {
-            None => (
-                check_run(chunk, shape, Arc::clone(chunks), decoder)?.0,
-                None,
-            ),
+            None => (check_run(chunk, shape, chunks, decoder)?.0, None),
             Some(pairs) => {
                 let (run, outcome) = pairs.check_group(chunk, shape, chunks)?;
                 (run, Some(outcome))
@@ -971,7 +973,7 @@ enum KeyDecoder {
     /// (`plain::checked_run`), where the chunk is one it reads; the column
     /// reader otherwise.
     Plain,
-    /// Parquet's column reader (`read_column_batches`).
+    /// Parquet's column reader (`RunBatches`).
     ColumnReader,
 }
 
@@ -981,12 +983,12 @@ enum KeyDecoder {
 /// the column reader would or not at all, and the column reader otherwise.
 /// A row group of plain pages that ends in any fault is read twice, the
 /// second time by the column reader, which reports the fault.
-fn check_run(
-    chunk: ColumnChunk<'_>,
+fn check_run<'c>(
+    chunk: ColumnChunk<'c>,
     shape: KeyShape,
-    chunks: Arc<Segments>,
+    chunks: &Arc<Segments>,
     decoder: KeyDecoder,
-) -> Result<(RunCheck<'_>, KeyDecoder)> {
+) -> Result<(RunCheck<'c>, KeyDecoder)> {
     let byte_keys = match shape {
         KeyShape::Str => Some(ByteKeys::Text),
         KeyShape::Bin => Some(ByteKeys::Bytes),
@@ -994,7 +996,7 @@ fn check_run(
     };
     if decoder == KeyDecoder::Plain
         && let Some(keys) = byte_keys
-        && let Some(run) = plain::checked_run(chunk, keys, &chunks)
+        && let Some(run) = plain::checked_run(chunk, keys, chunks)
     {
         return Ok((run, KeyDecoder::Plain));
     }
@@ -1004,53 +1006,35 @@ fn check_run(
 }
 
 /// Every key of row group `chunk` decoded from `chunks` by the column
-/// reader a batch at a time (`read_column_batches`) and handed to `run`.
-/// Each batch's buffer is handed back to the decoder for the next, so a
-/// row group's keys cost one batch's buffer rather than one buffer for all
-/// of them.
+/// reader a batch of at most `DECODE_BATCH_RECORDS` rows at a time
+/// (`RunBatches`) and handed to `run`. Each batch's buffer is handed back
+/// to the decoder for the next, so a row group's keys cost one batch's
+/// buffer rather than one buffer for all of them.
 fn read_run(
     chunk: ColumnChunk<'_>,
     shape: KeyShape,
-    chunks: Arc<Segments>,
+    chunks: &Arc<Segments>,
     run: &mut RunCheck<'_>,
 ) -> Result<()> {
-    let take = row_index(chunk.rows());
-    match shape {
-        KeyShape::Long => read_column_batches::<Int64Type>(chunk, chunks, 0, take, &mut |batch| {
-            let keys = Keys::Long(std::mem::take(batch));
-            run.visit(&keys);
-            *batch = keys.into_longs();
-        }),
-        KeyShape::Str => {
-            read_column_batches::<ByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
-                let keys = Keys::Str(std::mem::take(batch));
-                run.visit(&keys);
-                *batch = keys.into_byte_arrays();
-            })
-        }
-        KeyShape::Bin => {
-            read_column_batches::<ByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
-                let keys = Keys::Bin(std::mem::take(batch));
-                run.visit(&keys);
-                *batch = keys.into_byte_arrays();
-            })
-        }
-        KeyShape::FixedBin => {
-            read_column_batches::<FixedLenByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
-                run.visit(&Keys::Bin(fixed_as_binary(std::mem::take(batch))));
-            })
-        }
-        KeyShape::Uuid => {
-            read_column_batches::<FixedLenByteArrayType>(chunk, chunks, 0, take, &mut |batch| {
-                run.visit(&Keys::Uuid(fixed_as_uuids(batch)));
-            })
-        }
+    let rows = row_index(chunk.rows());
+    let window = row_index(DECODE_BATCH_RECORDS);
+    let mut batches = RunBatches::open(chunk, shape.run_shape(), chunks)?;
+    let mut asked = 0;
+    while asked < rows {
+        let records = window.min(rows - asked);
+        let Some((_, keys)) = batches.next(records)? else {
+            break;
+        };
+        run.visit(&keys);
+        batches.give_back(keys);
+        asked += records;
     }
+    batches.finish()
 }
 
 /// `FIXED_LEN_BYTE_ARRAY` values as the binary keys, or binary order
 /// values, they are.
-pub(super) fn fixed_as_binary(values: Vec<FixedLenByteArray>) -> Vec<ByteArray> {
+fn fixed_as_binary(values: Vec<FixedLenByteArray>) -> Vec<ByteArray> {
     values.into_iter().map(ByteArray::from).collect()
 }
 
@@ -1079,76 +1063,93 @@ fn not_above_previous(chunk: ColumnChunk<'_>, order: Ordering, key: Key) -> Refu
     }
 }
 
-/// Rows `rows` of the key column chunk `chunk` decoded from `chunks`, which
-/// hold at least the pages those rows are in. Exactly those rows come back,
-/// as `read_column` guarantees; a string column's values are not checked
-/// as UTF-8 here, `check_utf8` does that where the run is read back through
-/// `Keys::get`.
+/// Rows `rows` of the key or order column chunk `chunk`, whose values
+/// decode as `shape`, decoded from `chunks`, which hold at least the pages
+/// those rows are in. Exactly those rows come back, nulls left out, as
+/// `read_column` guarantees, and an `INT32` column's values widened to
+/// longs; a string column's values are not checked as UTF-8 here, the
+/// caller does that before the run is read back through `Keys::get`.
 pub(super) fn decode_run(
     chunk: ColumnChunk<'_>,
-    shape: KeyShape,
+    shape: RunShape,
     rows: Range<i64>,
     chunks: Arc<Segments>,
 ) -> Result<Keys> {
     let skip = row_index(rows.start);
     let take = row_index(rows.end - rows.start);
     Ok(match shape {
-        KeyShape::Long => Keys::Long(read_column::<Int64Type>(chunk, chunks, skip, take)?),
-        KeyShape::Str => Keys::Str(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
-        KeyShape::Bin => Keys::Bin(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
-        KeyShape::FixedBin => Keys::Bin(fixed_as_binary(read_column::<FixedLenByteArrayType>(
+        RunShape::Int32 => Keys::Long(
+            read_column::<Int32Type>(chunk, chunks, skip, take)?
+                .into_iter()
+                .map(i64::from)
+                .collect(),
+        ),
+        RunShape::Int64 => Keys::Long(read_column::<Int64Type>(chunk, chunks, skip, take)?),
+        RunShape::Str => Keys::Str(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
+        RunShape::Bin => Keys::Bin(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
+        RunShape::FixedBin => Keys::Bin(fixed_as_binary(read_column::<FixedLenByteArrayType>(
             chunk, chunks, skip, take,
         )?)),
-        KeyShape::Uuid => Keys::Uuid(fixed_as_uuids(&read_column::<FixedLenByteArrayType>(
+        RunShape::Uuid => Keys::Uuid(fixed_as_uuids(&read_column::<FixedLenByteArrayType>(
             chunk, chunks, skip, take,
         )?)),
     })
 }
 
-/// Every key of row group `chunk` decoded from `chunks` a batch at a time
-/// by one column reader (`ChunkBatches`), each batch as the `Keys` its
-/// shape decodes to, as `decode_run` decodes a range of them.
-pub(super) enum KeyBatches<'a> {
-    /// `INT64` keys.
+/// Every value of row group `chunk`'s key or order column decoded from
+/// `chunks` a batch at a time by one column reader (`ChunkBatches`), each
+/// batch as the `Keys` its shape decodes to, as `decode_run` decodes a
+/// range of them.
+pub(super) enum RunBatches<'a> {
+    /// `INT32` values, widened to longs.
+    Int32(ChunkBatches<'a, Int32Type>),
+    /// `INT64` values.
     Long(ChunkBatches<'a, Int64Type>),
-    /// `BYTE_ARRAY` keys, strings when `text`.
+    /// `BYTE_ARRAY` values, strings when `text`.
     Bytes {
         batches: ChunkBatches<'a, ByteArrayType>,
         text: bool,
     },
-    /// `FIXED_LEN_BYTE_ARRAY` keys, uuids when `uuid`.
+    /// `FIXED_LEN_BYTE_ARRAY` values, uuids when `uuid`.
     Fixed {
         batches: ChunkBatches<'a, FixedLenByteArrayType>,
         uuid: bool,
     },
 }
 
-impl<'a> KeyBatches<'a> {
-    /// The decode of every row of `chunk`, whose keys decode as `shape`.
+impl<'a> RunBatches<'a> {
+    /// The decode of every row of `chunk`, whose values decode as `shape`.
     pub(super) fn open(
         chunk: ColumnChunk<'a>,
-        shape: KeyShape,
+        shape: RunShape,
         chunks: &Arc<Segments>,
     ) -> Result<Self> {
         let rows = row_index(chunk.rows());
         let segments = Arc::clone(chunks);
         Ok(match shape {
-            KeyShape::Long => Self::Long(ChunkBatches::open(chunk, segments, 0, rows)?),
-            KeyShape::Str | KeyShape::Bin => Self::Bytes {
+            RunShape::Int32 => Self::Int32(ChunkBatches::open(chunk, segments, 0, rows)?),
+            RunShape::Int64 => Self::Long(ChunkBatches::open(chunk, segments, 0, rows)?),
+            RunShape::Str | RunShape::Bin => Self::Bytes {
                 batches: ChunkBatches::open(chunk, segments, 0, rows)?,
-                text: shape == KeyShape::Str,
+                text: shape == RunShape::Str,
             },
-            KeyShape::FixedBin | KeyShape::Uuid => Self::Fixed {
+            RunShape::FixedBin | RunShape::Uuid => Self::Fixed {
                 batches: ChunkBatches::open(chunk, segments, 0, rows)?,
-                uuid: shape == KeyShape::Uuid,
+                uuid: shape == RunShape::Uuid,
             },
         })
     }
 
-    /// The next `records` rows' keys, with how many rows were decoded
+    /// The next `records` rows' values, with how many rows were decoded
     /// (`ChunkBatches::next`).
     pub(super) fn next(&mut self, records: usize) -> Result<Option<(usize, Keys)>> {
         Ok(match self {
+            Self::Int32(batches) => batches.next(records)?.map(|(read, values, _)| {
+                (
+                    read,
+                    Keys::Long(values.iter().copied().map(i64::from).collect()),
+                )
+            }),
             Self::Long(batches) => batches
                 .next(records)?
                 .map(|(read, values, _)| (read, Keys::Long(std::mem::take(values)))),
@@ -1174,9 +1175,27 @@ impl<'a> KeyBatches<'a> {
         })
     }
 
+    /// `keys`, a batch `next` returned, handed back as the buffer the next
+    /// batch decodes into, so that every batch reuses it. A batch built
+    /// from the decoded values rather than taken from them (`INT32`,
+    /// `FIXED_LEN_BYTE_ARRAY`) leaves the buffer where it was.
+    pub(super) fn give_back(&mut self, keys: Keys) {
+        match (self, keys) {
+            (Self::Long(batches), Keys::Long(values)) => batches.values = values,
+            (Self::Bytes { batches, .. }, Keys::Str(values) | Keys::Bin(values)) => {
+                batches.values = values;
+            }
+            (
+                Self::Int32(_) | Self::Long(_) | Self::Bytes { .. } | Self::Fixed { .. },
+                Keys::Long(_) | Keys::Str(_) | Keys::Bin(_) | Keys::Uuid(_),
+            ) => {}
+        }
+    }
+
     /// `ChunkBatches::finish`.
     pub(super) fn finish(self) -> Result<()> {
         match self {
+            Self::Int32(batches) => batches.finish(),
             Self::Long(batches) => batches.finish(),
             Self::Bytes { batches, .. } => batches.finish(),
             Self::Fixed { batches, .. } => batches.finish(),
@@ -1211,7 +1230,7 @@ fn not_utf8(chunk: ColumnChunk<'_>) -> Error {
 /// validating that once costs as much in the copy as it saves in the
 /// validator for keys of a few dozen bytes (measured on the benchmark's
 /// string table).
-fn keys_are_utf8(keys: &Keys) -> bool {
+pub(super) fn keys_are_utf8(keys: &Keys) -> bool {
     let Keys::Str(run) = keys else {
         return true;
     };
@@ -1288,40 +1307,25 @@ pub(super) fn read_column<T: ParquetDataType>(
     take: usize,
 ) -> Result<Vec<T::T>> {
     let mut values = Vec::new();
-    read_column_batches::<T>(chunk, segments, skip, take, &mut |batch| {
+    read_batches_with_levels::<T>(chunk, segments, skip, take, &mut |batch, _levels| {
         values.append(batch);
     })?;
     Ok(values)
-}
-
-/// `read_column`, with each batch of at most `DECODE_BATCH_RECORDS` records
-/// handed to `sink` as it is decoded instead of gathered: the values of a
-/// batch, in file order, in a buffer the sink may read or take. What the
-/// sink leaves in the buffer is cleared before the next batch is decoded
-/// into it, so a sink that hands a buffer back lets every batch reuse it.
-/// The sink runs inside the decode's `catch_unwind`; everything
-/// `read_column` checks once the decode ends is checked after the last
-/// batch, so a sink sees batches of a decode that may still fail.
-fn read_column_batches<T: ParquetDataType>(
-    chunk: ColumnChunk<'_>,
-    segments: Arc<Segments>,
-    skip: usize,
-    take: usize,
-    sink: &mut dyn FnMut(&mut Vec<T::T>),
-) -> Result<()> {
-    read_batches_with_levels::<T>(chunk, segments, skip, take, &mut |batch, _levels| {
-        sink(batch);
-    })
 }
 
 /// What a decode hands each batch of values to, with the batch's
 /// definition levels (`read_batches_with_levels`).
 type LevelledSink<'a, V> = dyn FnMut(&mut Vec<V>, &[i16]) + 'a;
 
-/// `read_column_batches`, with each batch's definition levels handed to
-/// `sink` beside its values: one level per record, empty for a column that
-/// is not nullable, a record whose level is below the column's greatest
-/// one a null that holds no value.
+/// `read_column`, with each batch of at most `DECODE_BATCH_RECORDS` records
+/// handed to `sink` as it is decoded instead of gathered: the values of a
+/// batch, in file order, in a buffer the sink may read or take and that is
+/// cleared before the next batch, and beside them the batch's definition
+/// levels, one per record, empty for a column that is not nullable, a
+/// record whose level is below the column's greatest one a null that
+/// holds no value. Everything `read_column` checks once the decode ends is
+/// checked after the last batch, so a sink sees batches of a decode that
+/// may still fail.
 fn read_batches_with_levels<T: ParquetDataType>(
     chunk: ColumnChunk<'_>,
     segments: Arc<Segments>,
@@ -3288,13 +3292,8 @@ mod tests {
         assert_eq!(plain, reader, "the plain decoder against the column reader");
         let taken = (0..metadata.num_row_groups())
             .map(|row_group| {
-                check_run(
-                    column.group(row_group),
-                    shape,
-                    Arc::clone(chunks),
-                    KeyDecoder::Plain,
-                )
-                .map_or(KeyDecoder::ColumnReader, |(_, decoder)| decoder)
+                check_run(column.group(row_group), shape, chunks, KeyDecoder::Plain)
+                    .map_or(KeyDecoder::ColumnReader, |(_, decoder)| decoder)
             })
             .collect();
         (plain, taken)

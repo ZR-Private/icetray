@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::build::{
     DECODE_BATCH_RECORDS, check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts,
 };
-use super::ordered::{OrderRun, decode_orders};
+use super::ordered::OrderRun;
 use super::{
     Column, ColumnChunk, FileFault, FileIndex, KeyResidency, Keys, OrderLeaf, RowPosition, RowRef,
     file_fault, row_index,
@@ -88,7 +88,7 @@ impl Pairs {
     pub(crate) fn empty() -> Self {
         Self {
             keys: Keys::Long(Vec::new()),
-            orders: OrderRun::Long(Vec::new()),
+            orders: OrderRun(Keys::Long(Vec::new())),
             start: RowPosition(0),
         }
     }
@@ -108,7 +108,7 @@ impl Pairs {
     pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
         self.keys
             .cmp_at(at, &other.keys, other_at)
-            .then_with(|| self.orders.cmp_run(at, &other.orders, other_at))
+            .then_with(|| self.orders.cmp_at(at, &other.orders, other_at))
     }
 
     /// The key of pair `at`.
@@ -224,17 +224,17 @@ impl FileIndex {
         let order_chunk = self.order_values(order).group(span.row_group);
         let keys = decode_run(
             key_chunk,
-            self.layout.key_shape,
+            self.layout.key_shape.run_shape(),
             span.rows.clone(),
             Arc::clone(&chunks.chunks),
         )?;
         check_utf8(key_chunk, &keys)?;
-        let orders = decode_orders(
+        let orders = OrderRun(decode_run(
             order_chunk,
-            order.shape,
+            order.shape.run_shape(),
             span.rows.clone(),
             Arc::clone(&chunks.chunks),
-        )?;
+        )?);
         let rows = row_index(span.rows.end - span.rows.start);
         if keys.len() != rows || orders.len() != rows {
             return Err(file_fault(

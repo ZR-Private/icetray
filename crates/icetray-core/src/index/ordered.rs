@@ -7,14 +7,9 @@
 //! A key-value table never reaches this module.
 
 use std::cmp::Ordering;
-use std::ops::Range;
 use std::sync::Arc;
 
-use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType, Int32Type, Int64Type};
-
-use super::build::{
-    ChunkBatches, DECODE_BATCH_RECORDS, KeyBatches, RunCheck, fixed_as_binary, is_utf8, read_column,
-};
+use super::build::{DECODE_BATCH_RECORDS, RunBatches, RunCheck, keys_are_utf8};
 use super::order_fences::{GroupFences, GroupFencesBuilder, OrderFences, Pair, PairPart};
 use super::page_header::check_order_page_headers;
 use super::{
@@ -25,92 +20,57 @@ use crate::key::Key;
 use crate::order::{OrderFacts, OrderValue};
 use crate::parquet_io::Segments;
 
-/// A decoded run of order values in file order, holding the values parquet
-/// decoded so that a run costs no allocation per value. Compares as
-/// `OrderValue` does: longs numerically, strings and bytes bytewise.
-pub(super) enum OrderRun {
-    /// Integer and time values, an `INT32` column's widened.
-    Long(Vec<i64>),
-    /// String values as their bytes, which `is_utf8` checks.
-    Str(Vec<ByteArray>),
-    /// Binary and fixed-width values.
-    Bin(Vec<ByteArray>),
-}
+/// A decoded run of order values in file order: the `Keys` run their
+/// shape decodes to (`OrderShape::run_shape`), never one of uuids, holding
+/// the values parquet decoded so that a run costs no allocation per value.
+/// Compares as `OrderValue` does: longs numerically, strings and bytes
+/// bytewise.
+pub(super) struct OrderRun(pub(super) Keys);
 
 impl OrderRun {
     /// The number of values.
     pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Long(run) => run.len(),
-            Self::Str(run) | Self::Bin(run) => run.len(),
-        }
+        self.0.len()
     }
 
     /// Whether every value is UTF-8, in a run of strings; true in any
     /// other.
     pub(super) fn is_utf8(&self) -> bool {
-        match self {
-            Self::Str(run) => run.iter().all(|value| is_utf8(value.data())),
-            Self::Long(_) | Self::Bin(_) => true,
-        }
+        keys_are_utf8(&self.0)
     }
 
     /// The value at `at`, which is below `len`; a run of strings is read
     /// back only once `is_utf8` holds for it.
     pub(super) fn value(&self, at: usize) -> OrderValue {
-        match self {
-            Self::Long(run) => OrderValue::Long(run[at]),
-            Self::Str(run) => OrderValue::Str(
-                String::from_utf8(run[at].data().to_vec())
-                    .expect("a run of strings is read back once is_utf8 holds for it"),
-            ),
-            Self::Bin(run) => OrderValue::Bytes(run[at].data().to_vec()),
+        match self.0.get(at) {
+            Key::Long(value) => OrderValue::Long(value),
+            Key::Str(value) => OrderValue::Str(value),
+            Key::Bytes(value) => OrderValue::Bytes(value),
+            Key::Uuid(value) => OrderValue::Bytes(value.to_vec()),
         }
     }
 
     /// Value `at`, which is below `len`, as fences compare it.
     fn part(&self, at: usize) -> PairPart<'_> {
-        match self {
-            Self::Long(run) => PairPart::Long(run[at]),
-            Self::Str(run) | Self::Bin(run) => PairPart::Bytes(run[at].data()),
-        }
+        self.0.part(at)
     }
 
-    /// Value `at` against value `other_at` of the same run.
-    fn cmp_at(&self, at: usize, other_at: usize) -> Ordering {
-        match self {
-            Self::Long(run) => run[at].cmp(&run[other_at]),
-            Self::Str(run) | Self::Bin(run) => run[at].data().cmp(run[other_at].data()),
-        }
-    }
-
-    /// Value `at` against value `other_at` of `other`, a run of the same
-    /// column in another file. Runs of different variants never meet
-    /// within one table; when they do, the order is `OrderValue`'s derived
-    /// order across variants.
-    pub(super) fn cmp_run(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
-        match (self, other) {
-            (Self::Long(mine), Self::Long(theirs)) => mine[at].cmp(&theirs[other_at]),
-            (Self::Str(mine), Self::Str(theirs)) | (Self::Bin(mine), Self::Bin(theirs)) => {
-                mine[at].data().cmp(theirs[other_at].data())
-            }
-            (
-                Self::Long(_) | Self::Str(_) | Self::Bin(_),
-                Self::Long(_) | Self::Str(_) | Self::Bin(_),
-            ) => self.value(at).cmp(&other.value(other_at)),
-        }
+    /// Value `at` against value `other_at` of `other`, this run or a run of
+    /// the same column in another file (`Keys::cmp_at`).
+    pub(super) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
+        self.0.cmp_at(at, &other.0, other_at)
     }
 
     /// Value `at` against `value`, one of another run of the same column.
     /// A value of another variant never meets one of this run; when it
     /// does, the order is `OrderValue`'s derived order across variants.
     pub(super) fn cmp_value(&self, at: usize, value: &OrderValue) -> Ordering {
-        match (self, value) {
-            (Self::Long(run), OrderValue::Long(other)) => run[at].cmp(other),
-            (Self::Str(run), OrderValue::Str(other)) => run[at].data().cmp(other.as_bytes()),
-            (Self::Bin(run), OrderValue::Bytes(other)) => run[at].data().cmp(other.as_slice()),
+        match (&self.0, value) {
+            (Keys::Long(run), OrderValue::Long(other)) => run[at].cmp(other),
+            (Keys::Str(run), OrderValue::Str(other)) => run[at].data().cmp(other.as_bytes()),
+            (Keys::Bin(run), OrderValue::Bytes(other)) => run[at].data().cmp(other.as_slice()),
             (
-                Self::Long(_) | Self::Str(_) | Self::Bin(_),
+                Keys::Long(_) | Keys::Str(_) | Keys::Bin(_) | Keys::Uuid(_),
                 OrderValue::Long(_) | OrderValue::Str(_) | OrderValue::Bytes(_),
             ) => self.value(at).cmp(value),
         }
@@ -120,106 +80,9 @@ impl OrderRun {
     /// empty run.
     fn extremes(&self) -> Option<(usize, usize)> {
         let positions = 0..self.len();
-        let least = positions.clone().min_by(|&a, &b| self.cmp_at(a, b))?;
-        let greatest = positions.max_by(|&a, &b| self.cmp_at(a, b))?;
+        let least = positions.clone().min_by(|&a, &b| self.cmp_at(a, self, b))?;
+        let greatest = positions.max_by(|&a, &b| self.cmp_at(a, self, b))?;
         Some((least, greatest))
-    }
-}
-
-/// Rows `rows` of the order column chunk `chunk` decoded from `chunks`,
-/// which hold at least the pages those rows are in, as `decode_run` decodes
-/// keys: exactly those rows, nulls left out, and an `INT32` column read as
-/// longs. A string column's values are not checked as UTF-8 here.
-pub(super) fn decode_orders(
-    chunk: ColumnChunk<'_>,
-    shape: OrderShape,
-    rows: Range<i64>,
-    chunks: Arc<Segments>,
-) -> Result<OrderRun> {
-    let skip = row_index(rows.start);
-    let take = row_index(rows.end - rows.start);
-    Ok(match shape {
-        OrderShape::Int32 => OrderRun::Long(
-            read_column::<Int32Type>(chunk, chunks, skip, take)?
-                .into_iter()
-                .map(i64::from)
-                .collect(),
-        ),
-        OrderShape::Int64 => OrderRun::Long(read_column::<Int64Type>(chunk, chunks, skip, take)?),
-        OrderShape::Str => OrderRun::Str(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
-        OrderShape::Bin => OrderRun::Bin(read_column::<ByteArrayType>(chunk, chunks, skip, take)?),
-        OrderShape::Fixed(_) => OrderRun::Bin(fixed_as_binary(
-            read_column::<FixedLenByteArrayType>(chunk, chunks, skip, take)?,
-        )),
-    })
-}
-
-/// Every order value of row group `chunk` decoded a batch at a time by one
-/// column reader (`ChunkBatches`), each batch as the `OrderRun` its shape
-/// decodes to, as `decode_orders` decodes a range of them.
-enum OrderBatches<'a> {
-    Int32(ChunkBatches<'a, Int32Type>),
-    Int64(ChunkBatches<'a, Int64Type>),
-    /// `BYTE_ARRAY` values, strings when `text`.
-    Bytes {
-        batches: ChunkBatches<'a, ByteArrayType>,
-        text: bool,
-    },
-    Fixed(ChunkBatches<'a, FixedLenByteArrayType>),
-}
-
-impl<'a> OrderBatches<'a> {
-    /// The decode of every row of `chunk`, whose values decode as `shape`.
-    fn open(chunk: ColumnChunk<'a>, shape: OrderShape, chunks: &Arc<Segments>) -> Result<Self> {
-        let rows = row_index(chunk.rows());
-        let segments = Arc::clone(chunks);
-        Ok(match shape {
-            OrderShape::Int32 => Self::Int32(ChunkBatches::open(chunk, segments, 0, rows)?),
-            OrderShape::Int64 => Self::Int64(ChunkBatches::open(chunk, segments, 0, rows)?),
-            OrderShape::Str | OrderShape::Bin => Self::Bytes {
-                batches: ChunkBatches::open(chunk, segments, 0, rows)?,
-                text: shape == OrderShape::Str,
-            },
-            OrderShape::Fixed(_) => Self::Fixed(ChunkBatches::open(chunk, segments, 0, rows)?),
-        })
-    }
-
-    /// The next `records` rows' values, with how many rows were decoded
-    /// (`ChunkBatches::next`).
-    fn next(&mut self, records: usize) -> Result<Option<(usize, OrderRun)>> {
-        Ok(match self {
-            Self::Int32(batches) => batches.next(records)?.map(|(read, values, _)| {
-                (
-                    read,
-                    OrderRun::Long(values.iter().copied().map(i64::from).collect()),
-                )
-            }),
-            Self::Int64(batches) => batches
-                .next(records)?
-                .map(|(read, values, _)| (read, OrderRun::Long(std::mem::take(values)))),
-            Self::Bytes { batches, text } => batches.next(records)?.map(|(read, values, _)| {
-                let values = std::mem::take(values);
-                let run = if *text {
-                    OrderRun::Str(values)
-                } else {
-                    OrderRun::Bin(values)
-                };
-                (read, run)
-            }),
-            Self::Fixed(batches) => batches.next(records)?.map(|(read, values, _)| {
-                (read, OrderRun::Bin(fixed_as_binary(std::mem::take(values))))
-            }),
-        })
-    }
-
-    /// `ChunkBatches::finish`.
-    fn finish(self) -> Result<()> {
-        match self {
-            Self::Int32(batches) => batches.finish(),
-            Self::Int64(batches) => batches.finish(),
-            Self::Bytes { batches, .. } => batches.finish(),
-            Self::Fixed(batches) => batches.finish(),
-        }
     }
 }
 
@@ -387,8 +250,8 @@ impl<'a> PairCheck<'a> {
         let window = row_index(DECODE_BATCH_RECORDS);
         let mut run = RunCheck::ordered(chunk);
         let mut fences = GroupFencesBuilder::new(shape, self.shape, pages);
-        let mut key_batches = KeyBatches::open(chunk, shape, chunks)?;
-        let mut order_batches = OrderBatches::open(order_chunk, self.shape, chunks)?;
+        let mut key_batches = RunBatches::open(chunk, shape.run_shape(), chunks)?;
+        let mut order_batches = RunBatches::open(order_chunk, self.shape.run_shape(), chunks)?;
         let mut start = 0;
         while start < rows {
             let wanted = window.min(rows - start);
@@ -401,6 +264,7 @@ impl<'a> PairCheck<'a> {
             if read != wanted || order_read != wanted {
                 break;
             }
+            let orders = OrderRun(orders);
             run.visit(&keys);
             let batch = Window {
                 base: start,
@@ -544,7 +408,7 @@ impl<'a> PairCheck<'a> {
                 Some(Ordering::Equal) => {
                     let order = match (at, &self.last) {
                         (0, Some((_, last))) => orders.cmp_value(0, last),
-                        _ => orders.cmp_at(at, at - 1),
+                        _ => orders.cmp_at(at, orders, at - 1),
                     };
                     match order {
                         Ordering::Greater => true,

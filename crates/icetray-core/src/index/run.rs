@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 
 use super::build::{ValueRows, checked_values, decode_run};
 use super::order_fences::Pair;
-use super::ordered::{OrderRun, decode_orders};
+use super::ordered::OrderRun;
 use super::page_header::check_order_pages;
 use super::{
     ColumnChunk, DeletedRows, FileFault, FileIndex, GroupRange, KeyResidency, OrderLeaf,
@@ -186,7 +186,7 @@ impl FileIndex {
             let rows = chunk.page_rows(page);
             let keys = decode_run(
                 chunk,
-                self.layout.key_shape,
+                self.layout.key_shape.run_shape(),
                 rows.clone(),
                 Arc::clone(&segments),
             )?;
@@ -560,7 +560,12 @@ impl FileIndex {
         segments: Arc<Segments>,
     ) -> Result<OrderRun> {
         check_order_pages(chunk, order.shape, pages, &segments)?;
-        let values = decode_orders(chunk, order.shape, rows.clone(), segments)?;
+        let values = OrderRun(decode_run(
+            chunk,
+            order.shape.run_shape(),
+            rows.clone(),
+            segments,
+        )?);
         if values.len() != row_index(rows.end - rows.start) {
             return Err(chunk.page_rows_mismatch(chunk.page_holding(row_index(rows.start))));
         }

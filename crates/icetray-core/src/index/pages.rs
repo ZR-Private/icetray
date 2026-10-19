@@ -384,7 +384,7 @@ mod tests {
     use crate::generation::testing::Dictionary;
     use crate::index::build::{decode_run, read_optional};
     use crate::index::testing::{Fixture, Layout, contract_rows, location};
-    use crate::index::{Column, KeyShape, Keys};
+    use crate::index::{Column, Keys, RunShape};
     use crate::key::KeyType;
 
     /// Every `NULLS_EVERY`th value of a fixture with null values is null.
@@ -492,7 +492,7 @@ mod tests {
             let rows = keys.page_rows(page);
             let span = row_index(rows.start)..row_index(rows.end);
             let Keys::Long(decoded) =
-                decode_run(keys, KeyShape::Long, rows, held_for(file, keys, page)).unwrap()
+                decode_run(keys, RunShape::Int64, rows, held_for(file, keys, page)).unwrap()
             else {
                 panic!("a long key column decodes to longs");
             };

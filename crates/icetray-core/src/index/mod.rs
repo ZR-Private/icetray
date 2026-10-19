@@ -530,16 +530,19 @@ impl PageRef {
 /// A decoded run of keys in file order, one arm per key type, holding the
 /// values parquet decoded so that a run of a thousand keys costs no
 /// allocation per key. Order and search compare the served order of
-/// `Key`: longs numerically, everything else as unsigned bytes.
+/// `Key`: longs numerically, everything else as unsigned bytes. A run of
+/// order values is one too (`ordered::OrderRun`), without uuids.
 #[derive(Clone, Debug)]
 pub(crate) enum Keys {
-    /// Long keys.
+    /// Long keys, an `INT32` column's widened.
     Long(Vec<i64>),
-    /// String keys as their UTF-8 bytes. `verify` checks every value of the
-    /// file at build and `decode_keys` checks what it returns, so `get`
-    /// builds a `Key::Str` without a lossy conversion; a lookup's page is
-    /// bytes `verify` checked and is only searched, never read back through
-    /// `get`. A run built any other way must hold UTF-8 too.
+    /// String keys as their UTF-8 bytes. Every run read back through `get`
+    /// is checked first: by `verify` at build, then keys by `check_utf8`
+    /// and order values by `OrderRun::is_utf8` wherever they decode
+    /// (`PairCheck::visit`, `decode_pairs`, a Scan's `decode_order_span`).
+    /// So `get` builds a `Key::Str` without a lossy conversion; a lookup's
+    /// page is bytes `verify` checked and is only searched, never read back
+    /// through `get`. A run built any other way must hold UTF-8 too.
     Str(Vec<ByteArray>),
     /// Binary keys, from a `BYTE_ARRAY` or a `FIXED_LEN_BYTE_ARRAY` column.
     Bin(Vec<ByteArray>),
@@ -576,11 +579,10 @@ impl Keys {
     pub(crate) fn get(&self, at: usize) -> Key {
         match self {
             Self::Long(run) => Key::Long(run[at]),
-            Self::Str(run) => {
-                Key::Str(String::from_utf8(run[at].data().to_vec()).expect(
-                    "a Keys::Str run holds UTF-8: verify and decode_keys check every value",
-                ))
-            }
+            Self::Str(run) => Key::Str(
+                String::from_utf8(run[at].data().to_vec())
+                    .expect("a Keys::Str run holds UTF-8: every run read back is checked first"),
+            ),
             Self::Bin(run) => Key::Bytes(run[at].data().to_vec()),
             Self::Uuid(run) => Key::Uuid(run[at]),
         }
@@ -680,24 +682,6 @@ impl Keys {
         }
     }
 
-    /// A `Long` run's values, for the buffer they were decoded into to be
-    /// reused; empty for another arm.
-    pub(crate) fn into_longs(self) -> Vec<i64> {
-        match self {
-            Self::Long(run) => run,
-            Self::Str(_) | Self::Bin(_) | Self::Uuid(_) => Vec::new(),
-        }
-    }
-
-    /// A `Str` or `Bin` run's values, for the buffer they were decoded
-    /// into to be reused; empty for another arm.
-    pub(crate) fn into_byte_arrays(self) -> Vec<ByteArray> {
-        match self {
-            Self::Str(run) | Self::Bin(run) => run,
-            Self::Long(_) | Self::Uuid(_) => Vec::new(),
-        }
-    }
-
     /// The position of the first key that is not above the one before it,
     /// with how it compares to that key: `Equal` for a duplicate, `Less`
     /// for a key out of order. `None` for a strictly increasing run.
@@ -738,6 +722,17 @@ impl KeyShape {
             Self::Str => KeyType::String,
             Self::Bin | Self::FixedBin => KeyType::Binary,
             Self::Uuid => KeyType::Uuid,
+        }
+    }
+
+    /// How the keys decode into a `Keys` run.
+    fn run_shape(self) -> RunShape {
+        match self {
+            Self::Long => RunShape::Int64,
+            Self::Str => RunShape::Str,
+            Self::Bin => RunShape::Bin,
+            Self::FixedBin => RunShape::FixedBin,
+            Self::Uuid => RunShape::Uuid,
         }
     }
 }
@@ -788,6 +783,36 @@ impl OrderShape {
             Self::Str | Self::Bin | Self::Fixed(_) => bytes,
         }
     }
+
+    /// How the order values decode into a `Keys` run.
+    fn run_shape(self) -> RunShape {
+        match self {
+            Self::Int32 => RunShape::Int32,
+            Self::Int64 => RunShape::Int64,
+            Self::Str => RunShape::Str,
+            Self::Bin => RunShape::Bin,
+            Self::Fixed(_) => RunShape::FixedBin,
+        }
+    }
+}
+
+/// How a key or order column's values decode into a `Keys` run
+/// (`build::decode_run`, `build::RunBatches`): the physical type, and what
+/// its values are read as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunShape {
+    /// `INT32`, read as longs: an order column's alone.
+    Int32,
+    /// `INT64`, read as longs.
+    Int64,
+    /// `BYTE_ARRAY` holding UTF-8.
+    Str,
+    /// `BYTE_ARRAY` holding opaque bytes.
+    Bin,
+    /// `FIXED_LEN_BYTE_ARRAY` holding opaque bytes.
+    FixedBin,
+    /// `FIXED_LEN_BYTE_ARRAY` of `UUID_BYTES`: a key column's alone.
+    Uuid,
 }
 
 /// The column a file holds under an ordered table's order column: its
@@ -1520,7 +1545,12 @@ impl FileIndex {
             Some(page) => chunk.page_rows(page),
             None => 0..chunk.rows(),
         };
-        let keys = decode_run(chunk, self.layout.key_shape, rows, Arc::new(chunks.clone()))?;
+        let keys = decode_run(
+            chunk,
+            self.layout.key_shape.run_shape(),
+            rows,
+            Arc::new(chunks.clone()),
+        )?;
         check_utf8(chunk, &keys)?;
         Ok(keys)
     }
@@ -1596,7 +1626,12 @@ impl FileIndex {
     ) -> Result<Option<RowRef>> {
         let chunk = self.key_column().group(row_group);
         let rows = chunk.page_rows(page);
-        let keys = decode_run(chunk, self.layout.key_shape, rows.clone(), segments)?;
+        let keys = decode_run(
+            chunk,
+            self.layout.key_shape.run_shape(),
+            rows.clone(),
+            segments,
+        )?;
         Ok(keys.binary_search(key).ok().map(|at| RowRef {
             row_group,
             row: rows.start + row_offset(at),
