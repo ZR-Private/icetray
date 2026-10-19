@@ -31,7 +31,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parquet::basic::Type as PhysicalType;
 use parquet::bloom_filter::Sbbf;
-use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArrayType};
+use parquet::data_type::ByteArray;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::schema::types::ColumnDescPtr;
@@ -46,15 +46,12 @@ use crate::local::{ChunkRules, DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
 use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
-use build::{
-    check_utf8, chunks_from_disk, decode_run, decode_values, fetch_chunk_parts, read_rows,
-};
+use build::{check_utf8, checked_values, chunks_from_disk, decode_run, fetch_chunk_parts};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub use order_fences::{OrderFences, Pair, PairPart};
 use ordered::OrderVerified;
 pub(crate) use page_header::check_chunk_page_headers;
-use page_header::check_value_page_headers;
 pub use page_header::{ChunkPage, HeaderField, MOST_VALUE_PAGE_BYTES, PageHeaderFault, WireType};
 pub(crate) use pairs::{PairChunks, PairRead, Pairs};
 pub(crate) use run::RunSource;
@@ -1366,7 +1363,7 @@ impl FileIndex {
     /// bytes before parquet decodes them, and one that parquet would not
     /// read to the same numbers or that declares more than its page can
     /// hold is `FileFault::MalformedPageHeader` or
-    /// `FileFault::PageHeaderOverBound` (`check_value_page_headers`). A page
+    /// `FileFault::PageHeaderOverBound` (`checked_values`). A page
     /// parquet panics decoding is `FileFault::DecoderPanicked`.
     pub(crate) async fn read_column(
         &self,
@@ -1383,8 +1380,14 @@ impl FileIndex {
         let (segments, origins) = self
             .fetch_pages(chunk, page, PageSource::Store(cache, issue))
             .await?;
-        check_value_page_headers(chunk, value.shape, page, &segments)?;
-        let value = decode_values(chunk, value.shape, row.row..row.row + 1, &segments)?.value(0);
+        let value = checked_values(
+            chunk,
+            value.shape,
+            page..page + 1,
+            row.row..row.row + 1,
+            &segments,
+        )?
+        .value(0);
         Ok(Some(ValueRead {
             value,
             origin: origins.page,
@@ -1416,21 +1419,16 @@ impl FileIndex {
         let (segments, _) = self
             .fetch_pages(chunk, FIRST_PAGE, PageSource::Load)
             .await?;
-        check_value_page_headers(chunk, value.shape, FIRST_PAGE, &segments)?;
-        let rows = chunk.page_rows(FIRST_PAGE);
-        let values = match value.shape {
-            ValueShape::Variable => read_rows::<ByteArrayType>(chunk, rows, Arc::clone(&segments))?
-                .iter()
-                .map(|value| value_bytes(&segments, value.data()))
-                .collect(),
-            ValueShape::Fixed => {
-                read_rows::<FixedLenByteArrayType>(chunk, rows, Arc::clone(&segments))?
-                    .iter()
-                    .map(|value| value_bytes(&segments, value.data()))
-                    .collect()
-            }
-        };
-        Ok(Some(values))
+        let rows = checked_values(
+            chunk,
+            value.shape,
+            FIRST_PAGE..FIRST_PAGE + 1,
+            chunk.page_rows(FIRST_PAGE),
+            &segments,
+        )?;
+        Ok(Some(
+            (0..rows.len()).filter_map(|at| rows.value(at)).collect(),
+        ))
     }
 
     /// `read_column` of the layout's first value column, as the value and

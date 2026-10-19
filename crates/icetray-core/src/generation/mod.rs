@@ -48,7 +48,7 @@ use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayo
 use crate::metric::LookupResult;
 use crate::order::ScanBounds;
 use crate::parquet_io::{FileHandle, Segments};
-use crate::scan::{self, FileAnswer, ScanRow, Scanned};
+use crate::scan::{self, Scanned};
 use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
 use crate::storage::{HedgeWindow, Storage};
@@ -649,7 +649,7 @@ impl Generation {
         let read = futures::future::try_join_all(reads).await?;
         let mut answers = Vec::new();
         let mut from_store = false;
-        for (file, rows) in read.into_iter().flatten() {
+        for (file, mut rows) in read.into_iter().flatten() {
             from_store |= rows.from_store;
             // Per position of `columns` the file does not hold, the
             // column's default, set in each row's values in place.
@@ -659,19 +659,12 @@ impl Generation {
                 .filter(|&(_, &column)| file.index.value_leaf(column).is_none())
                 .map(|(at, &column)| (at, &self.layout.value_columns[column].default))
                 .collect();
-            answers.push(FileAnswer {
-                rows: rows
-                    .rows
-                    .into_iter()
-                    .map(|(order, mut values)| {
-                        for &(at, default) in &defaults {
-                            values[at].clone_from(default);
-                        }
-                        ScanRow { order, values }
-                    })
-                    .collect(),
-                next: rows.next,
-            });
+            for row in &mut rows.answer.rows {
+                for &(at, default) in &defaults {
+                    row.values[at].clone_from(default);
+                }
+            }
+            answers.push(rows.answer);
         }
         let files = answers.len();
         Ok((

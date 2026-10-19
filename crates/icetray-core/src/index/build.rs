@@ -23,7 +23,7 @@ use parquet::file::page_index::offset_index::PageLocation;
 
 use super::inspect::{bloom_ranges, column_chunk_ranges, rules_of};
 use super::ordered::{OrderVerified, PairCheck};
-use super::page_header::{check_key_page_headers, check_page_headers};
+use super::page_header::{check_key_page_headers, check_page_headers, check_value_pages};
 use super::pages::{ChunkPages, PageTally};
 use super::plain::{self, ByteKeys};
 use super::record::{self, RecordFault};
@@ -1269,8 +1269,7 @@ pub(super) const DECODE_BATCH_RECORDS: i64 = 16 * PAGE_ROWS;
 /// reader and refuse one that declares more than its page can hold: `verify`
 /// every key page's before the row group's first decode
 /// (`check_page_headers`), and `FileIndex::read_column` the value page's
-/// and its dictionary page's before `decode_values`
-/// (`check_value_page_headers`).
+/// and its dictionary page's before they decode (`checked_values`).
 /// A key page decoded at lookup is one `verify` checked at load, read from
 /// the resident chunks, the chunk file, or, in the Bloom tier, the data
 /// file again. A delta-length or delta byte-array page sizes its lengths
@@ -1503,27 +1502,10 @@ impl<'a, T: ParquetDataType> ChunkBatches<'a, T> {
     }
 }
 
-/// The rows `rows` of the value column chunk `chunk` from `segments`, its
-/// nulls left out: the values of one value page, which the caller has
-/// fetched with its dictionary page and whose headers it has checked
-/// (`check_value_page_headers`); `read_column` says why.
-pub(super) fn read_rows<T: ParquetDataType>(
-    chunk: ColumnChunk<'_>,
-    rows: Range<i64>,
-    segments: Arc<Segments>,
-) -> Result<Vec<T::T>> {
-    read_column::<T>(
-        chunk,
-        segments,
-        row_index(rows.start),
-        row_index(rows.end - rows.start),
-    )
-}
-
 /// Rows `rows` of the value column chunk `chunk` from `segments`, one
-/// entry per row, `None` for a null: the values of a span of value pages a
-/// Scan reads (RFD 025), which the caller has fetched with the chunk's
-/// dictionary page and whose headers it has checked, as for `read_rows`.
+/// entry per row, `None` for a null: the values of the value pages holding
+/// them, which the caller has fetched with the chunk's dictionary page and
+/// whose headers it has checked (`checked_values`); `read_column` says why.
 /// Exactly those rows decode, from exactly the pages the offset index names
 /// for them, as `read_column` guarantees; a column whose levels and values
 /// disagree is `FileFault::PageRowsMismatch` at the rows' first page.
@@ -1595,15 +1577,29 @@ impl ValueRows {
     }
 }
 
-/// Rows `rows` of the value column chunk `chunk`, whose values decode as
-/// `shape`, from `segments`, which hold the pages holding them and the
-/// chunk's dictionary page when it has one, and whose headers the caller
-/// has checked (`check_value_page_headers`, `check_value_pages`): one
-/// entry per row, `None` for a null. A chunk of `PLAIN` byte-array pages
-/// is read in place (`plain::value_rows`); any other chunk, or one
-/// holding a page that reader does not read exactly, by parquet's column
-/// reader (`read_optional`), which meets and reports every fault. Either
-/// way the values are the column reader's.
+/// Rows `rows` of the value column chunk `chunk`, its data pages `pages`
+/// holding them, whose values decode as `shape`, from `segments`, which
+/// hold those pages and the chunk's dictionary page when it has one: the
+/// one value decode, a lookup's, a Scan's, and the doctor's. The pages'
+/// headers are checked before parquet reads them (`check_value_pages`),
+/// then the rows decode (`decode_values`).
+pub(super) fn checked_values(
+    chunk: ColumnChunk<'_>,
+    shape: ValueShape,
+    pages: Range<usize>,
+    rows: Range<i64>,
+    segments: &Arc<Segments>,
+) -> Result<ValueRows> {
+    check_value_pages(chunk, shape, pages, segments)?;
+    decode_values(chunk, shape, rows, segments)
+}
+
+/// `checked_values` once the headers are checked: one entry per row,
+/// `None` for a null. A chunk of `PLAIN` byte-array pages is read in place
+/// (`plain::value_rows`); any other chunk, or one holding a page that
+/// reader does not read exactly, by parquet's column reader
+/// (`read_optional`), which meets and reports every fault. Either way the
+/// values are the column reader's.
 pub(super) fn decode_values(
     chunk: ColumnChunk<'_>,
     shape: ValueShape,

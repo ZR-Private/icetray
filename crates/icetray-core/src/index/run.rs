@@ -13,10 +13,10 @@ use bytes::Bytes;
 use metrics::Counter;
 use tokio::sync::Semaphore;
 
-use super::build::{ValueRows, decode_run, decode_values};
+use super::build::{ValueRows, checked_values, decode_run};
 use super::order_fences::Pair;
 use super::ordered::{OrderRun, decode_orders};
-use super::page_header::{check_order_pages, check_value_pages};
+use super::page_header::check_order_pages;
 use super::{
     ColumnChunk, DeletedRows, FileFault, FileIndex, GroupRange, KeyResidency, OrderLeaf,
     PageSource, RowRef, file_fault, row_index, row_offset,
@@ -27,6 +27,7 @@ use crate::key::Key;
 use crate::local::DiskChunks;
 use crate::order::{Direction, OrderValue, ScanBounds};
 use crate::parquet_io::Segments;
+use crate::scan::{FileAnswer, ScanRow};
 use crate::storage::HedgeWindow;
 
 /// The rows of a key's run in one row group.
@@ -50,17 +51,13 @@ pub(crate) struct Run<'k> {
 }
 
 /// What one file answers a Scan of one key (`FileIndex::read_run`).
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileRows {
-    /// The rows taken, in the Scan's direction: each its order value and
-    /// one value per requested column, `None` for a null and for a column
-    /// the file does not hold (`FileIndex::value_leaf`), whose default the
-    /// caller answers.
-    pub(crate) rows: Vec<(OrderValue, Vec<Option<Bytes>>)>,
-    /// The order value of the next live row inside the bounds past the
-    /// last row taken, in the Scan's direction; `None` when no live row
-    /// remains there.
-    pub(crate) next: Option<OrderValue>,
+    /// The rows taken, in the Scan's direction, each with one value per
+    /// requested column, `None` for a null and for a column the file does
+    /// not hold (`FileIndex::value_leaf`), whose default the caller
+    /// answers; and the order value of the next live row inside the bounds
+    /// past the last row taken, `None` when no live row remains there.
+    pub(crate) answer: FileAnswer,
     /// Whether any order or value page the read took came from object
     /// storage, a fetch it ran or joined.
     pub(crate) from_store: bool,
@@ -298,7 +295,7 @@ impl FileIndex {
     /// pages are read from the chunk file instead, one local read for the
     /// span and one for its dictionary page, and no GET. The headers of
     /// every page read are checked before parquet decodes it, as a value
-    /// page's are (`check_value_page_headers`, `check_order_pages`); a
+    /// page's are (`checked_values`, `check_order_pages`); a
     /// span that decodes to fewer order values than rows is
     /// `FileFault::PageRowsMismatch`, and a string order value that is not
     /// UTF-8 `FileFault::OrderNotUtf8`.
@@ -326,7 +323,7 @@ impl FileIndex {
             limit,
             deleted,
         };
-        let placed = walk.rows(&Orders::default());
+        let placed = walk.rows(&Spans::default());
         let known = self
             .known(order, &pieces, &placed, bounds.direction, source)
             .await?;
@@ -366,17 +363,18 @@ impl FileIndex {
                 next = Some(value);
                 break;
             }
-            let row_values = values
-                .columns
-                .iter()
-                .map(|column| column.as_ref().and_then(|column| column.value(walked.row)))
-                .collect();
-            rows.push((value, row_values));
+            rows.push(ScanRow {
+                order: value,
+                values: values
+                    .iter()
+                    .map(|column| column.as_ref().and_then(|column| column.value(walked.row)))
+                    .collect(),
+            });
         }
         Ok(FileRows {
-            rows,
-            next,
-            from_store: orders.from_store || values.from_store,
+            answer: FileAnswer { rows, next },
+            from_store: orders.from_store
+                || values.iter().flatten().any(|column| column.from_store),
         })
     }
 
@@ -492,13 +490,13 @@ impl FileIndex {
         placed: &[Walked],
         direction: Direction,
         source: RunSource<'_>,
-    ) -> Result<Orders> {
+    ) -> Result<Spans<OrderRun>> {
         let reached = |at: usize| placed.iter().any(|walked| walked.piece == at);
         let bound_pieces: Vec<usize> = (0..pieces.len())
             .filter(|&at| pieces[at].bound.is_some() && reached(at))
             .collect();
         if bound_pieces.is_empty() {
-            return Ok(Orders::default());
+            return Ok(Spans::default());
         }
         if self.disk_chunks().is_some() {
             let rows = in_file_order(placed.iter().map(|walked| walked.row), direction);
@@ -513,50 +511,34 @@ impl FileIndex {
                 continue;
             };
             let values = self.decode_order_span(chunk, order, pages, &piece.rows, segments)?;
-            spans.push((piece.row_group, piece.rows.start, values));
+            spans.push((piece.row_group, piece.rows.clone(), values));
         }
-        Ok(Orders {
+        Ok(Spans {
             spans,
             from_store: false,
         })
     }
 
     /// The order values of the spans of `rows`, rows in file order, by the
-    /// order column's pages (`spans_of`), fetched as `bridged` joins them
-    /// and decoded span by span, each span's pages' headers checked: from
-    /// the chunk file under Disk, through `source` otherwise.
+    /// order column's pages (`read_spans`): from the chunk file under Disk,
+    /// through `source` otherwise.
     async fn read_orders(
         &self,
         order: OrderLeaf,
         rows: &[RowRef],
         source: RunSource<'_>,
-    ) -> Result<Orders> {
-        let local = self.disk_chunks();
-        let chunk_of = |row_group| self.order_values(order).group(row_group);
-        let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
-        let read = fetches.iter().map(|fetch| async move {
-            let chunk = chunk_of(fetch.row_group);
-            let (segments, from_store) = self
-                .span_pages(chunk, fetch.pages.clone(), local, source, source.order_gets)
-                .await?;
-            let spans = fetch
-                .spans
-                .iter()
-                .map(|rows| {
-                    let pages = pages_holding(chunk, rows);
-                    let values =
-                        self.decode_order_span(chunk, order, pages, rows, Arc::clone(&segments))?;
-                    Ok((fetch.row_group, rows.start, values))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok::<_, Error>((spans, from_store))
-        });
-        let read = futures::future::try_join_all(read).await?;
-        let from_store = read.iter().any(|(_, from_store)| *from_store);
-        Ok(Orders {
-            spans: read.into_iter().flat_map(|(spans, _)| spans).collect(),
-            from_store,
-        })
+    ) -> Result<Spans<OrderRun>> {
+        self.read_spans(
+            rows,
+            |row_group| self.order_values(order).group(row_group),
+            self.disk_chunks(),
+            source,
+            source.order_gets,
+            |chunk, pages, rows, segments| {
+                self.decode_order_span(chunk, order, pages, rows, Arc::clone(segments))
+            },
+        )
+        .await
     }
 
     /// Rows `rows` of the order column chunk `chunk` decoded from
@@ -591,53 +573,75 @@ impl FileIndex {
 
     /// The values of each column of `columns`, positions in the layout,
     /// at `rows`, rows in file order, over the spans of them by each
-    /// column's pages (`spans_of`), fetched as `bridged` joins them and
-    /// decoded span by span, each span's pages' headers checked, every
-    /// column's fetches read together; `None` for a column the file does
-    /// not hold.
+    /// column's pages (`read_spans`), every column's fetches read together;
+    /// `None` for a column the file does not hold.
     async fn read_values(
         &self,
         columns: &[usize],
         rows: &[RowRef],
         source: RunSource<'_>,
-    ) -> Result<Values> {
+    ) -> Result<Vec<Option<Spans<ValueRows>>>> {
         let read = columns.iter().map(|&column| async move {
             let Some(value) = self.layout.values[column] else {
-                return Ok::<_, Error>((None, false));
+                return Ok(None);
             };
-            let counted = source.value_gets.get(column);
-            let chunk_of = |row_group| self.value_column(value).group(row_group);
-            let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
-            let read = fetches.iter().map(|fetch| async move {
-                let chunk = chunk_of(fetch.row_group);
-                let (segments, from_store) = self
-                    .span_pages(chunk, fetch.pages.clone(), None, source, counted)
-                    .await?;
-                let spans = fetch
-                    .spans
-                    .iter()
-                    .map(|rows| {
-                        check_value_pages(
-                            chunk,
-                            value.shape,
-                            pages_holding(chunk, rows),
-                            &segments,
-                        )?;
-                        let values = decode_values(chunk, value.shape, rows.clone(), &segments)?;
-                        Ok((fetch.row_group, rows.start, values))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok::<_, Error>((spans, from_store))
-            });
-            let spans = futures::future::try_join_all(read).await?;
-            let from_store = spans.iter().any(|(_, from_store)| *from_store);
-            let spans = spans.into_iter().flat_map(|(spans, _)| spans).collect();
-            Ok((Some(ColumnValues { spans }), from_store))
+            let spans = self
+                .read_spans(
+                    rows,
+                    |row_group| self.value_column(value).group(row_group),
+                    None,
+                    source,
+                    source.value_gets.get(column),
+                    |chunk, pages, rows, segments| {
+                        checked_values(chunk, value.shape, pages, rows.clone(), segments)
+                    },
+                )
+                .await?;
+            Ok(Some(spans))
+        });
+        futures::future::try_join_all(read).await
+    }
+
+    /// The spans of `rows`, rows in file order, by the pages of the column
+    /// whose chunk in each row group `chunk_of` gives (`spans_of`), fetched
+    /// as `bridged` joins them (`span_pages`), from `local` when given and
+    /// through `source` otherwise, counted in `counted`, and decoded span
+    /// by span by `decode` from the chunk, the pages holding the span, its
+    /// rows, and the bytes fetched, which checks the pages' headers before
+    /// parquet reads them; every fetch read together.
+    async fn read_spans<'c, T, C, D>(
+        &self,
+        rows: &[RowRef],
+        chunk_of: C,
+        local: Option<&DiskChunks>,
+        source: RunSource<'_>,
+        counted: Option<&Counter>,
+        decode: D,
+    ) -> Result<Spans<T>>
+    where
+        C: Fn(usize) -> ColumnChunk<'c> + Copy,
+        D: Fn(ColumnChunk<'c>, Range<usize>, &Range<i64>, &Arc<Segments>) -> Result<T> + Copy,
+    {
+        let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
+        let read = fetches.iter().map(|fetch| async move {
+            let chunk = chunk_of(fetch.row_group);
+            let (segments, from_store) = self
+                .span_pages(chunk, fetch.pages.clone(), local, source, counted)
+                .await?;
+            let spans = fetch
+                .spans
+                .iter()
+                .map(|rows| {
+                    let values = decode(chunk, pages_holding(chunk, rows), rows, &segments)?;
+                    Ok((fetch.row_group, rows.clone(), values))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok::<_, Error>((spans, from_store))
         });
         let read = futures::future::try_join_all(read).await?;
         let from_store = read.iter().any(|(_, from_store)| *from_store);
-        Ok(Values {
-            columns: read.into_iter().map(|(column, _)| column).collect(),
+        Ok(Spans {
+            spans: read.into_iter().flat_map(|(spans, _)| spans).collect(),
             from_store,
         })
     }
@@ -889,7 +893,7 @@ impl Walk<'_> {
     /// live row is taken up with its order value alone, and ends the walk
     /// unless no row has counted yet, as under a limit of zero, where only
     /// a row known inside does.
-    fn rows(&self, known: &Orders) -> Vec<Walked> {
+    fn rows(&self, known: &Spans<OrderRun>) -> Vec<Walked> {
         let mut walk = Taking {
             taken: Vec::new(),
             inside: 0,
@@ -916,7 +920,7 @@ impl Walk<'_> {
     /// each order page, the piece's rows on it are passed over in one step
     /// where every one of them is deleted, which the resident deletes tell
     /// with no I/O (`DeletedRows::all_deleted`).
-    fn walk_piece(&self, at: usize, known: &Orders, walk: &mut Taking) -> Walking {
+    fn walk_piece(&self, at: usize, known: &Spans<OrderRun>, walk: &mut Taking) -> Walking {
         let piece = &self.pieces[at];
         let chunk = self
             .index
@@ -986,7 +990,7 @@ enum Walking {
 impl Taking {
     /// Live row `row` of piece `at` of `walk`, taken up as `Walk::rows`
     /// says; whether the walk ends at it.
-    fn row(&mut self, walk: &Walk<'_>, at: usize, row: RowRef, known: &Orders) -> Walking {
+    fn row(&mut self, walk: &Walk<'_>, at: usize, row: RowRef, known: &Spans<OrderRun>) -> Walking {
         let fit = match walk.pieces[at].bound {
             None => Some(Fit::Inside),
             Some(_) => known.fit(row, walk.cut),
@@ -1135,44 +1139,55 @@ fn bridged<'c>(
 }
 
 /// The span of `spans` that holds `row`, and `row`'s position in it, where
-/// one does, `of` giving a span's row group, first row, and row count:
-/// spans in file order, by row group and then first row, no two holding
-/// one row, so one binary search finds it, and a lookup visits a number of
-/// spans logarithmic in theirs, however many spans a read decoded.
+/// one does, `of` giving a span's row group and rows: spans in file order,
+/// by row group and then first row, no two holding one row, so one binary
+/// search finds it, and a lookup visits a number of spans logarithmic in
+/// theirs, however many spans a read decoded.
 fn span_holding<S>(
     spans: &[S],
     row: RowRef,
-    of: impl Fn(&S) -> (usize, i64, usize),
+    of: impl Fn(&S) -> (usize, Range<i64>),
 ) -> Option<(&S, usize)> {
     let past = spans.partition_point(|span| {
-        let (row_group, start, _) = of(span);
-        (row_group, start) <= (row.row_group, row.row)
+        let (row_group, rows) = of(span);
+        (row_group, rows.start) <= (row.row_group, row.row)
     });
     let span = &spans[past.checked_sub(1)?];
-    let (row_group, start, rows) = of(span);
-    let at = (row_group == row.row_group).then(|| row_index(row.row - start))?;
-    (at < rows).then_some((span, at))
+    let (row_group, rows) = of(span);
+    (row_group == row.row_group && rows.contains(&row.row))
+        .then(|| (span, row_index(row.row - rows.start)))
 }
 
-/// The order values a read decoded: spans of rows, each its row group, its
-/// first row, and the values from it on, in file order, as `span_holding`
-/// finds them.
-#[derive(Default)]
-struct Orders {
-    spans: Vec<(usize, i64, OrderRun)>,
+/// One column's values a read decoded: spans of rows, each its row group,
+/// its rows, and their values, one per row, in file order, as
+/// `span_holding` finds them; and whether any page they decode from came
+/// from object storage.
+struct Spans<T> {
+    spans: Vec<(usize, Range<i64>, T)>,
     from_store: bool,
 }
 
-impl Orders {
+impl<T> Default for Spans<T> {
+    fn default() -> Self {
+        Self {
+            spans: Vec::new(),
+            from_store: false,
+        }
+    }
+}
+
+impl<T> Spans<T> {
     /// The decoded values holding `row` and its position among them, where
     /// a span holds it.
-    fn find(&self, row: RowRef) -> Option<(&OrderRun, usize)> {
-        span_holding(&self.spans, row, |(row_group, start, values)| {
-            (*row_group, *start, values.len())
+    fn find(&self, row: RowRef) -> Option<(&T, usize)> {
+        span_holding(&self.spans, row, |(row_group, rows, _)| {
+            (*row_group, rows.clone())
         })
         .map(|((_, _, values), at)| (values, at))
     }
+}
 
+impl Spans<OrderRun> {
     /// The decoded values holding `row`, which the read decoded, and its
     /// position among them.
     fn at(&self, row: RowRef) -> (&OrderRun, usize) {
@@ -1194,7 +1209,8 @@ impl Orders {
     /// knew before its round and those it read in it, each in file order
     /// and holding rows the other does not.
     fn and(mut self, other: Self) -> Self {
-        let file_order = |(row_group, start, _): &(usize, i64, OrderRun)| (*row_group, *start);
+        let file_order =
+            |(row_group, rows, _): &(usize, Range<i64>, OrderRun)| (*row_group, rows.start);
         debug_assert!(
             self.spans.is_sorted_by_key(file_order) && other.spans.is_sorted_by_key(file_order),
             "a read decodes spans in file order"
@@ -1206,27 +1222,12 @@ impl Orders {
     }
 }
 
-/// The values a read decoded, per requested column; `None` for a column
-/// the file does not hold.
-struct Values {
-    columns: Vec<Option<ColumnValues>>,
-    from_store: bool,
-}
-
-/// One column's values a read decoded: spans of rows, each its row
-/// group, its first row, and the values from it on, in file order, as
-/// `span_holding` finds them.
-struct ColumnValues {
-    spans: Vec<(usize, i64, ValueRows)>,
-}
-
-impl ColumnValues {
+impl Spans<ValueRows> {
     /// The value of `row`, `None` for a null; the read decoded it.
     fn value(&self, row: RowRef) -> Option<Bytes> {
-        let ((_, _, values), at) = span_holding(&self.spans, row, |(row_group, start, values)| {
-            (*row_group, *start, values.len())
-        })
-        .expect("the values of every row taken are read");
+        let (values, at) = self
+            .find(row)
+            .expect("the values of every row taken are read");
         values.value(at)
     }
 }
@@ -1405,9 +1406,12 @@ mod tests {
 
     /// What a read of one value column answers for file row `row`, `j`th
     /// of its key's run.
-    fn row_answer(row: i64, j: i64, columns: usize) -> (OrderValue, Vec<Option<Bytes>>) {
+    fn row_answer(row: i64, j: i64, columns: usize) -> ScanRow {
         let value = Bytes::from(value_for(usize::try_from(row).unwrap()));
-        (order_at(j), vec![Some(value); columns])
+        ScanRow {
+            order: order_at(j),
+            values: vec![Some(value); columns],
+        }
     }
 
     fn bounds(direction: Direction) -> ScanBounds {
@@ -1490,8 +1494,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(oldest.rows, all, "{residency}");
-            assert_eq!(oldest.next, None);
+            assert_eq!(oldest.answer.rows, all, "{residency}");
+            assert_eq!(oldest.answer.next, None);
             let newest = index
                 .read_run(
                     &run,
@@ -1503,8 +1507,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(newest.rows, all.into_iter().rev().collect::<Vec<_>>());
-            assert_eq!(newest.next, None);
+            assert_eq!(
+                newest.answer.rows,
+                all.into_iter().rev().collect::<Vec<_>>()
+            );
+            assert_eq!(newest.answer.next, None);
         }
     }
 
@@ -1630,8 +1637,8 @@ mod tests {
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
                 .collect();
-            assert_eq!(got.rows, expected, "{residency}");
-            assert_eq!(got.next, Some(order_at(9 - FIRST_RUN_ROW)));
+            assert_eq!(got.answer.rows, expected, "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(9 - FIRST_RUN_ROW)));
             assert!(got.from_store);
             let order_gets = u64::from(residency != Residency::Disk);
             assert_eq!(stats.gets() - before, order_gets + 1, "{residency}");
@@ -1652,8 +1659,8 @@ mod tests {
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
                 .collect();
-            assert_eq!(oldest.rows, expected, "{residency}");
-            assert_eq!(oldest.next, Some(order_at(4 - FIRST_RUN_ROW)));
+            assert_eq!(oldest.answer.rows, expected, "{residency}");
+            assert_eq!(oldest.answer.next, Some(order_at(4 - FIRST_RUN_ROW)));
             assert_eq!(stats.gets() - before, order_gets + 1, "{residency}");
         }
     }
@@ -1688,8 +1695,12 @@ mod tests {
                 .into_iter()
                 .map(|row| row_answer(row, row - FIRST_RUN_ROW, 1))
                 .collect();
-            assert_eq!(got.rows, expected, "{residency}");
-            assert_eq!(got.next, Some(order_at(7 - FIRST_RUN_ROW)), "{residency}");
+            assert_eq!(got.answer.rows, expected, "{residency}");
+            assert_eq!(
+                got.answer.next,
+                Some(order_at(7 - FIRST_RUN_ROW)),
+                "{residency}"
+            );
             // Order pages 1 and 3 are two spans, page 2 between them all
             // deleted and not decoded, but under the bridge, so fetched
             // with them in one span; the value page is page 3's.
@@ -1703,8 +1714,8 @@ mod tests {
                 .read_run(&run, &newest, 2, &[0], &is_deleted, reads.source())
                 .await
                 .unwrap();
-            assert_eq!(again.rows, got.rows);
-            assert_eq!(again.next, got.next);
+            assert_eq!(again.answer.rows, got.answer.rows);
+            assert_eq!(again.answer.next, got.answer.next);
             assert_eq!(since(&stats, before).0, 0, "{residency}: warm");
             assert!(!again.from_store, "{residency}");
 
@@ -1719,14 +1730,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(whole.rows.len(), live);
-            assert_eq!(whole.next, None, "{residency}");
+            assert_eq!(whole.answer.rows.len(), live);
+            assert_eq!(whole.answer.next, None, "{residency}");
             let none = index
                 .read_run(&run, &newest, 0, &[0], &is_deleted, reads.source())
                 .await
                 .unwrap();
-            assert_eq!(none.rows, []);
-            assert_eq!(none.next, Some(order_at(14 - FIRST_RUN_ROW)));
+            assert_eq!(none.answer.rows, []);
+            assert_eq!(none.answer.next, Some(order_at(14 - FIRST_RUN_ROW)));
         }
     }
 
@@ -1747,11 +1758,11 @@ mod tests {
     #[test]
     fn test_span_holding_finds_every_row_among_many_spans_in_a_binary_search() {
         let stride = LOOKUP_SPAN_ROWS + LOOKUP_GAP_ROWS;
-        let spans: Vec<(usize, i64, usize)> = (0..LOOKUP_ROW_GROUPS)
+        let spans: Vec<(usize, Range<i64>)> = (0..LOOKUP_ROW_GROUPS)
             .flat_map(|row_group| {
                 (0..LOOKUP_SPANS).map(move |at| {
                     let start = i64::try_from(at).unwrap() * stride + LOOKUP_GAP_ROWS;
-                    (row_group, start, row_index(LOOKUP_SPAN_ROWS))
+                    (row_group, start..start + LOOKUP_SPAN_ROWS)
                 })
             })
             .collect();
@@ -1759,9 +1770,9 @@ mod tests {
         // them, and the lookup then reads the one before where it ended.
         let most_visits = usize::try_from(spans.len().next_power_of_two().ilog2()).unwrap() + 2;
         let visited = std::cell::Cell::new(0);
-        let of = |span: &(usize, i64, usize)| {
+        let of = |span: &(usize, Range<i64>)| {
             visited.set(visited.get() + 1);
-            *span
+            span.clone()
         };
         let rows = i64::try_from(LOOKUP_SPANS).unwrap() * stride + LOOKUP_GAP_ROWS;
         let mut found = 0;
@@ -1892,14 +1903,14 @@ mod tests {
             let walked = testing::take_pages();
             let expected: Vec<_> = [last, BELOW_DELETED_ROW]
                 .into_iter()
-                .map(|at| {
-                    let value = written[row_index(at)].clone().map(Bytes::from);
-                    (order_at(at - FIRST_RUN_ROW), vec![value])
+                .map(|at| ScanRow {
+                    order: order_at(at - FIRST_RUN_ROW),
+                    values: vec![written[row_index(at)].clone().map(Bytes::from)],
                 })
                 .collect();
-            assert_eq!(got.rows, expected, "{case}");
+            assert_eq!(got.answer.rows, expected, "{case}");
             assert_eq!(
-                got.next,
+                got.answer.next,
                 Some(order_at(BELOW_DELETED_ROW - 1 - FIRST_RUN_ROW)),
                 "{case}"
             );
@@ -1982,7 +1993,7 @@ mod tests {
         with_extra(runs_of(&[(1, 1), (2, 30), (3, 1)], 32), extra)
     }
 
-    fn after_answer(columns: usize) -> Vec<(OrderValue, Vec<Option<Bytes>>)> {
+    fn after_answer(columns: usize) -> Vec<ScanRow> {
         [20, 21]
             .into_iter()
             .map(|j| row_answer(j + FIRST_RUN_ROW, j, columns))
@@ -2026,8 +2037,8 @@ mod tests {
             })
             .await
             .expect("every GET of the read is in flight at once");
-            assert_eq!(got.rows, after_answer(columns.len()), "{residency}");
-            assert_eq!(got.next, Some(order_at(22)));
+            assert_eq!(got.answer.rows, after_answer(columns.len()), "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(22)));
             assert_eq!(gauged.high_water(), together, "{residency}");
             assert_eq!(
                 stats.gets() - before,
@@ -2069,8 +2080,8 @@ mod tests {
                 .into_iter()
                 .map(|j| row_answer(j + FIRST_RUN_ROW, j, 1))
                 .collect();
-            assert_eq!(got.rows, expected, "{residency}");
-            assert_eq!(got.next, Some(order_at(7)));
+            assert_eq!(got.answer.rows, expected, "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(7)));
             let (gets, local) = since(&stats, before);
             match residency {
                 Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
@@ -2157,12 +2168,13 @@ mod tests {
             let expected: Vec<_> = [14, 13, 12]
                 .into_iter()
                 .map(|row| {
-                    let (order, values) = row_answer(row, row - FIRST_RUN_ROW, 1);
-                    (order, if row == null_row { vec![None] } else { values })
+                    let ScanRow { order, values } = row_answer(row, row - FIRST_RUN_ROW, 1);
+                    let values = if row == null_row { vec![None] } else { values };
+                    ScanRow { order, values }
                 })
                 .collect();
-            assert_eq!(got.rows, expected, "{residency}");
-            assert_eq!(got.next, Some(order_at(11 - FIRST_RUN_ROW)));
+            assert_eq!(got.answer.rows, expected, "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(11 - FIRST_RUN_ROW)));
             let (gets, local) = since(&stats, before);
             match residency {
                 Residency::Full | Residency::Bloom => assert_eq!((gets, local), (4, 0)),
@@ -2202,8 +2214,8 @@ mod tests {
             let got = tokio::time::timeout(DEADLINE_GUARD, read_after_run(&index, &run, &reads))
                 .await
                 .expect("every GET of the read is in flight at once");
-            assert_eq!(got.rows, after_answer(1), "{residency}");
-            assert_eq!(got.next, Some(order_at(22)));
+            assert_eq!(got.answer.rows, after_answer(1), "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(22)));
             let (gets, local) = since(&stats, before);
             match residency {
                 Residency::Full | Residency::Bloom => assert_eq!((gets, local), (2, 0)),
@@ -2272,7 +2284,7 @@ mod tests {
             .into_iter()
             .map(|j| row_answer(j + FIRST_RUN_ROW, j, 2))
             .collect();
-        assert_eq!(got.rows, expected);
+        assert_eq!(got.answer.rows, expected);
         assert_eq!(stats.gets() - before, 3);
         let counted: Vec<u64> = counters
             .iter()
@@ -2402,12 +2414,15 @@ mod tests {
                             .map(|&j| {
                                 let row = FIRST_RUN_ROW + i64::try_from(j).unwrap();
                                 let value = Bytes::from(value_for(usize::try_from(row).unwrap()));
-                                (travelling(order_type, prefixed(j)), vec![Some(value)])
+                                ScanRow {
+                                    order: travelling(order_type, prefixed(j)),
+                                    values: vec![Some(value)],
+                                }
                             })
                             .collect();
                         let case = format!("{residency} {order_type} {truncate:?} {scan:?}");
-                        assert_eq!(got.rows, expected, "{case}");
-                        assert_eq!(got.next, Some(value(*next)), "{case}");
+                        assert_eq!(got.answer.rows, expected, "{case}");
+                        assert_eq!(got.answer.next, Some(value(*next)), "{case}");
                     }
                 }
             }
@@ -2552,7 +2567,7 @@ mod tests {
     /// What the model answers one read of a run: the rows and `next` the
     /// read answers, and the run positions of the rows taken.
     struct Model {
-        rows: Vec<(OrderValue, Vec<Option<Bytes>>)>,
+        rows: Vec<ScanRow>,
         next: Option<OrderValue>,
         taken: Vec<usize>,
     }
@@ -2577,10 +2592,10 @@ mod tests {
         let taken: Vec<usize> = live.iter().copied().take(limit).collect();
         let answer = |at: usize| {
             let position = usize::try_from(index.position(rows[at]).0).unwrap();
-            (
-                orders[at].clone(),
-                vec![written[position].clone().map(Bytes::from)],
-            )
+            ScanRow {
+                order: orders[at].clone(),
+                values: vec![written[position].clone().map(Bytes::from)],
+            }
         };
         Model {
             rows: taken.iter().map(|&at| answer(at)).collect(),
@@ -3000,8 +3015,8 @@ mod tests {
                         let decoded_before = data_pages_decoded();
                         let (got, ranges) = probe.read(&scan, limit, &is_deleted).await;
                         let decoded = data_pages_decoded() - decoded_before;
-                        assert_eq!(got.rows, expected.rows, "{case}");
-                        assert_eq!(got.next, expected.next, "{case}");
+                        assert_eq!(got.answer.rows, expected.rows, "{case}");
+                        assert_eq!(got.answer.next, expected.next, "{case}");
                         let read = ReadOf {
                             index: &index,
                             rows: &rows,
@@ -3235,8 +3250,8 @@ mod tests {
                     limit,
                 );
                 assert_eq!(expected.taken, taken);
-                assert_eq!(got.rows, expected.rows, "{case}");
-                assert_eq!(got.next, Some(value(PAGE_START_ROW - 4)), "{case}");
+                assert_eq!(got.answer.rows, expected.rows, "{case}");
+                assert_eq!(got.answer.next, Some(value(PAGE_START_ROW - 4)), "{case}");
                 let value_leaf = index.value_leaf(0).unwrap();
                 let held: BTreeSet<PageAt> = pages_of(
                     &index,
@@ -3320,8 +3335,8 @@ mod tests {
                     &scan,
                     limit,
                 );
-                assert_eq!(got.rows, expected.rows, "{case}");
-                assert_eq!(got.next, Some(value(NEAR_THE_END_ROW - 4)), "{case}");
+                assert_eq!(got.answer.rows, expected.rows, "{case}");
+                assert_eq!(got.answer.next, Some(value(NEAR_THE_END_ROW - 4)), "{case}");
                 let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
                 assert_eq!(held.len(), 2, "{case}");
                 if order_type == OrderType::String {
@@ -3394,8 +3409,8 @@ mod tests {
                     &scan,
                     limit,
                 );
-                assert_eq!(got.rows, expected.rows, "{case}");
-                assert_eq!(got.next, expected.next, "{case}");
+                assert_eq!(got.answer.rows, expected.rows, "{case}");
+                assert_eq!(got.answer.next, expected.next, "{case}");
                 let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
                 assert_eq!(held.len(), 1, "{case}");
                 assert_eq!(needed, page_value_bytes, "{case}");
@@ -3484,7 +3499,7 @@ mod tests {
             let case = residency.to_string();
 
             let (cold, ranges) = probe.read(&scan, limit, &none_deleted).await;
-            assert_eq!(cold.rows, expected.rows, "{case}");
+            assert_eq!(cold.answer.rows, expected.rows, "{case}");
             let shifted = fetched(&index, value_leaf, &ranges);
             assert!(held.is_subset(&shifted), "{case}");
             assert_eq!(
@@ -3498,8 +3513,8 @@ mod tests {
             let (warm, ranges) = probe
                 .read_through(&reads, &scan, limit, &none_deleted)
                 .await;
-            assert_eq!(warm.rows, expected.rows, "{case}");
-            assert_eq!(warm.next, expected.next, "{case}");
+            assert_eq!(warm.answer.rows, expected.rows, "{case}");
+            assert_eq!(warm.answer.next, expected.next, "{case}");
             assert_eq!(fetched(&index, value_leaf, &ranges), held, "{case}");
             let orders_fetched = fetched(&index, order_leaf, &ranges);
             assert!(
@@ -3554,11 +3569,11 @@ mod tests {
             };
             let (got, ranges) = probe.read(&after_ten, limit, &none_deleted).await;
             assert_eq!(
-                got.rows,
+                got.answer.rows,
                 [row_answer(first_run_row + 2, 2, 1)],
                 "{residency}"
             );
-            assert_eq!(got.next, Some(order_at(3)), "{residency}");
+            assert_eq!(got.answer.next, Some(order_at(3)), "{residency}");
             let order_gets = usize::from(residency != Residency::Disk);
             assert_eq!(ranges.len(), 1 + order_gets, "{residency}");
             let value_leaf = index.value_leaf(0).unwrap();
@@ -3654,8 +3669,8 @@ mod tests {
                                 limit,
                             );
                             assert_eq!(expected.taken, taken, "{case}");
-                            assert_eq!(got.rows, expected.rows, "{case}");
-                            assert_eq!(got.next, Some(value(*next)), "{case}");
+                            assert_eq!(got.answer.rows, expected.rows, "{case}");
+                            assert_eq!(got.answer.next, Some(value(*next)), "{case}");
                             let (held, needed) = taken_bytes(&index, &rows, &expected.taken);
                             let values = fetched(&index, value_leaf, &ranges);
                             assert!(needed > 0, "{case}");
@@ -3742,8 +3757,8 @@ mod tests {
                         limit,
                     );
                     assert_eq!(expected.taken, taken, "{case}");
-                    assert_eq!(got.rows, expected.rows, "{case}");
-                    assert_eq!(got.next, Some(value(LOW_BOUND_ROW + 4)), "{case}");
+                    assert_eq!(got.answer.rows, expected.rows, "{case}");
+                    assert_eq!(got.answer.next, Some(value(LOW_BOUND_ROW + 4)), "{case}");
                     let values = fetched(&index, value_leaf, &ranges);
                     assert_eq!(
                         values, held,
@@ -3789,8 +3804,8 @@ mod tests {
             };
             let rows = rows_of(&run);
             let (got, ranges) = probe.read(&scan, limit_u32(limit), &none_deleted).await;
-            assert_eq!(got.rows.len(), limit, "{residency}");
-            assert_eq!(got.next, Some(value(limit)), "{residency}");
+            assert_eq!(got.answer.rows.len(), limit, "{residency}");
+            assert_eq!(got.answer.next, Some(value(limit)), "{residency}");
             let order_leaf = index.order_leaf().unwrap();
             let walked: BTreeSet<PageAt> = pages_of(&index, order_leaf, &rows[..=limit])
                 .into_iter()
@@ -3838,7 +3853,7 @@ mod tests {
         take_steps();
         let got = read().await.unwrap();
         assert_eq!(opened.stats().gets(), before, "warm");
-        assert_eq!(got.rows.len(), limit_index(WORK_LIMIT));
+        assert_eq!(got.answer.rows.len(), limit_index(WORK_LIMIT));
         Work {
             pages: testing::take_pages(),
             steps: take_steps(),
@@ -3894,6 +3909,6 @@ mod tests {
         let newest = bounds(Direction::NewestFirst);
         let read = index.read_run(&run, &newest, 1, &[0], &none_deleted, reads.source());
         is_send(&read);
-        assert_eq!(read.await.unwrap().rows.len(), 1);
+        assert_eq!(read.await.unwrap().answer.rows.len(), 1);
     }
 }

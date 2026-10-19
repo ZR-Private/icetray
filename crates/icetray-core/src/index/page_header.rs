@@ -987,7 +987,7 @@ pub(super) fn check_page_headers(
 /// Refuses, before parquet's page reader sees them, every page of the order
 /// column chunk `chunk` in `segments`, its dictionary page included, whose
 /// header does not decode as parquet reads it or declares more than its
-/// page can hold, as `check_value_page_headers` refuses a value page's,
+/// page can hold, as `check_value_pages` refuses a value page's,
 /// with `MOST_VALUE_PAGE_BYTES` as the ceiling (RFD 025, Load): the order
 /// pages get the value pages' checks, since the contract caps no order
 /// value's length, and are checked a chunk at a time, since a load
@@ -1069,8 +1069,8 @@ fn key_bounds(chunk: ColumnChunk<'_>, shape: KeyShape) -> Bounds {
 }
 
 /// Refuses, before parquet's page reader sees them, the headers of data
-/// page `page` of the value column chunk `chunk` and of the chunk's
-/// dictionary page when it has one, both in `segments`, as
+/// pages `pages` of the value column chunk `chunk` and of the chunk's
+/// dictionary page when it has one, all in `segments`, as
 /// `check_page_headers` refuses a key page's, with `MOST_VALUE_PAGE_BYTES`
 /// as the ceiling: a header that does not decode as parquet reads it, an
 /// uncompressed size above the ceiling, a dictionary counting more values
@@ -1078,19 +1078,9 @@ fn key_bounds(chunk: ColumnChunk<'_>, shape: KeyShape) -> Bounds {
 /// compressed size past the page's place in the chunk, and v2 level
 /// lengths whose sum is above the page's uncompressed size. The contract
 /// does not cap a value's length, so no bound follows a page's rows. The
-/// headers are read from the bytes the lookup fetched, with no copy.
-pub(super) fn check_value_page_headers(
-    chunk: ColumnChunk<'_>,
-    shape: ValueShape,
-    page: usize,
-    segments: &Segments,
-) -> Result<()> {
-    check_value_pages(chunk, shape, page..page + 1, segments)
-}
-
-/// `check_value_page_headers` for data pages `pages` of `chunk`, the value
-/// pages a Scan decodes over a span of rows (RFD 025), and the chunk's
-/// dictionary page when it has one, all in `segments`.
+/// headers are read from the bytes the read fetched, with no copy: a
+/// lookup's one value page, or the value pages a Scan decodes over a span
+/// of rows (RFD 025).
 pub(super) fn check_value_pages(
     chunk: ColumnChunk<'_>,
     shape: ValueShape,
@@ -1127,7 +1117,7 @@ struct Bounds {
     entries: u64,
 }
 
-/// One page of `check_page_headers` or `check_value_page_headers`, at
+/// One page of `check_page_headers` or `check_value_pages`, at
 /// `range` of the file, held to `bounds` (`check_header`); a data page's
 /// values are its rows in the offset index.
 fn check_page(
@@ -1253,7 +1243,7 @@ fn check_header(
 /// Refuses, before parquet's column reader sees them, every page header of
 /// the column chunk of leaf `leaf` in row group `row_group` of the file at
 /// `path`, held whole in `bytes` and described by `metadata`, as
-/// `check_value_page_headers` refuses a value page's: a position delete
+/// `check_value_pages` refuses a value page's: a position delete
 /// file's (RFD 021), whose values the spec caps no more than the contract
 /// caps a value. Such a file need carry no offset index, so the pages are
 /// walked as parquet's page reader walks them, from the chunk's start, each
