@@ -105,8 +105,9 @@ states a value only where the value is itself the decision, with the
 reason that fixes it: the response bound defaults to a gRPC client's
 default receive limit, and a cache holds at least one value page per
 shard. A value that could change without anyone revisiting the decision
-lives in its code constant and in the reference, which a test checks
-against the code, so changing it needs no update note.
+lives in its named constant in the code and in the configuration
+reference, so changing it needs no update note. The user guides name a
+setting and link the reference rather than repeat its value.
 
 **An RFD says what was decided and leaves the how to a plan.** It names
 its dependencies without versioning them, since versions come from the

@@ -192,8 +192,9 @@ A change a user can see is documented in the same change, in three places:
   and [Operating icetray](docs/operating.md) for whoever runs the server.
 - **The reference.** Every configuration key and its default in
   [Configuration and the command line](docs/configuration.md), which is
-  the one document that states a setting's default; a test checks those
-  defaults against the code. Every metric
+  the one document that states a setting's default. The default itself
+  is a named constant beside the setting in `config.rs`, and the guides
+  name the setting and link the reference. Every metric
   and log field in the operating guide, and every protobuf field in its
   comment in `icetray.proto`. The TOML examples in the README and `docs/`
   are parsed by a test, so an example that no longer matches the schema
