@@ -10,9 +10,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::build::{
-    DECODE_BATCH_RECORDS, check_utf8, chunks_from_disk, decode_run, fetch_chunk_parts,
-};
+use super::build::{DECODE_BATCH_RECORDS, check_utf8, decode_run};
 use super::ordered::OrderRun;
 use super::{
     ColumnChunk, FileFault, FileIndex, KeyResidency, Keys, RowPosition, RowRef, file_fault,
@@ -175,22 +173,13 @@ impl FileIndex {
     /// chunks, under Disk from the chunk file, one counted local read per
     /// range and no GET, and under Bloom by load GET.
     pub(crate) async fn pair_chunks(&self, read: PairRead) -> Result<PairChunks> {
-        let size = self.handle.size();
-        let chunks = match &self.keys {
-            KeyResidency::Chunks(held) => {
-                let mut parts = fetch_chunk_parts(&self.handle, &read.ranges).await?;
-                parts.extend(held.parts().iter().cloned());
-                Arc::new(Segments::new(parts, size))
-            }
-            KeyResidency::Disk(disk) => chunks_from_disk(disk, &read.ranges, size).await?,
-            KeyResidency::Filters(_) => Arc::new(Segments::new(
-                fetch_chunk_parts(&self.handle, &read.ranges).await?,
-                size,
-            )),
-        };
+        let mut parts = self.load_parts(&read.ranges).await?;
+        if let KeyResidency::Chunks(held) = &self.keys {
+            parts.extend(held.parts().iter().cloned());
+        }
         Ok(PairChunks {
             spans: read.spans,
-            chunks,
+            chunks: Arc::new(Segments::new(parts, self.handle.size())),
             read: read.bytes,
         })
     }

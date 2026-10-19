@@ -46,7 +46,7 @@ use crate::local::{ChunkRules, DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
 use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
-use build::{check_utf8, checked_values, chunks_from_disk, decode_run, fetch_chunk_parts};
+use build::{check_utf8, checked_values, decode_run, fetch_chunk_parts};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub use order_fences::{OrderFences, Pair, PairPart};
@@ -1572,16 +1572,31 @@ impl FileIndex {
     pub(crate) async fn key_chunks_for_verification(&self) -> Result<Arc<Segments>> {
         match &self.keys {
             KeyResidency::Chunks(chunks) => Ok(Arc::clone(chunks)),
-            KeyResidency::Disk(disk) => {
+            KeyResidency::Disk(_) | KeyResidency::Filters(_) => {
                 let ranges =
                     column_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
-                chunks_from_disk(disk, &ranges, self.handle.size()).await
-            }
-            KeyResidency::Filters(_) => {
-                let ranges =
-                    column_chunk_ranges(&self.metadata, self.layout.key_leaf, self.handle.size());
-                let parts = fetch_chunk_parts(&self.handle, &ranges).await?;
+                let parts = self.load_parts(&ranges).await?;
                 Ok(Arc::new(Segments::new(parts, self.handle.size())))
+            }
+        }
+    }
+
+    /// The bytes of `ranges` of the file, in order, read at load: under
+    /// Disk from the chunk file, one counted local read per range and no
+    /// GET; under Full and Bloom by load GET (`fetch_chunk_parts`). For
+    /// the overlap check, the doctor, and an ordered table's merge; a
+    /// build never reads its chunks back.
+    async fn load_parts(&self, ranges: &[Range<u64>]) -> Result<Vec<(Range<u64>, Bytes)>> {
+        match &self.keys {
+            KeyResidency::Disk(disk) => {
+                let mut parts = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    parts.push((range.clone(), disk.page(range.clone()).await?));
+                }
+                Ok(parts)
+            }
+            KeyResidency::Chunks(_) | KeyResidency::Filters(_) => {
+                fetch_chunk_parts(&self.handle, ranges).await
             }
         }
     }

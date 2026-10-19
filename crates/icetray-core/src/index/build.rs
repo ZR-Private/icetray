@@ -336,21 +336,6 @@ pub(super) async fn fetch_chunk_parts(
         .collect())
 }
 
-/// Every key column chunk read back from the disk tier's chunk file: one
-/// counted local read per row group, no GET. For the overlap check and the
-/// doctor, which decode every key; a build never reads chunks back.
-pub(super) async fn chunks_from_disk(
-    disk: &DiskChunks,
-    ranges: &[Range<u64>],
-    file_size: u64,
-) -> Result<Arc<Segments>> {
-    let mut parts = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        parts.push((range.clone(), disk.page(range.clone()).await?));
-    }
-    Ok(Arc::new(Segments::new(parts, file_size)))
-}
-
 /// Where a Disk-tier build writes its chunk file: the local directory, the
 /// load's hold on its budget, and the chunk file's length the footer
 /// predicted, which the hold covers.
