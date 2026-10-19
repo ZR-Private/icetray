@@ -85,53 +85,69 @@ fn plain_chunk(chunk: ColumnChunk<'_>) -> Option<bool> {
 /// counts, as many as the header's value count, with no byte left after
 /// the last, and the pages together the ones
 /// `ColumnChunk::check_pages_read` accepts for the row group's rows.
-/// Anything the pages fault on (a header, a decompression, a count past
-/// the offset index, a panic) ends this read the same way, with nothing
-/// reported, so the column reader meets the fault and reports it. The
-/// decode runs under `catch_unwind` for that reason: a panic in it is the
-/// column reader's to meet and report.
+/// Anything the pages fault on ends this read with nothing reported, so
+/// the column reader meets the fault and reports it (`read_plain`).
 pub(super) fn checked_run(
     chunk: ColumnChunk<'_>,
     keys: ByteKeys,
     segments: Arc<Segments>,
 ) -> Option<RunCheck<'_>> {
+    let rows = 0..row_index(chunk.rows());
+    read_plain(chunk, rows, segments, |pages, required| {
+        let mut run = RunCheck::new(chunk);
+        let decoded = read_pages(pages, keys, required, &mut run)?;
+        Some((run, decoded))
+    })
+}
+
+/// What a plain reader reads of rows `rows` of `chunk` from `segments`:
+/// `read`'s answer over the chunk's pages holding them, given whether the
+/// column is `required`, with the rows it decoded; `None` when the chunk
+/// is not of the shape the plain readers read (`plain_chunk`), when `read`
+/// meets a page it does not read exactly, and when the pages read are not
+/// the ones `ColumnChunk::check_pages_read` accepts for the rows, for the
+/// column reader to read the chunk instead. Anything the pages fault on (a
+/// header, a decompression, a count past the offset index, a panic) ends
+/// the read the same way, with nothing reported, so the column reader
+/// meets the fault and reports it. The read runs under `catch_unwind` for
+/// that reason: a panic in it is the column reader's to meet and report.
+fn read_plain<T>(
+    chunk: ColumnChunk<'_>,
+    rows: Range<usize>,
+    segments: Arc<Segments>,
+    read: impl FnOnce(ChunkPages, bool) -> Option<(T, usize)>,
+) -> Option<T> {
     let required = plain_chunk(chunk)?;
-    let rows = row_index(chunk.rows());
     let tally = Arc::new(Mutex::new(PageTally::default()));
-    let mut run = RunCheck::new(chunk);
     // Unwind-safe: the pages are built inside the call and dropped with a
-    // panic, the footer `chunk` borrows is only read, and the run and the
-    // tally a panic can leave mid-page are dropped unread.
-    let read = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        read_pages(chunk, rows, segments, &tally, keys, required, &mut run)
+    // panic, the footer `chunk` borrows is only read, and what `read` and
+    // the tally a panic can leave mid-page is dropped unread.
+    let answer = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // intentional: a chunk parquet's page reader cannot plan is the
+        // column reader's to report.
+        let pages = ChunkPages::new(chunk, rows.clone(), segments, Arc::clone(&tally)).ok()?;
+        read(pages, required)
     }));
     // intentional: a panic is the column reader's to meet and report.
-    let decoded = read.ok()??;
+    let (answer, decoded) = answer.ok()??;
     let seen = std::mem::take(&mut tally.lock().unwrap_or_else(PoisonError::into_inner).seen);
     // intentional: pages that contradict the offset index are the column
     // reader's to refuse, as `FileFault::PageRowsMismatch`.
-    chunk.check_pages_read(0..rows, &seen, Ok(decoded)).ok()?;
-    Some(run)
+    chunk.check_pages_read(rows, &seen, Ok(decoded)).ok()?;
+    Some(answer)
 }
 
-/// The data pages of `chunk` holding rows `0..rows`, each read plain and
-/// handed to `run` a decode batch at a time, with what the page reader saw
-/// recorded in `tally`: the values read, or `None` at the first page not
-/// read exactly. A batch holds at most `DECODE_BATCH_RECORDS` values
+/// Every data page of `pages`, each read plain and handed to `run` a
+/// decode batch at a time: the values read, or `None` at the first page
+/// not read exactly. A batch holds at most `DECODE_BATCH_RECORDS` values
 /// however many a header counts, so no buffer here is sized by a count
 /// before the values it counts have been read.
 fn read_pages(
-    chunk: ColumnChunk<'_>,
-    rows: usize,
-    segments: Arc<Segments>,
-    tally: &Arc<Mutex<PageTally>>,
+    mut pages: ChunkPages,
     keys: ByteKeys,
     required: bool,
     run: &mut RunCheck<'_>,
 ) -> Option<usize> {
-    // intentional: a chunk parquet's page reader cannot plan is the column
-    // reader's to report.
-    let mut pages = ChunkPages::new(chunk, 0..rows, segments, Arc::clone(tally)).ok()?;
     let batch_records = row_index(DECODE_BATCH_RECORDS);
     let mut decoded = 0;
     // intentional: a page the page reader faults on is the column
@@ -171,47 +187,30 @@ fn read_pages(
 /// `ColumnChunk::check_pages_read` accepts for the rows. Nothing past the
 /// last row asked for is read, as the column reader reads nothing past
 /// it either. Anything the pages fault on ends this read with nothing
-/// reported, and it runs under `catch_unwind`, as `checked_run` does and
-/// for the same reason.
+/// reported (`read_plain`).
 pub(super) fn value_rows(
     chunk: ColumnChunk<'_>,
     rows: Range<i64>,
     segments: &Arc<Segments>,
 ) -> Option<PlainValues> {
-    let required = plain_chunk(chunk)?;
     let rows = row_index(rows.start)..row_index(rows.end);
-    let tally = Arc::new(Mutex::new(PageTally::default()));
-    // Unwind-safe: the pages are built inside the call and dropped with a
-    // panic, the footer `chunk` borrows is only read, and the values and
-    // the tally a panic can leave mid-page are dropped unread.
-    let read = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        read_value_pages(chunk, rows.clone(), Arc::clone(segments), &tally, required)
-    }));
-    // intentional: a panic is the column reader's to meet and report.
-    let values = read.ok()??;
-    let seen = std::mem::take(&mut tally.lock().unwrap_or_else(PoisonError::into_inner).seen);
-    // intentional: pages that contradict the offset index are the column
-    // reader's to refuse, as `FileFault::PageRowsMismatch`.
-    chunk
-        .check_pages_read(rows, &seen, Ok(values.rows.len()))
-        .ok()?;
-    Some(values)
+    let segments = Arc::clone(segments);
+    read_plain(chunk, rows.clone(), segments, |pages, required| {
+        let values = read_value_pages(pages, rows, required)?;
+        let decoded = values.rows.len();
+        Some((values, decoded))
+    })
 }
 
-/// The data pages of `chunk` holding `rows`, read plain (`value_rows`),
-/// with what the page reader saw recorded in `tally`; `None` at the first
-/// page not read exactly. The rows read stop short of `rows` where the
-/// pages run out first, for `ColumnChunk::check_pages_read` to refuse.
+/// The data pages of `pages` holding `rows`, read plain (`value_rows`);
+/// `None` at the first page not read exactly. The rows read stop short of
+/// `rows` where the pages run out first, for
+/// `ColumnChunk::check_pages_read` to refuse.
 fn read_value_pages(
-    chunk: ColumnChunk<'_>,
+    mut pages: ChunkPages,
     rows: Range<usize>,
-    segments: Arc<Segments>,
-    tally: &Arc<Mutex<PageTally>>,
     required: bool,
 ) -> Option<PlainValues> {
-    // intentional: a chunk parquet's page reader cannot plan is the column
-    // reader's to report.
-    let mut pages = ChunkPages::new(chunk, rows.clone(), segments, Arc::clone(tally)).ok()?;
     let mut skip = rows.start.checked_sub(pages.first_row())?;
     let mut left = rows.len();
     let mut read = PlainValues {
