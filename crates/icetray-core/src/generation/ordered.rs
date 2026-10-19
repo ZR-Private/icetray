@@ -1271,7 +1271,7 @@ impl MergeState {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::super::testing::{KeyColumn, TABLE, bucketing, local_dir, refusal_of};
+    use super::super::testing::{KeyColumn, TABLE, bucketing, refusal_of};
     use super::super::{Span, overlap_groups, routes};
     use super::*;
     use crate::approx;
@@ -1486,10 +1486,10 @@ mod tests {
     struct Built {
         file: Arc<LoadedFile>,
         stats: Arc<IoStats>,
-        /// The store the file's GETs pass through, when a test gates them.
-        gauged: Option<Arc<Gauged>>,
+        /// The store the file's GETs pass through, which a test may gate.
+        gauged: Arc<Gauged>,
         /// The Disk tier's local directory, which outlives the index.
-        _dir: Option<tempfile::TempDir>,
+        _dir: tempfile::TempDir,
     }
 
     impl Built {
@@ -1520,22 +1520,14 @@ mod tests {
         residency: Residency,
     ) -> Built {
         let layout = index_testing::ordered_layout(KeyType::Long, OrderType::Long);
-        let fixture = in_groups(rows, page_rows, group_rows);
+        let fixture = index_testing::Fixture::of_long_pairs(rows).in_pages(page_rows, group_rows);
         built_of(name, &fixture, &layout, Some((TWO, 0)), residency).await
     }
 
-    /// The rows of `rows`, (key, order value) pairs ascending, in pages of
-    /// `page_rows` rows and row groups of `group_rows`.
-    fn in_groups(
-        rows: &[(i64, i64)],
-        page_rows: usize,
-        group_rows: usize,
-    ) -> index_testing::Fixture {
-        index_testing::Fixture::of_long_pairs(rows).in_pages(page_rows, group_rows)
-    }
-
     /// `fixture`, an ordered file served under `layout`, as file `name`
-    /// filed at `place`, indexed in `residency`.
+    /// filed at `place`, indexed in `residency`, its GETs through a
+    /// `Gauged` store, which passes every GET until a test gates them, so a
+    /// test can hold them and see how many it runs together.
     async fn built_of(
         name: &str,
         fixture: &index_testing::Fixture,
@@ -1543,52 +1535,12 @@ mod tests {
         place: Place,
         residency: Residency,
     ) -> Built {
-        let opened = index_testing::store(fixture).await;
-        built_from(name, &opened, layout, place, residency).await
-    }
-
-    /// `built_in_groups` over a `Gauged` store, so a test can hold the
-    /// file's GETs and see how many it runs together.
-    async fn built_gauged_in_groups(
-        name: &str,
-        rows: &[(i64, i64)],
-        page_rows: usize,
-        group_rows: usize,
-        residency: Residency,
-    ) -> Built {
-        let layout = index_testing::ordered_layout(KeyType::Long, OrderType::Long);
-        let (opened, gauged) =
-            index_testing::store_gauged(&in_groups(rows, page_rows, group_rows)).await;
-        Built {
-            gauged: Some(gauged),
-            ..built_from(name, &opened, &layout, Some((TWO, 0)), residency).await
-        }
-    }
-
-    /// The file `opened` holds, served under `layout`, as file `name` filed
-    /// at `place`, indexed in `residency`.
-    async fn built_from(
-        name: &str,
-        opened: &index_testing::Opened,
-        layout: &crate::manifest::TableLayout,
-        place: Place,
-        residency: Residency,
-    ) -> Built {
-        let (index, dir) = match residency {
-            Residency::Disk => {
-                let dir = tempfile::tempdir().unwrap();
-                let local = local_dir(dir.path(), opened.stats(), None);
-                let index = opened
-                    .build_under(layout, residency, Some(&local))
-                    .await
-                    .unwrap();
-                (index, Some(dir))
-            }
-            Residency::Full | Residency::Bloom => (
-                opened.build_under(layout, residency, None).await.unwrap(),
-                None,
-            ),
-        };
+        let (opened, gauged) = index_testing::store_gauged(fixture).await;
+        let dir = tempfile::tempdir().unwrap();
+        let index = opened
+            .build_under_in(layout, residency, dir.path())
+            .await
+            .unwrap();
         let (first, last) = index.key_range();
         let (first, last) = (first.clone(), last.clone());
         Built {
@@ -1608,7 +1560,7 @@ mod tests {
                 index,
             }),
             stats: opened.stats(),
-            gauged: None,
+            gauged,
             _dir: dir,
         }
     }
@@ -1947,9 +1899,7 @@ mod tests {
                 })
                 .collect();
             let name = format!("h-{at:03}");
-            built.push(
-                built_gauged_in_groups(&name, &rows, FEW_PAGE_ROWS, group_rows, residency).await,
-            );
+            built.push(built_in_groups(&name, &rows, FEW_PAGE_ROWS, group_rows, residency).await);
         }
         for one in &built {
             assert_eq!(one.file.index.metadata().num_row_groups(), GROUPS_PER_FILE);
@@ -2012,14 +1962,6 @@ mod tests {
             .collect()
     }
 
-    /// The store `built`'s GETs pass through.
-    fn gauged(built: &Built) -> &Gauged {
-        built
-            .gauged
-            .as_ref()
-            .expect("the file is built over a gauged store")
-    }
-
     /// Waits until `gauged` has held `gets` GETs in flight at once,
     /// failing past the get deadline.
     async fn reach(gauged: &Gauged, gets: usize) {
@@ -2045,24 +1987,24 @@ mod tests {
             let files = overlapping_in_groups(AHEAD_FILES, residency).await;
             let reused = [false; AHEAD_FILES];
             for one in &files {
-                gauged(one).fill_to(0);
+                one.gauged.fill_to(0);
             }
             let before: Vec<[u64; 4]> = files.iter().map(io).collect();
             check_rows_within(&files, &reused, BELOW_ANY_ROW_GROUP)
                 .await
                 .unwrap();
             let unread_ahead = io_since(&files, &before);
-            let per_group: Vec<usize> = files.iter().map(|one| gauged(one).high_water()).collect();
+            let per_group: Vec<usize> = files.iter().map(|one| one.gauged.high_water()).collect();
             for one in &files {
-                gauged(one).hold();
+                one.gauged.hold();
             }
             let before: Vec<[u64; 4]> = files.iter().map(io).collect();
             let every_group_in_flight = async {
                 for (one, &per_group) in files.iter().zip(&per_group) {
-                    reach(gauged(one), per_group * GROUPS_PER_FILE).await;
+                    reach(&one.gauged, per_group * GROUPS_PER_FILE).await;
                 }
                 for one in &files {
-                    gauged(one).release();
+                    one.gauged.release();
                 }
             };
             let (check, ()) = futures::join!(
@@ -2081,7 +2023,7 @@ mod tests {
                 assert!(unread[0] > 0 && per_group > 0, "{residency:?}: {path}");
                 assert_eq!(ahead, unread, "{residency:?}: {path}");
                 assert_eq!(
-                    gauged(one).high_water(),
+                    one.gauged.high_water(),
                     per_group * GROUPS_PER_FILE,
                     "{residency:?}: {path}"
                 );
@@ -2113,7 +2055,7 @@ mod tests {
         let key_rows = usize::try_from(OVERLAPPING_ROWS_PER_KEY).unwrap();
         let keys_per_group_of_the_first = 2;
         let files = [
-            built_gauged_in_groups(
+            built_in_groups(
                 "r-0",
                 &rows(1),
                 FEW_PAGE_ROWS,
@@ -2121,7 +2063,7 @@ mod tests {
                 residency,
             )
             .await,
-            built_gauged_in_groups("r-1", &rows(0), FEW_PAGE_ROWS, key_rows, residency).await,
+            built_in_groups("r-1", &rows(0), FEW_PAGE_ROWS, key_rows, residency).await,
         ];
         let group = |one: &Built, row_group: usize| -> u64 {
             (0..order_pages(&one.file, row_group))
@@ -2130,13 +2072,13 @@ mod tests {
         };
         let budget = group(&files[0], 0) + group(&files[1], 0) + group(&files[1], 1);
         for one in &files {
-            gauged(one).hold();
+            one.gauged.hold();
         }
         let first_ahead = async {
-            reach(gauged(&files[1]), 2).await;
-            let first_file_in_flight = gauged(&files[0]).high_water();
+            reach(&files[1].gauged, 2).await;
+            let first_file_in_flight = files[0].gauged.high_water();
             for one in &files {
-                gauged(one).release();
+                one.gauged.release();
             }
             first_file_in_flight
         };
@@ -2380,7 +2322,7 @@ mod tests {
         for residency in Residency::ALL {
             let files = overlapping_in_groups(OVERLAPPING, residency).await;
             for one in &files {
-                gauged(one).fill_to(0);
+                one.gauged.fill_to(0);
             }
             let before: Vec<[u64; 4]> = files.iter().map(io).collect();
             let check = check_rows_within(&files, &[false; OVERLAPPING], BELOW_ANY_ROW_GROUP)
@@ -2401,7 +2343,7 @@ mod tests {
                     "{residency:?}: {path}"
                 );
                 assert!(
-                    approx::count(gauged(one).high_water()) <= per_group_gets,
+                    approx::count(one.gauged.high_water()) <= per_group_gets,
                     "{residency:?}: {path} runs one row group's GETs at a time"
                 );
             }
