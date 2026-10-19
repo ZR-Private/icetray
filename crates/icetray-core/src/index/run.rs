@@ -3416,15 +3416,18 @@ mod tests {
         }
     }
 
-    /// Whatever the order column index, full length, truncated short of
-    /// the 32-byte prefix every value of a long run shares with the bound,
-    /// or none, oldest first after the run's first value and newest first
-    /// before its last read the value pages of the rows taken alone, and the
-    /// order pages from the bound's to the row that sets `more`, in one
-    /// round, in every residency: the fences place the bounds, not the
-    /// column index.
+    /// Whatever the order column index, the read is the same: the fences
+    /// place the bounds, not the column index. Under a string or binary
+    /// order column whose every value of a long run shares a 32-byte prefix
+    /// with the bound, with the index full length, truncated short of that
+    /// prefix, or none, oldest first after the run's first value and newest
+    /// first before its last read the value pages of the rows taken alone,
+    /// and the order pages from the bound's to the row that sets `more`, in
+    /// one round, in every residency; under a long order column, with the
+    /// index whole or none, so does a bounded read
+    /// (`assert_long_read_whatever_the_index`).
     #[tokio::test]
-    async fn test_read_run_under_a_shared_prefix_reads_the_rows_taken_whatever_the_index() {
+    async fn test_read_run_reads_the_rows_taken_whatever_the_order_column_index() {
         let limit = 3;
         let last = LONG_PREFIXED_RUN_ROWS - 1;
         for (truncate, statistics) in [
@@ -3470,6 +3473,9 @@ mod tests {
                         let orders: Vec<OrderValue> = (0..rows.len()).map(value).collect();
                         let order_leaf = index.order_leaf().unwrap();
                         let value_leaf = index.value_leaf(0).unwrap();
+                        if statistics.is_some() {
+                            assert_no_column_index(&opened, order_leaf).await;
+                        }
                         for (scan, taken, next, order_rows) in &cases {
                             let case = format!(
                                 "{residency} {order_type} {truncate:?} {statistics:?} {scan:?}"
@@ -3504,6 +3510,70 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+        assert_long_read_whatever_the_index().await;
+    }
+
+    /// Asserts that the file `opened` holds carries no column index on leaf
+    /// `leaf`, as a writer of chunk statistics alone leaves it: the premise
+    /// of a read without one.
+    async fn assert_no_column_index(opened: &Opened, leaf: usize) {
+        let loaded = opened.handle.load_metadata().await.unwrap();
+        assert!(
+            loaded
+                .column_index()
+                .is_none_or(|groups| groups.iter().all(|group| matches!(
+                    group[leaf],
+                    parquet::file::page_index::column_index::ColumnIndexMetaData::NONE
+                ))),
+            "leaf {leaf} has no column index"
+        );
+    }
+
+    /// Under a long order column, with the column index whole or none,
+    /// oldest first after the order value of `bounded_run`'s row 19 with a
+    /// limit of 2 answers rows 20 and 21 and row 22's order value, in one
+    /// round: a GET of the value pages and one of the order pages, the
+    /// order pages read locally under Disk.
+    async fn assert_long_read_whatever_the_index() {
+        let after = ScanBounds {
+            after: Some(order_at(19)),
+            ..bounds(Direction::OldestFirst)
+        };
+        for statistics in [
+            None,
+            Some(parquet::file::properties::EnabledStatistics::Chunk),
+        ] {
+            let mut fixture = bounded_run(0);
+            if let Some(statistics) = statistics {
+                fixture.layout.statistics = statistics;
+            }
+            let (opened, gauged) = store_gauged(&fixture).await;
+            for residency in Residency::ALL {
+                let case = format!("{residency} long {statistics:?}");
+                let probe = Probe::open(&opened, &gauged, residency, OrderType::Long).await;
+                if statistics.is_some() {
+                    assert_no_column_index(&opened, probe.index.order_leaf().unwrap()).await;
+                }
+                let stats = opened.stats();
+                let together = 1 + usize::from(residency != Residency::Disk);
+                gauged.fill_to(together);
+                let before = costs(&stats);
+                let (got, _) =
+                    tokio::time::timeout(DEADLINE_GUARD, probe.read(&after, 2, &none_deleted))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("{case}: every GET of the read is in flight at once")
+                        });
+                assert_eq!(got.answer.rows, after_answer(1), "{case}");
+                assert_eq!(got.answer.next, Some(order_at(22)), "{case}");
+                let expected = match residency {
+                    Residency::Full | Residency::Bloom => (2, 0),
+                    Residency::Disk => (1, 1),
+                };
+                assert_eq!(since(&stats, before), expected, "{case}");
+                assert_eq!(gauged.high_water(), together, "{case}");
             }
         }
     }
