@@ -1761,7 +1761,7 @@ mod tests {
     /// one read per column the tier does not hold.
     #[tokio::test]
     async fn test_first_load_reads_each_page_once_in_an_overlapping_group() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let mut files = Vec::new();
             let spread = i64::try_from(OVERLAPPING).unwrap();
             for at in 0..OVERLAPPING {
@@ -1891,7 +1891,7 @@ mod tests {
     /// pages they span under `bloom`, and from the chunk file under `disk`.
     #[tokio::test]
     async fn test_verify_rows_of_files_meeting_at_an_edge_key_reads_only_the_edge_pages() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let head: Vec<(i64, i64)> = (0..EDGE_RUN)
                 .map(|order| (BEFORE_EDGE, order))
                 .chain((0..EDGE_ROWS).map(|order| (EDGE_KEY, order)))
@@ -2384,7 +2384,7 @@ mod tests {
     /// group, which the merge starts from, and at most each file's largest.
     #[tokio::test]
     async fn test_verify_rows_under_a_budget_below_a_row_group_reads_one_row_group_per_file() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let files = overlapping_in_groups(OVERLAPPING, residency).await;
             for one in &files {
                 gauged(one).fill_to(0);
@@ -2435,7 +2435,7 @@ mod tests {
     /// file; it reads every page once.
     #[tokio::test]
     async fn test_verify_rows_holds_within_the_budget_beyond_one_row_group_per_file() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let files = overlapping_in_groups(OVERLAPPING, residency).await;
             let bytes = group_bytes(&files, residency);
             let budget = bytes.whole / 2;
@@ -2813,7 +2813,7 @@ mod tests {
             state = state.wrapping_mul(MIX).wrapping_add(STEP);
             (state >> 33) % below
         };
-        let residencies = [Residency::Full, Residency::Disk, Residency::Bloom];
+        let residencies = Residency::ALL;
         let written = [
             (Written::Long, Written::Long),
             (Written::Text, Written::Text),

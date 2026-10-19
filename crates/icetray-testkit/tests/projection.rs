@@ -27,9 +27,6 @@ use icetray_testkit::{
     memory_catalog_local, write_fixture,
 };
 
-/// Every residency tier a table can be served in.
-const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 /// The field lists the tests trim `VALUE_COLUMN` to: a singular field
 /// written twice, a packed field split in two records, two adjacent
 /// fields, a group, every field, and a number no value holds.
@@ -89,7 +86,7 @@ async fn test_projected_reads_answer_the_named_fields_at_a_whole_read_s_gets() -
     let fixture = fixture_of(dir.path(), "kv_project", ValueKind::Protobuf, Nulls::None).await?;
     let keys = fixture.keys_at(&SAMPLE);
     let costs = cold_costs(&fixture, &keys).await?;
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         for fields in FIELD_LISTS {
             let scratch = tempfile::tempdir()?;
             let config = entry(&fixture, residency, ValueFormat::Protobuf);
@@ -135,7 +132,7 @@ async fn test_projected_multi_get_answers_every_key_from_one_generation() -> Res
     let mut keys = present.clone();
     keys.push(fixture.absent_near(SAMPLE[0]));
     let fields = [SCORES_FIELD, GROUP_FIELD];
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         let scratch = tempfile::tempdir()?;
         let config = entry(&fixture, residency, ValueFormat::Protobuf);
         let served = verify::serve_in(config, scratch.path()).await?;

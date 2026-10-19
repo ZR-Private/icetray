@@ -4151,7 +4151,7 @@ mod tests {
     /// which holds what the load applied; the chunk files on disk do not.
     #[tokio::test]
     async fn test_diagnose_predicted_memory_counts_the_delete_bound() {
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             let scratch = tempfile::tempdir().unwrap();
             let (_table, before, after) =
                 deleted_file_table(residency, false, scratch.path()).await;

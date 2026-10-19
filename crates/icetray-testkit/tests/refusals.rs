@@ -1482,9 +1482,6 @@ async fn test_duplicate_rows_across_files_are_refused_naming_the_later_file() ->
     Ok(())
 }
 
-/// Every residency, each of which the revived-pair refusal is checked in.
-const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 /// A ref moved back to a snapshot that lists both copies of an updated pair
 /// but not the deletion vector that hid the older one revives it (RFD 021):
 /// the reused file whose deletes shrank is checked again, and the refresh is
@@ -1492,7 +1489,7 @@ const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency
 /// generation keeps serving, in every residency.
 #[tokio::test]
 async fn test_refresh_refuses_a_pair_revived_by_dropped_deletes() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
         let mut fixture = two_row_fixture(&catalog, &format!("ord_revived_{at}"), 1).await?;
         fixture

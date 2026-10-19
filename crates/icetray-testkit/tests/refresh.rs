@@ -592,9 +592,6 @@ const ORDERED_PAGE_ROWS: usize = 4;
 /// The id the ordered tests append beside, update, and repeat.
 const AN_ID: u64 = 17;
 
-/// Every residency, each of which an ordered refresh is checked in.
-const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 fn ordered_rows_per_key(_id: u64) -> u64 {
     ORDERED_ROWS_PER_KEY
 }
@@ -686,7 +683,7 @@ fn gets_by_path(generation: &Generation, counting: &CountingStore) -> Vec<(Strin
 /// reused one's, so no merge runs and no reused file is read again.
 #[tokio::test]
 async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
         let spec = ordered_spec(&format!("ord_later_{at}"), ordered_rows_per_key);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
@@ -736,7 +733,7 @@ async fn test_refresh_reads_only_new_files_for_an_append_of_later_rows() -> Resu
 /// file of the other bucket, which cannot share the key, is not read.
 #[tokio::test]
 async fn test_refresh_reads_only_the_order_pages_late_rows_fall_among() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let spec = ordered_spec(&format!("ord_late_{at}"), long_runs);
         let late = refresh_with_a_late_row(spec, residency).await?;
         assert_eq!(
@@ -802,7 +799,7 @@ async fn test_refresh_reads_the_same_order_pages_without_a_column_index() -> Res
 #[tokio::test]
 async fn test_refresh_reads_the_order_dictionary_with_the_pages_late_rows_fall_among() -> Result<()>
 {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let spec = ordered_spec(&format!("ord_dictionary_{at}"), long_runs);
         let spec = FixtureSpec {
             layout: Layout {
@@ -841,7 +838,7 @@ const ONE_ORDER_PAGE: u64 = 1;
 /// many as one late row costs; under `disk` none.
 #[tokio::test]
 async fn test_late_rows_read_each_touched_old_page_once() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let spec = ordered_spec(&format!("ord_late_once_{at}"), long_runs);
         let lates = one_page_lates();
         let one = refresh_with_late_rows(spec, residency, &lates[..1]).await?;
@@ -935,7 +932,7 @@ async fn refresh_with_late_rows(
 /// later of them in file order; the last generation keeps serving.
 #[tokio::test]
 async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
         let spec = ordered_spec(&format!("ord_twice_{at}"), ordered_rows_per_key);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
@@ -988,7 +985,7 @@ async fn test_new_files_of_one_refresh_are_checked_against_each_other() -> Resul
 /// deletion vector, is no repeat (RFD 021, RFD 025): the refresh serves.
 #[tokio::test]
 async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
         let spec = ordered_spec(&format!("ord_updated_{at}"), ordered_rows_per_key);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
@@ -1022,7 +1019,7 @@ async fn test_a_pair_whose_older_copy_is_deleted_is_served() -> Result<()> {
 /// at the key's first pair, while the last generation keeps serving.
 #[tokio::test]
 async fn test_a_pair_whose_new_copy_is_deleted_is_served() -> Result<()> {
-    for (at, residency) in RESIDENCIES.into_iter().enumerate() {
+    for (at, residency) in Residency::ALL.into_iter().enumerate() {
         let (_dir, catalog) = local_catalog().await?;
         let spec = ordered_spec(&format!("ord_new_deleted_{at}"), ordered_rows_per_key);
         let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;

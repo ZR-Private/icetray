@@ -31,9 +31,6 @@ async fn two_column_fixture(dir: &Path, name: &str) -> Result<Fixture> {
     write_fixture(catalog.as_ref(), NAMESPACE, spec).await
 }
 
-/// Every residency tier a table can be served in.
-const RESIDENCIES: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 /// The fixture's sampled keys, checked to hold different bytes in its two
 /// columns, so that no test of order or of one column passes with the
 /// other column's bytes.
@@ -77,7 +74,7 @@ async fn test_both_columns_answer_in_request_order_at_one_get_per_column_cold() 
     let fixture = two_column_fixture(dir.path(), "kv_columns").await?;
     let keys = sampled(&fixture);
     let (_, both) = cold_costs(&fixture, &keys).await?;
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         let scratch = tempfile::tempdir()?;
         let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();
@@ -103,7 +100,7 @@ async fn test_the_other_order_answers_the_other_order_and_warm_pages_cost_nothin
     let dir = tempfile::tempdir()?;
     let fixture = two_column_fixture(dir.path(), "kv_columns_order").await?;
     let keys = sampled(&fixture);
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         let scratch = tempfile::tempdir()?;
         let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         for key in &keys {
@@ -148,7 +145,7 @@ async fn test_presence_alone_reads_no_value_page_on_get_and_multi_get() -> Resul
     let (one_column, _) = cold_costs(&fixture, &keys).await?;
     let mut batch = keys.clone();
     batch.push(fixture.absent_near(SAMPLE[0]));
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         let scratch = tempfile::tempdir()?;
         let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();
@@ -182,7 +179,7 @@ async fn test_one_column_named_reads_that_columns_pages_alone() -> Result<()> {
     let fixture = two_column_fixture(dir.path(), "kv_columns_one").await?;
     let keys = sampled(&fixture);
     let (one_column, _) = cold_costs(&fixture, &keys).await?;
-    for residency in RESIDENCIES {
+    for residency in Residency::ALL {
         let scratch = tempfile::tempdir()?;
         let served = verify::serve_in(fixture.config(residency, false), scratch.path()).await?;
         let stats = served.storage.stats();

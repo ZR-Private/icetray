@@ -49,9 +49,6 @@ const MULTI_SCAN_INSTANCES: usize = 6;
 /// Keys one drawn `MultiScan` asks for, repeats included.
 const KEYS_PER_MULTI_SCAN: Range<usize> = 1..8;
 
-/// Every residency tier a table can be served in.
-const TIERS: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 /// Ids a drawn table writes, and the ids past them an append may add.
 const DRAWN_IDS: Range<u64> = 0..12;
 const NEW_IDS: u64 = 2;
@@ -180,7 +177,7 @@ impl Tiers {
 async fn serve_in_every_tier(config: impl Fn(Residency) -> TableConfig) -> Result<Tiers> {
     let mut served = Vec::new();
     let mut dirs = Vec::new();
-    for residency in TIERS {
+    for residency in Residency::ALL {
         let dir = tempfile::tempdir()?;
         served.push((
             residency,

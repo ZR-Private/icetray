@@ -513,7 +513,7 @@ const MOR_LIVE_IDS: [u64; 4] = [
 async fn assert_merge_on_read_serves(table: GoldenTable) -> Result<()> {
     let scratch = tempfile::tempdir()?;
     let mut tiers = Vec::new();
-    for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+    for residency in Residency::ALL {
         tiers.push((residency, open_in(table, residency, scratch.path()).await?));
     }
     let full = tiers[0].1.current();
@@ -803,9 +803,6 @@ async fn test_golden_merge_on_read_deletes_summary_matches_the_manifests() -> Re
     Ok(())
 }
 
-/// Every ordered table the recipe writes, and the tiers each is served in.
-const ORDERED_TIERS: [Residency; 3] = [Residency::Full, Residency::Disk, Residency::Bloom];
-
 /// Between two sampled key indexes of an ordered table: prime, so the
 /// sampled keys land at varied offsets in the pages and buckets.
 const ORDERED_SAMPLE_STRIDE: usize = 37;
@@ -914,7 +911,7 @@ async fn assert_ordered_scans_match_the_derivation(
     let scratch = tempfile::tempdir()?;
     let mut compared = 0_u64;
     let (mut cut, mut empty) = (0_u64, 0_u64);
-    for residency in ORDERED_TIERS {
+    for residency in Residency::ALL {
         let served = open_in(table, residency, scratch.path()).await?;
         for id in ordered_sample(extra) {
             let key = golden::ordered_key(table, id);

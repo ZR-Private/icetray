@@ -103,7 +103,7 @@ impl Tiers {
     async fn serve(fixture: &Fixture) -> Result<Self> {
         let scratch = tempfile::tempdir()?;
         let mut tiers = Vec::new();
-        for residency in [Residency::Full, Residency::Disk, Residency::Bloom] {
+        for residency in Residency::ALL {
             tiers.push((
                 residency,
                 serve_in(fixture, residency, scratch.path(), None).await?,
