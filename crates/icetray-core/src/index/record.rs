@@ -193,8 +193,8 @@ pub(super) fn encode(verified: &Verified) -> Vec<u8> {
         row_groups,
         max_key_bytes: approx::count(verified.max_key_bytes),
         order: verified.order.as_ref().map(|order| OrderRecord {
-            min: order_bytes(&order.facts.min),
-            max: order_bytes(&order.facts.max),
+            min: part_bytes(PairPart::of_order(&order.facts.min)),
+            max: part_bytes(PairPart::of_order(&order.facts.max)),
             distinct_keys: order.facts.distinct_keys.clone(),
             longest_run: order.facts.longest_run,
             fences: order
@@ -211,9 +211,9 @@ pub(super) fn encode(verified: &Verified) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// A fence's key or order value as the record stores it: a long's eight
-/// little-endian bytes, as `Key::as_bytes` and `order_bytes` store one, and
-/// bytes as they are.
+/// A fence's key, or an order value, as the record stores it: a long's
+/// eight little-endian bytes, as `Key::as_bytes` stores one, and bytes as
+/// they are.
 fn part_bytes(part: PairPart<'_>) -> Vec<u8> {
     match part {
         PairPart::Long(value) => value.to_le_bytes().to_vec(),
@@ -224,15 +224,6 @@ fn part_bytes(part: PairPart<'_>) -> Vec<u8> {
 /// A key as the record stores it.
 fn key_bytes(key: &Key) -> Vec<u8> {
     key.as_bytes().to_vec()
-}
-
-/// An order value as the record stores it.
-fn order_bytes(value: &OrderValue) -> Vec<u8> {
-    match value {
-        OrderValue::Long(value) => value.to_le_bytes().to_vec(),
-        OrderValue::Str(text) => text.as_bytes().to_vec(),
-        OrderValue::Bytes(bytes) => bytes.clone(),
-    }
 }
 
 /// The record in `bytes` as what `verify` of `column`, whose keys decode as
@@ -601,7 +592,6 @@ pub(super) fn most_bytes(column: &Column<'_>, order: Option<OrderLeaf>) -> u64 {
 /// string and binary keys. What the Disk tier's chunk file is predicted to
 /// hold at the footer stage, before any key is decoded (RFD 017).
 pub(super) fn estimated_len(groups: impl IntoIterator<Item = (u64, u64)>) -> u64 {
-    let framed = |len: u64| FIELD_KEY_BYTES + varint_len(len) + len;
     let mut total: u64 = 0;
     let mut longest = 0;
     for (fences, key_bytes) in groups {
@@ -646,7 +636,6 @@ pub(super) fn estimated_order_len(
     values: [u64; 2],
     fences: impl IntoIterator<Item = FenceBytes>,
 ) -> u64 {
-    let framed = |len: u64| FIELD_KEY_BYTES + varint_len(len) + len;
     let (mut counts, mut rows) = (0, 0u64);
     for group in group_rows {
         counts += varint_len(group);
@@ -668,6 +657,12 @@ pub(super) fn estimated_order_len(
         .saturating_add(FIELD_KEY_BYTES + varint_len(rows))
         .saturating_add(fences);
     framed(message)
+}
+
+/// The bytes a field of `len` bytes takes, framed: its key, the varint of
+/// its length, and its bytes.
+fn framed(len: u64) -> u64 {
+    FIELD_KEY_BYTES + varint_len(len) + len
 }
 
 /// The bytes the varint of `value` takes.
