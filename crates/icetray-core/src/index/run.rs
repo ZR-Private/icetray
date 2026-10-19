@@ -10,6 +10,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::FutureExt as _;
+use futures::future::OptionFuture;
 use metrics::Counter;
 use tokio::sync::Semaphore;
 
@@ -347,7 +349,7 @@ impl FileIndex {
             bounds.direction,
         );
         let (read, values) = futures::try_join!(
-            self.read_orders(order, &order_rows, source),
+            self.read_orders(&order, &order_rows, source),
             self.read_values(columns, &value_rows, source),
         )?;
         let orders = known.and(read);
@@ -500,7 +502,7 @@ impl FileIndex {
         }
         if self.disk_chunks().is_some() {
             let rows = in_file_order(placed.iter().map(|walked| walked.row), direction);
-            return self.read_orders(order, &rows, source).await;
+            return self.read_orders(&order, &rows, source).await;
         }
         let mut spans = Vec::new();
         for at in bound_pieces {
@@ -521,24 +523,26 @@ impl FileIndex {
 
     /// The order values of the spans of `rows`, rows in file order, by the
     /// order column's pages (`read_spans`): from the chunk file under Disk,
-    /// through `source` otherwise.
-    async fn read_orders(
-        &self,
-        order: OrderLeaf,
+    /// through `source` otherwise. A plain `fn` returning `read_spans`'
+    /// future, its closures holding `order` by reference: the future is
+    /// laid out in every file's share of a Scan, which `Generation::scan`
+    /// allocates, and an `async fn` around it would add its own state.
+    fn read_orders<'a>(
+        &'a self,
+        order: &'a OrderLeaf,
         rows: &[RowRef],
-        source: RunSource<'_>,
-    ) -> Result<Spans<OrderRun>> {
+        source: RunSource<'a>,
+    ) -> impl Future<Output = Result<Spans<OrderRun>>> + use<'a> {
         self.read_spans(
             rows,
-            |row_group| self.order_values(order).group(row_group),
+            move |row_group| self.order_values(*order).group(row_group),
             self.disk_chunks(),
             source,
             source.order_gets,
-            |chunk, pages, rows, segments| {
-                self.decode_order_span(chunk, order, pages, rows, Arc::clone(segments))
+            move |chunk, pages, rows, segments| {
+                self.decode_order_span(chunk, *order, pages, rows, Arc::clone(segments))
             },
         )
-        .await
     }
 
     /// Rows `rows` of the order column chunk `chunk` decoded from
@@ -572,34 +576,45 @@ impl FileIndex {
     }
 
     /// The values of each column of `columns`, positions in the layout,
-    /// at `rows`, rows in file order, over the spans of them by each
-    /// column's pages (`read_spans`), every column's fetches read together;
-    /// `None` for a column the file does not hold.
+    /// at `rows`, rows in file order (`read_column_spans`), every column's
+    /// fetches read together.
     async fn read_values(
         &self,
         columns: &[usize],
         rows: &[RowRef],
         source: RunSource<'_>,
     ) -> Result<Vec<Option<Spans<ValueRows>>>> {
-        let read = columns.iter().map(|&column| async move {
-            let Some(value) = self.layout.values[column] else {
-                return Ok(None);
-            };
-            let spans = self
-                .read_spans(
-                    rows,
-                    |row_group| self.value_column(value).group(row_group),
-                    None,
-                    source,
-                    source.value_gets.get(column),
-                    |chunk, pages, rows, segments| {
-                        checked_values(chunk, value.shape, pages, rows.clone(), segments)
-                    },
-                )
-                .await?;
-            Ok(Some(spans))
-        });
+        let read = columns
+            .iter()
+            .map(|&column| self.read_column_spans(column, rows, source));
         futures::future::try_join_all(read).await
+    }
+
+    /// The values of value column `column`, a position in the layout, at
+    /// `rows`, rows in file order, over the spans of them by the column's
+    /// pages (`read_spans`); `None` for a column the file does not hold.
+    /// `read_spans`' future itself, its closures holding the column by
+    /// reference, with no `async` block around it: `read_values`' join
+    /// allocates one per column.
+    fn read_column_spans<'a>(
+        &'a self,
+        column: usize,
+        rows: &[RowRef],
+        source: RunSource<'a>,
+    ) -> impl Future<Output = Result<Option<Spans<ValueRows>>>> + use<'a> {
+        let read = self.layout.values[column].as_ref().map(|value| {
+            self.read_spans(
+                rows,
+                move |row_group| self.value_column(*value).group(row_group),
+                None,
+                source,
+                source.value_gets.get(column),
+                move |chunk, pages, rows, segments| {
+                    checked_values(chunk, value.shape, pages, rows.clone(), segments)
+                },
+            )
+        });
+        OptionFuture::from(read).map(Option::transpose)
     }
 
     /// The spans of `rows`, rows in file order, by the pages of the column
@@ -608,42 +623,50 @@ impl FileIndex {
     /// through `source` otherwise, counted in `counted`, and decoded span
     /// by span by `decode` from the chunk, the pages holding the span, its
     /// rows, and the bytes fetched, which checks the pages' headers before
-    /// parquet reads them; every fetch read together.
-    async fn read_spans<'c, T, C, D>(
-        &self,
+    /// parquet reads them; every fetch read together. The fetches are
+    /// planned when it is called, so the future holds them and not `rows`,
+    /// and each fetch's future is `span_pages`' mapped to its decode: an
+    /// `async` block awaiting it would hold it twice, and the join
+    /// allocates one per fetch.
+    fn read_spans<'a, T, C, D>(
+        &'a self,
         rows: &[RowRef],
         chunk_of: C,
-        local: Option<&DiskChunks>,
-        source: RunSource<'_>,
-        counted: Option<&Counter>,
+        local: Option<&'a DiskChunks>,
+        source: RunSource<'a>,
+        counted: Option<&'a Counter>,
         decode: D,
-    ) -> Result<Spans<T>>
+    ) -> impl Future<Output = Result<Spans<T>>> + use<'a, T, C, D>
     where
-        C: Fn(usize) -> ColumnChunk<'c> + Copy,
-        D: Fn(ColumnChunk<'c>, Range<usize>, &Range<i64>, &Arc<Segments>) -> Result<T> + Copy,
+        C: Fn(usize) -> ColumnChunk<'a> + Copy + 'a,
+        D: Fn(ColumnChunk<'a>, Range<usize>, &Range<i64>, &Arc<Segments>) -> Result<T> + Copy + 'a,
     {
         let fetches = bridged(spans_of(rows, chunk_of), chunk_of);
-        let read = fetches.iter().map(|fetch| async move {
-            let chunk = chunk_of(fetch.row_group);
-            let (segments, from_store) = self
-                .span_pages(chunk, fetch.pages.clone(), local, source, counted)
-                .await?;
-            let spans = fetch
-                .spans
-                .iter()
-                .map(|rows| {
-                    let values = decode(chunk, pages_holding(chunk, rows), rows, &segments)?;
-                    Ok((fetch.row_group, rows.clone(), values))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok::<_, Error>((spans, from_store))
-        });
-        let read = futures::future::try_join_all(read).await?;
-        let from_store = read.iter().any(|(_, from_store)| *from_store);
-        Ok(Spans {
-            spans: read.into_iter().flat_map(|(spans, _)| spans).collect(),
-            from_store,
-        })
+        async move {
+            let read = fetches.iter().map(|fetch| {
+                let chunk = chunk_of(fetch.row_group);
+                self.span_pages(chunk, fetch.pages.clone(), local, source, counted)
+                    .map(move |read| {
+                        let (segments, from_store) = read?;
+                        let spans = fetch
+                            .spans
+                            .iter()
+                            .map(|rows| {
+                                let values =
+                                    decode(chunk, pages_holding(chunk, rows), rows, &segments)?;
+                                Ok((fetch.row_group, rows.clone(), values))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok::<_, Error>((spans, from_store))
+                    })
+            });
+            let read = futures::future::try_join_all(read).await?;
+            let from_store = read.iter().any(|(_, from_store)| *from_store);
+            Ok(Spans {
+                spans: read.into_iter().flat_map(|(spans, _)| spans).collect(),
+                from_store,
+            })
+        }
     }
 
     /// Data pages `pages` of `chunk` and its dictionary page when it has
@@ -3910,5 +3933,68 @@ mod tests {
         let read = index.read_run(&run, &newest, 1, &[0], &none_deleted, reads.source());
         is_send(&read);
         assert_eq!(read.await.unwrap().answer.rows.len(), 1);
+    }
+
+    /// The most bytes `read_run`'s future may take: `Generation::scan`'s
+    /// join allocates one for every file a Scan reads, so each byte is paid
+    /// per file per key. 1,072 is its size with the order and value reads
+    /// written out per column, which reading them through one `read_spans`
+    /// must not exceed.
+    const READ_RUN_FUTURE_BYTES: usize = 1_072;
+    /// The most bytes `read_orders`' future may take, laid out twice in
+    /// every `read_run` future: 320, its size with the read written out.
+    const READ_ORDERS_FUTURE_BYTES: usize = 320;
+    /// The most bytes `read_values`' future may take, laid out in every
+    /// `read_run` future: 256, its size with the read written out.
+    const READ_VALUES_FUTURE_BYTES: usize = 256;
+    /// The most bytes one column's read may take (`read_column_spans`),
+    /// which `read_values`' join allocates per column: 240, its size with
+    /// the read written out.
+    const COLUMN_READ_FUTURE_BYTES: usize = 240;
+
+    /// A Scan's read futures stay within their bytes, as `read_spans` keeps
+    /// them: no `async` layer around it holds state of its own.
+    #[tokio::test]
+    async fn test_read_run_futures_stay_within_their_bytes() {
+        let opened = store(&one_long_run(0)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_in(&opened, Residency::Full, dir.path(), 0).await;
+        let reads = Reads::new().await;
+        let run = index
+            .locate_run(&RUN_KEY, reads.source())
+            .await
+            .unwrap()
+            .unwrap();
+        let newest = bounds(Direction::NewestFirst);
+        let order = index.order_leaf_of();
+        let rows = [RowRef {
+            row_group: run.parts[0].row_group,
+            row: run.parts[0].rows.start,
+        }];
+        let sizes = [
+            (
+                "read_run",
+                size_of_val(&index.read_run(&run, &newest, 1, &[0], &none_deleted, reads.source())),
+                READ_RUN_FUTURE_BYTES,
+            ),
+            (
+                "read_orders",
+                size_of_val(&index.read_orders(&order, &rows, reads.source())),
+                READ_ORDERS_FUTURE_BYTES,
+            ),
+            (
+                "read_values",
+                size_of_val(&index.read_values(&[0], &rows, reads.source())),
+                READ_VALUES_FUTURE_BYTES,
+            ),
+            (
+                "read_column_spans",
+                size_of_val(&index.read_column_spans(0, &rows, reads.source())),
+                COLUMN_READ_FUTURE_BYTES,
+            ),
+        ];
+        for (future, bytes, most) in sizes {
+            assert!(bytes <= most, "{future}: {bytes} bytes, above {most}");
+        }
     }
 }
