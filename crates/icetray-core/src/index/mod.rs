@@ -644,8 +644,9 @@ impl Keys {
 
     /// Compares key `at` of this run with key `other_at` of `other` in
     /// served order. Runs of different types never meet within one table;
-    /// when they do, the order is `Key`'s derived order across variants,
-    /// which is total and carries no meaning.
+    /// when they do, strings against bytes compare bytewise, and any other
+    /// two variants by `Key`'s derived order, which is total and carries
+    /// no meaning.
     pub(crate) fn cmp_at(&self, at: usize, other: &Self, other_at: usize) -> Ordering {
         match (self, other) {
             (Self::Long(mine), Self::Long(theirs)) => mine[at].cmp(&theirs[other_at]),

@@ -64,6 +64,11 @@ impl OrderRun {
         self.0.cmp_at(at, &other.0, other_at)
     }
 
+    /// Value `at` against value `other_at` of this run (`Keys::cmp_within`).
+    pub(super) fn cmp_within(&self, at: usize, other_at: usize) -> Ordering {
+        self.0.cmp_within(at, other_at)
+    }
+
     /// Value `at` against `value`, one of another run of the same column.
     /// A value of another variant never meets one of this run; when it
     /// does, the order is `OrderValue`'s derived order across variants.
@@ -407,7 +412,7 @@ impl<'a> PairCheck<'a> {
                 Some(Ordering::Equal) => {
                     let order = match (at, &self.last) {
                         (0, Some((_, last))) => orders.cmp_value(0, last),
-                        _ => orders.0.cmp_within(at, at - 1),
+                        _ => orders.cmp_within(at, at - 1),
                     };
                     match order {
                         Ordering::Greater => true,

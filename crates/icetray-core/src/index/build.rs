@@ -328,9 +328,9 @@ async fn fetch_verified(
 /// Every column chunk of `ranges` in one `read_ranges` call: one load GET
 /// per row group per column. Each chunk is copied out of the buffer the
 /// store returned: a store may serve neighboring ranges from one fetch and
-/// hand back slices of it, and a slice keeps the whole fetch alive, so the bytes held would
-/// exceed the chunks by whatever lay between them. The copy is paid once at
-/// load.
+/// hand back slices of it, and a slice keeps the whole fetch alive, so the
+/// bytes held would exceed the chunks by whatever lay between them. The
+/// copy is paid once at load.
 pub(super) async fn fetch_chunk_parts(
     handle: &FileHandle,
     ranges: &[Range<u64>],
@@ -3943,8 +3943,8 @@ mod tests {
         );
     }
 
-    /// `verify` under the ordered rules of `opened`'s file over `metadata`, a footer edited
-    /// from its own, with the key and order chunks fetched.
+    /// `verify` under the ordered rules of `opened`'s file over `metadata`,
+    /// a footer edited from its own, with the key and order chunks fetched.
     async fn verify_ordered_over(
         opened: &Opened,
         metadata: &ParquetMetaData,
@@ -4451,9 +4451,9 @@ mod tests {
 
     /// Every order fence of random runs (RFD 025, Load; Review Focus 3),
     /// over long and string keys and long, string, binary, and fixed order
-    /// values, the byte ones sharing a long prefix, sorts above the last pair of the page before
-    /// its page and at or below its page's first pair, is the shortest such
-    /// pair, and places every row on its page.
+    /// values, the byte ones sharing a long prefix, sorts above the last
+    /// pair of the page before its page and at or below its page's first
+    /// pair, is the shortest such pair, and places every row on its page.
     #[tokio::test]
     async fn test_verify_ordered_fences_bound_every_order_page_with_the_shortest_pair() {
         // The shapes the fixed seeds draw, per order column: pages, pages
