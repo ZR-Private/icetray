@@ -81,7 +81,9 @@ encoded size above which a `Scan` or `MultiScan` response is refused as
 The listener serves plaintext gRPC and authenticates no caller. TLS,
 authentication, and access policy are left to the platform: run icetray
 on a private network or behind a service mesh or sidecar, and do not
-expose it directly. The default listen addresses are loopback.
+expose it directly. Set `server.listen` and `server.metrics_listen`
+([Configuration](configuration.md#server)) to the interfaces that policy
+covers.
 
 ## Metrics
 
@@ -613,9 +615,9 @@ through settings, mounted files, and environment variables.
   case, and `<version>` is the release's tag without its `v`, such as
   `0.1.0`.
 - icetray reads the configuration path from `ICETRAY_CONFIG`, so a pod
-  passes no flags. icetray reads TOML and JSON into the same schema. The
-  default listen addresses are loopback, so a container's configuration
-  sets `listen` and `metrics_listen`.
+  passes no flags. icetray reads TOML and JSON into the same schema. A
+  container's configuration sets `listen` and `metrics_listen` to
+  addresses its pod network reaches ([Configuration](configuration.md#server)).
 - icetray resolves S3 credentials once from the AWS SDK's default chain
   (environment variables, profiles and single sign-on, credential
   helpers, web identity, and container or instance roles, pod identity
@@ -793,8 +795,8 @@ until a drain closes the metrics listener.
   `server.load_deadline` plus the ten seconds that health stays
   `NOT_SERVING` after a failed start, so that a load that cannot finish
   ends with icetray's own error in the log before the kubelet kills the
-  container. The example allows 1,900 seconds against the default 30
-  minutes.
+  container. The example allows 1,900 seconds, which covers a
+  `server.load_deadline` of 30 minutes.
 - The readiness probe on `/ready` keeps traffic away until the tables
   serve. A Kubernetes gRPC probe against the health service reports the
   same state.
@@ -806,10 +808,10 @@ until a drain closes the metrics listener.
   kubelet restart a replica that is loading or draining as it should.
 
 **Termination.** On SIGTERM icetray drains for up to
-`server.drain_deadline` (20 seconds by default) and then flushes the page
-cache's disk level. `terminationGracePeriodSeconds` must cover both, or
-the kubelet's kill cuts the flush short; Kubernetes' default of 30
-seconds leaves ten seconds for the flush. The time from the `draining`
+`server.drain_deadline` ([Configuration](configuration.md#server)) and
+then flushes the page cache's disk level. `terminationGracePeriodSeconds`
+must cover both, or the kubelet's kill cuts the flush short; Kubernetes'
+default of 30 seconds leaves the flush only what remains after the drain. The time from the `draining`
 event to the process's exit shows how long a drain and flush take. A
 `preStop` delay, if one is used to let endpoints update first, adds to
 the time needed.

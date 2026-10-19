@@ -294,9 +294,13 @@ location = "/path/to/icetray/target/golden-warehouse/db/long_2m"
 icetray serve --config icetray.toml
 ```
 
-The server listens for gRPC on `127.0.0.1:7433` and serves `/ready` and
-`/metrics` on `127.0.0.1:9433`. From another terminal in the repository,
-look a key up with [grpcurl](https://github.com/fullstorydev/grpcurl):
+The server listens for gRPC on the address `server.listen` sets and serves
+`/ready` and `/metrics` on the address `server.metrics_listen` sets; this
+file sets neither, so the values are those in the
+[reference](docs/configuration.md#server). From another terminal in the
+repository, look a key up with
+[grpcurl](https://github.com/fullstorydev/grpcurl), the `127.0.0.1:7433`
+below being that `listen` value:
 
 ```sh
 grpcurl -plaintext -proto crates/icetray-proto/proto/icetray.proto \

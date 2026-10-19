@@ -142,7 +142,8 @@ snapshot added, as a compaction that rolls files by size writes them. A
 `Scan` of such a key reads every file that holds it, and the doctor
 reports it as `shared_edge_keys`, which caps the table at `balanced`.
 
-**Strict.** A per-table setting, off by default, under which icetray
+**Strict.** A per-table setting
+([Configuration](configuration.md#tables)) under which icetray
 refuses a snapshot whose layout is below the table's level; without it,
 icetray serves such a snapshot and flags the table. icetray keeps serving
 a strict table's last snapshot that met the level, and a strict table

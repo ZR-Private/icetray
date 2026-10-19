@@ -44,14 +44,14 @@ real table before configuring it.
 ### MultiGet fan-out
 
 icetray holds at most `server.batch_fan_out` GETs in flight for one
-`MultiGet`, 64 by default, and each GET a lookup issues holds one slot
-until it ends. A lookup takes its slot before it asks the page cache for
+`MultiGet` ([Configuration](configuration.md#server)), and each GET a
+lookup issues holds one slot until it ends. A lookup takes its slot before it asks the page cache for
 a page not in memory, so a page in memory costs no slot, and a `Get` of a
 page a batch is still waiting to fetch issues its own GET rather than
 waiting behind the batch. A batch whose keys are all cold therefore waits
-about one GET's latency for every `batch_fan_out` GETs. At the
-default, under `full` or `disk`, that is every 64 keys when it requests
-one column, every 32 when it requests two, and fewer when a column is
+about one GET's latency for every `batch_fan_out` GETs. Under `full` or
+`disk`, that is every `batch_fan_out` keys when it requests one column,
+every `batch_fan_out` / 2 when it requests two, and fewer when a column is
 dictionary-encoded, since its dictionary page is a GET of its own. Under
 `bloom` each key's key page takes a slot as well. A larger bound shortens
 a cold batch's latency, and each batch then holds more GETs open on the
@@ -62,7 +62,7 @@ getting faster at a fan-out of about 128, where it takes about three GET
 round trips. Several concurrent batches reach the process's shared GET
 throughput sooner, by 64 for two-column batches, and past that point a
 larger bound speeds no one up: it only lets one batch take more of the
-shared throughput from the others. The default of 64 keeps most of a lone
+shared throughput from the others. The default keeps most of a lone
 batch's gain and holds one caller to a fair share. A deployment with few
 concurrent batch callers can raise it toward 128; above that, the
 process's throughput is the limit
@@ -156,7 +156,7 @@ taking throughput from a busy one
 
 icetray caches each page a span GET fetches as its own entry, keyed by
 file and offset, in a memory cache of its own, bounded by
-`server.scan_page_cache_bytes`, 256 MiB by default. A later `Scan` of the
+`server.scan_page_cache_bytes` ([Configuration](configuration.md#server)). A later `Scan` of the
 same key reads those pages from memory, and one that reaches past them
 fetches only its uncached spans. The scan cache has no disk level, and
 key-value lookups read through the page cache alone, so a long run evicts
@@ -307,8 +307,8 @@ data files are immutable, so a cached page never goes stale, and icetray
 evicts pages by size alone. Concurrent lookups that need the same
 uncached page share one GET.
 
-- **The memory level**, `server.page_cache_bytes` (256 MiB by default),
-  holds the hottest pages. A hit there costs no I/O. The level is split
+- **The memory level**, `server.page_cache_bytes`
+  ([Configuration](configuration.md#server)), holds the hottest pages. A hit there costs no I/O. The level is split
   into shards, one per worker thread rounded up to a power of two, and
   each shard evicts within its own share of the budget.
 - **The disk level**, `storage.local.page_cache_disk_bytes`, stores the
@@ -335,10 +335,9 @@ replica's hit rate, raise the budget on every replica.
 
 When a lookup GET has not completed after a delay, icetray sends it a
 second time and uses whichever response arrives first. The delay is a
-high percentile of the table's recent lookup GET latencies, by default
-the 95th percentile of the last 256, so it tracks the object store's
-latency as it drifts. A ceiling, by default 5 percent, caps the share of
-the window's lookup GETs that icetray hedges. icetray never hedges load
+high percentile of the table's recent lookup GET latencies over a window
+of the latest GETs, so it tracks the object store's latency as it drifts.
+A ceiling caps the share of the window's lookup GETs that icetray hedges. icetray never hedges load
 reads. A `Scan`'s span GETs are hedged under the same settings in a
 window of their own per table, whose delay scales with a span's pages,
 since a span's latency grows with its size.
@@ -352,7 +351,8 @@ since a span's latency grows with its size.
 - `icetray_hedges_total` against `icetray_object_gets_total{kind="lookup"}`
   shows what hedging spends.
 
-The settings are under [`[storage.hedge]`](configuration.md#storagehedge),
+The settings, `percentile`, `window`, and `max_rate`, are under
+[`[storage.hedge]`](configuration.md#storagehedge) with their values,
 and the decision is [RFD 013](rfd/013-tail-latency.md).
 
 ## Load time

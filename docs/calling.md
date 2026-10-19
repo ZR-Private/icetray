@@ -26,7 +26,8 @@ partially; and retries only the transient errors.
 
 ## Connecting
 
-icetray serves gRPC on port 7433 by default, in plaintext, with the
+icetray serves gRPC on the address `server.listen` sets
+([Configuration](configuration.md#server)), in plaintext, with the
 standard `grpc.health.v1` health service for readiness. The port
 authenticates no client, so a deployment provides encryption and access
 control with a private network, a service mesh, or a sidecar.
@@ -180,12 +181,13 @@ The caller then retries the whole batch when the error's row in
 `FAILED_PRECONDITION`, the caller drops the key the error names or reads
 that column whole.
 
-A batch may request up to `server.max_multi_get_values` values, 1,000 by
-default, counting its keys times its columns, with a presence-only batch
-counting one per key. The server rejects a larger batch as
-`INVALID_ARGUMENT` before it looks up any key, so a caller with more
-values splits them across batches. The server caps the GETs a batch holds
-in flight at `server.batch_fan_out`, 64 by default, so a large batch
+A batch may request up to `server.max_multi_get_values` values
+([Configuration](configuration.md#server)), counting its keys times its
+columns, with a presence-only batch counting one per key. The server
+rejects a larger batch as `INVALID_ARGUMENT` before it looks up any key,
+so a caller with more values splits them across batches. The server caps the GETs a batch holds
+in flight at `server.batch_fan_out`
+([Configuration](configuration.md#server)), so a large batch
 takes longer and its load on object storage stays within that cap.
 
 ## Reading an ordered table
@@ -284,9 +286,10 @@ tuning](performance.md#what-a-scan-costs)).
 ### Response size
 
 The server refuses to send a `Scan` or `MultiScan` response whose encoded
-size is above `server.max_scan_bytes`, 4 MiB (4,194,304 bytes) by default,
-a gRPC client's default limit on a message it receives, which `TableInfo`
-reports in `max_scan_bytes`. The call fails as `FAILED_PRECONDITION`,
+size is above `server.max_scan_bytes`
+([Configuration](configuration.md#server)), which `TableInfo` reports in
+`max_scan_bytes`. Its default is set to a gRPC client's default limit on a
+message it receives. The call fails as `FAILED_PRECONDITION`,
 with no rows, and its message names the response's size, the bound, and
 how many rows of a `Scan`, or how many leading keys' results of a
 `MultiScan`, would have fit. The size is the
@@ -378,21 +381,22 @@ call. For a key listed twice, the server returns a result at each
 position. When the read of any key fails, the whole call fails, as for
 `MultiGet`.
 
-A `MultiScan` may request up to `server.max_multi_scan_values` values,
-4,000 by default, which `TableInfo` reports in `max_multi_scan_values`.
+A `MultiScan` may request up to `server.max_multi_scan_values` values
+([Configuration](configuration.md#server)), which `TableInfo` reports in
+`max_multi_scan_values`.
 They are counted as its keys times its limit times one more
 than its columns, the one being the order value. A `MultiScan` sets its
 limit per key, as a `Scan` does: a limit of 0 is `INVALID_ARGUMENT`. The
 server rejects a larger call as
-`INVALID_ARGUMENT` before it reads any key. At the defaults, a
-`MultiScan` at the full limit of 1,000 rows with one column covers two
-keys, and one with a limit of 20 and one column covers 100. A caller
+`INVALID_ARGUMENT` before it reads any key. A `MultiScan` at the
+table's full `max_scan_rows` with one column covers a few keys, and one
+with a limit of 20 and one column covers `server.max_multi_scan_values`
+divided by 40. A caller
 reading many keys requests a smaller limit and pages each key whose
 result has `next` set with a `Scan` of that key, passing that `next` as
 its bound, and a caller reading one key's full limit over
 several columns uses `Scan`. The GETs one `Scan` or `MultiScan` holds in
-flight are capped at `server.batch_fan_out`, 64 by default, as for
-`MultiGet`.
+flight are capped at `server.batch_fan_out`, as for `MultiGet`.
 
 The whole `MultiScan` response is held to `server.max_scan_bytes`
 ([Response size](#response-size)), and a key listed twice counts at each
@@ -428,15 +432,16 @@ its `limit`.
 | `NOT_FOUND` | The server does not serve a table of that name. | No |
 | `INVALID_ARGUMENT` | The request is invalid: a missing key, a key variant that does not match the table's key type, a uuid key that is not sixteen bytes, a column the table does not serve or one listed twice, a field list for a column that is not protobuf, a field number outside 1 to 536,870,911 or one listed twice, a `MultiGet` or `MultiScan` over its values limit, a `Scan` or `MultiScan` that sets no direction, sets a limit of 0 or one above the table's `max_scan_rows`, or sets a bound of the wrong variant, a bound with no variant, or a `start` at or above `before` (an empty window), or a call of the wrong kind for the table (`Get` or `MultiGet` of an ordered table, `Scan` or `MultiScan` of a key-value table). | No; fix the request |
 | `FAILED_PRECONDITION` | A request listed fields of a value that is not protobuf. The error names the table, column, and key, and for a `Scan` the order value of the row that holds the value, which a caller paging the key's rows steps past. Or a `Scan` or `MultiScan` response would encode to more than `server.max_scan_bytes` ([Response size](#response-size)). | No; it recurs until the writer rewrites the value. Read that column whole, or drop the key. For a response size, lower `limit` or request fewer columns or keys. |
-| `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls (1,024 by default) and refused this one at once. | Yes, with backoff |
+| `RESOURCE_EXHAUSTED` | The server is at `server.max_in_flight` calls and refused this one at once. | Yes, with backoff |
 | `UNAVAILABLE` | A read from object storage or local disk failed, the table is not ready yet, or a lookup was canceled. | Yes |
-| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline` (5 seconds by default), a `MultiGet` ran past `server.multi_get_deadline` (15 seconds by default), a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline` (5 seconds by default), or a `MultiScan` ran past `server.multi_scan_deadline` (15 seconds by default). | Yes, if the caller's own deadline allows |
+| `DEADLINE_EXCEEDED` | A `Get`, or a page fetch within any lookup, ran past `server.get_deadline`, a `MultiGet` ran past `server.multi_get_deadline`, a `Scan`, or a GET within any `Scan` or `MultiScan`, of a span of pages or of a key page under `bloom`, ran past `server.scan_deadline`, or a `MultiScan` ran past `server.multi_scan_deadline`. [Configuration](configuration.md#server) gives each deadline. | Yes, if the caller's own deadline allows |
 | `INTERNAL` | The table's data is faulty, such as a malformed file. | Only after the table advances to another snapshot |
 
 The gRPC layer enforces a deadline the client sends and reports its
 expiry to the client (a tonic client sees `CANCELLED`), and the server
 drops the call at that moment.
 
-By default the server hedges a slow GET to object storage with a second
-one to cut tail latency, so a caller can leave hedging a `Get` or a
-`Scan` to the server.
+The server hedges a slow GET to object storage with a second one to cut
+tail latency, under the settings in
+[`[storage.hedge]`](configuration.md#storagehedge), so a caller can leave
+hedging a `Get` or a `Scan` to the server.
